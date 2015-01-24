@@ -1,0 +1,20 @@
+# Least-privilege RBAC for sshpiperd's kubernetes plugin, scoped to the gateway
+# namespace (a Role, not a ClusterRole — sshpiper watches only this namespace).
+# It reads the Pipes the daemon programs and the Secrets they reference (the
+# upstream private key + any from-side key Secrets).
+#
+# NOTE: sshpiper's exec-into-pod mode additionally needs pods[get] +
+# pods/exec[create]. We route over TCP to the box Service, so those are omitted
+# (least privilege). Add them only if you enable that mode.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sshpiper
+  namespace: agent-gateway
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sshpiper
+  namespace: agent-gateway
+rules:
