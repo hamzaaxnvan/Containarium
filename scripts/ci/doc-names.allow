@@ -1,0 +1,21 @@
+# Allow-list for scripts/ci/check-doc-names.sh. One entry per line:
+#   ip   <address>            a public IPv4 address that is documented, not a deployment
+#   name <token>              a generic example identity usable as <token>-container
+#   pending <path> <token>    an ambiguous <token>-container left for a human to
+#                             rename or accept (#2558); a NEW occurrence in any
+#                             other file still fails. Delete the line once resolved.
+# Lines starting with # are comments; text after " # " is the reason.
+
+# Public resolvers and documentation placeholders.
+ip 8.8.8.8        # Google public DNS
+ip 1.1.1.1        # Cloudflare public DNS
+ip 9.9.9.9        # Quad9 public DNS
+ip 1.2.3.4        # obvious placeholder
+# Vendor-published ranges quoted as examples.
+ip 130.211.0.0    # Google Cloud load-balancer health-check range
+ip 35.191.0.0     # Google Cloud load-balancer health-check range
+ip 173.245.48.0   # Cloudflare published range
+ip 103.21.244.0   # Cloudflare published range
+ip 140.82.112.3   # a code-hosting vendor's public address used as an example destination
+
+# Generic example identities.
