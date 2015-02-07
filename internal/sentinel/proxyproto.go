@@ -1,0 +1,48 @@
+package sentinel
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+)
+
+// proxyV2Sig is the 12-byte PROXY protocol v2 signature.
+//
+//	\r\n\r\n\x00\r\nQUIT\n
+var proxyV2Sig = [12]byte{
+	0x0D, 0x0A, 0x0D, 0x0A,
+	0x00, 0x0D, 0x0A, 0x51,
+	0x55, 0x49, 0x54, 0x0A,
+}
+
+// WriteProxyV2 emits a PROXY protocol v2 header describing a TCP connection
+// from src to dst. It is intended to be written to the upstream side of a
+// TLS-passthrough proxy *before* any application bytes, so the downstream
+// parser (e.g. Caddy's proxy_protocol listener wrapper) can recover the real
+// client address.
+//
+// IPv4 produces a 28-byte frame, IPv6 a 52-byte frame. If src and dst are not
+// the same family, the call falls back to encoding both as IPv6
+// (IPv4-mapped) — this matches what most parsers expect.
+//
+// Wire format (16-byte fixed header followed by addrs+ports):
+//
+//	signature       (12)
+//	ver+cmd         (1)   = 0x21  (v2, PROXY command)
+//	fam+proto       (1)   = 0x11 IPv4/STREAM, 0x21 IPv6/STREAM
+//	body length     (2)   = big-endian
+//	src addr        (4 or 16)
+//	dst addr        (4 or 16)
+//	src port        (2)   = big-endian
+//	dst port        (2)   = big-endian
+func WriteProxyV2(w io.Writer, src, dst *net.TCPAddr) (int, error) {
+	if src == nil || dst == nil {
+		return 0, fmt.Errorf("proxyproto: nil addr (src=%v dst=%v)", src, dst)
+	}
+	if src.Port < 0 || src.Port > 0xFFFF || dst.Port < 0 || dst.Port > 0xFFFF {
+		return 0, fmt.Errorf("proxyproto: port out of TCP range (src=%d dst=%d)", src.Port, dst.Port)
+	}
+	srcPort, dstPort := uint16(src.Port), uint16(dst.Port) //nolint:gosec // bounds-checked above (G115)
+
+	srcIP4, dstIP4 := src.IP.To4(), dst.IP.To4()
