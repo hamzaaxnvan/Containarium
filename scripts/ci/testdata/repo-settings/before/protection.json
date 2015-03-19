@@ -1,0 +1,2 @@
+{"required_status_checks":{"strict":true,"checks":[{"app_id":15368,"context":"Unit + default e2e"},{"app_id":57789,"context":"Trivy"}]},
+ "enforce_admins":{"enabled":true},"required_linear_history":{"enabled":false},"allow_force_pushes":{"enabled":false},
