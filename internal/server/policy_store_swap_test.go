@@ -1,0 +1,41 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+
+	"github.com/footprintai/containarium/internal/guardrailpolicy"
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+)
+
+// #2483: the durable store can now be installed after the server is serving
+// (the recovery retry), so the swap has to reach every reader, including the
+// Provider() the deploy gate and model gateway captured at startup.
+
+func TestGuardrailPolicyProvider_FollowsDurableInstall(t *testing.T) {
+	s := NewGuardrailPolicyServer(guardrailPolicyStartupStore(true, nil))
+	provider := s.Provider() // captured at startup, as the gate and gateway do
+	if s.Durable() {
+		t.Fatal("Durable() = true on the fail-closed stand-in")
+	}
+	if _, err := provider.Get(context.Background()); err == nil || errors.Is(err, guardrailpolicy.ErrNotConfigured) {
+		t.Fatalf("provider.Get before install = %v, want a fail-closed error", err)
+	}
+
+	if err := s.InstallDurableStore(func() (guardrailpolicy.Store, error) {
+		return nil, errors.New("connection refused")
+	}); err == nil {
+		t.Fatal("InstallDurableStore: want the opener's error")
+	}
+	if s.Durable() {
+		t.Fatal("Durable() = true after a failed install")
+	}
+
+	durable := guardrailpolicy.NewMemoryStore() // stands in for the Postgres store
+	if _, err := durable.Set(context.Background(), gpRequest(0, gpSigner(1)), "admin"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := s.InstallDurableStore(func() (guardrailpolicy.Store, error) { return durable, nil }); err != nil {
+		t.Fatalf("InstallDurableStore: %v", err)

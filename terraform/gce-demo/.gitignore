@@ -1,0 +1,5 @@
+# Local state — never commit (contains resource IDs, sometimes secrets).
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfstate.*.backup
+.terraform/

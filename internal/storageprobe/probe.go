@@ -105,3 +105,111 @@ const (
 	severeMinPerOp = 50 * time.Millisecond
 )
 
+// Assessment is the outcome of comparing a baseline to an under-load run.
+type Assessment struct {
+	Baseline  Result
+	UnderLoad Result
+
+	// Ratio is under-load per-op latency divided by baseline per-op latency.
+	// This is the signal; neither input means anything alone.
+	Ratio   float64
+	Verdict Verdict
+}
+
+// Classify compares a baseline probe against one taken while a co-tenant
+// generates dirty pages.
+func Classify(baseline, underLoad Result) Assessment {
+	a := Assessment{Baseline: baseline, UnderLoad: underLoad}
+
+	base := baseline.PerOp()
+	if base <= 0 {
+		a.Verdict = VerdictUnknown
+		return a
+	}
+
+	a.Ratio = float64(underLoad.PerOp()) / float64(base)
+	switch {
+	case a.Ratio >= severeRatio && underLoad.PerOp() >= severeMinPerOp:
+		// Both conditions are required. A large ratio over a tiny baseline
+		// still leaves latency an operator would not notice; a large absolute
+		// latency that co-tenant load did not cause is not a contention
+		// failure at all. See severeMinPerOp.
+		a.Verdict = VerdictSevere
+	case a.Ratio >= degradedRatio:
+		a.Verdict = VerdictDegraded
+	default:
+		a.Verdict = VerdictIsolated
+	}
+	return a
+}
+
+// probeBlockSize is the write size per operation. Small on purpose: the
+// measurement is of fsync commit latency, not throughput.
+const probeBlockSize = 4096
+
+// Probe measures ops × (4 KiB write + fsync) in dir and returns the total
+// elapsed time. The scratch file is removed before returning, including on
+// error — the probe runs inside a tenant's box, and one that leaks a file per
+// invocation is one operators stop running.
+func Probe(dir string, ops int) (Result, error) {
+	if ops <= 0 {
+		return Result{}, fmt.Errorf("ops must be positive, got %d", ops)
+	}
+
+	f, err := os.CreateTemp(dir, "containarium-storage-probe-*")
+	if err != nil {
+		return Result{}, fmt.Errorf("create probe file in %s: %w", dir, err)
+	}
+	defer func() {
+		name := f.Name()
+		_ = f.Close()
+		_ = os.Remove(name)
+	}()
+
+	buf := make([]byte, probeBlockSize)
+	start := time.Now()
+	for i := 0; i < ops; i++ {
+		if _, err := f.Write(buf); err != nil {
+			return Result{}, fmt.Errorf("write: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			return Result{}, fmt.Errorf("fsync: %w", err)
+		}
+	}
+	return Result{Ops: ops, Total: time.Since(start)}, nil
+}
+
+// LoadConfig describes the dirty-page generator.
+type LoadConfig struct {
+	// BlockSize is one buffered write.
+	BlockSize int
+
+	// BlocksPerSync is how many blocks are written before a single fsync.
+	// BlockSize × BlocksPerSync is the dirty-page volume per commit, and
+	// volume is what reproduces the stall — not sync frequency.
+	BlocksPerSync int
+
+	// Cycles caps the number of write-then-sync cycles. Zero means run until
+	// the context is cancelled.
+	Cycles int
+}
+
+// DefaultLoadConfig mirrors the reproduction in #1206: 64 MiB of buffered
+// writes per fsync. Do not lower the volume per sync without re-measuring —
+// the small-write, high-sync-rate variant does not reproduce the stall.
+func DefaultLoadConfig() LoadConfig {
+	return LoadConfig{
+		BlockSize:     1 << 20, // 1 MiB
+		BlocksPerSync: 64,      // -> 64 MiB per fsync
+	}
+}
+
+// VolumePerSync is the dirty-page volume committed per fsync.
+func (c LoadConfig) VolumePerSync() int64 {
+	return int64(c.BlockSize) * int64(c.BlocksPerSync)
+}
+
+// loadTarget is the subset of *os.File the generator needs, so the write
+// pattern can be observed in tests without touching disk.
+type loadTarget interface {
+	Write(p []byte) (int, error)
