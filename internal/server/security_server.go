@@ -1,0 +1,303 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/footprintai/containarium/internal/auth"
+	"github.com/footprintai/containarium/internal/security"
+	"github.com/footprintai/containarium/pkg/core/incus"
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+)
+
+// SecurityServer implements the SecurityService gRPC service
+type SecurityServer struct {
+	pb.UnimplementedSecurityServiceServer
+	store          *security.Store
+	incusClient    *incus.Client
+	scanner        *security.Scanner
+	peerPool       *PeerPool
+	localBackendID string
+}
+
+// SetPeerPool sets the peer pool for including peer containers in security summaries.
+func (s *SecurityServer) SetPeerPool(pool *PeerPool) {
+	s.peerPool = pool
+	if pool != nil {
+		s.localBackendID = pool.LocalBackendID()
+	}
+}
+
+// NewSecurityServer creates a new security server
+func NewSecurityServer(store *security.Store, incusClient *incus.Client, scanner *security.Scanner) *SecurityServer {
+	return &SecurityServer{
+		store:       store,
+		incusClient: incusClient,
+		scanner:     scanner,
+	}
+}
+
+// ListClamavReports returns ClamAV scan reports with optional filtering.
+// Phase 1.4 — when ContainerName is set, tenant authz via the
+// owner derivation; when blank, the listing would cover all
+// containers, so require admin.
+func (s *SecurityServer) ListClamavReports(ctx context.Context, req *pb.ListClamavReportsRequest) (*pb.ListClamavReportsResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSecurityRead); err != nil {
+		return nil, err
+	}
+	if req.ContainerName == "" {
+		if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := auth.AuthorizeContainerAccess(ctx, req.ContainerName); err != nil {
+			return nil, err
+		}
+	}
+	params := security.ListParams{
+		ContainerName: req.ContainerName,
+		Status:        req.Status,
+		From:          req.From,
+		To:            req.To,
+		Limit:         int(req.Limit),
+		Offset:        int(req.Offset),
+	}
+
+	reports, totalCount, err := s.store.ListReports(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list reports: %w", err)
+	}
+
+	// Tag local reports with backend_id
+	for _, r := range reports {
+		if r.BackendId == "" {
+			r.BackendId = s.localBackendID
+		}
+	}
+
+	// Merge reports from peers
+	if s.peerPool != nil {
+		authToken := extractAuthToken(ctx)
+		peerReports := s.fetchPeerReports(authToken, req)
+		reports = append(reports, peerReports...)
+		totalCount += int32(len(peerReports)) // #nosec G115 -- value bounded by container/scan count
+	}
+
+	return &pb.ListClamavReportsResponse{
+		Reports:    reports,
+		TotalCount: totalCount,
+	}, nil
+}
+
+// fetchPeerReports fetches ClamAV reports from all peers in parallel.
+func (s *SecurityServer) fetchPeerReports(authToken string, req *pb.ListClamavReportsRequest) []*pb.ClamavReport {
+	peers := s.peerPool.Peers()
+	if len(peers) == 0 {
+		return nil
+	}
+
+	// Build query params
+	var qp []string
+	if req.ContainerName != "" {
+		qp = append(qp, "container_name="+req.ContainerName)
+	}
+	if req.Status != "" {
+		qp = append(qp, "status="+req.Status)
+	}
+	if req.From != "" {
+		qp = append(qp, "from="+req.From)
+	}
+	if req.To != "" {
+		qp = append(qp, "to="+req.To)
+	}
+	if req.Limit > 0 {
+		qp = append(qp, fmt.Sprintf("limit=%d", req.Limit))
+	}
+	queryParams := strings.Join(qp, "&")
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var all []*pb.ClamavReport
+
+	for _, peer := range peers {
+		if !peer.Healthy {
+			continue
+		}
+		wg.Add(1)
+		go func(pc *PeerClient) {
+			defer wg.Done()
+			body, err := pc.ForwardSecurityReports(authToken, queryParams)
+			if err != nil {
+				log.Printf("[security] failed to fetch reports from peer %s: %v", pc.ID, err)
+				return
+			}
+			var resp pb.ListClamavReportsResponse
+			if err := protojson.Unmarshal(body, &resp); err != nil {
+				log.Printf("[security] failed to parse reports from peer %s: %v", pc.ID, err)
+				return
+			}
+			// Tag with backend_id
+			for _, r := range resp.Reports {
+				if r.BackendId == "" {
+					r.BackendId = pc.ID
+				}
+			}
+			mu.Lock()
+			all = append(all, resp.Reports...)
+			mu.Unlock()
+		}(peer)
+	}
+	wg.Wait()
+	return all
+}
+
+// GetClamavSummary returns a summary of ClamAV scan status across all containers.
+// Admin-only — cluster-wide infection counts leak posture data and
+// list every container by name.
+func (s *SecurityServer) GetClamavSummary(ctx context.Context, req *pb.GetClamavSummaryRequest) (*pb.GetClamavSummaryResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSecurityRead); err != nil {
+		return nil, err
+	}
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	// Get scan summaries from DB
+	summaries, err := s.store.GetContainerSummaries(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get summaries: %w", err)
+	}
+
+	// Tag local summaries with backend_id
+	scannedMap := make(map[string]bool)
+	cleanCount := int32(0)
+	infectedCount := int32(0)
+	for _, sum := range summaries {
+		sum.BackendId = s.localBackendID
+		scannedMap[sum.ContainerName] = true
+		switch sum.LastStatus {
+		case "clean":
+			cleanCount++
+		case "infected":
+			infectedCount++
+		}
+	}
+
+	// Get all running local containers to find never-scanned ones
+	neverScanned := int32(0)
+	if s.incusClient != nil {
+		containers, err := s.incusClient.ListContainers()
+		if err == nil {
+			for _, c := range containers {
+				if c.Role.IsCoreRole() {
+					continue
+				}
+				if !scannedMap[c.Name] {
+					neverScanned++
+					username := c.Name
+					if strings.HasSuffix(c.Name, "-container") {
+						username = strings.TrimSuffix(c.Name, "-container")
+					}
+					summaries = append(summaries, &pb.ClamavContainerSummary{
+						ContainerName: c.Name,
+						Username:      username,
+						LastStatus:    "never",
+						BackendId:     s.localBackendID,
+					})
+				}
+			}
+		}
+	}
+
+	// Fetch and merge peer security summaries (federated scanning)
+	if s.peerPool != nil {
+		authToken := extractAuthToken(ctx)
+		peerSummaries, peerClean, peerInfected, peerNever := s.fetchPeerSummaries(authToken)
+		summaries = append(summaries, peerSummaries...)
+		cleanCount += peerClean
+		infectedCount += peerInfected
+		neverScanned += peerNever
+	}
+
+	return &pb.GetClamavSummaryResponse{
+		Containers:             summaries,
+		TotalContainers:        int32(len(summaries)), // #nosec G115 -- value bounded by container count
+		CleanContainers:        cleanCount,
+		InfectedContainers:     infectedCount,
+		NeverScannedContainers: neverScanned,
+		LastCollectionAt:       time.Now().Format(time.RFC3339),
+	}, nil
+}
+
+// fetchPeerSummaries fetches ClamAV summaries from all peers in parallel.
+// Returns merged summaries and aggregate counts.
+func (s *SecurityServer) fetchPeerSummaries(authToken string) (summaries []*pb.ClamavContainerSummary, clean, infected, never int32) {
+	peers := s.peerPool.Peers()
+	if len(peers) == 0 {
+		return
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, peer := range peers {
+		if !peer.Healthy {
+			continue
+		}
+		wg.Add(1)
+		go func(pc *PeerClient) {
+			defer wg.Done()
+			body, err := pc.ForwardSecuritySummary(authToken)
+			if err != nil {
+				log.Printf("[security] failed to fetch summary from peer %s: %v", pc.ID, err)
+				return
+			}
+			var resp pb.GetClamavSummaryResponse
+			if err := protojson.Unmarshal(body, &resp); err != nil {
+				log.Printf("[security] failed to parse summary from peer %s: %v", pc.ID, err)
+				return
+			}
+			// Tag containers with peer's backend_id
+			for _, c := range resp.Containers {
+				if c.BackendId == "" {
+					c.BackendId = pc.ID
+				}
+			}
+			mu.Lock()
+			summaries = append(summaries, resp.Containers...)
+			clean += resp.CleanContainers
+			infected += resp.InfectedContainers
+			never += resp.NeverScannedContainers
+			mu.Unlock()
+		}(peer)
+	}
+	wg.Wait()
+	return
+}
+
+// TriggerClamavScan enqueues a scan job for ONE container asynchronously and
+// returns immediately. container_name is required (#2631): the platform no
+// longer starts scans of every box, because a malware scan is something a box's
+// owner asks for, not something done to tenants. A blank name is rejected —
+// PermissionDenied for a non-admin (as before), InvalidArgument for an admin.
+func (s *SecurityServer) TriggerClamavScan(ctx context.Context, req *pb.TriggerClamavScanRequest) (*pb.TriggerClamavScanResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSecurityWrite); err != nil {
+		return nil, err
+	}
+	if req.ContainerName == "" {
+		if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+			return nil, err
+		}
+		return nil, status.Error(codes.InvalidArgument,
+			"container_name is required: scans are started per box by its owner (scan-all was removed, #2631)")
+	}
+	// Owner-only (#2655): the scan runs inside the customer's box, so the
+	// owner must be the one who asks. An administrator does not bypass this;
+	// only the owner, or a service credential acting for an owner it already
