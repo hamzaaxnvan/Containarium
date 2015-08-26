@@ -46,3 +46,147 @@ func TestExtractLabelsFromConfig(t *testing.T) {
 				"team":    "backend",
 				"project": "api",
 				"env":     "production",
+				"owner":   "alice",
+			},
+		},
+		{
+			name: "label with special characters in value",
+			config: map[string]string{
+				"user.containarium.label.description": "Production API Server v2.0",
+				"user.containarium.label.url":         "https://example.com/api",
+			},
+			wantLabels: map[string]string{
+				"description": "Production API Server v2.0",
+				"url":         "https://example.com/api",
+			},
+		},
+		{
+			name: "label with empty value",
+			config: map[string]string{
+				"user.containarium.label.empty": "",
+			},
+			wantLabels: map[string]string{
+				"empty": "",
+			},
+		},
+		{
+			name: "similar prefix but not a label",
+			config: map[string]string{
+				"containarium.labels":          "not a label",
+				"user.containarium.label.real": "label",
+				"containarium.labelconfig":     "also not a label",
+			},
+			wantLabels: map[string]string{
+				"real": "label",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractLabelsFromConfig(tt.config)
+
+			if len(got) != len(tt.wantLabels) {
+				t.Errorf("extractLabelsFromConfig() returned %d labels, want %d", len(got), len(tt.wantLabels))
+				return
+			}
+
+			for key, wantValue := range tt.wantLabels {
+				if gotValue, ok := got[key]; !ok {
+					t.Errorf("extractLabelsFromConfig() missing label %q", key)
+				} else if gotValue != wantValue {
+					t.Errorf("extractLabelsFromConfig() label %q = %q, want %q", key, gotValue, wantValue)
+				}
+			}
+		})
+	}
+}
+
+func TestMatchLabels(t *testing.T) {
+	tests := []struct {
+		name            string
+		containerLabels map[string]string
+		filter          map[string]string
+		wantMatch       bool
+	}{
+		{
+			name:            "empty filter matches everything",
+			containerLabels: map[string]string{"team": "backend"},
+			filter:          map[string]string{},
+			wantMatch:       true,
+		},
+		{
+			name:            "empty labels with empty filter",
+			containerLabels: map[string]string{},
+			filter:          map[string]string{},
+			wantMatch:       true,
+		},
+		{
+			name:            "empty labels with non-empty filter",
+			containerLabels: map[string]string{},
+			filter:          map[string]string{"team": "backend"},
+			wantMatch:       false,
+		},
+		{
+			name:            "exact match single label",
+			containerLabels: map[string]string{"team": "backend"},
+			filter:          map[string]string{"team": "backend"},
+			wantMatch:       true,
+		},
+		{
+			name:            "mismatch single label",
+			containerLabels: map[string]string{"team": "backend"},
+			filter:          map[string]string{"team": "frontend"},
+			wantMatch:       false,
+		},
+		{
+			name:            "filter with missing label",
+			containerLabels: map[string]string{"team": "backend"},
+			filter:          map[string]string{"project": "api"},
+			wantMatch:       false,
+		},
+		{
+			name:            "multiple labels all match",
+			containerLabels: map[string]string{"team": "backend", "env": "prod", "owner": "alice"},
+			filter:          map[string]string{"team": "backend", "env": "prod"},
+			wantMatch:       true,
+		},
+		{
+			name:            "multiple labels partial mismatch",
+			containerLabels: map[string]string{"team": "backend", "env": "prod", "owner": "alice"},
+			filter:          map[string]string{"team": "backend", "env": "staging"},
+			wantMatch:       false,
+		},
+		{
+			name:            "container has more labels than filter",
+			containerLabels: map[string]string{"team": "backend", "env": "prod", "owner": "alice", "version": "v2"},
+			filter:          map[string]string{"team": "backend"},
+			wantMatch:       true,
+		},
+		{
+			name:            "filter has more labels than container",
+			containerLabels: map[string]string{"team": "backend"},
+			filter:          map[string]string{"team": "backend", "env": "prod"},
+			wantMatch:       false,
+		},
+		{
+			name:            "nil container labels with filter",
+			containerLabels: nil,
+			filter:          map[string]string{"team": "backend"},
+			wantMatch:       false,
+		},
+		{
+			name:            "nil container labels with empty filter",
+			containerLabels: nil,
+			filter:          map[string]string{},
+			wantMatch:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := MatchLabels(tt.containerLabels, tt.filter)
+			if got != tt.wantMatch {
+				t.Errorf("MatchLabels() = %v, want %v", got, tt.wantMatch)
+			}
+		})
