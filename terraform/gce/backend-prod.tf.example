@@ -1,0 +1,4 @@
+# Terraform Remote Backend Configuration - Production
+#
+# Copy this file to backend.tf (which is gitignored) and update with your bucket name
+#

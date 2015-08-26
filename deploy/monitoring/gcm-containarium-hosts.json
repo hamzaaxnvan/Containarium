@@ -1,0 +1,98 @@
+{
+  "displayName": "Containarium backends",
+  "labels": {
+    "containarium": "true"
+  },
+  "mosaicLayout": {
+    "columns": 12,
+    "tiles": [
+      {
+        "yPos": 0, "xPos": 0, "width": 6, "height": 4,
+        "widget": {
+          "title": "Host CPU load (1m/5m/15m)",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.host.cpu.load_1m/gauge\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${resource.label.instance_id} load_1m"
+              },
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.host.cpu.load_5m/gauge\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${resource.label.instance_id} load_5m"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "yPos": 0, "xPos": 6, "width": 6, "height": 4,
+        "widget": {
+          "title": "Host memory used / total",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.host.memory.used_bytes/gauge\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${resource.label.instance_id} used"
+              },
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.host.memory.total_bytes/gauge\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${resource.label.instance_id} total"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "yPos": 4, "xPos": 0, "width": 6, "height": 4,
+        "widget": {
+          "title": "Host disk used / total",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.host.disk.used_bytes/gauge\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${resource.label.instance_id} used"
+              },
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.host.disk.total_bytes/gauge\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${resource.label.instance_id} total"
+              }
+            ]
+          }
+        }
+      },
