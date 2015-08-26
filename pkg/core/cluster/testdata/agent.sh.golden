@@ -1,0 +1,6 @@
+#!/bin/sh
+# containarium managed-cluster worker bootstrap (#1414).
+# The k3s binary and the join token are pre-pushed.
+set -eu
+
+chmod 0755 /usr/local/bin/k3s
