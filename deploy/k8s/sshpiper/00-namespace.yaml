@@ -1,0 +1,3 @@
+# The gateway namespace: sshpiper + its LoadBalancer Service live here, and the
+# daemon programs Pipe CRs (and references the upstream key Secret) here. Must
+# match the daemon's CONTAINARIUM_K8S_GATEWAY_NAMESPACE (default "agent-gateway").
