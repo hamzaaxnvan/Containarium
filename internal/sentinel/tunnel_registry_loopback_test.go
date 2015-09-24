@@ -22,3 +22,28 @@ func TestIsAlreadyExistsErr(t *testing.T) {
 			output: "Error: ipv4: Address already assigned.\nRTNETLINK answers: File exists\n",
 			want:   true,
 		},
+		// Live-confirmed production output (newer libnl-style iproute2) —
+		// this alone, with NO "File exists" substring anywhere, is what
+		// actually failed a real BYOC host's tunnel registration on every
+		// reconnect until this case was added.
+		{
+			name:   "standalone newer-iproute2 already-assigned output, no File exists substring",
+			output: "Error: ipv4: Address already assigned.\n",
+			want:   true,
+		},
+		{
+			name:   "empty output (e.g. success)",
+			output: "",
+			want:   false,
+		},
+		{
+			name:   "invalid address",
+			output: "Error: any valid prefix is expected rather than \"bogus\".\n",
+			want:   false,
+		},
+		{
+			name:   "missing interface",
+			output: "Cannot find device \"lo\"\n",
+			want:   false,
+		},
+		{
