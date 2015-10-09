@@ -296,3 +296,103 @@ func (s *TokensServer) GetUnscopedTokenReport(ctx context.Context, _ *pb.GetUnsc
 	if err := auth.RequireRoleOrScope(ctx, auth.RoleAdmin, auth.ScopeTokensRead); err != nil {
 		return nil, err
 	}
+
+	report := auth.UnscopedTokenCalls()
+	resp := &pb.GetUnscopedTokenReportResponse{
+		UnscopedCallCount: report.Count,
+		StrictModeEnabled: auth.StrictScopesEnabled(),
+	}
+	if !report.Since.IsZero() {
+		resp.Since = report.Since.UTC().Format(time.RFC3339)
+	}
+	return resp, nil
+}
+
+// ExchangeDelegatedToken mints a token acting FOR another subject, on the
+// authority of the caller's own credential (containarium-cloud#1427).
+//
+// A service that fronts this API for end users — the cloud control plane is
+// the case that motivated it — presents its own service credential on every
+// call. #1676 bounds an agent token by the caller's scopes, but when the
+// caller is a shared service account that bound means nothing, and #1678's
+// audit `actor` records the service rather than the person. `act` is a JWT
+// claim and never a header (#1677), so the fronting service cannot assert it:
+// it holds no signing key, and giving it one would let it mint any identity.
+// It asks this daemon to mint instead.
+//
+// Two invariants make that safe, and they are the same two RunAgentSkill's
+// own delegated mint relies on:
+//
+//   - Granted scopes are the INTERSECTION of the caller's with those
+//     requested. An exchange can never widen authority — without this the
+//     endpoint is exactly the escalation primitive #1676 closed, reopened
+//     under a new name.
+//   - `act` is built server-side from the authenticated caller, wrapping the
+//     caller's own chain, so the delegation path is recorded rather than
+//     claimed.
+func (s *TokensServer) ExchangeDelegatedToken(ctx context.Context, req *pb.ExchangeDelegatedTokenRequest) (*pb.ExchangeDelegatedTokenResponse, error) {
+	// tokens:delegate, not tokens:write — acting as another subject is a
+	// distinct capability from managing your own tokens.
+	if err := auth.RequireScope(ctx, auth.ScopeTokensDelegate); err != nil {
+		return nil, err
+	}
+
+	// A run token never delegates (#2069). The token minted below carries no
+	// run_id, and every run-token guard — #2060's lineage binding, #2112's
+	// taskRunID, the run_log claim check — applies only `if runID != ""`. A
+	// run-bound caller that got here would walk out of its own run with all
+	// of them shed at once.
+	//
+	// runForbiddenScopes already strips tokens:delegate when a run token is
+	// minted; this refusal is the same rule at the point of use, so a run
+	// token minted before that (still live until it expires) or by any
+	// future mint path that bypasses mintedAgentTokenScopes is caught too.
+	// Refusing, rather than copying the caller's run_id onto the new token,
+	// keeps this endpoint what it is: a fronting service acting for a user,
+	// which never happens from inside a run.
+	if runID, isRun := auth.RunIDFromGRPCContext(ctx); isRun {
+		return nil, status.Errorf(codes.PermissionDenied,
+			"run token (run_id %q) cannot exchange for a delegated token: the result would carry no run_id "+
+				"and so escape every run-scoped guard", runID)
+	}
+
+	// This endpoint FAILS CLOSED on an unscoped token, regardless of
+	// CONTAINARIUM_STRICT_SCOPES. Everywhere else a missing scopes claim is
+	// tolerated (#1679) so that tokens minted before scopes existed keep
+	// working; that tolerance is safe for a handler that merely reads or
+	// mutates, because the token's own authority still bounds the blast
+	// radius.
+	//
+	// It is NOT safe here. The ceiling below is the caller's scope set, and
+	// IntersectScopes treats a nil caller as unbounded — so an unscoped
+	// caller could ask for, and be granted, any scope in the system. That
+	// makes this endpoint the escalation primitive #1676 closed, reopened
+	// under a new name, with the fail-open as its trigger.
+	//
+	// The usual reason to fail open does not apply: this RPC is new, so
+	// there is no population of legacy callers to preserve. A fronting
+	// service must present a scoped credential — which is what
+	// containarium-cloud#1428 is separately doing to the cloud's own
+	// service token.
+	callerScopes, scopesPresent := auth.ScopesFromGRPCContext(ctx)
+	if !scopesPresent {
+		return nil, status.Error(codes.PermissionDenied,
+			"delegation requires a token carrying an explicit scopes claim: "+
+				"the granted set is bounded by the caller's own scopes, and an "+
+				"unscoped token has no bound to apply")
+	}
+
+	subject := strings.TrimSpace(req.GetSubject())
+	if subject == "" {
+		// An empty subject would mint an unattributed token — the exact
+		// state this endpoint exists to eliminate, so it is an error
+		// rather than a silent fallback to the caller's own identity.
+		return nil, status.Error(codes.InvalidArgument, "subject is required")
+	}
+
+	caller, callerRoles, ok := auth.SubjectFromGRPCContext(ctx)
+	if !ok || caller == "" {
+		return nil, status.Error(codes.Unauthenticated, "no authenticated subject in request context")
+	}
+
+	// The caller becomes the actor, wrapping whatever chain it already
