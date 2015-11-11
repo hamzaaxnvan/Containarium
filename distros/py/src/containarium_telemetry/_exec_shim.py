@@ -16,3 +16,21 @@ without us forking its argv parser.
 from __future__ import annotations
 
 import os
+import sys
+from typing import List, Optional
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv or argv[0] in ("-h", "--help"):
+        _print_help()
+        return 0 if argv else 2
+
+    if argv[0] in ("-V", "--version"):
+        from ._version import __version__
+
+        print(f"containarium-instrument {__version__}")
+        return 0
+
