@@ -67,3 +67,212 @@ func TestParseLabelFilter(t *testing.T) {
 			got := parseLabelFilter(tt.labelSlice)
 			if len(got) != len(tt.want) {
 				t.Errorf("parseLabelFilter() returned %d labels, want %d", len(got), len(tt.want))
+				return
+			}
+			for key, wantValue := range tt.want {
+				if gotValue, ok := got[key]; !ok {
+					t.Errorf("parseLabelFilter() missing label %q", key)
+				} else if gotValue != wantValue {
+					t.Errorf("parseLabelFilter() label %q = %q, want %q", key, gotValue, wantValue)
+				}
+			}
+		})
+	}
+}
+
+func TestFormatLabels(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   string
+	}{
+		{
+			name:   "nil labels",
+			labels: nil,
+			want:   "-",
+		},
+		{
+			name:   "empty labels",
+			labels: map[string]string{},
+			want:   "-",
+		},
+		{
+			name:   "single label",
+			labels: map[string]string{"team": "backend"},
+			want:   "team=backend",
+		},
+		// Note: multiple labels order is not guaranteed, so we only test single label for exact match
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatLabels(tt.labels)
+			if got != tt.want {
+				t.Errorf("formatLabels() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGroupContainersByLabel(t *testing.T) {
+	containers := []incus.ContainerInfo{
+		{
+			Name:   "alice-container",
+			State:  "Running",
+			Labels: map[string]string{"team": "backend", "env": "prod"},
+		},
+		{
+			Name:   "bob-container",
+			State:  "Running",
+			Labels: map[string]string{"team": "backend", "env": "staging"},
+		},
+		{
+			Name:   "charlie-container",
+			State:  "Stopped",
+			Labels: map[string]string{"team": "frontend", "env": "prod"},
+		},
+		{
+			Name:   "dave-container",
+			State:  "Running",
+			Labels: nil,
+		},
+		{
+			Name:   "eve-container",
+			State:  "Running",
+			Labels: map[string]string{"env": "dev"}, // no team label
+		},
+	}
+
+	tests := []struct {
+		name     string
+		labelKey string
+		wantKeys []string
+		wantLen  map[string]int
+	}{
+		{
+			name:     "group by team",
+			labelKey: "team",
+			wantKeys: []string{"backend", "frontend", "(no label)"},
+			wantLen: map[string]int{
+				"backend":    2,
+				"frontend":   1,
+				"(no label)": 2,
+			},
+		},
+		{
+			name:     "group by env",
+			labelKey: "env",
+			wantKeys: []string{"prod", "staging", "dev", "(no label)"},
+			wantLen: map[string]int{
+				"prod":       2,
+				"staging":    1,
+				"dev":        1,
+				"(no label)": 1,
+			},
+		},
+		{
+			name:     "group by non-existent label",
+			labelKey: "project",
+			wantKeys: []string{"(no label)"},
+			wantLen: map[string]int{
+				"(no label)": 5,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			groups := groupContainersByLabel(containers, tt.labelKey)
+
+			if len(groups) != len(tt.wantLen) {
+				t.Errorf("groupContainersByLabel() returned %d groups, want %d", len(groups), len(tt.wantLen))
+			}
+
+			for key, wantCount := range tt.wantLen {
+				if gotCount := len(groups[key]); gotCount != wantCount {
+					t.Errorf("group %q has %d containers, want %d", key, gotCount, wantCount)
+				}
+			}
+		})
+	}
+}
+
+func TestGetSortedGroupKeys(t *testing.T) {
+	tests := []struct {
+		name   string
+		groups map[string][]incus.ContainerInfo
+		want   []string
+	}{
+		{
+			name: "alphabetical with no-label at end",
+			groups: map[string][]incus.ContainerInfo{
+				"frontend":   {},
+				"backend":    {},
+				"(no label)": {},
+				"api":        {},
+			},
+			want: []string{"api", "backend", "frontend", "(no label)"},
+		},
+		{
+			name: "no-label only",
+			groups: map[string][]incus.ContainerInfo{
+				"(no label)": {},
+			},
+			want: []string{"(no label)"},
+		},
+		{
+			name: "all regular labels",
+			groups: map[string][]incus.ContainerInfo{
+				"c": {},
+				"a": {},
+				"b": {},
+			},
+			want: []string{"a", "b", "c"},
+		},
+		{
+			name:   "empty groups",
+			groups: map[string][]incus.ContainerInfo{},
+			want:   []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getSortedGroupKeys(tt.groups)
+
+			if len(got) != len(tt.want) {
+				t.Errorf("getSortedGroupKeys() returned %d keys, want %d", len(got), len(tt.want))
+				return
+			}
+
+			for i, wantKey := range tt.want {
+				if got[i] != wantKey {
+					t.Errorf("getSortedGroupKeys()[%d] = %q, want %q", i, got[i], wantKey)
+				}
+			}
+		})
+	}
+}
+
+func TestGroupedJSONOutput(t *testing.T) {
+	containers := []incus.ContainerInfo{
+		{
+			Name:      "alice-container",
+			State:     "Running",
+			IPAddress: "10.0.0.1",
+			Labels:    map[string]string{"team": "backend"},
+		},
+		{
+			Name:      "bob-container",
+			State:     "Stopped",
+			IPAddress: "10.0.0.2",
+			Labels:    map[string]string{"team": "frontend"},
+		},
+	}
+
+	groups := groupContainersByLabel(containers, "team")
+
+	// Verify the structure is JSON-serializable
+	output := map[string]interface{}{
+		"group_by":    "team",
+		"groups":      groups,
