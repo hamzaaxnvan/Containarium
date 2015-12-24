@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+import "google/api/annotations.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+// SSHAuthzService is the per-connection SSH authorization contract
+// (docs/architecture/ssh-live-authorization.md, component 1; #2516). The
+// sentinel's ssh-authz plugin asks the backend daemon, at connection time,
+// whether the credential offered may open a session as `login` on this
+// backend. The daemon answers from local state (self-host) or forwards to
+// the cloud over ActuationService.AuthorizeSSH, which reuses these same
+// messages so neither side translates.
+//
+// The REST route is mounted behind the sentinel request signature
+// (auth.SentinelVerifier), not a JWT: it is sentinel-to-daemon plumbing.
+service SSHAuthzService {
+  // Authorize decides whether the credential offered to the sentinel may
+  // open a session as `login` on this backend, right now.
+  //
+  // The request/response names follow the architecture doc, and the same
+  // messages back ActuationService.AuthorizeSSH on purpose (one message set
+  // for both hops), hence the lint exemptions.
+  rpc Authorize(AuthorizeSSHRequest) returns (AuthorizeSSHResponse) {
+    option (google.api.http) = {
+      post: "/v1/ssh/authorize"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Authorize SSH connection";
+      description: "Decide whether the credential offered to the sentinel may open a session as the given login on this backend. Sentinel-signed requests only.";
+      tags: "SSHAuthz";
+    };
+  }
