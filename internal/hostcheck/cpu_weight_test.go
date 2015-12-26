@@ -50,3 +50,29 @@ func TestPlatformCPUWeightCheck(t *testing.T) {
 			detail: []string{"could not determine", "incus.service"},
 		},
 	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			p, dir := tempPaths(t)
+			slice := filepath.Join(dir, "system.slice")
+			p.cgroupSystemSlice = slice
+			for rel, content := range tc.files {
+				write(t, filepath.Join(slice, rel), content)
+			}
+			c := platformCPUWeightCheck(p)
+			if c.OK != tc.wantOK {
+				t.Fatalf("OK = %v, want %v (detail: %s)", c.OK, tc.wantOK, c.Detail)
+			}
+			if c.Name != "platform daemons CPU weight" {
+				t.Errorf("name = %q", c.Name)
+			}
+			for _, d := range tc.detail {
+				if !strings.Contains(c.Detail, d) {
+					t.Errorf("detail lacks %q: %s", d, c.Detail)
+				}
+			}
+		})
+	}
+}
+
+// The check rides along in RunPosture — non-blocking like every posture
+// check — so `doctor`, `pool join` and the cloud probe all report it.
