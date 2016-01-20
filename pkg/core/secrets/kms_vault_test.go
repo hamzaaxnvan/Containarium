@@ -77,3 +77,161 @@ func (f *fakeVault) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"errors":["wrong op"]}`, http.StatusBadRequest)
 		return
 	}
+	body, _ := io.ReadAll(r.Body)
+	switch op {
+	case "encrypt":
+		var req struct {
+			Plaintext string `json:"plaintext"`
+		}
+		_ = json.Unmarshal(body, &req)
+		pt, err := base64.StdEncoding.DecodeString(req.Plaintext)
+		if err != nil {
+			http.Error(w, `{"errors":["bad plaintext b64"]}`, http.StatusBadRequest)
+			return
+		}
+		ct := f.symEncrypt(pt)
+		// vault:v1:<base64> shape — the fake encodes the
+		// AES-GCM output directly.
+		resp := map[string]any{
+			"data": map[string]string{
+				"ciphertext": "vault:v1:" + base64.StdEncoding.EncodeToString(ct),
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	case "decrypt":
+		var req struct {
+			Ciphertext string `json:"ciphertext"`
+		}
+		_ = json.Unmarshal(body, &req)
+		// Strip the vault:v<n>: prefix.
+		idx := strings.LastIndex(req.Ciphertext, ":")
+		if idx < 0 {
+			http.Error(w, `{"errors":["bad ciphertext shape"]}`, http.StatusBadRequest)
+			return
+		}
+		raw, err := base64.StdEncoding.DecodeString(req.Ciphertext[idx+1:])
+		if err != nil {
+			http.Error(w, `{"errors":["bad ciphertext b64"]}`, http.StatusBadRequest)
+			return
+		}
+		pt, err := f.symDecrypt(raw)
+		if err != nil {
+			http.Error(w, `{"errors":["bad ciphertext"]}`, http.StatusBadRequest)
+			return
+		}
+		resp := map[string]any{
+			"data": map[string]string{
+				"plaintext": base64.StdEncoding.EncodeToString(pt),
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	default:
+		http.Error(w, `{"errors":["unknown op"]}`, http.StatusBadRequest)
+	}
+}
+
+func (f *fakeVault) symEncrypt(pt []byte) []byte {
+	block, _ := aes.NewCipher(f.encryptKey)
+	gcm, _ := cipher.NewGCM(block)
+	nonce := make([]byte, gcm.NonceSize())
+	_, _ = io.ReadFull(rand.Reader, nonce)
+	return append(nonce, gcm.Seal(nil, nonce, pt, nil)...)
+}
+
+func (f *fakeVault) symDecrypt(blob []byte) ([]byte, error) {
+	block, _ := aes.NewCipher(f.encryptKey)
+	gcm, _ := cipher.NewGCM(block)
+	ns := gcm.NonceSize()
+	if len(blob) < ns {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return gcm.Open(nil, blob[:ns], blob[ns:], nil)
+}
+
+// --- Tests ---
+
+func TestVaultKMS_WrapUnwrapRoundtrip(t *testing.T) {
+	srv, _ := newFakeVault(t)
+	defer srv.Close()
+
+	k, err := NewVaultKMS(VaultConfig{
+		Address: srv.URL,
+		Token:   "root-token",
+		KeyName: "test-key",
+	})
+	if err != nil {
+		t.Fatalf("NewVaultKMS: %v", err)
+	}
+
+	dek, _ := NewDEK()
+	wrapped, kekID, err := k.Wrap(context.Background(), dek)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	if !strings.HasPrefix(kekID, "vault:") {
+		t.Fatalf("kek_id missing vault: prefix: %q", kekID)
+	}
+	if !bytes.HasPrefix(wrapped, []byte("vault:v")) {
+		t.Fatalf("wrapped DEK should be vault:v… shape; got %q", wrapped)
+	}
+
+	out, err := k.Unwrap(context.Background(), wrapped, kekID)
+	if err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if !bytes.Equal(out, dek) {
+		t.Fatal("round-trip altered DEK")
+	}
+}
+
+func TestVaultKMS_RejectsBadToken(t *testing.T) {
+	srv, _ := newFakeVault(t)
+	defer srv.Close()
+
+	k, _ := NewVaultKMS(VaultConfig{
+		Address: srv.URL,
+		Token:   "wrong-token",
+		KeyName: "test-key",
+	})
+
+	dek, _ := NewDEK()
+	_, _, err := k.Wrap(context.Background(), dek)
+	if err == nil {
+		t.Fatal("Wrap with wrong token should fail")
+	}
+	if !strings.Contains(err.Error(), "missing or invalid token") {
+		t.Fatalf("error should pass through Vault's message; got %v", err)
+	}
+}
+
+func TestVaultKMS_RejectsRowFromDifferentBackend(t *testing.T) {
+	srv, _ := newFakeVault(t)
+	defer srv.Close()
+
+	k, _ := NewVaultKMS(VaultConfig{
+		Address: srv.URL,
+		Token:   "root-token",
+		KeyName: "test-key",
+	})
+
+	// kek_id from a different backend (InProcKMS).
+	_, err := k.Unwrap(context.Background(), []byte("vault:v1:..."), "inproc:master")
+	if err == nil {
+		t.Fatal("VaultKMS must refuse non-vault: kek_id")
+	}
+}
+
+func TestVaultKMS_RejectsEmptyOrOversizedPlaintext(t *testing.T) {
+	srv, _ := newFakeVault(t)
+	defer srv.Close()
+	k, _ := NewVaultKMS(VaultConfig{
+		Address: srv.URL, Token: "root-token", KeyName: "k",
+	})
+
+	for _, badSize := range []int{0, MaxWrapPlaintext + 1} {
+		dek := make([]byte, badSize)
+		_, _, err := k.Wrap(context.Background(), dek)
+		if err == nil {
+			t.Fatalf("Wrap with plaintext size %d should fail", badSize)
+		}
+	}
