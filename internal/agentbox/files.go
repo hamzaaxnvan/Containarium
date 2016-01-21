@@ -192,3 +192,100 @@ func readFileTail(path string, info os.FileInfo, n int) (*mcp.CallToolResult, er
 	}
 	var b strings.Builder
 	byteCount := 0
+	truncated := false
+	for _, line := range ring {
+		if byteCount+len(line)+1 > readFileLimit {
+			truncated = true
+			break
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+		byteCount += len(line) + 1
+	}
+	body := fmt.Sprintf(
+		"path: %s\nsize: %d\nmode: tail\nlines_returned: %d\ntruncated: %v\n--- content ---\n%s",
+		path, info.Size(), len(ring), truncated, b.String(),
+	)
+	return mcp.NewToolResultText(body), nil
+}
+
+// ----- write_file ------------------------------------------------------
+
+func writeFileTool() mcp.Tool {
+	return mcp.NewTool(
+		"write_file",
+		mcp.WithDescription(
+			"Write a file atomically (write to temp then rename). Creates parent "+
+				"directories as needed. Mode defaults to 0644; pass an octal string "+
+				"like \"0755\" for executables.",
+		),
+		mcp.WithString("path",
+			mcp.Description("Path to write to. Parent dirs are created if missing."),
+			mcp.Required(),
+		),
+		mcp.WithString("content",
+			mcp.Description("File content as a string. Binary should be base64-encoded by the caller and decoded post-write via shell_exec — write_file does not interpret encoding."),
+			mcp.Required(),
+		),
+		mcp.WithString("mode",
+			mcp.Description("Octal file mode, e.g. \"0644\" (default) or \"0755\"."),
+			mcp.DefaultString("0644"),
+		),
+	)
+}
+
+func handleWriteFile(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	rawPath, ok := args["path"].(string)
+	if !ok || rawPath == "" {
+		return mcp.NewToolResultError("write_file: 'path' is required"), nil
+	}
+	path, err := validatePathCtx(ctx, rawPath)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("write_file: %v", err)), nil
+	}
+	content, ok := args["content"].(string)
+	if !ok {
+		return mcp.NewToolResultError("write_file: 'content' is required"), nil
+	}
+	modeStr, _ := args["mode"].(string)
+	if modeStr == "" {
+		modeStr = "0644"
+	}
+	mode, err := parseFileMode(modeStr)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("write_file: invalid mode %q: %v", modeStr, err)), nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("write_file: mkdir parent: %v", err)), nil
+	}
+
+	// Atomic write: temp + rename, so a half-written file never appears at
+	// the destination path even if the agent kills us mid-write.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".agent-box.*.tmp")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("write_file: temp create: %v", err)), nil
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpPath) }
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return mcp.NewToolResultError(fmt.Sprintf("write_file: write: %v", err)), nil
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return mcp.NewToolResultError(fmt.Sprintf("write_file: close: %v", err)), nil
+	}
+	if err := os.Chmod(tmpPath, mode); err != nil {
+		cleanup()
+		return mcp.NewToolResultError(fmt.Sprintf("write_file: chmod: %v", err)), nil
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		cleanup()
+		return mcp.NewToolResultError(fmt.Sprintf("write_file: rename: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf(
+		"path: %s\nbytes_written: %d\nmode: %s\n",

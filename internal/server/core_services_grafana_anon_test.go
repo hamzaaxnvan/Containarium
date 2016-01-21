@@ -101,3 +101,37 @@ func newFakeGrafanaBox(ini string, readErr error) *fakeGrafanaBox {
 		if f.readErr != nil {
 			return nil, f.readErr
 		}
+		if path != "/etc/grafana/grafana.ini" {
+			return nil, errors.New("unexpected path " + path)
+		}
+		return []byte(f.ini), nil
+	}
+	f.WriteFileFunc = func(_, path string, content []byte, _ string) error {
+		if path != "/etc/grafana/grafana.ini" {
+			return errors.New("unexpected write to " + path)
+		}
+		f.written = append(f.written, string(content))
+		return nil
+	}
+	f.ExecFunc = func(_ string, cmd []string) error {
+		f.execs = append(f.execs, cmd)
+		return nil
+	}
+	return f
+}
+
+func TestBackfillGrafanaAnonymous(t *testing.T) {
+	t.Run("live ini with anonymous on is rewritten and grafana restarted", func(t *testing.T) {
+		f := newFakeGrafanaBox(grafanaIniAnonOn, nil)
+		cs := NewCoreServices(f, CoreServicesConfig{})
+
+		cs.backfillGrafanaAnonymous()
+
+		if len(f.written) != 1 {
+			t.Fatalf("writes = %d, want 1", len(f.written))
+		}
+		if enabled, ok := grafanaAnonymousEnabled(f.written[0]); !ok || enabled {
+			t.Fatalf("written ini still allows anonymous:\n%s", f.written[0])
+		}
+		if !sawRestart(f.execs) {
+			t.Fatalf("grafana was not restarted after the ini change; execs = %v", f.execs)
