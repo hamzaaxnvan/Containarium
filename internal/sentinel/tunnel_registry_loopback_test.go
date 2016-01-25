@@ -35,15 +35,3 @@ func TestIsAlreadyExistsErr(t *testing.T) {
 			name:   "empty output (e.g. success)",
 			output: "",
 			want:   false,
-		},
-		{
-			name:   "invalid address",
-			output: "Error: any valid prefix is expected rather than \"bogus\".\n",
-			want:   false,
-		},
-		{
-			name:   "missing interface",
-			output: "Cannot find device \"lo\"\n",
-			want:   false,
-		},
-		{
