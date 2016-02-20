@@ -24,3 +24,12 @@ func MintDriverToken(secretFile string, ttl time.Duration) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read jwt secret %s: %w", secretFile, err)
 	}
+	secret := strings.TrimSpace(string(secretBytes))
+	if secret == "" {
+		return "", fmt.Errorf("jwt secret %s is empty", secretFile)
+	}
+	tm, err := auth.NewTokenManager(secret, "containarium")
+	if err != nil {
+		return "", fmt.Errorf("token manager: %w", err)
+	}
+	// #1679 — explicit wildcard scope: this token drives the daemon through
