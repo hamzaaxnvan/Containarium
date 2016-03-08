@@ -16,3 +16,9 @@ import "testing"
 // change with unrelated edits elsewhere in the package (as it did here:
 // adding one new, unrelated top-level command flipped
 // TestMovedServerCommands_ExitTwoNamingContainariumd from a coincidental
+// pass to a deterministic fail). No build tag — this runs against
+// whichever command tree the current build produces, client or server.
+func TestNoDuplicateTopLevelCommandNames(t *testing.T) {
+	seen := map[string]bool{}
+	for _, c := range rootCmd.Commands() {
+		name := c.Name()
