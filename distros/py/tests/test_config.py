@@ -34,15 +34,3 @@ def test_from_env_populated():
     assert cfg.protocol == "http/protobuf"
     assert cfg.container_id == "alice-container"
     assert cfg.backend_id == "node-7"
-    assert cfg.tenant_id == "alice"
-    assert cfg.service_version == "v1.2.3"
-
-
-def test_empty_string_is_treated_as_unset():
-    # Compose interpolation can produce empty strings when the source
-    # env is unset (`${SERVICE_VERSION:-}`). Empty == not set, so the
-    # downstream resource attrs don't stamp `service.version=""`.
-    env = {
-        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318",
-        "SERVICE_VERSION": "",
-    }
