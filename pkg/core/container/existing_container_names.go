@@ -33,3 +33,20 @@ type containerNameCache struct {
 //
 // On a refresh failure, the last good snapshot is served instead of the
 // error — matching ContainerExists' own per-container semantics, where one
+// backend's live-call failure only ever affected that one container's
+// answer, never every other container's. Only the very first call (nothing
+// cached yet) has no snapshot to fall back to and returns the error; callers
+// should treat that case the same way a nil orphan filter is already treated
+// elsewhere (i.e., don't filter, rather than drop every tenant on one
+// transient Incus hiccup — a batched check's blast radius on failure is the
+// whole fleet, not one tenant, so failing this open is the safer default).
+func (m *Manager) ExistingContainerNames() (map[string]bool, error) {
+	m.nameCache.mu.Lock()
+	defer m.nameCache.mu.Unlock()
+
+	ttl := m.nameCacheTTL
+	if ttl <= 0 {
+		ttl = existingContainerNamesCacheTTL
+	}
+	if m.nameCache.names != nil && time.Since(m.nameCache.fetchedAt) < ttl {
+		return m.nameCache.names, nil
