@@ -1,0 +1,9 @@
+1:"$Sreact.fragment"
+2:I[39756,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"default"]
+3:I[37457,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"default"]
+4:I[47257,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"ClientPageRoot"]
+5:I[38999,["/webui/_next/static/chunks/255a674474c1388a.js","/webui/_next/static/chunks/f408b3f266bc0ba1.js"],"default"]
+8:I[97367,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"OutletBoundary"]
+9:"$Sreact.suspense"
+b:I[97367,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"ViewportBoundary"]
+d:I[97367,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"MetadataBoundary"]
