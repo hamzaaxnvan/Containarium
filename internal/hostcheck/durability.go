@@ -47,28 +47,3 @@ func isOwnMount(procMountsPath, target string) (bool, error) {
 	if mountPoint == "" {
 		// No real device covers the path at all. Not durable, and not an
 		// error: an overlay-only or wholly pseudo-filesystem root is a
-		// legitimate host shape, just not a durable one.
-		return false, nil
-	}
-	return filepath.Clean(mountPoint) == target, nil
-}
-
-// recoveryConfigDurableCheck reports whether the recovery config's
-// directory is on storage that survives instance recreation.
-//
-// Surfaced through `containarium doctor` rather than left as a log line,
-// because the failure is silent by construction: the write succeeds, the
-// file looks current, and the problem is discovered during an actual
-// recovery — the worst possible moment (#1154).
-func recoveryConfigDurableCheck(p posturePaths) Check {
-	c := Check{Name: "recovery config on durable storage"}
-
-	dir := p.recoveryDir
-	if dir == "" {
-		dir = DefaultRecoveryDir
-	}
-
-	if _, err := os.Stat(dir); err != nil {
-		if os.IsNotExist(err) {
-			// No persistent storage provisioned. Reported as not-OK
-			// rather than OK: this host writes no recovery config at
