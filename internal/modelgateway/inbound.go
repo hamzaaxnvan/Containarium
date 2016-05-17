@@ -126,3 +126,390 @@ type InboundStatus struct {
 	// UpstreamErrors counts non-2xx responses with an unrecognised content
 	// type (a rate limit, a load-balancer page) passed through unchanged.
 	// They are not model output and are not counted as blocks.
+	UpstreamErrors uint64 `json:"upstream_errors"`
+	// HoldSeconds and HoldBytes are histograms over every held response:
+	// how long the gateway waited for the upstream to finish, and how much
+	// it held. Compare them with the ceilings in the design doc before
+	// turning a BLOCK rule on.
+	HoldSeconds Histogram `json:"hold_seconds"`
+	HoldBytes   Histogram `json:"hold_bytes"`
+	// PolicyReads counts reads of the policy provider, to show the cache.
+	PolicyReads   uint64            `json:"policy_reads"`
+	Blocked       map[string]uint64 `json:"blocked"`         // by reason
+	BlockedByKind map[string]uint64 `json:"blocked_by_kind"` // by finding kind
+	// BaselineDetections counts baseline rule matches by rule id while no
+	// admin policy exists (#2736); BaselineUnscanned counts responses the
+	// baseline could not scan (over the buffer limit, or encoded). Log-only:
+	// neither ever blocks.
+	BaselineDetections map[string]uint64 `json:"baseline_detections"`
+	BaselineUnscanned  uint64            `json:"baseline_unscanned"`
+	// BaselineMode is the last known stored baseline mode, "log" or "block"
+	// (#2738). It applies only while no admin policy is configured; in
+	// "block" a detection blocks and is counted under Blocked as well.
+	BaselineMode string `json:"baseline_mode"`
+}
+
+// inboundMode is what one request runs under, resolved from the policy.
+type inboundMode struct {
+	scan bool
+	// baseline is set when the store answered "not configured". In LOG mode
+	// the response is teed to the client and scanned at its end (#2736); with
+	// baselineBlock (BLOCK mode, #2738) scan is set too, and the response
+	// takes the hold-and-block path, scanned with the baseline rules.
+	baseline      bool
+	baselineBlock bool
+	kinds         []pb.GuardrailKind // inbound kinds with a BLOCK rule
+	policy        *pb.GuardrailPolicy
+	revision      int64
+}
+
+func modeOf(p *pb.ServerGuardrailPolicy, bm pb.GuardrailBaselineMode) inboundMode {
+	m := inboundMode{policy: p.GetPolicy(), revision: p.GetRevision(), kinds: guardrail.InboundBlockKinds(p)}
+	m.scan = len(m.kinds) > 0
+	// Callers only reach here with a nil policy after a read answered
+	// ErrNotConfigured; a wired-but-unread or absent provider never does.
+	m.baseline = p == nil
+	if m.baseline && bm == pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_BLOCK {
+		m.baselineBlock, m.scan = true, true
+	}
+	return m
+}
+
+// inbound is the gateway's inbound-scan state: the policy source, the last
+// known policy, and the block counters.
+type inbound struct {
+	provider guardrailpolicy.PolicyProvider
+	engine   guardrail.Engine
+	audit    InboundAuditSink
+	limit    int
+	timeout  time.Duration
+	logger   *log.Logger
+
+	// auditQ feeds the single audit worker, started on first use. nil when
+	// there is no sink.
+	auditQ       chan auditJob
+	auditTimeout time.Duration
+	auditOnce    sync.Once
+
+	// upstreamErrors counts non-2xx responses with an unrecognised content
+	// type passed through unscanned (#2453). Kept apart from the block counters.
+	upstreamErrors atomic.Uint64
+
+	holdSeconds *histogram
+	holdBytes   *histogram
+
+	// baselineModes is the stored baseline mode (#2738); nil reads as LOG.
+	baselineModes     guardrailpolicy.BaselineModeProvider
+	baselineUnscanned atomic.Uint64
+
+	// Policy read cache (#2454). fetchMu serialises refreshes so concurrent
+	// calls share one read; mu guards the fields below it.
+	ttl         time.Duration
+	fetchMu     sync.Mutex
+	fetchedAt   time.Time
+	policyReads atomic.Uint64
+
+	mu sync.Mutex
+	// gen counts invalidations. A read that started before one may still
+	// update the last known state, but it does not mark the cache fresh,
+	// so a switch committed during that read applies on the next call.
+	gen           uint64
+	auditDropped  uint64
+	auditFailed   uint64
+	loaded        bool                      // a read has succeeded (policy or ErrNotConfigured)
+	policy        *pb.ServerGuardrailPolicy // last known; nil = not configured
+	baselineMode  pb.GuardrailBaselineMode  // last known; read only while not configured
+	blocked       map[guardrail.InboundReason]uint64
+	blockedByKind map[pb.GuardrailKind]uint64
+	baselineHits  map[guardrail.BaselineRuleID]uint64
+}
+
+func newInbound(cfg Config) *inbound {
+	in := &inbound{
+		provider: cfg.InboundPolicy, engine: cfg.InboundEngine, audit: cfg.InboundAudit,
+		limit: cfg.InboundHoldLimit, timeout: cfg.InboundScanTimeout, logger: cfg.Logger,
+		blocked: map[guardrail.InboundReason]uint64{}, blockedByKind: map[pb.GuardrailKind]uint64{},
+		holdSeconds: newHistogram(holdSecondsBounds), holdBytes: newHistogram(holdBytesBounds),
+		ttl: cfg.InboundPolicyTTL, baselineModes: cfg.InboundBaselineMode,
+		baselineMode: pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_LOG,
+		baselineHits: map[guardrail.BaselineRuleID]uint64{},
+	}
+	if in.ttl == 0 {
+		in.ttl = DefaultInboundPolicyTTL
+	}
+	if cfg.InboundAudit != nil {
+		q := cfg.InboundAuditQueue
+		if q <= 0 {
+			q = DefaultInboundAuditQueue
+		}
+		in.auditQ = make(chan auditJob, q)
+		in.auditTimeout = cfg.InboundAuditTimeout
+		if in.auditTimeout <= 0 {
+			in.auditTimeout = DefaultInboundAuditTimeout
+		}
+	}
+	if in.limit <= 0 {
+		in.limit = DefaultInboundHoldLimit
+	}
+	if in.timeout <= 0 {
+		in.timeout = DefaultInboundScanTimeout
+	}
+	switch {
+	case in.provider == nil:
+		in.logger.Printf("model-gateway: inbound guardrail scan unavailable: no policy provider wired; model traffic through this gateway is unscanned (UNSCANNED_NO_POLICY)")
+	case in.engine == nil:
+		in.logger.Printf("model-gateway: inbound guardrail scan: policy provider wired but no engine; an inbound BLOCK rule will block every response (engine_error)")
+	default:
+		in.logger.Printf("model-gateway: inbound guardrail scan: enforced once the server policy carries an inbound BLOCK rule; hold limit %d bytes", in.limit)
+	}
+	return in
+}
+
+// ready is false only on cold start: a provider is wired and has never
+// answered, so the gateway cannot know whether any tenant has an active
+// rule. The health check attempts the read itself, so readiness turns on
+// as soon as the store answers, not on the next model call.
+func (in *inbound) ready(ctx context.Context) bool {
+	if in.provider == nil {
+		return true
+	}
+	in.mu.Lock()
+	loaded := in.loaded
+	in.mu.Unlock()
+	if loaded {
+		return true
+	}
+	_, ok := in.resolve(ctx)
+	return ok
+}
+
+// resolve reads the policy for one request. ok=false means the policy is
+// unavailable and the call must be refused: cold start, or a read error
+// while the last known policy had an active rule. A read error never turns
+// an active policy off, and ErrNotConfigured is the only "no policy".
+func (in *inbound) resolve(ctx context.Context) (mode inboundMode, ok bool) {
+	if in.provider == nil {
+		return inboundMode{}, true
+	}
+	if m, fresh := in.cached(); fresh {
+		return m, true
+	}
+	// One refresh at a time: callers that queue behind it find the result
+	// fresh and share it instead of each reading the store.
+	in.fetchMu.Lock()
+	defer in.fetchMu.Unlock()
+	if m, fresh := in.cached(); fresh {
+		return m, true
+	}
+	in.policyReads.Add(1)
+	in.mu.Lock()
+	gen := in.gen
+	in.mu.Unlock()
+	p, err := in.provider.Get(ctx)
+	// The baseline mode matters only while no policy is configured. A failed
+	// mode read is handled like a failed policy read: the last known state
+	// decides, so it never loosens a BLOCK mode (#2738).
+	notConfigured := errors.Is(err, guardrailpolicy.ErrNotConfigured)
+	bm := pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_LOG
+	if notConfigured {
+		bm, err = in.readBaselineMode(ctx)
+	}
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	switch {
+	case err == nil && !notConfigured:
+		in.loaded, in.policy = true, p
+		in.markFresh(gen)
+	case err == nil:
+		in.loaded, in.policy, in.baselineMode = true, nil, bm
+		in.markFresh(gen)
+	default:
+		// fetchedAt is untouched, so the next call reads again.
+		in.logger.Printf("model-gateway: inbound guardrail policy read failed (last known revision kept): %v", err)
+		if !in.loaded {
+			return inboundMode{}, false
+		}
+		m := modeOf(in.policy, in.baselineMode)
+		return m, !m.scan
+	}
+	return modeOf(in.policy, in.baselineMode), true
+}
+
+// readBaselineMode reads the stored baseline mode; no provider is LOG. A
+// mode other than LOG or BLOCK is an error, never a silent default.
+func (in *inbound) readBaselineMode(ctx context.Context) (pb.GuardrailBaselineMode, error) {
+	if in.baselineModes == nil {
+		return pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_LOG, nil
+	}
+	s, err := in.baselineModes.GetBaselineMode(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("baseline mode: %w", err)
+	}
+	if !guardrailpolicy.ValidBaselineMode(s.GetMode()) {
+		return 0, fmt.Errorf("baseline mode: stored mode %v is not LOG or BLOCK", s.GetMode())
+	}
+	return s.GetMode(), nil
+}
+
+// cached returns the mode from the last successful read while it is within
+// the TTL. A TTL below zero disables the cache.
+func (in *inbound) cached() (inboundMode, bool) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if in.ttl < 0 || !in.loaded || in.fetchedAt.IsZero() || time.Since(in.fetchedAt) >= in.ttl {
+		return inboundMode{}, false
+	}
+	return modeOf(in.policy, in.baselineMode), true
+}
+
+// invalidate forgets the cached read so the next call goes to the store. The
+// last known policy is kept: a failing read still falls back to it.
+func (in *inbound) invalidate() {
+	in.mu.Lock()
+	in.fetchedAt = time.Time{}
+	in.gen++
+	in.mu.Unlock()
+}
+
+// markFresh starts the cache TTL for a read that began at generation gen,
+// unless an invalidation happened since. Called with mu held.
+func (in *inbound) markFresh(gen uint64) {
+	if in.gen == gen {
+		in.fetchedAt = time.Now()
+	}
+}
+
+func (in *inbound) status() InboundStatus {
+	st := InboundStatus{PolicySource: in.provider != nil, Blocked: map[string]uint64{}, BlockedByKind: map[string]uint64{}, BaselineDetections: map[string]uint64{}}
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	st.Ready = in.provider == nil || in.loaded
+	m := modeOf(in.policy, in.baselineMode)
+	st.Scanning, st.PolicyRevision = m.scan, m.revision
+	st.BaselineMode = strings.ToLower(strings.TrimPrefix(in.baselineMode.String(), "GUARDRAIL_BASELINE_MODE_"))
+	st.AuditDropped, st.AuditFailed = in.auditDropped, in.auditFailed
+	st.UpstreamErrors = in.upstreamErrors.Load()
+	st.HoldSeconds, st.HoldBytes = in.holdSeconds.snapshot(), in.holdBytes.snapshot()
+	st.PolicyReads = in.policyReads.Load()
+	if in.auditQ != nil {
+		st.AuditQueued = len(in.auditQ)
+	}
+	for r, n := range in.blocked {
+		st.Blocked[r.String()] = n
+	}
+	for k, n := range in.blockedByKind {
+		st.BlockedByKind[kindName(k)] = n
+	}
+	for id, n := range in.baselineHits {
+		st.BaselineDetections[string(id)] = n
+	}
+	st.BaselineUnscanned = in.baselineUnscanned.Load()
+	return st
+}
+
+// inboundSubject is who a block is attributed to.
+type inboundSubject struct {
+	tenant, skill, provider, model string
+}
+
+// block records one block: log line, counters, and a queued audit entry. It
+// returns the typed error the response is replaced with. The audit write
+// happens off the request path and failing is logged and counted, never a
+// reason to let the response through or to delay it.
+func (in *inbound) block(sub inboundSubject, dec guardrail.InboundDecision, revision int64) *inboundBlockError {
+	in.logger.Printf("model-gateway: INBOUND-BLOCK tenant=%s skill=%s provider=%s model=%s reason=%s kinds=%v findings=%d gaps=%d engine=%q revision=%d",
+		sub.tenant, sub.skill, sub.provider, sub.model, dec.Reason, kindNames(dec.Kinds), dec.Findings, dec.Gaps, dec.EngineID, revision)
+	in.mu.Lock()
+	in.blocked[dec.Reason]++
+	for _, k := range dec.Kinds {
+		in.blockedByKind[k]++
+	}
+	in.mu.Unlock()
+	in.enqueueAudit(auditJob{b: &InboundBlock{
+		Tenant: sub.tenant, SkillID: sub.skill, Provider: sub.provider, Model: sub.model,
+		Reason: dec.Reason, Kinds: dec.Kinds, Findings: dec.Findings, EngineID: dec.EngineID, PolicyRevision: revision,
+	}})
+	return &inboundBlockError{dec: dec}
+}
+
+// auditJob is one queued audit entry (a block or a baseline detection), or
+// (done != nil) a flush marker.
+type auditJob struct {
+	b    *InboundBlock
+	d    *InboundDetection
+	done chan struct{}
+}
+
+// enqueueAudit hands an audit entry to the worker without ever
+// waiting: the request path must not depend on the audit store, whose outage
+// is also the likeliest reason for the policy-unavailable refusals this runs
+// for. A full queue drops the entry and counts it.
+func (in *inbound) enqueueAudit(job auditJob) {
+	if in.audit == nil {
+		return
+	}
+	in.startAuditWorker()
+	select {
+	case in.auditQ <- job:
+	default:
+		in.mu.Lock()
+		in.auditDropped++
+		n := in.auditDropped
+		in.mu.Unlock()
+		// First drop and every thousandth: an outage must not also flood the log.
+		if n%1000 == 1 {
+			in.logger.Printf("model-gateway: inbound audit queue full; entry dropped (%d dropped so far); a blocked response stays blocked", n)
+		}
+	}
+}
+
+func (in *inbound) startAuditWorker() {
+	in.auditOnce.Do(func() { go in.auditWorker() })
+}
+
+// auditWorker delivers queued entries one at a time, each under its own
+// short timeout. It runs for the life of the process.
+func (in *inbound) auditWorker() {
+	for job := range in.auditQ {
+		if job.done != nil {
+			close(job.done)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), in.auditTimeout)
+		var err error
+		if job.d != nil {
+			err = in.audit.RecordInboundDetection(ctx, *job.d)
+		} else {
+			err = in.audit.RecordInboundBlock(ctx, *job.b)
+		}
+		cancel()
+		if err != nil {
+			in.mu.Lock()
+			in.auditFailed++
+			in.mu.Unlock()
+			in.logger.Printf("model-gateway: inbound audit write failed (a blocked response stays blocked): %v", err)
+		}
+	}
+}
+
+// flushAudit waits until every entry queued before the call has been handed
+// to the sink (delivered, failed or timed out), or ctx ends. For a clean
+// daemon shutdown and for tests; the request path never calls it.
+func (in *inbound) flushAudit(ctx context.Context) error {
+	if in.audit == nil {
+		return nil
+	}
+	in.startAuditWorker()
+	done := make(chan struct{})
+	select {
+	case in.auditQ <- auditJob{done: done}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
