@@ -1,0 +1,236 @@
+//go:build !containarium_client
+
+package cluster
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Store is the persistence contract for managed clusters. Two
+// implementations exist — MemStore (daemon-without-Postgres degrade
+// path + unit tests) and PGStore — held to the same behavior by the
+// integration test suite (house rule from #1300: the contract is
+// stated once, against both).
+type Store interface {
+	Create(ctx context.Context, c *Cluster) error
+	Get(ctx context.Context, owner, name string) (*Cluster, error)
+	// List returns clusters for one owner, or every cluster when
+	// owner is empty, ordered by (owner, name).
+	List(ctx context.Context, owner string) ([]*Cluster, error)
+	SetState(ctx context.Context, owner, name string, st State, reason string) error
+	SetEndpoint(ctx context.Context, owner, name, endpoint string) error
+	UpdateNodeGroups(ctx context.Context, owner, name string, groups []NodeGroup) error
+	// SetNodeGroupTarget updates exactly one group's TargetNodes,
+	// atomically with respect to a concurrent call for a DIFFERENT
+	// group on the same cluster (#1882). UpdateNodeGroups' full-array
+	// replace is the wrong tool for this: the CA-provider handler for
+	// one group and the handler for a sibling group can each read a
+	// stale copy of the whole NodeGroups array before either writes,
+	// and whichever writes last overwrites the other's already-
+	// committed target with its own stale copy of it — observed live
+	// as the reconciler recreating a node the autoscaler had, only
+	// seconds earlier, correctly scaled to zero and deleted. Returns
+	// ErrNotFound if the cluster doesn't exist; a group name absent
+	// from the cluster's groups is a silent no-op (nothing to update),
+	// matching UpdateNodeGroups' own leniency.
+	SetNodeGroupTarget(ctx context.Context, owner, name, group string, target int32) error
+	// Delete removes the cluster and (transitively) its nodes and
+	// events — the "re-created cluster starts empty" guarantee.
+	Delete(ctx context.Context, owner, name string) error
+	UpsertNode(ctx context.Context, n *Node) error
+	ListNodes(ctx context.Context, owner, name string) ([]*Node, error)
+	// DeleteNode is scoped to (owner, cluster): a VM name is only
+	// deletable through its own cluster, so a caller holding a
+	// constructible cross-tenant VM name cannot remove another
+	// tenant's node row.
+	DeleteNode(ctx context.Context, owner, name, vmName string) error
+	AppendEvent(ctx context.Context, owner, name string, e Event) error
+	// ListEvents returns the newest events first, at most limit
+	// (limit <= 0 = all).
+	ListEvents(ctx context.Context, owner, name string, limit int) ([]Event, error)
+	Close()
+}
+
+// PGStore is the Postgres-backed Store.
+type PGStore struct {
+	pool *pgxpool.Pool
+}
+
+// NewPGStore initializes the schema on a shared pool (house pattern:
+// idempotent DDL in the constructor; the pool is owned by the caller).
+func NewPGStore(ctx context.Context, pool *pgxpool.Pool) (*PGStore, error) {
+	s := &PGStore{pool: pool}
+	if err := s.initSchema(ctx); err != nil {
+		return nil, fmt.Errorf("init k8s cluster schema: %w", err)
+	}
+	return s, nil
+}
+
+func (s *PGStore) initSchema(ctx context.Context) error {
+	schema := `
+		CREATE TABLE IF NOT EXISTS k8s_clusters (
+			id UUID PRIMARY KEY,
+			owner TEXT NOT NULL,
+			name TEXT NOT NULL,
+			state TEXT NOT NULL,
+			state_reason TEXT NOT NULL DEFAULT '',
+			k3s_version TEXT NOT NULL DEFAULT '',
+			api_endpoint TEXT NOT NULL DEFAULT '',
+			node_groups JSONB NOT NULL,
+			node_isolation TEXT NOT NULL DEFAULT 'vm',
+			created_at TIMESTAMPTZ NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			UNIQUE(owner, name)
+		);
+		CREATE INDEX IF NOT EXISTS idx_k8s_clusters_owner ON k8s_clusters(owner);
+		-- #1428: clusters recorded before the isolation class existed
+		-- were all VMs; the DEFAULT states that for the existing rows
+		-- rather than leaving their boundary unknown.
+		ALTER TABLE k8s_clusters ADD COLUMN IF NOT EXISTS node_isolation TEXT NOT NULL DEFAULT 'vm';
+
+		CREATE TABLE IF NOT EXISTS k8s_cluster_nodes (
+			vm_name TEXT PRIMARY KEY,
+			cluster_id UUID NOT NULL REFERENCES k8s_clusters(id) ON DELETE CASCADE,
+			role TEXT NOT NULL,
+			node_group TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_k8s_cluster_nodes_cluster ON k8s_cluster_nodes(cluster_id);
+
+		CREATE TABLE IF NOT EXISTS k8s_cluster_events (
+			id BIGSERIAL PRIMARY KEY,
+			cluster_id UUID NOT NULL REFERENCES k8s_clusters(id) ON DELETE CASCADE,
+			at TIMESTAMPTZ NOT NULL,
+			kind TEXT NOT NULL,
+			node_group TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT ''
+		);
+		CREATE INDEX IF NOT EXISTS idx_k8s_cluster_events_cluster ON k8s_cluster_events(cluster_id, id DESC);
+	`
+	_, err := s.pool.Exec(ctx, schema)
+	return err
+}
+
+func (s *PGStore) clusterID(ctx context.Context, owner, name string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM k8s_clusters WHERE owner = $1 AND name = $2`, owner, name).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return id, err
+}
+
+func (s *PGStore) Create(ctx context.Context, c *Cluster) error {
+	groups, err := json.Marshal(c.NodeGroups)
+	if err != nil {
+		return fmt.Errorf("marshal node groups: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO k8s_clusters (id, owner, name, state, state_reason, k3s_version, api_endpoint, node_groups, node_isolation, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		c.ID, c.Owner, c.Name, string(c.State), c.StateReason, c.K3sVersion, c.APIEndpoint, groups,
+		string(c.NodeIsolation.OrDefault()), c.CreatedAt, c.UpdatedAt)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+		return ErrAlreadyExists
+	}
+	return err
+}
+
+func scanCluster(row pgx.Row) (*Cluster, error) {
+	var c Cluster
+	var state, isolation string
+	var groups []byte
+	err := row.Scan(&c.ID, &c.Owner, &c.Name, &state, &c.StateReason, &c.K3sVersion, &c.APIEndpoint, &groups, &isolation, &c.CreatedAt, &c.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.State = State(state)
+	c.NodeIsolation = Isolation(isolation).OrDefault()
+	if err := json.Unmarshal(groups, &c.NodeGroups); err != nil {
+		return nil, fmt.Errorf("unmarshal node groups: %w", err)
+	}
+	return &c, nil
+}
+
+const clusterCols = `id, owner, name, state, state_reason, k3s_version, api_endpoint, node_groups, node_isolation, created_at, updated_at`
+
+func (s *PGStore) Get(ctx context.Context, owner, name string) (*Cluster, error) {
+	return scanCluster(s.pool.QueryRow(ctx,
+		`SELECT `+clusterCols+` FROM k8s_clusters WHERE owner = $1 AND name = $2`, owner, name))
+}
+
+func (s *PGStore) List(ctx context.Context, owner string) ([]*Cluster, error) {
+	query := `SELECT ` + clusterCols + ` FROM k8s_clusters ORDER BY owner, name`
+	args := []any{}
+	if owner != "" {
+		query = `SELECT ` + clusterCols + ` FROM k8s_clusters WHERE owner = $1 ORDER BY owner, name`
+		args = append(args, owner)
+	}
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Cluster
+	for rows.Next() {
+		c, err := scanCluster(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *PGStore) exec1(ctx context.Context, query string, args ...any) error {
+	tag, err := s.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PGStore) SetState(ctx context.Context, owner, name string, st State, reason string) error {
+	return s.exec1(ctx,
+		`UPDATE k8s_clusters SET state = $3, state_reason = $4, updated_at = $5 WHERE owner = $1 AND name = $2`,
+		owner, name, string(st), reason, time.Now().UTC())
+}
+
+func (s *PGStore) SetEndpoint(ctx context.Context, owner, name, endpoint string) error {
+	return s.exec1(ctx,
+		`UPDATE k8s_clusters SET api_endpoint = $3, updated_at = $4 WHERE owner = $1 AND name = $2`,
+		owner, name, endpoint, time.Now().UTC())
+}
+
+func (s *PGStore) UpdateNodeGroups(ctx context.Context, owner, name string, groups []NodeGroup) error {
+	data, err := json.Marshal(groups)
+	if err != nil {
+		return fmt.Errorf("marshal node groups: %w", err)
+	}
+	return s.exec1(ctx,
+		`UPDATE k8s_clusters SET node_groups = $3, updated_at = $4 WHERE owner = $1 AND name = $2`,
+		owner, name, data, time.Now().UTC())
+}
+
+// SetNodeGroupTarget rewrites node_groups server-side: every element
+// keeps its position and every field except the named group's
+// target_nodes, computed by Postgres FROM THE ROW AS IT STANDS AT
+// UPDATE TIME. Two concurrent calls for different groups therefore
+// serialize on Postgres' normal per-row locking and each transforms
