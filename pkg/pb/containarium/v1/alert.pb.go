@@ -793,3 +793,400 @@ func (x *GetAlertingInfoResponse) ProtoReflect() protoreflect.Message {
 	}
 	return mi.MessageOf(x)
 }
+
+// Deprecated: Use GetAlertingInfoResponse.ProtoReflect.Descriptor instead.
+func (*GetAlertingInfoResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *GetAlertingInfoResponse) GetEnabled() bool {
+	if x != nil {
+		return x.Enabled
+	}
+	return false
+}
+
+func (x *GetAlertingInfoResponse) GetVmalertStatus() string {
+	if x != nil {
+		return x.VmalertStatus
+	}
+	return ""
+}
+
+func (x *GetAlertingInfoResponse) GetAlertmanagerStatus() string {
+	if x != nil {
+		return x.AlertmanagerStatus
+	}
+	return ""
+}
+
+func (x *GetAlertingInfoResponse) GetWebhookUrl() string {
+	if x != nil {
+		return x.WebhookUrl
+	}
+	return ""
+}
+
+func (x *GetAlertingInfoResponse) GetTotalRules() int32 {
+	if x != nil {
+		return x.TotalRules
+	}
+	return 0
+}
+
+func (x *GetAlertingInfoResponse) GetCustomRules() int32 {
+	if x != nil {
+		return x.CustomRules
+	}
+	return 0
+}
+
+func (x *GetAlertingInfoResponse) GetWebhookSecretConfigured() bool {
+	if x != nil {
+		return x.WebhookSecretConfigured
+	}
+	return false
+}
+
+// ListDefaultAlertRulesRequest lists the built-in default alert rules
+type ListDefaultAlertRulesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListDefaultAlertRulesRequest) Reset() {
+	*x = ListDefaultAlertRulesRequest{}
+	mi := &file_containarium_v1_alert_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListDefaultAlertRulesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListDefaultAlertRulesRequest) ProtoMessage() {}
+
+func (x *ListDefaultAlertRulesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_alert_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListDefaultAlertRulesRequest.ProtoReflect.Descriptor instead.
+func (*ListDefaultAlertRulesRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{13}
+}
+
+// ListDefaultAlertRulesResponse returns the built-in default alert rules
+type ListDefaultAlertRulesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Rules         []*AlertRule           `protobuf:"bytes,1,rep,name=rules,proto3" json:"rules,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListDefaultAlertRulesResponse) Reset() {
+	*x = ListDefaultAlertRulesResponse{}
+	mi := &file_containarium_v1_alert_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListDefaultAlertRulesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListDefaultAlertRulesResponse) ProtoMessage() {}
+
+func (x *ListDefaultAlertRulesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_alert_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListDefaultAlertRulesResponse.ProtoReflect.Descriptor instead.
+func (*ListDefaultAlertRulesResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ListDefaultAlertRulesResponse) GetRules() []*AlertRule {
+	if x != nil {
+		return x.Rules
+	}
+	return nil
+}
+
+// UpdateAlertingConfigRequest updates alerting system configuration
+type UpdateAlertingConfigRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Webhook URL for alert notifications (empty string to disable)
+	WebhookUrl string `protobuf:"bytes,1,opt,name=webhook_url,json=webhookUrl,proto3" json:"webhook_url,omitempty"`
+	// When true, the server generates a new HMAC signing secret for webhook payloads
+	GenerateWebhookSecret bool `protobuf:"varint,2,opt,name=generate_webhook_secret,json=generateWebhookSecret,proto3" json:"generate_webhook_secret,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *UpdateAlertingConfigRequest) Reset() {
+	*x = UpdateAlertingConfigRequest{}
+	mi := &file_containarium_v1_alert_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateAlertingConfigRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateAlertingConfigRequest) ProtoMessage() {}
+
+func (x *UpdateAlertingConfigRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_alert_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateAlertingConfigRequest.ProtoReflect.Descriptor instead.
+func (*UpdateAlertingConfigRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *UpdateAlertingConfigRequest) GetWebhookUrl() string {
+	if x != nil {
+		return x.WebhookUrl
+	}
+	return ""
+}
+
+func (x *UpdateAlertingConfigRequest) GetGenerateWebhookSecret() bool {
+	if x != nil {
+		return x.GenerateWebhookSecret
+	}
+	return false
+}
+
+// UpdateAlertingConfigResponse returns updated alerting configuration
+type UpdateAlertingConfigResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Configured webhook URL (masked for security)
+	WebhookUrl string `protobuf:"bytes,1,opt,name=webhook_url,json=webhookUrl,proto3" json:"webhook_url,omitempty"`
+	// Whether the configuration was applied successfully
+	Success bool `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	// The generated webhook secret (returned only once when generate_webhook_secret=true)
+	WebhookSecret string `protobuf:"bytes,3,opt,name=webhook_secret,json=webhookSecret,proto3" json:"webhook_secret,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateAlertingConfigResponse) Reset() {
+	*x = UpdateAlertingConfigResponse{}
+	mi := &file_containarium_v1_alert_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateAlertingConfigResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateAlertingConfigResponse) ProtoMessage() {}
+
+func (x *UpdateAlertingConfigResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_alert_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateAlertingConfigResponse.ProtoReflect.Descriptor instead.
+func (*UpdateAlertingConfigResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *UpdateAlertingConfigResponse) GetWebhookUrl() string {
+	if x != nil {
+		return x.WebhookUrl
+	}
+	return ""
+}
+
+func (x *UpdateAlertingConfigResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *UpdateAlertingConfigResponse) GetWebhookSecret() string {
+	if x != nil {
+		return x.WebhookSecret
+	}
+	return ""
+}
+
+// TestWebhookRequest triggers a test notification to the configured webhook
+type TestWebhookRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TestWebhookRequest) Reset() {
+	*x = TestWebhookRequest{}
+	mi := &file_containarium_v1_alert_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TestWebhookRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TestWebhookRequest) ProtoMessage() {}
+
+func (x *TestWebhookRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_alert_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TestWebhookRequest.ProtoReflect.Descriptor instead.
+func (*TestWebhookRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{17}
+}
+
+// TestWebhookResponse returns the result of the test
+type TestWebhookResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Whether the test notification was sent successfully
+	Success bool `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	// HTTP status code from the webhook endpoint
+	StatusCode int32 `protobuf:"varint,2,opt,name=status_code,json=statusCode,proto3" json:"status_code,omitempty"`
+	// Human-readable message
+	Message       string `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TestWebhookResponse) Reset() {
+	*x = TestWebhookResponse{}
+	mi := &file_containarium_v1_alert_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TestWebhookResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TestWebhookResponse) ProtoMessage() {}
+
+func (x *TestWebhookResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_alert_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TestWebhookResponse.ProtoReflect.Descriptor instead.
+func (*TestWebhookResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *TestWebhookResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *TestWebhookResponse) GetStatusCode() int32 {
+	if x != nil {
+		return x.StatusCode
+	}
+	return 0
+}
+
+func (x *TestWebhookResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// WebhookDelivery represents a single webhook delivery attempt
+type WebhookDelivery struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Timestamp     string                 `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	AlertName     string                 `protobuf:"bytes,3,opt,name=alert_name,json=alertName,proto3" json:"alert_name,omitempty"`
+	Source        string                 `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"`                           // "relay" or "test"
+	WebhookUrl    string                 `protobuf:"bytes,5,opt,name=webhook_url,json=webhookUrl,proto3" json:"webhook_url,omitempty"` // masked
+	Success       bool                   `protobuf:"varint,6,opt,name=success,proto3" json:"success,omitempty"`
+	HttpStatus    int32                  `protobuf:"varint,7,opt,name=http_status,json=httpStatus,proto3" json:"http_status,omitempty"`
+	ErrorMessage  string                 `protobuf:"bytes,8,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	PayloadSize   int32                  `protobuf:"varint,9,opt,name=payload_size,json=payloadSize,proto3" json:"payload_size,omitempty"`
+	DurationMs    int32                  `protobuf:"varint,10,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WebhookDelivery) Reset() {
+	*x = WebhookDelivery{}
+	mi := &file_containarium_v1_alert_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WebhookDelivery) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WebhookDelivery) ProtoMessage() {}
+
+func (x *WebhookDelivery) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_alert_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
