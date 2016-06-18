@@ -16,21 +16,3 @@ import (
 // so a run cannot lower its effective depth by naming a shallower
 // parent_number. A run with no dispatch row (started by a human, not the
 // dispatcher) has no floor above the parent's depth, as before.
-func TestRecordChild_DepthFloorsAtTheRunsOwnDispatchDepth(t *testing.T) {
-	store, ctx := newTrackerTestStore(t)
-	const user = "tracker-store-depth-floor"
-	// Dispatch rows hang off the connection by foreign key; recreating it
-	// cascades any rows left over from an earlier run of this test.
-	_, _ = store.pool.Exec(ctx, "DELETE FROM tracker_connections WHERE username = $1", user)
-	_, _ = store.pool.Exec(ctx, "DELETE FROM tracker_issue_lineage WHERE username = $1", user)
-	if _, err := store.Set(ctx, Connection{
-		Username: user, Name: "default", Provider: pb.TrackerProvider_TRACKER_PROVIDER_GITHUB,
-		Project: "acme/widgets", CredentialSecret: "GH_TOKEN",
-	}); err != nil {
-		t.Fatalf("Set connection: %v", err)
-	}
-	// #10 (human) → #11 at depth 1, filed by an earlier run.
-	if _, err := store.RecordChild(ctx, Lineage{Username: user, Connection: "default", ParentNumber: 10, CreatedByRun: "earlier-run"},
-		0, 0, func(context.Context) (int64, error) { return 11, nil }); err != nil {
-		t.Fatalf("seed lineage #11: %v", err)
-	}
