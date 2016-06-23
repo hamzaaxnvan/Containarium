@@ -182,3 +182,95 @@ type itemEntry struct {
 // the operator's `@sha256:...` reference can point at any
 // of them. The caller (Phase B) checks membership.
 //
+// Empty result + nil error means "alias not found in the
+// index" — the caller decides how to surface that (a
+// recently-deleted product? a typo? a stale index?).
+//
+// Returns a non-nil error only for network failure, HTTP
+// status >= 400, or malformed JSON.
+func (r *StreamsResolver) ResolveImageDigests(ctx context.Context, server, alias string) ([]string, error) {
+	if server == "" {
+		return nil, errors.New("simplestreams resolver: server URL is required")
+	}
+	if alias == "" {
+		return nil, errors.New("simplestreams resolver: alias is required")
+	}
+	idx, err := r.fetchIndex(ctx, server)
+	if err != nil {
+		return nil, err
+	}
+	return collectDigests(idx, alias), nil
+}
+
+// fetchIndex returns the simplestreams index for `server`,
+// from the in-memory cache if fresh, or from the network
+// otherwise. The cache is best-effort: a concurrent
+// fetch-during-expiry produces at most one extra network
+// call, no correctness impact.
+func (r *StreamsResolver) fetchIndex(ctx context.Context, server string) (imagesIndex, error) {
+	key := strings.TrimRight(server, "/")
+
+	if r.cacheTTL > 0 {
+		r.mu.Lock()
+		entry, ok := r.cache[key]
+		r.mu.Unlock()
+		if ok && time.Since(entry.fetchedAt) < r.cacheTTL {
+			return entry.idx, nil
+		}
+	}
+
+	idx, err := r.fetchIndexFromNetwork(ctx, key)
+	if err != nil {
+		return imagesIndex{}, err
+	}
+
+	if r.cacheTTL > 0 {
+		r.mu.Lock()
+		r.cache[key] = cachedIndex{idx: idx, fetchedAt: time.Now()}
+		r.mu.Unlock()
+	}
+	return idx, nil
+}
+
+// fetchIndexFromNetwork performs the actual HTTP GET +
+// decode. Pulled out so the cache logic stays readable
+// and so tests can stub it via the public Resolve path.
+func (r *StreamsResolver) fetchIndexFromNetwork(ctx context.Context, server string) (imagesIndex, error) {
+	url := server + indexPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return imagesIndex{}, fmt.Errorf("build request: %w", err)
+	}
+	// Identify ourselves to the registry. Helps operators
+	// chase down "where is this traffic from" questions
+	// in registry access logs.
+	req.Header.Set("User-Agent", "containarium-streams-resolver/1.0")
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return imagesIndex{}, fmt.Errorf("fetch %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return imagesIndex{}, fmt.Errorf("fetch %s: status %d: %s", url, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var idx imagesIndex
+	if err := json.NewDecoder(resp.Body).Decode(&idx); err != nil {
+		return imagesIndex{}, fmt.Errorf("decode index: %w", err)
+	}
+	if idx.Format != "products:1.0" {
+		// The simplestreams ecosystem could ship a v2
+		// someday. Don't silently mis-parse — fail noisily
+		// so a Phase B+ follow-up can teach the resolver
+		// the new shape.
+		return imagesIndex{}, fmt.Errorf("unrecognized index format %q (want products:1.0)", idx.Format)
+	}
+	return idx, nil
+}
+
+// InvalidateCache clears any cached index entries. Useful
+// when the operator knows the registry has just published
+// a new image and wants the daemon to see it before the
+// TTL expires (e.g., after a release-ship workflow).
+func (r *StreamsResolver) InvalidateCache() {
+	r.mu.Lock()

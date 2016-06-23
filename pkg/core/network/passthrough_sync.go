@@ -73,3 +73,79 @@ func (j *PassthroughSyncJob) SyncNow(ctx context.Context) error {
 }
 
 // run is the main loop for the background sync job
+func (j *PassthroughSyncJob) run(ctx context.Context) {
+	defer close(j.doneCh)
+
+	// Run initial sync immediately
+	if err := j.sync(ctx); err != nil {
+		log.Printf("[PassthroughSyncJob] Initial sync failed: %v", err)
+	}
+
+	ticker := time.NewTicker(j.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-j.stopCh:
+			log.Println("[PassthroughSyncJob] Stopping passthrough sync job")
+			return
+		case <-ctx.Done():
+			log.Println("[PassthroughSyncJob] Context cancelled, stopping passthrough sync job")
+			return
+		case <-ticker.C:
+			if err := j.sync(ctx); err != nil {
+				log.Printf("[PassthroughSyncJob] Sync failed: %v", err)
+			}
+		}
+	}
+}
+
+// sync performs the actual synchronization from PostgreSQL to iptables
+func (j *PassthroughSyncJob) sync(ctx context.Context) error {
+	// Get routes from PostgreSQL (source of truth)
+	dbRoutes, err := j.store.List(ctx, true) // activeOnly = true
+	if err != nil {
+		return fmt.Errorf("failed to list passthrough routes from DB: %w", err)
+	}
+
+	// Get current routes from iptables
+	iptablesRoutes, err := j.manager.ListRoutes()
+	if err != nil {
+		return fmt.Errorf("failed to list passthrough routes from iptables: %w", err)
+	}
+
+	// Build maps for efficient diffing
+	// Key: "externalPort/protocol"
+	dbRouteMap := make(map[string]*PassthroughRecord)
+	for _, r := range dbRoutes {
+		key := fmt.Sprintf("%d/%s", r.ExternalPort, r.Protocol)
+		dbRouteMap[key] = r
+	}
+
+	iptablesRouteMap := make(map[string]PassthroughRoute)
+	for _, r := range iptablesRoutes {
+		key := fmt.Sprintf("%d/%s", r.ExternalPort, r.Protocol)
+		iptablesRouteMap[key] = r
+	}
+
+	var added, removed, updated int
+
+	// Find routes to add or update (in DB but not in iptables, or different)
+	for key, dbRoute := range dbRouteMap {
+		iptablesRoute, exists := iptablesRouteMap[key]
+
+		if !exists {
+			// Route in DB but not in iptables - add it
+			if err := j.manager.AddRoute(dbRoute.ExternalPort, dbRoute.TargetIP, dbRoute.TargetPort, dbRoute.Protocol); err != nil {
+				log.Printf("[PassthroughSyncJob] Failed to add route %s: %v", key, err)
+				continue
+			}
+			added++
+		} else {
+			// Route exists in both - check if it needs update
+			if j.needsUpdate(dbRoute, iptablesRoute) {
+				// Remove old rule and add new one
+				if err := j.manager.RemoveRoute(dbRoute.ExternalPort, dbRoute.Protocol); err != nil {
+					log.Printf("[PassthroughSyncJob] Failed to remove old route %s for update: %v", key, err)
+					continue
+				}
