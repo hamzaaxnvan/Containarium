@@ -1,0 +1,108 @@
+package netbpf
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"net/netip"
+
+	"github.com/cilium/ebpf/perf"
+)
+
+// DenyEvent is the decoded form of a `struct deny_event` emitted by the BPF
+// program (experimental/ebpf-phaseA/netpolicy.bpf.c) for a would-deny flow. The
+// binary layout must stay in lockstep with that C struct.
+type DenyEvent struct {
+	Ifindex  uint32
+	TenantID uint32
+	Saddr    uint32 // source IPv4, network byte order (as carried on the wire)
+	Daddr    uint32 // destination IPv4, network byte order
+	Dport    uint16 // host byte order (the program already ntoh'd it)
+	Proto    uint8  // IP protocol number (1=ICMP, 6=TCP, 17=UDP)
+	Reason   uint8  // why the flow was denied (DenyReason*); 0 on objects predating #660
+	SigID    uint16 // matched signature id when Reason==SIGNATURE, else 0 (#661); 0 on objects predating it
+	Verdict  uint8  // what the program actually did with the packet (DenyVerdict*); DenyVerdictUnknown on objects predating #2970
+
+	// LogOnly is NOT part of the wire struct: the program emits the event
+	// whether or not it drops, so the consumer sets this from the tenant's
+	// effective mode before handing the event on (#2612). True means the
+	// flow was only observed (log_only), not dropped. The zero value means
+	// "treat as a real drop", so a producer that never sets it keeps the
+	// pre-#2612 behavior.
+	LogOnly bool
+}
+
+// Deny reasons carried in DenyEvent.Reason — mirror the DENY_REASON_* #defines
+// in netpolicy.bpf.c. An object built before #660 always emits 0
+// (DenyReasonPolicy), which keeps the audit label as the generic policy deny.
+const (
+	DenyReasonPolicy       uint8 = 0 // failed the egress allow-list / intra-tenant / metadata check
+	DenyReasonVirtualPatch uint8 = 1 // matched an explicit virtual-patch deny rule (#660)
+	DenyReasonSignature    uint8 = 2 // matched a cleartext exploit signature (#661, Tier 2)
+	// DenyReasonSpoofedSource: the box sent with a source address that is not
+	// its own (#2618). Decided by the tenant's mode; never allowed by anything.
+	DenyReasonSpoofedSource uint8 = 3
+)
+
+// Verdicts carried in DenyEvent.Verdict — mirror the DENY_VERDICT_* #defines in
+// netpolicy.bpf.c. The program reports the verdict it actually applied, which
+// differs from the tenant-wide mode once mode and egress_mode differ (#2970):
+// an allow-list miss follows egress_mode, every other check follows mode. The
+// byte reuses the low half of the former pad2, so an object built before #2970
+// always emits 0 (DenyVerdictUnknown) and the consumer falls back to its own
+// tenant-wide guess.
+const (
+	DenyVerdictUnknown uint8 = 0 // not reported (older object or short sample)
+	DenyVerdictLogged  uint8 = 1 // observed only; the packet passed
+	DenyVerdictDropped uint8 = 2 // the packet was dropped (TC_ACT_SHOT)
+)
+
+// denyEventVerdictOffset is where the verdict byte sits in struct deny_event.
+const denyEventVerdictOffset = 22
+
+// Dropped reports whether the program dropped the packet. It trusts the
+// program-reported verdict, and only when the sample carried none (an older
+// object) uses fallback, the caller's tenant-wide "mode is ENFORCE" guess.
+func (e DenyEvent) Dropped(fallback bool) bool {
+	switch e.Verdict {
+	case DenyVerdictLogged:
+		return false
+	case DenyVerdictDropped:
+		return true
+	default:
+		return fallback
+	}
+}
+
+// denyEventSizeV1 is the wire size of struct deny_event through the Reason byte
+// (#660). #661 appends u16 sig_id + u16 pad (→ 24 bytes); decoding stays tolerant
+// of both so an object built before either feature still parses (missing tail → 0).
+const denyEventSizeV1 = 20
+
+// ParseDenyEvent decodes one perf-ring sample into a DenyEvent. It tolerates a
+// sample longer than the struct (perf samples are padded, and newer objects
+// carry the #661 sig_id tail) but rejects a short one. Decoded field-by-field so
+// the optional tail is handled cleanly.
+func ParseDenyEvent(raw []byte) (DenyEvent, error) {
+	if len(raw) < denyEventSizeV1 {
+		return DenyEvent{}, fmt.Errorf("netbpf: deny event sample too short: %d < %d bytes", len(raw), denyEventSizeV1)
+	}
+	b := binary.NativeEndian
+	ev := DenyEvent{
+		Ifindex:  b.Uint32(raw[0:4]),
+		TenantID: b.Uint32(raw[4:8]),
+		Saddr:    b.Uint32(raw[8:12]),
+		Daddr:    b.Uint32(raw[12:16]),
+		Dport:    b.Uint16(raw[16:18]),
+		Proto:    raw[18],
+		Reason:   raw[19],
+	}
+	if len(raw) >= 22 { // #661 sig_id tail present
+		ev.SigID = b.Uint16(raw[20:22])
+	}
+	if len(raw) > denyEventVerdictOffset { // #2970 verdict byte present
+		ev.Verdict = raw[denyEventVerdictOffset]
+	}
+	return ev, nil
+}
+
