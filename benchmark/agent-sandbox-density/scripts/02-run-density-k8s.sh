@@ -30,3 +30,35 @@ while [[ $# -gt 0 ]]; do
 	-h | --help)
 		grep '^#' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
+		;;
+	*)
+		die "unknown argument: $1"
+		;;
+	esac
+done
+[[ -n "$VM_NAME" ]] || die "usage: $0 --name <vm-name>"
+
+load_config
+require_vars SANDBOX_CPU_REQUEST SANDBOX_CPU_LIMIT SANDBOX_MEM_REQUEST SANDBOX_MEM_LIMIT \
+	GVISOR_RUNTIME_CLASS FAILURE_STREAK_TO_STOP CREATE_TIMEOUT_SECONDS BENCH_SSH_KEY_FILE
+resolve_remote "$VM_NAME"
+
+NAMESPACE="sandbox-density-bench"
+RESULTS_DIR="${BENCH_ROOT}/results"
+mkdir -p "$RESULTS_DIR"
+RESULTS_FILE="${RESULTS_DIR}/k8s-$(date -u +%Y%m%dT%H%M%SZ).md"
+
+create_sandbox() {
+	local name="$1"
+	sed \
+		-e "s/__NAME__/${name}/g" \
+		-e "s/__SANDBOX_CPU_REQUEST__/${SANDBOX_CPU_REQUEST}/g" \
+		-e "s/__SANDBOX_CPU_LIMIT__/${SANDBOX_CPU_LIMIT}/g" \
+		-e "s/__SANDBOX_MEM_REQUEST__/${SANDBOX_MEM_REQUEST}/g" \
+		-e "s/__SANDBOX_MEM_LIMIT__/${SANDBOX_MEM_LIMIT}/g" \
+		-e "s/__GVISOR_RUNTIME_CLASS__/${GVISOR_RUNTIME_CLASS}/g" \
+		"${BENCH_ROOT}/manifests/sandbox-template.yaml" |
+		ssh_or_local "kubectl apply -f -" >/dev/null 2>&1
+}
+
+sandbox_ready() {
