@@ -123,3 +123,66 @@ func (m *Manager) LoadFromBytes(data []byte) error {
 		}
 		seen[def.ID] = true
 		loaded = append(loaded, def.ToProto())
+	}
+
+	m.mu.Lock()
+	m.crews = loaded
+	m.mu.Unlock()
+	return nil
+}
+
+func validate(c *crewDef) error {
+	if c.ID == "" {
+		return fmt.Errorf("crew is missing required field: id")
+	}
+	if _, ok := topologyByName[c.Topology]; !ok {
+		return fmt.Errorf("crew %q has unknown topology %q (want pipeline|orchestrator|freeform)", c.ID, c.Topology)
+	}
+	if len(c.SkillIDs) < 2 {
+		return fmt.Errorf("crew %q must reference at least two skills", c.ID)
+	}
+	// Which role combinations are allowed is RunCrew's check
+	// (validateCrewRoles); loading only guarantees a typed role per member.
+	if len(c.Roles) > 0 && len(c.Roles) != len(c.SkillIDs) {
+		return fmt.Errorf("crew %q declares %d roles for %d skills; want one role per skill", c.ID, len(c.Roles), len(c.SkillIDs))
+	}
+	for _, r := range c.Roles {
+		if _, ok := roleByName[r]; !ok {
+			return fmt.Errorf("crew %q has unknown role %q (want coder|reviewer|pack_producer)", c.ID, r)
+		}
+	}
+	return nil
+}
+
+// LoadDir merges every *.yaml crew catalog in dir on top of the embedded
+// built-ins (#620). A missing dir is not an error. Fails on a parse/validate
+// error or an id that collides with an already-loaded crew. (Topology vs the
+// members' allowed_peers is validated at RunCrew time, against the skill
+// catalog — so load external skills before external crews.) Catalogs are
+// loaded unsigned; use LoadDirVerified to require a provenance check.
+func (m *Manager) LoadDir(dir string) error {
+	return m.LoadDirVerified(dir, nil)
+}
+
+// LoadDirVerified is LoadDir with an optional provenance check (#648). When v
+// is non-nil (require-signed mode on), each *.yaml file must carry a valid
+// detached ed25519 signature (foo.yaml.sig) under a trusted key, verified
+// before parse/merge; a missing or bad signature fails that file's load rather
+// than silently skipping it. When v is nil, behavior is identical to LoadDir.
+func (m *Manager) LoadDirVerified(dir string, v *catalogsig.Verifier) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read crews dir %q: %w", dir, err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", e.Name(), err)
+		}
