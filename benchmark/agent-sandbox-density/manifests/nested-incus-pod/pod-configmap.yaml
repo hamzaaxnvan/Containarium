@@ -1,0 +1,41 @@
+# Startup script for the nested-Incus-in-a-k8s-pod benchmark scenario
+# (issue #1565). Runs `incusd` and `containariumd daemon --runtime=lxc`
+# INSIDE this one pod — every `containarium create` becomes a real LXC
+# container, cgroup-ceilinged by this nested Incus, invisible to
+# Kubernetes' own admission accounting (which only ever sees this one
+# pod's declared request/limit). See README.md in this directory.
+#
+# No systemd in a bare ubuntu:24.04 container image — incusd and the
+# containariumd daemon are started directly (nohup'd background
+# processes), not via systemctl. The zabbly Incus package's postinst
+# scripts still try to touch systemd unit files (harmless — no init is
+# actually running them); the real daemon binary lives at
+# /opt/incus/lib/systemd/incusd, not on $PATH as `incusd`.
+#
+# Every `incus`/`containarium` invocation that spawns a nested process
+# (launch, exec, image-bake) is redirected from /dev/null — found live
+# (matches this repo's own documented gotcha) that piping a multi-line
+# script into a shell over `kubectl exec -i` can let a subprocess like
+# `incus launch` steal bytes meant for the *outer* script's remaining
+# lines if its stdin isn't explicitly detached.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nested-incus-pod-start
+  namespace: __NAMESPACE__
+  labels:
+    benchmark: agent-sandbox-density
+    scenario: nested-incus-pod
+data:
+  start.sh: |
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    LOG=/var/log/nested-incus-pod-start.log
+    # Tee, not a plain redirect — `kubectl logs` only ever sees this
+    # container's own stdout/stderr, and once the container exits
+    # `kubectl exec` stops working entirely (found live: a plain redirect
+    # here left both `kubectl logs` empty AND the log file unreachable
+    # after a failure, with no way to see what happened).
+    exec > >(tee "$LOG") 2>&1
+
+    echo "[start.sh] installing curl + Incus"
