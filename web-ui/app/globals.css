@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+/* ── Dark theme (default) ── */
+:root {
+  color-scheme: dark;
+
+  /* Layout tokens */
+  --background:    #09090b;
+  --surface:       #18181b;
+  --surface-2:     #27272a;
+  --border:        #3f3f46;
+  --border-subtle: #27272a;
+  --text:          #fafafa;
+  --text-secondary:#a1a1aa;
+  --text-muted:    #71717a;
+  --accent:        #3b82f6;
+  --accent-hover:  #2563eb;
+  --success:       #10b981;
+  --error:         #ef4444;
+  --warning:       #f59e0b;
+  --info:          #6366f1;
+
+  /* Semantic badge text colors (flip to darker in light mode) */
+  --c-emerald: #34d399;
+  --c-red:     #f87171;
+  --c-blue:    #60a5fa;
+  --c-amber:   #fbbf24;
+  --c-violet:  #a78bfa;
+  --c-orange:  #fb923c;
+}
+
+/* ── Light theme ── */
+html.light {
+  color-scheme: light;
+
+  --background:    #ffffff;
+  --surface:       #fafafa;
+  --surface-2:     #f4f4f5;
+  --border:        #d4d4d8;
+  --border-subtle: #e4e4e7;
+  --text:          #09090b;
+  --text-secondary:#3f3f46;
+  --text-muted:    #71717a;
+  --accent:        #2563eb;
+  --accent-hover:  #1d4ed8;
