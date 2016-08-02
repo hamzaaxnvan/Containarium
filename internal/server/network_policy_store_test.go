@@ -34,3 +34,39 @@ func TestNonNilStrings(t *testing.T) {
 // deny rules survive a Set/Get round-trip (clonePolicy used to drop them), and a
 // later `set` of the allow-policy must NOT wipe them (Set owns the allow-policy;
 // deny rules are owned by MutateDenyRules).
+func TestMemStore_DenyRulesPersistAndSetPreserves(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemNetworkPolicyStore()
+
+	// A fresh Set never carries deny rules (they're owned by MutateDenyRules).
+	if err := s.Set(ctx, &pb.NetworkPolicy{
+		Tenant:      "acme",
+		EgressCidrs: []string{"0.0.0.0/0"},
+		DenyRules:   []*pb.NetworkPolicyDenyRule{{Cidr: "1.2.3.4/32"}}, // should be ignored by Set
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	got, err := s.Get(ctx, "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(got.GetDenyRules()) != 0 {
+		t.Fatalf("Set must not store deny rules (owned by MutateDenyRules), got %+v", got.GetDenyRules())
+	}
+
+	// Add a deny rule via the atomic path; it must persist through Get.
+	if _, err := s.MutateDenyRules(ctx, "acme", func(ex []*pb.NetworkPolicyDenyRule) ([]*pb.NetworkPolicyDenyRule, error) {
+		return append(ex, &pb.NetworkPolicyDenyRule{Cidr: "9.9.9.9/32", Note: "CVE-x"}), nil
+	}); err != nil {
+		t.Fatalf("MutateDenyRules: %v", err)
+	}
+	got, _ = s.Get(ctx, "acme")
+	if len(got.GetDenyRules()) != 1 || got.GetDenyRules()[0].GetCidr() != "9.9.9.9/32" {
+		t.Fatalf("deny rule did not persist: %+v", got.GetDenyRules())
+	}
+
+	// A subsequent `set` (allow-policy change) must preserve the deny rule.
+	if err := s.Set(ctx, &pb.NetworkPolicy{Tenant: "acme", EgressCidrs: []string{"10.0.0.0/8"}}); err != nil {
+		t.Fatalf("Set #2: %v", err)
+	}
+	got, _ = s.Get(ctx, "acme")

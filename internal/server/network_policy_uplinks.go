@@ -51,3 +51,57 @@ func parseDefaultRouteIfaces(r io.Reader) []string {
 // uplinkIface is one candidate uplink: a named interface and its ifindex.
 type uplinkIface struct {
 	Name  string
+	Index int
+}
+
+// uplinkCandidates resolves the current uplink interfaces (default routes plus
+// extra) to interfaces, in order and deduplicated. A name that does not exist is
+// skipped.
+func uplinkCandidates(extra []string) []uplinkIface {
+	names := extra
+	if f, err := os.Open(procNetRoute); err == nil {
+		names = append(parseDefaultRouteIfaces(f), extra...)
+		_ = f.Close()
+	}
+	var out []uplinkIface
+	seen := map[int]bool{}
+	for _, n := range names {
+		if iface, err := net.InterfaceByName(n); err == nil && !seen[iface.Index] {
+			seen[iface.Index] = true
+			out = append(out, uplinkIface{Name: n, Index: iface.Index})
+		}
+	}
+	return out
+}
+
+// sysClassNet is where the kernel exposes each interface's bridge master. A
+// variable so tests can point it at a fake sysfs.
+var sysClassNet = "/sys/class/net"
+
+// masterOfIface returns the name of the bridge the veth iface is enslaved to, or
+// "" when it has none. A missing link (the veth has no master, or vanished
+// mid-scan) is normal and returns "", nil; any other read error is returned so
+// the caller can fail closed rather than treat an unreadable master as "none".
+func masterOfIface(iface string) (string, error) {
+	target, err := os.Readlink(filepath.Join(sysClassNet, iface, "master"))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read master of %q: %w", iface, err)
+	}
+	return filepath.Base(target), nil
+}
+
+// refuseVethCarriers splits candidates into the ones safe to trust and the ones
+// that carry managed instance veths (#3185 SF1). Trusting such an interface
+// would let a frame the host routes back through the instance bridge count as
+// "entered on an uplink" and seed an inbound flow without the sender-hook mark,
+// reopening the unmarked-frame seed path. An interface carries managed veths
+// when it is one of them or is the master a managed veth is enslaved to, whether
+// it came from default-route detection or CONTAINARIUM_NETWORK_POLICY_UPLINKS.
+// masterOf is injected so the decision is testable without sysfs. If any managed
+// veth's master cannot be read, err is set and trusted is nil: the carrier set
+// is incomplete, so no candidate can be judged safe. refused then lists only the
+// candidates already known to be carriers from the veths examined before the
+// unreadable one (#3251); it is a lower bound, not the full set.
