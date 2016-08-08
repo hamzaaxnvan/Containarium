@@ -1,0 +1,8 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: containarium-bench-sentinel
+  namespace: __NAMESPACE__
+  labels:
+    app.kubernetes.io/name: containarium-bench-sentinel
+    app.kubernetes.io/instance: containarium-bench
