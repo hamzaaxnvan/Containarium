@@ -42,3 +42,25 @@ func TestExportImportRoundTripMock(t *testing.T) {
 
 	if err := m.DeleteContainer("src"); err != nil {
 		t.Fatalf("delete: %v", err)
+	}
+	if _, err := m.ExportInstance("src"); !incus.IsNotFound(err) {
+		t.Fatalf("export of a deleted instance: err = %v, want not-found", err)
+	}
+
+	if err := m.ImportInstance("restored", "default", bytes.NewReader(exported), incus.ImportOptions{}); err != nil {
+		t.Fatalf("ImportInstance(restored): %v", err)
+	}
+	got, err := m.GetContainer("restored")
+	if err != nil || got == nil {
+		t.Fatalf("imported instance not present: %v, %v", got, err)
+	}
+	if got.State != "Stopped" {
+		t.Errorf("imported instance state = %q, want Stopped (an import never starts the box)", got.State)
+	}
+
+	rc, err = m.ExportInstance("restored")
+	if err != nil {
+		t.Fatalf("re-export of the imported instance: %v", err)
+	}
+	again, _ := io.ReadAll(rc)
+	_ = rc.Close()

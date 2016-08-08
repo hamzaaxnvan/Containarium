@@ -40,3 +40,45 @@ func TestReapOnce_OnlyReapsContainariumManagedShell(t *testing.T) {
 
 	makeHomeDir(t, homeRoot, "orphaned-tenant", true) // containarium-shell, no container -> reap
 	makeHomeDir(t, homeRoot, "admin-user", true)      // /bin/bash, no container -> must NOT reap
+	makeHomeDir(t, homeRoot, "live-tenant", true)     // containarium-shell, HAS container -> must NOT reap
+	makeHomeDir(t, homeRoot, "no-key-dir", false)     // no authorized_keys -> never considered
+
+	shells := map[string]string{
+		"orphaned-tenant": containerShellPath,
+		"admin-user":      "/bin/bash",
+		"live-tenant":     containerShellPath,
+	}
+	userShellFn := func(username string) (string, error) {
+		shell, ok := shells[username]
+		if !ok {
+			return "", fmt.Errorf("user %q not found", username)
+		}
+		return shell, nil
+	}
+
+	containerExistsFn := func(username string) bool {
+		return username == "live-tenant"
+	}
+
+	var deleted []string
+	deleteFn := func(username string, verbose bool) error {
+		deleted = append(deleted, username)
+		return nil
+	}
+
+	reapOnce(homeRoot, containerExistsFn, userShellFn, deleteFn)
+
+	if len(deleted) != 1 || deleted[0] != "orphaned-tenant" {
+		t.Fatalf("deleted = %v, want exactly [orphaned-tenant]", deleted)
+	}
+}
+
+// TestReapOnce_UnknownShellIsNotReaped covers the fail-safe path: if the
+// passwd lookup errors (e.g. the directory has no matching passwd entry at
+// all — a stale artifact, not a live account), the reaper must not delete
+// anything rather than guessing.
+func TestReapOnce_UnknownShellIsNotReaped(t *testing.T) {
+	homeRoot := t.TempDir()
+	makeHomeDir(t, homeRoot, "stale-dir", true)
+
+	userShellFn := func(username string) (string, error) {
