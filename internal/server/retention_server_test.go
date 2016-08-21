@@ -162,3 +162,167 @@ func TestRetentionServer_FailedAuditFailsTheChange(t *testing.T) {
 		t.Fatalf("ReleaseLegalHold with audit down = %v, want Internal", err)
 	}
 	p, _ := s.GetRetentionPolicy(ctx, &pb.GetRetentionPolicyRequest{})
+	if p.GetPolicy().GetRevision() != 0 || p.GetPolicy().GetWindows()[0].GetDays() != 30 {
+		t.Fatalf("policy after a failed audit = %v, want unchanged defaults", p.GetPolicy())
+	}
+	holds, _ := s.ListLegalHolds(ctx, &pb.ListLegalHoldsRequest{})
+	if len(holds.GetHolds()) != 1 || holds.GetHolds()[0].GetOrgId() != "org-held" {
+		t.Fatalf("holds after a failed audit = %v, want only org-held", holds.GetHolds())
+	}
+}
+
+// TestRetentionServer_NoAuditStoreStillChanges: with no audit store (no
+// Postgres, REST disabled, or an audit store that failed to start) a change
+// succeeds and writes no entry, as for the guardrail baseline switch.
+func TestRetentionServer_NoAuditStoreStillChanges(t *testing.T) {
+	s := NewRetentionServer(retention.NewMemoryStore())
+	if _, err := s.SetRetentionPolicy(gpAdminCtx(), promptsDays(7)); err != nil {
+		t.Fatalf("SetRetentionPolicy with no audit store: %v", err)
+	}
+}
+
+// TestRetentionServer_ErrorCodes maps store errors onto gRPC codes.
+func TestRetentionServer_ErrorCodes(t *testing.T) {
+	ctx := gpAdminCtx()
+	s, _ := newRetentionTestServer()
+	cases := []struct {
+		name string
+		call func() error
+		want codes.Code
+	}{
+		{"zero days", func() error { _, err := s.SetRetentionPolicy(ctx, promptsDays(0)); return err }, codes.InvalidArgument},
+		{"one day over the cap", func() error {
+			_, err := s.SetRetentionPolicy(ctx, promptsDays(retention.MaxDays+1))
+			return err
+		}, codes.InvalidArgument},
+		{"the cap itself", func() error { _, err := s.SetRetentionPolicy(ctx, promptsDays(retention.MaxDays)); return err }, codes.OK},
+		{"unknown class", func() error {
+			_, err := s.SetRetentionPolicy(ctx, &pb.SetRetentionPolicyRequest{Windows: []*pb.RetentionWindow{{Class: 99, Days: 5}}})
+			return err
+		}, codes.InvalidArgument},
+		{"hold without reason", func() error {
+			_, err := s.SetLegalHold(ctx, &pb.SetLegalHoldRequest{OrgId: "org-a"})
+			return err
+		}, codes.InvalidArgument},
+		{"release unknown org", func() error {
+			_, err := s.ReleaseLegalHold(ctx, &pb.ReleaseLegalHoldRequest{OrgId: "org-none"})
+			return err
+		}, codes.NotFound},
+		{"hold twice", func() error {
+			if _, err := s.SetLegalHold(ctx, &pb.SetLegalHoldRequest{OrgId: "org-b", Reason: "r"}); err != nil {
+				return err
+			}
+			_, err := s.SetLegalHold(ctx, &pb.SetLegalHoldRequest{OrgId: "org-b", Reason: "r"})
+			return err
+		}, codes.AlreadyExists},
+		{"store unavailable", func() error {
+			_, err := NewRetentionServer(unavailableRetentionStore{}).GetRetentionPolicy(ctx, &pb.GetRetentionPolicyRequest{})
+			return err
+		}, codes.Unavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(tc.call()); got != tc.want {
+				t.Fatalf("%s = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// countingSource answers with a fixed count and tallies its calls.
+type countingSource struct {
+	calls int
+	count retention.Count
+}
+
+func (c *countingSource) Class() pb.RetentionClass { return pb.RetentionClass_RETENTION_CLASS_PROMPTS }
+func (c *countingSource) Store() string            { return "agent_tasks" }
+func (c *countingSource) Count(context.Context, time.Time, []string) (retention.Count, error) {
+	c.calls++
+	return c.count, nil
+}
+
+func TestRetentionServer_GetRetentionReport(t *testing.T) {
+	s, _ := newRetentionTestServer()
+	src := &countingSource{count: retention.Count{Older: 3, Eligible: 3}}
+	s.SetReporter(retention.NewReporter(retention.NewSweeper(retention.NewMemoryStore(), []retention.Source{src},
+		[]retention.Unswept{{Class: pb.RetentionClass_RETENTION_CLASS_EVIDENCE_BUNDLES, Store: "evidence_bundles", Note: "no store yet (#2879)"}})))
+
+	resp, err := s.GetRetentionReport(gpAdminCtx(), &pb.GetRetentionReportRequest{})
+	if err != nil {
+		t.Fatalf("GetRetentionReport: %v", err)
+	}
+	if resp.GetReport().GetMode() != pb.RetentionMode_RETENTION_MODE_DRY_RUN || len(resp.GetReport().GetStores()) != 2 {
+		t.Fatalf("report = %v", resp.GetReport())
+	}
+	if _, err := s.GetRetentionReport(gpAdminCtx(), &pb.GetRetentionReportRequest{}); err != nil || src.calls != 1 {
+		t.Fatalf("second call: err=%v, sweeps=%d; want the kept report (1 sweep)", err, src.calls)
+	}
+	if _, err := s.GetRetentionReport(gpAdminCtx(), &pb.GetRetentionReportRequest{Refresh: true}); err != nil || src.calls != 2 {
+		t.Fatalf("refresh: err=%v, sweeps=%d; want a new sweep (2)", err, src.calls)
+	}
+}
+
+func TestRetentionServer_GetRetentionReportWithoutAReporterIsUnavailable(t *testing.T) {
+	s, _ := newRetentionTestServer()
+	_, err := s.GetRetentionReport(gpAdminCtx(), &pb.GetRetentionReportRequest{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code = %v (%v), want Unavailable", status.Code(err), err)
+	}
+}
+
+func TestRetentionServer_GetRetentionReportWithAnUnavailableStoreIsUnavailable(t *testing.T) {
+	s, _ := newRetentionTestServer()
+	s.SetReporter(retention.NewReporter(retention.NewSweeper(unavailableRetentionStore{}, nil, nil)))
+	_, err := s.GetRetentionReport(gpAdminCtx(), &pb.GetRetentionReportRequest{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code = %v (%v), want Unavailable", status.Code(err), err)
+	}
+}
+
+// With no database pool the daemon still answers: every Postgres-backed store
+// is listed NOT_SWEPT with the reason, next to the chained and bundle classes.
+func TestNewRetentionReporter_NoPoolListsEveryStoreNotSwept(t *testing.T) {
+	rep, err := newRetentionReporter(retention.NewMemoryStore(), nil).Report(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	notes := map[string]string{}
+	for _, s := range rep.GetStores() {
+		if s.GetStatus() != pb.RetentionSweepStatus_RETENTION_SWEEP_STATUS_NOT_SWEPT {
+			t.Errorf("%v/%s status = %v, want NOT_SWEPT with no database", s.GetClass(), s.GetStore(), s.GetStatus())
+		}
+		notes[s.GetClass().String()+"/"+s.GetStore()] = s.GetNote()
+	}
+	for key, want := range map[string]string{
+		"RETENTION_CLASS_PROMPTS/agent_tasks":               "no database",
+		"RETENTION_CLASS_GATEWAY_LOGS/traffic_connections":  "no database",
+		"RETENTION_CLASS_GATEWAY_LOGS/audit_logs":           "#2878",
+		"RETENTION_CLASS_SESSION_TRANSCRIPTS/audit_logs":    "#2878",
+		"RETENTION_CLASS_EVIDENCE_BUNDLES/evidence_bundles": "#2879",
+	} {
+		if got, ok := notes[key]; !ok || !strings.Contains(got, want) {
+			t.Errorf("%s note = %q (present %v), want it to mention %q", key, got, ok, want)
+		}
+	}
+}
+
+// removingSource is a count-and-delete source that tallies its removals.
+type removingSource struct {
+	countingSource
+	removals int
+}
+
+func (r *removingSource) Remove(context.Context, time.Time, []string, int) (retention.Removal, error) {
+	r.removals++
+	return retention.Removal{Removed: r.count.Eligible}, nil
+}
+
+// TestRetentionServer_ModeStartsDryRunAndSwitchIsAuditedWithTheCaller: the
+// default is DRY_RUN; a switch writes one entry naming the admin, with the
+// mode it replaced.
+func TestRetentionServer_ModeStartsDryRunAndSwitchIsAuditedWithTheCaller(t *testing.T) {
+	s, a := newRetentionTestServer()
+	ctx := gpAdminCtx()
+	got, err := s.GetRetentionMode(ctx, &pb.GetRetentionModeRequest{})
+	if err != nil || got.GetState().GetMode() != pb.RetentionMode_RETENTION_MODE_DRY_RUN {
