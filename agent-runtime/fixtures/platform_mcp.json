@@ -1,0 +1,3 @@
+{
+  "command": "env",
+  "args": ["CONTAINARIUM_MCP_ALLOW_INSECURE=true", "mcp-server"],
