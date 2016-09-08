@@ -26,31 +26,3 @@ func ParentCmdline() ([]byte, error) {
 // CheckParentLoginGrace logs a WARN through logf when the parent sshpiperd
 // was started without a --login-grace-time of at least MinLoginGrace: the
 // default 30s would drop a login while the user approves a device. A
-// binary-only rollout leaves an old unit in place, so this is the runtime
-// sign that the unit needs re-rendering (#3125). It never fails: an
-// unreadable command line is only noted as a debug line, no alarm.
-//
-// A value of 0 or below is reported too: it is not a duration of at least
-// MinLoginGrace (whether sshpiperd treats 0 as unlimited was not verified).
-// The scan covers the whole parent command line, so a plugin argument
-// literally named --login-grace-time would be misread (theoretical).
-func CheckParentLoginGrace(read func() ([]byte, error), logf func(string, ...any)) {
-	raw, err := read()
-	if err != nil || len(raw) == 0 {
-		logf("DEBUG ssh-authz: parent sshpiperd command line unreadable (%v); login-grace-time not checked", err)
-		return
-	}
-	args := strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
-	val, found := "", false
-	for i := 1; i < len(args); i++ {
-		if !strings.HasPrefix(args[i], "-") {
-			continue
-		}
-		a := strings.TrimLeft(args[i], "-")
-		if a == "login-grace-time" {
-			found = true
-			if i+1 < len(args) {
-				val = args[i+1]
-			}
-			break
-		}

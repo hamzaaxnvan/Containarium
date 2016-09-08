@@ -80,3 +80,44 @@ func TestChainBase_TamperingAfterAPurgeIsStillDetected(t *testing.T) {
 	firstBad, err := s.VerifyChainSinceID(ctx, 0, 1000)
 	if err == nil || firstBad != victim {
 		t.Fatalf("an edited retained row must be reported: firstBad=%d (want %d) err=%v", firstBad, victim, err)
+	}
+}
+
+func TestChainBase_ABaseThatDoesNotMatchTheFirstRetainedRowIsDetected(t *testing.T) {
+	ctx := context.Background()
+	s := auditTestStore(t)
+	logN(t, s, 30)
+	base := simulatePurge(t, s, 10)
+
+	// A base whose hash is not the first retained row's prev_hash: either the
+	// base was edited or rows between it and the retained chain are gone.
+	if _, err := s.pool.Exec(ctx, `UPDATE audit_chain_base SET base_hash = $1`, strings.Repeat("0", 64)); err != nil {
+		t.Fatal(err)
+	}
+	var first int64
+	if err := s.pool.QueryRow(ctx, `SELECT min(id) FROM audit_logs`).Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	firstBad, err := s.VerifyChainSinceID(ctx, 0, 1000)
+	if err == nil || firstBad != first {
+		t.Fatalf("a wrong base must fail at the first retained row %d: firstBad=%d err=%v (base id %d)", first, firstBad, err, base.ID)
+	}
+}
+
+func TestChainBase_RowsDeletedBeyondTheBaseAreStillDetected(t *testing.T) {
+	ctx := context.Background()
+	s := auditTestStore(t)
+	logN(t, s, 30)
+	simulatePurge(t, s, 10)
+
+	// Deleting a retained row (not a prefix) leaves a gap the base cannot
+	// explain.
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM audit_logs WHERE id = (SELECT id FROM audit_logs ORDER BY id ASC OFFSET 5 LIMIT 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.VerifyChainSinceID(ctx, 0, 1000); err == nil {
+		t.Fatal("removing a retained row left the purged chain verifying clean")
+	}
+}
+
