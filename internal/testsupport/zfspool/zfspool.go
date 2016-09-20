@@ -24,3 +24,29 @@ import (
 // vdevSize is comfortably above ZFS's 64 MiB minimum.
 const vdevSize = 512 << 20
 
+// Require skips the test unless a usable ZFS is present.
+//
+// Skips rather than fails on purpose: a developer's laptop or a container
+// dev box legitimately has no ZFS. The CI lane that exists to demonstrate
+// the encryption claim asserts the environment separately and fails on a
+// skip, so this cannot quietly turn that lane into a no-op.
+func Require(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("ZFS pool operations need root; run with sudo -E")
+	}
+	for _, bin := range []string{"zfs", "zpool"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not on PATH; install zfsutils-linux", bin)
+		}
+	}
+	if _, err := os.Stat("/dev/zfs"); err != nil {
+		t.Skipf("/dev/zfs is absent, so the kernel module cannot be driven: %v", err)
+	}
+}
+
+// Run executes a command and fails the test on error.
+func Run(t *testing.T, name string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command(name, args...).CombinedOutput()
+	if err != nil {
