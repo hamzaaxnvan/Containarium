@@ -64,36 +64,3 @@ func TestSyncTLSSubjects_CoversGRPCRoutes(t *testing.T) {
 	grpc := httpRoute("grpc.example.com")
 	grpc.Protocol = string(RouteProtocolGRPC)
 
-	if err := j.syncTLSSubjects([]*RouteRecord{grpc}); err != nil {
-		t.Fatalf("syncTLSSubjects: %v", err)
-	}
-
-	if !hasSubject(readPolicies(t, fc), "grpc.example.com") {
-		t.Fatal("gRPC route did not get a TLS subject reconciled (#1584)")
-	}
-}
-
-// TLS-passthrough routes terminate TLS at the backend, not at Caddy, so Caddy
-// must NOT try to obtain a certificate for them. Provisioning one would send
-// Caddy after a cert for a hostname it never terminates.
-func TestSyncTLSSubjects_SkipsTLSPassthroughRoutes(t *testing.T) {
-	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
-		[]string{"unrelated.example.com"},
-		[]CaddyTLSIssuer{NewACMEIssuer()},
-	))
-	defer srv.Close()
-
-	p := NewProxyManager(srv.URL, "example.com")
-	j := &RouteSyncJob{proxyManager: p}
-
-	pt := httpRoute("passthrough.example.com")
-	pt.Protocol = string(RouteProtocolTLSPassthrough)
-
-	if err := j.syncTLSSubjects([]*RouteRecord{pt}); err != nil {
-		t.Fatalf("syncTLSSubjects: %v", err)
-	}
-
-	if hasSubject(readPolicies(t, fc), "passthrough.example.com") {
-		t.Fatal("TLS-passthrough route must not get a Caddy TLS subject — Caddy does not " +
-			"terminate TLS for it")
-	}
