@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// VolumeService manages shared, multi-writer data volumes (#384).
+//
+// The only storage mechanism that lets N containers mount the SAME volume
+// read-write without corruption is a CephFS custom (filesystem) volume:
+// CephFS's MDS + capability/lease protocol coordinates concurrent POSIX
+// writers, which a block device on a non-cluster filesystem (ext4/xfs/zfs)
+// cannot. So this service is capability-gated: it only works on hosts
+// backed by a `cephfs` Incus storage pool, and rejects create/attach on
+// single-node ZFS hosts (today's default) with a clear error. Callers
+// check support via ListVolumes.shared_volumes_supported.
+//
+// NOTE: this is a single-writer-safe DATA volume, not an instance rootfs
+// (Incus restricts the cephfs driver to custom volumes).
+service VolumeService {
+  // CreateVolume provisions a CephFS custom filesystem volume with a quota.
+  rpc CreateVolume(CreateVolumeRequest) returns (CreateVolumeResponse) {
+    option (google.api.http) = {
+      post: "/v1/volumes"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Create a shared volume";
+      description: "Creates a CephFS custom (filesystem) volume that can be attached read-write to multiple containers. Rejected on non-CephFS hosts.";
+      tags: "Volumes";
+    };
+  }
+
+  // ListVolumes lists shared volumes and reports whether this host can
+  // serve them at all (a CephFS pool is present).
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {
+    option (google.api.http) = {
+      get: "/v1/volumes"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List shared volumes";
+      description: "Lists shared volumes and reports shared_volumes_supported for this backend (true only when a CephFS pool exists).";
+      tags: "Volumes";
+    };
+  }
+
+  // GetVolume returns a single volume's metadata + attachments.
+  rpc GetVolume(GetVolumeRequest) returns (GetVolumeResponse) {
+    option (google.api.http) = {
+      get: "/v1/volumes/{name}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get a shared volume";
+      tags: "Volumes";
+    };
+  }
+
+  // DeleteVolume removes a volume. Refuses while attached unless force.
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {
+    option (google.api.http) = {
+      delete: "/v1/volumes/{name}"
+    };
