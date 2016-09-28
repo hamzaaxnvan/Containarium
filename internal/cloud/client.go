@@ -1,0 +1,422 @@
+package cloud
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	cloudv1 "github.com/footprintai/containarium/pkg/pb/containarium/cloud/v1"
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+)
+
+// hostBearerMetadataKey is the gRPC metadata header the cloud-daemon's
+// HostBearerInterceptor reads to authenticate the host. Wire contract with the
+// cloud repo's internal/auth.HostBearerMetadataKey — a literal here because that
+// const lives in the cloud module's internal/ (not importable), and we vendor
+// only the proto, not the auth package.
+const hostBearerMetadataKey = "host-bearer"
+
+// defaultHeartbeatInterval is the actuation heartbeat cadence. The cloud-side
+// staleness threshold is ~3 missed beats; see the cloud container-actuation PRD.
+const defaultHeartbeatInterval = 30 * time.Second
+
+// driverRefreshInterval is how often the daemon re-mints and pushes a fresh
+// driver token (#557). Set to ⅔ of the 30-day OSS cap so there is always at
+// least 10 days of runway before expiry, even if one refresh cycle fails.
+const driverRefreshInterval = 20 * 24 * time.Hour
+
+// PolicySink receives each AssignmentBatch's per-org network policies so the
+// daemon can converge its NetworkPolicyStore (where the eBPF enforcer applies
+// them). The daemon implements this; keeping it an interface lets the client be
+// tested with a fake and keeps internal/cloud free of an internal/server import.
+type PolicySink interface {
+	// SyncNetworkPolicies is handed the full set of policies on the current
+	// batch (a snapshot, like assignments). Implementations converge their store
+	// to exactly this set, keyed by org.
+	SyncNetworkPolicies(ctx context.Context, policies []*cloudv1.NetworkPolicy) error
+}
+
+// ContainerSpec is the host-local shape of one cloud assignment the actuator
+// acts on. LocalName is the Incus instance name (cld-<short-uuid>); OrgID is
+// stamped as the container's user.containarium.tenant label so the network-policy
+// enforcer identifies it.
+type ContainerSpec struct {
+	LocalName string
+	OrgID     string
+	Image     string
+	RAMMB     int32
+	DiskGB    int32
+	GPUCount  int32
+	// SecretEnv are name→value pairs the actuator injects as container
+	// environment (from Assignment.secret_env).
+	SecretEnv map[string]string
+	// Routes are the hostname→port exposures for this container (from
+	// Assignment.routes); the actuator registers them at the host edge.
+	Routes []RouteSpec
+}
+
+// RouteSpec is one hostname→container-port exposure (from cloudv1.PortRoute).
+type RouteSpec struct {
+	Domain     string
+	TargetPort int32
+	Protocol   string
+}
+
+// ContainerActuator drives local Incus state toward an assignment's
+// desired_state. The daemon implements it (create/start/stop/delete + stamp the
+// tenant label); the interface keeps internal/cloud free of an Incus dependency
+// and lets the reconcile decision be unit-tested with a fake. Each method is
+// idempotent — the reconciler may call it for an already-converged container.
+type ContainerActuator interface {
+	EnsureRunning(ctx context.Context, spec ContainerSpec) error
+	EnsureStopped(ctx context.Context, localName string) error
+	EnsureDeleted(ctx context.Context, localName string) error
+}
+
+// HostCheck is one line of the host's `doctor` self-check — mirrors the
+// proto HostCapabilityCheck so callers (the daemon's probe) don't depend on
+// generated types.
+type HostCheck struct {
+	Name   string
+	OK     bool
+	Detail string
+}
+
+// HostSecurityPosture is a measured hardening snapshot, separate from the
+// capability self-check. A nil posture means no measurement, not a pass.
+type HostSecurityPosture struct {
+	Checks     []HostCheck
+	MeasuredAt time.Time
+}
+
+// HostStatus is the host's self-measured capability profile + `doctor`
+// self-check, reported to the cloud so the BYO fleet view goes live.
+type HostStatus struct {
+	AgentVersion  string
+	CPUCores      int32
+	TotalRAMMB    int32
+	TotalDiskGB   int32
+	TotalGPUCount int32
+	GPUSpec       string
+	// Spare headroom — currently-available, self-measured.
+	AvailRAMMB    int32
+	AvailDiskGB   int32
+	AvailGPUCount int32
+	SelfCheckOK   bool
+	Checks        []HostCheck
+	Posture       *HostSecurityPosture
+}
+
+// StatusProbe gathers the host's current capability profile + self-check.
+// The daemon implements it (hardware introspection + `containarium doctor`);
+// the interface keeps internal/cloud free of those deps and lets the report
+// loop be tested with a fake.
+type StatusProbe interface {
+	Probe(ctx context.Context) (HostStatus, error)
+}
+
+// DriverMinter mints a fresh BYOC driver token (an admin JWT signed with this
+// host's own jwt.secret). Called by the driver-refresh loop (#557) ~every 20
+// days to keep the cloud-stored credential from reaching the 30-day expiry cap.
+// Returns the raw JWT string. The function is optional in Deps; nil = no refresh.
+type DriverMinter func() (string, error)
+
+// Deps are the daemon-provided collaborators. All optional: nil Policies
+// skips network-policy sync, nil Containers skips container reconcile, nil
+// Status skips capability reporting. With all nil the client is
+// heartbeat-only.
+type Deps struct {
+	Policies   PolicySink
+	Containers ContainerActuator
+	Status     StatusProbe
+	// Driver, when non-nil, enables autonomous driver-token refresh (#557).
+	// The daemon provides this when cloud.yaml has a JWTSecretFile set (i.e.
+	// the host enrolled as a BYOC backend with a driver token).
+	Driver DriverMinter
+	// Sessions, when non-nil, handles ASSIGNMENT_KIND_TERMINATE_USER_SESSIONS
+	// assignments (#2522); nil leaves them unhandled.
+	Sessions SessionTerminator
+}
+
+// SessionTerminator ends every live SSH session a user holds on this host
+// without deleting anything. The daemon implements it with the same server
+// function `containarium sessions terminate` reaches; the interface keeps
+// internal/cloud free of an internal/server import.
+type SessionTerminator interface {
+	// orgID, when non-empty, limits the walk to boxes owned by that org (#2546).
+	TerminateUserSessions(ctx context.Context, userID, orgID string) error
+}
+
+// unaryActuation is the subset of the actuation API the client drives over a
+// unary transport (heartbeat + capability report). Both the gRPC
+// ActuationServiceClient and the REST transport (#722) satisfy it; the
+// CallOption args are part of the gRPC signature and ignored by REST.
+type unaryActuation interface {
+	Heartbeat(context.Context, *cloudv1.HeartbeatRequest, ...grpc.CallOption) (*cloudv1.HeartbeatResponse, error)
+	ReportHostStatus(context.Context, *cloudv1.ReportHostStatusRequest, ...grpc.CallOption) (*cloudv1.ReportHostStatusResponse, error)
+	GetSSHTrustBundle(context.Context, *cloudv1.GetSSHTrustBundleRequest, ...grpc.CallOption) (*cloudv1.GetSSHTrustBundleResponse, error)
+}
+
+// sshAuthorizer is the managed-mode SSH authorization call. It is kept
+// separate from unaryActuation because the REST transport does not expose the
+// host-bearer gRPC channel used by AuthorizeSSH.
+type sshAuthorizer interface {
+	AuthorizeSSH(context.Context, *pb.AuthorizeSSHRequest, ...grpc.CallOption) (*pb.AuthorizeSSHResponse, error)
+}
+
+// Client is the host-side cloud-actuation client. Slice 3 implements the
+// heartbeat; WatchAssignments + the reconciler land in slice 4. The actuation
+// proto is vendored (proto/containarium/cloud/v1), so this builds in the default
+// OSS binary with no private dependency; it is inert unless the host is enrolled
+// (~/.containarium/cloud.yaml present).
+type Client struct {
+	cfg        *Config
+	interval   time.Duration
+	sink       PolicySink        // optional; nil = no policy reconcile
+	containers ContainerActuator // optional; nil = no container reconcile
+
+	status StatusProbe  // optional; nil = no capability reporting
+	driver DriverMinter // optional; nil = no driver-token refresh (#557)
+
+	sessions SessionTerminator // optional; nil = terminate assignments ignored
+	// terminated holds the assignment_ids of TERMINATE_USER_SESSIONS
+	// assignments already carried out, so the snapshot resent on every batch
+	// does not end the user's sessions again. In memory: after a daemon
+	// restart a still-live assignment runs once more, which only ends
+	// sessions the cloud still wants ended.
+	terminatedMu sync.Mutex
+	terminated   map[string]bool
+
+	conn *grpc.ClientConn
+	// ac handles the unary actuation RPCs (heartbeat + status); it is either the
+	// gRPC client or the REST transport (#722). watchAC is the gRPC client used
+	// for the WatchAssignments stream — nil in REST mode, where a (push-driven)
+	// BYOC host pulls no assignments and the watch loop is not started.
+	ac      unaryActuation
+	watchAC cloudv1.ActuationServiceClient
+	sshAC   sshAuthorizer
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	mu       sync.Mutex
+	failures int // consecutive heartbeat failures, for observability
+
+	// sshTrustMu guards the SSH CA trust-bundle cache. Separate from mu
+	// (heartbeat bookkeeping) since a caller reading the cache (the
+	// gateway's /authorized-keys handler, on the sentinel-facing side) does
+	// so on every sentinel poll, independent of heartbeat timing.
+	sshTrustMu      sync.Mutex
+	sshTrustVersion string // last version successfully cached; "" = none yet
+	sshTrustFile    string // rendered TrustedUserCAKeys file content for sshTrustVersion
+}
+
+// New builds a client from a validated config. deps are optional collaborators
+// (see Deps) — both nil makes the client heartbeat-only.
+func New(cfg *Config, deps Deps) (*Client, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &Client{
+		cfg: cfg, interval: defaultHeartbeatInterval,
+		sink: deps.Policies, containers: deps.Containers,
+		status: deps.Status, driver: deps.Driver, sessions: deps.Sessions,
+	}, nil
+}
+
+// Start dials the control plane and launches the heartbeat loop. A dial error is
+// returned; per-beat errors are logged and retried (a control-plane outage must
+// not crash the daemon or stop local containers).
+func (c *Client) Start(ctx context.Context) error {
+	if isRESTControlPlane(c.cfg.ControlPlane) {
+		// REST transport (#722): no gRPC dial. WatchAssignments (streaming) is
+		// unavailable over REST, so the watch loop is skipped — a BYOC host on a
+		// REST-only control plane is push-driven (the cloud drives it via the
+		// sentinel peer-proxy) and pulls no assignments.
+		c.ac = newRESTActuation(c.cfg.ControlPlane, c.cfg.Token)
+	} else {
+		conn, err := c.dial()
+		if err != nil {
+			return fmt.Errorf("cloud: dial control plane %s: %w", c.cfg.ControlPlane, err)
+		}
+		c.conn = conn
+		gc := cloudv1.NewActuationServiceClient(conn)
+		c.ac, c.watchAC, c.sshAC = gc, gc, gc
+	}
+	c.ctx, c.cancel = context.WithCancel(ctx)
+
+	c.wg.Add(1)
+	go c.heartbeatLoop()
+	wantWatch := c.sink != nil || c.containers != nil
+	watch := wantWatch && c.watchAC != nil
+	if wantWatch && c.watchAC == nil {
+		log.Printf("[cloud] REST transport: assignment-watch disabled (push-driven host; policy/container pull is gRPC-only)")
+	}
+	if watch {
+		c.wg.Add(1)
+		go c.watchLoop()
+	}
+	if c.status != nil {
+		c.wg.Add(1)
+		go c.statusLoop()
+	}
+	if c.driver != nil {
+		c.wg.Add(1)
+		go c.driverRefreshLoop()
+	}
+	log.Printf("[cloud] actuation client started: host=%s control-plane=%s (heartbeat %s, watch=%v, status=%v, driver-refresh=%v)",
+		c.cfg.HostID, c.cfg.ControlPlane, c.interval, watch, c.status != nil, c.driver != nil)
+	return nil
+}
+
+// AuthorizeSSH forwards a sentinel authorization request over the enrolled
+// host-bearer channel. The cloud call is deliberately bounded here so every
+// managed-mode caller gets the same fail-closed deadline.
+func (c *Client) AuthorizeSSH(ctx context.Context, req *pb.AuthorizeSSHRequest, opts ...grpc.CallOption) (*pb.AuthorizeSSHResponse, error) {
+	if c.sshAC == nil {
+		return nil, fmt.Errorf("cloud: SSH authorization unavailable (client not started or REST transport)")
+	}
+	ctx, cancel := context.WithTimeout(c.authContext(ctx), 2*time.Second)
+	defer cancel()
+	return c.sshAC.AuthorizeSSH(ctx, req, opts...)
+}
+
+// Stop ends the loops and closes the connection. Safe to call once after Start.
+func (c *Client) Stop() {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.wg.Wait()
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+}
+
+func (c *Client) dial() (*grpc.ClientConn, error) {
+	return dialControlPlane(c.cfg.ControlPlane, c.cfg.Insecure)
+}
+
+// dialControlPlane builds a gRPC client connection to the control plane.
+// Shared by the running Client and the one-shot Enroll helper.
+func dialControlPlane(addr string, insecureTLS bool) (*grpc.ClientConn, error) {
+	var creds credentials.TransportCredentials
+	if insecureTLS {
+		creds = insecure.NewCredentials()
+	} else {
+		creds = credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
+	}
+	return grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
+}
+
+// EnrollOptions carries the optional BYOC driver-routing fields of EnrollHost
+// (cloud #554). Both empty = a plain enroll (host registered + heartbeating but
+// not cloud-drivable).
+type EnrollOptions struct {
+	// DriverToken is an admin JWT this host minted with its own jwt.secret;
+	// the cloud seals + replays it to drive this host through the sentinel
+	// peer-proxy.
+	DriverToken string
+	// OSSBackendID is this host's tunnel/`pool join` spot-id — what the
+	// sentinel `/peer/<id>/` proxy keys on.
+	OSSBackendID string
+	// AdoptForeign acknowledges that this host already runs cloud-managed
+	// containers belonging to other organizations, and enrolls it anyway
+	// (cloud #1006). Default false: the cloud refuses such a host rather than
+	// silently claiming it around the existing residents. The cloud makes and
+	// audits the decision — this flag only carries the operator's consent.
+	AdoptForeign bool
+}
+
+// Enroll redeems a single-use join token against the control plane and
+// returns the registered host id plus the durable host bearer to persist.
+// One-shot (no running client / host bearer yet — the token authenticates
+// itself in the body). Used by `containarium cloud enroll` for the BYO
+// self-service flow.
+//
+// On a FIRST enroll, the returned host id matches the join token's own
+// embedded host_id, so the bearer is (coincidentally) the join token itself.
+// On a RE-enroll (cloud #572, an existing host row matched by oss_backend_id),
+// the cloud updates the EXISTING row's bearer hash but returns that row's own,
+// different id — the join token's embedded host_id was only ever a throwaway,
+// never itself created as a host row. Persisting the raw join token in that
+// case produces a bearer whose embedded host_id resolves to nothing, and
+// every subsequent heartbeat/status call permanently 401s. bearerToken is
+// therefore always reconstructed as "<returned host id>.<token's secret
+// half>" rather than returning the raw joinToken — correct in both cases,
+// and a no-op string-rebuild on first enroll.
+//
+// opts optionally carries the BYOC driver token + backend id (cloud #554) so a
+// tunnel-joined host becomes cloud-drivable in the same round-trip.
+func Enroll(ctx context.Context, controlPlane, joinToken string, insecureTLS bool, opts EnrollOptions) (hostID, bearerToken string, err error) {
+	// REST control plane (#722): redeem over grpc-gateway instead of gRPC.
+	if isRESTControlPlane(controlPlane) {
+		return enrollREST(ctx, controlPlane, joinToken, opts)
+	}
+	conn, err := dialControlPlane(controlPlane, insecureTLS)
+	if err != nil {
+		return "", "", fmt.Errorf("cloud: dial control plane %s: %w", controlPlane, err)
+	}
+	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	resp, err := cloudv1.NewActuationServiceClient(conn).EnrollHost(ctx, &cloudv1.EnrollHostRequest{
+		JoinToken:    joinToken,
+		DriverToken:  opts.DriverToken,
+		OssBackendId: opts.OSSBackendID,
+		AdoptForeign: opts.AdoptForeign,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("cloud: enroll: %w", err)
+	}
+	return resp.GetHostId(), rebuildBearer(resp.GetHostId(), joinToken), nil
+}
+
+// rebuildBearer reconstructs a "<hostID>.<secret>" host bearer from a freshly
+// enrolled/re-enrolled host id and the join token presented to redeem it. The
+// join token is itself "<throwaway host_id>.<secret>" — only the secret half
+// is reused; the durable bearer's host_id is always the id the cloud actually
+// returned. Falls back to the raw joinToken if it isn't in the expected
+// "<id>.<secret>" shape (defensive; the server would already have rejected a
+// malformed token before responding).
+func rebuildBearer(hostID, joinToken string) string {
+	_, secret, ok := strings.Cut(joinToken, ".")
+	if !ok || secret == "" {
+		return joinToken
+	}
+	return hostID + "." + secret
+}
+
+// statusLoop reports the host's capability profile + self-check on the same
+// cadence as the heartbeat. Best-effort: a failed probe or RPC is logged and
+// retried next tick — capability staleness must never crash the daemon.
+func (c *Client) statusLoop() {
+	defer c.wg.Done()
+	t := time.NewTicker(c.interval)
+	defer t.Stop()
+	c.reportStatusOnce() // immediate first report so the fleet row goes live fast
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+			c.reportStatusOnce()
+		}
+	}
+}
+
+func (c *Client) reportStatusOnce() {
+	st, err := c.status.Probe(c.ctx)
+	if err != nil {
+		log.Printf("[cloud] status probe failed: %v", err)
