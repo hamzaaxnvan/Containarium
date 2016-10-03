@@ -71,3 +71,149 @@ compose disable
 compose discover
 compose enable
 compose status
+config get-token
+connect
+console
+create
+crew get
+crew list
+crew logs
+crew plan
+crew plan validate
+crew run
+crew status
+debug
+delete
+egress-via-client
+expose-port
+gateway key delete
+gateway key set
+gateway key status
+gateway mint
+gateway models
+get
+guardrail apply
+guardrail baseline set
+guardrail keygen
+guardrail policy get
+guardrail policy set
+guardrail scan
+guardrail signer bundle
+guardrail signer revoke
+guardrail signer rotate
+guardrail status
+guardrail verify
+info
+install-stack
+kms envelope-coverage
+kms migrate-to-envelope
+kms status
+label list
+label remove
+label set
+list
+login
+logout
+monitoring disable
+monitoring enable
+monitoring export disable
+monitoring export enable
+monitoring export status
+move
+moved:audit
+moved:cloud
+moved:daemon
+moved:doctor
+moved:egress-relay
+moved:export
+moved:hosting
+moved:hypervisor-agent
+moved:image-bake
+moved:node
+moved:passthrough
+moved:portforward
+moved:recover
+moved:sentinel
+moved:service
+moved:sync-accounts
+moved:tunnel
+moved:upgrade-watchdog
+network-guard status
+network-policy access apply
+network-policy access preview
+network-policy delete
+network-policy get
+network-policy list
+network-policy patch add
+network-policy patch list
+network-policy patch rm
+network-policy plan
+network-policy set
+network-policy signature add
+network-policy signature list
+network-policy signature rm
+network-policy status
+network-tenant capabilities
+notify delete
+notify set ntfy
+notify show
+notify test
+org get-default-region
+org set-default-region
+passthrough-route add
+passthrough-route list
+passthrough-route remove
+pki generate-ca
+pool list
+protect
+prune
+push
+quickstart
+recipe deploy
+recipe get
+recipe list
+recipe workspace-access
+regions
+remind-me
+resize
+retention hold list
+retention hold release
+retention hold set
+retention mode get
+retention mode set
+retention policy get
+retention policy set
+retention report
+route add
+route delete
+route list
+runner list
+runner provision
+runner reconcile
+runner remove
+sandbox delete
+sandbox exec
+sandbox pool-status
+sandbox read-file
+sandbox spawn
+sandbox write-file
+scale-down disable
+scale-down enable
+scale-down status
+secrets clear-kms-key
+secrets delete
+secrets get
+secrets list
+secrets refresh
+secrets set
+secrets set-kms-key
+security bad-destinations add
+security bad-destinations list
+security bad-destinations remove
+security clamav install
+security exec-events
+security findings
+security findings list
+security findings resolve
+security miner-signatures add
+security miner-signatures list
