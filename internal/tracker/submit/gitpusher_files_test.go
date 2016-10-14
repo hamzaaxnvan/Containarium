@@ -57,3 +57,33 @@ func TestGitPusher_RealGit_CommitsFilesOnTopOfHead(t *testing.T) {
 		t.Fatalf("PushBundle: %v", err)
 	}
 	if result.SHA == headSHA || len(result.SHA) != 40 {
+		t.Fatalf("result.SHA = %q, want a new commit on top of %s", result.SHA, headSHA)
+	}
+	remoteTip := testGit(t, root, "ls-remote", originDir, "refs/heads/"+result.Branch)
+	if !strings.HasPrefix(remoteTip, result.SHA) {
+		t.Fatalf("remote %s = %q, want %s", result.Branch, remoteTip, result.SHA)
+	}
+	if parent := testGit(t, root, "--git-dir", originDir, "rev-parse", result.SHA+"^"); parent != headSHA {
+		t.Errorf("parent = %s, want the agent's head %s", parent, headSHA)
+	}
+	if got := testGit(t, root, "--git-dir", originDir, "show", result.SHA+":.containarium/proof-pack.json"); got != `{"sealed":true}` {
+		t.Errorf("attached file = %q, want the daemon's content, not the agent's", got)
+	}
+	if got := testGit(t, root, "--git-dir", originDir, "show", result.SHA+":README.md"); got != "base" {
+		t.Errorf("README.md = %q, rest of the tree must be unchanged", got)
+	}
+	if msg := testGit(t, root, "--git-dir", originDir, "log", "-1", "--format=%s", result.SHA); msg != "Add Proof Pack" {
+		t.Errorf("commit message = %q", msg)
+	}
+}
+
+// idRunner is a fake gitRunFunc that records calls and prints a plausible
+// object id for each object-writing subcommand, or what out overrides, so a
+// test reaches exactly the guard it is about.
+func idRunner(calls *[]recordedCall, out map[string]string) gitRunFunc {
+	return func(_ context.Context, env []string, args []string) (string, string, error) {
+		*calls = append(*calls, recordedCall{env: append([]string(nil), env...), args: append([]string(nil), args...)})
+		for _, sub := range []string{"hash-object", "write-tree", "commit-tree"} {
+			if contains(args, sub) {
+				if v, ok := out[sub]; ok {
+					return v, "", nil

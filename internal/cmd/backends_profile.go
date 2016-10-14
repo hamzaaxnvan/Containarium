@@ -89,3 +89,49 @@ type profileBackendResp struct {
 	BackendID string             `json:"backendId"`
 }
 
+func runBackendsProfile(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (the platform daemon's HTTP address, e.g. http://host:8080)")
+	}
+	backendID := ""
+	if len(args) == 1 {
+		backendID = args[0]
+	}
+
+	url := strings.TrimSuffix(serverAddr, "/") + "/v1/capabilities/profile"
+	var req *http.Request
+	var err error
+	if profileBackendGet {
+		if backendID != "" {
+			url += "?backend_id=" + backendID
+		}
+		req, err = http.NewRequest("GET", url, nil)
+	} else {
+		reqBody, _ := json.Marshal(profileBackendReq{BackendID: backendID, SkipGpu: profileBackendSkipGPU})
+		req, err = http.NewRequest("POST", url, bytes.NewReader(reqBody))
+	}
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+
+	// Generous timeout: recording runs a micro-benchmark and (unless skipped)
+	// creates+starts+execs+deletes a throwaway GPU probe LXC.
+	httpClient := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	if profileBackendFormat == "json" {
+		if _, err := cmd.OutOrStdout().Write(body); err != nil {
+			return fmt.Errorf("write response: %w", err)
+		}
