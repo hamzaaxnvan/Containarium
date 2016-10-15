@@ -89,3 +89,48 @@ func TestAllocate_ExhaustedRangeReturnsTypedError(t *testing.T) {
 
 	if _, err := a.Allocate(); err != nil {
 		t.Fatalf("Allocate 1: %v", err)
+	}
+	if _, err := a.Allocate(); err != nil {
+		t.Fatalf("Allocate 2: %v", err)
+	}
+	_, err = a.Allocate()
+	if !errors.Is(err, ErrExhausted) {
+		t.Fatalf("Allocate 3 (exhausted) = %v, want ErrExhausted", err)
+	}
+}
+
+func TestAllocate_SkipsQuarantinedAddressUntilItExpires(t *testing.T) {
+	// A 2-address range makes the quarantine unambiguous: after releasing
+	// the first address, the ONLY way Allocate can succeed a second time
+	// while the first is quarantined is by handing out the second address
+	// — and once the quarantine elapses, the freed one becomes available
+	// again.
+	const quarantine = 60 * time.Millisecond
+	a, err := New("10.0.0.1", "10.0.0.2", "10.0.0.254", quarantine)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	first, err := a.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate 1: %v", err)
+	}
+	second, err := a.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate 2: %v", err)
+	}
+	if first.Equal(second) {
+		t.Fatalf("Allocate returned the same address twice: %s", first)
+	}
+
+	if err := a.Release(first); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	// Range is now fully exhausted except for `first`, which is
+	// quarantined — Allocate must fail, not silently ignore quarantine.
+	if _, err := a.Allocate(); !errors.Is(err, ErrExhausted) {
+		t.Fatalf("Allocate immediately after release = %v, want ErrExhausted (quarantine not yet elapsed)", err)
+	}
+
+	time.Sleep(quarantine + 20*time.Millisecond)

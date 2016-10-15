@@ -29,35 +29,3 @@ func (authorizationTestTokens) TokenFor(string) (string, bool, error) { return "
 func (authorizationTestTokens) Backends() ([]string, error)           { return []string{"test-backend"}, nil }
 
 func TestShipOnce_AuthorizationAndLegacyJSONL(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		input string
-		want  *pb.SSHSessionRecord
-	}{
-		{"legacy", `{"session_id":"legacy","phase":"open","occurred_at":"2026-10-13T00:00:00Z","login":"test-login"}`, &pb.SSHSessionRecord{
-			SessionId: "legacy", Phase: pb.SSHSessionPhase_SSH_SESSION_PHASE_OPEN,
-		}},
-		{"audit-only open", `{"session_id":"audit","phase":"open","occurred_at":"2026-10-13T00:00:00Z","login":"test-login","user_id":"user-test","authz_decision":2,"deny_reason":1,"enforced":false}`, &pb.SSHSessionRecord{
-			SessionId: "audit", Phase: pb.SSHSessionPhase_SSH_SESSION_PHASE_OPEN, UserId: "user-test",
-			AuthzDecision: pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_DENY, DenyReason: pb.SSHDenyReason_SSH_DENY_REASON_UNKNOWN_KEY,
-		}},
-		{"enforced denied", `{"session_id":"denied","phase":"denied","occurred_at":"2026-10-13T00:00:00Z","login":"test-login","user_id":"user-test","authz_decision":2,"deny_reason":2,"enforced":true}`, &pb.SSHSessionRecord{
-			SessionId: "denied", Phase: pb.SSHSessionPhase_SSH_SESSION_PHASE_DENIED, UserId: "user-test", Enforced: true,
-			AuthzDecision: pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_DENY, DenyReason: pb.SSHDenyReason_SSH_DENY_REASON_USER_INACTIVE,
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "sessions.jsonl")
-			if err := os.WriteFile(path, []byte(tc.input+"\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			capture := &authorizationCaptureClient{}
-			cfg := ShipConfig{RecordsFile: path, CheckpointFile: filepath.Join(dir, "checkpoint.json"),
-				DefaultBackend: "test-backend", Tokens: authorizationTestTokens{},
-				NewClient: func(string, string) (IngestClient, error) { return capture, nil },
-			}
-			stats, err := ShipOnce(context.Background(), cfg)
-			if err != nil || stats.Shipped != 1 || stats.SkippedMalformed != 0 || len(capture.records) != 1 {
-				t.Fatalf("stats=%+v captured=%d err=%v", stats, len(capture.records), err)
-			}
