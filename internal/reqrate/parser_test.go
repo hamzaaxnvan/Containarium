@@ -17,3 +17,22 @@ func TestParseHost(t *testing.T) {
 		},
 		{
 			name:     "host carries a port",
+			line:     `{"msg":"handled request","request":{"host":"bob.example.com:443"}}`,
+			wantHost: "bob.example.com",
+			wantOK:   true,
+		},
+		{
+			name:     "uppercase host is lower-cased",
+			line:     `{"request":{"host":"Carol.Example.COM"}}`,
+			wantHost: "carol.example.com",
+			wantOK:   true,
+		},
+		{
+			name:   "not json",
+			line:   `this is not json`,
+			wantOK: false,
+		},
+		{
+			name:   "json without a request host (e.g. a startup line)",
+			line:   `{"level":"info","msg":"serving initial configuration"}`,
+			wantOK: false,
