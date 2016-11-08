@@ -19,3 +19,45 @@ set -euo pipefail
 release_only() {
   local base="$1" head="$2" files f other
 
+  files="$(git diff --no-renames --name-only "$base" "$head")"
+  if [ -z "$files" ]; then
+    echo "empty diff" >&2
+    echo false
+    return
+  fi
+
+  while IFS= read -r f; do
+    case "$f" in
+      CHANGELOG.md | pkg/version/version.go) ;;
+      *)
+        echo "touches $f" >&2
+        echo false
+        return
+        ;;
+    esac
+  done <<<"$files"
+
+  # Every changed line in version.go must be the Version constant.
+  other="$(git diff --no-renames -U0 "$base" "$head" -- pkg/version/version.go \
+    | grep -E '^[+-]' \
+    | grep -vE '^(\+\+\+|---) ' \
+    | grep -vE '^[+-][[:space:]]*Version[[:space:]]*=[[:space:]]*"[^"]*"[[:space:]]*$' || true)"
+  if [ -n "$other" ]; then
+    echo "pkg/version/version.go changes more than the Version constant" >&2
+    echo false
+    return
+  fi
+
+  echo "release-only diff: $(tr '\n' ' ' <<<"$files")" >&2
+  echo true
+}
+
+self_test() {
+  local dir fails=0 base
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' RETURN
+  git -C "$dir" init -q
+  git -C "$dir" config user.email t@example.com
+  git -C "$dir" config user.name t
+  mkdir -p "$dir/pkg/version" "$dir/internal"
+  printf '# Changelog\n\n## [Unreleased]\n' >"$dir/CHANGELOG.md"
