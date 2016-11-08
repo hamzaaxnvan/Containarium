@@ -34,3 +34,21 @@ export const AgentCredentialSourceValues = [
   'AGENT_CREDENTIAL_SOURCE_UNSPECIFIED',
   'AGENT_CREDENTIAL_SOURCE_GLOBAL_KEY',
   'AGENT_CREDENTIAL_SOURCE_OWNER_KEY',
+  'AGENT_CREDENTIAL_SOURCE_DIRECT_MODE',
+] as const;
+export const AgentCredentialSourceSchema = z.enum(AgentCredentialSourceValues).default('AGENT_CREDENTIAL_SOURCE_UNSPECIFIED');
+export type AgentCredentialSource = z.infer<typeof AgentCredentialSourceSchema>;
+
+export const GatewayProviderValues = [
+  'GATEWAY_PROVIDER_UNSPECIFIED',
+  'GATEWAY_PROVIDER_ANTHROPIC',
+  'GATEWAY_PROVIDER_OPENAI',
+  'GATEWAY_PROVIDER_GEMINI',
+  'GATEWAY_PROVIDER_GEMINI_OPENAI',
+  'GATEWAY_PROVIDER_KAFEIDO',
+] as const;
+export const GatewayProviderSchema = z.enum(GatewayProviderValues).default('GATEWAY_PROVIDER_UNSPECIFIED');
+export type GatewayProvider = z.infer<typeof GatewayProviderSchema>;
+
+export const AgentEngineStatusSchema = z.object({
+  engine: AgentEngineSchema,
