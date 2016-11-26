@@ -1,0 +1,112 @@
+package retention
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+)
+
+const (
+	gwClass   = pb.RetentionClass_RETENTION_CLASS_GATEWAY_LOGS
+	sessClass = pb.RetentionClass_RETENTION_CLASS_SESSION_TRANSCRIPTS
+)
+
+// fakePrefix is a PrefixSource over a fixed answer. It records what it was
+// asked and the order of its calls, to pin that nothing is removed before the
+// audit entry exists.
+type fakePrefix struct {
+	count     PrefixCount
+	countErr  error
+	removal   PrefixRemoval
+	removeErr error
+
+	countCutoffs  map[pb.RetentionClass]time.Time
+	removeCutoffs map[pb.RetentionClass]time.Time
+	removeHeld    []string
+	removeMax     int
+	removed       int
+	log           *[]string
+}
+
+func (f *fakePrefix) Store() string { return "audit_logs" }
+func (f *fakePrefix) Classes() []pb.RetentionClass {
+	return []pb.RetentionClass{gwClass, sessClass}
+}
+func (f *fakePrefix) CountPrefix(_ context.Context, c map[pb.RetentionClass]time.Time, _ []string) (PrefixCount, error) {
+	f.countCutoffs = c
+	return f.count, f.countErr
+}
+func (f *fakePrefix) RemovePrefix(_ context.Context, c map[pb.RetentionClass]time.Time, held []string, max int) (PrefixRemoval, error) {
+	f.removed++
+	f.removeCutoffs, f.removeHeld, f.removeMax = c, held, max
+	if f.log != nil {
+		*f.log = append(*f.log, "remove")
+	}
+	return f.removal, f.removeErr
+}
+
+func chainBase(id int64) *pb.RetentionChainBase {
+	return &pb.RetentionChainBase{BaseId: id, BaseHash: "h", PurgedAt: timestamppb.New(fixedNow()), RowsPurged: id}
+}
+
+func eligibleChain() *fakePrefix {
+	return &fakePrefix{
+		count: PrefixCount{
+			ByClass: map[pb.RetentionClass]Count{
+				gwClass:   {Older: 9, Eligible: 7},
+				sessClass: {Older: 4, Eligible: 3},
+			},
+			Base: chainBase(10),
+			Note: "bounded by the anchor at id 500",
+		},
+		removal: PrefixRemoval{
+			RemovedByClass: map[pb.RetentionClass]int64{gwClass: 7, sessClass: 3},
+			Base:           chainBase(510),
+		},
+	}
+}
+
+func chainUnswept() []Unswept {
+	return []Unswept{
+		{Class: gwClass, Store: "audit_logs", Note: "not swept (#2878)"},
+		{Class: sessClass, Store: "audit_logs", Note: "not swept (#2878)"},
+		{Class: pb.RetentionClass_RETENTION_CLASS_EVIDENCE_BUNDLES, Store: "evidence_bundles", Note: "no store"},
+	}
+}
+
+func TestPrefixSource_DryRunReportsEachClassAndNeverRemoves(t *testing.T) {
+	p := eligibleChain()
+	sw := newTestSweeper(t, NewMemoryStore(), nil, chainUnswept())
+	sw.AddPrefixSource(p)
+
+	rep, err := sw.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if p.removed != 0 {
+		t.Fatalf("RemovePrefix called %d times in DRY_RUN, want never", p.removed)
+	}
+	gw := findStore(t, rep, gwClass, "audit_logs")
+	if gw.GetStatus() != pb.RetentionSweepStatus_RETENTION_SWEEP_STATUS_COUNTED ||
+		gw.GetOlderThanCutoff() != 9 || gw.GetEligible() != 7 || gw.GetHeld() != 2 || gw.GetRemoved() != 0 {
+		t.Errorf("gateway-logs entry = %v, want COUNTED with 9 older, 7 eligible, 2 kept, 0 removed", gw)
+	}
+	if gw.GetChainBase().GetBaseId() != 10 || !strings.Contains(gw.GetNote(), "anchor at id 500") {
+		t.Errorf("gateway-logs entry should carry the current base (10) and the bounding note, got %v", gw)
+	}
+	sess := findStore(t, rep, sessClass, "audit_logs")
+	if sess.GetEligible() != 3 || sess.GetOlderThanCutoff() != 4 {
+		t.Errorf("session entry = %v, want 4 older and 3 eligible", sess)
+	}
+	// Each class is counted against its own window.
+	if want := fixedNow().AddDate(0, 0, -90); !p.countCutoffs[gwClass].Equal(want) || !p.countCutoffs[sessClass].Equal(want) {
+		t.Errorf("cutoffs = %v, want both at the 90-day default %v", p.countCutoffs, want)
+	}
+	// The chained entries are no longer "not swept".
+	for _, s := range rep.GetStores() {
