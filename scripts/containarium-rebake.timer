@@ -1,0 +1,5 @@
+[Unit]
+Description=Containarium weekly base-image re-bake timer
+Documentation=https://github.com/footprintai/Containarium/issues/1037
+
+[Timer]
