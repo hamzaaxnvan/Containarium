@@ -146,3 +146,151 @@ func assertLeaseEnded(t *testing.T, h *crewLeaseHarness, runID, skillID, reason 
 		if !revoked {
 			t.Errorf("member %s: credential %s was never revoked — its lease outlived the crew run", skillID, jti)
 		}
+	}
+	for _, r := range listRevocations(t, h.revocations) {
+		if strings.HasSuffix(r.JTI, "-"+skillID) && r.Reason != reason {
+			t.Errorf("member %s: %s revoked with reason %q, want %q", skillID, r.JTI, r.Reason, reason)
+		}
+	}
+
+	// The wipe + removal land in the member's OWN box, so "which box did the
+	// rm -rf run in" is what distinguishes member leases from each other.
+	box := "agent-" + skillID + "-container"
+	seedDir, workspace := seedDirFor(runID), workspaceDirFor(runID)
+	var wipes, removals int
+	for i, cmd := range h.wiper.cmds {
+		if h.wiper.boxes[i] != box {
+			continue
+		}
+		joined := strings.Join(cmd, " ")
+		switch {
+		case joined == strings.Join([]string{"rm", "-f", seedDir + "/token", seedDir + "/gateway.env"}, " "):
+			wipes++
+		case joined == strings.Join([]string{"rm", "-rf", seedDir, workspace}, " "):
+			removals++
+		default:
+			t.Errorf("member %s: unexpected exec in its box: %v", skillID, cmd)
+		}
+	}
+	if wipes != 1 {
+		t.Errorf("member %s: seed-file wipes in %s = %d, want 1", skillID, box, wipes)
+	}
+	if removals != 1 {
+		t.Errorf("member %s: seed dir + workspace removals in %s = %d, want 1 — the fetched repo is still in the box", skillID, box, removals)
+	}
+}
+
+// endRowsFor returns the run's agent.run_lease_end audit rows, decoded.
+func endRowsFor(t *testing.T, h *crewLeaseHarness, runID string) []runLeaseEndDetail {
+	t.Helper()
+	var out []runLeaseEndDetail
+	for _, e := range h.audits.byAction("agent.run_lease_end") {
+		if e.RunID != runID {
+			t.Errorf("agent.run_lease_end row run_id = %q, want the crew run's id %q", e.RunID, runID)
+		}
+		var d runLeaseEndDetail
+		if err := json.Unmarshal([]byte(e.Detail), &d); err != nil {
+			t.Fatalf("agent.run_lease_end detail is not the typed struct: %v", err)
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// assertEndRows checks one agent.run_lease_end row per member, each recording
+// the reason and that the wipe + directory removal actually happened.
+func assertEndRows(t *testing.T, h *crewLeaseHarness, runID, reason string, wantMembers int) {
+	t.Helper()
+	rows := endRowsFor(t, h, runID)
+	if len(rows) != wantMembers {
+		t.Fatalf("agent.run_lease_end rows = %d, want one per member (%d) — a crew run's audit trail must show every member's lease closing",
+			len(rows), wantMembers)
+	}
+	var revoked []string
+	for _, d := range rows {
+		if d.Reason != reason {
+			t.Errorf("end row reason = %q, want %q", d.Reason, reason)
+		}
+		if !d.Wiped {
+			t.Error("end row says the seed files were not wiped")
+		}
+		if !d.DirsRemoved {
+			t.Error("end row says the seed dir + workspace were not removed")
+		}
+		if len(d.Errors) != 0 {
+			t.Errorf("end row reports errors: %v", d.Errors)
+		}
+		revoked = append(revoked, d.Revoked...)
+	}
+	if len(revoked) != 2*wantMembers {
+		t.Errorf("credentials revoked across the run = %d, want 2 per member (%d): %v", len(revoked), 2*wantMembers, revoked)
+	}
+}
+
+// TestRunCrew_EndsEveryMemberLeaseOnSuccess is terminal path 1: driveCrew
+// returns an artifact, the run lands COMPLETED, and no member is left holding
+// a live gateway token or a checkout of the repo.
+func TestRunCrew_EndsEveryMemberLeaseOnSuccess(t *testing.T) {
+	h := newCrewLeaseHarness(t, "relay-agent", "hello-agent")
+	const runID = "run-crew-success"
+
+	resp, err := h.run(t, runID, func(_ context.Context, req *pb.SendAgentTaskRequest) (*pb.SendAgentTaskResponse, error) {
+		return completed("out-of-" + req.ToPeerId), nil
+	})
+	if err != nil {
+		t.Fatalf("runCrew: %v", err)
+	}
+	if got := resp.GetRun().GetState(); got != pb.CrewRunState_CREW_RUN_STATE_COMPLETED {
+		t.Fatalf("state = %v, want COMPLETED", got)
+	}
+	if got := h.provisioner.provided; len(got) != 2 {
+		t.Fatalf("provisioned members = %v, want both", got)
+	}
+
+	for _, sid := range []string{"relay-agent", "hello-agent"} {
+		assertLeaseEnded(t, h, runID, sid, runExitReason)
+	}
+	assertEndRows(t, h, runID, runExitReason, 2)
+}
+
+// TestRunCrew_EndsEveryMemberLeaseOnDriveFailure is terminal path 2: driveCrew
+// fails (a member's A2A server never came up), the run lands FAILED rather
+// than erroring the RPC — and every member's lease still ends. A FAILED run is
+// exactly the case where credentials are most likely to be forgotten.
+func TestRunCrew_EndsEveryMemberLeaseOnDriveFailure(t *testing.T) {
+	h := newCrewLeaseHarness(t, "relay-agent", "hello-agent")
+	const runID = "run-crew-drive-failed"
+
+	resp, err := h.run(t, runID, func(_ context.Context, _ *pb.SendAgentTaskRequest) (*pb.SendAgentTaskResponse, error) {
+		return nil, errors.New("a2a server not up")
+	})
+	if err != nil {
+		t.Fatalf("a driveCrew failure must land in the run, not error the RPC: %v", err)
+	}
+	if got := resp.GetRun().GetState(); got != pb.CrewRunState_CREW_RUN_STATE_FAILED {
+		t.Fatalf("state = %v, want FAILED", got)
+	}
+
+	for _, sid := range []string{"relay-agent", "hello-agent"} {
+		assertLeaseEnded(t, h, runID, sid, runExitReason)
+	}
+	assertEndRows(t, h, runID, runExitReason, 2)
+}
+
+// TestRunCrew_EndsAlreadyProvisionedLeasesOnProvisionFailure is terminal path
+// 3, and the one the issue calls out specifically: member 2's provisioning
+// fails, so the RPC returns an error — but member 1 is already provisioned and
+// running in serve mode with live credentials and a checkout. Nothing will
+// ever come back for it (this RPC IS the run), so its lease must end here.
+// Asserting only "the RPC errored" would pass against the old, leaking code.
+func TestRunCrew_EndsAlreadyProvisionedLeasesOnProvisionFailure(t *testing.T) {
+	h := newCrewLeaseHarness(t, "relay-agent", "hello-agent")
+	h.provisioner.failOn = "hello-agent" // the SECOND member fails
+	const runID = "run-crew-provision-failed"
+
+	_, err := h.run(t, runID, func(_ context.Context, _ *pb.SendAgentTaskRequest) (*pb.SendAgentTaskResponse, error) {
+		t.Error("driveCrew must not run when a member failed to provision")
+		return nil, errors.New("unreachable")
+	})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("code = %v, want Internal: %v", status.Code(err), err)
