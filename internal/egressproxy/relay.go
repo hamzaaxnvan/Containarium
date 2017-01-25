@@ -117,3 +117,43 @@ func (r *Relay) StartBackground(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", r.listen, err)
 	}
+	r.mu.Lock()
+	r.ln = ln
+	r.mu.Unlock()
+	go func() { _ = r.serveListener(ctx, ln) }()
+	return nil
+}
+
+// Addr returns the actually-bound listen address, or "" if not yet bound.
+func (r *Relay) Addr() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ln != nil {
+		return r.ln.Addr().String()
+	}
+	return ""
+}
+
+func (r *Relay) serveListener(ctx context.Context, ln net.Listener) error {
+	r.logf("egress-relay %s -> %s (allow %v)", ln.Addr(), r.upstream, r.allow)
+
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return fmt.Errorf("accept: %w", err)
+			}
+		}
+		go r.handle(c)
+	}
+}
+
+func (r *Relay) handle(c net.Conn) {
