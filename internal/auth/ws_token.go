@@ -70,3 +70,39 @@ func (s TokenSource) String() string {
 //  1. Sec-WebSocket-Protocol — first non-"containarium.bearer"
 //     entry. This is the preferred form.
 //  2. Authorization: Bearer <token>
+//  3. ?token=<token> — deprecated, kept for backwards-compat.
+//
+// Returns the empty string + TokenSourceNone if no token is
+// present. Callers MUST still validate the token before
+// trusting it; this function only locates the bytes.
+func ExtractBearerForUpgrade(r *http.Request) (token string, source TokenSource) {
+	// 1. Sec-WebSocket-Protocol. http.Header normalizes the key.
+	//
+	// The value is a comma-separated list per RFC 6455 §4.1; the
+	// browser sends every entry of the JS subprotocol array as
+	// one comma-separated header. We look for the bearer marker
+	// and treat the *next* non-marker entry as the token.
+	if v := r.Header.Get("Sec-WebSocket-Protocol"); v != "" {
+		entries := splitSubprotocols(v)
+		sawMarker := false
+		for _, e := range entries {
+			if e == WSSubprotocolBearer {
+				sawMarker = true
+				continue
+			}
+			if sawMarker && e != "" {
+				return e, TokenSourceSubprotocol
+			}
+		}
+		// Some clients send the JWT as the only entry without
+		// the marker. That's still better than ?token=; accept
+		// it if it looks like a JWT (3 dot-separated b64 parts).
+		for _, e := range entries {
+			if looksLikeJWT(e) {
+				return e, TokenSourceSubprotocol
+			}
+		}
+	}
+
+	// 2. Authorization header.
+	if v := r.Header.Get("Authorization"); strings.HasPrefix(v, "Bearer ") {
