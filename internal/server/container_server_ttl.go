@@ -84,3 +84,46 @@ func (s *ContainerServer) SetContainerTTL(ctx context.Context, req *pb.SetContai
 				return nil, status.Errorf(codes.Internal, "failed to clear ttl: %v", err)
 			}
 			log.Printf("[ttl] cleared container=%s", containerName)
+			return resp, nil
+		}
+		expiresAt := time.Now().Add(time.Duration(req.DurationSeconds) * time.Second).UTC()
+		if err := tc.SetTTL(ctx, ref, &expiresAt); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to set ttl: %v", err)
+		}
+		log.Printf("[ttl] set container=%s expires_at=%s (duration=%ds)", containerName, expiresAt.Format(time.RFC3339), req.DurationSeconds)
+		resp.TtlExpiresAt = timestamppb.New(expiresAt)
+		return resp, nil
+	}
+
+	if req.DurationSeconds == 0 {
+		// Clear: remove the key entirely so parseTTLExpiresAt and the
+		// sweeper see "absent" rather than "empty string". UnsetConfig
+		// is idempotent — clearing an already-clear TTL is a no-op
+		// followed by a no-op response (TtlExpiresAt zero-value).
+		if err := s.manager.UnsetConfig(containerName, incus.TTLExpiresAtKey); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to clear %s: %v", incus.TTLExpiresAtKey, err)
+		}
+		log.Printf("[ttl] cleared container=%s", containerName)
+		return resp, nil
+	}
+
+	// Set: stamp now() + duration in UTC RFC3339 so the sweeper's
+	// time.Parse round-trips with the same precision. Capping is
+	// already enforced above.
+	expiresAt, err := s.stampTTL(containerName, req.DurationSeconds)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to set %s: %v", incus.TTLExpiresAtKey, err)
+	}
+	log.Printf("[ttl] set container=%s expires_at=%s (duration=%ds)", containerName, expiresAt.Format(time.RFC3339), req.DurationSeconds)
+	resp.TtlExpiresAt = timestamppb.New(expiresAt)
+	return resp, nil
+}
+
+// validateTTLSeconds checks a requested TTL duration against the bounds
+// shared by SetContainerTTL and the birth-TTL path in CreateContainer (#523).
+// Zero is always valid — it means "no TTL" on create and "clear the TTL" on
+// set, so callers handle the zero case themselves. Negative and over-cap
+// (> maxTTLSeconds, 7 days) return InvalidArgument so the two entry points
+// reject identical input identically.
+func validateTTLSeconds(seconds int64) error {
+	if seconds < 0 {
