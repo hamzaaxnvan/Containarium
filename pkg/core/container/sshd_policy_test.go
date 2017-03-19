@@ -30,35 +30,3 @@ func TestInstallPackages_WritesKeyOnlySSHDDropIn(t *testing.T) {
 			if !bytes.Equal(got, sshdpolicy.DropInContent()) {
 				t.Errorf("drop-in content differs from sshdpolicy.DropInContent()")
 			}
-			if b.modes[sshdpolicy.DropInPath] != sshdpolicy.DropInMode {
-				t.Errorf("mode = %q, want %s", b.modes[sshdpolicy.DropInPath], sshdpolicy.DropInMode)
-			}
-			if !sshdpolicy.Evaluate(string(got)).Compliant() {
-				t.Errorf("what we write must itself evaluate as key-only")
-			}
-
-			svc := ospkg.ForFamily(family).SSHServiceName()
-			restart := slices.IndexFunc(b.execs, func(c []string) bool {
-				return slices.Equal(c, []string{"systemctl", "restart", svc})
-			})
-			if restart < 0 {
-				t.Fatalf("sshd must be RESTARTED (not started) so a pre-running sshd picks the drop-in up; execs: %v", b.execs)
-			}
-			if slices.ContainsFunc(b.execs, func(c []string) bool { return slices.Equal(c, []string{"systemctl", "start", svc}) }) {
-				t.Errorf("plain `start` leaves an already-running sshd on the old config")
-			}
-			mkdir := slices.IndexFunc(b.execs, func(c []string) bool {
-				return len(c) == 3 && c[0] == "mkdir" && c[2] == sshdpolicy.DropInDir
-			})
-			if mkdir < 0 || mkdir > restart {
-				t.Errorf("drop-in dir must be created before the restart; mkdir at %d, restart at %d", mkdir, restart)
-			}
-		})
-	}
-}
-
-// Unlike the cosmetic login hook, a failed policy write fails provisioning:
-// a box the daemon cannot write into is not one it should hand out.
-func TestInstallPackages_SSHDDropInWriteFailureIsFatal(t *testing.T) {
-	b := &provisionRecorder{writeFileErr: errors.New("push failed"), failPath: sshdpolicy.DropInPath}
-	err := NewWithBackend(b).installPackages("box-container", false, "", nil, "", ostype.Debian)
