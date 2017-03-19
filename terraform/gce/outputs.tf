@@ -27,3 +27,18 @@ output "sentinel_enabled" {
   value       = module.containarium.sentinel_enabled
 }
 
+output "sentinel_vm_name" {
+  description = "Name of the sentinel VM instance"
+  value       = module.containarium.sentinel_vm_name
+}
+
+output "spot_vm_internal_ip" {
+  description = "Internal IP of the spot VM (used by sentinel for forwarding)"
+  value       = module.containarium.spot_vm_internal_ip
+}
+
+output "daemon_enabled" {
+  description = "Whether Containarium gRPC daemon is enabled"
+  value       = module.containarium.daemon_enabled
+}
+

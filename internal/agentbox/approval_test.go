@@ -144,3 +144,77 @@ func TestApprovalForgedAnswerIsIgnoredAndTheRequestExpires(t *testing.T) {
 		if e.Kind == coderun.KindInputResponse && e.Reason == coderun.ReasonExpired && e.Answer == coderun.AnswerDeny {
 			expired++
 		}
+	}
+	if notes != 1 || expired != 1 {
+		t.Errorf("journal has %d rejected-answer notes and %d expiry lines, want 1 and 1", notes, expired)
+	}
+}
+
+func TestApprovalUnansweredRequestExpiresIntoDeny(t *testing.T) {
+	s := newTestApprovalServer(t, testPub, 100*time.Millisecond)
+	text, _ := callTool(t, s.handleApprove, bashCall("make deploy"))
+	if d := decisionOf(t, text); d.Behavior != "deny" {
+		t.Fatalf("decision = %+v, want deny", d)
+	}
+	ev := readJournal(t, s)
+	if last := ev[len(ev)-1]; last.Kind != coderun.KindInputResponse || last.Reason != coderun.ReasonExpired {
+		t.Errorf("last journal line = %+v, want an expiry", last)
+	}
+}
+
+// With no usable public key nothing could ever answer, so requests are denied
+// at once rather than after the timeout, and the reason is journaled.
+func TestApprovalWithoutAKeyDeniesAtOnce(t *testing.T) {
+	s := newTestApprovalServer(t, nil, time.Hour)
+	start := time.Now()
+	text, _ := callTool(t, s.handleApprove, bashCall("ls"))
+	if d := decisionOf(t, text); d.Behavior != "deny" {
+		t.Fatalf("decision = %+v, want deny", d)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("a keyless request waited %s", time.Since(start))
+	}
+	ev := readJournal(t, s)
+	if ev[0].Kind != coderun.KindInputStatus || !strings.Contains(ev[0].Text, "no usable approval public key") {
+		t.Errorf("first journal line = %+v, want the missing-key note", ev[0])
+	}
+	if last := ev[len(ev)-1]; last.Reason != coderun.ReasonNoKey {
+		t.Errorf("response line = %+v, want reason no_key", last)
+	}
+}
+
+// The client builds the --mcp-config and --permission-prompt-tool names from
+// its own copies of these constants; they must match what this server serves.
+func TestApprovalNamesMatchTheClientsPromptTool(t *testing.T) {
+	if want := "mcp__" + ApprovalServerName + "__" + ApprovalToolName; engine.ApprovalPromptTool != want {
+		t.Errorf("engine.ApprovalPromptTool = %q, server serves %q", engine.ApprovalPromptTool, want)
+	}
+	if engine.ApprovalProbeOK != approvalProbeOK {
+		t.Errorf("engine.ApprovalProbeOK = %q, server prints %q", engine.ApprovalProbeOK, approvalProbeOK)
+	}
+	if coderun.ApprovalJournalPath("code") != filepath.Join(DefaultLogDir, "code.input.jsonl") ||
+		coderun.ApprovalAnswersDir("code") != filepath.Join(DefaultLogDir, "code.answers") {
+		t.Error("coderun's approval paths drifted from the server's")
+	}
+}
+
+// The client's run-name check accepts exactly the names agent-box's process
+// name sanitizer leaves unchanged (bar "." and ".."), so approval files always
+// sit next to the run's own log.
+func TestValidApprovalRunNameMatchesSanitizeName(t *testing.T) {
+	for _, name := range []string{"code", "sess-42", "a_b.c", "sub/task", "../victim", "a b", "naïve", "x:y", "..x"} {
+		unchanged := sanitizeName(name) == name
+		if ok := coderun.ValidApprovalRunName(name) == nil; ok != unchanged {
+			t.Errorf("%q: ValidApprovalRunName ok=%v, sanitizeName leaves it unchanged=%v", name, ok, unchanged)
+		}
+	}
+}
+
+func TestApprovalCLIProbe(t *testing.T) {
+	var out, errb bytes.Buffer
+	if rc := RunApprovalCLI([]string{"--probe"}, strings.NewReader(""), &out, &errb); rc != 0 || strings.TrimSpace(out.String()) != approvalProbeOK {
+		t.Fatalf("probe rc=%d out=%q err=%q", rc, out.String(), errb.String())
+	}
+	if rc := RunApprovalCLI([]string{"--run", "../x"}, strings.NewReader(""), &out, &errb); rc != 2 {
+		t.Errorf("a run name with a path separator was accepted (rc=%d)", rc)
+	}
