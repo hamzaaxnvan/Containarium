@@ -22,3 +22,27 @@ func TestParseSentinelCandidates(t *testing.T) {
 	if cands[1].Region != "" || cands[1].Addr != "plain.example.com:443" {
 		t.Errorf("bare parse wrong: %+v", cands[1])
 	}
+	if cands[2].Region != "eu" || cands[2].Addr != "eu.example.com:443" {
+		t.Errorf("whitespace-trim parse wrong: %+v", cands[2])
+	}
+}
+
+func TestParseSentinelCandidates_Errors(t *testing.T) {
+	for _, in := range [][]string{
+		{},            // none
+		{"=host:443"}, // empty region
+		{"us="},       // empty addr
+		{"   "},       // blank → none
+	} {
+		if _, err := parseSentinelCandidates(in); err == nil {
+			t.Errorf("parseSentinelCandidates(%v) expected error", in)
+		}
+	}
+}
+
+func TestPickLowestRTT(t *testing.T) {
+	rows := []rttRow{
+		{Cand: sentinelCandidate{Region: "us", Addr: "a"}, RTT: 30 * time.Millisecond},
+		{Cand: sentinelCandidate{Region: "eu", Addr: "b"}, RTT: 10 * time.Millisecond},
+		{Cand: sentinelCandidate{Region: "ap", Addr: "c"}, Err: errors.New("timeout")},
+	}
