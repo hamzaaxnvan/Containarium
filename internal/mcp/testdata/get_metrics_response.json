@@ -1,0 +1,6 @@
+{
+  "metrics": [
+    {
+      "name": "alice-container",
+      "cpuUsageSeconds": "1234",
+      "memoryUsageBytes": "536870912",
