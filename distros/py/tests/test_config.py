@@ -22,15 +22,3 @@ def test_from_env_populated():
         "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=Bearer abc",
         "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
         "CONTAINARIUM_CONTAINER_ID": "alice-container",
-        "CONTAINARIUM_BACKEND_ID": "node-7",
-        "CONTAINARIUM_TENANT_ID": "alice",
-        "SERVICE_VERSION": "v1.2.3",
-    }
-    cfg = DistroConfig.from_env(env=env)
-    assert cfg.endpoint == "http://10.0.3.42:4318"
-    assert cfg.service_name == "payment-api"
-    assert cfg.resource_attributes == "container.id=alice,backend.id=node-7"
-    assert cfg.headers == "Authorization=Bearer abc"
-    assert cfg.protocol == "http/protobuf"
-    assert cfg.container_id == "alice-container"
-    assert cfg.backend_id == "node-7"
