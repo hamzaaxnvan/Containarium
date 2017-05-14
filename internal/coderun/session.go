@@ -78,3 +78,83 @@ var dialMCP = func(args []string) (mcpConn, error) {
 var probeAgentBox = func(ctx context.Context, sshArgs []string) error {
 	sshBin, err := exec.LookPath("ssh")
 	if err != nil {
+		return nil
+	}
+	args := append(append([]string{}, sshArgs...), agentBoxProbeCommand)
+	// #nosec G204 -- see dialMCP; agentBoxProbeCommand is a fixed literal.
+	return exec.CommandContext(ctx, sshBin, args...).Run()
+}
+
+// Session is a live MCP connection to one box's agent-box, reached the same
+// way any MCP client (Claude Code, Claude Desktop) reaches it: spawn
+// `ssh <sshArgs...> -- agent-box` as a subprocess and speak MCP over its
+// stdio (docs/K8S-AGENT-BOX-RUNTIME-DESIGN.md). Implements LogReader
+// directly, transparently reconnecting once on a transport-level failure
+// (a dropped SSH connection) before surfacing an error — StreamOutput's own
+// retry loop is the second line of defense for anything that doesn't
+// self-heal on one reconnect attempt.
+type Session struct {
+	sshArgs []string // ssh's own flags/target; "agent-box" is appended as the remote command
+
+	mu  sync.Mutex
+	mcp mcpConn
+}
+
+// Connect spawns ssh with sshArgs (host/user/identity/port flags — NOT
+// including a remote command) plus "agent-box" appended as the remote
+// command, and initializes an MCP session over its stdio.
+func Connect(ctx context.Context, sshArgs []string) (*Session, error) {
+	s := &Session{sshArgs: sshArgs}
+	c, err := s.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.mcp = c
+	return s, nil
+}
+
+func (s *Session) dial(ctx context.Context) (mcpConn, error) {
+	args := append(append([]string{}, s.sshArgs...), AgentBoxRemoteCommand)
+	c, err := dialMCP(args)
+	if err != nil {
+		return nil, fmt.Errorf("start agent-box over ssh: %w", err)
+	}
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{Name: "containarium-code", Version: "1"}
+	if _, err := c.Initialize(ctx, initReq); err != nil {
+		_ = c.Close()
+		// A box with no agent-box and a box whose ssh connection died look
+		// identical here: the far end simply never speaks MCP. One probe
+		// tells them apart, and only the first has an obvious fix.
+		if probeErr := probeAgentBox(ctx, s.sshArgs); probeErr != nil {
+			return nil, fmt.Errorf("%w (initialize MCP session: %v)", ErrAgentBoxMissing, err)
+		}
+		return nil, fmt.Errorf("initialize MCP session: %w", err)
+	}
+	return c, nil
+}
+
+// Close ends the underlying ssh subprocess and MCP session.
+func (s *Session) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mcp.Close()
+}
+
+// callTool invokes name with args and returns its concatenated text
+// content. reconnect=true retries once over a freshly-dialed session on
+// any error (transport-level failures — a dead ssh subprocess, a closed
+// pipe — look identical to a tool-level error at this layer, so the retry
+// is harmless when it wasn't actually a transport failure: a genuine
+// application error simply repeats).
+func (s *Session) callTool(ctx context.Context, name string, args map[string]any, reconnect bool) (string, error) {
+	s.mu.Lock()
+	c := s.mcp
+	s.mu.Unlock()
+
+	text, err := doCallTool(ctx, c, name, args)
+	if err == nil || !reconnect {
+		return text, err
+	}
+

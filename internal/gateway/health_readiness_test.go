@@ -23,3 +23,28 @@ func TestHealthEndpoint_CorePostgresReadiness(t *testing.T) {
 		status healthpb.HealthCheckResponse_ServingStatus
 		err    error
 		want   healthStatus
+	}{
+		{"ready", healthpb.HealthCheckResponse_SERVING, nil, healthStatusHealthy},
+		{"not configured", healthpb.HealthCheckResponse_SERVICE_UNKNOWN, nil, healthStatusHealthy},
+		{"startup check failed", healthpb.HealthCheckResponse_NOT_SERVING, nil, healthStatusDegraded},
+		{"unknown readiness", healthpb.HealthCheckResponse_UNKNOWN, nil, healthStatusDegraded},
+		{"readiness error is private", healthpb.HealthCheckResponse_UNKNOWN, errors.New("postgres://example:private-password@db.example.test/state"), healthStatusDegraded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			check := func(_ context.Context, service string) (healthpb.HealthCheckResponse_ServingStatus, error) {
+				if service != policyreadiness.CorePostgresService {
+					t.Errorf("checked %q, want the core Postgres startup readiness", service)
+				}
+				return tc.status, tc.err
+			}
+			rec := httptest.NewRecorder()
+			healthHandlerWithReadiness(check)(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("HTTP %d, want 200 so a degraded backend remains live", rec.Code)
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", ct)
+			}
+			var got map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
