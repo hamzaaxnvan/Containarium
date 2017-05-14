@@ -59,3 +59,24 @@ variable "admin_ssh_keys" {
 variable "allowed_ssh_sources" {
   description = "CIDR blocks allowed to SSH to the sentinel on port 22. Restrict to your egress IP for a real demo; broad for a quick test."
   type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "jwt_secret" {
+  description = "JWT signing secret used by the daemon. Anyone holding it can mint admin tokens, so generate a random one and don't commit it to public terraform.tfvars."
+  type        = string
+  sensitive   = true
+}
+
+variable "sentinel_auth_secret" {
+  description = "Shared HMAC secret (32+ bytes) the sentinel uses to authenticate its keysync/certsync calls to the backend daemon. REQUIRED on v0.22.x — an empty secret makes every sentinel↔daemon sync 401, breaking SSH key sync and the create→ssh→install demo flow. Generate with `openssl rand -hex 32`."
+  type        = string
+  sensitive   = true
+}
+
+// DNS -----------------------------------------------------------------
+
+variable "dns_managed_zone_name" {
+  description = "Cloud DNS managed-zone resource name (e.g. 'kafeido-app'). Empty disables DNS provisioning — set the *.<subdomain> A-record manually elsewhere in that case."
+  type        = string
+  default     = ""
