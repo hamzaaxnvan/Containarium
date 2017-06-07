@@ -127,3 +127,46 @@ func (s *ContainerServer) SetContainerTTL(ctx context.Context, req *pb.SetContai
 // reject identical input identically.
 func validateTTLSeconds(seconds int64) error {
 	if seconds < 0 {
+		return status.Errorf(codes.InvalidArgument, "ttl seconds must be >= 0, got %d", seconds)
+	}
+	if seconds > maxTTLSeconds {
+		return status.Errorf(codes.InvalidArgument, "ttl seconds %d exceeds maximum of %d (7 days)", seconds, maxTTLSeconds)
+	}
+	return nil
+}
+
+// stampBirthTTL applies a create-time TTL (#523) to a just-created box so it
+// is born with a death date the ttlsweeper honors — closing the leak window
+// where a box exists with no TTL because the separate `ttl set` call never
+// ran. On failure it DELETES the box and returns an error rather than hand
+// back a box that was asked to be ephemeral but would otherwise leak forever:
+// default-dead, not default-alive (#522). ttlSeconds must be > 0 (the zero
+// case is "no TTL" and never reaches here). containerName is the backend box
+// name (info.Ref.Name) for logs and the LXC config write; username keys the
+// cleanup delete.
+func (s *ContainerServer) stampBirthTTL(ctx context.Context, containerName, username string, ttlSeconds int64) error {
+	var expiresAt time.Time
+	var err error
+	if tc, ok := s.boxes().(box.TTLCapable); ok {
+		// Native persistence (K8s: Sandbox spec.shutdownTime).
+		expiresAt = time.Now().Add(time.Duration(ttlSeconds) * time.Second).UTC()
+		err = tc.SetTTL(ctx, box.BoxRef{Tenant: username}, &expiresAt)
+	} else {
+		expiresAt, err = s.stampTTL(containerName, ttlSeconds)
+	}
+	if err != nil {
+		if delErr := s.boxes().Delete(ctx, box.BoxRef{Tenant: username}, true); delErr != nil {
+			log.Printf("[ttl] birth TTL stamp failed AND cleanup-delete failed for %s: stamp=%v delete=%v", containerName, err, delErr)
+		}
+		return status.Errorf(codes.Internal, "failed to set birth TTL on %s (box deleted to avoid a leak): %v", containerName, err)
+	}
+	log.Printf("[ttl] birth TTL set container=%s expires_at=%s (duration=%ds)", containerName, expiresAt.Format(time.RFC3339), ttlSeconds)
+	return nil
+}
+
+// stampBirthAutoSleep enables auto-sleep on a just-created box (#524) with the
+// given idle threshold (minutes), via the same Incus config keys ToggleAutoSleep
+// writes — so the box is born with its idle→stop timer and the autosleep loop
+// reclaims its CPU/RAM if a job crashes/cancels without anyone calling
+// toggle_auto_sleep (the stop half of #522's default-sleep model; birth TTL is
+// the delete half). Best-effort: auto-sleep is an optimization, not a leak
