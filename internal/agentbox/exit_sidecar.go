@@ -61,3 +61,35 @@ type framingSpec struct {
 // In framed mode the two framers are started BEFORE the command and read from
 // FIFOs it writes to. Opening a FIFO blocks until both ends are open, so the
 // readers must be running first. They are children of this shell, which
+// spawnBackgroundProcess has already setsid'd, so nothing here depends on
+// agent-box surviving — which was the whole defect.
+func buildRunScript(command, sidecar string, f *framingSpec) string {
+	qs := shellSingleQuote(sidecar)
+
+	var prologue, redirect, drain string
+	if f != nil {
+		qo, qe := shellSingleQuote(f.outFIFO), shellSingleQuote(f.errFIFO)
+		qb, ql := shellSingleQuote(f.agentBox), shellSingleQuote(f.logPath)
+		prologue = fmt.Sprintf(
+			"rm -f %s %s; mkfifo %s %s || exit 1\n"+
+				"%s frame 1 %s < %s &\n"+
+				"%s frame 2 %s < %s &\n",
+			qo, qe, qo, qe, qb, ql, qo, qb, ql, qe)
+		redirect = fmt.Sprintf(" > %s 2> %s", qo, qe)
+		// Drain before recording the exit status: the sidecar's appearance is
+		// what a reconnecting client reads as "finished", so the log must be
+		// complete by then or a reader can see a finished run with output
+		// still arriving.
+		drain = fmt.Sprintf("wait; rm -f %s %s; ", qo, qe)
+	}
+
+	return fmt.Sprintf(
+		"%s( %s\n)%s; __cx=$?; %sprintf '%%s %%s' \"$__cx\" \"$(date -u +%%s)\" > %s.tmp 2>/dev/null && mv -f %s.tmp %s 2>/dev/null; exit $__cx",
+		prologue, command, redirect, drain, qs, qs, qs,
+	)
+}
+
+// shellSingleQuote renders s as a single-quoted shell word, closing the
+// quote around any embedded single quote. sanitizeName already constrains
+// the name, but the log dir is configurable, so the path is quoted rather
+// than assumed safe.
