@@ -1,0 +1,33 @@
+package releases
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// TestFetchSHA256_FindsNamedBinary pins the GNU sha256sum-style parsing
+// (SHA256SUMS.txt lines are "<hash>  <filename>") against a fixture that
+// carries several binaries, only one of which is asked for.
+func TestFetchSHA256_FindsNamedBinary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/SHA256SUMS.txt") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(
+			"aaaa1111  containarium-linux-amd64\n" +
+				"bbbb2222  containariumd-linux-amd64\n" +
+				"cccc3333  containarium-windows-amd64.exe\n"))
+	}))
+	defer srv.Close()
+
+	orig := GitHubReleaseBaseURL
+	GitHubReleaseBaseURL = srv.URL
+	t.Cleanup(func() { GitHubReleaseBaseURL = orig })
+
+	got, err := FetchSHA256(context.Background(), "v0.55.0", "containariumd-linux-amd64")
+	if err != nil {
+		t.Fatalf("FetchSHA256: %v", err)
+	}
