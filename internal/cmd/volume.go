@@ -92,3 +92,97 @@ func init() {
 
 // parseSizeBytes parses a human size like "50GB", "1TiB", "500M", or a
 // bare byte count into bytes. KB/MB/GB/TB are decimal (1000-based);
+// KiB/MiB/GiB/TiB are binary (1024-based); a bare K/M/G/T is treated as
+// binary (the common shell expectation).
+func parseSizeBytes(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	upper := strings.ToUpper(s)
+	type unit struct {
+		suffix string
+		mult   int64
+	}
+	// Order matters: check longer suffixes (KIB) before shorter (K/B).
+	units := []unit{
+		{"TIB", 1 << 40}, {"GIB", 1 << 30}, {"MIB", 1 << 20}, {"KIB", 1 << 10},
+		{"TB", 1e12}, {"GB", 1e9}, {"MB", 1e6}, {"KB", 1e3},
+		{"T", 1 << 40}, {"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10}, {"B", 1},
+	}
+	for _, u := range units {
+		if strings.HasSuffix(upper, u.suffix) {
+			num := strings.TrimSpace(upper[:len(upper)-len(u.suffix)])
+			f, err := strconv.ParseFloat(num, 64)
+			if err != nil {
+				return 0, fmt.Errorf("invalid size %q: %w", s, err)
+			}
+			return int64(f * float64(u.mult)), nil
+		}
+	}
+	// Bare number → bytes.
+	n, err := strconv.ParseInt(upper, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q (expected e.g. 50GB, 1TiB, or a byte count)", s)
+	}
+	return n, nil
+}
+
+// newVolumeGRPCClient returns a gRPC client; volume verbs are server-side.
+func newVolumeGRPCClient() (*client.GRPCClient, error) {
+	if serverAddr == "" {
+		return nil, fmt.Errorf("--server is required")
+	}
+	return client.NewGRPCClient(serverAddr, certsDir, insecure)
+}
+
+func runVolumeCreate(cmd *cobra.Command, args []string) error {
+	if volumeSize == "" {
+		return fmt.Errorf("--size is required (e.g. --size 50GB)")
+	}
+	bytes, err := parseSizeBytes(volumeSize)
+	if err != nil {
+		return err
+	}
+	c, err := newVolumeGRPCClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	resp, err := c.CreateVolume(&pb.CreateVolumeRequest{Name: args[0], SizeBytes: bytes, Pool: volumePool})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ %s\n", resp.Message)
+	return nil
+}
+
+func runVolumeList(cmd *cobra.Command, args []string) error {
+	c, err := newVolumeGRPCClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	resp, err := c.ListVolumes(volumePool)
+	if err != nil {
+		return err
+	}
+	if !resp.SharedVolumesSupported {
+		fmt.Printf("Shared volumes not supported on this backend: %s\n", resp.CapabilityDetail)
+		return nil
+	}
+	fmt.Printf("Shared volumes: supported (%s)\n", resp.CapabilityDetail)
+	if len(resp.Volumes) == 0 {
+		fmt.Println("No volumes.")
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tPOOL\tTYPE\tATTACHMENTS")
+	for _, v := range resp.Volumes {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\n", v.Name, v.Pool, v.ContentType, len(v.Attachments))
+	}
+	return w.Flush()
+}
+
+func runVolumeDelete(cmd *cobra.Command, args []string) error {
+	c, err := newVolumeGRPCClient()
