@@ -38,3 +38,85 @@ const PiPackage = "@earendil-works/pi-coding-agent"
 // npm's EBADENGINE output.
 const PiNodeMinVersion = "22.19.0"
 
+// piAgentDir is pi's user-level config directory (pi's own
+// docs/configuration.md: "the agent directory, which defaults to ~/.pi/agent").
+// Written absolute-from-$HOME rather than ~-relative because these strings are
+// tested by the shell, not expanded by it.
+const piAgentDir = "$HOME/.pi/agent"
+
+// piModelsPath is the custom-provider config `code install` renders.
+const piModelsPath = piAgentDir + "/models.json"
+
+// piGatewayEnvPath is the 0600 file `code run` writes the per-run gateway token
+// to before process_start. Contract C4 puts it at ~/.pi/gateway.env — beside
+// pi's state, not inside agent/, so pi never tries to parse it as config.
+const piGatewayEnvPath = "$HOME/.pi/gateway.env"
+
+// piBin is where the install lands pi. $HOME/.local/bin, matching
+// ~/.local/bin/claude and ~/.local/bin/agent-box, so the whole command stays
+// user-level with no sudo anywhere.
+const piBin = "$HOME/.local/bin/pi"
+
+func (piEngine) Name() Name                     { return NamePi }
+func (e piEngine) Credential() CredentialSource { return e.opts.Credential }
+func (piEngine) GatewayEnvPath() string         { return piGatewayEnvPath }
+
+// InstallScript installs pi at a pinned version and writes its
+// custom-provider config.
+//
+// It does NOT use pi's own install.sh, and that is a deliberate deviation from
+// the issue's wording. The real https://pi.dev/install.sh (a) takes no version
+// argument — the version comes from release metadata it fetches, so there is
+// nothing to pin — and (b) opens /dev/tty for a logo animation, `stty`, and an
+// interactive "install Node for you?" prompt. `code install` execs over ssh with
+// no TTY, so that installer is a hang, not a pin. The npm line below is the
+// alternative docs/integrations/pi.md already documents, and it takes a version.
+//
+// npm's prefix is pointed at $HOME/.local so `npm i -g` needs no root, and
+// --ignore-scripts is pi.md's own recommendation.
+func (piEngine) InstallScript(o InstallOptions) string {
+	version := strings.TrimSpace(o.Version)
+	if version == "" {
+		version = PiVersion
+	}
+	return `set -e
+# pi requires Node >= ` + PiNodeMinVersion + ` (its own engines.node). Check it here so a
+# box without it says so, instead of failing inside npm's EBADENGINE output.
+if ! command -v node >/dev/null 2>&1; then
+  echo "pi needs Node >= ` + PiNodeMinVersion + ` on the box and none is installed." >&2
+  echo "Install Node on the box (docs/integrations/pi.md step 2), then re-run this command." >&2
+  exit 5
+fi
+if ! node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&(b>19||(b===19&&c>=0)))?0:1)'; then
+  echo "pi needs Node >= ` + PiNodeMinVersion + `; this box has $(node --version). Upgrade Node on the box, then re-run." >&2
+  exit 5
+fi
+mkdir -p "$HOME/.local"
+npm config set prefix "$HOME/.local" >/dev/null
+npm install -g --ignore-scripts --no-fund --no-audit ` + shellQuoteSingle(PiPackage+"@"+version) + `
+# umask before the write, not chmod after: a chmod leaves a window in which the
+# file exists world-readable, and on a box the user shares with an agent that
+# window is not theoretical (same argument as boxbootstrap's apply.sh).
+umask 077
+mkdir -p ` + piAgentDir + `
+printf '%s' ` + shellQuoteSingle(o.ModelsJSON) + ` > ` + piModelsPath + `
+chmod 600 ` + piModelsPath + `
+echo "pi installed at ` + piBin + ` (` + version + `), provider config at ` + piModelsPath + `"`
+}
+
+// VerifyScript proves the box can actually reach a model, which is the whole
+// point of verifying at install time: the alternative is the user discovering a
+// misconfiguration at their first real prompt.
+//
+// The prompt is the AC's: `pi -p "print the current working directory" --mode
+// json`. It runs on whatever credential the box now has — for a gateway
+// credential, a deliberately short-lived token the caller wrote to
+// GatewayEnvPath just before this.
+//
+// As on the Claude path, the credential is reported by NAME only. Nothing here
+// expands the token.
+func (e piEngine) VerifyScript() string {
+	script := `set -e
+` + piBin + ` --version
+echo "credential sources present:"
+found=0`
