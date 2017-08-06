@@ -25,30 +25,3 @@ func sentinelHint(verb string, username string, err error) error {
 	return fmt.Errorf("%s failed: %w", verb, err)
 }
 
-// handlePush is the agent-native version of `containarium push <user>`.
-// Same Go function (transfer.Push) backs both surfaces; this just adapts
-// the MCP args dict into a typed PushOptions struct.
-func handlePush(client API, args map[string]interface{}) (string, error) {
-	username := getStringArg(args, "username", "")
-	if username == "" {
-		return "", fmt.Errorf("username is required")
-	}
-
-	res, err := transfer.Push(transfer.PushOptions{
-		Options: transfer.Options{
-			Username:     username,
-			SentinelHost: pickSentinel(client, args),
-			KeyPath:      getStringArg(args, "key_path", ""),
-			LocalPath:    getStringArg(args, "local_path", ""),
-			RemotePath:   getStringArg(args, "remote_path", ""),
-			Verbose:      false,
-		},
-		Branch:     getStringArg(args, "branch", ""),
-		IncludeWIP: getBoolArg(args, "include_wip", false),
-		DeployCmd:  getStringArg(args, "deploy_cmd", ""),
-		RemoteName: getStringArg(args, "remote_name", ""),
-	})
-	if err != nil {
-		return "", sentinelHint("push", username, err)
-	}
-
