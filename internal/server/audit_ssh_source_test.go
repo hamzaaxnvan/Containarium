@@ -21,3 +21,51 @@ func TestIngestSSHSourceRecords(t *testing.T) {
 		name       string
 		rec        *pb.SSHSessionRecord
 		wantAction string
+		wantDetail SSHSessionDetail
+		wantIP     string
+	}{
+		{
+			name: "auth failures in a window",
+			rec: &pb.SSHSessionRecord{SessionId: "f1", Phase: pb.SSHSessionPhase_SSH_SESSION_PHASE_AUTH_FAILED,
+				OccurredAt: timestamppb.New(at), ClientIp: "203.0.113.9", FailureCount: 7, BanListener: pb.SSHBanListener_SSH_BAN_LISTENER_MAIN},
+			wantAction: "ssh_auth_failed", wantIP: "203.0.113.9",
+			wantDetail: SSHSessionDetail{SentinelID: "sentinel-1", FailureCount: 7, BanListener: pb.SSHBanListener_SSH_BAN_LISTENER_MAIN},
+		},
+		{
+			name: "a ban",
+			rec: &pb.SSHSessionRecord{SessionId: "b1", Phase: pb.SSHSessionPhase_SSH_SESSION_PHASE_BANNED,
+				OccurredAt: timestamppb.New(at), ClientIp: "203.0.113.9", FailureCount: 100, BannedUntil: timestamppb.New(until),
+				BanListener: pb.SSHBanListener_SSH_BAN_LISTENER_ANONYMOUS},
+			wantAction: "ssh_banned", wantIP: "203.0.113.9",
+			wantDetail: SSHSessionDetail{SentinelID: "sentinel-1", FailureCount: 100, BannedUntil: "2026-10-19T01:07:03Z", BanListener: pb.SSHBanListener_SSH_BAN_LISTENER_ANONYMOUS},
+		},
+		{
+			name: "overflow record",
+			rec: &pb.SSHSessionRecord{SessionId: "o1", Phase: pb.SSHSessionPhase_SSH_SESSION_PHASE_AUTH_FAILED,
+				OccurredAt: timestamppb.New(at), SuppressedCount: 4200, BanListener: pb.SSHBanListener_SSH_BAN_LISTENER_MAIN},
+			wantAction: "ssh_auth_failed", wantIP: "",
+			wantDetail: SSHSessionDetail{SentinelID: "sentinel-1", SuppressedCount: 4200, BanListener: pb.SSHBanListener_SSH_BAN_LISTENER_MAIN},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeBatchLogger{}
+			resp, err := NewAuditServer(store).IngestSSHSessionRecords(ingestCtx(), &pb.IngestSSHSessionRecordsRequest{
+				Records: []*pb.SSHSessionRecord{tt.rec}, SentinelId: "sentinel-1"})
+			if err != nil || resp.GetInserted() != 1 {
+				t.Fatalf("ingest: resp %v err %v", resp, err)
+			}
+			rec, err := sshsession.FromProto(tt.rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row, err := sshSessionBatchEntry(rec, "sentinel-1", "jti")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.Entry.Action != tt.wantAction || row.Entry.SourceIP != tt.wantIP || row.Entry.Username != "" {
+				t.Fatalf("row action/ip/username = %q/%q/%q, want %q/%q/\"\"", row.Entry.Action, row.Entry.SourceIP, row.Entry.Username, tt.wantAction, tt.wantIP)
+			}
+			var got SSHSessionDetail
+			if err := json.Unmarshal([]byte(row.Entry.Detail), &got); err != nil {
+				t.Fatal(err)

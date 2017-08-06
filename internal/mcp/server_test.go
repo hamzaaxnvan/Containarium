@@ -95,3 +95,101 @@ func TestHandleInitialize(t *testing.T) {
 	// bumped on every release). Just confirm a non-empty version
 	// string ships back.
 	serverInfo := result["serverInfo"].(map[string]interface{})
+	assert.Equal(t, "containarium-mcp-server", serverInfo["name"])
+	assert.NotEmpty(t, serverInfo["version"], "serverInfo.version must be set from pkg/version")
+}
+
+// TestHandleToolsList tests the tools/list method
+func TestHandleToolsList(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	req := &MCPRequest{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  "tools/list",
+	}
+
+	resp := server.handleRequest(req)
+
+	assert.Equal(t, "2.0", resp.JSONRPC)
+	assert.Equal(t, 2, resp.ID)
+	assert.Nil(t, resp.Error)
+
+	// Check tools list
+	result, ok := resp.Result.(map[string]interface{})
+	require.True(t, ok)
+
+	tools, ok := result["tools"].([]map[string]interface{})
+	require.True(t, ok)
+	// See TestServerCreation's tally comment for the running count — 109.
+	assert.Len(t, tools, 109)
+
+	// Check first tool structure
+	firstTool := tools[0]
+	assert.NotEmpty(t, firstTool["name"])
+	assert.NotEmpty(t, firstTool["description"])
+	assert.NotNil(t, firstTool["inputSchema"])
+
+	// Verify input schema is valid
+	schema := firstTool["inputSchema"].(map[string]interface{})
+	assert.Equal(t, "object", schema["type"])
+	assert.NotNil(t, schema["properties"])
+}
+
+// TestHandleMethodNotFound tests unknown method handling
+func TestHandleMethodNotFound(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	req := &MCPRequest{
+		JSONRPC: "2.0",
+		ID:      3,
+		Method:  "unknown/method",
+	}
+
+	resp := server.handleRequest(req)
+
+	assert.Equal(t, "2.0", resp.JSONRPC)
+	assert.Equal(t, 3, resp.ID)
+	assert.NotNil(t, resp.Error)
+	assert.Nil(t, resp.Result)
+
+	// Check error
+	assert.Equal(t, -32601, resp.Error.Code)
+	assert.Contains(t, resp.Error.Message, "Method not found")
+}
+
+// TestHandleToolsCallInvalidParams tests invalid parameters
+func TestHandleToolsCallInvalidParams(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name   string
+		params interface{}
+	}{
+		{
+			name:   "missing name",
+			params: map[string]interface{}{"arguments": map[string]interface{}{}},
+		},
+		{
+			name:   "invalid name type",
+			params: map[string]interface{}{"name": 123, "arguments": map[string]interface{}{}},
+		},
+	}
