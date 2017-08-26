@@ -52,21 +52,3 @@ func runPortforwardSetup(cmd *cobra.Command, args []string) error {
 	caddyIP := portforwardCaddyIP
 
 	// Auto-detect if requested
-	if portforwardAutoDetect {
-		if caddyIP != "" {
-			return fmt.Errorf("cannot use both --caddy-ip and --auto")
-		}
-
-		fmt.Println("Auto-detecting Caddy container IP...")
-		incusClient, err := incus.New()
-		if err != nil {
-			return fmt.Errorf("failed to connect to Incus: %w", err)
-		}
-
-		detectedIP, err := incusClient.FindCaddyContainerIP()
-		if err != nil {
-			return fmt.Errorf("failed to auto-detect Caddy IP: %w", err)
-		}
-		caddyIP = detectedIP
-		fmt.Printf("Detected Caddy at: %s\n", caddyIP)
-	}
