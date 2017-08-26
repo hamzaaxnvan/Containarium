@@ -18,3 +18,14 @@ func TestCollaboratorKeysFromRequest(t *testing.T) {
 		{
 			name: "repeated preferred",
 			req:  &pb.AddCollaboratorRequest{SshPublicKeys: []string{"ssh-ed25519 AAA a", "ssh-ed25519 BBB b"}},
+			want: []string{"ssh-ed25519 AAA a", "ssh-ed25519 BBB b"},
+		},
+		{
+			name: "legacy single fallback",
+			req:  &pb.AddCollaboratorRequest{SshPublicKey: "ssh-ed25519 AAA a"},
+			want: []string{"ssh-ed25519 AAA a"},
+		},
+		{
+			name: "repeated wins over legacy when both set",
+			req:  &pb.AddCollaboratorRequest{SshPublicKey: "ssh-ed25519 LEGACY x", SshPublicKeys: []string{"ssh-ed25519 AAA a"}},
+			want: []string{"ssh-ed25519 AAA a"},
