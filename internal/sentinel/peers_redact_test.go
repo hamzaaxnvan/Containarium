@@ -33,3 +33,20 @@ func peersCall(t *testing.T, m *Manager, query string, signWith string) (string,
 	}
 	return rec.Body.String(), parsed.Peers
 }
+
+func TestPeersHandler_UnsignedSeesNoPool(t *testing.T) {
+	m := newManagerForPeersTest(peersTestSecret)
+	raw, peers := peersCall(t, m, "", "")
+	if len(peers) != 2 {
+		t.Fatalf("want 2 peers, got %d", len(peers))
+	}
+	if strings.Contains(raw, "pool") || strings.Contains(raw, "prod") {
+		t.Fatalf("unsigned response leaks pool: %s", raw)
+	}
+}
+
+func TestPeersHandler_UnsignedPoolQueryIgnored(t *testing.T) {
+	m := newManagerForPeersTest(peersTestSecret)
+	_, all := peersCall(t, m, "", "")
+	for _, q := range []string{"?pool=prod", "?pool=ghost", "?pool="} {
+		raw, got := peersCall(t, m, q, "")
