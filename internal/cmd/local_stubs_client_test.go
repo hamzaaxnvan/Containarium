@@ -58,3 +58,33 @@ func TestHybridCommands_NoServer_NeverReachRealLocalMode(t *testing.T) {
 			setup: func() { outputFormat = "table"; filterState = "all"; groupByLabel = "" },
 			run:   func() error { return runList(testCmd(), nil) },
 		},
+		{
+			name:  "info (system)",
+			setup: func() {},
+			run:   func() error { return runInfo(testCmd(), nil) },
+		},
+		{
+			name:  "info (container)",
+			setup: func() {},
+			run:   func() error { return runInfo(testCmd(), []string{"testuser"}) },
+		},
+		{
+			name:  "label list",
+			setup: func() { labelListFormat = "table" },
+			run:   func() error { return runLabelList(testCmd(), []string{"testuser"}) },
+		},
+		{
+			name:  "label set",
+			setup: func() { labelOverwrite = true },
+			run:   func() error { return runLabelSet(testCmd(), []string{"testuser", "k=v"}) },
+		},
+		{
+			name:  "label remove",
+			setup: func() {},
+			run:   func() error { return runLabelRemove(testCmd(), []string{"testuser", "k"}) },
+		},
+		{
+			name:  "install-stack",
+			setup: func() {},
+			run:   func() error { return runInstallStack(testCmd(), []string{"testuser", "nodejs"}) },
+		},
