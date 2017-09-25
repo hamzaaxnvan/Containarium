@@ -45,3 +45,97 @@ func TestQuickstartMCP_NonInteractiveShell(t *testing.T) {
 			spec := agentSpecs[agent]
 			path := spec.mcpConfigPath(t.TempDir())
 			if _, err := spec.wireMCP(path, "containarium-box", "alice"); err != nil {
+				t.Fatal(err)
+			}
+			var entry mcpServerEntry
+			if agent == "codex" {
+				entry = codexMCPServerFromFile(t, path, "containarium-box")
+			} else {
+				entry = mcpServerFromFile(t, path, "mcpServers", "containarium-box")
+			}
+			if entry.Command != "ssh" || len(entry.Args) != 2 || entry.Args[0] != "alice" {
+				t.Fatalf("MCP entry = %+v", entry)
+			}
+			// ssh passes its remote command to a non-interactive shell. Execute
+			// that same command with no login files or user-local PATH entry.
+			cmd := exec.Command("/bin/sh", "-c", entry.Args[1])
+			cmd.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin"}
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("remote command failed: %v\n%s", err, out)
+			}
+			if want := bin + ":/usr/local/bin:/usr/bin:/bin\n"; string(out) != want {
+				t.Fatalf("helper PATH = %q, want %q", out, want)
+			}
+			if entry.Args[1] != wantAgentBoxRemoteCommand {
+				t.Fatalf("remote command = %q, want %q", entry.Args[1], wantAgentBoxRemoteCommand)
+			}
+		})
+	}
+}
+
+func TestMergeMCPServerJSON_UpgradeLegacy(t *testing.T) {
+	for _, tc := range []struct {
+		name, entry string
+		upgrade     bool
+	}{
+		{"generated", `{"command":"ssh","args":["alice","agent-box"]}`, true},
+		{"extra settings", `{"command":"ssh","args":["alice","agent-box"],"env":{"FOO":"bar"},"timeout":30}`, true},
+		{"different host", `{"command":"ssh","args":["bob","agent-box"]}`, false},
+		{"custom command", `{"command":"custom","args":["alice","agent-box"]}`, false},
+		{"custom flags", `{"command":"ssh","args":["-T","alice","agent-box"]}`, false},
+		{"explicit path", `{"command":"ssh","args":["alice","~/.local/bin/agent-box"]}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			seed := `{"theme":"dark","mcpServers":{"other":{"command":"foo"},"containarium-box":` + tc.entry + `}}`
+			if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			changed, err := mergeMCPServerJSON(path, "mcpServers", "containarium-box", "alice")
+			if err != nil || changed != tc.upgrade {
+				t.Fatalf("changed = %v, err = %v, want changed = %v", changed, err, tc.upgrade)
+			}
+			var want, got map[string]any
+			if err := json.Unmarshal([]byte(seed), &want); err != nil {
+				t.Fatal(err)
+			}
+			if tc.upgrade {
+				want["mcpServers"].(map[string]any)["containarium-box"].(map[string]any)["args"] = []any{"alice", wantAgentBoxRemoteCommand}
+			}
+			before := readFile(t, path)
+			if err := json.Unmarshal([]byte(before), &got); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) || (!tc.upgrade && before != seed) {
+				t.Fatalf("settings changed unexpectedly:\n%s", before)
+			}
+			if changed, err := mergeMCPServerJSON(path, "mcpServers", "containarium-box", "alice"); err != nil || changed || readFile(t, path) != before {
+				t.Fatalf("second merge must be a no-op: changed = %v, err = %v", changed, err)
+			}
+		})
+	}
+}
+
+func TestCodexAppendMCP_UpgradeLegacy(t *testing.T) {
+	const header = "[mcp_servers.containarium-box]\n"
+	const legacy = "command = \"ssh\"\nargs = [\"alice\", \"agent-box\"]\n"
+	for _, tc := range []struct {
+		name, entry string
+		upgrade     bool
+	}{
+		{"generated", legacy, true},
+		{"extra settings", legacy + "startup_timeout_sec = 30\n", true},
+		{"setting before args", strings.Replace(legacy, "args =", "startup_timeout_sec = 30\nargs =", 1), true},
+		{"command after args", "args = [\"alice\", \"agent-box\"]\ncommand = \"ssh\"\n", true},
+		{"literal strings", "command = 'ssh'\nargs = ['alice', 'agent-box']\n", true},
+		{"different host", strings.Replace(legacy, "alice", "bob", 1), false},
+		{"custom command", strings.Replace(legacy, "ssh", "custom", 1), false},
+		{"custom flags", "command = \"ssh\"\nargs = [\"-T\", \"alice\", \"agent-box\"]\n", false},
+		{"explicit path", strings.Replace(legacy, "agent-box", "~/.local/bin/agent-box", 1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			prefix := "# keep this comment\nmodel = \"o3\"\n\n"
+			suffix := "\n[mcp_servers.other]\ncommand = \"foo\"\n"
+			seed := prefix + header + tc.entry + suffix
