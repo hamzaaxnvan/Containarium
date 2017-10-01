@@ -35,3 +35,41 @@ describe("runTask (serve mode)", () => {
   it("fails the task, not the server, on a run_id that would escape the journal root", async () => {
     const journals = serveJournals({ root: mkdtempSync(join(tmpdir(), "journal-")), skillId: "s", secrets: [], warn: () => {} });
     const art = await runTask({ id: "t", inputJson: "{}", runId: "../../etc" }, engine, cfg, journals);
+    expect(art.state).toBe("AGENT_TASK_STATE_FAILED");
+    expect(art.error).toMatch(/run id/);
+  });
+
+  it("still runs a task without a journal factory (poll mode)", async () => {
+    const art = await runTask({ id: "t", inputJson: "{}" }, engine, cfg);
+    expect(art.state).toBe("AGENT_TASK_STATE_COMPLETED");
+  });
+});
+
+// POST /tasks is a daemon-only endpoint (#2125, decision D1 in
+// docs/architecture/execution-scoped-authorization.md). The daemon presents the
+// per-box secret it derived for THIS box; anyone else — including a peer box
+// that can reach port 8674 — is refused before the body is parsed, before the
+// engine runs, and before any journal line exists.
+const BOX_SECRET = "2a4f6c8e0b1d3f5a7c9e1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a";
+
+const seed: Seed = {
+  systemPrompt: "",
+  inputJson: "{}",
+  agentCard: { name: "hello-agent" },
+  tokenPath: null,
+  platformMcp: null,
+  outputSchema: null,
+};
+
+interface Harness {
+  url: string;
+  journalRoot: string;
+  engineCalls: () => number;
+  close: () => Promise<void>;
+}
+
+const openHarnesses: Harness[] = [];
+
+function startHarness(expectedToken: string): Promise<Harness> {
+  let calls = 0;
+  const countingEngine: Engine = {
