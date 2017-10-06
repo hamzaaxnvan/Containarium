@@ -86,3 +86,92 @@ func ServeSentinelKeyWithAuthorizer(a SentinelKeyAuthorizer) http.HandlerFunc {
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 			return
+		}
+		var req SentinelKeyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
+			return
+		}
+		pubKey := strings.TrimSpace(req.PublicKey)
+		if pubKey == "" {
+			http.Error(w, `{"error":"public_key is required"}`, http.StatusBadRequest)
+			return
+		}
+		updated, rotated, err := a.SetSentinelKey(r.Context(), pubKey)
+		if err != nil {
+			log.Printf("[keys] sentinel-key authorize failed: %v", err)
+			http.Error(w, `{"error":"failed to apply sentinel key"}`, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int{"updated": updated, "rotated": rotated})
+	}
+}
+
+// ServeAuthorizedKeysFromLister returns a handler that answers
+// /authorized-keys from a ClientKeyLister and advertises sshPort as the
+// node's SSH ingress (KeysResponse.SSHPort) so the sentinel forwards to the
+// in-cluster gateway rather than the node's :22. Used on the K8s runtime.
+func ServeAuthorizedKeysFromLister(lister ClientKeyLister, sshPort func() int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		m, err := lister.ListClientKeys(r.Context())
+		if err != nil {
+			log.Printf("[keys] lister failed: %v", err)
+			http.Error(w, `{"error":"failed to list client keys"}`, http.StatusInternalServerError)
+			return
+		}
+		keys := make([]UserKeys, 0, len(m))
+		for username, ak := range m {
+			content := strings.TrimSpace(ak)
+			if content == "" {
+				continue
+			}
+			keys = append(keys, UserKeys{Username: username, AuthorizedKeys: content})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(KeysResponse{Keys: keys, SSHPort: sshPort()})
+	}
+}
+
+// ServeAuthorizedKeys returns an HTTP handler that walks
+// homeRoot/*/.ssh/authorized_keys and returns each user's authorized keys
+// as JSON for the sentinel to sync into sshpiper.
+//
+// homeRoot defaults to "/home" when empty (allows tests to inject a
+// tmp dir).
+//
+// containerExistsFn is the orphan filter for #343: when non-nil, each
+// candidate username is checked against the live container registry,
+// and entries whose container is missing are dropped from the response
+// AND logged as `WARNING orphan ...`. This prevents sshpiper from
+// accepting keys for tenants whose container has been deleted (the
+// resulting "Container <name>-container not found" inside the SSH
+// session was the user-facing symptom in #343). Pass nil to disable
+// the filter (back-compat / tests).
+func ServeAuthorizedKeys(homeRoot string, containerExistsFn func(username string) bool, trustBundle TrustBundleProvider) http.HandlerFunc {
+	if homeRoot == "" {
+		homeRoot = "/home"
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		entries, err := os.ReadDir(homeRoot)
+		if err != nil {
+			log.Printf("[keys] failed to read %s: %v", homeRoot, err)
+			http.Error(w, `{"error":"failed to read home directories"}`, http.StatusInternalServerError)
+			return
+		}
+
+		var keys []UserKeys
+		orphanCount := 0
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
