@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+import "containarium/v1/config.proto";
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+// CodingToolEgressPolicyService — the admin-approved egress allowlist for the
+// coding CLI's own traffic (#2370, docs/architecture/coding-cli-egress-allowlist.md).
+//
+// Separate from NetworkPolicyService on purpose: a coding-tool policy never
+// changes what a tenant's own NetworkPolicy means. This service is the policy
+// store only; the kernel-side enforcement is a later increment.
+service CodingToolEgressPolicyService {
+  // SetCodingToolEgressPolicy creates or replaces a policy (upsert by tenant).
+  // Validated with the same rules as NetworkPolicy, and the mode is required;
+  // the stored form, with its new revision, is echoed back.
+  //
+  // Which tenant: on PUT /v1/code/egress-policy/{policy.tenant} the tenant is
+  // the URL value. The gateway decodes the body first and then applies the
+  // path parameter, so the URL wins over a different policy.tenant in the
+  // body. On the bare PUT /v1/code/egress-policy the tenant is policy.tenant
+  // from the body, and an empty tenant means the cluster default. Over gRPC
+  // it is policy.tenant, with the same empty = cluster default rule.
+  rpc SetCodingToolEgressPolicy(SetCodingToolEgressPolicyRequest) returns (SetCodingToolEgressPolicyResponse) {
+    option (google.api.http) = {
+      put: "/v1/code/egress-policy/{policy.tenant}"
+      body: "policy"
+      additional_bindings {
+        put: "/v1/code/egress-policy"
+        body: "policy"
+      }
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Set coding-tool egress policy";
+      description: "Create or replace the coding tool's egress allowlist. Admin-only. On PUT /v1/code/egress-policy/{policy.tenant} the tenant is the URL value, which wins over any policy.tenant in the body (path parameters are applied after the body is decoded). On the bare PUT /v1/code/egress-policy the tenant is policy.tenant from the body; an empty tenant sets the cluster default. mode is required: LOG_ONLY or ENFORCE; UNSPECIFIED is rejected with INVALID_ARGUMENT.";
+      tags: "CodingToolEgressPolicy";
+    };
+  }
+
+  // GetCodingToolEgressPolicy returns the stored policy for the key (absent
+  // when none is set) and the effective policy a run for that tenant takes.
+  // Which tenant: on GET /v1/code/egress-policy/{tenant} the URL value. On the
+  // bare GET /v1/code/egress-policy the optional ?tenant= query parameter,
+  // and with none the cluster default.
+  rpc GetCodingToolEgressPolicy(GetCodingToolEgressPolicyRequest) returns (GetCodingToolEgressPolicyResponse) {
+    option (google.api.http) = {
+      get: "/v1/code/egress-policy/{tenant}"
+      additional_bindings {
+        get: "/v1/code/egress-policy"
+      }
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get coding-tool egress policy";
+      description: "Return the stored and effective coding-tool egress policy. On GET /v1/code/egress-policy/{tenant} the tenant is the URL value; on the bare GET /v1/code/egress-policy it is the optional ?tenant= query parameter, and with none the cluster default (admin only). Admin, or the tenant itself holding the code-egress:read scope.";
+      tags: "CodingToolEgressPolicy";
+    };
+  }
+
+  // DeleteCodingToolEgressPolicy removes a policy. Idempotent. Which tenant:
+  // on DELETE /v1/code/egress-policy/{tenant} the URL value; on the bare
+  // DELETE /v1/code/egress-policy the optional ?tenant= query parameter, and
+  // with none the cluster default.
+  rpc DeleteCodingToolEgressPolicy(DeleteCodingToolEgressPolicyRequest) returns (DeleteCodingToolEgressPolicyResponse) {
+    option (google.api.http) = {
+      delete: "/v1/code/egress-policy/{tenant}"
+      additional_bindings {
+        delete: "/v1/code/egress-policy"
