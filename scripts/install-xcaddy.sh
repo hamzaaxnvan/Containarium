@@ -10,3 +10,16 @@ case "$platform" in
   Linux-aarch64) asset=linux_arm64; checksum="$XCADDY_SHA256_LINUX_AARCH64" ;;
   Darwin-x86_64) asset=mac_amd64;   checksum="$XCADDY_SHA256_DARWIN_X86_64" ;;
   Darwin-arm64)  asset=mac_arm64;   checksum="$XCADDY_SHA256_DARWIN_ARM64" ;;
+  *) echo "Unsupported xcaddy platform: $platform" >&2; exit 1 ;;
+esac
+digest() {
+  local output
+  if command -v sha256sum >/dev/null; then output="$(sha256sum "$1")"; else output="$(shasum -a 256 "$1")"; fi
+  echo "${output%% *}"
+}
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+curl --fail --location --silent --show-error --retry 3 \
+  "https://github.com/caddyserver/xcaddy/releases/download/v${XCADDY_VERSION}/xcaddy_${XCADDY_VERSION}_${asset}.tar.gz" \
+  --output "$work/xcaddy.tar.gz"
+if [[ "$(digest "$work/xcaddy.tar.gz")" != "$checksum" ]]; then

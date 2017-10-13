@@ -50,3 +50,55 @@ func TestRecovery_DefaultsApplied(t *testing.T) {
 		t.Errorf("max (%v) should be clamped >= initial (%v)", m2.config.RecoveryBackoffMax, m2.config.RecoveryBackoffInitial)
 	}
 }
+
+func TestRecovery_FailedStartGrowsBackoffAndRetries(t *testing.T) {
+	p := &fakeRecoveryProvider{status: StatusTerminated, startErr: errors.New("no spot capacity")}
+	cfg := Config{RecoveryBackoffInitial: 30 * time.Second, RecoveryBackoffMax: 5 * time.Minute}
+	m, _ := newMaintenanceManager(t, p, cfg)
+	ctx := context.Background()
+
+	// First attempt (the transition-time call).
+	m.diagnoseAndRecover(ctx, m.backends.Get("gcp"))
+	if p.startCalls != 1 {
+		t.Fatalf("after first attempt, startCalls = %d, want 1", p.startCalls)
+	}
+	if m.recoveryBackoff != 30*time.Second {
+		t.Fatalf("backoff after first failure = %v, want 30s", m.recoveryBackoff)
+	}
+
+	// Before the window elapses, maybeRetryRecovery must NOT re-attempt.
+	m.maybeRetryRecovery(ctx)
+	if p.startCalls != 1 {
+		t.Fatalf("re-attempt before backoff window: startCalls = %d, want still 1", p.startCalls)
+	}
+
+	// Force the window open → it re-attempts and doubles the backoff.
+	m.nextRecoveryAttempt = time.Now().Add(-time.Second)
+	m.maybeRetryRecovery(ctx)
+	if p.startCalls != 2 {
+		t.Fatalf("after window elapsed, startCalls = %d, want 2", p.startCalls)
+	}
+	if m.recoveryBackoff != 60*time.Second {
+		t.Fatalf("backoff after second failure = %v, want 60s (doubled)", m.recoveryBackoff)
+	}
+}
+
+func TestRecovery_BackoffCapsAtMax(t *testing.T) {
+	p := &fakeRecoveryProvider{status: StatusTerminated, startErr: errors.New("no capacity")}
+	cfg := Config{RecoveryBackoffInitial: time.Minute, RecoveryBackoffMax: 3 * time.Minute}
+	m, _ := newMaintenanceManager(t, p, cfg)
+	ctx := context.Background()
+
+	// Drive many failures; backoff must never exceed Max (1→2→3→3→3...).
+	m.diagnoseAndRecover(ctx, m.backends.Get("gcp")) // 1m
+	for i := 0; i < 6; i++ {
+		m.nextRecoveryAttempt = time.Now().Add(-time.Second)
+		m.maybeRetryRecovery(ctx)
+		if m.recoveryBackoff > cfg.RecoveryBackoffMax {
+			t.Fatalf("backoff %v exceeded max %v", m.recoveryBackoff, cfg.RecoveryBackoffMax)
+		}
+	}
+	if m.recoveryBackoff != cfg.RecoveryBackoffMax {
+		t.Fatalf("backoff settled at %v, want the cap %v", m.recoveryBackoff, cfg.RecoveryBackoffMax)
+	}
+}
