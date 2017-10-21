@@ -38,23 +38,3 @@ func TestWaitWithTimeout_WedgedOperationTimesOutRatherThanHangingForever(t *test
 	if !strings.Contains(err.Error(), "wedged") {
 		t.Errorf("error should say the operation looks wedged, not just cancelled: %q", err.Error())
 	}
-}
-
-func TestWaitWithTimeout_SuccessPassesThrough(t *testing.T) {
-	ok := func(ctx context.Context) error { return nil }
-	if err := waitWithTimeout(time.Second, ok); err != nil {
-		t.Fatalf("want nil, got %v", err)
-	}
-}
-
-// A genuine command failure (the operation completed, just with an error)
-// must be distinguishable from a timeout — a caller retrying on "wedged"
-// should not retry a real, already-finished failure the same way.
-func TestWaitWithTimeout_RealErrorIsNotReportedAsATimeout(t *testing.T) {
-	realErr := errors.New("command exited with code 1")
-	fails := func(ctx context.Context) error { return realErr }
-
-	err := waitWithTimeout(time.Second, fails)
-	if err == nil || !errors.Is(err, realErr) {
-		t.Fatalf("want the real error wrapped, got %v", err)
-	}
