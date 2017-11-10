@@ -16,22 +16,3 @@ import (
 func TestRequireRole_NoSubject(t *testing.T) {
 	err := RequireRole(context.Background(), RoleAdmin)
 	if status.Code(err) != codes.Unauthenticated {
-		t.Fatalf("want Unauthenticated, got %v (%v)", status.Code(err), err)
-	}
-}
-
-func TestRequireRole_MissingRole(t *testing.T) {
-	ctx := metadata.NewIncomingContext(context.Background(),
-		metadata.Pairs(MDKeyUsername, "alice", MDKeyRoles, "user"))
-	err := RequireRole(ctx, RoleAdmin)
-	if status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("want PermissionDenied, got %v (%v)", status.Code(err), err)
-	}
-}
-
-func TestRequireRole_HasRole(t *testing.T) {
-	ctx := metadata.NewIncomingContext(context.Background(),
-		metadata.Pairs(MDKeyUsername, "_system", MDKeyRoles, "admin"))
-	if err := RequireRole(ctx, RoleAdmin); err != nil {
-		t.Fatalf("admin should be allowed: %v", err)
-	}
