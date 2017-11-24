@@ -37,3 +37,42 @@ import (
 const quarantineCIDR = "0.0.0.0/0"
 
 // quarantineNote marks a deny rule as auto-added by quarantine, so an operator can
+// tell it from their own, and quarantine never clobbers an operator's own
+// 0.0.0.0/0 deny.
+const quarantineNote = "auto-quarantine: clamav malware"
+
+// defaultQuarantineTTL is a safety backstop: if scans stop entirely, an
+// abandoned quarantine self-expires rather than blackholing a tenant forever.
+// Refreshed on every infected scan; a clean scan does not release it.
+const defaultQuarantineTTL = 24 * time.Hour
+
+// denyRuleMutator is the slice of NetworkPolicyStore the hook needs — its atomic
+// deny-rule mutation. *MemNetworkPolicyStore / *PostgresNetworkPolicyStore both
+// satisfy it; an interface keeps the hook testable.
+type denyRuleMutator interface {
+	MutateDenyRules(ctx context.Context, tenant string, fn func([]*pb.NetworkPolicyDenyRule) ([]*pb.NetworkPolicyDenyRule, error)) (*pb.NetworkPolicy, error)
+}
+
+// AutoQuarantine wires a ClamAV scan result to a tenant's deny rules.
+type AutoQuarantine struct {
+	store denyRuleMutator
+	ttl   time.Duration
+	now   func() time.Time // injectable for tests
+}
+
+// NewAutoQuarantine builds the hook over a deny-rule store.
+func NewAutoQuarantine(store denyRuleMutator) *AutoQuarantine {
+	return &AutoQuarantine{store: store, ttl: defaultQuarantineTTL, now: time.Now}
+}
+
+// OnScanResult is the scanner callback: quarantine on "infected", ignore
+// anything else. "clean" is deliberately ignored for release (self-reported
+// verdict, see the file header); it is logged when a quarantine is in place. tenant is the container's owning username.
+func (q *AutoQuarantine) OnScanResult(containerName, tenant, status string) {
+	tenant = strings.TrimSpace(tenant)
+	if tenant == "" {
+		return
+	}
+	if status == "clean" {
+		log.Printf("[auto-quarantine] clean verdict for %s (tenant %q) not used to release any quarantine (self-reported; release is operator/TTL)", containerName, tenant)
+		return
