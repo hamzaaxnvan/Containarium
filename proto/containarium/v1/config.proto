@@ -1,0 +1,800 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "containarium/v1/container.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// Config represents the system-wide configuration for Containarium
+message Config {
+  // Incus configuration
+  IncusConfig incus = 1;
+
+  // Default resource limits for new containers
+  ResourceLimits default_resources = 2;
+
+  // Default container image
+  string default_image = 3;
+
+  // Enable Docker support by default
+  bool default_docker_enabled = 4;
+
+  // Network configuration
+  NetworkConfig network = 5;
+
+  // Storage configuration
+  StorageConfig storage = 6;
+
+  // Security configuration
+  SecurityConfig security = 7;
+
+  // Default OS type for new containers
+  OSType default_os_type = 8;
+}
+
+// IncusConfig contains Incus-specific configuration
+message IncusConfig {
+  // Incus socket path (default: /var/lib/incus/unix.socket)
+  string socket_path = 1;
+
+  // Project name to use (default: default)
+  string project = 2;
+
+  // Remote name (default: local)
+  string remote = 3;
+
+  // Timeout for Incus operations in seconds
+  int32 timeout_seconds = 4;
+}
+
+// NetworkConfig contains network-related configuration
+message NetworkConfig {
+  // Network bridge name (default: incusbr0)
+  string bridge_name = 1;
+
+  // Subnet for container IPs (e.g., "10.0.3.0/24")
+  string subnet = 2;
+
+  // DHCP range start
+  string dhcp_range_start = 3;
+
+  // DHCP range end
+  string dhcp_range_end = 4;
+
+  // DNS servers for containers
+  repeated string dns_servers = 5;
+
+  // Enable IPv6
+  bool enable_ipv6 = 6;
+}
+
+// StorageConfig contains storage-related configuration
+message StorageConfig {
+  // Storage pool name
+  string pool_name = 1;
+
+  // Storage driver (e.g., "dir", "zfs", "btrfs")
+  string driver = 2;
+
+  // Storage pool path
+  string pool_path = 3;
+
+  // Default disk quota for containers
+  string default_disk_quota = 4;
+}
+
+// SecurityConfig contains security-related configuration
+message SecurityConfig {
+  // Use unprivileged containers (recommended: true)
+  bool unprivileged_containers = 1;
+
+  // AppArmor profile to use (default: "default")
+  string apparmor_profile = 2;
+
+  // SELinux context (if using SELinux)
+  string selinux_context = 3;
+
+  // Enable seccomp filtering
+  bool enable_seccomp = 4;
+
+  // Fields 5 and 6 were require_ssh_keys and min_password_length. Nothing
+  // ever read them: this file declares no service, so SecurityConfig is not
+  // reachable over the API. Box SSH is key-only by construction instead
+  // (the provisioner's sshd drop-in plus the posture reconciler, #2424).
+  reserved 5, 6;
+  reserved "require_ssh_keys", "min_password_length";
+}
+
+// GetConfigRequest is the request to get current configuration
+message GetConfigRequest {}
+
+// GetConfigResponse is the response from getting configuration
+message GetConfigResponse {
+  // Current configuration
+  Config config = 1;
+}
+
+// UpdateConfigRequest is the request to update configuration
+message UpdateConfigRequest {
+  // Updated configuration
+  Config config = 1;
+
+  // Fields to update (if empty, update all)
+  repeated string update_mask = 2;
+}
+
+// UpdateConfigResponse is the response from updating configuration
+message UpdateConfigResponse {
+  // Success message
+  string message = 1;
+
+  // Updated configuration
+  Config config = 2;
+}
+
+// SystemInfo contains information about the host system
+message SystemInfo {
+  // Incus version
+  string incus_version = 1;
+
+  // Operating system
+  string os = 2;
+
+  // Kernel version
+  string kernel_version = 3;
+
+  // Total CPU cores
+  int32 total_cpus = 4;
+
+  // Total memory in bytes
+  int64 total_memory_bytes = 5;
+
+  // Available memory in bytes
+  int64 available_memory_bytes = 6;
+
+  // Total disk space in bytes
+  int64 total_disk_bytes = 7;
+
+  // Available disk space in bytes
+  int64 available_disk_bytes = 8;
+
+  // Number of containers running
+  int32 containers_running = 9;
+
+  // Number of containers stopped
+  int32 containers_stopped = 10;
+
+  // Total number of containers
+  int32 containers_total = 11;
+
+  // Hostname of the system
+  string hostname = 12;
+
+  // Uptime in seconds
+  int64 uptime_seconds = 13;
+
+  // Container network CIDR (e.g., "10.100.0.0/24")
+  string network_cidr = 14;
+
+  // CPU load average (1 minute)
+  double cpu_load_1min = 15;
+
+  // CPU load average (5 minutes)
+  double cpu_load_5min = 16;
+
+  // CPU load average (15 minutes)
+  double cpu_load_15min = 17;
+
+  // GPU information
+  repeated GPUInfo gpus = 18;
+
+  // Backend ID (e.g., "tunnel-node-a-gpu") — set when returned from peer
+  string backend_id = 19;
+
+  // OTLP collector endpoint (e.g., "http://10.0.3.5:4318") that
+  // monitoring=true containers ship app telemetry to. Empty when the
+  // core OTel collector isn't provisioned. Advertised here so a tenant
+  // or agent can discover where to point OTEL_EXPORTER_OTLP_ENDPOINT —
+  // in particular for docker-in-LXC apps that don't inherit the
+  // env-stamped value. See #370.
+  string otel_collector_endpoint = 20;
+
+  // Containarium daemon version of this backend (e.g. "0.21.0"), so the
+  // fleet's running versions + drift are visible via get_system_info and
+  // /v1/backends without SSHing each host. See #354.
+  string daemon_version = 21;
+
+  // Public SSH entrypoint (the sentinel host) clients dial to reach this
+  // backend's containers — the daemon's advertised --ssh-host. **Empty means
+  // this backend advertises NO external SSH entrypoint** (direct / in-network
+  // mode: reach containers by IP, or deploy through an in-network pipeline).
+  // Surfaced so an agent can tell, from get_system_info alone, whether an
+  // external SSH/deploy entrypoint exists and what host it is — instead of
+  // assuming a sentinel that may not exist. See #1011.
+  string ssh_ingress_host = 22;
+
+  // The storage pool backing this backend's containers, and whether that
+  // pool isolates tenant volumes. Null when the pool could not be read —
+  // "we don't know" must stay distinguishable from "isolated". Carried on
+  // SystemInfo so peers report it through the GetSystemInfo fan-out that
+  // ListBackends already uses, BYOC tunnel hosts included. See #1209.
+  BackendStorage storage = 23;
+
+  // committed_cpu_cores is the sum of this host's TENANT containers'
+  // committed CPU (limits.cpu / limits.cpu.allowance, summed via
+  // incus.CommittedCores) — the "how much is actually spoken for" number
+  // that pairs with total_cpus to answer "is this host over its CPU
+  // overcommit ceiling right now" (#1580). A caller derives the ratio as
+  // committed_cpu_cores / total_cpus.
+  //
+  // This is TENANT capacity, not total host capacity: the platform's own
+  // core-infra containers (Postgres, Caddy, control-plane — not tenant
+  // workload) are deliberately excluded, the same exclusion the CPU
+  // admission gate (docs/CPU-CAPACITY-ADMISSION.md, #1029) already applies.
+  // The platform's own footprint is reported separately in
+  // core_committed_cpu_cores (#2284) so an operator sizing a factor can
+  // see both halves instead of guessing the second.
+  //
+  // 0 on the K8s runtime, same as total_cpus (the Incus resource read
+  // no-ops there) — "not applicable to this runtime," not "nothing
+  // committed." See #1571/#1578 for the design this closes the visibility
+  // half of.
+  double committed_cpu_cores = 24;
+
+  // core_committed_cpu_cores is the sum of this host's CORE-ROLE containers'
+  // committed CPU (Postgres, Caddy, VictoriaMetrics, control plane, ... —
+  // the platform's own processes), the half committed_cpu_cores leaves out.
+  // Together with committed_cpu_cores and total_cpus it gives the full
+  // tenant / core / physical picture the admission gate reasons about only
+  // half of, so a saturated host is visible as such (#2284). 0 on the K8s
+  // runtime, like the other two.
+  double core_committed_cpu_cores = 25;
+
+  // cpu_admission_mode is the CPU overcommit admission gate's posture on
+  // this backend (docs/CPU-CAPACITY-ADMISSION.md): disabled, advisory
+  // (logs what it would reject, admits everything) or enforcing. Surfaced so
+  // a client can tell that a host past its ceiling is NOT being protected —
+  // advisory mode otherwise fails silently (#2284). UNSPECIFIED means the
+  // backend predates this field, not that the gate is off.
+  CPUAdmissionMode cpu_admission_mode = 26;
+
+  // cpu_overcommit_factor is the gate's configured ceiling multiple of
+  // total_cpus (the --cpu-overcommit-factor flag). 0 when the gate is
+  // disabled. The ceiling in cores is total_cpus × cpu_overcommit_factor;
+  // the host is over it when committed_cpu_cores exceeds that.
+  double cpu_overcommit_factor = 27;
+
+  // headroom is the spare scheduling capacity this backend currently
+  // advertises (#680), or null when nothing is advertised (withdrawn or
+  // never published) — null stays distinguishable from "offering zero".
+  // Carried on SystemInfo so ListBackends' existing GetSystemInfo fan-out
+  // surfaces a peer's advertisement with no extra forwarded call (#2135).
+  CapacityHeadroom headroom = 28;
+
+  // capability_profile is this backend's last-recorded hardware capability
+  // profile (#681), or null until ProfileBackend has run — null stays
+  // distinguishable from "profiled CPU-only". Carried here for the same
+  // peer fan-out as headroom (#2135).
+  CapabilityProfile capability_profile = 29;
+
+  // capabilities lists the optional API features this daemon supports, as
+  // the stable names in internal/server's DaemonCap* constants. A client
+  // checks for a name BEFORE sending a request field an older daemon would
+  // reject (the REST mux rejects unknown JSON fields). Absent from an older
+  // daemon: an empty list means "none of the optional features", so a
+  // client must treat a missing name as unsupported. Names are only ever
+  // added. Currently: "box_run_name" (StartBoxRunRequest.run_name) and
+  // "box_run_structured_output" (StartBoxRunRequest.structured_output) and
+  // "box_run_model" (StartBoxRunRequest.model, BoxRun.model).
+  // An open string set rather than an enum so a newer daemon's extra names
+  // never fail to decode in an older client.
+  repeated string capabilities = 30;
+
+  // storage_pools is every Incus storage pool's fill as the daemon's pool
+  // capacity monitor last read it (#2823), so a nearly full pool is visible
+  // per pool rather than hidden in the summed disk fields above. Served from
+  // the monitor's snapshot (no extra Incus call); empty when the monitor has
+  // not read yet or the daemon predates the field.
+  repeated StoragePoolCapacity storage_pools = 31;
+
+  // peer_transport is how this daemon's own calls to peer backends are
+  // secured right now (Phase 0.5 peer mTLS). PEER_TRANSPORT_HTTP is a
+  // supported setup (peer mTLS off, or no peer CA on the sentinel) but it
+  // means those calls go over plain HTTP, not over the pinned peer-PKI
+  // TLS, so an operator can see the degraded state instead of finding one
+  // startup log line. UNSPECIFIED means this daemon has no sentinel URL and no
+  // peers, so makes no peer calls (or predates the field). Says nothing about any other transport, such as
+  // the sentinel-backend tunnel. See #3079.
+  PeerTransport peer_transport = 32;
+
+  // managed_backup_key_configured is true when this daemon has a managed
+  // backup key (CONTAINARIUM_BACKUP_KMS_KEY_NAME), so every database backup
+  // it takes is encrypted even for a tenant with no registered age
+  // recipient. `containarium backup status` reads it to avoid flagging such
+  // tenants as unencrypted. False covers both "no managed key" and a daemon
+  // that predates the field, so a client must treat false as "not known to
+  // be encrypted". See #3213.
+  bool managed_backup_key_configured = 33;
+}
+
+// PeerTransport is the transport this daemon uses for its calls to peer
+// backends.
+enum PeerTransport {
+  // No sentinel and no peers (no peer calls), or the daemon predates the field.
+  PEER_TRANSPORT_UNSPECIFIED = 0;
+  // Peer calls use plain HTTP: peer mTLS is not enabled (no peer cert was
+  // obtained from the sentinel).
+  PEER_TRANSPORT_HTTP = 1;
+  // Peer calls use HTTPS with the sentinel-issued leaf cert and the pinned
+  // peer CA.
+  PEER_TRANSPORT_MTLS = 2;
+}
+
+// StoragePoolCapacity is one storage pool's fill (#2823).
+message StoragePoolCapacity {
+  // Storage pool name.
+  string pool = 1;
+
+  // The pool's driver as a typed constant.
+  StorageDriver driver = 2;
+
+  // Bytes used and usable size, as Incus reports them for the pool. For ZFS,
+  // Incus derives the size as used + available, so ZFS slop space is already
+  // excluded (read from the Incus driver; not verified on a live pool).
+  int64 used_bytes = 3;
+  int64 total_bytes = 4;
+
+  // Fill level against the daemon's fixed thresholds (warning >= 85%,
+  // critical >= 95% of used_bytes / total_bytes).
+  StoragePoolCapacityLevel level = 5;
+
+  // When the monitor read the pool.
+  google.protobuf.Timestamp observed_at = 6;
+}
+
+// StoragePoolCapacityLevel is a storage pool's fill level (#2823).
+enum StoragePoolCapacityLevel {
+  // The pool did not report a size.
+  STORAGE_POOL_CAPACITY_LEVEL_UNSPECIFIED = 0;
+  // Below the warning threshold.
+  STORAGE_POOL_CAPACITY_LEVEL_OK = 1;
+  // At or above 85%.
+  STORAGE_POOL_CAPACITY_LEVEL_WARNING = 2;
+  // At or above 95%: containers on the pool may soon stop writing.
+  STORAGE_POOL_CAPACITY_LEVEL_CRITICAL = 3;
+}
+
+// CPUAdmissionMode is the CPU overcommit admission gate's posture
+// (docs/CPU-CAPACITY-ADMISSION.md, #1029). An enum rather than a pair of
+// bare flags so a client switches on typed constants and cannot mistake
+// "factor set but not enforced" for protection (#2284).
+enum CPUAdmissionMode {
+  // The backend did not report a posture (pre-#2284 daemon).
+  CPU_ADMISSION_MODE_UNSPECIFIED = 0;
+  // No factor configured: the gate never runs (the default).
+  CPU_ADMISSION_MODE_DISABLED = 1;
+  // A factor is configured but over-ceiling creates are only logged, never
+  // rejected.
+  CPU_ADMISSION_MODE_ADVISORY = 2;
+  // Over-ceiling creates are rejected with ResourceExhausted.
+  CPU_ADMISSION_MODE_ENFORCING = 3;
+}
+
+// StorageDriver identifies the incus storage-pool driver backing a backend's
+// containers. An enum rather than a bare string so callers switch on typed
+// constants; the raw driver name travels alongside in BackendStorage for
+// drivers we do not have a constant for.
+enum StorageDriver {
+  STORAGE_DRIVER_UNSPECIFIED = 0;
+  STORAGE_DRIVER_ZFS = 1;
+  STORAGE_DRIVER_BTRFS = 2;
+  STORAGE_DRIVER_LVM = 3;
+  STORAGE_DRIVER_CEPH = 4;
+  STORAGE_DRIVER_DIR = 5;
+
+  // A pool driver we read successfully but do not classify. Distinct from
+  // UNSPECIFIED, which means we could not read the pool at all.
+  STORAGE_DRIVER_OTHER = 6;
+}
+
+// StorageIsolation says whether a storage pool hands each container its own
+// filesystem, or puts every container on one shared filesystem.
+//
+// This is the property behind #1206. On a shared filesystem every tenant
+// rootfs lives on one ext4 filesystem and therefore shares one jbd2 journal;
+// ext4's default data=ordered mode writes back a transaction's dirty data
+// while holding the journal lock, so one tenant's buffered writes block
+// another tenant's fsync() — measured at 17 ms -> 11,885 ms with the host and
+// the physical device both idle. A tenant degrades its neighbours by writing
+// normally, which makes this an isolation property, not a performance one.
+enum StorageIsolation {
+  // Not known — the pool could not be read. Deliberately distinct from
+  // SHARED_FILESYSTEM: an unread pool must not be reported as either safe or
+  // unsafe.
+  STORAGE_ISOLATION_UNSPECIFIED = 0;
+
+  // Each container gets its own dataset / subvolume / logical volume, so
+  // tenants share no filesystem journal.
+  STORAGE_ISOLATION_PER_CONTAINER = 1;
+
+  // Every container's rootfs is on one filesystem — one journal, and
+  // cross-tenant fsync stalls.
+  STORAGE_ISOLATION_SHARED_FILESYSTEM = 2;
+
+  // The driver was read but is not one we classify, so we cannot vouch for it
+  // either way. Distinct from UNSPECIFIED (pool unreadable) and from
+  // SHARED_FILESYSTEM (positively known to share).
+  STORAGE_ISOLATION_UNKNOWN_DRIVER = 3;
+}
+
+// BackendStorage describes the storage pool backing a backend's containers.
+// Surfaced through ListBackends so an operator can answer "which of my
+// backends can have one tenant stall another's fsync?" from the product,
+// rather than by reading a daemon startup log on each host. See #1209.
+message BackendStorage {
+  // Storage pool name (e.g. "default").
+  string pool = 1;
+
+  // The pool's driver as a typed constant.
+  StorageDriver driver = 2;
+
+  // Whether this pool isolates tenant volumes.
+  StorageIsolation isolation = 3;
+
+  // The raw driver string incus reported (e.g. "zfs", "dir", or a driver
+  // predating this enum). Always populated when the pool was read, so a
+  // STORAGE_DRIVER_OTHER value is still actionable.
+  string driver_name = 4;
+}
+
+// GPU vendor enum
+enum GPUVendor {
+  GPU_VENDOR_UNSPECIFIED = 0;
+  GPU_VENDOR_NVIDIA = 1;
+  GPU_VENDOR_AMD = 2;
+  GPU_VENDOR_INTEL = 3;
+}
+
+// GPU model enum (common datacenter and workstation GPUs)
+enum GPUModel {
+  GPU_MODEL_UNSPECIFIED = 0;
+
+  // NVIDIA Consumer
+  GPU_MODEL_NVIDIA_RTX_4090 = 100;
+  GPU_MODEL_NVIDIA_RTX_4080 = 101;
+  GPU_MODEL_NVIDIA_RTX_4070_TI = 102;
+  GPU_MODEL_NVIDIA_RTX_4070 = 103;
+  GPU_MODEL_NVIDIA_RTX_3090 = 104;
+  GPU_MODEL_NVIDIA_RTX_3080 = 105;
+  GPU_MODEL_NVIDIA_RTX_5090 = 106;
+  GPU_MODEL_NVIDIA_RTX_5080 = 107;
+
+  // NVIDIA Datacenter
+  GPU_MODEL_NVIDIA_A100 = 200;
+  GPU_MODEL_NVIDIA_A10 = 201;
+  GPU_MODEL_NVIDIA_A10G = 202;
+  GPU_MODEL_NVIDIA_H100 = 203;
+  GPU_MODEL_NVIDIA_H200 = 204;
+  GPU_MODEL_NVIDIA_L4 = 205;
+  GPU_MODEL_NVIDIA_L40 = 206;
+  GPU_MODEL_NVIDIA_L40S = 207;
+  GPU_MODEL_NVIDIA_T4 = 208;
+  GPU_MODEL_NVIDIA_V100 = 209;
+  GPU_MODEL_NVIDIA_B200 = 210;
+
+  // AMD
+  GPU_MODEL_AMD_MI300X = 300;
+  GPU_MODEL_AMD_MI250X = 301;
+  GPU_MODEL_AMD_RX_7900_XTX = 302;
+
+  // Intel
+  GPU_MODEL_INTEL_MAX_1550 = 400;
+  GPU_MODEL_INTEL_ARC_A770 = 401;
+}
+
+// GPUInfo represents a GPU device on the system
+message GPUInfo {
+  // GPU vendor
+  GPUVendor vendor = 1;
+
+  // GPU model (known models mapped to enum, or UNSPECIFIED for unknown)
+  GPUModel model = 2;
+
+  // Raw model name string from the driver (for display when model is UNSPECIFIED)
+  string model_name = 3;
+
+  // PCI address (e.g., "0000:0b:00.0")
+  string pci_address = 4;
+
+  // Driver version (e.g., "570.86.15")
+  string driver_version = 5;
+
+  // CUDA version (e.g., "12.7") — NVIDIA only
+  string cuda_version = 6;
+
+  // VRAM in bytes (when available)
+  int64 vram_bytes = 7;
+}
+
+// GetSystemInfoRequest is the request to get system information
+message GetSystemInfoRequest {}
+
+// GetSystemInfoResponse is the response from getting system information
+message GetSystemInfoResponse {
+  // System information (local/primary backend)
+  SystemInfo info = 1;
+
+  // System information from peer backends (tunnel-connected)
+  repeated SystemInfo peers = 2;
+}
+
+// GetLatestReleaseRequest is the request for the latest-release check.
+message GetLatestReleaseRequest {}
+
+// GetLatestReleaseResponse reports the latest published release vs the
+// running daemon version. See #354.
+message GetLatestReleaseResponse {
+  // Latest release tag from GitHub (e.g. "v0.21.2"). Empty when the lookup
+  // hasn't succeeded yet (e.g. rate-limited with no cached value).
+  string latest_release = 1;
+
+  // This daemon's running version (e.g. "0.21.0").
+  string current_version = 2;
+
+  // True when latest_release is a newer semver than current_version.
+  bool update_available = 3;
+
+  // Version of the binary the sentinel currently serves, i.e. what a default
+  // (sentinel-path) TriggerUpgrade would install. Can lag latest_release
+  // until an operator runs `containarium sentinel fetch-release`. Empty when
+  // unknown: no sentinel configured, an older sentinel without
+  // /containarium/version, or the lookup failed. #2171.
+  string target_version = 4;
+}
+
+// ValidateGPURequest asks a backend to prove GPU passthrough works from inside
+// an LXC. See #316.
+message ValidateGPURequest {
+  // Backend to validate. Empty = the local/primary daemon's own host.
+  string backend_id = 1;
+
+  // Specific GPU PCI address (e.g. "0000:01:00.0"). Empty = pass through all
+  // GPUs. Prefer PCI over a DRM index — it's stable across kernel upgrades.
+  string pci = 2;
+}
+
+// ValidateGPUResponse reports whether the GPU is usable from inside an LXC on
+// the backend: the daemon launches a throwaway nvidia.runtime LXC, runs
+// nvidia-smi inside, tears it down, and returns the parsed model + driver.
+message ValidateGPUResponse {
+  enum GPUStatus {
+    GPU_STATUS_UNSPECIFIED = 0;
+    GPU_STATUS_OK = 1;          // nvidia-smi saw the GPU inside the LXC
+    GPU_STATUS_UNAVAILABLE = 2; // no GPU / passthrough not visible / setup failed
+    GPU_STATUS_DEGRADED = 3;    // reserved (e.g. present but reporting errors)
+  }
+
+  GPUStatus status = 1;
+  string gpu_model = 2;      // e.g. "NVIDIA GeForce RTX 3090"
+  string driver_version = 3; // e.g. "570.211.01"
+  string detail = 4;         // populated when status != OK
+  string backend_id = 5;     // echoes the validated backend ("" = local)
+}
+
+// TriggerUpgradeRequest asks a backend to upgrade its daemon binary now instead
+// of waiting for the periodic auto-update tick. The daemon pulls the binary the
+// sentinel currently serves (SHA-verified), smoke-tests it, swaps atomically
+// (keeping the previous binary as .old), and restarts. See #354 Phase B.
+message TriggerUpgradeRequest {
+  // Backend to upgrade. Empty = the local/primary daemon's own host.
+  string backend_id = 1;
+
+  // Upgrade even if the sentinel-served binary already matches the running one.
+  bool force = 2;
+
+  // Optional (#1028): pull this exact release directly from GitHub Releases
+  // instead of the sentinel-served binary — "vX.Y.Z" or "latest". Opt-in;
+  // empty (the default) is unchanged sentinel-served behavior. Lets an
+  // internet-connected host (e.g. an operator-owned lab BYOC box) jump
+  // straight to a tag without upgrading the sentinel first. Not for
+  // air-gapped hosts, which have no GitHub egress and must keep the
+  // sentinel path regardless — this field existing changes nothing for them.
+  string github_tag = 3;
+
+  // Permit github_tag to name a release older than the running daemon
+  // version (a deliberate rollback). Default false: such a tag is refused
+  // with FAILED_PRECONDITION. Only both-parse-as-semver comparisons can
+  // refuse; "latest", dev builds and unparseable versions are not blocked.
+  // Has no effect on the sentinel-served path.
+  bool allow_downgrade = 4;
+}
+
+// TriggerUpgradeResponse acknowledges that an upgrade was started. The upgrade
+// runs asynchronously (the daemon restarts), so callers poll GetUpgradeStatus
+// or watch the backend's version in ListBackends for the outcome. See #354.
+message TriggerUpgradeResponse {
+  // Opaque id for polling via GetUpgradeStatus.
+  string upgrade_id = 1;
+
+  // Status at acknowledgement time: "in_progress" (started) or "noop"
+  // (already up to date and force=false).
+  string status = 2;
+
+  // The daemon version running when the upgrade was triggered.
+  string current_version = 3;
+
+  // Human-readable detail (e.g. why it was a noop).
+  string message = 4;
+
+  // Echoes the targeted backend ("" = local).
+  string backend_id = 5;
+
+  // Version this upgrade will install: the sentinel-served binary's version,
+  // or the requested github_tag. Best-effort — empty when unknown. #2171.
+  string target_version = 6;
+}
+
+// GetUpgradeStatusRequest polls an upgrade started by TriggerUpgrade.
+message GetUpgradeStatusRequest {
+  string upgrade_id = 1;
+}
+
+// GetUpgradeStatusResponse reports an upgrade's progress. Note: a local
+// self-upgrade restarts the daemon, dropping in-memory job state — after a
+// restart this returns status "unknown" and callers should compare the
+// backend's version in ListBackends instead. See #354.
+message GetUpgradeStatusResponse {
+  // One of: "in_progress", "completed", "failed", "noop", "unknown".
+  string status = 1;
+
+  // Daemon version recorded when the upgrade was triggered.
+  string current_version = 2;
+
+  // Error detail when status == "failed".
+  string error = 3;
+
+  // RFC3339 completion time when status is "completed" or "failed".
+  string completed_at = 4;
+
+  // Version the upgrade was installing, as recorded when it was triggered.
+  // Empty when unknown, including after a restart dropped the job. #2171.
+  string target_version = 5;
+}
+
+// NetworkPolicyMode controls whether a tenant's network policy is enforced or
+// only observed. Phase A ships log_only; Phase B flips to enforce. See
+// docs/security/NETWORK-ISOLATION-DESIGN.md (#315).
+enum NetworkPolicyMode {
+  NETWORK_POLICY_MODE_UNSPECIFIED = 0; // treated as LOG_ONLY in Phase A
+  NETWORK_POLICY_MODE_LOG_ONLY = 1;    // observe + audit denied flows; drop nothing
+  NETWORK_POLICY_MODE_ENFORCE = 2;     // actually drop denied flows
+}
+
+// EgressPreset names a ready-made egress posture so a tenant lockdown is one
+// field rather than a rule set (#2440).
+enum EgressPreset {
+  // No preset: the policy is exactly what its egress lists say. The behaviour
+  // before this enum existed.
+  EGRESS_PRESET_UNSPECIFIED = 0;
+  // Allow-list only: egress is limited to egress_cidrs and egress_domains plus
+  // the box's DNS resolver (the bridge gateway), which is added implicitly so
+  // an allow-list cannot blackhole name resolution. Everything else is denied
+  // in ENFORCE mode and audited in LOG_ONLY, so the preset can be soaked
+  // before it is armed. The mode is not changed by the preset.
+  EGRESS_PRESET_ALLOW_LIST_ONLY = 1;
+}
+
+// NetworkPolicy is a tenant's network-isolation policy, enforced at each of the
+// tenant's container host-veth TC_INGRESS hooks (the sender side of every flow;
+// see the Phase 0 findings in NETWORK-ISOLATION-DESIGN.md). #315.
+message NetworkPolicy {
+  // Tenant this policy applies to (required).
+  string tenant = 1;
+
+  // Allow container↔container traffic within the same tenant. When false, even
+  // same-tenant peers can't reach each other.
+  bool allow_intra_tenant = 2;
+
+  // Allowed egress destination CIDRs (e.g. "10.0.0.0/8", "1.2.3.4/32").
+  repeated string egress_cidrs = 3;
+
+  // Allowed egress domains (e.g. "api.github.com"); the daemon resolves these
+  // to CIDRs on a refresh loop and folds them into the egress allow set.
+  repeated string egress_domains = 4;
+
+  // Enforcement mode. Unspecified is treated as LOG_ONLY in Phase A.
+  NetworkPolicyMode mode = 5;
+
+  // Allow reaching the cloud metadata service (169.254.169.254). Default false:
+  // the metadata IP is denied even if egress_cidrs/egress_domains would
+  // otherwise cover it (deny-beats-allow for this one sensitive IP, since it
+  // hands out cloud credentials). Set true only for a tenant that legitimately
+  // needs instance metadata. #315 Phase D.
+  bool allow_metadata = 6;
+
+  // Source identifies who authored this policy: "" / "cli" for an operator via
+  // `containarium network-policy set`, "cloud" for one synced from a cloud
+  // control plane (#354). The cloud-actuation reconciler converges only its own
+  // ("cloud") policies — so removing a policy cloud-side clears it on the host
+  // without clobbering an operator's CLI-authored policy. Informational on
+  // get/list.
+  string source = 7;
+
+  // Virtual-patch deny rules (#660). Each blocks traffic to a destination
+  // CIDR (optionally scoped to a port/proto) and is evaluated BEFORE the
+  // egress allow-list: deny beats allow, the same way the metadata IP does.
+  // Use to "virtually patch" a known-vulnerable destination/service until the
+  // real upstream fix ships — instant, in-kernel, zero downtime. A rule whose
+  // expires_at is in the past is dropped at compile time, so the patch
+  // self-removes once the fix lands.
+  repeated NetworkPolicyDenyRule deny_rules = 8;
+  // Tenants whose containers may reach this tenant's containers over the
+  // bridge (#2359). Consumed by the tenant network guard
+  // (docs/architecture/tenant-network-guard.md): every box of a listed
+  // tenant becomes an allowed ingress source on this tenant's NIC ACL.
+  // This is the only way to open tenant ingress to another tenant; the
+  // per-container ACL (UpdateContainerACL) no longer carries ingress rules.
+  // Normalised on set: trimmed, deduplicated, sorted; the tenant itself is
+  // rejected (use allow_intra_tenant). One-directional: listing bob here
+  // lets bob reach us, not the reverse.
+  repeated string allow_from_tenants = 9;
+
+  // Ready-made egress posture (#2440). UNSPECIFIED leaves the policy exactly
+  // as its lists say. See EgressPreset.
+  EgressPreset egress_preset = 10;
+
+  // Enforcement mode for the egress allow-list ONLY. `mode` keeps governing
+  // the cross-tenant, intra-tenant, metadata, virtual-patch and signature
+  // checks; this field decides whether a flow to a destination outside the
+  // allow-list (egress_cidrs + resolved egress_domains) is dropped or only
+  // logged. It lets an operator soak a narrower allow-list in LOG_ONLY while
+  // the cross-tenant drop stays in ENFORCE. UNSPECIFIED (the default, and what
+  // every policy written before this field carries) means "follow `mode`", so
+  // existing policies behave exactly as before. The daemon-wide enforce guard
+  // downgrades ENFORCE here exactly as it does for `mode`.
+  NetworkPolicyMode egress_mode = 11;
+}
+
+// NetworkPolicyDenyRule is one virtual-patch block rule (#660). Traffic from a
+// tenant's container to the destination is denied — dropped in ENFORCE mode,
+// audited (action network_policy.virtual_patch) in every mode. Deny beats the
+// egress allow-list.
+message NetworkPolicyDenyRule {
+  // Destination CIDR to block (e.g. "1.2.3.4/32", "10.0.0.0/8"). Required.
+  // IPv4 only (Phase A parses IPv4); a host IP is just a /32.
+  string cidr = 1;
+
+  // Optional destination port to scope the block (0 = any port). Lets a rule
+  // target only the vulnerable service (e.g. a Redis CVE on 6379) without
+  // blocking unrelated traffic to the same host.
+  uint32 port = 2;
+
+  // Optional IP protocol to scope the block: "tcp" | "udp" | "" (any).
+  string proto = 3;
+
+  // Operator note — typically the CVE id this rule virtual-patches. Echoed on
+  // get/list and carried into the audit detail.
+  string note = 4;
+
+  // Optional RFC3339 expiry (e.g. "2026-07-01T00:00:00Z"). A rule past its
+  // expiry is not installed into the kernel, so a virtual patch auto-removes
+  // once the real fix is confirmed. Empty = no expiry.
+  string expires_at = 5;
+}
+
+// --- NetworkPolicyService request/response messages (#315) ---
+
+message SetNetworkPolicyRequest {
+  NetworkPolicy policy = 1;
+}
+message SetNetworkPolicyResponse {
+  // The stored policy (echoed back in its normalized form).
+  NetworkPolicy policy = 1;
+}
+
+message GetNetworkPolicyRequest {
+  string tenant = 1;
+}
+message GetNetworkPolicyResponse {
