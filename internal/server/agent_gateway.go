@@ -102,3 +102,108 @@ var gatewayProviderEnvs = map[string]gatewayProviderEnv{
 // re-parse its own token to kill it.
 //
 // keyOwner is stamped as the token's key_owner claim (#2134) so the gateway
+// spends that owner's registered key; "" mints no claim and the token resolves
+// through the daemon-global key exactly as before. Callers resolve it with
+// runKeyOwner, which only ever returns a validated owner or "".
+//
+// model (#2229) is the skill manifest's own pinned model, already confirmed
+// (by the caller, before this mint) to be one the resolved provider actually
+// serves when a check was possible. Empty means the skill pins none — the
+// token carries no AllowedModels ceiling, the gateway's own default applies,
+// unchanged pre-#2229 behavior. A skill with one DOES get a real ceiling: the
+// token can spend on exactly that model and no other, enforced at the
+// gateway (internal/modelgateway/gateway.go), not just advisory.
+func (g *gatewayProvisioning) mintGatewayToken(tenant, skillID, runID, keyOwner, provider, model string) (string, tokenid.MintedID, error) {
+	var allowedModels []string
+	if model != "" {
+		allowedModels = []string{model}
+	}
+	return modelgateway.MintTokenWithID(g.secret, modelgateway.GatewayClaims{
+		Tenant:        tenant,
+		SkillID:       skillID,
+		Provider:      provider,
+		AllowedModels: allowedModels,
+		RunID:         runID,
+		KeyOwner:      keyOwner,
+	}, agentTokenTTL)
+}
+
+// runKeyOwner resolves whose provider key a skill/crew run's model calls spend
+// (#2134), the way MintGatewayToken resolves it for a named box
+// (resolveBoxKeyOwner): the box's cloud_org_id attribution label when the
+// cloud stamped one -> org:<org_id>, else the run's owning username. A skill
+// box is named agent-<skill> and shared by every caller of that skill, so the
+// box name is not an owner; the run belongs to whoever dispatched it — the
+// authenticated subject, the same identity the run's platform token records as
+// its act claim (mintedAgentAct).
+//
+// Returns "" — no key_owner claim, the daemon-global key, as before #2134 —
+// when there is no attributable owner (a system-started run with no subject;
+// decided on FootprintAI/Containarium-cloud#1917, 2026-09-29) or when the
+// resolved owner does not pass modelgateway.ValidateKeyOwner. A malformed
+// owner is never stamped and never degrades to a different owner: a stamped
+// but malformed attribution must not fall through to the caller's username,
+// since that would bill someone the cloud did not attribute the box to.
+func runKeyOwner(ctx context.Context, box *pb.Container, orgID string) string {
+	var owner string
+	if orgID != "" {
+		// The request's own org attribution wins: the skill box is
+		// shared across runs, so its label cannot say whose run this is.
+		owner = modelgateway.OrgKeyOwner(orgID)
+	} else if orgID := strings.TrimSpace(box.GetLabels()[cloudOrgIDLabel]); orgID != "" {
+		owner = modelgateway.OrgKeyOwner(orgID)
+	} else if username, _, ok := auth.SubjectFromGRPCContext(ctx); ok && username != "" {
+		owner = modelgateway.UserKeyOwner(username)
+	} else {
+		return ""
+	}
+	if err := modelgateway.ValidateKeyOwner(owner); err != nil {
+		log.Printf("[agent-skill] run key owner %q is not a valid key_owner (%v); minting with no key_owner claim", owner, err)
+		return ""
+	}
+	return owner
+}
+
+// authorizeRunOrg validates RunAgentSkillRequest/RunCrewRequest.
+// on_behalf_of_org_id and returns it, or "" when unset. Setting it
+// spends that org's provider key, so only a service credential carrying the
+// literal agents:run-for-org scope may; it must also be a well-formed id.
+func authorizeRunOrg(ctx context.Context, orgID string) (string, error) {
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return "", nil
+	}
+	if !auth.HasLiteralScope(ctx, auth.ScopeAgentsRunForOrg) {
+		return "", status.Errorf(codes.PermissionDenied,
+			"on_behalf_of_org_id requires the %s scope", auth.ScopeAgentsRunForOrg)
+	}
+	if err := modelgateway.ValidateKeyOwner(modelgateway.OrgKeyOwner(orgID)); err != nil {
+		return "", status.Errorf(codes.InvalidArgument, "on_behalf_of_org_id: %v", err)
+	}
+	return orgID, nil
+}
+
+// mintRunGatewayToken mints the gateway token for one skill/crew run on the box
+// `name`, carrying the run's key_owner (runKeyOwner) and bound to provider —
+// the run's RESOLVED provider (#2222), not necessarily the daemon's default.
+// Every run path — a push run, a crew member, a queue worker — reaches it
+// through provisionSkillBoxWith, which resolves provider once per run via
+// agentengine.Resolve before calling here.
+//
+// An owner with no registered key is still minted a key_owner token: the
+// gateway falls back to the daemon-global key for it and logs that call as
+// billed to the operator (modelgateway resolveKey, case 3). That differs on
+// purpose from MintGatewayToken, which refuses such a mint up front — a caller
+// asking for a token can fix its config and retry, whereas a run that fails
+// outright is worse than one that runs and is logged (#2134). This path never
+// reaches here for a provider agentengine.Resolve already refused: that
+// refusal happens in provisionSkillBoxWith before any mint is attempted.
+//
+// A run with no attributable owner mints no claim, and is logged here, once
+// per run, rather than per model call.
+//
+// model (#2229) is the skill manifest's own pinned model — see
+// gatewayProvisioning.mintGatewayToken's doc for what it does to the token.
+func (s *AgentSkillServer) mintRunGatewayToken(ctx context.Context, name, skillID, runID, provider, model string, box *pb.Container, orgID string) (string, tokenid.MintedID, error) {
+	keyOwner := runKeyOwner(ctx, box, orgID)
+	if keyOwner == "" {
