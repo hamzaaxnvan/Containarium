@@ -21,14 +21,3 @@ run() { # run NAME FIXDIR args...
 }
 
 # 1. dry run: exit 0, no write calls, says so
-run dry "$fix" || t "dry run exited non-zero"
-if grep -qE '^(PUT|PATCH|POST|DELETE) ' "$tmp/dry.log"; then t "dry run wrote"; fi
-grep -q 'DRY RUN' "$tmp/dry.out" || t "dry run did not say so"
-
-# 2. --apply: succeeds, protection body preserves contexts/app ids/strict/enforce_admins
-run apply "$fix" --apply || { t "--apply failed"; cat "$tmp/apply.out"; }
-body=$(awk '/^== PUT .*branches\/main\/protection/{f=1;next} /^== /{f=0} f' "$tmp/apply.log.body")
-for want in '"context":"Unit + default e2e"' '"context":"Trivy"' '"app_id":15368' '"app_id":57789' \
-            '"strict":true' '"enforce_admins":true' '"require_code_owner_reviews":true' \
-            '"dismiss_stale_reviews":true' '"required_conversation_resolution":true'; do
-  grep -qF "$want" <<<"$(jq -c . <<<"$body")" || t "protection body lacks $want"
