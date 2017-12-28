@@ -32,38 +32,3 @@ export default function WorkspaceView({ server, routes }: { server: Server; rout
   // unrelated apps as workspaces).
   const workspaces = useMemo(
     () => (routes || []).filter((r) => r.active && !!r.subdomain?.includes('workspace')),
-    [routes]
-  );
-
-  const [selected, setSelected] = useState<string>('');
-  const active = workspaces.find((w) => w.fullDomain === selected) ?? workspaces[0];
-  const activeDomain = active?.fullDomain;
-  const activeName = active?.username;
-
-  const [bootstrapSrc, setBootstrapSrc] = useState<string>('');
-  const [loading, setLoading] = useState(false);
-  const [needsSignin, setNeedsSignin] = useState(false);
-  const [tab, setTab] = useState<'chat' | 'settings'>('chat');
-  const [reloadKey, setReloadKey] = useState(0);
-
-  const loadAccess = useCallback(async () => {
-    if (!activeDomain) return;
-    const fallback = `https://${activeDomain}`;
-    setLoading(true);
-    setNeedsSignin(false);
-    try {
-      const access = activeName ? await getClient(server).getWorkspaceAccess(activeName) : null;
-      if (access?.url) {
-        setBootstrapSrc(access.url);
-      } else {
-        setBootstrapSrc(fallback);
-        setNeedsSignin(true);
-      }
-    } catch {
-      setBootstrapSrc(fallback);
-      setNeedsSignin(true);
-    } finally {
-      setLoading(false);
-    }
-  }, [server, activeDomain, activeName]);
-
