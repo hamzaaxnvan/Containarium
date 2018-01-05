@@ -30,3 +30,19 @@ func TestTenantAccessRESTSignedTokenScopeAndTypedReceipt(t *testing.T) {
 	handler := auth.NewAuthMiddleware(tm).HTTPMiddleware(mux)
 	for _, allowed := range []bool{false, true} {
 		scopes := []string{auth.ScopeContainersWrite}
+		if allowed {
+			scopes = append(scopes, auth.ScopeNetworkPolicyWrite)
+		}
+		token, err := tm.GenerateToken("operator", []string{auth.RoleAdmin}, time.Minute, scopes...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest("POST", "/v1/network-policies/tenant-access", strings.NewReader(`{"changes":[{"destination":"team-b","addSources":["team-a"],"expectedRevision":"absent"}]}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		out := httptest.NewRecorder()
+		handler.ServeHTTP(out, req)
+		if !allowed {
+			if out.Code != 403 {
+				t.Fatalf("scope bypass %d", out.Code)
+			}
