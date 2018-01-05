@@ -78,3 +78,245 @@ type TokensServiceClient interface {
 	// CONTAINARIUM_STRICT_SCOPES is set to. Elsewhere that claim is
 	// optional for backward compatibility (#1679); here the
 	// caller's scopes ARE the ceiling, so an absent claim would
+	// mean no ceiling. A caller must present a scoped credential.
+	ExchangeDelegatedToken(ctx context.Context, in *ExchangeDelegatedTokenRequest, opts ...grpc.CallOption) (*ExchangeDelegatedTokenResponse, error)
+	// RefreshToken exchanges a valid refresh token for a new
+	// (access, refresh) pair. The prior refresh token's jti is
+	// revoked on success — refresh tokens are SINGLE-USE.
+	// Replay of an already-exchanged refresh token returns
+	// Unauthenticated (it's now on the revocation list).
+	//
+	// Unauthenticated endpoint by design — the refresh token
+	// itself IS the credential. Don't wrap with the access-
+	// token middleware.
+	RefreshToken(ctx context.Context, in *RefreshTokenRequest, opts ...grpc.CallOption) (*RefreshTokenResponse, error)
+	// ListRevokedTokens enumerates active revocations.
+	// Operators use this to confirm a revoke landed or to
+	// investigate "what got killed during the incident window."
+	// Admin-only + tokens:write scope (same surface as
+	// RevokeToken — anyone who can revoke can enumerate).
+	ListRevokedTokens(ctx context.Context, in *ListRevokedTokensRequest, opts ...grpc.CallOption) (*ListRevokedTokensResponse, error)
+	// GetUnscopedTokenReport reports how many recent calls used a token with
+	// no scopes claim — the measured-rollout deliverable for #1679's strict
+	// mode. Same gate as ListRevokedTokens: admin-only + tokens:read scope.
+	GetUnscopedTokenReport(ctx context.Context, in *GetUnscopedTokenReportRequest, opts ...grpc.CallOption) (*GetUnscopedTokenReportResponse, error)
+}
+
+type tokensServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewTokensServiceClient(cc grpc.ClientConnInterface) TokensServiceClient {
+	return &tokensServiceClient{cc}
+}
+
+func (c *tokensServiceClient) RevokeToken(ctx context.Context, in *RevokeTokenRequest, opts ...grpc.CallOption) (*RevokeTokenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RevokeTokenResponse)
+	err := c.cc.Invoke(ctx, TokensService_RevokeToken_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tokensServiceClient) ExchangeDelegatedToken(ctx context.Context, in *ExchangeDelegatedTokenRequest, opts ...grpc.CallOption) (*ExchangeDelegatedTokenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExchangeDelegatedTokenResponse)
+	err := c.cc.Invoke(ctx, TokensService_ExchangeDelegatedToken_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tokensServiceClient) RefreshToken(ctx context.Context, in *RefreshTokenRequest, opts ...grpc.CallOption) (*RefreshTokenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RefreshTokenResponse)
+	err := c.cc.Invoke(ctx, TokensService_RefreshToken_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tokensServiceClient) ListRevokedTokens(ctx context.Context, in *ListRevokedTokensRequest, opts ...grpc.CallOption) (*ListRevokedTokensResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListRevokedTokensResponse)
+	err := c.cc.Invoke(ctx, TokensService_ListRevokedTokens_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *tokensServiceClient) GetUnscopedTokenReport(ctx context.Context, in *GetUnscopedTokenReportRequest, opts ...grpc.CallOption) (*GetUnscopedTokenReportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetUnscopedTokenReportResponse)
+	err := c.cc.Invoke(ctx, TokensService_GetUnscopedTokenReport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// TokensServiceServer is the server API for TokensService service.
+// All implementations must embed UnimplementedTokensServiceServer
+// for forward compatibility.
+//
+// TokensService is the admin surface for JWT lifecycle.
+//
+// RevokeToken requires an admin role + tokens:write scope;
+// tenants can't revoke other tenants' tokens. RefreshToken
+// is open to any holder of a valid refresh token — that's
+// the whole point of the exchange flow.
+type TokensServiceServer interface {
+	// RevokeToken adds a token's jti to the revocation list,
+	// taking effect on the next authenticated request that
+	// names it. Idempotent — repeated revokes are safe.
+	RevokeToken(context.Context, *RevokeTokenRequest) (*RevokeTokenResponse, error)
+	// ExchangeDelegatedToken mints a token that acts FOR another
+	// subject, on the authority of the caller's own credential
+	// (containarium-cloud#1427).
+	//
+	// The problem it solves: a service that fronts this API on
+	// behalf of end users — the cloud control plane is the case
+	// that motivated it — presents its own service credential on
+	// every call. #1676 bounds an agent token by the CALLER's
+	// scopes, but when the caller is a shared service account
+	// that bound is meaningless, and #1678's audit `actor` column
+	// records the service, not the person. `act` is deliberately
+	// a JWT claim and never a header (#1677: set only by the
+	// minting server from an authenticated context), so the
+	// fronting service cannot assert it — it has no signing key,
+	// and giving it one would let it mint any identity.
+	//
+	// So it asks this daemon to mint instead. Two invariants make
+	// that safe, mirroring RunAgentSkill's own delegated mint:
+	//
+	//   - The minted token's scopes are the INTERSECTION of the
+	//     caller's scopes with those requested, so an exchange can
+	//     never produce more authority than the caller already
+	//     holds. Without this the endpoint would be precisely the
+	//     escalation primitive #1676 closed.
+	//   - `act` is built server-side from the authenticated
+	//     caller, wrapping the caller's own chain, so the delegation
+	//     path is recorded rather than claimed.
+	//
+	// Gated on `tokens:delegate` — a distinct scope, not
+	// `tokens:write`: acting as another subject is a different and
+	// more dangerous capability than managing your own tokens.
+	//
+	// Unlike every other RPC, this one FAILS CLOSED on a token that
+	// carries no scopes claim at all, whatever
+	// CONTAINARIUM_STRICT_SCOPES is set to. Elsewhere that claim is
+	// optional for backward compatibility (#1679); here the
+	// caller's scopes ARE the ceiling, so an absent claim would
+	// mean no ceiling. A caller must present a scoped credential.
+	ExchangeDelegatedToken(context.Context, *ExchangeDelegatedTokenRequest) (*ExchangeDelegatedTokenResponse, error)
+	// RefreshToken exchanges a valid refresh token for a new
+	// (access, refresh) pair. The prior refresh token's jti is
+	// revoked on success — refresh tokens are SINGLE-USE.
+	// Replay of an already-exchanged refresh token returns
+	// Unauthenticated (it's now on the revocation list).
+	//
+	// Unauthenticated endpoint by design — the refresh token
+	// itself IS the credential. Don't wrap with the access-
+	// token middleware.
+	RefreshToken(context.Context, *RefreshTokenRequest) (*RefreshTokenResponse, error)
+	// ListRevokedTokens enumerates active revocations.
+	// Operators use this to confirm a revoke landed or to
+	// investigate "what got killed during the incident window."
+	// Admin-only + tokens:write scope (same surface as
+	// RevokeToken — anyone who can revoke can enumerate).
+	ListRevokedTokens(context.Context, *ListRevokedTokensRequest) (*ListRevokedTokensResponse, error)
+	// GetUnscopedTokenReport reports how many recent calls used a token with
+	// no scopes claim — the measured-rollout deliverable for #1679's strict
+	// mode. Same gate as ListRevokedTokens: admin-only + tokens:read scope.
+	GetUnscopedTokenReport(context.Context, *GetUnscopedTokenReportRequest) (*GetUnscopedTokenReportResponse, error)
+	mustEmbedUnimplementedTokensServiceServer()
+}
+
+// UnimplementedTokensServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedTokensServiceServer struct{}
+
+func (UnimplementedTokensServiceServer) RevokeToken(context.Context, *RevokeTokenRequest) (*RevokeTokenResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RevokeToken not implemented")
+}
+func (UnimplementedTokensServiceServer) ExchangeDelegatedToken(context.Context, *ExchangeDelegatedTokenRequest) (*ExchangeDelegatedTokenResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExchangeDelegatedToken not implemented")
+}
+func (UnimplementedTokensServiceServer) RefreshToken(context.Context, *RefreshTokenRequest) (*RefreshTokenResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RefreshToken not implemented")
+}
+func (UnimplementedTokensServiceServer) ListRevokedTokens(context.Context, *ListRevokedTokensRequest) (*ListRevokedTokensResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListRevokedTokens not implemented")
+}
+func (UnimplementedTokensServiceServer) GetUnscopedTokenReport(context.Context, *GetUnscopedTokenReportRequest) (*GetUnscopedTokenReportResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetUnscopedTokenReport not implemented")
+}
+func (UnimplementedTokensServiceServer) mustEmbedUnimplementedTokensServiceServer() {}
+func (UnimplementedTokensServiceServer) testEmbeddedByValue()                       {}
+
+// UnsafeTokensServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to TokensServiceServer will
+// result in compilation errors.
+type UnsafeTokensServiceServer interface {
+	mustEmbedUnimplementedTokensServiceServer()
+}
+
+func RegisterTokensServiceServer(s grpc.ServiceRegistrar, srv TokensServiceServer) {
+	// If the following call panics, it indicates UnimplementedTokensServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&TokensService_ServiceDesc, srv)
+}
+
+func _TokensService_RevokeToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RevokeTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TokensServiceServer).RevokeToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TokensService_RevokeToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TokensServiceServer).RevokeToken(ctx, req.(*RevokeTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TokensService_ExchangeDelegatedToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExchangeDelegatedTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TokensServiceServer).ExchangeDelegatedToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TokensService_ExchangeDelegatedToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TokensServiceServer).ExchangeDelegatedToken(ctx, req.(*ExchangeDelegatedTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TokensService_RefreshToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RefreshTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
