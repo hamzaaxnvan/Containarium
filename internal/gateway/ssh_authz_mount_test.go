@@ -106,3 +106,57 @@ func TestSSHAuthzMount_UnverifiedRequestIs401AtTheMount(t *testing.T) {
 			if code != http.StatusUnauthorized {
 				t.Fatalf("code = %d body = %s, want 401", code, body)
 			}
+			if !strings.Contains(body, "sentinel auth") {
+				t.Fatalf("body = %q, want the sentinel verifier's refusal (not the /v1/ fallback)", body)
+			}
+		})
+	}
+}
+
+// unimplementedAuthz is the generated stub: what the daemon's server returns
+// once its own scope check passes (that check is tested in internal/server,
+// which this package cannot import).
+type unimplementedAuthz struct {
+	pb.UnimplementedSSHAuthzServiceServer
+}
+
+// identityProbe records the identity metadata the gRPC handler sees.
+type identityProbe struct {
+	pb.UnimplementedSSHAuthzServiceServer
+	md metadata.MD
+}
+
+func (p *identityProbe) Authorize(ctx context.Context, _ *pb.AuthorizeSSHRequest) (*pb.AuthorizeSSHResponse, error) {
+	p.md, _ = metadata.FromIncomingContext(ctx)
+	return &pb.AuthorizeSSHResponse{}, nil
+}
+
+func TestSSHAuthzMount_VerifiedRequestCarriesSentinelIdentity(t *testing.T) {
+	probe := &identityProbe{}
+	req := newSSHAuthzRequest()
+	auth.SignSentinelRequest(req, sshAuthzSecret)
+	code, body := serve(sshAuthzMux(t, auth.NewSentinelVerifier(nil, sshAuthzSecret), probe), req)
+	if code != http.StatusOK {
+		t.Fatalf("code = %d body = %s, want 200", code, body)
+	}
+	if got := probe.md.Get(auth.MDKeyUsername); len(got) != 1 || got[0] != SSHAuthzUsername {
+		t.Errorf("username = %v, want [%s]", got, SSHAuthzUsername)
+	}
+	if got := probe.md.Get(auth.MDKeyScopes); len(got) != 1 || got[0] != auth.ScopeSSHAuthorize {
+		t.Errorf("scopes = %v, want [%s] only", got, auth.ScopeSSHAuthorize)
+	}
+	if got := probe.md.Get(auth.MDKeyRoles); len(got) != 0 {
+		t.Errorf("roles = %v, want none: the sentinel is not an admin", got)
+	}
+}
+
+// countingAuthz counts calls that reached the Authorize handler.
+type countingAuthz struct {
+	pb.UnimplementedSSHAuthzServiceServer
+	calls int
+}
+
+func (c *countingAuthz) Authorize(context.Context, *pb.AuthorizeSSHRequest) (*pb.AuthorizeSSHResponse, error) {
+	c.calls++
+	return &pb.AuthorizeSSHResponse{}, nil
+}
