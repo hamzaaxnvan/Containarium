@@ -77,3 +77,29 @@ for a in "${CLIENT_ARTIFACTS[@]}"; do
   f="$BUILD_DIR/$a"
   if [ ! -f "$f" ]; then bad "$a missing from $BUILD_DIR"; continue; fi
 
+  tags="$(build_setting "$f" -tags)"
+  case ",$tags," in
+    *,containarium_client,*) pass "$a built with -tags=$tags" ;;
+    *) bad "$a is not the client build (-tags='$tags', want containarium_client)" ;;
+  esac
+
+  cgo="$(build_setting "$f" CGO_ENABLED)"
+  if [ "$cgo" = "0" ]; then pass "$a CGO_ENABLED=0 (static)"; else bad "$a CGO_ENABLED='$cgo', want 0"; fi
+
+  syms="$(symbols_file "$f")"; tmpfiles+=("$syms")
+  if [ ! -s "$syms" ]; then bad "$a: 'go tool nm' returned no symbols"; continue; fi
+  for pkg in "${FORBIDDEN[@]}"; do
+    if has_pkg_symbols "$syms" "$pkg"; then bad "$a links $pkg"; fi
+  done
+done
+
+for p in "${DAEMON_PLATFORMS[@]}"; do
+  f="$BUILD_DIR/$DAEMON-$p"
+  if [ ! -f "$f" ]; then bad "$DAEMON-$p missing from $BUILD_DIR"; continue; fi
+
+  tags="$(build_setting "$f" -tags)"
+  case ",$tags," in
+    *,containarium_client,*) bad "$DAEMON-$p was built with the client tag (-tags=$tags)" ;;
+    *) pass "$DAEMON-$p is not client-tagged (-tags='$tags')" ;;
+  esac
+
