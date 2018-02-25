@@ -54,3 +54,22 @@ func TestRouteRecordFor(t *testing.T) {
 	}
 }
 
+// TestTenantLabelStale locks in the #780 follow-up fix: a container whose
+// tenant label predates the labeling code (empty) or drifted from its
+// current org must be flagged for re-stamping on every reconcile, not just
+// at creation.
+func TestTenantLabelStale(t *testing.T) {
+	cases := []struct {
+		name          string
+		orgID         string
+		currentTenant string
+		want          bool
+	}{
+		{"already correct", "org-1", "org-1", false},
+		{"never labeled", "org-1", "", true},
+		{"stale from a reassignment", "org-1", "org-0", true},
+		{"no org known yet — nothing to stamp", "", "", false},
+		{"no org known yet — leave existing label alone", "", "org-1", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
