@@ -27,32 +27,3 @@ func TestJSONLRecorder_StableFieldNames(t *testing.T) {
 		AuthMethod: AuthMethodCertificate,
 		Credential: Credential{
 			KeyID:          "alice",
-			Serial:         42,
-			CAFingerprint:  "SHA256:ca",
-			KeyFingerprint: "SHA256:key",
-		},
-	}
-
-	w := NewJSONLRecorder(&buf)
-	if err := w.Record(rec); err != nil {
-		t.Fatalf("Record: %v", err)
-	}
-
-	var decoded map[string]interface{}
-	if err := json.Unmarshal(bytes.TrimRight(buf.Bytes(), "\n"), &decoded); err != nil {
-		t.Fatalf("decode JSONL line: %v", err)
-	}
-
-	for _, field := range []string{
-		"session_id", "phase", "occurred_at", "client_ip", "client_port",
-		"login", "target", "auth_method", "key_id", "serial",
-		"ca_key_fingerprint", "key_fingerprint",
-	} {
-		if _, ok := decoded[field]; !ok {
-			t.Errorf("missing stable field %q in %v", field, decoded)
-		}
-	}
-
-	if decoded["session_id"] != "sess-1" {
-		t.Errorf("session_id = %v, want sess-1", decoded["session_id"])
-	}
