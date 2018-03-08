@@ -43,3 +43,48 @@ func TestRequireSecureTransportForIdentity(t *testing.T) {
 				t.Errorf("error should name the age identity so the operator knows why: %v", err)
 			}
 		})
+	}
+}
+
+func setTransportGlobals(t *testing.T, server string, http, insec bool) {
+	t.Helper()
+	oa, oh, oi := serverAddr, httpMode, insecure
+	serverAddr, httpMode, insecure = server, http, insec
+	t.Cleanup(func() { serverAddr, httpMode, insecure = oa, oh, oi })
+}
+
+func writeIdentityFile(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "backup.key")
+	const secret = "AGE-SECRET-KEY-1EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE"
+	if err := os.WriteFile(p, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestBackupVerify_RefusesIdentityOverCleartext(t *testing.T) {
+	f := &fakeBackupAPI{}
+	withFakeBackupClient(t, f)
+	setTransportGlobals(t, "http://host.example.com", true, false)
+	backupVerifyTarget = "scratch-tenant"
+	backupVerifyAgeIdentityFile = writeIdentityFile(t)
+	t.Cleanup(func() { backupVerifyAgeIdentityFile = "" })
+
+	err := runBackupVerify(backupVerifyCmd, []string{"alice-app-x"})
+	if err == nil || !strings.Contains(err.Error(), "age identity") {
+		t.Fatalf("expected a refusal naming the age identity, got %v", err)
+	}
+	if f.callCnt != 0 {
+		t.Error("the key must not be sent: no verify call may be made")
+	}
+}
+
+func TestBackupRestore_RefusesIdentityOverCleartext(t *testing.T) {
+	f := withRecordingBackupClient(t)
+	setTransportGlobals(t, "host.example.com:8080", true, false)
+	backupRestoreAgeIdentityFile = writeIdentityFile(t)
+	t.Cleanup(func() { backupRestoreAgeIdentityFile = "" })
+
+	err := runBackupRestore(backupRestoreCmd, []string{"alice-app-x"})
+	if err == nil || !strings.Contains(err.Error(), "age identity") {
