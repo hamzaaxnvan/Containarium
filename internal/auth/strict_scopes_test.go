@@ -27,3 +27,17 @@ func TestUnscopedTokenCalls_TracksCountAndSince(t *testing.T) {
 	ResetUnscopedTokenCallsForTest()
 
 	if got := UnscopedTokenCalls(); got.Count != 0 || !got.Since.IsZero() {
+		t.Fatalf("fresh report = %+v, want zero count and zero Since", got)
+	}
+
+	recordUnscopedCall()
+	recordUnscopedCall()
+	recordUnscopedCall()
+
+	got := UnscopedTokenCalls()
+	if got.Count != 3 {
+		t.Fatalf("Count = %d, want 3", got.Count)
+	}
+	if got.Since.IsZero() {
+		t.Fatal("Since is zero after recording a call, want the time of the first call")
+	}
