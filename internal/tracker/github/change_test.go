@@ -33,3 +33,20 @@ func TestOpenChange_DraftFlagSentAsIs(t *testing.T) {
 			BaseBranch:  "main",
 			Title:       "Title",
 			Description: "Body",
+			Draft:       draft,
+		})
+		if err != nil {
+			t.Fatalf("OpenChange(draft=%v): %v", draft, err)
+		}
+		gotDraft, _ := gotBody["draft"].(bool)
+		if gotDraft != draft {
+			t.Errorf("request body draft = %v, want %v (raw body: %+v)", gotDraft, draft, gotBody)
+		}
+		// GitHub's title/body must never carry a synthetic draft prefix
+		// — that's GitLab's mechanism, not GitHub's.
+		if title, _ := gotBody["title"].(string); title != "Title" {
+			t.Errorf("request body title = %q, want unmodified %q", title, "Title")
+		}
+	}
+}
+
