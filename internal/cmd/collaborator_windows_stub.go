@@ -11,7 +11,3 @@ import "fmt"
 // CLIENT-ONLY" shape the rest of cmd/containariumd's windows build already
 // has via scattered !windows tags on individual files (see build-all's
 // comment in the Makefile): these stubs keep that windows target
-// compiling, and the collaborator commands behave there exactly like they
-// do on the containarium_client build — they need --server.
-var errCollaboratorNotOnWindows = fmt.Errorf("collaborator management requires a Linux/macOS host — pass --server to reach one")
-
