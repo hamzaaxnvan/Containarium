@@ -55,3 +55,60 @@ Examples:
 func init() {
 	rootCmd.AddCommand(pruneCmd)
 	pruneCmd.Flags().StringVar(&pruneState, "state", "", "Only containers in this state: running | stopped")
+	pruneCmd.Flags().StringVar(&pruneNameContains, "name-contains", "", "Only containers whose name/username contains this substring")
+	pruneCmd.Flags().StringVar(&pruneOlderThan, "older-than", "", "Only containers created longer ago than this (Go duration: '1h', '24h', '7d' is not valid — use '168h')")
+	pruneCmd.Flags().StringSliceVar(&pruneLabels, "label", nil, "Only containers with this label (key=value); repeatable, all must match")
+	pruneCmd.Flags().BoolVar(&pruneDryRun, "dry-run", false, "Show what would be deleted and exit without deleting")
+	pruneCmd.Flags().BoolVarP(&pruneYes, "yes", "y", false, "Skip the confirmation prompt (delete immediately)")
+	pruneCmd.Flags().BoolVar(&pruneForce, "force", false, "Force-stop running containers before deleting (passed to each delete)")
+}
+
+func runPrune(_ *cobra.Command, _ []string) error {
+	// Require at least one narrowing filter. Without this guard a bare
+	// `prune` would match (and offer to delete) every container — exactly the
+	// foot-gun bulk delete must not have.
+	if pruneState == "" && pruneNameContains == "" && pruneOlderThan == "" && len(pruneLabels) == 0 {
+		return fmt.Errorf("refusing to prune without a filter: pass at least one of --state, --name-contains, --older-than, --label (they combine with AND to narrow the set)")
+	}
+
+	switch pruneState {
+	case "", "running", "stopped":
+	default:
+		return fmt.Errorf("--state must be 'running' or 'stopped', got %q", pruneState)
+	}
+
+	var olderThan time.Duration
+	if pruneOlderThan != "" {
+		d, err := time.ParseDuration(pruneOlderThan)
+		if err != nil {
+			return fmt.Errorf("invalid --older-than %q: %w (expected Go duration like '1h', '24h', '168h')", pruneOlderThan, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("--older-than must be positive, got %s", pruneOlderThan)
+		}
+		olderThan = d
+	}
+
+	labelFilter := parseLabels(pruneLabels)
+
+	containers, err := pruneList()
+	if err != nil {
+		return fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	now := time.Now()
+	matches := filterForPrune(containers, pruneState, pruneNameContains, olderThan, labelFilter, now)
+
+	if len(matches) == 0 {
+		fmt.Println("No containers match the filter — nothing to prune.")
+		return nil
+	}
+
+	fmt.Printf("%d container(s) match:\n", len(matches))
+	for _, c := range matches {
+		fmt.Printf("  - %-24s state=%-8s %s\n", pruneDeleteKey(c), c.State, ageString(now, c.CreatedAt))
+	}
+
+	if pruneDryRun {
+		fmt.Printf("\ndry-run: would delete %d container(s). Re-run without --dry-run to delete.\n", len(matches))
+		return nil
