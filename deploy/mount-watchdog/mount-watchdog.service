@@ -2,8 +2,3 @@
 Description=containarium mount-dependency watchdog -- recover a silently dead containarium.service (#1317)
 Documentation=https://github.com/FootprintAI/Containarium/issues/1317
 # Deliberately no After=/Wants= on the mount or on containarium.service --
-# this watchdog exists to recover from EXACTLY the case where that
-# dependency chain is stuck, so it must start and keep running independent
-# of whether the mount (or containarium.service) ever comes up.
-
-[Service]
