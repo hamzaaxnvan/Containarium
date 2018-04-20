@@ -58,3 +58,63 @@ func TestAgentA2ASecret_PerBoxAndStable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenManager: %v", err)
 	}
+	other := &AgentSkillServer{tokens: otherTM}
+	if got := other.agentA2ASecret("hello-agent"); got == hello {
+		t.Error("a daemon with a different signing key derives the same credential")
+	}
+	// No token manager (a bare test server, or a daemon that failed to build
+	// one) derives nothing rather than a predictable constant.
+	if got := (&AgentSkillServer{}).agentA2ASecret("hello-agent"); got != "" {
+		t.Errorf("credential without a token manager = %q, want empty", got)
+	}
+}
+
+// The box's serve-mode process is launched holding its own credential — which
+// is what makes the in-box check enforceable at all.
+func TestServeModeCommand_ExportsA2AToken(t *testing.T) {
+	s := a2aTestServer(t)
+	want := "CONTAINARIUM_A2A_TOKEN='" + s.agentA2ASecret("hello-agent") + "' "
+	got := s.serveModeCommand("/seed/run-9", "hello-agent", agentengine.Resolved{}, "")
+	if !strings.Contains(got, want) {
+		t.Errorf("serveModeCommand = %q, want it to export %q", got, want)
+	}
+	// A peer's credential must never appear in this box's launch.
+	if strings.Contains(got, s.agentA2ASecret("relay-agent")) {
+		t.Error("serveModeCommand leaked a peer's credential into this box")
+	}
+	// Without a derivable credential the box is launched with no token at all,
+	// so the runtime fails closed instead of reading an empty one as "any".
+	bare := (&AgentSkillServer{}).serveModeCommand("/seed/run-9", "hello-agent", agentengine.Resolved{}, "")
+	if strings.Contains(bare, "CONTAINARIUM_A2A_TOKEN") {
+		t.Errorf("serveModeCommand without a token manager = %q, want no A2A token export", bare)
+	}
+}
+
+// The transport presents the peer box's credential as a bearer token, and the
+// task body still carries exactly what it did before.
+func TestSendA2ATask_SendsBearerToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		body, _ := io.ReadAll(r.Body)
+		task := &pb.AgentTask{}
+		if err := protojson.Unmarshal(body, task); err != nil {
+			t.Errorf("peer could not decode task: %v", err)
+		}
+		if task.GetRunId() != "run-9" {
+			t.Errorf("run_id = %q, want run-9", task.GetRunId())
+		}
+		// The credential must not travel inside the task the peer journals.
+		if strings.Contains(string(body), "peer-secret") {
+			t.Errorf("task body carries the credential: %s", body)
+		}
+		out, _ := protojson.Marshal(&pb.AgentArtifact{TaskId: task.GetId(), State: pb.AgentTaskState_AGENT_TASK_STATE_COMPLETED})
+		_, _ = w.Write(out)
+	}))
+	defer srv.Close()
+
+	if _, err := sendA2ATask(context.Background(), srv.URL, &pb.AgentTask{Id: "t", RunId: "run-9"}, "peer-secret"); err != nil {
+		t.Fatalf("sendA2ATask: %v", err)
+	}
+	if gotAuth != "Bearer peer-secret" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer peer-secret")
