@@ -207,3 +207,107 @@ func authorizeRunOrg(ctx context.Context, orgID string) (string, error) {
 func (s *AgentSkillServer) mintRunGatewayToken(ctx context.Context, name, skillID, runID, provider, model string, box *pb.Container, orgID string) (string, tokenid.MintedID, error) {
 	keyOwner := runKeyOwner(ctx, box, orgID)
 	if keyOwner == "" {
+		log.Printf("[agent-skill] run %s on %s has no attributable key owner; its model calls are billed to the daemon-global key", runID, name)
+	}
+	return s.gateway.mintGatewayToken(name, skillID, runID, keyOwner, provider, model)
+}
+
+// gatewayEnvScript returns a shell snippet (run inside the box, in the same exec
+// as the seed) that resolves the host's IP from the box's default route and
+// writes the provider env to <seedDir>/gateway.env. The base URL is resolved
+// IN-BOX (not baked at provision time) so it works regardless of the bridge
+// subnet — the same default-route approach validated for the worker poll path.
+// Pure: returns the script for the given provider/port/token; errors on an
+// unknown provider.
+func gatewayEnvScript(provider string, httpPort int, token, seedDir string) (string, error) {
+	pe, ok := gatewayProviderEnvs[provider]
+	if !ok {
+		return "", fmt.Errorf("model-gateway: unknown provider %q", provider)
+	}
+	var b strings.Builder
+	// Resolve the host (LXC bridge gateway) from the default route; the daemon's
+	// model-gateway listens on http://<that host>:<httpPort>.
+	b.WriteString("__ctn_host=\"$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')\"\n")
+	b.WriteString("if [ -z \"$__ctn_host\" ]; then echo 'model-gateway: could not resolve host from default route' >&2; fi\n")
+	fmt.Fprintf(&b, "{\n")
+	// URL var: double-quoted so $__ctn_host expands at write time.
+	fmt.Fprintf(&b, "  printf 'export %s=%%s\\n' \"http://$__ctn_host:%d%s\"\n", pe.urlVar, httpPort, pe.urlSuffix)
+	// Token var: single-quoted literal (a JWT — no shell metachars, but be safe).
+	fmt.Fprintf(&b, "  printf 'export %s=%%s\\n' %s\n", pe.tokenVar, shellSingleQuote(token))
+	fmt.Fprintf(&b, "} > %s/gateway.env\n", seedDir)
+	fmt.Fprintf(&b, "chmod 600 %s/gateway.env\n", seedDir)
+	return b.String(), nil
+}
+
+// gatewayRecipeEnvExports returns shell lines that resolve the daemon host from
+// the box's default route and EXPORT the managed model-gateway contract into the
+// post_start environment (not a file): CONTAINARIUM_MODEL_GATEWAY_URL, pointing
+// at the gateway's per-provider base (/v1/model/<provider>), and
+// CONTAINARIUM_GATEWAY_TOKEN. A recipe's post_start reads these to point its
+// in-box app at the gateway, appending any upstream sub-path. The URL is
+// resolved IN-BOX so it works regardless of the bridge subnet (same approach as
+// gatewayEnvScript). Pure: returns the snippet for the given provider/port/token.
+func gatewayRecipeEnvExports(provider string, httpPort int, token string) string {
+	var b strings.Builder
+	b.WriteString("__ctn_host=\"$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')\"\n")
+	b.WriteString("if [ -z \"$__ctn_host\" ]; then echo 'model-gateway: could not resolve host from default route' >&2; fi\n")
+	fmt.Fprintf(&b, "export CONTAINARIUM_MODEL_GATEWAY_URL=\"http://$__ctn_host:%d/v1/model/%s\"\n", httpPort, provider)
+	fmt.Fprintf(&b, "export CONTAINARIUM_GATEWAY_TOKEN=%s\n", shellSingleQuote(token))
+	return b.String()
+}
+
+// gatewayProviderKeysFromEnv reads provider API keys from the daemon env, one
+// per provider that has a key set. These keys are held ONLY in the daemon's
+// gateway process; a box never sees them. Gemini accepts GEMINI_API_KEY or
+// GOOGLE_API_KEY (mirrors the gemini engine's own lookup).
+func gatewayProviderKeysFromEnv() map[string]string {
+	out := map[string]string{}
+	if v := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")); v != "" {
+		out["anthropic"] = v
+	}
+	if v := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); v != "" {
+		out["openai"] = v
+	}
+	if v := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); v != "" {
+		out["gemini"] = v
+	} else if v := strings.TrimSpace(os.Getenv("GOOGLE_API_KEY")); v != "" {
+		out["gemini"] = v
+	}
+	// The Gemini key also backs the OpenAI-compatible Gemini provider
+	// (gemini-openai), which the hosted OpenHands canvas routes through. Same
+	// real key, different upstream protocol + auth header (see DefaultProviders).
+	if v := out["gemini"]; v != "" {
+		out["gemini-openai"] = v
+	}
+	return out
+}
+
+// gatewayRegistryFromEnv builds the provider registry the daemon serves and the
+// daemon-global keys it holds:
+//
+//   - providers: the compiled-in set (modelgateway.DefaultProviders) plus every
+//     OpenAI-compatible upstream an operator registered by setting
+//     <PROVIDER>_UPSTREAM_URL. Nothing is compiled in for those, which is why a
+//     brokered vendor's hostname lives in the deployment's environment and not
+//     in this repo.
+//   - keys: the daemon-global fallback key per provider — the built-ins as
+//     before, plus <PROVIDER>_API_KEY for each registered provider that has one.
+//   - registered: the names that came from the environment, so the caller can
+//     tell "an operator configured an upstream" from "an operator configured a
+//     key". A registered provider with no global key is the normal multi-owner
+//     shape: its keys arrive per owner (modelgateway.KeyResolver), not from env.
+//
+// A malformed <PROVIDER>_UPSTREAM_URL comes back as an error; the caller logs it
+// and carries on with the built-ins rather than failing the daemon's start.
+func gatewayRegistryFromEnv() (map[string]*modelgateway.Provider, map[string]string, []string, error) {
+	providers := modelgateway.DefaultProviders()
+	keys := gatewayProviderKeysFromEnv()
+
+	envProviders, err := modelgateway.ProvidersFromEnv(os.Environ())
+	if err != nil {
+		return providers, keys, nil, err
+	}
+	registered := make([]string, 0, len(envProviders))
+	for name, p := range envProviders {
+		providers[name] = p
+		registered = append(registered, name)
