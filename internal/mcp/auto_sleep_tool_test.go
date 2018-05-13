@@ -50,3 +50,55 @@ func TestHandleToggleAutoSleep_RequiresEnabledBool(t *testing.T) {
 			t.Errorf("args=%v: err = %v, want 'enabled' validation", args, err)
 		}
 	}
+}
+
+// TestHandleToggleAutoSleep_OmitsThresholdDefaultsToZero — when
+// idleThresholdMinutes is absent from args, the handler sends 0 over
+// the wire. The server side then applies its 15-minute default. This
+// is the contract between MCP and the daemon.
+func TestHandleToggleAutoSleep_OmitsThresholdDefaultsToZero(t *testing.T) {
+	var captured map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&captured))
+		_, _ = w.Write([]byte(`{"message":"ok","autoSleepEnabled":true,"idleThresholdMinutes":15}`))
+	}))
+	defer srv.Close()
+	client := NewClient(srv.URL, "tok")
+
+	out, err := handleToggleAutoSleep(client, map[string]interface{}{
+		"username": "alice",
+		"enabled":  true,
+	})
+	require.NoError(t, err)
+	assert.Contains(t, out, "auto_sleep_enabled=true")
+	assert.EqualValues(t, 0, captured["idle_threshold_minutes"], "absent idleThresholdMinutes must wire as 0 so server applies default")
+}
+
+// TestHandleToggleAutoSleep_ThresholdPropagates — explicit
+// idleThresholdMinutes lands intact on the wire. Verifies JSON-number
+// (float64) decode path in getIntArg.
+func TestHandleToggleAutoSleep_ThresholdPropagates(t *testing.T) {
+	var captured map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&captured))
+		_, _ = w.Write([]byte(`{"message":"ok","autoSleepEnabled":true,"idleThresholdMinutes":45}`))
+	}))
+	defer srv.Close()
+	client := NewClient(srv.URL, "tok")
+
+	_, err := handleToggleAutoSleep(client, map[string]interface{}{
+		"username":             "alice",
+		"enabled":              true,
+		"idleThresholdMinutes": float64(45), // JSON number arrives as float64
+	})
+	require.NoError(t, err)
+	assert.EqualValues(t, 45, captured["idle_threshold_minutes"])
+}
+
+// TestHandleStartContainer_WaitForReadyPropagates — the waitForReady
+// MCP arg must land in the request body as wait_for_ready.
+func TestHandleStartContainer_WaitForReadyPropagates(t *testing.T) {
+	var captured map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&captured))
+		_, _ = w.Write([]byte(`{"message":"started","container":{"state":"Running"},"readyTimedOut":false}`))
