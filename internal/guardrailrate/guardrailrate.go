@@ -32,3 +32,38 @@ const ThrottleLogInterval = time.Minute
 
 // Limit is one configured rate. PerMinute <= 0 disables the limit. Burst <= 0
 // defaults to PerMinute rounded down, floor 1 (internal/sandbox/ratelimit's
+// convention).
+type Limit struct {
+	PerMinute float64
+	Burst     int
+}
+
+// Option configures a Limiter.
+type Option func(*Limiter)
+
+// WithClock replaces time.Now (tests use a fake clock).
+func WithClock(now func() time.Time) Option { return func(l *Limiter) { l.now = now } }
+
+// WithLogf replaces log.Printf for the throttle line.
+func WithLogf(logf func(string, ...any)) Option { return func(l *Limiter) { l.logf = logf } }
+
+// Limiter is a per-subject token bucket. A nil *Limiter, or one built from a
+// disabled Limit, allows everything. Safe for concurrent use.
+type Limiter struct {
+	name  string
+	every rate.Limit
+	burst int
+	// idleTTL is how long an empty bucket takes to refill completely: a
+	// bucket idle that long is indistinguishable from a new one, so it is
+	// dropped.
+	idleTTL time.Duration
+
+	now  func() time.Time
+	logf func(string, ...any)
+
+	mu        sync.Mutex
+	buckets   map[string]*bucket
+	lastSweep time.Time
+}
+
+type bucket struct {
