@@ -1,0 +1,171 @@
+package network
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var (
+	// ErrPassthroughNotFound is returned when a passthrough route is not found
+	ErrPassthroughNotFound = errors.New("passthrough route not found")
+)
+
+// PassthroughRecord is the persistence view of a passthrough route: the
+// runtime fields (port/IP/protocol/etc., the same shape as PassthroughRoute
+// in portforward.go) plus DB metadata (ID, creator, timestamps). The Store
+// interface persists PassthroughRecord values; the sync job reads them and
+// projects them into PassthroughRoute values to drive iptables.
+//
+// PostgreSQL is the source of truth; iptables is the runtime mirror.
+type PassthroughRecord struct {
+	ID            string
+	ExternalPort  int
+	TargetIP      string
+	TargetPort    int
+	Protocol      string // "tcp" or "udp"
+	ContainerName string
+	Description   string
+	Active        bool
+	CreatedBy     string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// PassthroughStore abstracts persistence of passthrough routes. The production
+// implementation is *postgresPassthroughStore (PostgreSQL via pgxpool); tests
+// or non-PG daemons can supply their own implementation.
+type PassthroughStore interface {
+	Save(ctx context.Context, route *PassthroughRecord) error
+	GetByPortProtocol(ctx context.Context, externalPort int, protocol string) (*PassthroughRecord, error)
+	List(ctx context.Context, activeOnly bool) ([]*PassthroughRecord, error)
+	// ListByContainer returns every route owned by containerName — the
+	// passthrough analog of RouteStore.ListByContainer, used to cascade-clean
+	// a deleted container's routes (#1462).
+	ListByContainer(ctx context.Context, containerName string) ([]*PassthroughRecord, error)
+	Delete(ctx context.Context, externalPort int, protocol string) error
+	SetActive(ctx context.Context, externalPort int, protocol string, active bool) error
+	Count(ctx context.Context, activeOnly bool) (int32, error)
+}
+
+// postgresPassthroughStore is the PostgreSQL-backed implementation of
+// PassthroughStore.
+type postgresPassthroughStore struct {
+	pool *pgxpool.Pool
+}
+
+// NewPassthroughStore creates a new PostgreSQL-backed passthrough store and
+// initializes its schema. Returns the PassthroughStore interface so callers
+// can swap implementations.
+func NewPassthroughStore(ctx context.Context, pool *pgxpool.Pool) (PassthroughStore, error) {
+	store := &postgresPassthroughStore{pool: pool}
+
+	if err := store.initSchema(ctx); err != nil {
+		return nil, fmt.Errorf("failed to initialize passthrough schema: %w", err)
+	}
+
+	return store, nil
+}
+
+// initSchema creates the passthrough_routes table if it doesn't exist
+func (s *postgresPassthroughStore) initSchema(ctx context.Context) error {
+	schema := `
+		CREATE TABLE IF NOT EXISTS passthrough_routes (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			external_port INTEGER NOT NULL,
+			target_ip TEXT NOT NULL,
+			target_port INTEGER NOT NULL,
+			protocol TEXT NOT NULL DEFAULT 'tcp',
+			container_name TEXT,
+			description TEXT,
+			active BOOLEAN NOT NULL DEFAULT true,
+			created_by TEXT,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			UNIQUE (external_port, protocol)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_passthrough_routes_active ON passthrough_routes(active);
+		CREATE INDEX IF NOT EXISTS idx_passthrough_routes_port_proto ON passthrough_routes(external_port, protocol);
+	`
+
+	_, err := s.pool.Exec(ctx, schema)
+	return err
+}
+
+// Save saves or updates a passthrough route (upsert by external_port + protocol).
+//
+// Creation attribution is READ BACK rather than assumed. The DO UPDATE list
+// deliberately omits created_by and created_at, so an upsert cannot rewrite
+// who opened a port — but the caller's struct still carried whatever they
+// passed in, which on an update is somebody else's name and a creation time
+// that never happened. A caller logging the returned record then reports the
+// wrong creator for a published port, which is exactly the question asked
+// during an incident (#1300).
+func (s *postgresPassthroughStore) Save(ctx context.Context, route *PassthroughRecord) error {
+	query := `
+		INSERT INTO passthrough_routes (external_port, target_ip, target_port, protocol,
+			container_name, description, active, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (external_port, protocol) DO UPDATE SET
+			target_ip = EXCLUDED.target_ip,
+			target_port = EXCLUDED.target_port,
+			container_name = EXCLUDED.container_name,
+			description = EXCLUDED.description,
+			active = EXCLUDED.active,
+			updated_at = EXCLUDED.updated_at
+		RETURNING id, created_by, created_at
+	`
+
+	now := time.Now()
+	if route.CreatedAt.IsZero() {
+		route.CreatedAt = now
+	}
+	route.UpdatedAt = now
+
+	if route.Protocol == "" {
+		route.Protocol = "tcp"
+	}
+
+	err := s.pool.QueryRow(ctx, query,
+		route.ExternalPort,
+		route.TargetIP,
+		route.TargetPort,
+		route.Protocol,
+		route.ContainerName,
+		route.Description,
+		route.Active,
+		route.CreatedBy,
+		route.CreatedAt,
+		route.UpdatedAt,
+	).Scan(&route.ID, &route.CreatedBy, &route.CreatedAt)
+
+	if err != nil {
+		return fmt.Errorf("failed to save passthrough route: %w", err)
+	}
+
+	return nil
+}
+
+// GetByPortProtocol retrieves a passthrough route by external port and protocol
+func (s *postgresPassthroughStore) GetByPortProtocol(ctx context.Context, externalPort int, protocol string) (*PassthroughRecord, error) {
+	query := `
+		SELECT id, external_port, target_ip, target_port, protocol,
+			COALESCE(container_name, ''), COALESCE(description, ''), active,
+			COALESCE(created_by, ''), created_at, updated_at
+		FROM passthrough_routes
+		WHERE external_port = $1 AND protocol = $2
+	`
+
+	route := &PassthroughRecord{}
+	err := s.pool.QueryRow(ctx, query, externalPort, protocol).Scan(
+		&route.ID,
+		&route.ExternalPort,
+		&route.TargetIP,
+		&route.TargetPort,
+		&route.Protocol,
+		&route.ContainerName,
