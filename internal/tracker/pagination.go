@@ -1,0 +1,39 @@
+package tracker
+
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+)
+
+// MaxListPages bounds how many pages a provider's list call follows
+// (#2040). At 100 items per page that is 5,000 items per list call, and
+// it guarantees a misbehaving upstream that always answers with a next
+// link cannot loop forever.
+//
+// The bound is on what the upstream returns, not on what the caller
+// keeps. The dispatcher lists ALL open issues with no label filter, and
+// on GitHub the /issues endpoint also returns open pull requests (the
+// adapter drops them only after fetching), so the real ceiling is 5,000
+// open issues plus pull requests per project.
+//
+// Both GitHub and GitLab return newest first by default, so hitting the
+// bound silently drops the OLDEST items — the same failure mode as
+// #2040, only at 5,000 instead of 100. An adapter that hits the bound
+// returns what it collected with a nil error and only logs the
+// truncation; the caller is not told.
+const MaxListPages = 50
+
+// ErrCrossOriginNextLink is returned when a pagination Link header
+// names a different scheme or host than the request that produced it.
+// Following it would send the connection's credential to a host the
+// operator never configured, so the list call fails instead.
+//
+// HTTP redirects are guarded separately by WithSameOriginRedirects, which
+// both adapters install on their clients.
+var ErrCrossOriginNextLink = errors.New("refusing to follow pagination link to a different host")
+
+// NextPageURL returns the rel="next" target of an RFC 8288 Link header
+// — the pagination mechanism both GitHub and GitLab use — or "" when
+// there is no next page.
