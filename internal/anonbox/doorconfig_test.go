@@ -30,3 +30,35 @@ func TestDoorStore_SetPersistsAndReloads(t *testing.T) {
 		if cfg.Enabled != want.Enabled || cfg.DisabledMessage != want.DisabledMessage || strings.Join(cfg.BannedFingerprints, ",") != strings.Join(want.BannedFingerprints, ",") {
 			t.Errorf("%s = %+v, want %+v", label, cfg, want)
 		}
+	}
+	check("in-memory", s.Get())
+	check("reloaded", NewDoorStore(path).Get())
+	if !s.IsBanned("SHA256:a") || s.IsBanned("SHA256:c") {
+		t.Errorf("IsBanned wrong")
+	}
+	// Get hands out a copy.
+	got := s.Get()
+	got.BannedFingerprints[0] = "mutated"
+	if s.Get().BannedFingerprints[0] != "SHA256:a" {
+		t.Errorf("Get must not alias internal state")
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("temp file left behind")
+	}
+}
+
+func TestDoorStore_MalformedFileFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "anon-door.json")
+	if err := os.WriteFile(path, []byte(`{"enabled": true,`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := NewDoorStore(path)
+	if s.Err() == nil {
+		t.Fatal("malformed file must poison the store")
+	}
+	cfg := s.Get()
+	if cfg.Enabled || !strings.Contains(cfg.DisabledMessage, "malformed") {
+		t.Errorf("poisoned store must report closed with the reason: %+v", cfg)
+	}
+	// A deliberate Set repairs it.
+	if err := s.Set(DefaultDoorConfig()); err != nil {
