@@ -45,27 +45,3 @@ func TestIngestSSHSourceRecords(t *testing.T) {
 				OccurredAt: timestamppb.New(at), SuppressedCount: 4200, BanListener: pb.SSHBanListener_SSH_BAN_LISTENER_MAIN},
 			wantAction: "ssh_auth_failed", wantIP: "",
 			wantDetail: SSHSessionDetail{SentinelID: "sentinel-1", SuppressedCount: 4200, BanListener: pb.SSHBanListener_SSH_BAN_LISTENER_MAIN},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			store := &fakeBatchLogger{}
-			resp, err := NewAuditServer(store).IngestSSHSessionRecords(ingestCtx(), &pb.IngestSSHSessionRecordsRequest{
-				Records: []*pb.SSHSessionRecord{tt.rec}, SentinelId: "sentinel-1"})
-			if err != nil || resp.GetInserted() != 1 {
-				t.Fatalf("ingest: resp %v err %v", resp, err)
-			}
-			rec, err := sshsession.FromProto(tt.rec)
-			if err != nil {
-				t.Fatal(err)
-			}
-			row, err := sshSessionBatchEntry(rec, "sentinel-1", "jti")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if row.Entry.Action != tt.wantAction || row.Entry.SourceIP != tt.wantIP || row.Entry.Username != "" {
-				t.Fatalf("row action/ip/username = %q/%q/%q, want %q/%q/\"\"", row.Entry.Action, row.Entry.SourceIP, row.Entry.Username, tt.wantAction, tt.wantIP)
-			}
-			var got SSHSessionDetail
-			if err := json.Unmarshal([]byte(row.Entry.Detail), &got); err != nil {
-				t.Fatal(err)
