@@ -188,3 +188,98 @@ func ExecObjectSource(value string) (embedded bool, path string) {
 // execwatch.bpf.o is loaded (ExecObjectPathFor). An empty value means
 // embedded too (and fails when nothing is embedded) — never a file relative
 // to the daemon's working directory.
+func ResolveExecWatch(value string) (*ExecWatch, error) {
+	embedded, path := ExecObjectSource(value)
+	if !embedded {
+		return LoadExecWatch(path)
+	}
+	obj := EmbeddedExecObject()
+	if len(obj) == 0 {
+		return nil, fmt.Errorf("netbpf: no embedded execwatch BPF object in this build " +
+			"(release binaries bundle it; for a custom build run `make build-bpf` then build with -tags embed_bpf)")
+	}
+	return LoadExecWatchFromBytes(obj)
+}
+
+// LoadExecWatch reads the compiled execwatch object at objPath and loads the
+// collection (verifier runs here; nothing is attached yet).
+func LoadExecWatch(objPath string) (*ExecWatch, error) {
+	if _, err := os.Stat(objPath); err != nil {
+		return nil, fmt.Errorf("netbpf: execwatch BPF object %q: %w", objPath, err)
+	}
+	spec, err := ebpf.LoadCollectionSpec(objPath)
+	if err != nil {
+		return nil, fmt.Errorf("netbpf: execwatch: load spec: %w", err)
+	}
+	return newExecWatchFromSpec(spec)
+}
+
+// LoadExecWatchFromBytes loads the collection from an in-memory object (the
+// embedded one).
+func LoadExecWatchFromBytes(obj []byte) (*ExecWatch, error) {
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(obj))
+	if err != nil {
+		return nil, fmt.Errorf("netbpf: execwatch: load spec from embedded object: %w", err)
+	}
+	return newExecWatchFromSpec(spec)
+}
+
+func newExecWatchFromSpec(spec *ebpf.CollectionSpec) (*ExecWatch, error) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return nil, fmt.Errorf("netbpf: execwatch: RemoveMemlock: %w", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		// A missing kernel BTF or a CO-RE relocation failure surfaces here —
+		// the reason the daemon reports as `exec-telemetry: unavailable (...)`.
+		return nil, fmt.Errorf("netbpf: execwatch: load collection: %w", err)
+	}
+	for _, name := range []string{mapWatchedCgroups, mapExecEvents, mapExecStats} {
+		if coll.Maps[name] == nil {
+			coll.Close()
+			return nil, fmt.Errorf("netbpf: execwatch BPF object missing map %q (rebuild execwatch.bpf.o?)", name)
+		}
+	}
+	if coll.Programs[progExecWatch] == nil {
+		coll.Close()
+		return nil, fmt.Errorf("netbpf: execwatch BPF object missing program %q", progExecWatch)
+	}
+	return &ExecWatch{coll: coll}, nil
+}
+
+// Attach hooks the program onto the sched/sched_process_exec tracepoint.
+// Idempotent. Nothing is emitted until WatchCgroup registers a cgroup.
+func (w *ExecWatch) Attach() error {
+	if w.link != nil {
+		return nil
+	}
+	lnk, err := link.Tracepoint(execTracepointGroup, execTracepointName, w.coll.Programs[progExecWatch], nil)
+	if err != nil {
+		return fmt.Errorf("netbpf: execwatch: attach tracepoint %s/%s: %w", execTracepointGroup, execTracepointName, err)
+	}
+	w.link = lnk
+	return nil
+}
+
+// WatchCgroup registers a cgroup id (the inode of /sys/fs/cgroup/<path>) so
+// execs under it — at any depth — are emitted. index is opaque to the kernel.
+// Upsert semantics: re-registering an id is a no-op apart from the index.
+func (w *ExecWatch) WatchCgroup(cgroupID uint64, index uint32) error {
+	if err := w.coll.Maps[mapWatchedCgroups].Update(&cgroupID, &index, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("netbpf: execwatch: update watched_cgroups[%d]: %w", cgroupID, err)
+	}
+	return nil
+}
+
+// UnwatchCgroup removes a cgroup id. A missing key is not an error (the
+// desired state is already reached), like DeleteEgress.
+func (w *ExecWatch) UnwatchCgroup(cgroupID uint64) error {
+	if err := w.coll.Maps[mapWatchedCgroups].Delete(&cgroupID); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("netbpf: execwatch: delete watched_cgroups[%d]: %w", cgroupID, err)
+	}
+	return nil
+}
+

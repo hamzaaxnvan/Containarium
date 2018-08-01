@@ -39,23 +39,3 @@ func TestResolveGPUDevices_MultiplePinnedByPCI(t *testing.T) {
 		t.Fatalf("got %d devices, want %d (%+v)", len(got), len(want), got)
 	}
 	for i := range want {
-		if got[i].PCI != want[i].PCI {
-			t.Errorf("device[%d].PCI = %q, want %q", i, got[i].PCI, want[i].PCI)
-		}
-	}
-}
-
-func TestResolveGPUDevices_RejectsDuplicateGPU(t *testing.T) {
-	// Two different inputs ("0" and a PCI string) that resolve to the SAME
-	// physical GPU must be rejected — you can't attach one GPU twice.
-	mock := &incustest.MockBackend{
-		ResolveGPUInputToPCIFunc: fakePCIResolver(map[string]string{
-			"0": "0000:01:00.0",
-		}),
-	}
-	_, err := resolveGPUDevices(mock, []string{"0", "0000:01:00.0"})
-	if err == nil {
-		t.Fatal("expected duplicate-GPU error, got nil")
-	}
-	if !strings.Contains(err.Error(), "more than once") {
-		t.Errorf("error = %q, want it to mention the GPU was requested more than once", err)

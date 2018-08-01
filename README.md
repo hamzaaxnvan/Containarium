@@ -269,3 +269,274 @@ on the box, so the work survives your machine sleeping, and the tests run
 next to the code instead of over a network hop.
 
 ### Run pi inside the box
+
+If your agent has no MCP client, run it *inside* the box instead. See
+[docs/integrations/pi.md](docs/integrations/pi.md) for the
+[pi](https://pi.dev) walkthrough (installs, keys, code sync, sessions).
+
+### Put the box on a public hostname
+
+```bash
+containarium expose-port alice \
+  --container-port 8080 \
+  --domain blog.example.com
+```
+
+Caddy on the sentinel terminates TLS for `blog.example.com` and forwards to
+`alice-container:8080`. `curl https://blog.example.com` then hits whatever
+`alice` is serving on port 8080.
+
+### Build a site in one command
+
+Run from your laptop against a server you can reach (see step 2, variant B),
+`quickstart` does steps 1–3 in one go: it creates the box and wires SSH and
+your agent (`claude`, `gemini` or `codex`). With `--prompt` it also exposes
+`--domain` and launches your local agent on the build:
+
+```bash
+containarium quickstart alice --server <your-server> \
+  --prompt "a coffee-shop landing page" --domain coffee.example.com
+```
+
+`containarium quickstart --help` lists every option.
+
+---
+
+## The four primitives
+
+Every action in Containarium has a CLI verb (canonical) AND an MCP tool
+(thin wrapper that delegates to the same Go function). See
+[CLAUDE.md](CLAUDE.md) for the convention.
+
+### `agent-box` — in-the-box MCP server
+
+Runs inside every container. Reached over stdio (typically wrapped by
+SSH on the client side). Exposes Linux-native operations:
+
+| Tool | What it does |
+|---|---|
+| `shell_exec` | Run a shell command, capture stdout/stderr/exit, bounded by timeout (default 30s, max 10min) and 256 KiB output cap |
+| `read_file` | Byte range OR `head=N` lines OR `tail=N` lines |
+| `write_file` | Atomic write with `mkdirp` (temp + rename) |
+| `list_directory` | Type/size/mtime, hidden filtering |
+| `move_file` | Atomic rename with `mkdirp` on destination |
+| `delete_file` | Single-file remove (refuses directories so recursive deletes go via `shell_exec` where blast radius is explicit) |
+
+Resources (read-only data the agent fetches via MCP `resources/read`):
+
+| URI | What it returns |
+|---|---|
+| `containarium://ci-context` | JSON metadata about the current CI run (PR number, commit SHA, failing test, etc.) when the box was kept alive by the FootprintAI/containarium-run GitHub Action after a failed CI run. Returns `{"available": false}` on non-CI boxes so callers never have to special-case errors. |
+| `containarium://ci-prompt` | Static markdown playbook telling agents how to debug a failing CI run inside this box (what to read first, how to iterate, what not to do). Same body on every box; pair with `ci-context` for the per-run data. |
+
+Optional sandbox: when `AGENTBOX_ROOT` is set, every file-ops path is
+resolved against that root with a boundary-aware prefix check. Default
+unset = no constraint. See
+[`internal/agentbox/`](internal/agentbox/) for the Go implementation.
+
+### `mcp-server` — platform MCP server
+
+Runs on the host. Exposes the platform's outside-the-box operations as
+MCP tools — about a hundred of them, one per CLI verb: container lifecycle
+(`create_container`, `list_containers`, `start_container`,
+`stop_container`, `delete_container`, `resize_container`), networking
+(`expose_port`, `sync_ssh_config`, passthrough routes), coding-agent runs
+(`code_run`, `code_attach`, `code_status`, `code_stop`), secrets, backups,
+recipes, security scans, tracker connections, and `get_metrics` /
+`get_system_info`. A token's scopes decide which ones a client sees. See
+[`cmd/mcp-server/`](cmd/mcp-server/) and
+[`internal/mcp/`](internal/mcp/) for the catalog.
+
+### `containarium` CLI
+
+Same surface as the platform MCP, plus deeper administration. The verbs
+this README uses (the CLI has about ninety — `containarium --help` lists
+them all):
+
+```
+containarium quickstart         Create a box, wire SSH + your agent, optionally build a site
+containarium create             Create a new container
+containarium list               List all containers
+containarium wake / sleep       Start a stopped box / stop a running one
+containarium delete             Delete a container
+containarium code               Run a coding agent ON a box (install / run / attach / logs / runs / status / stop / egress-policy)
+containarium expose-port        Expose container:port on a public hostname
+containarium ssh-config         Generate self-contained ssh_config (show / sync)
+containarium route              Manage proxy routes (low-level)
+containarium passthrough-route  Manage TCP/UDP passthrough routes (daemon API)
+containarium token              Issue, inspect, refresh and revoke JWT tokens
+containarium login / connect    Device-flow sign-in to a server; open a shell on a box with that token
+containarium info               Container or system info
+containarium version            Print version
+```
+
+Host-side verbs (`daemon`, `sentinel`, `passthrough`, `audit`, `doctor`,
+…) live in `containariumd` — see [Two binaries](#two-binaries-containarium-vs-containariumd).
+Run `containarium <verb> --help` for full options.
+
+### Sentinel — sshpiper + Caddy + PROXY-protocol
+
+The sentinel is a tiny always-on VM (e2-micro on GCP free tier works)
+that:
+
+- Receives SSH on port 22 (sshpiper routes to the right backend by
+  username).
+- Receives HTTPS on 443 (Caddy with TLS-passthrough or
+  PROXY-protocol-aware forwarding to backend Caddy).
+- Survives spot-VM termination on the backend with a maintenance page.
+- Holds the static IP / DNS A-record so backends can be ephemeral.
+
+See [docs/SENTINEL-DESIGN.md](docs/SENTINEL-DESIGN.md) for the full
+design.
+
+---
+
+## Architecture
+
+```
+        Agent (Cursor / Claude Code / OpenCode)
+            │
+            │ JWT (access; tt=access, jti, scopes)
+            │ MCP over stdio  ──┐
+            │                   │ ┌── refresh ──> POST /v1/tokens/refresh
+            v                   ▼ │                  (single-use; old jti revoked)
+        ssh user@box  → sshpiper → agent-box (in container)
+            │
+            │ HTTPS  (mTLS upstream; PROXY-protocol v2)
+            v
+        Sentinel (e2-micro, always-on)
+        ├── sshpiper (port 22)            : routes by username; fail2ban per-user
+        ├── Caddy + PROXY-protocol (443)  : routes by hostname / SNI suffix
+        └── /wake/ source-IP allowlist    : trusted-proxy only
+            │
+            v
+        +-------------------------------------------------+
+        | Backend VM (spot or bare-metal GPU node)        |
+        |                                                 |
+        |  Incus (LXC) ── containers                      |
+        |    ├── alice-container    : SSH + agent-box     |
+        |    │   └── /run/secrets/* : tmpfs, 0440 alice   |
+        |    └── bob-container      : ZFS-backed storage  |
+        |                                                 |
+        |  Containarium daemon                            |
+        |    ├── JWT auth (iss/aud/jti/scopes)            |
+        |    ├── Admin RBAC + container-owner authz       |
+        |    ├── Image-digest gate (REQUIRE + VERIFY)     |
+        |    ├── Secrets ── Postgres (envelope-encrypted) |
+        |    │              │                             |
+        |    │              v                             |
+        |    │           KMS ── Vault Transit / GCP KMS   |
+        |    │           (master key retirable post-cutover)
+        |    └── Audit log ── Postgres + SHA-256 hash     |
+        |                     chain (verify CLI)          |
+        +-------------------------------------------------+
+```
+
+A single sentinel can front multiple backend VMs — a "pool" — and a
+single deployment can run multiple pools (each with its own backends). See
+[docs/MULTI-POOL.md](docs/MULTI-POOL.md).
+
+**Security control surface** (all opt-in via env, default-off for
+upgrade safety; see [`docs/security/OPERATOR-SECURITY-RUNBOOK.md`](docs/security/OPERATOR-SECURITY-RUNBOOK.md)):
+
+| Env var | Layer | Effect |
+| --- | --- | --- |
+| `CONTAINARIUM_REQUIRE_IMAGE_DIGEST=true` | API | refuse images without `@sha256:<64hex>` | <!-- claim-row: Image-registry allow-list and digest verification. -->
+| `CONTAINARIUM_VERIFY_IMAGE_DIGEST=true` | API | verify digest against the registry index (pre- + post-pull) |
+| `CONTAINARIUM_ALLOWED_IMAGE_REGISTRIES` | API | restrict which simplestreams remotes the daemon will pull from |
+| `CONTAINARIUM_KMS_BACKEND={none,inproc,vault,gcp}` | Secrets | envelope-encrypt DEKs through an external KMS |
+| `CONTAINARIUM_REQUIRE_ENVELOPE=true` | Secrets | refuse legacy master-key-only rows (Phase E retirement gate) |
+| `CONTAINARIUM_POSTGRES_URL_FILE` / `_PASSWORD_FILE` | Secrets | DB creds from disk rather than env |
+| `CONTAINARIUM_WAKE_TRUSTED_PROXIES` | Sentinel | source-IP allowlist for `/wake/` |
+| `OTEL_BEARER_REQUIRED=true` | Telemetry (collector-side; set on the OTel collector, not the daemon) | collector rejects un-bearered OTLP submissions |
+
+---
+
+## How it's different
+
+### vs. SaaS-only sandboxes (e2b, Modal, Replit)
+
+These give you sandboxes for AI agents, but only as hosted SaaS:
+
+- **Self-hostability**: Containarium runs on your own infrastructure
+  (a $5 VM, your homelab, your enterprise data center). e2b, Modal,
+  and Replit are SaaS-only — your code, your data, and your customers
+  go through their compute.
+- **License**: Apache 2.0, no CLA. Fork it, sell it, run it.
+- **Surface**: full Linux containers with `systemd`, real network
+  namespaces, GPU passthrough. Not a process-per-call sandbox.
+- **Transport**: MCP-native from day one, not a custom SDK with MCP
+  bolted on.
+
+### vs. Docker AI Sandboxes (`sbx`)
+
+Docker's `sbx run claude` and Containarium both call themselves
+"AI sandboxes," but they sit on opposite ends of the same spectrum:
+
+- **Locality**: `sbx` runs the sandbox on the developer's laptop
+  (microVM, host-isolation). Containarium runs the sandbox on a VM
+  you host (LXC, multi-tenant, public-internet reachable via the
+  sentinel).
+  <!-- claim-exempt: describes another product's locality, not a Containarium claim -->
+- **Persistence**: `sbx` is session-shaped (workspace mount, no
+  documented "give me a box that survives reboot and has a
+  hostname"). Containarium containers persist indefinitely, with
+  ZFS snapshots and 30-day retention.
+- **Public reach**: `containarium expose-port alice --domain
+  blog.example.com` is one verb. `sbx` is laptop-local; no
+  public-hostname story.
+- **Agent surface**: `sbx` is CLI-first (`sbx run <agent>`).
+  Containarium is MCP-native — two MCP servers (in-the-box
+  `agent-box` + platform `mcp-server`) plus the same surface via
+  CLI, SSH, REST/gRPC, and a web UI.
+- **License**: `sbx` CLI is free; team policy (Docker Admin Console)
+  is a paid subscription. Containarium is Apache 2.0 — including
+  the audit log, RBAC, KMS integrations, and everything else on
+  this page.
+
+If you're stopping an agent from `rm -rf`-ing the laptop it's
+running on, `sbx` is the lighter tool. If you're giving your agent
+(or your customer's agent) a persistent Linux box on the public
+internet, Containarium is the shape.
+
+### vs. OSS Kubernetes agent runtimes (agent-sandbox, OpenShell)
+
+[`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox)
+and [`NVIDIA/OpenShell`](https://github.com/NVIDIA/OpenShell) are the
+closest open-source peers on Kubernetes:
+
+- **SSH-native vs. exec-based**: both agent-sandbox and OpenShell reach
+  the sandbox via `kubectl exec` or a proprietary client, which requires
+  the agent to hold a kube-apiserver token or cluster credentials.
+  Containarium reaches the pod over SSH through sshpiper — the agent has
+  no path to the cluster control plane at all.
+- **MCP-native**: agent-sandbox and OpenShell expose REST APIs or custom
+  SDKs. Containarium's `agent-box` MCP server runs *inside* the box,
+  reachable over SSH stdio — any MCP-speaking agent (Claude Code, Cursor,
+  OpenCode) works with zero client library.
+- **LXC + K8s, one CLI**: Containarium runs on either Incus/LXC or
+  Kubernetes behind the same `containarium` CLI and `--runtime` flag. You
+  switch backends without changing anything for the agent.
+- **eBPF egress policy**: Containarium can enforce per-tenant egress
+  allowlists at the kernel level via TC_INGRESS eBPF programs once an
+  operator arms them (opt-in; see [`docs/security/CLAIMS.md`](docs/security/CLAIMS.md)).
+  agent-sandbox has NetworkPolicy; OpenShell has eBPF but is
+  NVIDIA-stack-specific. Neither offers a portable, per-tenant eBPF
+  allowlist across LXC and K8s backends.
+
+### vs. dev environment platforms (Codespaces, Gitpod, Coder)
+
+Those are persistent IDEs. Containarium is a persistent **box** —
+agent-driven, not developer-driven, no IDE assumption, SSH-as-the-API:
+
+- Containarium environments are reached by SSH and MCP. Any IDE works
+  (Vim, JetBrains Remote, VS Code Remote, Cursor's remote dev — your
+  call).
+- Cost: no per-hour billing in the OSS path. Self-host costs are just
+  your underlying VM.
+- Persistence: containers survive indefinitely; Codespaces auto-delete
+  after inactivity.
+
+### vs. application container platforms (Docker, Kubernetes)
+
+LXC is a **system** container, not an application container. Each
