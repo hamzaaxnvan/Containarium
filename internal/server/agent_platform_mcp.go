@@ -20,3 +20,25 @@ const platformMCPAllowInsecureEnv = "CONTAINARIUM_MCP_ALLOW_INSECURE"
 // platformMCPSeed is the Go side of the daemon <-> in-box runtime contract for
 // mounting the platform MCP (design decision D4, docs/architecture/
 // agent-tracker-broker.md). Written as <seed>/platform_mcp.json; the runtime
+// mounts it as a second MCP server beside agent-box. The shape is pinned by
+// agent-runtime/fixtures/platform_mcp.json, which both this package's tests and
+// the runtime's seed.test.ts read.
+type platformMCPSeed struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+	// ServerURL is the daemon REST base URL as reachable from inside the box.
+	ServerURL string `json:"server_url"`
+	// TokenFile is the run's seeded platform JWT. The MCP server re-reads it on
+	// every request (CONTAINARIUM_JWT_TOKEN_FILE), so the seed never carries the
+	// token itself.
+	TokenFile string `json:"token_file"`
+	// Tools is the CONTAINARIUM_MCP_TOOLS allow-list — "tracker_*", so the agent
+	// sees the tracker tools and not the other ~75 platform tools. The JWT's own
+	// scopes still gate every call; this narrows what is offered.
+	Tools string `json:"tools"`
+}
+
+// platformMCPSeedScript returns the shell that writes <seedDir>/platform_mcp.json,
+// or ok=false when this run should not get one: a run not bound to a tracker
+// connection has nothing to reach through the tracker tools, and without the
+// daemon's HTTP port the URL would be unusable.
