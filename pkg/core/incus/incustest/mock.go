@@ -1,0 +1,248 @@
+// Package incustest provides test doubles for the incus package.
+package incustest
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/footprintai/containarium/pkg/core/incus"
+	"github.com/lxc/incus/v7/shared/api"
+)
+
+// MockBackend is a test double for incus.Backend. Lifecycle methods
+// (Create/Start/Stop/Delete/Get/List/WaitForNetwork) provide stateful default
+// behavior via the Containers map; other methods return zero values by
+// default. Any method can be fully overridden by setting the corresponding
+// <Method>Func field.
+type MockBackend struct {
+	// Containers is the in-memory state used by default lifecycle methods.
+	Containers map[string]*incus.ContainerInfo
+
+	// WaitNetworkIP, if set, is returned by WaitForNetwork and written to
+	// the container's IPAddress field.
+	WaitNetworkIP string
+
+	// StoragePoolName, if set, is what StoragePool reports. Empty yields
+	// incus.DefaultStoragePool, so existing tests see what they always did
+	// while a test that cares can point the mock at another pool (#1213).
+	StoragePoolName string
+
+	// Override hooks. If non-nil, the method delegates to the function and
+	// the default behavior is skipped.
+	CreateContainerFunc       func(config incus.ContainerConfig) error
+	StartContainerFunc        func(name string) error
+	StopContainerFunc         func(name string, force bool) error
+	DeleteContainerFunc       func(name string) error
+	GetContainerFunc          func(name string) (*incus.ContainerInfo, error)
+	ListContainersFunc        func() ([]incus.ContainerInfo, error)
+	WaitForNetworkFunc        func(containerName string, timeout time.Duration) (string, error)
+	ExecFunc                  func(containerName string, command []string) error
+	ExecWithTimeoutFunc       func(containerName string, command []string, timeout time.Duration) error
+	ExecWithOutputFunc        func(containerName string, command []string) (string, string, error)
+	ExecWithExitCodeFunc      func(containerName string, command []string) (string, string, int, error)
+	WriteFileFunc             func(containerName, path string, content []byte, mode string) error
+	ReadFileFunc              func(containerName, path string) ([]byte, error)
+	ListDirFunc               func(containerName, path string) ([]string, error)
+	SetConfigFunc             func(containerName, key, value string) error
+	SetCPULimitFunc           func(containerName, cpu string) error
+	SetCPUConfigFunc          func(containerName, count, allowance string) error
+	FreezeContainerFunc       func(name string) error
+	UnfreezeContainerFunc     func(name string) error
+	UnsetConfigFunc           func(containerName, key string) error
+	SetDeviceSizeFunc         func(containerName, deviceName, size string) error
+	EnsureToolchainVolumeFunc func(containerName, root string) error
+	ResolveGPUInputToPCIFunc  func(input string) (string, error)
+	CleanupDiskFunc           func(containerName string) (string, int64, error)
+	UpdateContainerConfigFunc func(name, key, value string) error
+	GetRawInstanceFunc        func(name string) (map[string]string, string, error)
+	GetConsoleLogFunc         func(name string) (string, error)
+	AddLabelFunc              func(containerName, key, value string) error
+	RemoveLabelFunc           func(containerName, key string) error
+	GetLabelsFunc             func(containerName string) (map[string]string, error)
+	GetNetworkACLFunc         func(name string) (*api.NetworkACL, error)
+	CreateNetworkACLFunc      func(config incus.ACLConfig) error
+	UpdateNetworkACLFunc      func(name string, config incus.ACLConfig) error
+	ListNetworkACLsFunc       func() ([]api.NetworkACL, error)
+	DeleteNetworkACLFunc      func(name string) error
+	AttachACLToContainerFunc  func(containerName, aclName, deviceName string) error
+	SetOwnedACLFunc           func(containerName, aclName, deviceName, ownedPrefix string) error
+	EnsureNICDeviceFunc       func(containerName string, want incus.NICDevice) error
+	SetDeviceConfigFunc       func(containerName, deviceName string, keys map[string]string) error
+	SetLabelsFunc             func(containerName string, labels map[string]string) error
+	GetServerInfoFunc         func() (*api.Server, error)
+	GetContainerMetricsFunc   func(name string) (*incus.ContainerMetrics, error)
+
+	// Phase 3.1 Phase-C — post-pull fingerprint check.
+	GetContainerImageFingerprintFunc func(name string) (string, error)
+
+	// Baked base images (#1037).
+	PublishImageFunc            func(containerName, alias string, properties map[string]string) (string, error)
+	GetImageAliasPropertiesFunc func(alias string) (map[string]string, bool, error)
+
+	// Whole-box export/import (#2801). Archives is the default behaviour's
+	// state: the bytes each instance exports as. An import stores what it
+	// read under the new name and adds that instance, stopped.
+	Archives           map[string][]byte
+	ExportInstanceFunc func(name string) (io.ReadCloser, error)
+	ImportInstanceFunc func(name, pool string, r io.Reader, opts incus.ImportOptions) error
+}
+
+func (m *MockBackend) EnsureToolchainVolume(name, root string) error {
+	if m.EnsureToolchainVolumeFunc != nil {
+		return m.EnsureToolchainVolumeFunc(name, root)
+	}
+	return nil
+}
+
+// ExportInstance returns the instance's Archives entry; a name not in
+// Containers is a not-found error, as from Incus.
+func (m *MockBackend) ExportInstance(name string) (io.ReadCloser, error) {
+	if m.ExportInstanceFunc != nil {
+		return m.ExportInstanceFunc(name)
+	}
+	if _, ok := m.Containers[name]; !ok {
+		return nil, api.StatusErrorf(http.StatusNotFound, "Instance not found")
+	}
+	return io.NopCloser(bytes.NewReader(m.Archives[name])), nil
+}
+
+// ImportInstance refuses an existing name, as Incus does.
+func (m *MockBackend) ImportInstance(name, pool string, r io.Reader, opts incus.ImportOptions) error {
+	if m.ImportInstanceFunc != nil {
+		return m.ImportInstanceFunc(name, pool, r, opts)
+	}
+	if _, ok := m.Containers[name]; ok {
+		return fmt.Errorf("import %s: instance already exists", name)
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("import %s: %w", name, err)
+	}
+	if m.Archives == nil {
+		m.Archives = make(map[string][]byte)
+	}
+	if m.Containers == nil {
+		m.Containers = make(map[string]*incus.ContainerInfo)
+	}
+	m.Archives[name] = b
+	m.Containers[name] = &incus.ContainerInfo{Name: name, State: "Stopped"}
+	return nil
+}
+
+// NewMockBackend returns a ready-to-use MockBackend with an initialized
+// Containers map.
+func NewMockBackend() *MockBackend {
+	return &MockBackend{
+		Containers: make(map[string]*incus.ContainerInfo),
+	}
+}
+
+func (m *MockBackend) CreateContainer(config incus.ContainerConfig) error {
+	if m.CreateContainerFunc != nil {
+		return m.CreateContainerFunc(config)
+	}
+	if m.Containers == nil {
+		m.Containers = make(map[string]*incus.ContainerInfo)
+	}
+	m.Containers[config.Name] = &incus.ContainerInfo{
+		Name:      config.Name,
+		State:     "Stopped",
+		CPU:       config.CPU,
+		Memory:    config.Memory,
+		CreatedAt: time.Now(),
+	}
+	return nil
+}
+
+func (m *MockBackend) StartContainer(name string) error {
+	if m.StartContainerFunc != nil {
+		return m.StartContainerFunc(name)
+	}
+	if c, ok := m.Containers[name]; ok {
+		c.State = "Running"
+	}
+	return nil
+}
+
+func (m *MockBackend) StopContainer(name string, force bool) error {
+	if m.StopContainerFunc != nil {
+		return m.StopContainerFunc(name, force)
+	}
+	if c, ok := m.Containers[name]; ok {
+		c.State = "Stopped"
+	}
+	return nil
+}
+
+func (m *MockBackend) DeleteContainer(name string) error {
+	if m.DeleteContainerFunc != nil {
+		return m.DeleteContainerFunc(name)
+	}
+	delete(m.Containers, name)
+	return nil
+}
+
+func (m *MockBackend) GetContainer(name string) (*incus.ContainerInfo, error) {
+	if m.GetContainerFunc != nil {
+		return m.GetContainerFunc(name)
+	}
+	c, ok := m.Containers[name]
+	if !ok {
+		return nil, nil
+	}
+	return c, nil
+}
+
+func (m *MockBackend) ListContainers() ([]incus.ContainerInfo, error) {
+	if m.ListContainersFunc != nil {
+		return m.ListContainersFunc()
+	}
+	out := make([]incus.ContainerInfo, 0, len(m.Containers))
+	for _, c := range m.Containers {
+		out = append(out, *c)
+	}
+	return out, nil
+}
+
+func (m *MockBackend) WaitForNetwork(containerName string, timeout time.Duration) (string, error) {
+	if m.WaitForNetworkFunc != nil {
+		return m.WaitForNetworkFunc(containerName, timeout)
+	}
+	if c, ok := m.Containers[containerName]; ok {
+		c.IPAddress = m.WaitNetworkIP
+	}
+	return m.WaitNetworkIP, nil
+}
+
+func (m *MockBackend) Exec(containerName string, command []string) error {
+	if m.ExecFunc != nil {
+		return m.ExecFunc(containerName, command)
+	}
+	return nil
+}
+
+// ExecWithTimeout defaults to Exec's own behavior when ExecWithTimeoutFunc
+// is unset, so every existing test that only sets ExecFunc keeps working
+// unchanged even though MockBackend now also satisfies the (optional,
+// type-asserted) timed-exec capability real callers can detect.
+func (m *MockBackend) ExecWithTimeout(containerName string, command []string, timeout time.Duration) error {
+	if m.ExecWithTimeoutFunc != nil {
+		return m.ExecWithTimeoutFunc(containerName, command, timeout)
+	}
+	return m.Exec(containerName, command)
+}
+
+func (m *MockBackend) ExecWithOutput(containerName string, command []string) (string, string, error) {
+	if m.ExecWithOutputFunc != nil {
+		return m.ExecWithOutputFunc(containerName, command)
+	}
+	return "", "", nil
+}
+
+func (m *MockBackend) ExecWithExitCode(containerName string, command []string) (string, string, int, error) {
+	if m.ExecWithExitCodeFunc != nil {
+		return m.ExecWithExitCodeFunc(containerName, command)
+	}
