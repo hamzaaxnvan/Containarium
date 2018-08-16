@@ -21,3 +21,51 @@ func TestPrimaryNetworkInterface_VMWithK3sBridges(t *testing.T) {
 	network := map[string]api.InstanceStateNetwork{
 		"cni0":      {Addresses: globalInet("10.42.0.1")},
 		"flannel.1": {Addresses: globalInet("10.42.0.0")},
+		"enp5s0":    {Addresses: globalInet("10.232.21.167")},
+	}
+	got := primaryNetworkInterface(network)
+	if got != "10.232.21.167" {
+		t.Fatalf("primaryNetworkInterface() = %q, want the real NIC 10.232.21.167 (got cni0/flannel.1 instead)", got)
+	}
+}
+
+// TestPrimaryNetworkInterface_ContainerEth0 is the pre-existing, still-must-
+// work case: a container's default bridge device is named eth0.
+func TestPrimaryNetworkInterface_ContainerEth0(t *testing.T) {
+	network := map[string]api.InstanceStateNetwork{
+		"lo":   {Addresses: globalInet("127.0.0.1")},
+		"eth0": {Addresses: globalInet("10.100.0.42")},
+	}
+	got := primaryNetworkInterface(network)
+	if got != "10.100.0.42" {
+		t.Fatalf("primaryNetworkInterface() = %q, want eth0's 10.100.0.42", got)
+	}
+}
+
+// TestPrimaryNetworkInterface_ContainerWithDockerBridge proves the existing
+// docker0/podman0 exclusion (nested-Docker workloads inside a tenant
+// container) still works after refactoring the three passes into one
+// shared helper.
+func TestPrimaryNetworkInterface_ContainerWithDockerBridge(t *testing.T) {
+	network := map[string]api.InstanceStateNetwork{
+		"docker0": {Addresses: globalInet("172.17.0.1")},
+		"eth0":    {Addresses: globalInet("10.100.0.7")},
+	}
+	got := primaryNetworkInterface(network)
+	if got != "10.100.0.7" {
+		t.Fatalf("primaryNetworkInterface() = %q, want eth0's 10.100.0.7, not docker0's", got)
+	}
+}
+
+// TestPrimaryNetworkInterface_UnrecognizedNameFallsBackButSkipsBridges
+// covers an interface name pass 1 doesn't recognize (neither eth0 nor a
+// VM predictable name) alongside a k3s bridge: pass 2 must still skip the
+// bridge, even though it's reached by exclusion rather than a named match.
+func TestPrimaryNetworkInterface_UnrecognizedNameFallsBackButSkipsBridges(t *testing.T) {
+	network := map[string]api.InstanceStateNetwork{
+		"cni0":     {Addresses: globalInet("10.42.0.1")},
+		"wlan-vpc": {Addresses: globalInet("10.9.9.9")},
+	}
+	got := primaryNetworkInterface(network)
+	if got != "10.9.9.9" {
+		t.Fatalf("primaryNetworkInterface() = %q, want the unrecognized-but-non-bridge interface 10.9.9.9", got)
