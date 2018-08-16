@@ -133,3 +133,71 @@ func TestVerifyAttestation(t *testing.T) {
 			f.att.KeyId = trustedKeyID // claim the trusted signer, and sign that claim with the attacker's key
 			f.att.Signature = ed25519.Sign(attacker, signingBytesForTest(t, f.att))
 			return nil
+		}},
+		{name: "wrong policy hash", wantErr: guardrailpolicy.ErrPolicyMismatch, mutate: func(t *testing.T, f *verifyFixture) []pb.GuardrailKind {
+			f.att = f.attest(t, guardrail.DefaultPolicy(), []pb.GuardrailKind{pii, secret}, pb.GuardrailVerdict_GUARDRAIL_VERDICT_PASS, f.priv)
+			return nil
+		}},
+		{name: "FAIL verdict", wantErr: guardrailpolicy.ErrVerdictNotPass, mutate: func(t *testing.T, f *verifyFixture) []pb.GuardrailKind {
+			f.att = f.attest(t, f.server.GetPolicy(), f.att.GetKindsScanned(), pb.GuardrailVerdict_GUARDRAIL_VERDICT_FAIL, f.priv)
+			return nil
+		}},
+		{name: "policy kind not scanned", wantErr: guardrailpolicy.ErrKindNotCovered, mutate: func(t *testing.T, f *verifyFixture) []pb.GuardrailKind {
+			f.att = f.attest(t, f.server.GetPolicy(), nil, pb.GuardrailVerdict_GUARDRAIL_VERDICT_PASS, f.priv)
+			return nil
+		}},
+		{name: "require kind not scanned", wantErr: guardrailpolicy.ErrKindNotCovered, mutate: func(*testing.T, *verifyFixture) []pb.GuardrailKind {
+			return []pb.GuardrailKind{secret} // the policy ALLOWs secrets, so they were never scanned
+		}},
+		{name: "tampered byte", wantErr: guardrailpolicy.ErrDigestMismatch, mutate: func(t *testing.T, f *verifyFixture) []pb.GuardrailKind {
+			if err := os.WriteFile(filepath.Join(f.dir, "a.txt"), []byte("clean tExt\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newVerifyFixture(t)
+			require := tc.mutate(t, f)
+			signer, err := guardrailpolicy.VerifyAttestation(f.att, f.server, f.dir, require)
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("want pass, got %v", err)
+				}
+				if signer.GetLabel() != "release key" {
+					t.Errorf("signer = %v, want the trusted release key", signer)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestVerifyClaims: every check of VerifyAttestation except the digest. It
+// refuses what VerifyAttestation refuses on the attestation alone, and
+// passes an attestation whose bytes changed (only the digest catches that).
+func TestVerifyClaims(t *testing.T) {
+	f := newVerifyFixture(t)
+	if _, err := guardrailpolicy.VerifyClaims(f.att, f.server, nil); err != nil {
+		t.Fatalf("valid attestation: %v", err)
+	}
+	if _, err := guardrailpolicy.VerifyClaims(f.att, f.server, []pb.GuardrailKind{pb.GuardrailKind_GUARDRAIL_KIND_SECRET}); !errors.Is(err, guardrailpolicy.ErrKindNotCovered) {
+		t.Errorf("uncovered require kind = %v, want ErrKindNotCovered", err)
+	}
+	_, other, _ := ed25519.GenerateKey(rand.Reader)
+	untrusted := f.attest(t, f.server.GetPolicy(), f.att.GetKindsScanned(), pb.GuardrailVerdict_GUARDRAIL_VERDICT_PASS, other)
+	if _, err := guardrailpolicy.VerifyClaims(untrusted, f.server, nil); !errors.Is(err, guardrailpolicy.ErrUntrustedSigner) {
+		t.Errorf("untrusted signer = %v, want ErrUntrustedSigner", err)
+	}
+	wrongPolicy := f.attest(t, guardrail.DefaultPolicy(), f.att.GetKindsScanned(), pb.GuardrailVerdict_GUARDRAIL_VERDICT_PASS, f.priv)
+	if _, err := guardrailpolicy.VerifyClaims(wrongPolicy, f.server, nil); !errors.Is(err, guardrailpolicy.ErrPolicyMismatch) {
+		t.Errorf("different policy = %v, want ErrPolicyMismatch", err)
+	}
+	fail := f.attest(t, f.server.GetPolicy(), f.att.GetKindsScanned(), pb.GuardrailVerdict_GUARDRAIL_VERDICT_FAIL, f.priv)
+	if _, err := guardrailpolicy.VerifyClaims(fail, f.server, nil); !errors.Is(err, guardrailpolicy.ErrVerdictNotPass) {
+		t.Errorf("FAIL verdict = %v, want ErrVerdictNotPass", err)
+	}
