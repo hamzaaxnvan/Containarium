@@ -50,3 +50,21 @@ def _cfg(protocol):
 def test_otlp_protocol_normalization(raw, expected):
     assert _otlp_protocol(_cfg(raw)) == expected
 
+
+def test_metric_exporter_transport_selection():
+    assert "proto.http" in type(_make_metric_exporter("http/protobuf")).__module__
+    assert "proto.grpc" in type(_make_metric_exporter("grpc")).__module__
+
+
+def test_span_exporter_transport_selection():
+    assert "proto.http" in type(_make_span_exporter("http/protobuf")).__module__
+    assert "proto.grpc" in type(_make_span_exporter("grpc")).__module__
+
+
+def test_init_installs_real_tracer_provider():
+    # Before #386 init() installed a NoOpTracerProvider and silently
+    # dropped spans; now it installs a real SDK TracerProvider so spans
+    # created via trace.get_tracer(...) are actually exported.
+    env = {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318"}
+    with mock.patch.dict(os.environ, env, clear=True):
+        handle = init(instrumentations="off")

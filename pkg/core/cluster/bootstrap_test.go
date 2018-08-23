@@ -49,3 +49,55 @@ func TestRenderServerScript(t *testing.T) {
 		if !strings.Contains(got, must) {
 			t.Fatalf("server script missing %q", must)
 		}
+	}
+	if strings.Contains(got, "curl") || strings.Contains(got, "wget") {
+		t.Fatal("bootstrap must not download anything in-guest")
+	}
+}
+
+func TestRenderAgentScript(t *testing.T) {
+	got := RenderAgentScript(AgentBootstrap{ServerURL: "https://10.166.11.5:6443"})
+	golden(t, "agent.sh.golden", got)
+
+	for _, must := range []string{
+		"k3s agent --server https://10.166.11.5:6443",
+		"--token-file " + AgentTokenPath,
+		"chmod 0600 " + AgentTokenPath,
+	} {
+		if !strings.Contains(got, must) {
+			t.Fatalf("agent script missing %q", must)
+		}
+	}
+	if strings.Contains(got, "curl") || strings.Contains(got, "wget") {
+		t.Fatal("bootstrap must not download anything in-guest")
+	}
+}
+
+func TestRewriteKubeconfigServer(t *testing.T) {
+	in := "apiVersion: v1\nclusters:\n- cluster:\n    server: https://127.0.0.1:6443\n  name: default\n"
+	got := RewriteKubeconfigServer(in, "203.0.113.10:30443")
+	if !strings.Contains(got, "    server: https://203.0.113.10:30443\n") {
+		t.Fatalf("server line not rewritten:\n%s", got)
+	}
+	if strings.Contains(got, "127.0.0.1") {
+		t.Fatalf("old server survived rewrite:\n%s", got)
+	}
+	// Indentation is preserved so the YAML stays valid.
+	if !strings.Contains(got, "\n    server:") {
+		t.Fatalf("indentation lost:\n%s", got)
+	}
+}
+
+func TestRenderCAUnitScript(t *testing.T) {
+	got := RenderCAUnitScript(CADeploy{ProviderAddr: "10.0.0.1:36442"})
+	golden(t, "ca-unit.sh.golden", got)
+	for _, must := range []string{
+		CAImage, // digest-pinned, never a floating tag
+		"--cloud-provider=externalgrpc",
+		"--cloud-config=" + CACloudConfigPath,
+		"ctr run", // containerd task, not a Pod — outside the tenant-visible API
+	} {
+		if !strings.Contains(got, must) {
+			t.Fatalf("CA unit script missing %q", must)
+		}
+	}
