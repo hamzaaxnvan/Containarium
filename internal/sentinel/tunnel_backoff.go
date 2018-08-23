@@ -34,3 +34,15 @@ func newReconnectBackoff() *reconnectBackoff {
 func (b *reconnectBackoff) next(sessionLasted time.Duration) time.Duration {
 	if sessionLasted >= reconnectStableAfter {
 		b.cur = reconnectInitialDelay
+	}
+	d := b.cur
+	b.cur *= 2
+	if b.cur > reconnectMaxDelay {
+		b.cur = reconnectMaxDelay
+	}
+	return d
+}
+
+// jitterDelay spreads d by up to ±20% so several clients that lost the same
+// sentinel do not all retry in the same instant. It reads crypto/rand because
+// the cost is irrelevant at reconnect frequency and it keeps the weak-RNG
