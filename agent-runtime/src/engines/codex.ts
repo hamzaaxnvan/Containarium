@@ -1,0 +1,71 @@
+import { Codex, type Thread, type ThreadItem } from "@openai/codex-sdk";
+import type { Engine, EngineConfig, EngineResult } from "../engine.js";
+import type { JournalSink } from "../journal.js";
+import { describeRunEnding } from "./ending.js";
+
+// CodexThreadFactory starts the Codex thread a run streams; a seam for tests.
+export type CodexThreadFactory = () => Pick<Thread, "runStreamed">;
+
+// CodexEngine drives the in-box loop with the OpenAI Codex SDK. Like the Claude
+// engine it mounts agent-box as its tool surface — but Codex wires MCP servers
+// and the model through its own config (~/.codex/config.toml), which the
+// runtime writes before this engine runs (see writeCodexConfig in index.ts).
+// Auth: the Codex SDK reads its key from the environment (CODEX_API_KEY /
+// OPENAI_API_KEY), seeded via secrets.
+//
+// The Codex SDK has no separate system-prompt field, so the skill's persona is
+// prepended to the task. The turn is streamed (thread.runStreamed) rather than
+// awaited (thread.run) so each completed item is journaled as it lands
+// (#2095); the result is the same thread.run() computes: the last agent
+// message is the final response, turn.failed throws.
+//
+// Output schema (#2002): the skill's agent_card.output_schema_json is passed
+// as the turn's outputSchema — the SDK's native mechanism (codex exec
+// --output-schema), which shapes the final agent message provider-side. The
+// runtime does not re-validate the message locally; conformance is the
+// provider's, as with the Claude engine's structured output.
+export class CodexEngine implements Engine {
+  readonly name = "codex";
+
+  constructor(
+    private readonly startThread: CodexThreadFactory = () =>
+      new Codex().startThread({ workingDirectory: process.cwd(), skipGitRepoCheck: true }),
+  ) {}
+
+  async run(task: string, cfg: EngineConfig, journal: JournalSink): Promise<EngineResult> {
+    const thread = this.startThread();
+
+    const prompt = cfg.systemPrompt
+      ? `${cfg.systemPrompt}\n\n---\nTask:\n${task}`
+      : task;
+
+    return this.turn(thread, prompt, cfg, journal);
+  }
+
+  // turn streams one turn on the thread. Its result's followUp runs the next
+  // turn on the same thread, so the model has this one in context (#2513).
+  private async turn(
+    thread: Pick<Thread, "runStreamed">,
+    prompt: string,
+    cfg: EngineConfig,
+    journal: JournalSink,
+  ): Promise<EngineResult> {
+    const { events } = await thread.runStreamed(prompt, cfg.outputSchema ? { outputSchema: cfg.outputSchema } : undefined);
+    let finalResponse = "";
+    let usage: unknown;
+    let turnCompleted = false;
+    for await (const event of events) {
+      if (event.type === "item.completed") {
+        if (event.item.type === "agent_message") finalResponse = event.item.text;
+        journalCodexItem(event.item, journal);
+      } else if (event.type === "turn.completed") {
+        turnCompleted = true;
+        usage = event.usage;
+      } else if (event.type === "turn.failed") {
+        throw new Error(event.error.message);
+      } else if (event.type === "error") {
+        journal.append({ kind: "error", text: event.message });
+      }
+    }
+    // #2513: the Codex SDK reports no stop reason; what the stream does say is
+    // whether the turn completed. See ending.ts for the row's shape.
