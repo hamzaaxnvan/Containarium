@@ -113,3 +113,60 @@ func (s *ThreatDetectionServer) SetProcessPolicy(ctx context.Context, req *pb.Se
 	switch {
 	case req.GetClearOverride():
 		if container == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "clear_override requires container")
+		}
+		if err := s.policies.ClearOverride(ctx, container); err != nil {
+			return nil, status.Errorf(codes.Internal, "clear process policy override: %v", err)
+		}
+	default:
+		if err := threatdetect.ValidateProcessPolicy(req.GetPolicy()); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		if mb := req.GetPolicy().GetMiningBehavior(); mb != nil {
+			if container != "" {
+				return nil, status.Errorf(codes.InvalidArgument, "mining_behavior thresholds are backend-wide; omit container")
+			}
+			if s.miningCfg == nil {
+				return nil, status.Errorf(codes.Unavailable, "mining-behavior thresholds not available")
+			}
+			if err := s.miningCfg.Set(ctx, mb); err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+			}
+		}
+		// Thresholds live under their own config key; keep the stored
+		// policy free of a second copy.
+		pol := proto.Clone(req.GetPolicy()).(*pb.ProcessPolicy)
+		pol.MiningBehavior = nil
+		// A request sets only the fields it carries: an unset action,
+		// allowance or TTL keeps its stored value. Replacing the record
+		// wholesale made a thresholds-only set wipe the configured action,
+		// and a lone --action drop the allowance and TTL (#2675).
+		var stored *pb.ProcessPolicy
+		var err error
+		if container == "" {
+			stored, err = s.policies.Default(ctx)
+		} else {
+			stored, err = s.policies.Override(ctx, container)
+		}
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read process policy: %v", err)
+		}
+		merged := mergeProcessPolicy(stored, pol)
+		if proto.Equal(merged, stored) || (stored == nil && proto.Equal(merged, &pb.ProcessPolicy{})) {
+			break // nothing to store (e.g. thresholds only on a fresh backend)
+		}
+		if container == "" {
+			err = s.policies.SetDefault(ctx, merged)
+		} else {
+			err = s.policies.SetOverride(ctx, container, merged)
+		}
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "set process policy: %v", err)
+		}
+	}
+	effective, err := s.policies.Effective(ctx, container)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "resolve process policy: %v", err)
+	}
+	return &pb.SetProcessPolicyResponse{Effective: s.withEffectiveThresholds(effective)}, nil
+}
