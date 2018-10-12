@@ -32,15 +32,3 @@ func requireSecureTransportForIdentity(server string, httpMode, insecureConn boo
 	return fmt.Errorf("refusing to send the age identity (a private key) to %q over a cleartext connection: "+
 		"use an https:// server with --http, or gRPC with mTLS (omit --insecure)", server)
 }
-
-// isLoopbackServer reports whether a --server value (host, host:port, or a
-// URL) points at the local machine. Only the literal name "localhost" and
-// loopback IPs qualify; a lookalike such as "localhost.example.com" does not.
-func isLoopbackServer(server string) bool {
-	hostport := server
-	if strings.Contains(server, "://") {
-		u, err := url.Parse(server)
-		if err != nil {
-			return false
-		}
-		hostport = u.Host
