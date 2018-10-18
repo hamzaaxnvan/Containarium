@@ -28,13 +28,3 @@ func init() {
 	rootCmd.AddCommand(crewCmd)
 }
 
-type crewAPI interface {
-	RunCrewGraph(req *pb.RunCrewRequest) (*pb.CrewRun, error)
-	PlanTaskGraph(req *pb.PlanTaskGraphRequest) (*pb.PlanTaskGraphResponse, error)
-	ListCrews() ([]*pb.Crew, error)
-	GetCrew(id string) (*pb.Crew, error)
-	RunCrew(crewID, backendID, pool, inputJSON, gitSource, gitRef, gitCredential string, engineOverrides map[string]pb.AgentEngine, modelOverrides map[string]string) (*pb.CrewRun, error)
-	GetCrewRun(id string) (*pb.CrewRun, error)
-	TailRunLog(req *pb.TailRunLogRequest) (*pb.TailRunLogResponse, error)
-	ValidateTaskGraph(g *pb.TaskGraph) (*pb.ValidateTaskGraphResponse, error)
-	Close() error
