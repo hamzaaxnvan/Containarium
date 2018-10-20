@@ -1,0 +1,301 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "containarium/v1/container.proto";
+import "containarium/v1/config.proto";
+import "containarium/v1/alert.proto";
+import "containarium/v1/secrets.proto";
+import "containarium/v1/box_run.proto";
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
+  info: {
+    title: "Containarium API";
+    version: "1.0";
+    description: "Container management API for LXC-based development environments. Provides both gRPC and REST interfaces for managing containers, SSH keys, and system resources.";
+    contact: {
+      name: "Containarium";
+      url: "https://github.com/footprintai/containarium";
+    };
+    license: {
+      name: "Apache 2.0";
+      url: "https://github.com/footprintai/containarium/blob/main/LICENSE";
+    };
+  };
+  schemes: HTTPS;
+  schemes: HTTP;
+  consumes: "application/json";
+  produces: "application/json";
+  security_definitions: {
+    security: {
+      key: "bearer";
+      value: {
+        type: TYPE_API_KEY;
+        in: IN_HEADER;
+        name: "Authorization";
+        description: "Bearer token authentication. Format: 'Bearer <token>'";
+      }
+    }
+  };
+  security: {
+    security_requirement: {
+      key: "bearer";
+      value: {};
+    }
+  };
+};
+
+// ContainerService provides container management operations
+service ContainerService {
+  // CreateContainer creates a new container for a user
+  rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Create a new container";
+      description: "Creates a new LXC container with specified resources and configuration. The container will be started automatically after creation.";
+      tags: "Containers";
+    };
+  }
+
+  // ListContainers lists all containers with optional filtering
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse) {
+    option (google.api.http) = {
+      get: "/v1/containers"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List all containers";
+      description: "Returns a list of containers with optional filtering by state, username, or labels. Use query parameters to filter results.";
+      tags: "Containers";
+    };
+  }
+
+  // GetContainer gets detailed information about a specific container
+  rpc GetContainer(GetContainerRequest) returns (GetContainerResponse) {
+    option (google.api.http) = {
+      get: "/v1/containers/{username}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get container details";
+      description: "Returns detailed information about a specific container including state, resources, network info, and current metrics.";
+      tags: "Containers";
+    };
+  }
+
+  // DebugContainer reports diagnostic information about a container's
+  // SSH path: state, host user, shell, recent sshd rejections.
+  rpc DebugContainer(DebugContainerRequest) returns (DebugContainerResponse) {
+    option (google.api.http) = {
+      get: "/v1/containers/{username}/debug"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Debug a container's SSH path";
+      description: "Inspects backend-local state for the container: container runtime state, host /etc/passwd entry, whether the shell wrapper exists, and recent sshd journal lines matching the username. Returns a structured diagnosis with likely_cause and ordered next_actions for the caller to apply.";
+      tags: "Containers";
+    };
+  }
+
+  // GetConsoleLog fetches a VM instance's boot-time console ring-buffer
+  // log — a static read, not a live attach. Diagnoses boot hangs (BIOS/UEFI
+  // POST, bootloader, kernel panic pre-network) that leave the instance
+  // unreachable via SSH or its own tunnel agent.
+  rpc GetConsoleLog(GetConsoleLogRequest) returns (GetConsoleLogResponse) {
+    option (google.api.http) = {
+      get: "/v1/containers/{username}/console-log"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get a VM instance's console log";
+      description: "Returns the instance's boot-time console ring-buffer log. For LXC containers (no serial console) this returns an empty log rather than an error.";
+      tags: "Containers";
+    };
+  }
+
+  // DeleteContainer deletes a container
+  rpc DeleteContainer(DeleteContainerRequest) returns (DeleteContainerResponse) {
+    option (google.api.http) = {
+      delete: "/v1/containers/{username}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Delete a container";
+      description: "Permanently deletes a container. Use force=true query parameter to delete running containers.";
+      tags: "Containers";
+    };
+  }
+
+  // StartContainer starts a stopped container
+  rpc StartContainer(StartContainerRequest) returns (StartContainerResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/start"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Start a container";
+      description: "Starts a stopped container. The container must exist and be in STOPPED state.";
+      tags: "Container Operations";
+    };
+  }
+
+  // StopContainer stops a running container
+  rpc StopContainer(StopContainerRequest) returns (StopContainerResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/stop"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Stop a container";
+      description: "Gracefully stops a running container with optional timeout and force parameters. The container can be started again later.";
+      tags: "Container Operations";
+    };
+  }
+
+  // ResizeContainer dynamically adjusts container resources
+  rpc ResizeContainer(ResizeContainerRequest) returns (ResizeContainerResponse) {
+    option (google.api.http) = {
+      put: "/v1/containers/{username}/resize"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Resize container resources";
+      description: "Dynamically adjusts CPU, memory, and disk resources without container restart. Disk can only be increased, not decreased.";
+      tags: "Container Operations";
+    };
+  }
+
+  // MoveContainer migrates a container from the local daemon (source)
+  // to a peer daemon (target) using pre-copy snapshot + delta refresh.
+  // Three phases: (1) initial snapshot copy while source keeps running,
+  // (2) iterative delta refreshes to shrink the dirty set, (3) brief
+  // stop + final delta + start-on-target + route swap. Downtime is
+  // sub-second on quiet workloads with ZFS/btrfs storage; minutes
+  // for active workloads on dir-pool. Prereq: incus remotes
+  // configured both ways between the source and target VMs.
+  rpc MoveContainer(MoveContainerRequest) returns (MoveContainerResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/move"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Migrate container to peer daemon";
+      description: "Pre-copy snapshot-based migration to a peer daemon. Sub-second downtime on ZFS/btrfs storage with low write rate; up to minutes on dir-pool or active workloads. Caller must have incus remotes configured both directions between the source and target hosts.";
+      tags: "Container Operations";
+    };
+  }
+
+  // CreateContainerSnapshot takes a point-in-time ZFS snapshot of a
+  // container's dataset (#1160).
+  //
+  // On ContainerService rather than VolumeService because the subject is a
+  // container: the dataset is an implementation detail the daemon resolves
+  // itself, and the tenant authorization here is already the right shape.
+  // See docs/architecture/container-snapshots.md.
+  //
+  // Succeeds with the encryption key unloaded — ZFS permits it, and blocking
+  // on key custody would let a transient outage suppress the backup window.
+  rpc CreateContainerSnapshot(CreateContainerSnapshotRequest) returns (CreateContainerSnapshotResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/snapshots"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Snapshot a container";
+      description: "Takes a point-in-time ZFS snapshot of the container's dataset. Instant and space-efficient: it shares blocks with the live dataset until they diverge. Works while the container runs, and while its encryption key is unloaded.";
+      tags: "Container Operations";
+    };
+  }
+
+  // ListContainerSnapshots lists a container's snapshots with their space
+  // usage. The usage is the point: a forgotten snapshot silently pins disk,
+  // and nothing else in the API reports it.
+  rpc ListContainerSnapshots(ListContainerSnapshotsRequest) returns (ListContainerSnapshotsResponse) {
+    option (google.api.http) = {
+      get: "/v1/containers/{username}/snapshots"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List a container's snapshots";
+      description: "Lists the container's ZFS snapshots, each with the bytes it uniquely holds (what deleting it would free) and the bytes it references in total.";
+      tags: "Container Operations";
+    };
+  }
+
+  // DeleteContainerSnapshot removes a snapshot and reports what it freed.
+  rpc DeleteContainerSnapshot(DeleteContainerSnapshotRequest) returns (DeleteContainerSnapshotResponse) {
+    option (google.api.http) = {
+      delete: "/v1/containers/{username}/snapshots/{name}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Delete a container snapshot";
+      description: "Removes the snapshot and reports the bytes reclaimed. Works while the container's encryption key is unloaded.";
+      tags: "Container Operations";
+    };
+  }
+
+  // RollbackContainerSnapshot returns a container's dataset to the state
+  // captured by a snapshot (#1160b).
+  //
+  // Destructive, and guarded three ways: it refuses a running container
+  // (unless force), refuses to destroy newer snapshots (unless destroy_newer),
+  // and refuses when the encryption key is unavailable — a rollback whose
+  // result cannot be read is not a restore (#1202 AC2).
+  rpc RollbackContainerSnapshot(RollbackContainerSnapshotRequest) returns (RollbackContainerSnapshotResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/snapshots/{name}/rollback"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Roll a container back to a snapshot";
+      description: "Discards everything written since the snapshot. Refuses a running container unless force is set, refuses to destroy newer snapshots unless destroy_newer is set, and refuses when the container's encryption key is unavailable.";
+      tags: "Container Operations";
+    };
+  }
+
+  // DeleteTenantStorage tears down a departing tenant's encrypted storage
+  // (#1343) — the Incus storage pool, then the encrypted dataset it is
+  // sourced at, in that order.
+  //
+  // The order is not cosmetic: destroying the dataset first leaves a pool
+  // pointing at nothing, and the daemon walks every pool at startup, so a
+  // mis-ordered teardown breaks startup for every tenant on the host.
+  //
+  // Refused while the tenant still has containers. DESTRUCTIVE and
+  // irreversible: the dataset is the tenant's encryptionroot, so destroying
+  // it destroys the only thing that could decrypt their data. Admin only.
+  rpc DeleteTenantStorage(DeleteTenantStorageRequest) returns (DeleteTenantStorageResponse) {
+    option (google.api.http) = {
+      delete: "/v1/tenants/{tenant}/storage"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Destroy a departing tenant's encrypted storage";
+      description: "Deletes the tenant's Incus storage pool and then the encrypted dataset it was sourced at. Refused while the tenant still has containers. Irreversible — the dataset is the tenant's encryptionroot, so this destroys the only key path to their data. Admin only.";
+      tags: "Container Operations";
+    };
+  }
+
+  // RewrapContainer rotates the key protecting a container's data onto
+  // new key material, without rewriting the data (#1204).
+  //
+  // Rotation is per-TENANT: a tenant's containers share one encryptionroot,
+  // so this rotates the key for every container that tenant owns. The
+  // response lists them.
+  //
+  // The caller supplies the NEW key reference; the daemon resolves it with
+  // its own KeyProvider and never receives key material. OSS ships no
+  // rotation scheduler — cadence is tenant policy owned by the control
+  // plane (design resolved decision #5).
+  rpc RewrapContainer(RewrapContainerRequest) returns (RewrapContainerResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/rewrap"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Rotate a tenant's encryption key";
+      description: "Rewraps the tenant's ZFS encryptionroot onto new key material supplied as a key reference. Only the wrapping key changes, so the cost is independent of dataset size. Affects every container the tenant owns, which the response lists. Admin only.";
+      tags: "Container Operations";
+    };
+  }
+

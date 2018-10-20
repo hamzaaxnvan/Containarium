@@ -52,3 +52,30 @@ func (e *UpstreamStatusError) Error() string {
 	}
 	return fmt.Sprintf("modelgateway: %s model list: upstream returned %d: %s", e.Provider, e.StatusCode, e.Body)
 }
+
+// modelListTimeout bounds one upstream model-list lookup. Short: it sits in
+// front of an interactive CLI verb and an install-time preflight, and a provider
+// that cannot answer in this window is a provider the caller should hear about
+// rather than wait on.
+const modelListTimeout = 10 * time.Second
+
+// maxModelListErrorBody caps how much of an upstream error body is quoted back.
+const maxModelListErrorBody = 512
+
+// HasProvider reports whether this gateway brokers a provider by that name —
+// either compiled in (DefaultProviders) or registered from the environment
+// (ProvidersFromEnv). The mint path asks before issuing a token, so "this daemon
+// does not serve that provider" is named at mint time rather than discovered as
+// a 404 on the box's first model call.
+func (g *Gateway) HasProvider(name string) bool {
+	p, ok := g.cfg.Providers[name]
+	return ok && p != nil
+}
+
+// ListModels returns the model ids provider exposes, read on keyOwner's key
+// (falling back to the daemon-global key for the provider, same precedence as
+// the proxy path). keyOwner may be empty, which resolves to the global key only.
+func (g *Gateway) ListModels(ctx context.Context, keyOwner, provider string) ([]string, error) {
+	p, ok := g.cfg.Providers[provider]
+	if !ok || p == nil {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownProvider, provider)
