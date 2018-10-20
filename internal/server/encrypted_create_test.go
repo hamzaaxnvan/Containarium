@@ -64,3 +64,36 @@ func TestEncryptionTenantFor(t *testing.T) {
 	}
 }
 
+// The guard inherited from #1339.
+//
+// #1339 made a storage pool that IS set impossible to drop silently. This is
+// the other half: an encrypted create whose pool could not be resolved must
+// fail loudly rather than fall through to the daemon default, where the
+// container would be created unencrypted and reported as a success.
+//
+// Reachable only through a misconfigured daemon — a KeyProvider wired with no
+// encryption hooks — which is exactly the shape a future wiring change could
+// produce by accident.
+func TestCreateContainer_EncryptedWithoutAResolvedPoolFails(t *testing.T) {
+	s := &ContainerServer{
+		// A provider is present, so validateEncryption lets the request
+		// through...
+		keyProvider: stubProvider{},
+		// ...but the hooks are not wired, so no pool can be resolved.
+		encryption: nil,
+	}
+
+	_, err := s.CreateContainer(tenantWithScopes("alice", auth.ScopeContainersWrite),
+		&pb.CreateContainerRequest{Username: "alice", Encrypted: true})
+	if err == nil {
+		t.Fatal("an encrypted create with no resolvable storage pool succeeded — the container " +
+			"would land on the daemon's default pool, unencrypted, and be reported as encrypted")
+	}
+	if got := status.Code(err); got != codes.FailedPrecondition && got != codes.Internal {
+		t.Errorf("code = %v, want FailedPrecondition or Internal", got)
+	}
+	// The operator has to be able to tell this from a caller error.
+	if !strings.Contains(err.Error(), "pool") {
+		t.Errorf("the error does not mention the storage pool, so nobody can act on it: %v", err)
+	}
+}
