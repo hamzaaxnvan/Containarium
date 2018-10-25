@@ -59,3 +59,23 @@ func TestIntegrationIncus_PodmanEnabledRoundTripsThroughGetAndList(t *testing.T)
 		Name:  legacyName,
 		Image: incusenv.BoxImage(),
 	}); err != nil {
+		t.Fatalf("create the legacy-shaped box: %v", err)
+	}
+
+	all, err := client.ListContainers()
+	if err != nil {
+		t.Fatalf("ListContainers: %v", err)
+	}
+	for _, tc := range []struct {
+		instance string
+		want     bool
+	}{
+		{onInstance, true},
+		{offInstance, false},
+		{legacyName, true},
+	} {
+		info, err := client.GetContainer(tc.instance)
+		if err != nil || info == nil {
+			t.Fatalf("GetContainer(%s) = %v, %v", tc.instance, info, err)
+		}
+		if info.PodmanEnabled != tc.want {

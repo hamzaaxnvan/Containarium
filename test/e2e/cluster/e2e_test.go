@@ -189,3 +189,194 @@ func TestManagedClusterJourney(t *testing.T) {
 		l.t.Logf("teardown delete: %v %s", err, strings.TrimSpace(out))
 	}()
 
+	steps := []struct {
+		name string
+		fn   func() error
+	}{
+		{"1_create_kubeconfig_from_outside", l.stepCreate},
+		{"2_overflow_scales_up_via_new_ready_node", l.stepOverflowScaleUp},
+		{"3_big_pod_lands_on_larger_class_node", l.stepLargerClass},
+		{"4_vpa_raises_requests_without_restart_loop", l.stepVPA},
+		{"5_scale_to_zero_drains_and_deletes_instance", l.stepScaleToZero},
+		{"6_delete_leaves_nothing", l.stepDelete},
+	}
+	for _, s := range steps {
+		if !t.Run(s.name, func(t *testing.T) {
+			if err := s.fn(); err != nil {
+				l.dumpDiagnostics()
+				t.Fatal(err)
+			}
+		}) {
+			t.Fatalf("step %s failed; aborting the journey (later steps depend on it)", s.name)
+		}
+	}
+}
+
+// --- CLI ----------------------------------------------------------------
+
+// runCLI returns stdout alone on success: `cluster kubeconfig` writes
+// the credential to stdout and a notice to stderr, and merging the two
+// would corrupt the YAML this test parses. On error the streams are
+// joined — cobra reports errors on stderr, and callers match on them.
+func (l *lane) runCLI(args ...string) (string, error) {
+	full := append([]string{"--http", "--server", l.server, "--token", l.token}, args...)
+	cmd := exec.Command(l.cli, full...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return strings.TrimSpace(stdout.String() + "\n" + stderr.String()), err
+	}
+	return stdout.String(), nil
+}
+
+// dropPrerouting deletes the published endpoint's inbound DNAT rule,
+// leaving the locally-generated OUTPUT rule intact — the exact state
+// that used to leave this lane green while no tenant could connect
+// (#1468).
+func (l *lane) dropPrerouting(hostPort string) error {
+	_, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return fmt.Errorf("sabotage: parse endpoint %q: %w", hostPort, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("sabotage: parse port %q: %w", portStr, err)
+	}
+	cmd := DropPreroutingCommand(port)
+	c := exec.Command(cmd[0], cmd[1:]...)
+	var out bytes.Buffer
+	c.Stdout, c.Stderr = &out, &out
+	if err := c.Run(); err != nil {
+		// A rule that is not there cannot be deleted, and that is a
+		// setup failure rather than the breakage under test — say so,
+		// instead of letting the run go red for the wrong reason and
+		// pass as "proof".
+		return fmt.Errorf("sabotage: could not delete the PREROUTING rule for port %d (%v): %s\n"+
+			"the proof run is invalid — it must remove a rule that exists", port, err, out.String())
+	}
+	l.t.Logf("SABOTAGE: deleted the PREROUTING DNAT rule for port %d; the OUTPUT rule is untouched", port)
+	return nil
+}
+
+// assertReachableFromOffHost dials the advertised endpoint from a
+// network namespace joined to the host by a veth, so the packet
+// arrives from elsewhere and traverses PREROUTING the way a tenant's
+// does (#1468).
+//
+// When the probe is not enabled this does NOT quietly pass. It says,
+// in the run's own output, that the tenant-facing path was not
+// verified — because the alternative is a step called "from outside"
+// that has never left the host, which is a check that cannot fail for
+// the case it is named after.
+func (l *lane) assertReachableFromOffHost(hostPort string) error {
+	if l.offHost != OffHostProbeNetns {
+		l.t.Logf("NOT VERIFIED: the advertised endpoint %s was only dialled from the daemon host itself, "+
+			"which skips PREROUTING and exercises the OUTPUT rule (#1459) instead of the DNAT rule tenants use. "+
+			"Set CONTAINARIUM_E2E_OFFHOST_PROBE=netns to check it for real (#1468).", hostPort)
+		return nil
+	}
+
+	// A namespace leaked by a killed run would fail setup, so clear
+	// any leftovers first. Errors here are expected and ignored.
+	for _, cmd := range OffHostTeardownCommands() {
+		_ = exec.Command(cmd[0], cmd[1:]...).Run()
+	}
+	for _, cmd := range OffHostSetupCommands() {
+		c := exec.Command(cmd[0], cmd[1:]...)
+		var out bytes.Buffer
+		c.Stdout, c.Stderr = &out, &out
+		if err := c.Run(); err != nil {
+			return fmt.Errorf("off-host probe setup (%s): %v\n%s", strings.Join(cmd, " "), err, out.String())
+		}
+	}
+	defer func() {
+		for _, cmd := range OffHostTeardownCommands() {
+			_ = exec.Command(cmd[0], cmd[1:]...).Run()
+		}
+	}()
+
+	dial := OffHostDialCommand(hostPort, 15*time.Second)
+	c := exec.Command(dial[0], dial[1:]...)
+	var stdout, stderr bytes.Buffer
+	c.Stdout, c.Stderr = &stdout, &stderr
+	err := c.Run()
+	code := strings.TrimSpace(stdout.String())
+
+	// Any HTTP status proves the packet reached the API server through
+	// PREROUTING. 401/403 is a pass: authentication is not what is
+	// under test, reachability is. Only a failure to connect fails.
+	if err != nil || code == "" || code == "000" {
+		return fmt.Errorf(
+			"the advertised endpoint %s is NOT reachable from off-host (curl=%v code=%q): %s\n"+
+				"the kubeconfig names an address a tenant cannot reach. This is the PREROUTING/DNAT path, "+
+				"which the daemon host itself never traverses (#1468)",
+			hostPort, err, code, strings.TrimSpace(stderr.String()))
+	}
+	l.t.Logf("reachable from off-host: %s answered HTTP %s from netns %s (traversed PREROUTING)",
+		hostPort, code, OffHostNetns)
+	return nil
+}
+
+// --- step 1: create → kubeconfig works from outside ---------------------
+
+func (l *lane) stepCreate() error {
+	readyTimeout := timeoutEnv("CONTAINARIUM_E2E_READY_TIMEOUT", 15*time.Minute)
+
+	// CLI-first, and the isolation class is a CLI flag exactly as a
+	// tenant would pass it (#1428). VM mode adds no flag at all.
+	createArgs := append([]string{"cluster", "create", clusterName}, l.isolation.CreateArgs()...)
+	if out, err := l.runCLI(createArgs...); err != nil {
+		return fmt.Errorf("cluster create (%s): %v\n%s", l.isolation, err, out)
+	}
+
+	// The kubeconfig RPC is FailedPrecondition until the cluster is
+	// READY, then returns the credential: polling it IS the readiness
+	// probe, through the same door a tenant uses.
+	err := l.waitFor("cluster READY and kubeconfig served", readyTimeout, 10*time.Second, func() (bool, string) {
+		out, err := l.runCLI("cluster", "kubeconfig", clusterName)
+		if err != nil {
+			return false, strings.TrimSpace(out)
+		}
+		l.kubeconfig = []byte(out)
+		return true, "kubeconfig fetched"
+	})
+	if err != nil {
+		return err
+	}
+
+	// "From outside": the credential must point at the advertised host
+	// (the passthrough route), not at a VM address only the host can
+	// reach.
+	host, err := KubeconfigServerHost(l.kubeconfig)
+	if err != nil {
+		return err
+	}
+	if got, _, splitErr := net.SplitHostPort(host); splitErr != nil || got != l.advertiseHost {
+		return fmt.Errorf("kubeconfig points at %q, want the advertised host %q — that is not the address a tenant is given", host, l.advertiseHost)
+	}
+
+	// ...and that address must actually answer from OFF the host
+	// (#1468). Everything above, and every l.cs call below, runs on
+	// the daemon host: those packets are locally generated, skip
+	// PREROUTING, and take the OUTPUT path that #1459 added for the
+	// lane's own benefit. The DNAT rule every real tenant traverses is
+	// in PREROUTING, and nothing here had ever exercised it — delete
+	// that rule and this suite stayed green while no tenant could
+	// reach any cluster.
+	if l.sabotage == SabotageDropPrerouting {
+		if err := l.dropPrerouting(host); err != nil {
+			return err
+		}
+	}
+	if err := l.assertReachableFromOffHost(host); err != nil {
+		return err
+	}
+
+	restCfg, err := clientcmd.RESTConfigFromKubeConfig(l.kubeconfig)
+	if err != nil {
+		return fmt.Errorf("kubeconfig rest config: %w", err)
+	}
+	if l.cs, err = kubernetes.NewForConfig(restCfg); err != nil {
+		return fmt.Errorf("clientset: %w", err)
+	}
+	if l.dyn, err = dynamic.NewForConfig(restCfg); err != nil {
