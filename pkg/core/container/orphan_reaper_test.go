@@ -82,3 +82,45 @@ func TestReapOnce_UnknownShellIsNotReaped(t *testing.T) {
 	makeHomeDir(t, homeRoot, "stale-dir", true)
 
 	userShellFn := func(username string) (string, error) {
+		return "", fmt.Errorf("user %q not found", username)
+	}
+	containerExistsFn := func(username string) bool { return false }
+
+	var deleted []string
+	deleteFn := func(username string, verbose bool) error {
+		deleted = append(deleted, username)
+		return nil
+	}
+
+	reapOnce(homeRoot, containerExistsFn, userShellFn, deleteFn)
+
+	if len(deleted) != 0 {
+		t.Fatalf("deleted = %v, want none", deleted)
+	}
+}
+
+// TestReapOnce_NoAuthorizedKeysNeverConsidered ensures a plain directory
+// under homeRoot with no .ssh/authorized_keys never reaches the shell
+// lookup or delete path at all.
+func TestReapOnce_NoAuthorizedKeysNeverConsidered(t *testing.T) {
+	homeRoot := t.TempDir()
+	makeHomeDir(t, homeRoot, "plain-dir", false)
+
+	userShellFn := func(username string) (string, error) {
+		t.Fatalf("userShellFn should not be called for %q", username)
+		return "", nil
+	}
+	containerExistsFn := func(username string) bool { return false }
+	deleteFn := func(username string, verbose bool) error {
+		t.Fatalf("deleteFn should not be called for %q", username)
+		return nil
+	}
+
+	reapOnce(homeRoot, containerExistsFn, userShellFn, deleteFn)
+}
+
+// TestReapOnce_InvalidUsernameShapeNeverConsidered ensures a directory
+// whose name isn't a valid containarium username (e.g. contains shell
+// metacharacters) never reaches the getent/exec.Command call at all —
+// gosec G204 defense-in-depth, not just a shell-invocation non-issue.
+func TestReapOnce_InvalidUsernameShapeNeverConsidered(t *testing.T) {
