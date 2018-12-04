@@ -48,3 +48,20 @@ export interface UpdateAlertRuleRequest {
   enabled?: boolean;
 }
 
+export interface UpdateAlertingConfigRequest {
+  webhookUrl: string;
+  generateWebhookSecret?: boolean;
+}
+
+export interface UpdateAlertingConfigResponse {
+  webhookUrl: string;
+  success: boolean;
+  webhookSecret?: string;
+}
+
+export interface TestWebhookResponse {
+  success: boolean;
+  statusCode: number;
+  message: string;
+}
+
