@@ -34,21 +34,3 @@ Examples:
 
   # Setup with auto-detection (requires Incus)
   containarium portforward setup --auto`,
-	RunE: runPortforwardSetup,
-}
-
-func init() {
-	portforwardCmd.AddCommand(portforwardSetupCmd)
-	portforwardSetupCmd.Flags().StringVar(&portforwardCaddyIP, "caddy-ip", "", "IP address of the Caddy container")
-	portforwardSetupCmd.Flags().BoolVar(&portforwardAutoDetect, "auto", false, "Auto-detect Caddy container IP from Incus")
-}
-
-func runPortforwardSetup(cmd *cobra.Command, args []string) error {
-	// Check if iptables is available
-	if !network.CheckIPTablesAvailable() {
-		return fmt.Errorf("iptables is not available on this system")
-	}
-
-	caddyIP := portforwardCaddyIP
-
-	// Auto-detect if requested
