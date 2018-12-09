@@ -59,3 +59,125 @@ func degradedMutations() []struct {
 		}},
 		{"PatchNetworkPolicyDenyRules", func(ctx context.Context, s *NetworkPolicyServer) error {
 			_, err := s.PatchNetworkPolicyDenyRules(ctx, &pb.PatchNetworkPolicyDenyRulesRequest{
+				Tenant: "alice", Add: []*pb.NetworkPolicyDenyRule{{Cidr: "8.8.8.8/32"}},
+			})
+			return err
+		}},
+		{"DeleteNetworkPolicy", func(ctx context.Context, s *NetworkPolicyServer) error {
+			_, err := s.DeleteNetworkPolicy(ctx, &pb.DeleteNetworkPolicyRequest{Tenant: "alice"})
+			return err
+		}},
+		{"SetNetworkPolicySignature", func(ctx context.Context, s *NetworkPolicyServer) error {
+			_, err := s.SetNetworkPolicySignature(ctx, &pb.SetNetworkPolicySignatureRequest{Signature: &pb.NetworkPolicySignature{
+				Name: "sig2", Pattern: "bad", Enabled: true,
+			}})
+			return err
+		}},
+		{"DeleteNetworkPolicySignature", func(ctx context.Context, s *NetworkPolicyServer) error {
+			_, err := s.DeleteNetworkPolicySignature(ctx, &pb.DeleteNetworkPolicySignatureRequest{Name: "sig1"})
+			return err
+		}},
+	}
+}
+
+func TestNetworkPolicy_DegradedRejectsMutationsAndChangesNothing(t *testing.T) {
+	for _, m := range degradedMutations() {
+		t.Run(m.name, func(t *testing.T) {
+			s := newDegradedNPServer(t)
+			ctx := npAdminCtx()
+			err := m.call(ctx, s)
+			if status.Code(err) != codes.Unavailable {
+				t.Fatalf("code = %v (err %v), want Unavailable", status.Code(err), err)
+			}
+			if got := status.Convert(err).Message(); got != degradedMsg {
+				t.Errorf("message = %q, want %q", got, degradedMsg)
+			}
+
+			// Nothing was changed: the seeded policy and signature are intact
+			// and the would-be new ones do not exist.
+			list, lerr := s.ListNetworkPolicies(ctx, &pb.ListNetworkPoliciesRequest{})
+			if lerr != nil {
+				t.Fatalf("ListNetworkPolicies while degraded: %v", lerr)
+			}
+			if len(list.GetPolicies()) != 1 || list.GetPolicies()[0].GetTenant() != "alice" {
+				t.Errorf("policies changed: %v", list.GetPolicies())
+			}
+			if rules := list.GetPolicies()[0].GetDenyRules(); len(rules) != 1 || rules[0].GetCidr() != "9.9.9.9/32" {
+				t.Errorf("deny rules changed: %v", rules)
+			}
+			sigs, serr := s.ListNetworkPolicySignatures(ctx, &pb.ListNetworkPolicySignaturesRequest{})
+			if serr != nil {
+				t.Fatalf("ListNetworkPolicySignatures while degraded: %v", serr)
+			}
+			if len(sigs.GetSignatures()) != 1 || sigs.GetSignatures()[0].GetName() != "sig1" {
+				t.Errorf("signatures changed: %v", sigs.GetSignatures())
+			}
+		})
+	}
+}
+
+// The admin check still comes first: a non-admin caller learns nothing about
+// the store's state.
+func TestNetworkPolicy_DegradedStillChecksAuthFirst(t *testing.T) {
+	s := newDegradedNPServer(t)
+	_, err := s.SetNetworkPolicy(context.Background(), &pb.SetNetworkPolicyRequest{Policy: &pb.NetworkPolicy{Tenant: "bob"}})
+	if c := status.Code(err); c == codes.Unavailable || c == codes.OK {
+		t.Fatalf("unauthenticated caller got %v, want an auth error", c)
+	}
+}
+
+func TestNetworkPolicy_DegradedReadsStillWork(t *testing.T) {
+	s := newDegradedNPServer(t)
+	ctx := npAdminCtx()
+	got, err := s.GetNetworkPolicy(ctx, &pb.GetNetworkPolicyRequest{Tenant: "alice"})
+	if err != nil || got.GetPolicy().GetTenant() != "alice" {
+		t.Fatalf("GetNetworkPolicy while degraded: %v, %v", got, err)
+	}
+	if _, err := s.ListNetworkPolicies(ctx, &pb.ListNetworkPoliciesRequest{}); err != nil {
+		t.Fatalf("ListNetworkPolicies while degraded: %v", err)
+	}
+	if _, err := s.ListNetworkPolicySignatures(ctx, &pb.ListNetworkPolicySignaturesRequest{}); err != nil {
+		t.Fatalf("ListNetworkPolicySignatures while degraded: %v", err)
+	}
+	if _, err := s.GetNetworkPolicyStatus(ctx, &pb.GetNetworkPolicyStatusRequest{Tenant: "alice"}); err != nil {
+		t.Fatalf("GetNetworkPolicyStatus while degraded: %v", err)
+	}
+}
+
+// A server with a durable store accepts every mutation (the default, and the
+// no-Postgres configuration where the in-memory store IS the store).
+func TestNetworkPolicy_DurableAcceptsMutations(t *testing.T) {
+	for _, m := range degradedMutations() {
+		t.Run(m.name, func(t *testing.T) {
+			s := newDegradedNPServer(t)
+			s.SetDurable(true)
+			if err := m.call(npAdminCtx(), s); err != nil {
+				t.Fatalf("durable store rejected %s: %v", m.name, err)
+			}
+		})
+	}
+}
+
+func TestNetworkPolicy_NewServerIsDurable(t *testing.T) {
+	if !NewNetworkPolicyServer(NewMemNetworkPolicyStore()).Durable() {
+		t.Fatal("a new server should be durable until told otherwise")
+	}
+}
+
+// Attaching the durable store on the same live server ends the rejection: the
+// flag is read on every call, not captured at construction.
+func TestNetworkPolicy_InstallDurableStoreEndsRejectionWithoutRestart(t *testing.T) {
+	s := newDegradedNPServer(t)
+	ctx := npAdminCtx()
+	req := &pb.SetNetworkPolicyRequest{Policy: &pb.NetworkPolicy{Tenant: "bob"}}
+	if _, err := s.SetNetworkPolicy(ctx, req); status.Code(err) != codes.Unavailable {
+		t.Fatalf("before attach: code = %v, want Unavailable", status.Code(err))
+	}
+	if s.Durable() {
+		t.Fatal("degraded server reports Durable() = true")
+	}
+
+	durable := NewMemNetworkPolicyStore() // stands in for the Postgres store
+	s.InstallDurableStore(durable)
+
+	if !s.Durable() {
