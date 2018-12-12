@@ -25,3 +25,57 @@ func TestCancelPendingCreation(t *testing.T) {
 		pending *PendingCreation
 		want    bool
 	}{
+		{"in flight is claimed", &PendingCreation{Username: "alice", StartedAt: time.Now()}, true},
+		{"provisioning is claimed", &PendingCreation{Username: "alice", Provisioning: true}, true},
+		{"finished is not claimed", &PendingCreation{Username: "alice", Done: true}, false},
+		{"already cancelled is not re-claimed", &PendingCreation{Username: "alice", Cancelled: true}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := newPendingServer(c.pending)
+			if got := s.cancelPendingCreation("alice"); got != c.want {
+				t.Fatalf("cancelPendingCreation = %v, want %v", got, c.want)
+			}
+		})
+	}
+
+	t.Run("no pending creation", func(t *testing.T) {
+		if newPendingServer().cancelPendingCreation("alice") {
+			t.Fatal("claimed a creation that does not exist")
+		}
+	})
+}
+
+// TestCancelledCreationIsNotActive: a cancelled-but-still-running creation
+// must drop out of the Get/List provisioning overlay immediately. Otherwise
+// the box the caller just deleted keeps reporting CREATING for the remaining
+// minutes of a provisioning run that no longer has an instance behind it.
+func TestCancelledCreationIsNotActive(t *testing.T) {
+	cases := []struct {
+		name    string
+		pending *PendingCreation
+		want    bool
+	}{
+		{"in flight", &PendingCreation{}, true},
+		{"cancelled", &PendingCreation{Cancelled: true}, false},
+		{"done", &PendingCreation{Done: true}, false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.pending.active(); got != c.want {
+				t.Fatalf("active() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestUncancelPendingCreation: a delete that fails must not leave the creation
+// flagged — the create is still genuinely running and must keep reporting its
+// real state. Only the delete that set the flag may clear it.
+func TestUncancelPendingCreation(t *testing.T) {
+	s := newPendingServer(&PendingCreation{Username: "alice"})
+	if !s.cancelPendingCreation("alice") {
+		t.Fatal("expected to claim the in-flight creation")
+	}
+	s.uncancelPendingCreation("alice", true)
