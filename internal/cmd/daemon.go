@@ -512,3 +512,260 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		var pool *pgxpool.Pool
 		var poolErr error
 		for attempt := 1; attempt <= 5; attempt++ {
+			pool, poolErr = pgxpool.New(context.Background(), postgresConnString)
+			if poolErr != nil {
+				if attempt < 5 {
+					log.Printf("PostgreSQL config connection attempt %d/5 failed: %v (retrying in 3s)", attempt, poolErr)
+					time.Sleep(3 * time.Second)
+				}
+				continue
+			}
+			if pingErr := pool.Ping(context.Background()); pingErr != nil {
+				pool.Close()
+				pool = nil
+				poolErr = pingErr
+				if attempt < 5 {
+					log.Printf("PostgreSQL config ping attempt %d/5 failed: %v (retrying in 3s)", attempt, pingErr)
+					time.Sleep(3 * time.Second)
+				}
+				continue
+			}
+			break
+		}
+		if pool != nil {
+			cs, csErr := app.NewDaemonConfigStore(context.Background(), pool)
+			if csErr == nil {
+				daemonConfigStore = cs
+				savedConfig, loadErr := cs.GetAll(context.Background())
+				if loadErr == nil && len(savedConfig) > 0 {
+					log.Printf("Loaded daemon config from PostgreSQL (%d keys)", len(savedConfig))
+					if !cmd.Flags().Changed("base-domain") {
+						if v, ok := savedConfig["base_domain"]; ok {
+							baseDomain = v
+							log.Printf("  base-domain = %s (from DB)", v)
+						}
+					}
+					if !cmd.Flags().Changed("http-port") {
+						if v, ok := savedConfig["http_port"]; ok {
+							if parsed, err := strconv.Atoi(v); err == nil {
+								daemonHTTPPort = parsed
+								log.Printf("  http-port = %d (from DB)", parsed)
+							}
+						}
+					}
+					if !cmd.Flags().Changed("port") {
+						if v, ok := savedConfig["grpc_port"]; ok {
+							if parsed, err := strconv.Atoi(v); err == nil {
+								daemonPort = parsed
+								log.Printf("  port = %d (from DB)", parsed)
+							}
+						}
+					}
+					if !cmd.Flags().Changed("address") {
+						if v, ok := savedConfig["listen_address"]; ok {
+							daemonAddress = v
+							log.Printf("  address = %s (from DB)", v)
+						}
+					}
+					if !cmd.Flags().Changed("mtls") {
+						if v, ok := savedConfig["enable_mtls"]; ok {
+							if parsed, err := strconv.ParseBool(v); err == nil {
+								enableMTLS = parsed
+								log.Printf("  mtls = %v (from DB)", parsed)
+							}
+						}
+					}
+					if !cmd.Flags().Changed("rest") {
+						if v, ok := savedConfig["enable_rest"]; ok {
+							if parsed, err := strconv.ParseBool(v); err == nil {
+								enableREST = parsed
+								log.Printf("  rest = %v (from DB)", parsed)
+							}
+						}
+					}
+					if !cmd.Flags().Changed("app-hosting") {
+						if v, ok := savedConfig["enable_app_hosting"]; ok {
+							if parsed, err := strconv.ParseBool(v); err == nil {
+								enableAppHosting = parsed
+								log.Printf("  app-hosting = %v (from DB)", parsed)
+							}
+						}
+					}
+					if !cmd.Flags().Changed("alert-webhook-url") {
+						if v, ok := savedConfig["alert_webhook_url"]; ok && v != "" {
+							alertWebhookURL = v
+							log.Printf("  alert-webhook-url = *** (from DB)")
+						}
+					}
+					if v, ok := savedConfig["alert_webhook_secret"]; ok && v != "" {
+						alertWebhookSecret = v
+						log.Printf("  alert-webhook-secret = *** (from DB)")
+					}
+				} else if loadErr != nil {
+					log.Printf("Warning: Failed to load daemon config from DB: %v", loadErr)
+				}
+			} else {
+				log.Printf("Warning: Failed to create daemon config store: %v", csErr)
+				pool.Close()
+			}
+		} else {
+			log.Printf("Warning: Failed to connect to PostgreSQL for config after 5 attempts: %v", poolErr)
+		}
+	}
+
+	// Save recovery config to persistent storage (for disaster recovery)
+	if err := saveRecoveryConfigToPersistentStorage(networkSubnet, baseDomain, caddyAdminURL, jwtSecretFile, enableAppHosting); err != nil {
+		// Log warning but don't fail - recovery config is optional
+		log.Printf("Warning: Failed to save recovery config: %v", err)
+	}
+
+	// Load or generate JWT secret if REST is enabled
+	var finalJWTSecret string
+	var isRandomSecret bool
+	if enableREST {
+		// Priority 1: Environment variable (silent - production use)
+		if envSecret := os.Getenv(config.EnvJWTSecret); envSecret != "" {
+			finalJWTSecret = envSecret
+			log.Printf("Using JWT secret from CONTAINARIUM_JWT_SECRET environment variable")
+		} else if jwtSecretFile != "" {
+			// Priority 2: Secret file (production use)
+			secretBytes, err := os.ReadFile(jwtSecretFile)
+			if err != nil {
+				return fmt.Errorf("failed to read JWT secret file %s: %w", jwtSecretFile, err)
+			}
+			finalJWTSecret = strings.TrimSpace(string(secretBytes))
+			log.Printf("Loaded JWT secret from file: %s", jwtSecretFile)
+		} else if jwtSecret != "" {
+			// Priority 3: Command-line flag (testing use)
+			finalJWTSecret = jwtSecret
+			log.Printf("Using JWT secret from --jwt-secret flag")
+		} else {
+			// Priority 4: Generate random (development use)
+			finalJWTSecret = generateRandomSecret()
+			isRandomSecret = true
+		}
+	}
+
+	sentinelURL = resolveSentinelURL(sentinelURL, os.Getenv(config.EnvSentinelURL))
+	if w := server.SentinelConfigWarning(sentinelURL); w != "" {
+		log.Print(w)
+	}
+
+	// Create dual server config
+	config := &server.DualServerConfig{
+		GRPCAddress:         daemonAddress,
+		GRPCPort:            daemonPort,
+		EnableMTLS:          enableMTLS,
+		CertsDir:            daemonCertsDir,
+		HTTPPort:            daemonHTTPPort,
+		EnableREST:          enableREST,
+		StartupListener:     early.releaseUnlessServing(enableREST, daemonHTTPPort),
+		JWTSecret:           finalJWTSecret,
+		SwaggerDir:          swaggerDir,
+		EnableAppHosting:    enableAppHosting,
+		PostgresConnString:  postgresConnString,
+		BaseDomain:          baseDomain,
+		AnonClaimURLBase:    anonClaimURLBase,
+		AnonReminderWebhook: anonReminderWebhook,
+		AnonDoor: server.AnonDoorOptions{
+			MaxBoxes: anonMaxBoxes, KeyCreatesPer10: anonKeyCreatesPer10, KeyBurst: anonKeyBurst,
+			IPCreatesPer10: anonIPCreatesPer10, IPBurst: anonIPBurst, StatePath: anonDoorStatePath,
+		},
+		GuardrailStagingRoot:   daemonGuardrailStagingRoot,
+		GuardrailSnapshotDir:   daemonGuardrailSnapshotDir,
+		GuardrailRateLimits:    daemonGuardrailRateLimits(),
+		CaddyAdminURL:          caddyAdminURL,
+		HostIP:                 hostIPFromCIDR(networkSubnet),
+		DaemonConfigStore:      daemonConfigStore,
+		CaddyCertDir:           caddyCertDir,
+		VictoriaMetricsURL:     victoriaMetricsURL,
+		Standalone:             standaloneMode,
+		DisableSecurityScanner: disableSecurityScanner,
+		DisablePentestScanner:  disablePentestScanner,
+		DisableZapScanner:      disableZapScanner,
+		AlertWebhookURL:        alertWebhookURL,
+		AlertWebhookSecret:     alertWebhookSecret,
+		SentinelURL:            sentinelURL,
+		SSHHost:                sshHost,
+		Peers:                  peerAddrs,
+		LocalBackendID:         resolveBackendID(localBackendID),
+		Pool:                   pool,
+		Region:                 region,
+		PoolHeadroomFloors:     poolHeadroomFloors,
+		CPUOvercommitFactor:    cpuOvercommitFactor,
+		CPUOvercommitEnforce:   cpuOvercommitEnforce,
+		PlacementCPUAware:      placementCPUAware,
+		PublicHostname:         publicHostname,
+		PublicAliases:          publicAliases,
+		PublicBaseDomains:      resolvePublicBaseDomains(publicBaseDomains, baseDomain),
+		PublicPort:             publicPort,
+		ProxyProtocol:          proxyProtocol,
+		ProxyProtocolTrusted:   proxyProtocolTrusted,
+		ClientIPHeaders:        clientIPHeaders,
+		TrustedProxyCIDRs:      trustedProxyCIDRs,
+		OTelDropLabels:         otelDropLabels,
+		Runtime:                runtime,
+		ZFSTenantRoot:          zfsTenantRoot,
+		ZFSKeysDir:             zfsKeysDir,
+		RunJournalRetention:    runJournalRetention,
+		RunCheckoutMaxAge:      runCheckoutMaxAge,
+		SSHAuthzMaxKeyAge:      sshAuthzMaxKeyAge,
+		SSHAuthzKeysCommand:    sshAuthzKeysCommand,
+	}
+
+	// Create dual server
+	dualServer, err := server.NewDualServer(config)
+	if err != nil {
+		return fmt.Errorf("failed to create server: %w", err)
+	}
+
+	// Setup graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Println("\nReceived shutdown signal")
+		cancel()
+	}()
+
+	// Start servers
+	log.Printf("Containarium daemon starting...")
+	log.Printf("  gRPC: %s:%d", daemonAddress, daemonPort)
+	if enableMTLS {
+		log.Printf("  gRPC authentication: mTLS (certificate-based)")
+	} else {
+		log.Printf("  gRPC authentication: INSECURE (no authentication)")
+	}
+	if enableREST {
+		log.Printf("  HTTP/REST: %s:%d", daemonAddress, daemonHTTPPort)
+		log.Printf("  REST authentication: Bearer tokens (JWT)")
+		log.Printf("  Swagger UI: http://localhost:%d/swagger-ui/", daemonHTTPPort)
+		log.Printf("  OpenAPI spec: http://localhost:%d/swagger.json", daemonHTTPPort)
+
+		// If using random secret, print it prominently for easy token generation
+		if isRandomSecret {
+			log.Printf("")
+			log.Printf("═══════════════════════════════════════════════════════════════")
+			log.Printf("  🔐 JWT Secret (Auto-Generated)")
+			log.Printf("═══════════════════════════════════════════════════════════════")
+			log.Printf("")
+			log.Printf("  %s", finalJWTSecret)
+			log.Printf("")
+			log.Printf("⚠️  This secret is random and temporary!")
+			log.Printf("   • Tokens will be invalid after daemon restart")
+			log.Printf("   • For production, use one of these methods:")
+			log.Printf("     - Environment: export CONTAINARIUM_JWT_SECRET='your-secret'")
+			log.Printf("     - File: --jwt-secret-file /etc/containarium/jwt.secret")
+			log.Printf("     - Flag: --jwt-secret 'your-secret'")
+			log.Printf("")
+			log.Printf("Generate a token:")
+			log.Printf("  containarium token generate --username admin --secret '%s'", finalJWTSecret)
+			log.Printf("")
+			log.Printf("═══════════════════════════════════════════════════════════════")
+			log.Printf("")
+		}
+	}
