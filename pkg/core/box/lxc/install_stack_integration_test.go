@@ -57,3 +57,23 @@ func TestIntegrationIncus_InstallStackUpdatesStoredStack(t *testing.T) {
 			t.Fatalf("ListContainers: %v", err)
 		}
 		found := false
+		for _, c := range all {
+			if c.Name == instance {
+				found, viaList = true, c.Stack
+			}
+		}
+		if !found {
+			t.Fatalf("ListContainers did not return %s", instance)
+		}
+		return info.Stack, viaList
+	}
+	expect := func(t *testing.T, want string) {
+		t.Helper()
+		g, l := stackOf(t)
+		if g != want {
+			t.Errorf("GetContainer.Stack = %q, want %q", g, want)
+		}
+		if l != want {
+			t.Errorf("ListContainers.Stack = %q, want %q", l, want)
+		}
+	}
