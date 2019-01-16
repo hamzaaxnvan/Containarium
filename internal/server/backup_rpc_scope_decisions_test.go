@@ -145,3 +145,52 @@ func TestBackupRPCScopeDecisions_Enforced(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBackupRPCScopeDecisions_VerifyScopeRefusedOnWriteRPCs is the reason
+// backups:verify exists: a token holding it (and backups:read) can verify its
+// own tenant's backups but is refused every RPC that creates, restores,
+// deletes or prunes. Granting it any of those RPCs makes this test fail.
+func TestBackupRPCScopeDecisions_VerifyScopeRefusedOnWriteRPCs(t *testing.T) {
+	_, bs := verifierServer(t)
+	ctx := verifierCtx("alice")
+	for _, name := range []string{"CreateBackup", "CreateBackup/BOX", "RestoreBackup", "DeleteBackup", "PruneBackups"} {
+		t.Run(name+" refused", func(t *testing.T) {
+			if c := status.Code(callBackupRPC(ctx, bs, name)); c != codes.PermissionDenied {
+				t.Fatalf("verify-only token on %s: code = %v, want PermissionDenied", name, c)
+			}
+		})
+	}
+	for _, name := range []string{"ListBackups", "GetBackup", "VerifyBackup"} {
+		t.Run(name+" allowed", func(t *testing.T) {
+			if c := status.Code(callBackupRPC(ctx, bs, name)); c == codes.PermissionDenied || c == codes.Unauthenticated {
+				t.Fatalf("verify-only token on %s: code = %v, want it to pass the scope gate", name, c)
+			}
+		})
+	}
+}
+
+// The v0.120.1 deprecation window has ended (#3219). A write-only token is
+// refused with re-mint instructions; the ordinary wildcard, unscoped-token
+// and strict-mode rules are unchanged.
+func TestBackupRPCScopeDecisions_VerifyRequiresVerifyScope(t *testing.T) {
+	prevStrict := auth.StrictScopesEnabled()
+	t.Cleanup(func() { auth.SetStrictScopes(prevStrict) })
+	for _, tc := range []struct {
+		name   string
+		scopes []string // nil = a token with no scopes claim
+		strict bool
+		want   codes.Code
+	}{
+		{"legacy write only", []string{auth.ScopeBackupsWrite}, false, codes.PermissionDenied},
+		{"legacy read and write", []string{auth.ScopeBackupsRead, auth.ScopeBackupsWrite}, false, codes.PermissionDenied},
+		{"read only", []string{auth.ScopeBackupsRead}, false, codes.PermissionDenied},
+		{"empty scopes", []string{}, false, codes.PermissionDenied},
+		{"verify only", []string{auth.ScopeBackupsVerify}, false, codes.OK},
+		{"read and verify", []string{auth.ScopeBackupsRead, auth.ScopeBackupsVerify}, false, codes.OK},
+		{"both scopes", []string{auth.ScopeBackupsWrite, auth.ScopeBackupsVerify}, false, codes.OK},
+		{"wildcard", []string{auth.ScopeWildcard}, false, codes.OK},
+		{"no scopes claim", nil, false, codes.OK},
+		{"no scopes claim strict", nil, true, codes.PermissionDenied},
+		{"verify strict", []string{auth.ScopeBackupsVerify}, true, codes.OK},
+	} {
