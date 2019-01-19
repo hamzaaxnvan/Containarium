@@ -1,0 +1,172 @@
+package sentinel
+
+import (
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/footprintai/containarium/internal/auth"
+	"github.com/footprintai/containarium/internal/config"
+	"github.com/footprintai/containarium/pkg/version"
+)
+
+// defaultBinaryPath is what this sentinel serves to backends over
+// /sentinel/fetch-release. #1779: flipped to containariumd for release N —
+// see selfupdate.go's releaseBinaryName for the matching fetch-side rename.
+const defaultBinaryPath = "/usr/local/bin/containariumd"
+
+// StatusJSON is the JSON response for the /status endpoint.
+type StatusJSON struct {
+	State          string `json:"state"`
+	SpotIP         string `json:"spot_ip"`
+	PreemptCount   int    `json:"preempt_count"`
+	OutageDuration string `json:"outage_duration,omitempty"`
+	LastPreemption string `json:"last_preemption,omitempty"`
+	CertSyncCount  int    `json:"cert_sync_count"`
+	CertLastSync   string `json:"cert_last_sync,omitempty"`
+	CertSyncError  string `json:"cert_sync_error,omitempty"`
+	// SentinelAuthMisconfigured is true when CONTAINARIUM_SENTINEL_AUTH_SECRET
+	// is unset or shorter than the minimum, which silently 401s every
+	// keysync/certsync against the daemons. Surfaced here (in addition
+	// to the startup + per-cycle log lines) so monitoring can alert on
+	// it without scraping logs — alert on this being true. #341.
+	SentinelAuthMisconfigured bool   `json:"sentinel_auth_misconfigured"`
+	SentinelAuthDetail        string `json:"sentinel_auth_detail,omitempty"`
+	// PrimaryAuthCounts is how many primaries are in each daemon-AUTH state
+	// (#2892). Counts only: this endpoint is unauthenticated, so it never
+	// names a pool; the per-pool detail is on the ADMIN-secret-gated
+	// /sentinel/primary-auth-health (#3004). Never secret-derived.
+	PrimaryAuthCounts PrimaryAuthCountsJSON `json:"primary_auth_counts"`
+	// UnattributedAuthFailures counts daemon-AUTH 401s that could not be
+	// tied to exactly one primary by source address (scanners, a daemon
+	// that never authenticated, several primaries behind one address).
+	UnattributedAuthFailures    uint64 `json:"unattributed_auth_failures"`
+	LastUnattributedAuthFailure string `json:"last_unattributed_auth_failure,omitempty"`
+}
+
+// buildBinaryServerMux registers every binary-server route on a fresh
+// mux. Split out of StartBinaryServer so tests can exercise the REAL
+// route table — in particular which middleware each route is registered
+// behind (#1102). A test that builds its own mux proves only that the
+// handler works when someone remembers to gate it, which is exactly the
+// mistake being fixed here.
+func buildBinaryServerMux(binaryPath string, manager *Manager) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/containarium", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", "attachment; filename=containarium")
+		http.ServeFile(w, r, binaryPath)
+	})
+	mux.HandleFunc("/containarium/checksum", func(w http.ResponseWriter, r *http.Request) {
+		f, err := os.Open(binaryPath)
+		if err != nil {
+			http.Error(w, "binary not found", http.StatusInternalServerError)
+			return
+		}
+		defer func() { _ = f.Close() }()
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			http.Error(w, "checksum error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, hex.EncodeToString(h.Sum(nil)))
+	})
+	// Served-binary version (#2171) — what a daemon's sentinel-path upgrade
+	// would install. Unauthenticated like /containarium/checksum: the binary
+	// itself is public at /containarium, so its version string is too.
+	mux.HandleFunc("/containarium/version", newServedVersionCache().handler(binaryPath))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	// Version endpoint (#354) — lets the webui's Versions panel show the
+	// sentinel's running version alongside each backend's (from the
+	// daemon's /v1/backends) and the latest GitHub release (from the
+	// daemon's /v1/releases/latest). Unauthenticated: it reveals only the
+	// build version, the same as the binary the sentinel already serves at
+	// /containarium for peers to pull.
+	mux.HandleFunc("/sentinel/version", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(version.Get())
+	})
+
+	// Peers endpoint — for daemon multi-backend discovery
+	mux.HandleFunc("/sentinel/peers", manager.PeersHandler())
+
+	// Primaries endpoints — populated by daemon self-registration, gated by
+	// the same sentinel HMAC secret as /sentinel/certs and
+	// /sentinel/keys/resync below. Left unauthenticated until now (tracked
+	// as a known gap in docs/MULTI-POOL.md) — a caller with no credential
+	// at all could otherwise read the full primary registry, overwrite any
+	// pool's declared routing target, or delete it outright.
+	// One handler covers both /sentinel/primaries and /sentinel/primaries/{pool}.
+	// daemonAuthGate is SentinelHMACMiddleware over the same secret, plus
+	// per-primary auth-health recording for /status (#2892).
+	mux.Handle("/sentinel/primaries", manager.daemonAuthGate(manager.PrimariesHandler()))
+	mux.Handle("/sentinel/primaries/", manager.daemonAuthGate(manager.PrimariesHandler()))
+
+	// Per-pool auth health (#3004): names pools, so it sits behind the ADMIN
+	// secret, which daemons do not hold (the daemon AUTH secret cannot read the
+	// pool inventory). Deliberately NOT daemonAuthGate (see
+	// primaryAuthHealthHandler).
+	mux.Handle(primaryAuthHealthPath, auth.SentinelHMACMiddleware(manager.adminSecret, manager.primaryAuthHealthHandler()))
+
+	// Phase 0.5: peer-CA distribution + leaf-cert issuance. Both
+	// gated by the existing HMAC middleware — the same secret that
+	// guards /authorized-keys and /certs. 503 when no CA is wired up
+	// (rollout mode), so daemons can detect the sentinel's
+	// capability without a separate feature flag.
+	mux.Handle("/sentinel/ca", manager.daemonAuthGate(manager.CAHandler()))
+	mux.Handle("/sentinel/peer-cert", manager.daemonAuthGate(manager.PeerCertHandler()))
+	mux.Handle("/sentinel/fetch-release", manager.daemonAuthGate(fetchReleaseHandler(binaryPath)))
+
+	// Event-driven SSH key resync — a daemon calls this the moment its
+	// host-side authorized_keys set changes, so a freshly created box is
+	// SSH-reachable immediately instead of waiting up to a full keysync
+	// tick (cloud #971). Gated by the same daemon HMAC secret that
+	// authenticates the sentinel's own /authorized-keys pull; it triggers
+	// that pull rather than accepting key material, so it grants no
+	// authority the caller doesn't already have.
+	mux.Handle("/sentinel/keys/resync", manager.daemonAuthGate(manager.KeyResyncHandler()))
+
+	// Runtime tunnel-token registration — gated by the separate
+	// admin secret (CONTAINARIUM_SENTINEL_ADMIN_SECRET), not the
+	// cluster-wide daemon HMAC secret. See TunnelTokenRegisterHandler.
+	mux.Handle("/sentinel/tunnel-tokens", auth.SentinelHMACMiddleware(manager.adminSecret, manager.TunnelTokenRegisterHandler()))
+	// Its inverse (cloud#999 step 4) — a distinct method pattern on the
+	// SAME path (Go 1.22+ ServeMux: a method-specific pattern is more
+	// specific than a bare one and both may be registered), so DELETE
+	// routes here while every other method still reaches the register
+	// handler's own method check above. See TunnelTokenDeregisterHandler.
+	mux.Handle("DELETE /sentinel/tunnel-tokens", auth.SentinelHMACMiddleware(manager.adminSecret, manager.TunnelTokenDeregisterHandler()))
+
+	// Per-backend audit-ingest tokens for the SSH session shipper (#2415).
+	// Admin-secret gated like tunnel-token registration: letting the
+	// sentinel append to a backend's audit chain is an authority decision.
+	mux.Handle("/sentinel/audit-ingest-tokens", auth.SentinelHMACMiddleware(manager.adminSecret, manager.AuditIngestTokenRegisterHandler()))
+	mux.Handle("DELETE /sentinel/audit-ingest-tokens", auth.SentinelHMACMiddleware(manager.adminSecret, manager.AuditIngestTokenDeregisterHandler()))
+
+	// Cloud pushes the authoritative BYOC public-ingress bindings
+	// (subdomain → tunnel host) here. Gated by the admin secret (an
+	// authority decision, like tunnel-token registration) — never the
+	// cluster-wide daemon secret. See #733.
+	mux.Handle("/sentinel/byoc-routes", auth.SentinelHMACMiddleware(manager.adminSecret, manager.BYOCRouteRegisterHandler()))
+
+	// fail2ban admin endpoints (#1962) — inspect and clear SSH
+	// brute-force bans remotely; previously only reachable via shell
+	// access to the sentinel's admin sshd on :2222. Gated by the admin
+	// secret, same tier as /sentinel/tunnel-tokens and
+	// /sentinel/byoc-routes above: this reveals and mutates the
+	// sentinel's ban state, not something every cluster daemon's shared
+	// HMAC secret should unlock.
+	mux.Handle("/sentinel/fail2ban/bans", auth.SentinelHMACMiddleware(manager.adminSecret, manager.Fail2BanBansHandler()))
