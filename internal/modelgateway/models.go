@@ -79,3 +79,30 @@ func (g *Gateway) ListModels(ctx context.Context, keyOwner, provider string) ([]
 	p, ok := g.cfg.Providers[provider]
 	if !ok || p == nil {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownProvider, provider)
+	}
+	if !p.openAIShaped {
+		return nil, fmt.Errorf("%w: %s", ErrModelListUnsupported, provider)
+	}
+	key, ok := g.resolveKey(ctx, &GatewayClaims{KeyOwner: keyOwner}, provider)
+	if !ok || key == "" {
+		return nil, fmt.Errorf("%w: key_owner=%s provider=%s", ErrNoKey, keyOwner, provider)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, modelListTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.UpstreamURL+"/v1/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	// Same injection the proxy path uses, so the real key is set and any inbound
+	// gateway credential is stripped in one place rather than two.
+	p.inject(req.Header, key)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("modelgateway: %s model list: %w", provider, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+

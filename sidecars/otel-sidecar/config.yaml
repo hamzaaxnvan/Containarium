@@ -1,0 +1,12 @@
+# containarium-otel-sidecar collector config
+#
+# Per docs/OTEL-AGENT-RELAY-DESIGN.md. The resource processor stamps
+# platform-controlled identity attributes (container.id, backend.id)
+# from the CONTAINARIUM_* env vars Containarium puts on the LXC. The
+# entrypoint script validates those env vars before this config is
+# loaded.
+#
+# OTLP/HTTP + OTLP/gRPC receivers because some SDKs default to gRPC
+# (decision O2).
+receivers:
+  otlp:
