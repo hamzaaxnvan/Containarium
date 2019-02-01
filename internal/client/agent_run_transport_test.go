@@ -81,3 +81,44 @@ func startGRPCAgentServer(t *testing.T, fake *fakeAgentSkillServer) *GRPCClient 
 // (internal/gateway/gateway.go): unknown request fields are rejected, so a
 // misspelled key fails here instead of being silently dropped, and errors
 // come back as {"error": ..., "code": ...} like customErrorHandler writes.
+func startGatewayAgentServer(t *testing.T, fake *fakeAgentSkillServer) *HTTPClient {
+	t.Helper()
+	mux := runtime.NewServeMux(
+		runtime.WithErrorHandler(func(_ context.Context, _ *runtime.ServeMux, _ runtime.Marshaler, w http.ResponseWriter, _ *http.Request, err error) {
+			code := runtime.HTTPStatusFromCode(status.Code(err))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error(), "code": code})
+		}),
+		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{
+			MarshalOptions:   protojson.MarshalOptions{EmitUnpopulated: true},
+			UnmarshalOptions: protojson.UnmarshalOptions{DiscardUnknown: false},
+		}),
+	)
+	if err := pb.RegisterAgentSkillServiceHandlerServer(context.Background(), mux, fake); err != nil {
+		t.Fatalf("register gateway handler: %v", err)
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c, err := NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	return c
+}
+
+// agentRunner is the method under test, shared by both clients.
+type agentRunner interface {
+	RunAgentSkill(skillID, backendID, pool, inputJSON, gitSource, gitRef, gitCredential, trackerConnection string, engine pb.AgentEngine) (*pb.RunAgentSkillResponse, error)
+}
+
+// runAgentSkill calls c with req's fields in RunAgentSkill's positional order.
+func runAgentSkill(c agentRunner, req *pb.RunAgentSkillRequest) (*pb.RunAgentSkillResponse, error) {
+	return c.RunAgentSkill(req.GetSkillId(), req.GetBackendId(), req.GetPool(), req.GetInputJson(),
+		req.GetGitSource(), req.GetGitRef(), req.GetGitCredential(), req.GetTrackerConnection(), req.GetEngine())
+}
+
+var agentRunTransports = []struct {
+	name  string
+	start func(*testing.T, *fakeAgentSkillServer) agentRunner
