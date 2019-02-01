@@ -116,3 +116,62 @@ func (m memKV) Set(_ context.Context, key, value string) error {
 // AC2: thresholds persist in the config store as protojson and survive a
 // restart (a fresh config over the same store).
 func TestMiningThresholdsConfig_PersistsAcrossRestart(t *testing.T) {
+	kv := memKV{}
+	c, err := NewMiningThresholdsConfig(context.Background(), kv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Set(context.Background(), &pb.MiningBehaviorThresholds{MinCores: 3, FlowMinAge: durationpb.New(time.Minute), StratumPorts: []uint32{3333, 9999}}); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := kv[MiningThresholdsConfigKey]
+	if !ok {
+		t.Fatalf("nothing stored under %q", MiningThresholdsConfigKey)
+	}
+	var decoded pb.MiningBehaviorThresholds
+	if err := protojson.Unmarshal([]byte(raw), &decoded); err != nil {
+		t.Fatalf("stored value is not protojson: %v (%q)", err, raw)
+	}
+	reloaded, err := NewMiningThresholdsConfig(context.Background(), kv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reloaded.Effective()
+	if got.MinCores != 3 || got.FlowMinAge != time.Minute || !slices.Equal(got.StratumPorts, []uint32{3333, 9999}) {
+		t.Fatalf("reloaded Effective = %+v", got)
+	}
+}
+
+// A window shorter than flow_min_age (explicit or defaulted) is rejected.
+func TestMiningThresholdsConfig_RejectsWindowShorterThanFlowMinAge(t *testing.T) {
+	c, err := NewMiningThresholdsConfig(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []*pb.MiningBehaviorThresholds{
+		{Window: durationpb.New(2 * time.Minute), FlowMinAge: durationpb.New(3 * time.Minute)},
+		{Window: durationpb.New(2 * time.Minute)},      // default flow_min_age 3m
+		{FlowMinAge: durationpb.New(10 * time.Minute)}, // default window 5m
+	} {
+		if err := c.Set(context.Background(), m); err == nil {
+			t.Errorf("Set(%v) = nil error, want rejection", m)
+		}
+	}
+	if err := c.Set(context.Background(), &pb.MiningBehaviorThresholds{Window: durationpb.New(3 * time.Minute), FlowMinAge: durationpb.New(3 * time.Minute)}); err != nil {
+		t.Errorf("window == flow_min_age rejected: %v", err)
+	}
+}
+
+// A window shorter than MinMiningWindow can never be satisfied either: the
+// sweep keeps samples newer than now-window, so at the 30 s tick the oldest
+// retained sample is at most window-30 s old, below the 0.8 x window
+// coverage the rule demands once 0.2 x window < 30 s (window < 150 s). The
+// threshold is accepted by the CLI otherwise and the rule silently never
+// fires (#2674).
+func TestMiningThresholdsConfig_RejectsWindowBelowMin(t *testing.T) {
+	c, err := NewMiningThresholdsConfig(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Set(context.Background(), &pb.MiningBehaviorThresholds{Window: durationpb.New(MinMiningWindow), FlowMinAge: durationpb.New(MinMiningWindow)}); err != nil {
+		t.Errorf("window == MinMiningWindow rejected: %v", err)
