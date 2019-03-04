@@ -146,3 +146,151 @@ func TestSSHHTTPClient_ListSSHKeys_GatewayJSON(t *testing.T) {
 			if len(keys) != 2 {
 				t.Fatalf("got %d keys, want 2", len(keys))
 			}
+			key := keys[0]
+			if key.Name != "laptop" || key.PublicKey != "ssh-ed25519 example" || key.Fingerprint != "SHA256:example" ||
+				key.CreatedAt.Format(time.RFC3339) != "2026-10-01T00:00:00Z" ||
+				key.ExpiresAt.Format(time.RFC3339) != "2026-11-01T00:00:00Z" ||
+				key.RetiredAt == nil || key.RetiredAt.Format(time.RFC3339) != "2026-10-20T00:00:00Z" {
+				t.Fatalf("gateway fields were not decoded: %+v", key)
+			}
+			if keys[1].RetiredAt != nil {
+				t.Fatal("null retirement timestamp must remain unset")
+			}
+		})
+	}
+}
+
+// --- validators ---------------------------------------------------------
+
+func TestValidateKeyName(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{"plain", "alice", false},
+		{"with at", "alice@laptop", false},
+		{"with dash and underscore", "alice-mbp_2024", false},
+		{"with dot", "alice.work", false},
+		{"empty", "", true},
+		{"whitespace only", "   ", true},
+		{"too long", strings.Repeat("a", 65), true},
+		{"path-traversal attempt", "../etc/passwd", true},
+		{"slash", "alice/bob", true},
+		{"space", "alice laptop", true},
+		{"quote", `alice"laptop`, true},
+		{"semicolon", "alice;rm", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateKeyName(tc.in)
+			if tc.wantErr && err == nil {
+				t.Errorf("validateKeyName(%q) = nil, want error", tc.in)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("validateKeyName(%q) = %v, want nil", tc.in, err)
+			}
+		})
+	}
+}
+
+func TestValidateBoxName(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{"plain", "alice", false},
+		{"with dash", "ci-bob-pr123", false},
+		{"empty", "", true},
+		{"uppercase", "Alice", true},
+		{"at sign", "alice@laptop", true},
+		{"dot", "alice.laptop", true},
+		{"too long", strings.Repeat("a", 33), true},
+		{"slash", "alice/bob", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateBoxName(tc.in)
+			if tc.wantErr && err == nil {
+				t.Errorf("validateBoxName(%q) = nil, want error", tc.in)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("validateBoxName(%q) = %v, want nil", tc.in, err)
+			}
+		})
+	}
+}
+
+// --- pickSSHServer -----------------------------------------------------
+
+func TestPickSSHServer_ExplicitWins(t *testing.T) {
+	home := withSSHHome(t)
+	seedTokenFor(t, home, "https://cloud.containarium.dev", "t")
+	got := pickSSHServer("https://explicit.example.com/")
+	if got != "https://explicit.example.com" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPickSSHServer_DefaultsToCredentials(t *testing.T) {
+	home := withSSHHome(t)
+	seedTokenFor(t, home, "https://self-hosted.example.com", "t")
+	got := pickSSHServer("")
+	if got != "https://self-hosted.example.com" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPickSSHServer_FallsBackToConstant(t *testing.T) {
+	withSSHHome(t)
+	got := pickSSHServer("")
+	if got != defaultLoginServer {
+		t.Fatalf("got %q, want %q", got, defaultLoginServer)
+	}
+}
+
+// --- newSSHHTTPClient ---------------------------------------------------
+
+func TestNewSSHHTTPClient_RequiresToken(t *testing.T) {
+	withSSHHome(t)
+	_, err := newSSHHTTPClient("https://no-token.example.com")
+	if err == nil || !strings.Contains(err.Error(), "no auth token") {
+		t.Fatalf("err = %v, want no-auth-token error", err)
+	}
+}
+
+func TestNewSSHHTTPClient_LoadsTokenFromCreds(t *testing.T) {
+	home := withSSHHome(t)
+	seedTokenFor(t, home, "https://cloud.example.com", "tok-xyz")
+	c, err := newSSHHTTPClient("https://cloud.example.com")
+	if err != nil {
+		t.Fatalf("newSSHHTTPClient: %v", err)
+	}
+	if c.token != "tok-xyz" {
+		t.Errorf("token fingerprint = %s, want %s", tokenFingerprint(c.token), tokenFingerprint("tok-xyz"))
+	}
+}
+
+// --- runSSHSetup --------------------------------------------------------
+
+func TestSSHSetup_HappyPath_GeneratesAndUploads(t *testing.T) {
+	home := withSSHHome(t)
+	f := newFakeSSHKeysServer(t)
+	f.wireAdd()
+	seedTokenFor(t, home, f.srv.URL, "tok")
+
+	sshSetupServer = f.srv.URL
+	sshSetupName = "alice-laptop"
+
+	var out bytes.Buffer
+	sshSetupCmd.SetOut(&out)
+	sshSetupCmd.SetErr(&out)
+	if err := runSSHSetup(sshSetupCmd, nil); err != nil {
+		t.Fatalf("runSSHSetup: %v", err)
+	}
+
+	if len(f.added) != 1 {
+		t.Fatalf("added = %+v, want 1 entry", f.added)
+	}
+	if f.added[0].Name != "alice-laptop" {

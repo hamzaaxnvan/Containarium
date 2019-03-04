@@ -152,3 +152,55 @@ func runWithLevel(t *testing.T, level, engineJSON string) policyRun {
 			return "", nil
 		},
 		boxRunStartExec: func(box, username, script string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			r.userCalls = append(r.userCalls, script)
+			switch {
+			case script == boxRunHomeAndConfigScript():
+				return "/srv/alice\n" + engineJSON, nil
+			case script == signInProbeScript(t):
+				return "interactive\n", nil
+			case strings.Contains(script, "setsid"):
+				return "4242 boot-1\n", nil
+			}
+			return "", nil
+		},
+	}
+	_, r.err = s.StartBoxRun(adminCtx(), &pb.StartBoxRunRequest{Username: "alice", Prompt: "do it"})
+	return r
+}
+
+const claudeCfg = `{"version":1,"engine":"claude","credential":"secret","provider":"anthropic"}`
+
+func spawnScriptOf(r policyRun) string {
+	for _, c := range r.userCalls {
+		if strings.Contains(c, "setsid") {
+			return c
+		}
+	}
+	return ""
+}
+
+func TestStartBoxRun_PolicyFlagsAndSudoGrantFollowTheLevel(t *testing.T) {
+	// No level: today's command, no flags, nothing to do with sudo.
+	legacy := runWithLevel(t, "", claudeCfg)
+	if legacy.err != nil {
+		t.Fatal(legacy.err)
+	}
+	if sp := spawnScriptOf(legacy); strings.Contains(sp, "--restricted") || strings.Contains(sp, "--allowedTools") {
+		t.Errorf("a box with no level must keep its command unchanged:\n%s", sp)
+	}
+	for _, c := range legacy.rootCalls {
+		if strings.Contains(c, "sudoers") {
+			t.Errorf("a box with no level must not touch sudoers:\n%s", c)
+		}
+	}
+
+	for _, tc := range []struct {
+		level     string
+		wantSudo  bool
+		wantBuild bool
+	}{{"none", false, false}, {"build_tools", false, true}, {"full_sudo", true, true}} {
+		t.Run(tc.level, func(t *testing.T) {
+			r := runWithLevel(t, tc.level, claudeCfg)
+			if r.err != nil {

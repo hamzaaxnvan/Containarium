@@ -34,3 +34,21 @@ var (
 func recordPersistFailure() {
 	persistFailures.Add(1)
 	firstFailureAt.CompareAndSwap(0, time.Now().UnixNano())
+}
+
+// PersistFailureReport is what GetPersistFailureReport returns.
+type PersistFailureReport struct {
+	// Count is the number of audit entries this process has failed to
+	// durably write since startup (or since ResetPersistFailuresForTest).
+	Count int64
+	// Since is when the first failure was recorded. Zero if Count == 0.
+	Since time.Time
+}
+
+// GetPersistFailureReport reports this process's audit persistence
+// failures since startup. Exposed to operators via GET /v1/audit/health
+// (admin role or audit:read scope, same gate as /v1/audit/logs).
+func GetPersistFailureReport() PersistFailureReport {
+	count := persistFailures.Load()
+	var since time.Time
+	if ns := firstFailureAt.Load(); ns != 0 {
