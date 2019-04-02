@@ -95,36 +95,3 @@ func (s Spec) image() string {
 // from name+pool so it's stable and human-readable in `backends list`.
 func (s Spec) SpotID() string {
 	return s.Name + "-" + s.Pool
-}
-
-// launchArgs builds `incus launch <image> <name> --vm -c limits.cpu=N
-// -c limits.memory=X [--device root,size=<disk>]`.
-func launchArgs(s Spec) []string {
-	args := []string{
-		"launch", s.image(), s.Name, "--vm",
-		"-c", "limits.cpu=" + strconv.Itoa(s.CPU),
-		"-c", "limits.memory=" + s.Memory,
-	}
-	if s.Disk != "" {
-		args = append(args, "--device", "root,size="+s.Disk)
-	}
-	return args
-}
-
-// gpuDeviceArgs builds `incus config device add <name> gpu0 gpu pci=<addr>`.
-func gpuDeviceArgs(name, pci string) []string {
-	return []string{"config", "device", "add", name, gpuDeviceName, "gpu", "pci=" + pci}
-}
-
-func destroyArgs(name string) []string { return []string{"delete", "-f", name} }
-
-// listArgs lists only VMs. Note: `--vm` is a `launch`/`init` flag, NOT a
-// `list` flag — VM filtering on `list` uses the positional `type=` filter.
-func listArgs() []string {
-	return []string{"list", "type=virtual-machine", "--format", "csv", "-c", "ns"}
-}
-
-// RenderBootstrap produces the in-guest bootstrap script — the
-// setup-peer.sh-equivalent run inside the VM on first provision. It does
-// NOT contain the tunnel token (delivered separately as a file at
-// tokenPath); the script reads it from there. Pure function for testing.
