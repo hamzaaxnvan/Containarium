@@ -1,0 +1,193 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// Phase 1.2 follow-up — admin-facing API to invalidate a JWT
+// by its jti claim. Pairs with the revocation list landed in
+// PR #248: the list is the kill-switch, this RPC + the
+// `containarium token revoke` CLI verb is how operators pull
+// the switch.
+
+// RevokeTokenRequest names a token to invalidate.
+message RevokeTokenRequest {
+  // The `jti` claim of the token to revoke. Required.
+  // Operators get the jti either from the audit trail
+  // (every authenticated request logs its jti) or by
+  // decoding the token they want to kill.
+  string jti = 1;
+
+  // Optional free-form reason recorded in the revocation
+  // table for forensics. Examples: "user_logout",
+  // "compromise_2026_05_20", "operator_revoke".
+  string reason = 2;
+
+  // Optional expiry hint — when the token's exp claim is.
+  // Used as the cleanup horizon for the row. If omitted,
+  // the daemon falls back to the configured max token
+  // lifetime so the row eventually prunes itself.
+  string expires_at = 3;
+}
+
+message RevokeTokenResponse {
+  // True when a new revocation row was inserted; false when
+  // the jti was already revoked (idempotent — the existing
+  // revocation reason is preserved).
+  bool newly_revoked = 1;
+
+  // Human-readable confirmation, intended for CLI output.
+  string message = 2;
+}
+
+// Phase 1.6 part B — exchange a refresh token for a new
+// (access, refresh) pair. Rotates the refresh token:
+// the prior jti is revoked on success, so each refresh
+// token is single-use. Replay = denied + audit signal.
+message RefreshTokenRequest {
+  // The current refresh token. Must validate via
+  // ValidateRefreshToken (signature + iss + aud + exp +
+  // tt == "refresh") AND not be in the revocation list.
+  string refresh_token = 1;
+}
+
+message RefreshTokenResponse {
+  // New short-lived access token, ready to use as
+  // Authorization: Bearer.
+  string access_token = 1;
+
+  // New refresh token. Save this — the one you just sent
+  // in is now revoked and cannot be exchanged again.
+  string refresh_token = 2;
+
+  // Unix-seconds expiry of the access token, for clients
+  // that want to refresh proactively before exp.
+  int64 access_token_expires_at = 3;
+
+  // Unix-seconds expiry of the refresh token.
+  int64 refresh_token_expires_at = 4;
+}
+
+// Revocation is one row of the revocation list, surfaced
+// by the admin listing path. The plaintext token itself is
+// not in the table — only the jti is.
+message Revocation {
+  // The jti claim of the revoked token.
+  string jti = 1;
+
+  // RFC3339 timestamp of the token's original `exp` claim.
+  // Used as the cleanup horizon (rows past this can no
+  // longer authenticate anyway, so the daemon prunes
+  // them eventually).
+  string expires_at = 2;
+
+  // RFC3339 timestamp of when the revocation row was
+  // first inserted. Operators correlating an incident
+  // window use this column.
+  string revoked_at = 3;
+
+  // Free-form reason recorded at revoke time (e.g.
+  // "operator_revoke", "refresh_rotation", "leak_2026_X").
+  string reason = 4;
+}
+
+message ListRevokedTokensRequest {
+  // Max rows to return. 0 → 100 default. Server caps at
+  // 1000.
+  int32 limit = 1;
+
+  // When true, include rows whose expires_at has already
+  // passed (default false — most operators only care
+  // about active revocations).
+  bool include_expired = 2;
+
+  // Narrow by jti prefix. Empty disables. Useful when an
+  // operator only remembers part of a leaked jti.
+  string jti_prefix = 3;
+}
+
+message ListRevokedTokensResponse {
+  repeated Revocation revocations = 1;
+}
+
+// GetUnscopedTokenReportRequest takes no parameters — the report always
+// covers the daemon's whole in-process measurement window (see the response
+// fields), not an operator-chosen range.
+message GetUnscopedTokenReportRequest {}
+
+// GetUnscopedTokenReportResponse answers "how many recent calls used an
+// unscoped token" — the measurement #1679's strict-mode rollout depends on:
+// an operator should be able to see the blast radius BEFORE arming
+// CONTAINARIUM_STRICT_SCOPES, not discover it from a wave of denials after.
+message GetUnscopedTokenReportResponse {
+  // Number of RequireScope calls, since since_ (or 0 if none observed yet),
+  // whose token carried no `scopes` claim at all — the population strict
+  // mode would start rejecting.
+  int64 unscoped_call_count = 1;
+
+  // RFC3339 timestamp of the first such call observed. Empty if
+  // unscoped_call_count is 0. This is an in-process measurement with no
+  // persistence layer — it resets on daemon restart, so it always answers
+  // "since this daemon process started" (or since the first unscoped call
+  // within that lifetime), never a longer historical window.
+  string since = 2;
+
+  // Whether CONTAINARIUM_STRICT_SCOPES is currently armed on this daemon.
+  bool strict_mode_enabled = 3;
+}
+
+// TokensService is the admin surface for JWT lifecycle.
+//
+// RevokeToken requires an admin role + tokens:write scope;
+// tenants can't revoke other tenants' tokens. RefreshToken
+// is open to any holder of a valid refresh token — that's
+// the whole point of the exchange flow.
+service TokensService {
+  // RevokeToken adds a token's jti to the revocation list,
+  // taking effect on the next authenticated request that
+  // names it. Idempotent — repeated revokes are safe.
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse) {
+    option (google.api.http) = {
+      post: "/v1/tokens/revoke"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Revoke a JWT by its jti";
+      description: "Adds the token's jti to the revocation list. The token will be rejected on the next request that tries to use it. Admin-only. Idempotent — revoking an already-revoked jti is a no-op (the original revocation reason is preserved).";
+      tags: "Tokens";
+    };
+  }
+
+  // ExchangeDelegatedToken mints a token that acts FOR another
+  // subject, on the authority of the caller's own credential
+  // (containarium-cloud#1427).
+  //
+  // The problem it solves: a service that fronts this API on
+  // behalf of end users — the cloud control plane is the case
+  // that motivated it — presents its own service credential on
+  // every call. #1676 bounds an agent token by the CALLER's
+  // scopes, but when the caller is a shared service account
+  // that bound is meaningless, and #1678's audit `actor` column
+  // records the service, not the person. `act` is deliberately
+  // a JWT claim and never a header (#1677: set only by the
+  // minting server from an authenticated context), so the
+  // fronting service cannot assert it — it has no signing key,
+  // and giving it one would let it mint any identity.
+  //
+  // So it asks this daemon to mint instead. Two invariants make
+  // that safe, mirroring RunAgentSkill's own delegated mint:
+  //
+  //   * The minted token's scopes are the INTERSECTION of the
+  //     caller's scopes with those requested, so an exchange can
+  //     never produce more authority than the caller already
+  //     holds. Without this the endpoint would be precisely the
+  //     escalation primitive #1676 closed.
+  //   * `act` is built server-side from the authenticated
+  //     caller, wrapping the caller's own chain, so the delegation
+  //     path is recorded rather than claimed.
+  //
+  // Gated on `tokens:delegate` — a distinct scope, not
