@@ -118,3 +118,63 @@ func TestFailback_RestoresThePreferredPrimaryAfterItRecovers(t *testing.T) {
 
 	r.set("10.0.0.1", true)
 	r.tick(3) // healthy again, but not yet stable for FailbackChecks
+	assert.Equal(t, []string{"tunnel-a"}, r.switches(), "must not fail back before the hold-down has elapsed")
+
+	r.tick(1) // 4th consecutive healthy check
+	assert.Equal(t, []string{"tunnel-a", "gcp"}, r.switches(), "the recovered preferred primary must be restored")
+	assert.Equal(t, "gcp", r.primaryID())
+	assert.EqualValues(t, 1, r.m.FailbackCount())
+	assert.EqualValues(t, 1, r.m.FailoverCount(), "failback must not be counted as a failover")
+	assert.True(t, r.m.primaryIsPreferred())
+
+	r.tick(5)
+	assert.Equal(t, []string{"tunnel-a", "gcp"}, r.switches(), "once restored there is nothing further to do")
+}
+
+func TestFailback_FlappingPrimaryDoesNotOscillate(t *testing.T) {
+	r := newFailbackRig(t, 4)
+	r.set("10.0.0.1", false)
+	r.tick(2)
+	require.Equal(t, "tunnel-a", r.primaryID())
+
+	// Up for three checks, down for one, repeatedly: never four in a row.
+	for i := 0; i < 6; i++ {
+		r.set("10.0.0.1", true)
+		r.tick(3)
+		r.set("10.0.0.1", false)
+		r.tick(1)
+	}
+	assert.Equal(t, []string{"tunnel-a"}, r.switches(), "a flapping primary must not be failed back to")
+	assert.EqualValues(t, 0, r.m.FailbackCount())
+}
+
+func TestFailback_NothingToDoWhenAlreadyOnThePreferredPrimary(t *testing.T) {
+	r := newFailbackRig(t, 4)
+	r.tick(12)
+	assert.Empty(t, r.switches())
+	assert.EqualValues(t, 0, r.m.FailbackCount())
+}
+
+func TestFailback_PeersOfEqualPriorityNeverSwapPlaces(t *testing.T) {
+	r := newFailbackRig(t, 4)
+	r.gcp.Healthy = false
+	r.gcp.Priority = 10 // two equal-priority peers only
+	r.m.primary = r.peer
+	r.set("10.0.0.1", true)
+	r.tick(10)
+	assert.Empty(t, r.switches(), "equal priority is not 'better': no swap")
+}
+
+func TestFailback_AFailedSwitchLeavesThePrimaryAndRetries(t *testing.T) {
+	r := newFailbackRig(t, 4)
+	r.set("10.0.0.1", false)
+	r.tick(2)
+	require.Equal(t, "tunnel-a", r.primaryID())
+
+	fail := true
+	inner := r.m.switchToProxyFn
+	r.m.switchToProxyFn = func(b *Backend) error {
+		if b.ID == "gcp" && fail {
+			r.mu.Lock()
+			r.calls = append(r.calls, "gcp(refused)")
+			r.mu.Unlock()
