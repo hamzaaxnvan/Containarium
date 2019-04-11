@@ -55,3 +55,117 @@ func fullCreateRequest() *pb.CreateContainerRequest {
 	}
 }
 
+// capturingPeer records the forwarded body and replies with a full response.
+func capturingPeer(t *testing.T, body *string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		*body = string(b)
+		_, _ = w.Write([]byte(`{
+			"container": {
+				"name": "alice-container",
+				"username": "alice",
+				"state": "CONTAINER_STATE_RUNNING",
+				"network": {"ipAddress": "10.0.0.5"},
+				"resources": {"cpu": "4", "memory": "4GB", "disk": "50GB"},
+				"sshHost": "edge.example",
+				"pool": "gpu-pool"
+			},
+			"message": "created",
+			"sshCommand": "ssh alice@edge.example"
+		}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func peerClientFor(srv *httptest.Server) *PeerClient {
+	return &PeerClient{
+		ID:     "peer-a",
+		Addr:   strings.TrimPrefix(srv.URL, "http://"),
+		client: srv.Client(),
+	}
+}
+
+// THE test: nothing set on the request may be missing from what is forwarded.
+//
+// Asserted over the whole message rather than a hand-listed set of fields —
+// the bug WAS a hand-listed set of fields. A field added to the proto later is
+// covered by this automatically, without anyone remembering this file.
+func TestForwardCreateContainer_ForwardsEveryField(t *testing.T) {
+	var forwarded string
+	srv := capturingPeer(t, &forwarded)
+	req := fullCreateRequest()
+
+	if _, err := peerClientFor(srv).ForwardCreateContainer("token", req); err != nil {
+		t.Fatalf("ForwardCreateContainer: %v", err)
+	}
+
+	var got pb.CreateContainerRequest
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal([]byte(forwarded), &got); err != nil {
+		t.Fatalf("forwarded body is not a valid CreateContainerRequest: %v\n%s", err, forwarded)
+	}
+
+	// backend_id is intentionally cleared; everything else must survive.
+	want := proto.Clone(req).(*pb.CreateContainerRequest)
+	want.BackendId = ""
+
+	if !proto.Equal(want, &got) {
+		// Name the specific fields that went missing — a bare "not equal" on
+		// a 25-field message is not a usable failure.
+		var missing []string
+		want.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+			if !got.ProtoReflect().Has(fd) {
+				missing = append(missing, string(fd.Name()))
+			}
+			return true
+		})
+		t.Errorf("fields dropped while forwarding: %v\nsent: %v\ngot:  %v", missing, want, &got)
+	}
+}
+
+// The two that matter most, called out on their own so a regression reads as
+// a security problem rather than a diffing problem.
+func TestForwardCreateContainer_ForwardsEncryptionIntent(t *testing.T) {
+	var forwarded string
+	srv := capturingPeer(t, &forwarded)
+
+	req := &pb.CreateContainerRequest{
+		Username:  "alice",
+		Resources: &pb.ResourceLimits{Cpu: "2", Memory: "2GB", Disk: "10GB"},
+		BackendId: "peer-a",
+		Encrypted: true,
+		TenantId:  "acme",
+	}
+	if _, err := peerClientFor(srv).ForwardCreateContainer("token", req); err != nil {
+		t.Fatalf("ForwardCreateContainer: %v", err)
+	}
+
+	var got pb.CreateContainerRequest
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal([]byte(forwarded), &got); err != nil {
+		t.Fatalf("unmarshal forwarded body: %v", err)
+	}
+	if !got.Encrypted {
+		t.Error("`encrypted` was not forwarded: a --encrypted create aimed at a remote backend " +
+			"would produce an UNENCRYPTED container and report success (#1001)")
+	}
+	if got.TenantId != "acme" {
+		t.Errorf("tenant_id = %q, want \"acme\" — the wrong tenant's key would be used", got.TenantId)
+	}
+}
+
+// backend_id must NOT be forwarded: the peer is the target, and leaving it set
+// would have the peer evaluate routing again instead of creating locally.
+func TestForwardCreateContainer_ClearsBackendID(t *testing.T) {
+	var forwarded string
+	srv := capturingPeer(t, &forwarded)
+
+	req := fullCreateRequest()
+	if _, err := peerClientFor(srv).ForwardCreateContainer("token", req); err != nil {
+		t.Fatalf("ForwardCreateContainer: %v", err)
+	}
+
+	var got pb.CreateContainerRequest
+	_ = (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal([]byte(forwarded), &got)
+	if got.BackendId != "" {
+		t.Errorf("backend_id = %q was forwarded; the peer would try to route onwards", got.BackendId)
