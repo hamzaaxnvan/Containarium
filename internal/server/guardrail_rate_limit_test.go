@@ -68,38 +68,3 @@ func TestDeployGate_RateLimitedBeforeAnySnapshot(t *testing.T) {
 	_, err := f.deploy(t)
 	if status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("second deploy = %v, want ResourceExhausted", err)
-	}
-	if snapshots != 1 {
-		t.Errorf("throttled deploy took a snapshot (%d total), want none", snapshots)
-	}
-	if len(f.boxes.created) != 1 || len(f.boxes.events) != events {
-		t.Errorf("throttled deploy touched the backend: created %v, events %v", f.boxes.created, f.boxes.events[events:])
-	}
-	after := stagingListing(t, f.srv.guardrailStagingRoot)
-	if len(before) != len(after) {
-		t.Errorf("staging root changed: %d entries before, %d after", len(before), len(after))
-	}
-	for p, v := range before {
-		if after[p] != v {
-			t.Errorf("staging entry %s changed: %q -> %q", p, v, after[p])
-		}
-	}
-	f.assertNoSnapshotLeft(t)
-}
-
-// Acceptance criterion 2 on the deploy path: alice exhausting her budget
-// does not throttle bob.
-func TestDeployGate_RateLimitIsPerSubject(t *testing.T) {
-	f := newGateFixture(t)
-	f.srv.SetGuardrailDeployRateLimit(frozenLimiter("gated deploy", guardrailrate.Limit{PerMinute: 6, Burst: 1}))
-	if _, err := f.deploy(t); err != nil {
-		t.Fatalf("alice's first deploy: %v", err)
-	}
-	if _, err := f.deploy(t); status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("alice's second deploy = %v, want ResourceExhausted", err)
-	}
-	bob := &pb.DeployRecipeRequest{RecipeId: "gated", Name: "bob", GuardrailInput: f.req.GetGuardrailInput()}
-	_, err := f.srv.DeployRecipe(tenantWithScopes("bob", auth.ScopeContainersWrite), bob)
-	if status.Code(err) == codes.ResourceExhausted {
-		t.Fatalf("bob throttled by alice's budget: %v", err)
-	}
