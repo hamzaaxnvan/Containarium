@@ -110,3 +110,115 @@ func TestPrefixSource_DryRunReportsEachClassAndNeverRemoves(t *testing.T) {
 	}
 	// The chained entries are no longer "not swept".
 	for _, s := range rep.GetStores() {
+		if s.GetStore() == "audit_logs" && s.GetStatus() == pb.RetentionSweepStatus_RETENTION_SWEEP_STATUS_NOT_SWEPT {
+			t.Errorf("%v/audit_logs is still listed not swept: %v", s.GetClass(), s)
+		}
+	}
+	if findStore(t, rep, pb.RetentionClass_RETENTION_CLASS_EVIDENCE_BUNDLES, "evidence_bundles").GetStatus() != pb.RetentionSweepStatus_RETENTION_SWEEP_STATUS_NOT_SWEPT {
+		t.Error("evidence bundles must stay not swept")
+	}
+}
+
+func TestPrefixSource_EnforceAuditsFirstThenRemovesAndReportsTheNewBase(t *testing.T) {
+	var events []string
+	p := eligibleChain()
+	p.log = &events
+	st := enforcing(t)
+	if _, err := st.SetHold(context.Background(), "org-a", "case", "admin", nil); err != nil {
+		t.Fatal(err)
+	}
+	sw := newTestSweeper(t, st, nil, chainUnswept())
+	sw.SetAuditor(func(context.Context, *pb.RetentionReport) error { events = append(events, "audit"); return nil })
+	sw.AddPrefixSource(p)
+
+	rep, err := sw.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if strings.Join(events, ",") != "audit,remove" {
+		t.Fatalf("events = %v, want the audit entry before the removal", events)
+	}
+	if p.removeMax != MaxRemovePerStore || strings.Join(p.removeHeld, ",") != "org-a" {
+		t.Errorf("RemovePrefix got max=%d held=%v, want the bound and [org-a]", p.removeMax, p.removeHeld)
+	}
+	gw := findStore(t, rep, gwClass, "audit_logs")
+	sess := findStore(t, rep, sessClass, "audit_logs")
+	if gw.GetRemoved() != 7 || sess.GetRemoved() != 3 || !rep.GetEnforced() {
+		t.Errorf("removed gw/sess = %d/%d enforced=%v, want 7/3/true", gw.GetRemoved(), sess.GetRemoved(), rep.GetEnforced())
+	}
+	if gw.GetChainBase().GetBaseId() != 510 || sess.GetChainBase().GetBaseId() != 510 {
+		t.Errorf("both classes should report the new base 510, got %v / %v", gw.GetChainBase(), sess.GetChainBase())
+	}
+}
+
+func TestPrefixSource_EnforceWithoutAnAuditorRemovesNothing(t *testing.T) {
+	p := eligibleChain()
+	sw := newTestSweeper(t, enforcing(t), nil, chainUnswept())
+	sw.AddPrefixSource(p)
+
+	if _, err := sw.Sweep(context.Background()); !errors.Is(err, ErrNoAuditor) {
+		t.Fatalf("Sweep err = %v, want ErrNoAuditor", err)
+	}
+	if p.removed != 0 {
+		t.Fatalf("RemovePrefix called %d times with no auditor, want never", p.removed)
+	}
+}
+
+func TestPrefixSource_AFailedAuditWriteRemovesNothing(t *testing.T) {
+	p := eligibleChain()
+	sw := newTestSweeper(t, enforcing(t), nil, chainUnswept())
+	sw.SetAuditor(func(context.Context, *pb.RetentionReport) error { return errors.New("audit down") })
+	sw.AddPrefixSource(p)
+
+	if _, err := sw.Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep succeeded although the audit write failed")
+	}
+	if p.removed != 0 {
+		t.Fatalf("RemovePrefix called %d times after a failed audit write, want never", p.removed)
+	}
+}
+
+func TestPrefixSource_NothingEligibleNeitherAuditsNorRemoves(t *testing.T) {
+	p := eligibleChain()
+	p.count.ByClass = map[pb.RetentionClass]Count{gwClass: {Older: 5}, sessClass: {Older: 0}}
+	audited := 0
+	sw := newTestSweeper(t, enforcing(t), nil, chainUnswept())
+	sw.SetAuditor(func(context.Context, *pb.RetentionReport) error { audited++; return nil })
+	sw.AddPrefixSource(p)
+
+	if _, err := sw.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if audited != 0 || p.removed != 0 {
+		t.Fatalf("audited %d, removed %d times with nothing eligible, want neither", audited, p.removed)
+	}
+}
+
+func TestPrefixSource_APreviewNeverRemovesEvenInEnforceMode(t *testing.T) {
+	p := eligibleChain()
+	sw := newTestSweeper(t, enforcing(t), nil, chainUnswept())
+	sw.SetAuditor(func(context.Context, *pb.RetentionReport) error { return nil })
+	sw.AddPrefixSource(p)
+
+	rep, err := sw.Preview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.removed != 0 || rep.GetEnforced() {
+		t.Fatalf("Preview removed %d times, enforced=%v, want neither", p.removed, rep.GetEnforced())
+	}
+}
+
+func TestPrefixSource_ACountFailureIsReportedAndNothingIsRemoved(t *testing.T) {
+	p := eligibleChain()
+	p.countErr = errors.New("count audit_logs: boom")
+	sw := auditedSweeper(t, enforcing(t), nil, chainUnswept())
+	sw.AddPrefixSource(p)
+
+	rep, err := sw.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	for _, c := range []pb.RetentionClass{gwClass, sessClass} {
+		got := findStore(t, rep, c, "audit_logs")
+		if got.GetStatus() != pb.RetentionSweepStatus_RETENTION_SWEEP_STATUS_ERROR || !strings.Contains(got.GetNote(), "boom") {

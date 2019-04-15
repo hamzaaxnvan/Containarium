@@ -1,0 +1,147 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/footprintai/containarium/pkg/core/incus"
+)
+
+// Phase 3.1 Phase-B — registry-side image digest
+// verification. Audit B-HIGH-1 (deeper half). Pairs with
+// the operator-enforced @sha256: syntax check in
+// image_digest.go.
+//
+// When CONTAINARIUM_VERIFY_IMAGE_DIGEST=true is set, every
+// CreateContainer request that carries a `@sha256:...`
+// reference is checked against the registry's published
+// digests for that alias. A miss → FailedPrecondition. A
+// match → pull proceeds normally.
+//
+// See docs/security/IMAGE-DIGEST-VERIFY-DESIGN.md for the
+// full design.
+//
+// What this catches:
+//   - Allowlisted-registry MITM serving different bytes.
+//   - Bytes-vs-declared-digest divergence.
+//   - Stale operator pin (the registry has rotated the
+//     image and the operator's digest no longer resolves).
+//
+// What this does NOT catch:
+//   - Cache tampering between pull and start. Phase C
+//     covers that with a post-pull local-store fingerprint
+//     check.
+//   - Registry-account compromise where the attacker has
+//     pushed bytes AND can update the index to match. Only
+//     out-of-band digest custody (release notes / signed
+//     records) catches that.
+//
+// Default is OFF. Operators opt in once they've seeded
+// known-good digests for their pinned images.
+
+const verifyImageDigestEnv = "CONTAINARIUM_VERIFY_IMAGE_DIGEST"
+
+var (
+	verifyDigestOnce sync.Once
+	verifyDigestOn   bool
+
+	// Resolver cached at first use so each CreateContainer
+	// reuses the same http.Client (TLS handshake pool stays
+	// warm). Caching of the index itself is a Phase B+
+	// follow-up — premature caching hides correctness
+	// bugs.
+	verifyResolverOnce sync.Once
+	verifyResolver     *incus.StreamsResolver
+)
+
+func loadDigestVerificationOn() bool {
+	verifyDigestOnce.Do(func() {
+		raw := strings.TrimSpace(os.Getenv(verifyImageDigestEnv))
+		if raw == "" {
+			verifyDigestOn = false
+			return
+		}
+		switch strings.ToLower(raw) {
+		case "1", "true", "yes", "on":
+			verifyDigestOn = true
+			log.Printf("[image-digest] registry verification ENABLED: every `@sha256:` digest is checked against the registry's published index before pull (audit B-HIGH-1 Phase B)")
+			// Sanity check the operator's two-gate
+			// configuration. VERIFY only kicks in for
+			// requests that carry `@sha256:` — without
+			// REQUIRE, undigested requests bypass the
+			// gate entirely. Operators who enabled VERIFY
+			// thinking they'd covered both surfaces get a
+			// startup warning rather than silently-
+			// degraded protection. The configuration is
+			// still ALLOWED (an operator may legitimately
+			// want "verify when pinned, but pinning is
+			// optional"), just loudly flagged.
+			if !loadDigestRequired() {
+				log.Printf("WARNING: %s=true but %s is OFF; undigested CreateContainer requests will SKIP verification. Set %s=true to make pinning mandatory.",
+					verifyImageDigestEnv, requireImageDigestEnv, requireImageDigestEnv)
+			}
+		default:
+			verifyDigestOn = false
+			log.Printf("WARNING: %s=%q is unrecognized (expected 1/true/yes/on); registry verification STAYS OFF", verifyImageDigestEnv, raw)
+		}
+	})
+	return verifyDigestOn
+}
+
+func resolver() *incus.StreamsResolver {
+	verifyResolverOnce.Do(func() {
+		// 10s matches the design doc; covers a slow
+		// simplestreams index without keeping the
+		// CreateContainer call hung indefinitely on a
+		// dead registry.
+		verifyResolver = incus.NewStreamsResolver(10 * time.Second)
+	})
+	return verifyResolver
+}
+
+// verifyImageDigestAgainstRegistry is the Phase B gate.
+// Returns nil when:
+//   - verification is OFF (env unset / false), OR
+//   - the image string has no `@sha256:` suffix (the
+//     syntax gate in validateImageDigest will have
+//     rejected if Phase 2 enforcement was on; otherwise
+//     the operator chose not to pin and we don't override
+//     that), OR
+//   - the image string has no resolvable server (local
+//     alias, no registry to query), OR
+//   - the operator-supplied digest appears in the set
+//     published by the registry for that alias.
+//
+// Returns a non-nil error when the digest is present, the
+// server is resolvable, and the registry's published set
+// does NOT contain the requested digest (or the resolver
+// fails outright).
+func verifyImageDigestAgainstRegistry(ctx context.Context, image string) error {
+	if !loadDigestVerificationOn() {
+		return nil
+	}
+	digest, ok := extractImageDigest(image)
+	if !ok {
+		// No digest supplied → nothing to verify. The
+		// syntax-required env handles "must have digest";
+		// this env handles "the digest you supplied
+		// matches the registry."
+		return nil
+	}
+	server, alias := splitServerAlias(image)
+	if server == "" {
+		// Local alias — there's no registry to query.
+		// Skip with a debug log; legitimate use-case for
+		// the inproc test images Containarium pre-populates.
+		log.Printf("[image-digest] image %q has no resolvable registry server; skipping registry verification", image)
+		return nil
+	}
+
+	published, err := resolver().ResolveImageDigests(ctx, server, alias)
+	if err != nil {
+		return fmt.Errorf("registry digest verification: fetch %s index for %q: %w", server, alias, err)
