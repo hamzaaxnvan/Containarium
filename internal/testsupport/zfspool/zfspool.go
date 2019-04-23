@@ -50,3 +50,29 @@ func Run(t *testing.T, name string, args ...string) string {
 	t.Helper()
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
+		t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+// Pool is a throwaway file-backed pool.
+type Pool struct {
+	Name  string // the ZFS pool name
+	Mount string // its mountpoint
+	Image string // the backing file
+}
+
+// New creates a pool and registers its teardown.
+func New(t *testing.T) *Pool {
+	t.Helper()
+	dir := t.TempDir()
+	p := &Pool{
+		Name:  fmt.Sprintf("containarium-zfstest-%d", os.Getpid()),
+		Mount: filepath.Join(dir, "mnt"),
+		Image: filepath.Join(dir, "vdev.img"),
+	}
+
+	if err := os.MkdirAll(p.Mount, 0o755); err != nil {
+		t.Fatalf("mkdir mountpoint: %v", err)
+	}
+	f, err := os.Create(p.Image)
