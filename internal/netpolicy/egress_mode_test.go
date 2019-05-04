@@ -34,21 +34,3 @@ func TestCompile_EgressModeCarriedAsGiven(t *testing.T) {
 		}
 	}
 }
-
-func TestCompile_EgressModeUnknownRejected(t *testing.T) {
-	if _, err := Compile(&pb.NetworkPolicy{Tenant: "t", EgressMode: pb.NetworkPolicyMode(99)}); err == nil {
-		t.Error("an unknown egress_mode must be rejected, like an unknown mode")
-	}
-}
-
-// EffectiveEgressMode is the one place "unset follows mode" is decided.
-func TestCompiledPolicy_EffectiveEgressMode(t *testing.T) {
-	const (
-		unset   = pb.NetworkPolicyMode_NETWORK_POLICY_MODE_UNSPECIFIED
-		logOnly = pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY
-		enforce = pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE
-	)
-	cases := []struct {
-		name       string
-		mode, egr  pb.NetworkPolicyMode
-		wantEgress pb.NetworkPolicyMode
