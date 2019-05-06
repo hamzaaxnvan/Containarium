@@ -12,3 +12,11 @@ func TestValidateSSHKeyMode(t *testing.T) {
 	cases := []struct {
 		name       string
 		noSSHKey   bool
+		sshKeyPath string
+		wantErr    string // substring; "" means expect success
+	}{
+		{"key provided (human dev box)", false, "~/.ssh/id_rsa.pub", ""},
+		{"keyless service tenant", true, "", ""},
+		{"neither → required error", false, "", "--ssh-key is required"},
+		{"both → mutually exclusive", true, "/tmp/k.pub", "mutually exclusive"},
+	}

@@ -63,35 +63,3 @@ func (s Spec) Validate() error {
 	}
 	switch s.Kind {
 	case KindCPU, KindGPU:
-	default:
-		return fmt.Errorf("kind must be %q or %q, got %q", KindCPU, KindGPU, s.Kind)
-	}
-	if s.Kind == KindGPU && s.GPUPCI == "" {
-		return fmt.Errorf("kind %q requires --gpu pci=<addr>", KindGPU)
-	}
-	if s.CPU <= 0 {
-		return fmt.Errorf("cpu must be > 0")
-	}
-	if s.Memory == "" {
-		return fmt.Errorf("memory is required (e.g. 64GiB)")
-	}
-	if s.Sentinel == "" {
-		return fmt.Errorf("sentinel address is required")
-	}
-	if s.Pool == "" {
-		return fmt.Errorf("pool is required")
-	}
-	return nil
-}
-
-func (s Spec) image() string {
-	if s.Image == "" {
-		return DefaultImage
-	}
-	return s.Image
-}
-
-// SpotID is the tunnel/peer identity this node registers under — derived
-// from name+pool so it's stable and human-readable in `backends list`.
-func (s Spec) SpotID() string {
-	return s.Name + "-" + s.Pool
