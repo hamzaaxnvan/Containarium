@@ -62,35 +62,3 @@ func ServeSwaggerUI(swaggerDir string) http.HandlerFunc {
 			htmlContent = strings.Replace(htmlContent,
 				"url: \"https://petstore.swagger.io/v2/swagger.json\"",
 				"url: \"/swagger.json\"",
-				1)
-			// Also try alternate format
-			htmlContent = strings.ReplaceAll(htmlContent,
-				"https://petstore.swagger.io/v2/swagger.json",
-				"/swagger.json")
-			w.Write([]byte(htmlContent))
-			return
-		}
-
-		w.Write(content)
-	}
-}
-
-// serveBasicSwaggerUI serves a basic Swagger UI page when static files are not available
-func serveBasicSwaggerUI(w http.ResponseWriter, r *http.Request) {
-	html := `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Containarium API</title>
-    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.11.0/swagger-ui.css" />
-    <style>
-        html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
-        *, *:before, *:after { box-sizing: inherit; }
-        body { margin:0; padding:0; }
-    </style>
-</head>
-<body>
-    <div id="swagger-ui"></div>
-    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.11.0/swagger-ui-bundle.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.11.0/swagger-ui-standalone-preset.js"></script>
