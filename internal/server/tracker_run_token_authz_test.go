@@ -33,3 +33,38 @@ import (
 // the token manager and the catalog. Nothing here touches a box.
 func realRunTokenMinter(t *testing.T) (*AgentSkillServer, *auth.TokenManager, *pb.AgentSkill) {
 	t.Helper()
+	tm, err := auth.NewTokenManager("test-secret-must-be-at-least-32-bytes-long-ok", "test")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	catalog := skills.GetDefault()
+	skill, err := catalog.Get("product-define")
+	if err != nil {
+		t.Fatalf("product-define not in the catalog: %v", err)
+	}
+	return &AgentSkillServer{catalog: catalog, tokens: tm}, tm, skill
+}
+
+// dispatchCallerCtx is the context the tracker dispatcher starts a run
+// under: the tenant's OWN token (requireDispatchCaller), which must also
+// pass provisionBoxOnly's AuthorizeTenant on the agent box — so, in
+// production, an admin-role token for the tenant. No scopes claim, so the
+// run receives exactly the skill manifest's scopes (#1676).
+func dispatchCallerCtx(user string) context.Context {
+	return kmsKeyTestCtx(user, auth.RoleAdmin, "")
+}
+
+// mintRealRunToken mints a run token for `user`, bound to connection
+// `conn`, through the same code provisionSkillBoxWith runs for a real
+// dispatched run, and returns the raw JWT.
+func mintRealRunToken(t *testing.T, user, runID, conn string) (string, *auth.TokenManager) {
+	t.Helper()
+	agents, tm, skill := realRunTokenMinter(t)
+	tok, cred, err := agents.mintRunToken(dispatchCallerCtx(user), skill, runID, conn)
+	if err != nil {
+		t.Fatalf("mintRunToken: %v", err)
+	}
+	if cred.Kind != runlease.KindPlatformJWT || cred.JTI == "" {
+		t.Fatalf("lease credential = %+v, want the platform JWT with its jti", cred)
+	}
+	return tok, tm
