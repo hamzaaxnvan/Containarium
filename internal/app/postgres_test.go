@@ -5,5 +5,3 @@ import (
 	"testing"
 
 	"github.com/footprintai/containarium/internal/testsupport/postgres"
-)
-
