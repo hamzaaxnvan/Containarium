@@ -22,3 +22,11 @@ func TestToSigEntry(t *testing.T) {
 	e2 := toSigEntry(netpolicy.Signature{ID: 1, Name: "x", Pattern: long})
 	if int(e2.Len) != netbpf.SigMaxLen {
 		t.Errorf("truncated len = %d, want %d", e2.Len, netbpf.SigMaxLen)
+	}
+}
+
+// TestBuiltinSignaturesFitMap guards the cross-package invariant the netpolicy
+// package can't check itself (it can't import netbpf): every built-in fits the
+// BPF map's slot count and pattern width.
+func TestBuiltinSignaturesFitMap(t *testing.T) {
+	sigs := netpolicy.BuiltinSignatures()
