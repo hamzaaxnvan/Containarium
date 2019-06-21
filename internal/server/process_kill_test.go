@@ -366,3 +366,187 @@ func TestHostProcessKiller_RefusesLowPIDsAndStoppedBox(t *testing.T) {
 	if err := k.KillInContainer("box-a", 4242, fakeStart(4242)); err == nil {
 		t.Error("init pid lookup failure must refuse the kill")
 	}
+}
+
+// fakeKiller records KillInContainer calls; err scripts a refusal.
+type fakeKiller struct {
+	calls  []string
+	starts []threatdetect.ProcStartTicks
+	err    error
+}
+
+func (k *fakeKiller) KillInContainer(container string, pid uint32, start threatdetect.ProcStartTicks) error {
+	k.calls = append(k.calls, fmt.Sprintf("%s:%d", container, pid))
+	k.starts = append(k.starts, start)
+	return k.err
+}
+
+func (fx *responderFixture) fireSignature(t *testing.T, container string, pid uint32) *threatdetect.Finding {
+	t.Helper()
+	out, err := NewActingSink(fx.findings, fx.r).Upsert(context.Background(), &threatdetect.Finding{
+		Rule: ruleMinerSignature, Severity: pb.ThreatSeverity_THREAT_SEVERITY_HIGH, TenantID: "tenant-a",
+		Container: container, Subject: "name:xmrig",
+		Evidence: threatdetect.Evidence{Execs: []threatdetect.ExecEvidence{{PID: pid, Comm: "xmrig", Filename: "/tmp/xmrig",
+			Argv: "./xmrig --donate-level 1", Matched: "name:xmrig"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func (fx *responderFixture) setKill(t *testing.T, container string, on bool) {
+	t.Helper()
+	// Keep whatever is stored at that level (e.g. a THROTTLE default) and
+	// only set kill_process, as the server's field-by-field merge does.
+	ctx := context.Background()
+	var p *pb.ProcessPolicy
+	var err error
+	if container == "" {
+		p, err = fx.policies.Default(ctx)
+	} else {
+		p, err = fx.policies.Override(ctx, container)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p == nil {
+		p = &pb.ProcessPolicy{}
+	}
+	p.KillProcess = &on
+	if container == "" {
+		err = fx.policies.SetDefault(ctx, p)
+	} else {
+		err = fx.policies.SetOverride(ctx, container, p)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func auditDetails(a *fakeAudit, action string) []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []string
+	for _, e := range a.entries {
+		if e.ResourceType == actionAuditResourceType && e.Action == action {
+			out = append(out, e.Detail)
+		}
+	}
+	return out
+}
+
+// TestProcessResponder_KillProcess: kill_process off (the default) never
+// signals; on, the matched pid is killed, audited by pid, flagged on the
+// finding, and the box's policy action still applies.
+func TestProcessResponder_KillProcess(t *testing.T) {
+	t.Run("default off never kills", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		f := fx.fireSignature(t, "box-a", 4242)
+		if len(k.calls) != 0 || f.Response.ProcessKilled {
+			t.Fatalf("kills=%v killed=%v, want none", k.calls, f.Response.ProcessKilled)
+		}
+	})
+	t.Run("on with ALERT kills and audits the pid", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 4242)
+		if len(k.calls) != 1 || k.calls[0] != "box-a:4242" {
+			t.Fatalf("kills = %v", k.calls)
+		}
+		if f.Response == nil || !f.Response.ProcessKilled || f.Response.Action != pb.ProcessAction_PROCESS_ACTION_ALERT {
+			t.Fatalf("response = %+v, want ALERT with process_killed", f.Response)
+		}
+		if f.Response.KilledPID != 4242 {
+			t.Fatalf("killed_pid = %d, want 4242 (#2775: the webhook names it)", f.Response.KilledPID)
+		}
+		d := auditDetails(fx.audit, "kill")
+		if len(d) != 1 || !strings.Contains(d[0], "pid=4242") || !strings.Contains(d[0], `matched="name:xmrig"`) {
+			t.Fatalf("kill audit = %v", d)
+		}
+	})
+	t.Run("on with THROTTLE kills and still throttles", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_THROTTLE, "10%", time.Hour)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 4242)
+		if len(k.calls) != 1 || f.Response.State != pb.ResponseState_RESPONSE_STATE_APPLIED || !f.Response.ProcessKilled {
+			t.Fatalf("kills=%v response=%+v", k.calls, f.Response)
+		}
+		if f.Response.KilledPID != 4242 {
+			t.Fatalf("killed_pid = %d, want 4242", f.Response.KilledPID)
+		}
+		row, err := fx.actions.Open(context.Background(), "box-a")
+		if err != nil || row.KilledPID != 4242 || row.Action != pb.ProcessAction_PROCESS_ACTION_THROTTLE {
+			t.Fatalf("action row = %+v, %v; want THROTTLE with killed_pid 4242", row, err)
+		}
+		// A second miner exec while the throttle is open: killed too, no
+		// second action.
+		f = fx.fireSignature(t, "box-a", 5151)
+		if len(k.calls) != 2 || k.calls[1] != "box-a:5151" || !f.Response.ProcessKilled {
+			t.Fatalf("second exec: kills=%v response=%+v", k.calls, f.Response)
+		}
+	})
+	t.Run("container override false beats backend true", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		fx.setKill(t, "box-a", false)
+		fx.fireSignature(t, "box-a", 4242)
+		if len(k.calls) != 0 {
+			t.Fatalf("kills = %v, want none", k.calls)
+		}
+	})
+	t.Run("refused kill is audited as skipped, finding not flagged", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{err: fmt.Errorf("pid 4242: %w", errKillPIDReused)}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 4242)
+		if f.Response == nil || f.Response.ProcessKilled {
+			t.Fatalf("response = %+v, want not killed", f.Response)
+		}
+		if f.Response.KillSkipReason != pb.KillSkipReason_KILL_SKIP_REASON_PID_REUSED || f.Response.KilledPID != 0 {
+			t.Fatalf("kill_skip_reason = %s killed_pid = %d, want PID_REUSED and no pid (#2775)", f.Response.KillSkipReason, f.Response.KilledPID)
+		}
+		d := auditDetails(fx.audit, "kill-skipped")
+		if len(d) != 1 || !strings.Contains(d[0], "pid reused") || len(auditDetails(fx.audit, "kill")) != 0 {
+			t.Fatalf("audit kill-skipped=%v", d)
+		}
+	})
+	t.Run("matched exec's start time reaches the killer", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		if _, err := NewActingSink(fx.findings, fx.r).Upsert(context.Background(), &threatdetect.Finding{
+			Rule: ruleMinerSignature, Severity: pb.ThreatSeverity_THREAT_SEVERITY_HIGH, TenantID: "tenant-a",
+			Container: "box-a", Subject: "name:xmrig",
+			Evidence: threatdetect.Evidence{Execs: []threatdetect.ExecEvidence{{PID: 4242, StartTime: 987654, Comm: "xmrig",
+				Filename: "/tmp/xmrig", Matched: "name:xmrig"}}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(k.starts) != 1 || k.starts[0] != 987654 {
+			t.Fatalf("killer got start times %v, want [987654] (#2765)", k.starts)
+		}
+		if d := auditDetails(fx.audit, "kill"); len(d) != 1 || !strings.Contains(d[0], "start_time=987654") {
+			t.Fatalf("kill audit = %v, want the start time it checked", d)
+		}
+	})
+	t.Run("same-box pid reuse is audited as skipped (#2765)", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{err: fmt.Errorf("pid 4242 start time 2 != matched 1: %w", errKillPIDReused)}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 4242)
+		if f.Response == nil || f.Response.ProcessKilled || f.Response.KillSkipReason != pb.KillSkipReason_KILL_SKIP_REASON_PID_REUSED {
+			t.Fatalf("response = %+v, want not killed, PID_REUSED", f.Response)
+		}
