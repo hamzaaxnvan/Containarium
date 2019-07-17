@@ -286,3 +286,292 @@ func (pf *PortForwarder) removePreRoutingRule(port int) {
 // loopback traffic.
 func (pf *PortForwarder) removeOutputRule(port int) {
 	if _, err := pf.ipt("-t", "nat", "-D", "OUTPUT",
+		"-p", "tcp", "-d", "127.0.0.0/8", "--dport", fmt.Sprintf("%d", port),
+		"-j", "DNAT", "--to-destination", fmt.Sprintf("%s:%d", pf.caddyIP, port)); err != nil {
+		log.Printf("  removeOutputRule: rule may not exist (ignored): %v", err)
+	}
+}
+
+// removeMasqueradeRule removes the POSTROUTING MASQUERADE rule
+func (pf *PortForwarder) removeMasqueradeRule() {
+	if _, err := pf.ipt("-t", "nat", "-D", "POSTROUTING", "-d", pf.caddyIP, "-j", "MASQUERADE"); err != nil {
+		log.Printf("  removeMasqueradeRule: rule may not exist (ignored): %v", err)
+	}
+}
+
+// reconcileStaleRules deletes Caddy port-forward DNAT/MASQUERADE rules whose
+// target IP is not pf.caddyIP. Best-effort: enumerates the nat table with
+// `iptables -t nat -S`, computes the stale deletions, and runs each. Failures
+// are logged, not fatal — the subsequent ensure*Rule calls still install the
+// current rules. See SetupPortForwarding / issue #400.
+func (pf *PortForwarder) reconcileStaleRules() {
+	pf.deleteFromSave("stale Caddy target", func(save string) [][]string {
+		return staleCaddyNATRules(save, pf.caddyIP)
+	})
+}
+
+// clearLegacyRules deletes the pre-#2732 80/443 DNAT shape. Called only
+// after the current rules are ensured (see applyRules). A legacy rule that
+// also pointed at an old IP is already gone by then, because the nat table
+// is re-read here, so no rule is deleted twice.
+func (pf *PortForwarder) clearLegacyRules() {
+	pf.deleteFromSave("pre-#2732 rule shape", func(save string) [][]string {
+		return legacyCaddyPreRoutingRules(save, pf.networkCIDR)
+	})
+}
+
+// deleteFromSave reads `iptables -t nat -S` and deletes what pick selects.
+func (pf *PortForwarder) deleteFromSave(what string, pick func(save string) [][]string) {
+	out, err := pf.ipt("-t", "nat", "-S")
+	if err != nil {
+		log.Printf("  Warning: could not enumerate nat rules to clear %s: %v", what, err)
+		return
+	}
+	for _, args := range pick(string(out)) {
+		if _, e := pf.ipt(args...); e != nil {
+			log.Printf("  Warning: failed to delete Caddy rule (%s) %v: %v", what, args, e)
+		} else {
+			log.Printf("  Cleared Caddy port-forward rule (%s; current target %s): %v", what, pf.caddyIP, args)
+		}
+	}
+}
+
+// legacyCaddyPreRoutingRules returns deletions for the pre-#2732 Caddy DNAT
+// shape: a PREROUTING DNAT on --dport 80/443 excluding the bridge subnet by
+// source (`! -s <networkCIDR>`), whatever its target. Left in place it would
+// sit ahead of the new rule and duplicate it. Passthrough DNATs keep their
+// `! -s` shape but never use 80/443, and a `! -s` rule for any other subnet
+// is not ours, so both are left alone.
+//
+// Subnets are compared as networks: callers may pass the gateway form Incus
+// reports (`10.0.3.1/24`), while `iptables -S` prints the network form
+// (`10.0.3.0/24`). If networkCIDR does not parse, nothing is deleted and
+// that is logged; the old rule is a duplicate, deleting the wrong one is not.
+func legacyCaddyPreRoutingRules(saveOutput, networkCIDR string) [][]string {
+	ours, err := networkOf(networkCIDR)
+	if err != nil {
+		log.Printf("  Warning: bridge subnet %q is not a CIDR (%v); leaving any pre-#2732 Caddy DNAT rules in place", networkCIDR, err)
+		return nil
+	}
+	var dels [][]string
+	for _, raw := range strings.Split(saveOutput, "\n") {
+		fields := strings.Fields(strings.TrimSpace(raw))
+		if len(fields) < 2 || fields[0] != "-A" || fields[1] != "PREROUTING" {
+			continue
+		}
+		var dport string
+		isDNAT, negatedSrc := false, false
+		for i, f := range fields {
+			switch {
+			case f == "--dport" && i+1 < len(fields):
+				dport = fields[i+1]
+			case f == "DNAT":
+				isDNAT = true
+			case f == "!" && i+2 < len(fields) && fields[i+1] == "-s":
+				if n, err := networkOf(fields[i+2]); err == nil && n == ours {
+					negatedSrc = true
+				}
+			}
+		}
+		if isDNAT && negatedSrc && (dport == "80" || dport == "443") {
+			dels = append(dels, append([]string{"-t", "nat", "-D"}, fields[1:]...))
+		}
+	}
+	return dels
+}
+
+// networkOf returns the network a CIDR belongs to ("10.0.3.1/24" → "10.0.3.0/24").
+func networkOf(cidr string) (string, error) {
+	_, n, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return "", err
+	}
+	return n.String(), nil
+}
+
+// staleCaddyNATRules scans `iptables -t nat -S` output and returns the argument
+// lists (ready to pass to `iptables`, with the leading `-A` turned into `-D`)
+// for Caddy port-forward rules that point at an IP other than currentIP:
+//
+//   - PREROUTING/OUTPUT DNAT rules whose --dport is 80 or 443 (the dport gate
+//     keeps passthrough-route DNATs, which use other ports, untouched), and
+//   - the POSTROUTING MASQUERADE rule of the form `-d <ip> -j MASQUERADE`
+//     with no -p/--dport (passthrough MASQUERADE rules carry -p/--dport, so
+//     they're left alone).
+//
+// Pure/string-only so it can be unit-tested without touching the host firewall.
+func staleCaddyNATRules(saveOutput, currentIP string) [][]string {
+	var dels [][]string
+	for _, raw := range strings.Split(saveOutput, "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "-A ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		chain := fields[1]
+
+		var toIP, dport, dstIP string
+		isMasq := false
+		for i, f := range fields {
+			switch f {
+			case "--to-destination":
+				if i+1 < len(fields) {
+					toIP = hostOnly(fields[i+1])
+				}
+			case "--dport":
+				if i+1 < len(fields) {
+					dport = fields[i+1]
+				}
+			case "-d":
+				if i+1 < len(fields) {
+					dstIP = stripCIDR(fields[i+1])
+				}
+			case "MASQUERADE":
+				isMasq = true
+			}
+		}
+
+		stale := false
+		switch {
+		case (chain == "PREROUTING" || chain == "OUTPUT") && toIP != "" && (dport == "80" || dport == "443"):
+			stale = toIP != currentIP
+		case chain == "POSTROUTING" && isMasq && dport == "":
+			stale = dstIP != "" && dstIP != currentIP
+		}
+		if !stale {
+			continue
+		}
+
+		// Re-issue the exact rule spec as a delete: -t nat -D <chain> <rest>.
+		del := append([]string{"-t", "nat", "-D"}, fields[1:]...)
+		dels = append(dels, del)
+	}
+	return dels
+}
+
+// stripCIDR drops a trailing /prefix from an address ("10.0.3.5/32" → "10.0.3.5").
+func stripCIDR(s string) string {
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// hostOnly drops a trailing :port ("10.0.3.5:443" → "10.0.3.5").
+func hostOnly(s string) string {
+	if i := strings.LastIndexByte(s, ':'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// CheckIPTablesAvailable checks if iptables is available on the system
+func CheckIPTablesAvailable() bool {
+	cmd := exec.Command("iptables", "--version")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), "iptables")
+}
+
+// PassthroughRoute is the runtime view of a passthrough route: the minimum
+// data the iptables layer needs to forward packets. It does NOT carry
+// persistence metadata (ID, creator, timestamps); for the durable, DB-backed
+// view see PassthroughRecord in passthrough_store.go.
+//
+// The sync job projects PassthroughRecord values from the Store into
+// PassthroughRoute values to drive iptables.
+type PassthroughRoute struct {
+	ExternalPort  int
+	TargetIP      string
+	TargetPort    int
+	Protocol      string // "tcp" or "udp"
+	ContainerName string
+	Description   string
+	Active        bool
+}
+
+// PassthroughManager manages TCP/UDP passthrough routes via iptables
+type PassthroughManager struct {
+	networkCIDR string // Container network CIDR (e.g., "10.0.3.0/24")
+}
+
+// NewPassthroughManager creates a new passthrough manager
+func NewPassthroughManager(networkCIDR string) *PassthroughManager {
+	return &PassthroughManager{
+		networkCIDR: networkCIDR,
+	}
+}
+
+// ListRoutes returns all passthrough routes from iptables PREROUTING chain
+func (pm *PassthroughManager) ListRoutes() ([]PassthroughRoute, error) {
+	var routes []PassthroughRoute
+
+	// List NAT PREROUTING rules
+	cmd := exec.Command("iptables", "-t", "nat", "-L", "PREROUTING", "-n", "--line-numbers")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list iptables rules: %w", err)
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		route := pm.parsePassthroughRule(line)
+		if route != nil {
+			routes = append(routes, *route)
+		}
+	}
+
+	return routes, nil
+}
+
+// parsePassthroughRule parses an iptables rule line to extract passthrough route info
+// Example line: "1    DNAT       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:50051 to:10.0.3.150:50051"
+func (pm *PassthroughManager) parsePassthroughRule(line string) *PassthroughRoute {
+	// Skip header lines and empty lines
+	if !strings.Contains(line, "DNAT") || !strings.Contains(line, "dpt:") {
+		return nil
+	}
+
+	// Skip Caddy port forwarding rules (ports 80 and 443)
+	if strings.Contains(line, "dpt:80 ") || strings.Contains(line, "dpt:443 ") {
+		return nil
+	}
+
+	fields := strings.Fields(line)
+	if len(fields) < 7 {
+		return nil
+	}
+
+	route := &PassthroughRoute{
+		Active: true,
+	}
+
+	// Parse protocol
+	for _, field := range fields {
+		if field == "tcp" || field == "udp" {
+			route.Protocol = field
+			break
+		}
+	}
+
+	// Parse external port (dpt:PORT)
+	for _, field := range fields {
+		if strings.HasPrefix(field, "dpt:") {
+			port := strings.TrimPrefix(field, "dpt:")
+			if _, err := fmt.Sscanf(port, "%d", &route.ExternalPort); err != nil {
+				log.Printf("  failed to parse external port %q: %v", port, err)
+			}
+		}
+	}
+
+	// Parse target (to:IP:PORT)
+	for _, field := range fields {
+		if strings.HasPrefix(field, "to:") {
+			target := strings.TrimPrefix(field, "to:")
+			parts := strings.Split(target, ":")
+			if len(parts) == 2 {
