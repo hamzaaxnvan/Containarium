@@ -52,3 +52,30 @@ func TestQuickstartLocalIncus(t *testing.T) {
 	out, err := runQuickstartCLI(t, home, "quickstart", box, "--server", server)
 	require.NoError(t, err, "quickstart failed:\n%s", out)
 
+	// 2. the box actually exists on the daemon.
+	list, err := runQuickstartCLI(t, home, "list", "--server", server)
+	require.NoError(t, err, "list failed:\n%s", list)
+	require.Contains(t, list, box, "box not listed after quickstart")
+
+	// 3. real config was written under the temp HOME.
+	sshConfig := filepath.Join(home, ".containarium", "ssh_config")
+	require.FileExists(t, sshConfig)
+	require.Contains(t, readFileString(t, sshConfig), box, "ssh_config has no host for the box")
+
+	claudeCfg := filepath.Join(home, ".claude.json")
+	require.FileExists(t, claudeCfg)
+	require.Contains(t, readFileString(t, claudeCfg), "containarium-box", "agent MCP config not wired")
+
+	userSSHConfig := filepath.Join(home, ".ssh", "config")
+	require.FileExists(t, userSSHConfig)
+	require.Contains(t, readFileString(t, userSSHConfig), "Include", "Include line not added to ~/.ssh/config")
+
+	// 4. a managed keypair was generated (since no --ssh-key was passed).
+	require.FileExists(t, filepath.Join(home, ".ssh", "containarium_ed25519"))
+
+	// 5. idempotent — a second run succeeds and reuses the box.
+	out2, err := runQuickstartCLI(t, home, "quickstart", box, "--server", server)
+	require.NoError(t, err, "second quickstart (idempotency) failed:\n%s", out2)
+}
+
+// runQuickstartCLI runs the containarium binary with HOME redirected to the
