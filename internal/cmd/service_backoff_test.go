@@ -50,29 +50,3 @@ func unitSources(t *testing.T) map[string]string {
 	// lives — and is closer to what actually ships anyway.
 	sentinelUnit, err := buildSentinelUnit(sentinelUnitConfig{
 		SpotVM:     "spot-vm",
-		Zone:       "zone",
-		Project:    "project",
-		MemoryHigh: defaultSentinelMemoryHigh,
-		MemoryMax:  defaultSentinelMemoryMax,
-	})
-	if err != nil {
-		t.Fatalf("buildSentinelUnit: %v", err)
-	}
-
-	return map[string]string{
-		"daemon (systemdServiceTemplate)":       systemdServiceTemplate,
-		"daemon (scripts/containarium.service)": read("..", "..", "scripts", "containarium.service"),
-		"sentinel (generated unit)":             sentinelUnit,
-	}
-}
-
-// Every unit must bound its retry rate. Without these, a persistent
-// failure retries 12 times a minute forever.
-func TestUnitsHaveRestartBackoff(t *testing.T) {
-	for name, unit := range unitSources(t) {
-		t.Run(name, func(t *testing.T) {
-			for _, directive := range []string{"RestartSteps=", "RestartMaxDelaySec="} {
-				if !strings.Contains(unit, directive) {
-					t.Errorf("%s is missing %s — a persistent start failure would retry at a flat "+
-						"interval forever, which is #1152 (1655 restarts in 4 hours)", name, directive)
-				}
