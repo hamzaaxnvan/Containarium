@@ -51,30 +51,3 @@ func printConfig(w io.Writer, cfg DistroConfig, redact bool) error {
 	sb.WriteString("# containariumotel resolved config\n")
 	fmt.Fprintf(&sb, "distro_version       : %s\n", version)
 	fmt.Fprintf(&sb, "endpoint             : %s\n", or(cfg.Endpoint, "<unset>"))
-	fmt.Fprintf(&sb, "protocol             : %s\n", or(cfg.Protocol, "<default: http/protobuf>"))
-	fmt.Fprintf(&sb, "service_name         : %s\n", or(cfg.ServiceName, "<unset — SDK will default to unknown_service>"))
-	fmt.Fprintf(&sb, "resource_attributes  : %s\n", or(cfg.ResourceAttributes, "<unset>"))
-	fmt.Fprintf(&sb, "headers              : %s\n", formatHeaders(cfg.Headers, redact))
-	sb.WriteString("\n# Containarium identity (CONTAINARIUM_* env)\n")
-	fmt.Fprintf(&sb, "container.id         : %s\n", or(cfg.ContainerID, "<unset>"))
-	fmt.Fprintf(&sb, "backend.id           : %s\n", or(cfg.BackendID, "<unset>"))
-	fmt.Fprintf(&sb, "tenant.id            : %s\n", or(cfg.TenantID, "<unset>"))
-	fmt.Fprintf(&sb, "service.version      : %s\n", or(cfg.ServiceVersion, "<unset>"))
-	sb.WriteString("\n# Defended distro stamp (always present, never overridable)\n")
-	fmt.Fprintf(&sb, "containarium.distro  : go/%s\n", version)
-	sb.WriteString("\n")
-	if cfg.Endpoint != "" {
-		sb.WriteString("Status: telemetry pipeline will be configured.\n")
-	} else {
-		sb.WriteString("Status: TELEMETRY WILL BE NO-OP. Endpoint env not set; Init() will fail-open.\n")
-		sb.WriteString("Enable monitoring on this LXC with:\n")
-		sb.WriteString("  containarium monitoring enable <username>\n")
-	}
-	_, err := io.WriteString(w, sb.String())
-	return err
-}
-
-func or(s, fallback string) string {
-	if s == "" {
-		return fallback
-	}

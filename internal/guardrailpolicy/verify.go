@@ -59,33 +59,3 @@ func VerifyAttestation(att *pb.GuardrailAttestation, server *pb.ServerGuardrailP
 	return signer, nil
 }
 
-// VerifyClaims is every check of VerifyAttestation except the digest: it
-// needs only the attestation and the server policy, not the bytes. A caller
-// may run it first to refuse a bad attestation cheaply, but it proves nothing
-// about any data; VerifyAttestation must still be the check that accepts.
-func VerifyClaims(att *pb.GuardrailAttestation, server *pb.ServerGuardrailPolicy, require []pb.GuardrailKind) (*pb.GuardrailTrustedSigner, error) {
-	if server == nil || server.GetPolicy() == nil {
-		return nil, ErrNoServerPolicy
-	}
-	if err := CheckRevoked(att, server.GetRevokedSigners()); err != nil {
-		return nil, err
-	}
-	if len(server.GetTrustedSigners()) == 0 {
-		return nil, ErrNoTrustedSigner
-	}
-	var signer *pb.GuardrailTrustedSigner
-	for _, s := range server.GetTrustedSigners() {
-		if s.GetKeyId() == att.GetKeyId() {
-			signer = s
-			break
-		}
-	}
-	if signer == nil {
-		return nil, fmt.Errorf("%w (attestation key %s)", ErrUntrustedSigner, shortHex(att.GetKeyId()))
-	}
-	if err := guardrail.Verify(att, ed25519.PublicKey(signer.GetPublicKey())); err != nil {
-		return nil, err
-	}
-	want, err := Hash(server)
-	if err != nil {
-		return nil, err
