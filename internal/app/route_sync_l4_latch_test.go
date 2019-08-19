@@ -73,28 +73,3 @@ func TestSyncL4Routes_LatchesActiveAcrossEmptyRouteSet(t *testing.T) {
 	route2 := &RouteRecord{
 		FullDomain: "box-b.example",
 		TargetIP:   "203.0.113.8",
-		TargetPort: 22,
-		Protocol:   string(RouteProtocolTLSPassthrough),
-		Active:     true,
-	}
-	if err := j.syncL4Routes([]*RouteRecord{route2}); err != nil {
-		t.Fatalf("syncL4Routes(re-add): %v", err)
-	}
-	if !m.IsL4Active() {
-		t.Fatal("L4 should remain active across route churn")
-	}
-	if got := l4SNIs(t, m); len(got) != 1 || got[0] != "box-b.example" {
-		t.Fatalf("expected 1 SNI route [box-b.example], got %v", got)
-	}
-}
-
-// assertHTTPOff443 verifies the HTTP server is NOT listening on :443 — i.e.
-// layer4 owns :443. If srv0 ever regains :443 the listener was swapped back.
-func assertHTTPOff443(t *testing.T, baseURL string) {
-	t.Helper()
-	cfg := readConfig(t, baseURL)
-	apps, _ := cfg["apps"].(map[string]interface{})
-	httpApp, _ := apps["http"].(map[string]interface{})
-	if httpApp == nil {
-		return // no HTTP app at all is fine for this assertion
-	}

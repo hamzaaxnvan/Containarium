@@ -52,3 +52,31 @@ func NewJSONLFileRecorder(path string) (*JSONLRecorder, error) {
 }
 
 // NewJSONLRecorder wraps an already-open writer (e.g. a bytes.Buffer in
+// tests) instead of opening a file.
+func NewJSONLRecorder(w io.Writer) *JSONLRecorder {
+	return &JSONLRecorder{w: w}
+}
+
+// Record marshals rec as one JSON line and appends it.
+func (j *JSONLRecorder) Record(rec Record) error {
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("marshal session record: %w", err)
+	}
+	line = append(line, '\n')
+
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	if _, err := j.w.Write(line); err != nil {
+		return fmt.Errorf("write session record: %w", err)
+	}
+
+	return nil
+}
+
+// Reopen closes the sink and opens the same PATH again (#2415). logrotate in
+// create mode renames the sink and leaves a fresh file at the path; without a
+// reopen the plugin keeps appending to the renamed file for as long as
+// sshpiperd runs, so new sessions would land in a file about to be
+// compressed and expired. Wired to SIGHUP by ReopenOn.
