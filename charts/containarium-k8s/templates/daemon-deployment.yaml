@@ -1,0 +1,45 @@
+{{- if and .Values.gateway.namespace (not .Values.gateway.upstreamKeySecret) }}
+{{ fail "gateway.namespace is set (gateway routing enabled) but gateway.upstreamKeySecret is empty — the daemon will refuse to start (#1496). Generate an upstream keypair and set gateway.upstreamPublicKey/upstreamKeySecret (see values.yaml comments), or disable gateway routing with --set gateway.enabled=false --set gateway.namespace=\"\"." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "containarium-k8s.fullname" . }}-daemon
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "containarium-k8s.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.daemon.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "containarium-k8s.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "containarium-k8s.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "containarium-k8s.serviceAccountName" . }}
+      containers:
+        - name: daemon
+          image: {{ include "containarium-k8s.daemonImage" . }}
+          imagePullPolicy: {{ .Values.daemon.image.pullPolicy }}
+          args:
+            - daemon
+            - --runtime=k8s
+          env:
+            - name: CONTAINARIUM_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "containarium-k8s.fullname" . }}-daemon
+                  key: jwt-secret
+            - name: CONTAINARIUM_K8S_GATEWAY_NAMESPACE
+              value: {{ .Values.gateway.namespace | quote }}
+            - name: CONTAINARIUM_K8S_GATEWAY_HOST
+              value: {{ printf "%s-sshpiper.%s.svc.cluster.local" (include "containarium-k8s.fullname" .) .Values.gateway.namespace | quote }}
+            - name: CONTAINARIUM_K8S_GATEWAY_SSH_PORT
+              value: "22"
+            {{- if .Values.gateway.upstreamPublicKey }}
