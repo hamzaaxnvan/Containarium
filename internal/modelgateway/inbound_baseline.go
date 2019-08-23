@@ -25,3 +25,57 @@ type baselineRequest struct {
 	sub inboundSubject
 }
 
+// watch wraps the final response body. It runs as the last step of
+// ModifyResponse, so it sees exactly the bytes the client is sent.
+func (br *baselineRequest) watch(resp *http.Response) {
+	if resp.Body == nil || resp.Body == http.NoBody {
+		return
+	}
+	// Encoded bytes are opaque to the rules; count, never block.
+	if resp.Header.Get("Content-Encoding") != "" {
+		br.in.baselineUnscanned.Add(1)
+		return
+	}
+	resp.Body = &baselineTee{
+		src: resp.Body, br: br, limit: br.in.limit,
+		streaming: strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream"),
+	}
+}
+
+// baselineTee passes reads through unchanged and keeps a bounded copy whose
+// capacity never exceeds the limit. Past the limit the copy is dropped (the
+// response still flows) and the response is counted as unscanned.
+type baselineTee struct {
+	src       io.ReadCloser
+	br        *baselineRequest
+	limit     int
+	streaming bool
+	buf       []byte
+	over      bool
+	once      sync.Once
+}
+
+func (t *baselineTee) Read(p []byte) (int, error) {
+	n, err := t.src.Read(p)
+	if n > 0 && !t.over {
+		need := len(t.buf) + n
+		switch {
+		case need > t.limit:
+			t.over, t.buf = true, nil
+		case need > cap(t.buf):
+			// Double like append, but never past the limit.
+			grown := make([]byte, len(t.buf), min(max(2*cap(t.buf), need, 4096), t.limit))
+			copy(grown, t.buf)
+			t.buf = append(grown, p[:n]...)
+		default:
+			t.buf = append(t.buf, p[:n]...)
+		}
+	}
+	return n, err
+}
+
+// Close is called by the proxy after the last byte was written to the
+// client; the scan runs here, once.
+func (t *baselineTee) Close() error {
+	err := t.src.Close()
+	t.once.Do(t.finish)
