@@ -30,35 +30,3 @@ func diagnoseStates() []*pb.DebugContainerResponse {
 		{ContainerState: "stopped"},
 		{ContainerState: "running", HostUserExists: false},
 		{ContainerState: "running", HostUserExists: true, HostUserShell: "/usr/local/bin/containarium-shell"},
-		{ContainerState: "running", HostUserExists: true, HostUserShell: "/nonexistent", HostUserShellExists: false},
-		{ContainerState: "error: incus unreachable"},
-		{ContainerState: "running", HostUserExists: true, SshIngressHost: "sentinel.example.com"},
-	}
-}
-
-// extractContainariumCommands pulls each `containarium ...` invocation out of a
-// next_actions line. A line is prose with the command embedded, and may chain
-// two commands with &&.
-//
-// "containarium" also appears as an ARGUMENT to other tools in these hints —
-// `journalctl -u containarium -e --no-pager` — so a bare substring match
-// mistakes a unit name for a command and then reports a bogus failure. Require
-// the following token to look like a subcommand (not a flag) to tell them
-// apart.
-func extractContainariumCommands(action string) []string {
-	var out []string
-	for _, chunk := range strings.Split(action, "&&") {
-		idx := strings.Index(chunk, "containarium ")
-		if idx < 0 {
-			continue
-		}
-		rest := strings.TrimSpace(chunk[idx+len("containarium "):])
-		verb, _, _ := strings.Cut(rest, " ")
-		if verb == "" || strings.HasPrefix(verb, "-") {
-			continue // e.g. `journalctl -u containarium -e` — not an invocation
-		}
-		out = append(out, "containarium "+rest)
-	}
-	return out
-}
-
