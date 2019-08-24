@@ -1,0 +1,90 @@
+package sentinel
+
+import (
+	"errors"
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+// Fail2BanRunner is the small surface the fail2ban admin handlers
+// (Fail2BanBansHandler, Fail2BanUnbanHandler — #1962) need from
+// fail2ban-client. It exists as an interface — same pattern as
+// pkg/core/incus.MigrationRunner — so tests can substitute canned
+// fail2ban-client output/exit codes without a real fail2ban install,
+// which most dev sandboxes and CI runners don't have.
+type Fail2BanRunner interface {
+	// Run executes `fail2ban-client <args...>` and returns its combined
+	// stdout+stderr. args are passed straight to exec.Command, never
+	// through a shell, so jail names / IP values in them can never be
+	// used for command injection. A non-nil err just means
+	// fail2ban-client exited non-zero or couldn't run at all —
+	// fail2banClientRun below classifies what that means.
+	Run(args ...string) (output string, err error)
+}
+
+// execFail2BanRunner is the production Fail2BanRunner. It shells out to
+// the fail2ban-client CLI on the host — fail2ban-client has no JSON
+// mode, so the parsing helpers below work against its text output.
+type execFail2BanRunner struct {
+	// Path to the fail2ban-client binary. Empty means look on $PATH.
+	Path string
+}
+
+func (e execFail2BanRunner) Run(args ...string) (string, error) {
+	bin := e.Path
+	if bin == "" {
+		bin = "fail2ban-client"
+	}
+	// #nosec G204 -- args are fixed subcommand literals ("status", "get",
+	// "set", "unbanip", "ignoreip") plus a jail name / IP address that
+	// callers validate before this is ever reached (net.ParseIP for IPs;
+	// jail names are never interpolated into a shell string — they're a
+	// literal argv element). Never exec.Command("sh", "-c", ...).
+	cmd := exec.Command(bin, args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+var (
+	// errFail2BanUnavailable means this sentinel cannot answer fail2ban
+	// questions at all right now — fail2ban-client isn't on $PATH, or
+	// it's installed but the fail2ban service it talks to isn't
+	// running/reachable. Handlers map this to 404, not 500: it tells a
+	// caller "this sentinel cannot do that" rather than reporting a bug.
+	errFail2BanUnavailable = errors.New("fail2ban unavailable on this sentinel")
+
+	// errFail2BanJailNotFound means fail2ban-client itself rejected a
+	// jail name as unknown (its literal "... does not exist" error).
+	// Handlers map this to 404 too, but it's a distinct condition from
+	// errFail2BanUnavailable: fail2ban IS available here, the named jail
+	// just isn't one it knows about.
+	errFail2BanJailNotFound = errors.New("fail2ban jail not found")
+)
+
+// fail2banClientRun runs a fail2ban-client subcommand via runner and
+// classifies any failure into errFail2BanUnavailable or
+// errFail2BanJailNotFound so callers can map errors.Is() straight to
+// the right HTTP status. jail is the jail name being addressed (used
+// only to build a readable error message) — pass "" for
+// jail-independent commands like the top-level `status`.
+func fail2banClientRun(runner Fail2BanRunner, jail string, args ...string) (string, error) {
+	out, err := runner.Run(args...)
+	if err == nil {
+		return out, nil
+	}
+	if strings.Contains(out, "does not exist") {
+		if jail == "" {
+			jail = "(unknown)"
+		}
+		return out, fmt.Errorf("%w: %q: %s", errFail2BanJailNotFound, jail, strings.TrimSpace(out))
+	}
+	return out, fmt.Errorf("%w: %v: %s", errFail2BanUnavailable, err, strings.TrimSpace(out))
+}
+
+// fail2banListJails discovers the jails fail2ban-client currently knows
+// about on this host, from `fail2ban-client status`'s "Jail list:"
+// line. Never hardcoded — this works for whatever jails a given
+// sentinel happens to have configured (sshpiperd, sshd, both, or none
+// at all), matching #1962's explicit "don't assume a jail name" ask.
+func fail2banListJails(runner Fail2BanRunner) ([]string, error) {
