@@ -36,22 +36,3 @@ func TestIntegrationIncus_StackRoundTripsThroughGetAndList(t *testing.T) {
 	backend := New(container.NewWithBackend(client))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-
-	// With a stack: through the daemon's own create path (writes the key).
-	if _, err := backend.Create(ctx, box.BoxSpec{
-		Ref:       box.BoxRef{Tenant: withTenant},
-		Image:     incusenv.BoxImage(),
-		OSType:    pb.OSType_OS_TYPE_UBUNTU_2404,
-		Stack:     stack,
-		AutoStart: true,
-	}); err != nil {
-		t.Fatalf("create with stack %q: %v", stack, err)
-	}
-	// Without a stack: the same path, no stack requested.
-	if _, err := backend.Create(ctx, box.BoxSpec{
-		Ref:       box.BoxRef{Tenant: withoutTenant},
-		Image:     incusenv.BoxImage(),
-		OSType:    pb.OSType_OS_TYPE_UBUNTU_2404,
-		AutoStart: true,
-	}); err != nil {
-		t.Fatalf("create without a stack: %v", err)
