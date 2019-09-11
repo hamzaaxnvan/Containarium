@@ -285,3 +285,147 @@ func spawnBackgroundProcess(name, command, cwd string, captureMode CaptureMode, 
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return nil, fmt.Errorf("spawn: %w", err)
+	}
+
+	startedAt := time.Now()
+	record := RunRecord{
+		Version:     RunRecordVersion,
+		Name:        name,
+		PID:         cmd.Process.Pid,
+		BootID:      bootID,
+		Command:     command,
+		Cwd:         cwd,
+		CaptureMode: captureMode,
+		LogPath:     logPath,
+		StartedAt:   startedAt,
+		// Caller-asserted provenance (#1699) — see RunRecord.Actor for why
+		// this is not, and cannot be on this transport, an authenticated
+		// attribution.
+		Actor:           actor,
+		DelegationChain: delegationChain,
+	}
+	// Written before returning, so the run is discoverable even if the
+	// caller (or agent-box itself) dies immediately after this call. A run
+	// that can't be durably recorded is exactly the pre-#1672 bug, so this
+	// fails the spawn rather than silently degrading back to it.
+	if err := writeRunRecordAt(logDir, record); err != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = logFile.Close()
+		return nil, fmt.Errorf("write run record: %w", err)
+	}
+
+	mp := &managedProcess{
+		Name:      name,
+		PID:       cmd.Process.Pid,
+		Command:   command,
+		StartedAt: startedAt,
+		LogPath:   logPath,
+		cmd:       cmd,
+	}
+	processRegistry[name] = mp
+
+	// Reap exit asynchronously so we don't accumulate zombies. We don't
+	// remove the entry from the registry on exit — a list call can still
+	// surface it as not-alive, and the log file remains readable.
+	reapWG.Add(1)
+	go func() {
+		defer reapWG.Done()
+		_ = cmd.Wait()
+		_ = logFile.Close()
+
+		// Record the outcome instead of discarding it (the second finding
+		// #1672 fixes). ProcessState is set by Wait() whenever it actually
+		// waited on the process — including a signaled exit, where
+		// ExitCode() reports -1 rather than a WIFSIGNALED detail; either
+		// way ExitCode becomes non-nil, so ResolveOutcome reports "exited"
+		// rather than leaving the run's fate undetermined.
+		finishedAt := time.Now()
+		exitCode := cmd.ProcessState.ExitCode()
+		finished := record
+		finished.FinishedAt = &finishedAt
+		finished.ExitCode = &exitCode
+		// Best-effort: the process has already exited either way, and a
+		// write failure here (disk full, box dying) leaves the run
+		// correctly classified as "unknown" (A2) rather than silently
+		// "exited" — never a false clean exit. writeRunRecordAt(logDir, ...)
+		// — not writeRunRecord — deliberately: see the logDir comment above.
+		_ = writeRunRecordAt(logDir, finished)
+	}()
+
+	return mp, nil
+}
+
+// ----- process_list ----------------------------------------------------
+
+func processListTool() mcp.Tool {
+	return mcp.NewTool(
+		"process_list",
+		mcp.WithDescription(
+			"List background processes started via process_start. Reports PID, command, "+
+				"start time, log_path, and a liveness flag. Processes that have already "+
+				"exited still appear here until process_kill is called on them — useful "+
+				"for inspecting their final log output via tail_log.",
+		),
+	)
+}
+
+func handleProcessList(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Sourced from durable records, not processRegistry: the registry is
+	// per-agent-box-instance and empty after a reconnect, but a run started
+	// by a PRIOR instance must still be reported here (#1672) — including
+	// one that finished while no client was connected at all.
+	records, err := listRunRecords()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("process_list: %v", err)), nil
+	}
+
+	if len(records) == 0 {
+		return mcp.NewToolResultText("No background processes registered.\n"), nil
+	}
+
+	sort.Slice(records, func(i, j int) bool { return records[i].StartedAt.Before(records[j].StartedAt) })
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Found %d process(es):\n\n", len(records))
+	for _, r := range records {
+		outcome := ResolveOutcome(r, bootID, isAlive)
+		icon := "🟢"
+		if outcome != RunOutcomeRunning {
+			icon = "⚪"
+		}
+		fmt.Fprintf(&b, "%s %s  (pid %d, %s)\n", icon, r.Name, r.PID, outcome)
+		fmt.Fprintf(&b, "   Command:    %s\n", r.Command)
+		fmt.Fprintf(&b, "   Started at: %s\n", r.StartedAt.UTC().Format(time.RFC3339))
+		if r.Actor != "" {
+			// "asserted" is load-bearing: this is what the client claimed, not
+			// what the platform verified (#1699).
+			fmt.Fprintf(&b, "   Actor:      %s (asserted)\n", r.Actor)
+		}
+		if r.ExitCode != nil {
+			fmt.Fprintf(&b, "   Exit code:  %d\n", *r.ExitCode)
+		}
+		if r.FinishedAt != nil {
+			fmt.Fprintf(&b, "   Finished at: %s\n", r.FinishedAt.UTC().Format(time.RFC3339))
+		}
+		fmt.Fprintf(&b, "   Log path:   %s\n", r.LogPath)
+		b.WriteString("\n")
+	}
+	return mcp.NewToolResultText(b.String()), nil
+}
+
+// ----- process_kill ----------------------------------------------------
+
+func processKillTool() mcp.Tool {
+	return mcp.NewTool(
+		"process_kill",
+		mcp.WithDescription(
+			"Stop a process started via process_start. Sends SIGTERM by default and "+
+				"waits up to 2s for the process to exit. Pass force=true for SIGKILL. "+
+				"Removes the process from the registry on success — the log file is "+
+				"left in place so the agent can still read final output via tail_log.",
+		),
+		mcp.WithString("name",
+			mcp.Description("Process name (as returned by process_start or process_list)."),
+			mcp.Required(),

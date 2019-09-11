@@ -88,3 +88,48 @@ func fail2banClientRun(runner Fail2BanRunner, jail string, args ...string) (stri
 // sentinel happens to have configured (sshpiperd, sshd, both, or none
 // at all), matching #1962's explicit "don't assume a jail name" ask.
 func fail2banListJails(runner Fail2BanRunner) ([]string, error) {
+	out, err := fail2banClientRun(runner, "", "status")
+	if err != nil {
+		return nil, err
+	}
+	return parseJailList(out)
+}
+
+// parseJailList extracts jail names from `fail2ban-client status`
+// output, e.g.:
+//
+//	Status
+//	|- Number of jail:	2
+//	`- Jail list:	sshd, sshpiperd
+func parseJailList(out string) ([]string, error) {
+	const marker = "Jail list:"
+	for _, line := range strings.Split(out, "\n") {
+		idx := strings.Index(line, marker)
+		if idx == -1 {
+			continue
+		}
+		rest := strings.TrimSpace(line[idx+len(marker):])
+		if rest == "" {
+			return []string{}, nil
+		}
+		parts := strings.Split(rest, ",")
+		jails := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if p = strings.TrimSpace(p); p != "" {
+				jails = append(jails, p)
+			}
+		}
+		return jails, nil
+	}
+	return nil, fmt.Errorf("%w: could not find %q in fail2ban-client status output: %s", errFail2BanUnavailable, marker, strings.TrimSpace(out))
+}
+
+// fail2banJailBanned returns jail's currently-banned IPs, parsed from
+// `fail2ban-client status <jail>`'s "Banned IP list:" line.
+func fail2banJailBanned(runner Fail2BanRunner, jail string) ([]string, error) {
+	out, err := fail2banClientRun(runner, jail, "status", jail)
+	if err != nil {
+		return nil, err
+	}
+	return parseBannedIPList(out)
+}
