@@ -323,3 +323,979 @@ func (x *ZapAlert) GetMethod() string {
 	if x != nil {
 		return x.Method
 	}
+	return ""
+}
+
+func (x *ZapAlert) GetEvidence() string {
+	if x != nil {
+		return x.Evidence
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetSolution() string {
+	if x != nil {
+		return x.Solution
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetCweIds() string {
+	if x != nil {
+		return x.CweIds
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetReferences() string {
+	if x != nil {
+		return x.References
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetFirstScanRunId() string {
+	if x != nil {
+		return x.FirstScanRunId
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetLastScanRunId() string {
+	if x != nil {
+		return x.LastScanRunId
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetFirstSeenAt() string {
+	if x != nil {
+		return x.FirstSeenAt
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetLastSeenAt() string {
+	if x != nil {
+		return x.LastSeenAt
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetResolvedAt() string {
+	if x != nil {
+		return x.ResolvedAt
+	}
+	return ""
+}
+
+func (x *ZapAlert) GetSuppressed() bool {
+	if x != nil {
+		return x.Suppressed
+	}
+	return false
+}
+
+func (x *ZapAlert) GetSuppressedReason() string {
+	if x != nil {
+		return x.SuppressedReason
+	}
+	return ""
+}
+
+// ZapAlertSummary provides aggregate counts
+type ZapAlertSummary struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	TotalAlerts      int32                  `protobuf:"varint,1,opt,name=total_alerts,json=totalAlerts,proto3" json:"total_alerts,omitempty"`
+	OpenAlerts       int32                  `protobuf:"varint,2,opt,name=open_alerts,json=openAlerts,proto3" json:"open_alerts,omitempty"`
+	ResolvedAlerts   int32                  `protobuf:"varint,3,opt,name=resolved_alerts,json=resolvedAlerts,proto3" json:"resolved_alerts,omitempty"`
+	SuppressedAlerts int32                  `protobuf:"varint,4,opt,name=suppressed_alerts,json=suppressedAlerts,proto3" json:"suppressed_alerts,omitempty"`
+	HighCount        int32                  `protobuf:"varint,5,opt,name=high_count,json=highCount,proto3" json:"high_count,omitempty"`
+	MediumCount      int32                  `protobuf:"varint,6,opt,name=medium_count,json=mediumCount,proto3" json:"medium_count,omitempty"`
+	LowCount         int32                  `protobuf:"varint,7,opt,name=low_count,json=lowCount,proto3" json:"low_count,omitempty"`
+	InfoCount        int32                  `protobuf:"varint,8,opt,name=info_count,json=infoCount,proto3" json:"info_count,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *ZapAlertSummary) Reset() {
+	*x = ZapAlertSummary{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ZapAlertSummary) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ZapAlertSummary) ProtoMessage() {}
+
+func (x *ZapAlertSummary) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ZapAlertSummary.ProtoReflect.Descriptor instead.
+func (*ZapAlertSummary) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ZapAlertSummary) GetTotalAlerts() int32 {
+	if x != nil {
+		return x.TotalAlerts
+	}
+	return 0
+}
+
+func (x *ZapAlertSummary) GetOpenAlerts() int32 {
+	if x != nil {
+		return x.OpenAlerts
+	}
+	return 0
+}
+
+func (x *ZapAlertSummary) GetResolvedAlerts() int32 {
+	if x != nil {
+		return x.ResolvedAlerts
+	}
+	return 0
+}
+
+func (x *ZapAlertSummary) GetSuppressedAlerts() int32 {
+	if x != nil {
+		return x.SuppressedAlerts
+	}
+	return 0
+}
+
+func (x *ZapAlertSummary) GetHighCount() int32 {
+	if x != nil {
+		return x.HighCount
+	}
+	return 0
+}
+
+func (x *ZapAlertSummary) GetMediumCount() int32 {
+	if x != nil {
+		return x.MediumCount
+	}
+	return 0
+}
+
+func (x *ZapAlertSummary) GetLowCount() int32 {
+	if x != nil {
+		return x.LowCount
+	}
+	return 0
+}
+
+func (x *ZapAlertSummary) GetInfoCount() int32 {
+	if x != nil {
+		return x.InfoCount
+	}
+	return 0
+}
+
+// ZapConfig returns the current ZAP configuration
+type ZapConfig struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Whether ZAP scanning is enabled
+	Enabled bool `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	// Scan interval (e.g., "720h" for 30 days)
+	Interval string `protobuf:"bytes,2,opt,name=interval,proto3" json:"interval,omitempty"`
+	// Whether ZAP is installed and available
+	ZapAvailable bool `protobuf:"varint,3,opt,name=zap_available,json=zapAvailable,proto3" json:"zap_available,omitempty"`
+	// ZAP version string
+	ZapVersion    string `protobuf:"bytes,4,opt,name=zap_version,json=zapVersion,proto3" json:"zap_version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ZapConfig) Reset() {
+	*x = ZapConfig{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ZapConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ZapConfig) ProtoMessage() {}
+
+func (x *ZapConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ZapConfig.ProtoReflect.Descriptor instead.
+func (*ZapConfig) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ZapConfig) GetEnabled() bool {
+	if x != nil {
+		return x.Enabled
+	}
+	return false
+}
+
+func (x *ZapConfig) GetInterval() string {
+	if x != nil {
+		return x.Interval
+	}
+	return ""
+}
+
+func (x *ZapConfig) GetZapAvailable() bool {
+	if x != nil {
+		return x.ZapAvailable
+	}
+	return false
+}
+
+func (x *ZapConfig) GetZapVersion() string {
+	if x != nil {
+		return x.ZapVersion
+	}
+	return ""
+}
+
+type TriggerZapScanRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional: container to scope the scan to. Empty = scan every
+	// exposed route, the historical default. Set to scope a single
+	// container's routes for an on-demand operator scan.
+	ContainerName string `protobuf:"bytes,1,opt,name=container_name,json=containerName,proto3" json:"container_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TriggerZapScanRequest) Reset() {
+	*x = TriggerZapScanRequest{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TriggerZapScanRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TriggerZapScanRequest) ProtoMessage() {}
+
+func (x *TriggerZapScanRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TriggerZapScanRequest.ProtoReflect.Descriptor instead.
+func (*TriggerZapScanRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *TriggerZapScanRequest) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+type TriggerZapScanResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Scan run ID
+	ScanRunId string `protobuf:"bytes,1,opt,name=scan_run_id,json=scanRunId,proto3" json:"scan_run_id,omitempty"`
+	// Human-readable message
+	Message       string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TriggerZapScanResponse) Reset() {
+	*x = TriggerZapScanResponse{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TriggerZapScanResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TriggerZapScanResponse) ProtoMessage() {}
+
+func (x *TriggerZapScanResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TriggerZapScanResponse.ProtoReflect.Descriptor instead.
+func (*TriggerZapScanResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *TriggerZapScanResponse) GetScanRunId() string {
+	if x != nil {
+		return x.ScanRunId
+	}
+	return ""
+}
+
+func (x *TriggerZapScanResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+type ListZapScanRunsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Maximum number of scan runs to return (default: 20)
+	Limit int32 `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
+	// Offset for pagination
+	Offset int32 `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	// Optional: filter to scan runs scoped to this container. Empty =
+	// return all runs (both cluster-wide and container-scoped).
+	ContainerName string `protobuf:"bytes,3,opt,name=container_name,json=containerName,proto3" json:"container_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListZapScanRunsRequest) Reset() {
+	*x = ListZapScanRunsRequest{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListZapScanRunsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListZapScanRunsRequest) ProtoMessage() {}
+
+func (x *ListZapScanRunsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListZapScanRunsRequest.ProtoReflect.Descriptor instead.
+func (*ListZapScanRunsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ListZapScanRunsRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+func (x *ListZapScanRunsRequest) GetOffset() int32 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+func (x *ListZapScanRunsRequest) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+type ListZapScanRunsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ScanRuns      []*ZapScanRun          `protobuf:"bytes,1,rep,name=scan_runs,json=scanRuns,proto3" json:"scan_runs,omitempty"`
+	TotalCount    int32                  `protobuf:"varint,2,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListZapScanRunsResponse) Reset() {
+	*x = ListZapScanRunsResponse{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListZapScanRunsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListZapScanRunsResponse) ProtoMessage() {}
+
+func (x *ListZapScanRunsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListZapScanRunsResponse.ProtoReflect.Descriptor instead.
+func (*ListZapScanRunsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ListZapScanRunsResponse) GetScanRuns() []*ZapScanRun {
+	if x != nil {
+		return x.ScanRuns
+	}
+	return nil
+}
+
+func (x *ListZapScanRunsResponse) GetTotalCount() int32 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+type ListZapAlertsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Filter by risk level (optional)
+	Risk string `protobuf:"bytes,1,opt,name=risk,proto3" json:"risk,omitempty"`
+	// Filter by status: "open", "resolved", "suppressed" (optional)
+	Status string `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	// Maximum number of alerts to return (default: 50)
+	Limit int32 `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"`
+	// Offset for pagination
+	Offset int32 `protobuf:"varint,4,opt,name=offset,proto3" json:"offset,omitempty"`
+	// Filter by domain/host — substring-matched against the alert's target
+	// URL (optional). E.g. "wordpress.kafeido.app" matches any alert whose
+	// url contains that host.
+	Domain        string `protobuf:"bytes,5,opt,name=domain,proto3" json:"domain,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListZapAlertsRequest) Reset() {
+	*x = ListZapAlertsRequest{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListZapAlertsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListZapAlertsRequest) ProtoMessage() {}
+
+func (x *ListZapAlertsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListZapAlertsRequest.ProtoReflect.Descriptor instead.
+func (*ListZapAlertsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *ListZapAlertsRequest) GetRisk() string {
+	if x != nil {
+		return x.Risk
+	}
+	return ""
+}
+
+func (x *ListZapAlertsRequest) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *ListZapAlertsRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+func (x *ListZapAlertsRequest) GetOffset() int32 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+func (x *ListZapAlertsRequest) GetDomain() string {
+	if x != nil {
+		return x.Domain
+	}
+	return ""
+}
+
+type ListZapAlertsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Alerts        []*ZapAlert            `protobuf:"bytes,1,rep,name=alerts,proto3" json:"alerts,omitempty"`
+	TotalCount    int32                  `protobuf:"varint,2,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListZapAlertsResponse) Reset() {
+	*x = ListZapAlertsResponse{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListZapAlertsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListZapAlertsResponse) ProtoMessage() {}
+
+func (x *ListZapAlertsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListZapAlertsResponse.ProtoReflect.Descriptor instead.
+func (*ListZapAlertsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *ListZapAlertsResponse) GetAlerts() []*ZapAlert {
+	if x != nil {
+		return x.Alerts
+	}
+	return nil
+}
+
+func (x *ListZapAlertsResponse) GetTotalCount() int32 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+type GetZapAlertSummaryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetZapAlertSummaryRequest) Reset() {
+	*x = GetZapAlertSummaryRequest{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetZapAlertSummaryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetZapAlertSummaryRequest) ProtoMessage() {}
+
+func (x *GetZapAlertSummaryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetZapAlertSummaryRequest.ProtoReflect.Descriptor instead.
+func (*GetZapAlertSummaryRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{10}
+}
+
+type GetZapAlertSummaryResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Summary       *ZapAlertSummary       `protobuf:"bytes,1,opt,name=summary,proto3" json:"summary,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetZapAlertSummaryResponse) Reset() {
+	*x = GetZapAlertSummaryResponse{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetZapAlertSummaryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetZapAlertSummaryResponse) ProtoMessage() {}
+
+func (x *GetZapAlertSummaryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetZapAlertSummaryResponse.ProtoReflect.Descriptor instead.
+func (*GetZapAlertSummaryResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *GetZapAlertSummaryResponse) GetSummary() *ZapAlertSummary {
+	if x != nil {
+		return x.Summary
+	}
+	return nil
+}
+
+type SuppressZapAlertRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Alert ID to suppress
+	AlertId int64 `protobuf:"varint,1,opt,name=alert_id,json=alertId,proto3" json:"alert_id,omitempty"`
+	// Reason for suppression
+	Reason        string `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SuppressZapAlertRequest) Reset() {
+	*x = SuppressZapAlertRequest{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SuppressZapAlertRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SuppressZapAlertRequest) ProtoMessage() {}
+
+func (x *SuppressZapAlertRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SuppressZapAlertRequest.ProtoReflect.Descriptor instead.
+func (*SuppressZapAlertRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *SuppressZapAlertRequest) GetAlertId() int64 {
+	if x != nil {
+		return x.AlertId
+	}
+	return 0
+}
+
+func (x *SuppressZapAlertRequest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+type SuppressZapAlertResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Message       string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SuppressZapAlertResponse) Reset() {
+	*x = SuppressZapAlertResponse{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SuppressZapAlertResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SuppressZapAlertResponse) ProtoMessage() {}
+
+func (x *SuppressZapAlertResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SuppressZapAlertResponse.ProtoReflect.Descriptor instead.
+func (*SuppressZapAlertResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *SuppressZapAlertResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+type GetZapConfigRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetZapConfigRequest) Reset() {
+	*x = GetZapConfigRequest{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetZapConfigRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetZapConfigRequest) ProtoMessage() {}
+
+func (x *GetZapConfigRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetZapConfigRequest.ProtoReflect.Descriptor instead.
+func (*GetZapConfigRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{14}
+}
+
+type GetZapConfigResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Config        *ZapConfig             `protobuf:"bytes,1,opt,name=config,proto3" json:"config,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetZapConfigResponse) Reset() {
+	*x = GetZapConfigResponse{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetZapConfigResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetZapConfigResponse) ProtoMessage() {}
+
+func (x *GetZapConfigResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetZapConfigResponse.ProtoReflect.Descriptor instead.
+func (*GetZapConfigResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *GetZapConfigResponse) GetConfig() *ZapConfig {
+	if x != nil {
+		return x.Config
+	}
+	return nil
+}
+
+type GetZapReportRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Scan run ID
+	ScanRunId string `protobuf:"bytes,1,opt,name=scan_run_id,json=scanRunId,proto3" json:"scan_run_id,omitempty"`
+	// Report format: "html", "json", "csv"
+	Format        string `protobuf:"bytes,2,opt,name=format,proto3" json:"format,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetZapReportRequest) Reset() {
+	*x = GetZapReportRequest{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetZapReportRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetZapReportRequest) ProtoMessage() {}
+
+func (x *GetZapReportRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetZapReportRequest.ProtoReflect.Descriptor instead.
+func (*GetZapReportRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *GetZapReportRequest) GetScanRunId() string {
+	if x != nil {
+		return x.ScanRunId
+	}
+	return ""
+}
+
+func (x *GetZapReportRequest) GetFormat() string {
+	if x != nil {
+		return x.Format
+	}
+	return ""
+}
+
+type GetZapReportResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Report content (base64-encoded for binary formats)
+	Content string `protobuf:"bytes,1,opt,name=content,proto3" json:"content,omitempty"`
+	// Content type (e.g., "text/html", "application/json")
+	ContentType string `protobuf:"bytes,2,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"`
+	// Suggested filename
+	Filename      string `protobuf:"bytes,3,opt,name=filename,proto3" json:"filename,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetZapReportResponse) Reset() {
+	*x = GetZapReportResponse{}
+	mi := &file_containarium_v1_zap_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetZapReportResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetZapReportResponse) ProtoMessage() {}
+
+func (x *GetZapReportResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_zap_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetZapReportResponse.ProtoReflect.Descriptor instead.
+func (*GetZapReportResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_zap_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *GetZapReportResponse) GetContent() string {
+	if x != nil {
+		return x.Content
+	}
+	return ""
+}
+
+func (x *GetZapReportResponse) GetContentType() string {
+	if x != nil {
