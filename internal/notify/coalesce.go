@@ -31,3 +31,36 @@ type Coalescer struct {
 	state map[runKey]*runState
 }
 
+type runKey struct{ user, run string }
+
+type runState struct {
+	seen     map[string]bool // request ids pushed or waiting to be
+	pending  []string        // ids found but not pushed yet, in order
+	lastPush time.Time
+}
+
+// NewCoalescer returns a coalescer with the given window.
+func NewCoalescer(window time.Duration) *Coalescer {
+	return &Coalescer{window: window, state: map[runKey]*runState{}}
+}
+
+// Step takes the open requests of every live run of user, keyed by run name,
+// and returns the pushes now due. A run of user missing from open has ended,
+// and its state is dropped.
+func (c *Coalescer) Step(user string, open map[string][]Request, now time.Time) []Push {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.state {
+		if _, ok := open[k.run]; k.user == user && !ok {
+			delete(c.state, k)
+		}
+	}
+	var out []Push
+	for run, reqs := range open {
+		k := runKey{user, run}
+		st := c.state[k]
+		if st == nil {
+			st = &runState{seen: map[string]bool{}}
+			c.state[k] = st
+		}
+		byID := make(map[string]Request, len(reqs))

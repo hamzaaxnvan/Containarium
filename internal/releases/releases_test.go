@@ -31,36 +31,3 @@ func TestLatest_CachesWithinTTL(t *testing.T) {
 		t.Fatalf("first Latest: %v", err)
 	}
 	if cached {
-		t.Error("first call should not be from cache")
-	}
-	if rel.TagName != "v0.23.0" {
-		t.Errorf("tag = %q", rel.TagName)
-	}
-
-	// Second call within TTL → cache hit, no extra upstream request.
-	_, cached2, err := c.Latest(context.Background())
-	if err != nil || !cached2 {
-		t.Fatalf("second Latest: cached=%v err=%v", cached2, err)
-	}
-	if got := atomic.LoadInt32(&hits); got != 1 {
-		t.Errorf("expected 1 upstream hit, got %d", got)
-	}
-}
-
-func TestLatest_RefetchesAfterTTL(t *testing.T) {
-	var hits int32
-	srv := fakeGitHub(t, "v0.23.0", &hits)
-	now := time.Unix(1_000_000, 0)
-	c := NewClient(WithURL(srv.URL), WithTTL(time.Hour), WithClock(func() time.Time { return now }))
-
-	if _, _, err := c.Latest(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	now = now.Add(2 * time.Hour) // advance past TTL
-	if _, cached, err := c.Latest(context.Background()); err != nil || cached {
-		t.Fatalf("post-TTL call should refetch: cached=%v err=%v", cached, err)
-	}
-	if got := atomic.LoadInt32(&hits); got != 2 {
-		t.Errorf("expected 2 upstream hits, got %d", got)
-	}
-}
