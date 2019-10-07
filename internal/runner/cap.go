@@ -26,17 +26,3 @@ const DefaultMaxRunnersTotal = 20
 // it with t.Setenv.
 func MaxRunnersTotal() int {
 	raw := strings.TrimSpace(os.Getenv("MAX_RUNNERS_TOTAL"))
-	if raw == "" {
-		return DefaultMaxRunnersTotal
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n <= 0 {
-		// A typo'd/garbage value should fail safe to the default
-		// rather than disable the cap (n<=0) or crash.
-		return DefaultMaxRunnersTotal
-	}
-	return n
-}
-
-// CountLiveRunners reports how many runner boxes currently exist on
-// the daemon — the capacity signal the cap is enforced against. We
