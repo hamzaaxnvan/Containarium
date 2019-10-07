@@ -112,3 +112,231 @@ func ContextWithTestSubjectAct(ctx context.Context, username string, roles []str
 // chain of HTTP middleware would layer metadata onto a single request.
 // Merges into whatever metadata is already present rather than replacing
 // it, so it composes with the other ContextWithTestSubject* helpers. #1678.
+func ContextWithTestJTI(ctx context.Context, jti string) context.Context {
+	md, _ := metadata.FromIncomingContext(ctx)
+	md = md.Copy()
+	md.Set(MDKeyJTI, jti)
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+// ContextWithTestRunID is a test-only helper that stamps a run_id onto an
+// existing gRPC-incoming test context, the same way ContextWithTestJTI
+// layers a jti on. #1922.
+func ContextWithTestRunID(ctx context.Context, runID string) context.Context {
+	md, _ := metadata.FromIncomingContext(ctx)
+	md = md.Copy()
+	md.Set(MDKeyRunID, runID)
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+// ContextWithTestTrackerConn is a test-only helper that stamps a
+// tracker_conn onto an existing gRPC-incoming test context, the same way
+// ContextWithTestRunID layers a run_id on. #1922.
+func ContextWithTestTrackerConn(ctx context.Context, conn string) context.Context {
+	md, _ := metadata.FromIncomingContext(ctx)
+	md = md.Copy()
+	md.Set(MDKeyTrackerConn, conn)
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+// ContextWithTestRunTenant is a test-only helper that stamps a run_tenant
+// onto an existing gRPC-incoming test context, the same way
+// ContextWithTestTrackerConn layers a tracker_conn on. #2268.
+func ContextWithTestRunTenant(ctx context.Context, tenant string) context.Context {
+	md, _ := metadata.FromIncomingContext(ctx)
+	md = md.Copy()
+	md.Set(MDKeyRunTenant, tenant)
+	return metadata.NewIncomingContext(ctx, md)
+}
+
+// SubjectFromGRPCContext returns the authenticated username and
+// roles. It looks first at incoming gRPC metadata (the production
+// path: HTTP middleware → gateway annotator → gRPC metadata), then
+// falls back to context values for in-process gRPC calls and tests.
+// The boolean is false if no subject is in either place.
+func SubjectFromGRPCContext(ctx context.Context) (username string, roles []string, ok bool) {
+	if md, mdOk := metadata.FromIncomingContext(ctx); mdOk {
+		if vals := md.Get(MDKeyUsername); len(vals) > 0 && vals[0] != "" {
+			username = vals[0]
+			ok = true
+		}
+		if vals := md.Get(MDKeyRoles); len(vals) > 0 && vals[0] != "" {
+			roles = splitRoles(vals[0])
+		}
+	}
+	if !ok {
+		if u, found := UsernameFromContext(ctx); found && u != "" {
+			username = u
+			ok = true
+		}
+	}
+	if len(roles) == 0 {
+		if r, found := RolesFromContext(ctx); found {
+			roles = r
+		}
+	}
+	return username, roles, ok
+}
+
+// ScopesFromGRPCContext returns the JWT's `scopes` claim
+// propagated through metadata or context. Returns (nil, false)
+// when the claim wasn't carried — distinct from (empty, true)
+// which means an explicit empty grant. HasScope treats nil
+// as "no restriction" (Phase 1.7 backwards-compat), so callers
+// can pass the returned slice through to HasScope directly.
+//
+// That distinction is load-bearing and used to be documented here without
+// being implemented (#1722): a carried-but-empty metadata value returned
+// (nil, false), so "this credential holds nothing" and "this credential is
+// unrestricted" produced the same answer — the permissive one. The
+// context-value path below never had the bug, so the two transports
+// disagreed about identical input.
+//
+// No production writer emits an empty value — the gateway annotator and the
+// HTTP middleware both guard on len(scopes) > 0, and generate() omits the
+// claim entirely for zero scopes — so correcting this changes no real
+// caller's authority. What it fixes is tests: an assertion written as "a
+// caller with no scopes is denied" silently passed whether or not the guard
+// under test existed, because such a caller was read as unrestricted and the
+// handler answered normally.
+func ScopesFromGRPCContext(ctx context.Context) (scopes []string, present bool) {
+	if md, mdOk := metadata.FromIncomingContext(ctx); mdOk {
+		if vals := md.Get(MDKeyScopes); len(vals) > 0 {
+			// Carried, so present — even when empty. ParseScopes returns nil
+			// for an empty string, which HasScope would read as unrestricted,
+			// so hand back a non-nil empty slice instead.
+			parsed := ParseScopes(vals[0])
+			if parsed == nil {
+				parsed = []string{}
+			}
+			return parsed, true
+		}
+	}
+	if s, found := ScopesFromContext(ctx); found {
+		return s, s != nil
+	}
+	return nil, false
+}
+
+// ActFromGRPCContext returns the JWT's `act` delegation claim (#1677)
+// propagated through metadata or context — the same
+// metadata-then-context-value fallback ScopesFromGRPCContext and
+// SubjectFromGRPCContext use, and for the same reason: the primary API
+// surface is REST via grpc-gateway, and the caller's claims only survive
+// that hop as gRPC metadata, not a context value. Returns (nil, false) when
+// no delegation was carried — the valid, backward-compatible "unattributed"
+// case, never an error.
+func ActFromGRPCContext(ctx context.Context) (act *Actor, present bool) {
+	if md, mdOk := metadata.FromIncomingContext(ctx); mdOk {
+		if vals := md.Get(MDKeyAct); len(vals) > 0 && vals[0] != "" {
+			var a Actor
+			if err := json.Unmarshal([]byte(vals[0]), &a); err == nil {
+				return &a, true
+			}
+			return nil, false
+		}
+	}
+	if a, found := ActFromContext(ctx); found {
+		return a, a != nil
+	}
+	return nil, false
+}
+
+// JTIFromGRPCContext returns the authenticated token's own `jti` claim
+// (#1678), propagated through metadata or context the same way
+// ActFromGRPCContext's claim is. Audit attribution is the first gRPC-side
+// consumer — nothing needed jti off the HTTP layer before. Returns ("",
+// false) when no jti was carried (pre-1.2 tokens minted without one, or a
+// caller that bypassed the standard mint path).
+func JTIFromGRPCContext(ctx context.Context) (jti string, present bool) {
+	if md, mdOk := metadata.FromIncomingContext(ctx); mdOk {
+		if vals := md.Get(MDKeyJTI); len(vals) > 0 && vals[0] != "" {
+			return vals[0], true
+		}
+	}
+	if j, found := JTIFromContext(ctx); found && j != "" {
+		return j, true
+	}
+	return "", false
+}
+
+// RunIDFromGRPCContext returns the authenticated token's `run_id` claim
+// (#1815), propagated through metadata or context the same way
+// JTIFromGRPCContext's claim is. Returns ("", false) when no run id was
+// carried — the valid, backward-compatible case for every operator/human
+// token and every token minted before run binding existed.
+func RunIDFromGRPCContext(ctx context.Context) (runID string, present bool) {
+	if md, mdOk := metadata.FromIncomingContext(ctx); mdOk {
+		if vals := md.Get(MDKeyRunID); len(vals) > 0 && vals[0] != "" {
+			return vals[0], true
+		}
+	}
+	if r, found := RunIDFromContext(ctx); found && r != "" {
+		return r, true
+	}
+	return "", false
+}
+
+// TrackerConnFromGRPCContext returns the authenticated token's
+// `tracker_conn` claim (#1922), propagated through metadata or context the
+// same way RunIDFromGRPCContext's claim is. Returns ("", false) when no
+// tracker connection binding was carried — the valid, common case for
+// every operator/human token and every run not bound to a connection.
+func TrackerConnFromGRPCContext(ctx context.Context) (conn string, present bool) {
+	if md, mdOk := metadata.FromIncomingContext(ctx); mdOk {
+		if vals := md.Get(MDKeyTrackerConn); len(vals) > 0 && vals[0] != "" {
+			return vals[0], true
+		}
+	}
+	if c, found := TrackerConnFromContext(ctx); found && c != "" {
+		return c, true
+	}
+	return "", false
+}
+
+// RunTenantFromGRPCContext returns the authenticated token's `run_tenant`
+// claim (#2268), propagated through metadata or context the same way
+// TrackerConnFromGRPCContext's claim is. Returns ("", false) when no run
+// tenant was carried — every operator/human token, and every run token
+// minted before the claim existed.
+func RunTenantFromGRPCContext(ctx context.Context) (tenant string, present bool) {
+	if md, mdOk := metadata.FromIncomingContext(ctx); mdOk {
+		if vals := md.Get(MDKeyRunTenant); len(vals) > 0 && vals[0] != "" {
+			return vals[0], true
+		}
+	}
+	if t, found := RunTenantFromContext(ctx); found && t != "" {
+		return t, true
+	}
+	return "", false
+}
+
+// HasRole reports whether `roles` contains `wanted`.
+func HasRole(roles []string, wanted string) bool {
+	for _, r := range roles {
+		if r == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// RequireRole returns nil if the authenticated subject holds
+// `role`. Returns Unauthenticated if no subject is in context,
+// PermissionDenied if the subject exists but lacks the role.
+//
+// Use at the top of handlers that should be admin-only — fleet
+// topology disclosure, cross-backend infrastructure operations,
+// peer-to-peer system endpoints. Tenant-scoped operations should
+// use AuthorizeTenant instead; this is for the strictly-narrower
+// class of cluster-wide ops. Tracks audit finding A-MED-4.
+func RequireRole(ctx context.Context, role string) error {
+	_, roles, ok := SubjectFromGRPCContext(ctx)
+	if !ok {
+		return status.Error(codes.Unauthenticated, "no authenticated subject in request context")
+	}
+	if !HasRole(roles, role) {
+		return status.Error(codes.PermissionDenied, "role required: "+role)
+	}
+	return nil
+}
