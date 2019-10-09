@@ -15,3 +15,11 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: nested-incus-spike
+  namespace: __NAMESPACE__
+  labels:
+    benchmark: agent-sandbox-density
+    scenario: nested-incus-pod
+spec:
+  restartPolicy: Never
+  containers:
+    - name: nested-incus
