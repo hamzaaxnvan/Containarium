@@ -190,3 +190,67 @@ func TestWithZpool_HungCommandReturnsWithinTheDeadline(t *testing.T) {
 	}
 	if got[0].Zpool != nil || got[1].Zpool != nil || got[0].UsedBytes != 50 {
 		t.Fatalf("got %+v %+v, want the Incus readings and no Zpool", got[0], got[1])
+	}
+}
+
+// The monitor's tick is not held by it either: the snapshot lands with the
+// Incus numbers, well inside the monitor's own timeout.
+func TestMonitor_ATickWithAHungZpoolStillCompletes(t *testing.T) {
+	f := &fakeRun{hang: map[string]bool{"tank": true}}
+	m := New(WithZpool(baseRead(zfsPool("default", "tank")), f.run, 50*time.Millisecond), Options{Timeout: 5 * time.Second, Logf: func(string, ...any) {}})
+
+	start := time.Now()
+	m.Tick()
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("Tick took %s", time.Since(start))
+	}
+	snap := m.Snapshot()
+	if len(snap.Pools) != 1 || snap.Pools[0].UsedBytes != 50 {
+		t.Fatalf("snapshot = %+v, want the Incus reading", snap.Pools)
+	}
+}
+
+// The Incus read failing is passed through untouched.
+func TestWithZpool_PassesTheReadErrorThrough(t *testing.T) {
+	boom := errors.New("list storage pools: boom")
+	f := &fakeRun{}
+	_, err := WithZpool(func() ([]incus.StoragePoolUsage, error) { return nil, boom }, f.run, time.Second)()
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the read error", err)
+	}
+	if f.called() != 0 {
+		t.Error("zpool was run although the pool list failed")
+	}
+}
+
+// A name that could be read as an option or a path never reaches the command
+// line.
+func TestWithZpool_NeverRunsAnUnsafePoolName(t *testing.T) {
+	f := &fakeRun{}
+	read := baseRead(
+		zfsPool("a", "-evil"), zfsPool("b", "../x"), zfsPool("c", "a b"), zfsPool("d", "tank; reboot"), zfsPool("e", ""),
+	)
+	got, err := WithZpool(read, f.run, time.Second)()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.called() != 0 {
+		t.Fatalf("zpool was run %d times for names that are not pool names: %v", f.called(), f.calls)
+	}
+	for _, p := range got {
+		if p.Zpool != nil {
+			t.Errorf("%s got Zpool numbers", p.Name)
+		}
+	}
+}
+
+// A zpool that ignores its deadline (stuck in uninterruptible I/O) must not
+// hold the read, and must not be joined by another one on the next tick.
+func TestWithZpool_DoesNotStackOnAStuckCommand(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	runs := 0
+	stuck := func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		mu.Lock()
+		runs++
+		mu.Unlock()
