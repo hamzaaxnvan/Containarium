@@ -4,3 +4,5 @@ self.__BUILD_MANIFEST = {
     "beforeFiles": [],
     "fallback": []
   },
+  "sortedPages": [
+    "/_app",
