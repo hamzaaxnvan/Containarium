@@ -29,34 +29,3 @@
 # internal/depsguard/testdata is run against the live sum.golang.org and
 # must exit with the status its `expect` file names, failing fixtures for
 # the named rule only; seeded unsafe environments and a seeded second go.mod
-# must fail, and the pinned env and a root-only layout must pass.
-set -euo pipefail
-
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-fixtures="$repo_root/internal/depsguard/testdata"
-
-build() {
-  local out=$1
-  (cd "$repo_root" && go build -o "$out" ./cmd/deps-guard)
-}
-
-# expect_exit <want> <log> <cmd...>: run cmd, require exit status <want>.
-expect_exit() {
-  local want=$1 log=$2 rc
-  shift 2
-  set +e
-  "$@" >"$log" 2>&1
-  rc=$?
-  set -e
-  if [[ $rc -ne $want ]]; then
-    echo "self-test FAIL: '$*' exited $rc, want $want" >&2
-    sed 's/^/    /' "$log" >&2
-    return 1
-  fi
-}
-
-self_test() {
-  local d=$work bin dir name want log
-  bin="$d/deps-guard"
-  build "$bin"
-
