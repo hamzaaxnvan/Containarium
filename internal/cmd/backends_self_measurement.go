@@ -36,3 +36,80 @@ Requires --server pointing at the daemon's HTTP address.`,
 
 func init() {
 	backendsCmd.AddCommand(backendsSelfMeasurementCmd)
+	backendsSelfMeasurementCmd.Flags().StringVarP(&selfMeasurementFormat, "format", "f", "text",
+		"Output format: text, json")
+}
+
+// programDigest mirrors the proto ProgramDigest wire shape.
+type programDigest struct {
+	Name   string `json:"name,omitempty"`
+	Digest string `json:"digest,omitempty"`
+}
+
+// selfMeasurement mirrors the proto SelfMeasurement wire shape (camelCase via
+// grpc-gateway JSON).
+type selfMeasurement struct {
+	HashAlgorithm      string          `json:"hashAlgorithm,omitempty"`
+	BinaryDigest       string          `json:"binaryDigest,omitempty"`
+	ProgramDigests     []programDigest `json:"programDigests,omitempty"`
+	ConfigDigest       string          `json:"configDigest,omitempty"`
+	MeasurementDigest  string          `json:"measurementDigest,omitempty"`
+	Signature          string          `json:"signature,omitempty"`
+	SignatureAlgorithm string          `json:"signatureAlgorithm,omitempty"`
+	TpmBacked          bool            `json:"tpmBacked,omitempty"`
+	Signed             bool            `json:"signed,omitempty"`
+	SigningCertPem     string          `json:"signingCertPem,omitempty"`
+	MeasuredAt         string          `json:"measuredAt,omitempty"`
+	DaemonVersion      string          `json:"daemonVersion,omitempty"`
+}
+
+// selfMeasurementResp mirrors GetSelfMeasurementResponse.
+type selfMeasurementResp struct {
+	Measurement *selfMeasurement `json:"measurement"`
+	BackendID   string           `json:"backendId"`
+}
+
+func runBackendsSelfMeasurement(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (the platform daemon's HTTP address, e.g. http://host:8080)")
+	}
+	backendID := ""
+	if len(args) == 1 {
+		backendID = args[0]
+	}
+
+	url := strings.TrimSuffix(serverAddr, "/") + "/v1/integrity/self-measurement"
+	if backendID != "" {
+		url += "?backend_id=" + backendID
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+
+	httpClient := &http.Client{Timeout: 1 * time.Minute}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	if selfMeasurementFormat == "json" {
+		if _, err := cmd.OutOrStdout().Write(body); err != nil {
+			return fmt.Errorf("write response: %w", err)
+		}
+		fmt.Fprintln(cmd.OutOrStdout())
+		return nil
+	}
+
+	var out selfMeasurementResp
+	if err := json.Unmarshal(body, &out); err != nil {
+		return fmt.Errorf("decode response: %w", err)

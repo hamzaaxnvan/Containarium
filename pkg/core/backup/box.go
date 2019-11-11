@@ -298,3 +298,304 @@ func (c *boxClaims) held(dev uint64) uint64 {
 
 // boxPreflight refuses a backup that cannot fit before the export starts,
 // and claims the box and the space for the caller. The returned release
+// gives both back; call it when the backup is done, whatever the outcome
+// (calling it again is a no-op).
+//
+// Backups of one box are serialized: a second while one runs is
+// ErrBoxBackupInProgress. Backups of different boxes run concurrently, but
+// each reserves its estimate on the filesystems it uses, and a later
+// pre-flight requires free space for its own estimate PLUS the full
+// reservations of the backups in flight. That over-refuses: statfs already
+// excludes the bytes a running backup has written, and they are counted
+// again in its reservation. It is deliberate. Crediting the drop in free
+// space would credit other processes' writes as the backup's own and could
+// admit a backup that cannot fit, which is the failure this guards against;
+// refusing a backup that would have fitted is the safe error, and the caller
+// retries when the running one finishes.
+//
+// The estimate is the box's disk usage. Incus may stage one compressed copy
+// in each of boxStagingDirs (on 6.0 LTS, before the first byte streams),
+// and we stage the encrypted archive in m.dir, which the cap bounds. The
+// compressed sizes are not known up front, so each staging area is asked
+// for the uncompressed usage: conservative, never optimistic. Two areas on
+// one filesystem are counted together.
+func (m *Manager) boxPreflight(containerName string) (release func(), err error) {
+	usage, err := m.box.BoxDiskUsage(containerName)
+	if err != nil {
+		return nil, fmt.Errorf("read disk usage of %s for the free-space pre-flight: %w", containerName, err)
+	}
+	if usage <= 0 {
+		return nil, fmt.Errorf("disk usage of %s is unknown, so the free-space pre-flight cannot run", containerName)
+	}
+	if err := os.MkdirAll(m.dir, 0o700); err != nil {
+		return nil, err
+	}
+	// Check-and-claim is atomic: the statfs calls are quick, and holding
+	// the lock across them is what closes the race.
+	c := &m.boxClaims
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, busy := c.inFlight[containerName]; busy {
+		return nil, fmt.Errorf("%w: %s (retry when it finishes)", ErrBoxBackupInProgress, containerName)
+	}
+	ours := min(usage, m.maxBoxBytes)
+	type area struct {
+		need  uint64
+		free  uint64
+		paths []string
+	}
+	byDevice := map[uint64]*area{}
+	var order []uint64
+	add := func(path string, need int64) error {
+		ds, err := m.freeSpace(path)
+		if err != nil {
+			return fmt.Errorf("free-space pre-flight on %s: %w", path, err)
+		}
+		a, ok := byDevice[ds.Device]
+		if !ok {
+			a = &area{free: ds.Free}
+			byDevice[ds.Device] = a
+			order = append(order, ds.Device)
+		}
+		a.need += uint64(need) // #nosec G115 -- need is a positive byte count
+		a.paths = append(a.paths, path)
+		return nil
+	}
+	if err := add(m.dir, ours); err != nil {
+		return nil, err
+	}
+	for _, dir := range m.boxStagingDirs {
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			log.Printf("[backup] free-space pre-flight: Incus staging dir %s not found; not counted", dir)
+			continue
+		}
+		if err := add(dir, usage); err != nil {
+			return nil, err
+		}
+	}
+	claim := &boxClaim{box: containerName, need: map[uint64]uint64{}}
+	for _, dev := range order {
+		a := byDevice[dev]
+		held := c.held(dev)
+		if a.free < a.need+held {
+			return nil, fmt.Errorf("%w: %s needs %d bytes free for a box using %d bytes (plus %d reserved by backups in progress), has %d",
+				ErrInsufficientSpace, strings.Join(a.paths, " and "), a.need, usage, held, a.free)
+		}
+		claim.need[dev] = a.need
+	}
+	if c.inFlight == nil {
+		c.inFlight = map[string]*boxClaim{}
+	}
+	c.inFlight[containerName] = claim
+	return func() { m.releaseBoxClaim(claim) }, nil
+}
+
+// releaseBoxClaim gives back a claim, and only that claim: a stale or
+// repeated release never drops a later backup's claim on the same box.
+func (m *Manager) releaseBoxClaim(claim *boxClaim) {
+	c := &m.boxClaims
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.inFlight[claim.box] == claim {
+		delete(c.inFlight, claim.box)
+	}
+}
+
+// filterBoxArchive copies an Incus instance backup from src to dst, gzip in
+// and gzip out. On the way it drops the contents of the excluded
+// directories (keeping the directory entries), digests every regular file,
+// and appends the manifest as the last entry. Every other entry, including
+// its PAX records (xattrs, file capabilities), is re-emitted unchanged.
+//
+// Memory is independent of the archive's size: file contents stream
+// through. The manifest itself is held until the end, so it grows with the
+// number of files (about a hundred bytes each), not with their size.
+//
+// limit bounds the uncompressed stream as well as (in stageDump) the stored
+// archive, as DefaultMaxDumpBytes does for a dump: a box of zeros or a
+// sparse file compresses to almost nothing and must not be decompressed
+// without bound.
+//
+// A hard link at a kept path whose target is excluded keeps its content:
+// the content of every dropped regular file is set aside in spillDir,
+// encrypted to a key that exists only in memory for this call, and the
+// first kept name is re-emitted as a regular file from it. Later kept
+// names link to that one. The spill is deleted on return. It holds at most
+// the excluded content, which the box's disk usage (what the free-space
+// pre-flight counts) already includes.
+func filterBoxArchive(src io.Reader, dst io.Writer, box string, now time.Time, limit int64, spillDir string) error {
+	br := bufio.NewReader(src)
+	magic, err := br.Peek(2)
+	if err != nil {
+		return fmt.Errorf("read export: %w", err)
+	}
+	if !bytes.Equal(magic, []byte{0x1f, 0x8b}) {
+		return fmt.Errorf("export is not gzip-compressed (magic %x): a whole-box backup needs the Incus backup compression to be gzip", magic)
+	}
+	gzr, err := gzip.NewReader(br)
+	if err != nil {
+		return fmt.Errorf("read export: %w", err)
+	}
+	plain := &boundedReader{r: gzr, limit: limit}
+	tr := tar.NewReader(plain)
+	// BestSpeed: the stream is recompressed on the daemon, single-threaded,
+	// on the backup's critical path; storage is cheaper than hours.
+	gzw, err := gzip.NewWriterLevel(dst, gzip.BestSpeed)
+	if err != nil {
+		return err
+	}
+	tw := tar.NewWriter(gzw)
+
+	mf := BoxManifest{Version: boxManifestVersion, Box: box, CreatedAt: now, Files: []BoxManifestFile{}, Config: []BoxManifestFile{}}
+	for _, d := range boxExcludedDirs {
+		mf.Excluded = append(mf.Excluded, "/"+d)
+	}
+	h := sha256.New()
+	spill := &boxSpill{dir: spillDir}
+	defer spill.close()
+	promotedLinks := map[string]string{}
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read export: %w", err)
+		}
+		name := strings.TrimPrefix(hdr.Name, "./")
+		if name == BoxManifestPath {
+			return fmt.Errorf("export already carries an entry at the manifest path %s", BoxManifestPath)
+		}
+		rel, inRootfs := strings.CutPrefix(name, boxRootfsPrefix)
+		if inRootfs && boxExcluded(rel) {
+			// A dropped regular file may have another name outside the
+			// excluded directories, carried later in the tar as a hard
+			// link to this one. Keep its content aside until the end.
+			if hdr.Typeflag == tar.TypeReg {
+				if err := spill.add(name, hdr, io.LimitReader(tr, hdr.Size)); err != nil {
+					return fmt.Errorf("set aside %s: %w", name, err)
+				}
+			}
+			continue
+		}
+		if hdr.Typeflag == tar.TypeLink {
+			targetName := strings.TrimPrefix(hdr.Linkname, "./")
+			target, targetInRootfs := strings.CutPrefix(targetName, boxRootfsPrefix)
+			if targetInRootfs && boxExcluded(target) {
+				// The content's first name was excluded, this one is kept.
+				if promoted, ok := promotedLinks[targetName]; ok {
+					// An earlier kept name already carries the content.
+					hdr.Linkname = promoted
+					if inRootfs {
+						mf.Links = append(mf.Links, BoxManifestLink{Path: "/" + rel, Target: "/" + strings.TrimPrefix(strings.TrimPrefix(promoted, "./"), boxRootfsPrefix)})
+					}
+				} else {
+					// This name becomes the regular file.
+					body, src, ok, err := spill.open(targetName)
+					if err != nil {
+						return fmt.Errorf("restore %s for %s: %w", targetName, name, err)
+					}
+					if !ok {
+						// The target was not a regular file (nothing was set
+						// aside); there is no content to keep.
+						log.Printf("[backup] whole-box backup of %s: hard link %s points at excluded %s, which has no content; dropped", box, name, targetName)
+						continue
+					}
+					reg := *src
+					reg.Name, reg.Linkname, reg.Typeflag = hdr.Name, "", tar.TypeReg
+					entry, err := copyEntry(tw, h, &reg, body)
+					if err != nil {
+						return err
+					}
+					promotedLinks[targetName] = hdr.Name
+					if inRootfs {
+						entry.Path = "/" + rel
+						mf.Files = append(mf.Files, entry)
+					}
+					continue
+				}
+			} else if inRootfs && targetInRootfs {
+				mf.Links = append(mf.Links, BoxManifestLink{Path: "/" + rel, Target: "/" + target})
+			}
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			if err := tw.WriteHeader(hdr); err != nil {
+				return fmt.Errorf("write %s: %w", name, err)
+			}
+			continue
+		}
+		entry, err := copyEntry(tw, h, hdr, tr)
+		if err != nil {
+			return err
+		}
+		if inRootfs {
+			entry.Path = "/" + rel
+			mf.Files = append(mf.Files, entry)
+		} else {
+			entry.Path = name
+			mf.Config = append(mf.Config, entry)
+		}
+	}
+	// After the tar end marker only zero padding may follow, and the gzip
+	// stream must end cleanly: a truncated export is a failed backup, never
+	// a short one.
+	trailing, err := io.CopyN(zeroOnly{}, plain, maxBoxTrailingBytes+1)
+	switch {
+	case errors.Is(err, errNonZeroTrailing) || trailing > maxBoxTrailingBytes:
+		return fmt.Errorf("read export: trailing data after the end of the archive")
+	case err != nil && !errors.Is(err, io.EOF):
+		return fmt.Errorf("read export: %w", err)
+	}
+
+	body, err := json.Marshal(&mf)
+	if err != nil {
+		return fmt.Errorf("encode manifest: %w", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{
+		Name: BoxManifestPath, Typeflag: tar.TypeReg, Mode: 0o600, Size: int64(len(body)), ModTime: now,
+	}); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	return gzw.Close()
+}
+
+// copyEntry writes a regular file entry from body, digesting it.
+func copyEntry(tw *tar.Writer, h hash.Hash, hdr *tar.Header, body io.Reader) (BoxManifestFile, error) {
+	if err := tw.WriteHeader(hdr); err != nil {
+		return BoxManifestFile{}, fmt.Errorf("write %s: %w", hdr.Name, err)
+	}
+	h.Reset()
+	n, err := io.CopyN(io.MultiWriter(tw, h), body, hdr.Size)
+	if err != nil {
+		return BoxManifestFile{}, fmt.Errorf("copy %s: %w", hdr.Name, err)
+	}
+	return BoxManifestFile{Size: n, SHA256: hex.EncodeToString(h.Sum(nil))}, nil
+}
+
+// boxSpill keeps the content of dropped regular files, in case a kept hard
+// link needs it. Each file is its own age segment, appended to one temp
+// file and encrypted to an identity held only in memory, so the host holds
+// ciphertext only, as for the staged archive.
+type boxSpill struct {
+	dir      string
+	f        *os.File
+	identity *age.X25519Identity
+	end      int64
+	entries  map[string]boxSpillEntry
+}
+
+type boxSpillEntry struct {
+	off, n int64
+	hdr    *tar.Header
+}
+
+func (s *boxSpill) add(name string, hdr *tar.Header, body io.Reader) error {
+	if s.f == nil {
+		id, err := age.GenerateX25519Identity()
+		if err != nil {
