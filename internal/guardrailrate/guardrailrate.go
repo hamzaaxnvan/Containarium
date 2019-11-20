@@ -67,3 +67,72 @@ type Limiter struct {
 }
 
 type bucket struct {
+	lim        *rate.Limiter
+	lastSeen   time.Time
+	lastLogged time.Time
+	suppressed int
+}
+
+// New builds the limiter named name (it appears in refusals and log lines).
+func New(name string, lim Limit, opts ...Option) *Limiter {
+	l := &Limiter{name: name, now: time.Now, logf: log.Printf}
+	for _, o := range opts {
+		o(l)
+	}
+	if lim.PerMinute <= 0 {
+		return l
+	}
+	burst := lim.Burst
+	if burst <= 0 {
+		burst = int(lim.PerMinute)
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	l.every = rate.Limit(lim.PerMinute / 60)
+	l.burst = burst
+	l.idleTTL = time.Duration(float64(burst) / float64(l.every) * float64(time.Second))
+	l.buckets = make(map[string]*bucket)
+	return l
+}
+
+// Enabled reports whether the limiter refuses anything at all.
+func (l *Limiter) Enabled() bool { return l != nil && l.every > 0 }
+
+// Check consumes one token from subject's bucket. It returns nil when the
+// call may proceed, or a RESOURCE_EXHAUSTED status with a RetryInfo detail
+// when the caller is over the limit; a refused call consumes nothing.
+func (l *Limiter) Check(subject string) error {
+	if !l.Enabled() {
+		return nil
+	}
+	now := l.now()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sweep(now)
+	b, ok := l.buckets[subject]
+	if !ok {
+		b = &bucket{lim: rate.NewLimiter(l.every, l.burst)}
+		l.buckets[subject] = b
+	}
+	b.lastSeen = now
+	if b.lim.AllowN(now, 1) {
+		return nil
+	}
+
+	missing := 1 - b.lim.TokensAt(now)
+	retry := time.Duration(math.Ceil(missing/float64(l.every))) * time.Second
+	if retry < time.Second {
+		retry = time.Second
+	}
+	l.logThrottled(subject, b, now)
+
+	st := status.New(codes.ResourceExhausted,
+		fmt.Sprintf("%s rate limit exceeded for this caller; retry in %s", l.name, retry))
+	if withInfo, err := st.WithDetails(&errdetails.RetryInfo{RetryDelay: durationpb.New(retry)}); err == nil {
+		st = withInfo
+	}
+	return st.Err()
+}
+
