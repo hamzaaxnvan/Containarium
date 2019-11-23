@@ -13,3 +13,11 @@ func TestInFleetCertScopeFromFlags(t *testing.T) {
 		t.Fatalf("scope = %+v, want the flag values", scope)
 	}
 
+	empty, err := inFleetCertScopeFromFlags("", nil, nil)
+	if err != nil {
+		t.Fatalf("no flags: %v", err)
+	}
+	if !empty.Empty() {
+		t.Fatalf("no flags gave scope %+v, want empty", empty)
+	}
+
