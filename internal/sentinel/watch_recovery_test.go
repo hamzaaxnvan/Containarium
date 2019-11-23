@@ -33,38 +33,3 @@ func TestWatchOnly_StoppedTargetGetsStarted(t *testing.T) {
 
 	if p.startCalls != 1 {
 		t.Fatalf("startCalls = %d, want 1", p.startCalls)
-	}
-	if !wb.down {
-		t.Fatal("wb.down should be true after observing StatusStopped")
-	}
-}
-
-func TestWatchOnly_FailedStartGrowsBackoffIndependentlyOfPrimary(t *testing.T) {
-	primary := &fakeRecoveryProvider{status: StatusTerminated, startErr: errors.New("primary down too")}
-	watched := &fakeRecoveryProvider{status: StatusTerminated, startErr: errors.New("no spot capacity")}
-	cfg := Config{RecoveryBackoffInitial: 30 * time.Second, RecoveryBackoffMax: 5 * time.Minute}
-
-	m, primaryBackend := newMaintenanceManager(t, primary, cfg)
-	m.AddWatchOnlyBackend("ase1-prod", watched)
-	wb := m.watchOnly[0]
-	ctx := context.Background()
-
-	// Drive the PRIMARY backend's recovery once — must not perturb the
-	// watch-only target's independent timeline.
-	m.diagnoseAndRecover(ctx, primaryBackend)
-	if wb.recoveryBackoff != 0 {
-		t.Fatalf("watch-only backoff should be untouched by primary recovery; got %v", wb.recoveryBackoff)
-	}
-
-	m.diagnoseAndRecoverWatchOnly(ctx, wb)
-	if watched.startCalls != 1 {
-		t.Fatalf("startCalls = %d, want 1", watched.startCalls)
-	}
-	if wb.recoveryBackoff != 30*time.Second {
-		t.Fatalf("backoff after first failure = %v, want 30s", wb.recoveryBackoff)
-	}
-	// The primary's own backoff must likewise be unaffected by the
-	// watch-only attempt.
-	if m.recoveryBackoff != 30*time.Second {
-		t.Fatalf("primary backoff should reflect only its own failure; got %v", m.recoveryBackoff)
-	}
