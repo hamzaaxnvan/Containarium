@@ -26,3 +26,31 @@ type MeterRow struct {
 	BlockedCalls int64 `json:"blocked_calls,omitempty"`
 }
 
+// Meter is the in-memory per-tenant model-token writer the metering plane lacks
+// today. Prototype: in-memory only; production writes the same shape into
+// usage_rollups (see the design note's "metering/billing fit").
+type Meter struct {
+	mu   sync.Mutex
+	rows map[meterKey]*MeterRow
+}
+
+// NewMeter returns an empty Meter.
+func NewMeter() *Meter { return &Meter{rows: map[meterKey]*MeterRow{}} }
+
+func (m *Meter) record(tenant, skill, provider string, u Usage) {
+	m.add(tenant, skill, provider, u, false)
+}
+
+// recordBlocked meters a call whose response the inbound scan blocked.
+func (m *Meter) recordBlocked(tenant, skill, provider string, u Usage) {
+	m.add(tenant, skill, provider, u, true)
+}
+
+func (m *Meter) add(tenant, skill, provider string, u Usage, blocked bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := meterKey{tenant, skill, provider, u.Model}
+	r := m.rows[k]
+	if r == nil {
+		r = &MeterRow{Tenant: tenant, Skill: skill, Provider: provider, Model: u.Model}
+		m.rows[k] = r
