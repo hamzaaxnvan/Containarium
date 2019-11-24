@@ -112,3 +112,60 @@ func runPrune(_ *cobra.Command, _ []string) error {
 	if pruneDryRun {
 		fmt.Printf("\ndry-run: would delete %d container(s). Re-run without --dry-run to delete.\n", len(matches))
 		return nil
+	}
+
+	if !pruneYes {
+		fmt.Printf("\nDelete these %d container(s)? [y/N]: ", len(matches))
+		reader := bufio.NewReader(os.Stdin)
+		resp, _ := reader.ReadString('\n')
+		if r := strings.TrimSpace(strings.ToLower(resp)); r != "y" && r != "yes" {
+			fmt.Println("Cancelled — nothing deleted.")
+			return nil
+		}
+	}
+
+	var deleted, failed int
+	for _, c := range matches {
+		key := pruneDeleteKey(c)
+		if err := pruneDelete(key, pruneForce); err != nil {
+			fmt.Printf("  ✗ %s: %v\n", key, err)
+			failed++
+			continue
+		}
+		fmt.Printf("  ✓ %s deleted\n", key)
+		deleted++
+	}
+	fmt.Printf("\nPruned %d/%d container(s).\n", deleted, len(matches))
+	if failed > 0 {
+		return fmt.Errorf("%d container(s) failed to delete", failed)
+	}
+	return nil
+}
+
+// filterForPrune is the pure selection logic: which containers match the
+// filters. Core containers and protected boxes (#284) are NEVER matched
+// (infrastructure + runner safety, regardless of the other filters). Filters
+// combine with AND. olderThan == 0 / state == "" / nameContains == "" /
+// empty labels each mean "don't filter on that". A box with no CreatedAt is
+// excluded by an olderThan filter (can't prove it's old enough). Pure — no IO,
+// `now` injected — so it's unit-tested directly.
+func filterForPrune(containers []incus.ContainerInfo, state, nameContains string, olderThan time.Duration, labels map[string]string, now time.Time) []incus.ContainerInfo {
+	var matches []incus.ContainerInfo
+	for _, c := range containers {
+		if c.Role.IsCoreRole() {
+			continue
+		}
+		// Protected boxes (#284, e.g. persistent runners) are never bulk-deleted
+		// — a "clean up leaked boxes" sweep must not take out a runner. Removing
+		// one takes a deliberate single-box `containarium delete`.
+		if c.DeletePolicy == incus.DeletePolicyProtected {
+			continue
+		}
+		if state == "running" && !strings.EqualFold(c.State, "Running") {
+			continue
+		}
+		if state == "stopped" && !strings.EqualFold(c.State, "Stopped") {
+			continue
+		}
+		if nameContains != "" &&
+			!strings.Contains(c.Name, nameContains) &&

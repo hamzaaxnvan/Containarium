@@ -24,16 +24,3 @@ func TestResolveInstanceType(t *testing.T) {
 		{"ubuntu+unspecified → container", pb.OSType_OS_TYPE_UBUNTU_2404, pb.IsolationType_ISOLATION_TYPE_UNSPECIFIED, incusapi.InstanceTypeContainer, false},
 		{"no os+unspecified → container", pb.OSType_OS_TYPE_UNSPECIFIED, pb.IsolationType_ISOLATION_TYPE_UNSPECIFIED, incusapi.InstanceTypeContainer, false},
 		{"ubuntu+vm → vm", pb.OSType_OS_TYPE_UBUNTU_2404, pb.IsolationType_ISOLATION_TYPE_VM, incusapi.InstanceTypeVM, false},
-		{"rocky+vm → vm", pb.OSType_OS_TYPE_ROCKY_9, pb.IsolationType_ISOLATION_TYPE_VM, incusapi.InstanceTypeVM, false},
-		{"ubuntu+container → container", pb.OSType_OS_TYPE_UBUNTU_2404, pb.IsolationType_ISOLATION_TYPE_CONTAINER, incusapi.InstanceTypeContainer, false},
-		{"windows+vm → vm", pb.OSType_OS_TYPE_WINDOWS_2022, pb.IsolationType_ISOLATION_TYPE_VM, incusapi.InstanceTypeVM, false},
-		{"windows+container → error", pb.OSType_OS_TYPE_WINDOWS_2022, pb.IsolationType_ISOLATION_TYPE_CONTAINER, "", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := resolveInstanceType(tt.osType, tt.isolation)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
-			}
-			if got != tt.want {
-				t.Errorf("got %q, want %q", got, tt.want)

@@ -160,3 +160,57 @@ func openNoSymlinks(root *os.Root, ref string) (*os.Root, error) {
 		}
 		if !info.IsDir() {
 			release()
+			return nil, fmt.Errorf("%w: %q: %s is not a directory (symlinks are refused)", ErrBadRef, ref, part)
+		}
+		hook(hookBeforeOpenDir, part)
+		next, err := cur.OpenRoot(part)
+		if err != nil {
+			release()
+			return nil, fmt.Errorf("%w: %q: %s: %v", ErrBadRef, ref, part, errors.Unwrap(err))
+		}
+		got, err := next.Stat(".")
+		if err != nil || !os.SameFile(info, got) {
+			_ = next.Close()
+			release()
+			return nil, fmt.Errorf("%w: %q: %s changed while it was being opened", ErrBadRef, ref, part)
+		}
+		release()
+		cur = next
+	}
+	return cur, nil
+}
+
+// Snapshot copies the dataset staged at ref into a new directory under
+// parent ("" = os.TempDir()). parent must be daemon-private and outside the
+// staging root. On any error nothing is left under parent.
+func (a *Area) Snapshot(ref, parent string) (*Snapshot, error) {
+	if err := validRef(ref); err != nil {
+		return nil, err
+	}
+	if err := a.checkParent(parent); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(a.root)
+	if err != nil {
+		return nil, ErrStagingRootUnavailable
+	}
+	defer func() { _ = root.Close() }()
+
+	src, err := openNoSymlinks(root, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = src.Close() }()
+
+	dir, err := os.MkdirTemp(parent, "guardrail-snapshot-")
+	if err != nil {
+		return nil, err
+	}
+	if err := copyTree(src, dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("snapshot %q: %w", ref, err)
+	}
+	return &Snapshot{Dir: dir}, nil
+}
+
+// copyTree copies every directory and regular file under src into dst.
