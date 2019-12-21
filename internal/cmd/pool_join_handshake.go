@@ -106,39 +106,3 @@ func readUnitJournal(unit string, since time.Time) (string, error) {
 	// the check next to the exec that depends on it.
 	if !validUnitName.MatchString(unit) {
 		return "", fmt.Errorf("refusing to read the journal for %q: not a valid unit name", unit)
-	}
-
-	// #nosec G204 -- the binary is the literal "journalctl"; the only
-	// non-literal argument is the unit name, which is validated immediately
-	// above and never reaches a shell (exec.Command does not use one).
-	out, err := exec.Command("journalctl",
-		"-u", unit,
-		"--since", since.Format("2006-01-02 15:04:05"),
-		"--no-pager", "-n", "200",
-	).CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("read journal for %s: %w", unit, err)
-	}
-	return string(out), nil
-}
-
-// waitForTunnelHandshake polls the unit journal until the handshake is
-// decisively registered or rejected, or the timeout elapses.
-//
-// Returns Unknown rather than an error when the journal is unreadable: a host
-// without journald must still be able to join. Reporting "could not confirm"
-// is honest; failing the join would be a regression for those hosts.
-func waitForTunnelHandshake(read journalReader, unit string, since time.Time, timeout, poll time.Duration) (tunnelHandshakeOutcome, string) {
-	if poll <= 0 {
-		poll = 500 * time.Millisecond
-	}
-	deadline := time.Now().Add(timeout)
-
-	var lastOutcome = tunnelHandshakeUnknown
-	var lastDetail string
-	for {
-		journal, err := read(unit, since)
-		if err == nil {
-			if outcome, detail := classifyTunnelJournal(journal); outcome != tunnelHandshakeUnknown {
-				// A rejection can be followed by a success once a token is
-				// registered, but not the other way round within one join, so
