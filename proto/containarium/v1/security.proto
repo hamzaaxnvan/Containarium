@@ -1,0 +1,204 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// ClamavReport represents a single ClamAV scan result for a container
+message ClamavReport {
+  // Database ID
+  int64 id = 1;
+
+  // Container name that was scanned
+  string container_name = 2;
+
+  // Username associated with the container
+  string username = 3;
+
+  // Scan status: "clean", "infected", "incomplete", "unsupported_size" or
+  // "not_installed" (see status_enum; a scan that could not finish is never
+  // reported clean, #2496). The verdict is produced by the scan running inside
+  // the tenant's own box, so it is self-reported.
+  string status = 4;
+
+  // Number of infected files found
+  int32 findings_count = 5;
+
+  // Infected file lines from ClamAV output
+  string findings = 6;
+
+  // When the scan was performed (ISO 8601 timestamp)
+  string scanned_at = 7;
+
+  // How long the scan took
+  string scan_duration = 8;
+
+  // When the report was created in the database
+  string created_at = 9;
+
+  // Backend ID identifying which node performed the scan
+  string backend_id = 10;
+
+  // Typed form of status (#2631). status stays populated for compatibility.
+  ClamavScanStatus status_enum = 11;
+
+  // Why a scan produced no verdict (status other than clean/infected); empty
+  // otherwise. Never contains file paths.
+  string reason = 12;
+}
+
+// ClamavScanStatus is the outcome of a tenant-run, in-box ClamAV scan (#2631).
+// Only a clamscan run that exits 0 with no findings is CLEAN, and even then the
+// verdict is self-reported by the scan inside the tenant's own box.
+enum ClamavScanStatus {
+  CLAMAV_SCAN_STATUS_UNSPECIFIED = 0;
+  CLAMAV_SCAN_STATUS_CLEAN = 1;
+  CLAMAV_SCAN_STATUS_INFECTED = 2;
+  // The scan could not finish or could not be started (error, timeout, out of
+  // memory, box not running). Never treated as clean.
+  CLAMAV_SCAN_STATUS_INCOMPLETE = 3;
+  // No scan has ever been requested for the box: no platform assurance.
+  CLAMAV_SCAN_STATUS_NEVER_SCANNED = 4;
+  // The box has less memory than ClamAV needs (4 GB); no scan was attempted.
+  CLAMAV_SCAN_STATUS_UNSUPPORTED_SIZE = 5;
+  // ClamAV or its signatures are not installed in the box.
+  CLAMAV_SCAN_STATUS_NOT_INSTALLED = 6;
+}
+
+// ClamavContainerSummary provides per-container scan summary
+message ClamavContainerSummary {
+  // Container name
+  string container_name = 1;
+
+  // Username associated with the container
+  string username = 2;
+
+  // When the last scan was performed
+  string last_scan_at = 3;
+
+  // Last scan status: "clean", "infected", or "never"
+  string last_status = 4;
+
+  // Number of findings in the last scan
+  int32 last_findings_count = 5;
+
+  // Total number of scans performed
+  int32 total_scans = 6;
+
+  // Number of scans that found infections
+  int32 infected_scans = 7;
+
+  // Backend ID identifying which node owns this container
+  string backend_id = 8;
+}
+
+// ============= Request/Response Messages =============
+
+message ListClamavReportsRequest {
+  // Filter by container name (optional)
+  string container_name = 1;
+
+  // Filter by status: "clean" or "infected" (optional)
+  string status = 2;
+
+  // Start date filter (ISO 8601, optional)
+  string from = 3;
+
+  // End date filter (ISO 8601, optional)
+  string to = 4;
+
+  // Maximum number of reports to return (default: 50)
+  int32 limit = 5;
+
+  // Offset for pagination
+  int32 offset = 6;
+}
+
+message ListClamavReportsResponse {
+  // List of scan reports
+  repeated ClamavReport reports = 1;
+
+  // Total count matching query
+  int32 total_count = 2;
+}
+
+message GetClamavSummaryRequest {}
+
+// Counts are self-reported: the scan runs inside each tenant's own box (#2631),
+// so a compromised box can report "clean". Treat them as a tenant-visible
+// signal, not as platform assurance.
+message GetClamavSummaryResponse {
+  // Per-container summaries
+  repeated ClamavContainerSummary containers = 1;
+
+  // Total number of containers
+  int32 total_containers = 2;
+
+  // Number of containers with clean last scan
+  int32 clean_containers = 3;
+
+  // Number of containers with infected last scan
+  int32 infected_containers = 4;
+
+  // Number of containers never scanned
+  int32 never_scanned_containers = 5;
+
+  // When the summary was last collected
+  string last_collection_at = 6;
+}
+
+message InstallClamavRequest {
+  // Box to install ClamAV into. Required.
+  string container_name = 1;
+}
+
+message InstallClamavResponse {
+  ClamavInstallOutcome outcome = 1;
+  // Short human-readable result. Never contains package-manager output or paths.
+  string message = 2;
+}
+
+// ClamavInstallOutcome is the result of installing ClamAV inside a box (#2631).
+enum ClamavInstallOutcome {
+  CLAMAV_INSTALL_OUTCOME_UNSPECIFIED = 0;
+  // ClamAV and its signatures were installed.
+  CLAMAV_INSTALL_OUTCOME_INSTALLED = 1;
+  // Already present: nothing was run.
+  CLAMAV_INSTALL_OUTCOME_ALREADY_PRESENT = 2;
+  // The box's OS family is not supported by this command; install manually.
+  CLAMAV_INSTALL_OUTCOME_UNSUPPORTED_FAMILY = 3;
+  // The box has less memory than ClamAV needs (4 GB).
+  CLAMAV_INSTALL_OUTCOME_UNSUPPORTED_SIZE = 4;
+  // The install ran and failed, or the box could not be reached.
+  CLAMAV_INSTALL_OUTCOME_FAILED = 5;
+}
+
+message TriggerClamavScanRequest {
+  // Container name to scan. Required: the platform no longer scans every box
+  // (#2631); a scan is started per box by its owner.
+  string container_name = 1;
+}
+
+message TriggerClamavScanResponse {
+  // Human-readable result message
+  string message = 1;
+
+  // Number of containers queued for scanning
+  int32 scanned_count = 2;
+}
+
+// ScanJob represents a queued ClamAV scan job
+message ScanJob {
+  // Database ID
+  int64 id = 1;
+
+  // Container name to scan
+  string container_name = 2;
+
+  // Username associated with the container
+  string username = 3;
+
+  // Job status: pending, running, completed, failed
