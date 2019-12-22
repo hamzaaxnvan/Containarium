@@ -60,3 +60,34 @@ func grafanaAnonymousEnabled(ini string) (enabled, ok bool) {
 	inSection := false
 	for _, raw := range strings.Split(ini, "\n") {
 		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "[") {
+			inSection = strings.EqualFold(line, "[auth.anonymous]")
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		key, val, found := strings.Cut(line, "=")
+		if !found || !strings.EqualFold(strings.TrimSpace(key), "enabled") {
+			continue
+		}
+		return strings.EqualFold(strings.TrimSpace(val), "true"), true
+	}
+	return false, false
+}
+
+// disableGrafanaAnonymous rewrites [auth.anonymous] enabled to false and
+// reports whether anything changed. Only that one key is touched; a text
+// with anonymous already off, or with no such section, is returned as is.
+func disableGrafanaAnonymous(ini string) (string, bool) {
+	if enabled, ok := grafanaAnonymousEnabled(ini); !ok || !enabled {
+		return ini, false
+	}
+	lines := strings.Split(ini, "\n")
+	inSection := false
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "[") {
+			inSection = strings.EqualFold(line, "[auth.anonymous]")
+			continue
+		}
