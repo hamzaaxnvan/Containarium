@@ -40,24 +40,3 @@ func TestAppServer_ListApps_RejectsMissingScope(t *testing.T) {
 func TestAppServer_GetApp_RejectsMissingScope(t *testing.T) {
 	srv := &AppServer{}
 	ctx := tenantWithScopes("alice", auth.ScopeContainersWrite)
-	_, err := srv.GetApp(ctx, &pb.GetAppRequest{Username: "alice", AppName: "myapp"})
-	if status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("got %v want PermissionDenied", err)
-	}
-}
-
-func TestAppServer_LifecycleHandlers_RejectMissingScope(t *testing.T) {
-	srv := &AppServer{}
-	ctx := tenantWithScopes("alice", auth.ScopeContainersRead) // read-only
-	cases := map[string]func() error{
-		"StopApp": func() error { _, e := srv.StopApp(ctx, &pb.StopAppRequest{Username: "alice", AppName: "x"}); return e },
-		"StartApp": func() error {
-			_, e := srv.StartApp(ctx, &pb.StartAppRequest{Username: "alice", AppName: "x"})
-			return e
-		},
-		"RestartApp": func() error {
-			_, e := srv.RestartApp(ctx, &pb.RestartAppRequest{Username: "alice", AppName: "x"})
-			return e
-		},
-		"DeleteApp": func() error {
-			_, e := srv.DeleteApp(ctx, &pb.DeleteAppRequest{Username: "alice", AppName: "x"})
