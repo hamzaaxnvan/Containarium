@@ -29,34 +29,3 @@ const (
 func RunOrphanReaper(ctx context.Context, containerExistsFn func(username string) bool) {
 	RunOrphanReaperWithRoot(ctx, orphanReaperHomeRoot, containerExistsFn)
 }
-
-// RunOrphanReaperWithRoot is the testable variant that accepts an explicit homeRoot.
-func RunOrphanReaperWithRoot(ctx context.Context, homeRoot string, containerExistsFn func(username string) bool) {
-	// Grace period: let the daemon finish startup before first sweep.
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(orphanReaperGracePeriod):
-	}
-
-	reapOnce(homeRoot, containerExistsFn, userShell, DeleteJumpServerAccount)
-
-	ticker := time.NewTicker(orphanReaperInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			reapOnce(homeRoot, containerExistsFn, userShell, DeleteJumpServerAccount)
-		}
-	}
-}
-
-// UserLoginShell exports userShell for packages outside pkg/core/container
-// (e.g. the keysync HTTP handler) that need the exact same
-// orphan-reaper-eligibility check without duplicating the getent logic —
-// see IsContainerManagedShell.
-func UserLoginShell(username string) (string, error) {
-	return userShell(username)
-}
