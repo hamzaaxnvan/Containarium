@@ -32,37 +32,3 @@ describe('AgentEnginesPanel', () => {
         {
           engine: 'AGENT_ENGINE_CODEX',
           provider: 'GATEWAY_PROVIDER_OPENAI',
-          readiness: 'AGENT_ENGINE_READINESS_NOT_READY',
-          reason: 'no key for provider openai',
-          source: 'AGENT_CREDENTIAL_SOURCE_UNSPECIFIED',
-          isDefault: false,
-          skillIds: [],
-        },
-      ],
-    });
-
-    render(<AgentEnginesPanel server={server} />);
-
-    await waitFor(() => expect(screen.getByText('Claude')).toBeInTheDocument());
-    expect(screen.getByText('Codex')).toBeInTheDocument();
-    expect(screen.getByText('ready')).toBeInTheDocument();
-    expect(screen.getByText('not ready')).toBeInTheDocument();
-    expect(screen.getByText('hello-agent')).toBeInTheDocument();
-    expect(screen.getByText('no key for provider openai')).toBeInTheDocument();
-    expect(screen.getByText(/user:alice/)).toBeInTheDocument();
-    expect(screen.getByText('anthropic')).toBeInTheDocument();
-    expect(screen.getByText('openai')).toBeInTheDocument();
-  });
-
-  it('shows an empty state when no engines are configured', async () => {
-    listAgentEngines.mockResolvedValue({ keyOwner: '', engines: [] });
-
-    render(<AgentEnginesPanel server={server} />);
-
-    await waitFor(() => expect(screen.getByText('No agent engines configured.')).toBeInTheDocument());
-  });
-
-  it('surfaces a load error', async () => {
-    listAgentEngines.mockRejectedValue(new Error('daemon unreachable'));
-
-    render(<AgentEnginesPanel server={server} />);
