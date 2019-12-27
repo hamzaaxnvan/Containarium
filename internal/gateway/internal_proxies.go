@@ -38,17 +38,3 @@ func mountInternalProxies(mux *http.ServeMux, gs *GatewayServer) {
 	proxies := []struct {
 		name       string
 		backendURL string
-		prefix     string
-	}{
-		{"Grafana", gs.grafanaBackendURL, "/grafana"},
-		{"Alertmanager", gs.alertmanagerBackendURL, "/alertmanager"},
-		{"Guacamole", gs.guacamoleBackendURL, "/guacamole"},
-	}
-
-	for _, p := range proxies {
-		if p.backendURL == "" {
-			continue
-		}
-		target, err := url.Parse(p.backendURL)
-		if err != nil {
-			log.Printf("Warning: Invalid %s backend URL %q: %v", p.name, p.backendURL, err)

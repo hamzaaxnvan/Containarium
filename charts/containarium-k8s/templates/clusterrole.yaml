@@ -1,0 +1,42 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "containarium-k8s.fullname" . }}-daemon
+  labels:
+    {{- include "containarium-k8s.labels" . | nindent 4 }}
+rules:
+  # Manage per-tenant namespaces
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Manage box workloads in tenant namespaces: one agent-sandbox Sandbox CR
+  # per box; the agent-sandbox controller owns the pod + Service under it.
+  # Requires the agent-sandbox controller to be installed in the cluster —
+  # see docs/KIND-QUICKSTART.md.
+  - apiGroups: [agents.x-k8s.io]
+    resources: [sandboxes]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Legacy: pre-Sandbox deployments managed a StatefulSet per box. Kept one
+  # release for the migration window (delete of old boxes on the previous
+  # object shape); drop after that.
+  - apiGroups: ["apps"]
+    resources: [statefulsets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [services, pods, persistentvolumeclaims]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Read pod logs / exec for debug commands, and for SSH session audit
+  # (#1189): a K8s box logs its logins to stderr, so pods/log is the audit
+  # trail, not just a debugging convenience. Removing it does not fail
+  # loudly — the collector logs a read error per poll and the fleet records
+  # no logins, which reads exactly like a fleet nobody logged into.
+  - apiGroups: [""]
+    resources: [pods/log, pods/exec]
+    verbs: [get, list, create]
+  # Manage per-box SSH keys in tenant namespaces, and the per-tenant Secret
+  # that carries delivered tenant secrets (#1190). Removing this does not
+  # fail loudly for the second: `secret set` still succeeds — the value is
+  # stored and encrypted — and only the delivery into the box is lost.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, create, update, patch, delete]
