@@ -76,3 +76,81 @@ func TestScopeClaim_EndToEndPropagation(t *testing.T) {
 	// Scopes are the new bit. Must be present, comma-joined.
 	scopesVals := capturedMD.Get(auth.MDKeyScopes)
 	if len(scopesVals) != 1 {
+		t.Fatalf("scopes metadata = %v; want exactly one entry", scopesVals)
+	}
+	if scopesVals[0] != strings.Join(wantScopes, ",") {
+		t.Fatalf("scopes metadata = %q; want %q", scopesVals[0], strings.Join(wantScopes, ","))
+	}
+
+	// Reconstruct the gRPC-side context from the propagated
+	// metadata and verify RequireScope reads it correctly —
+	// this is the same code path the daemon's gRPC handlers
+	// hit on every authenticated request.
+	grpcCtx := metadata.NewIncomingContext(context.Background(), capturedMD)
+	if err := auth.RequireScope(grpcCtx, auth.ScopeContainersRead); err != nil {
+		t.Fatalf("RequireScope(containers:read) should pass; got %v", err)
+	}
+	if err := auth.RequireScope(grpcCtx, auth.ScopeSecretsRead); err != nil {
+		t.Fatalf("RequireScope(secrets:read) should pass; got %v", err)
+	}
+	if err := auth.RequireScope(grpcCtx, auth.ScopeContainersWrite); err == nil {
+		t.Fatal("RequireScope(containers:write) should fail — token doesn't grant it")
+	}
+}
+
+func TestScopeClaim_AbsentClaimPropagatesAsAbsent(t *testing.T) {
+	// Pre-1.7 tokens (no scopes claim) MUST keep working —
+	// backwards compat is a security property. The metadata
+	// MUST NOT carry a scopes entry, and RequireScope must
+	// treat the absent claim as unrestricted.
+	tm, _ := auth.NewTokenManager("propagation-test-secret-at-least-32-bytes-ok", "test")
+	mw := auth.NewAuthMiddleware(tm)
+
+	tok, _ := tm.GenerateToken("alice", []string{"user"}, time.Hour) // no scopes
+
+	var capturedMD metadata.MD
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMD = annotateContext(r.Context(), r)
+		w.WriteHeader(http.StatusOK)
+	})
+	wrapped := mw.HTTPMiddleware(stub)
+
+	req := httptest.NewRequest("GET", "/v1/containers", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+
+	if got := capturedMD.Get(auth.MDKeyScopes); len(got) != 0 {
+		t.Fatalf("legacy token should NOT propagate scopes metadata; got %v", got)
+	}
+
+	grpcCtx := metadata.NewIncomingContext(context.Background(), capturedMD)
+	// Any scope passes because nil grants are unrestricted.
+	if err := auth.RequireScope(grpcCtx, auth.ScopeContainersWrite); err != nil {
+		t.Fatalf("legacy token should pass any scope check; got %v", err)
+	}
+}
+
+// TestRunIDClaim_EndToEndPropagation is TestScopeClaim_EndToEndPropagation's
+// counterpart for the `run_id` claim (#1922): a run-scoped token minted via
+// GenerateDelegatedTokenWithID must have its run_id survive the same
+// HTTP-middleware -> annotateContext -> gRPC-metadata hop, since the
+// tracker broker's write verbs read the acting run's identity off it.
+func TestRunIDClaim_EndToEndPropagation(t *testing.T) {
+	tm, err := auth.NewTokenManager("propagation-test-secret-at-least-32-bytes-ok", "test")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	mw := auth.NewAuthMiddleware(tm)
+
+	tok, _, err := tm.GenerateDelegatedTokenWithID("alice", []string{"user"}, time.Hour, nil, "run-abc123", auth.ScopeTrackerWrite)
+	if err != nil {
+		t.Fatalf("GenerateDelegatedTokenWithID: %v", err)
+	}
+
+	var capturedMD metadata.MD
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMD = annotateContext(r.Context(), r)
+		w.WriteHeader(http.StatusOK)
+	})
+	wrapped := mw.HTTPMiddleware(stub)

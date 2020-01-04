@@ -34,3 +34,39 @@ func NewBoxWriter(namespace string) (*BoxWriter, error) {
 	if err := containariumv1alpha1.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
+	cl, err := ctrlclient.New(cfg, ctrlclient.Options{Scheme: scheme})
+	if err != nil {
+		return nil, err
+	}
+	return &BoxWriter{client: cl, namespace: namespace}, nil
+}
+
+// Upsert creates or updates the tenant's Box CR to match spec.
+func (w *BoxWriter) Upsert(ctx context.Context, spec box.BoxSpec) error {
+	return upsertBox(ctx, w.client, w.namespace, spec)
+}
+
+// upsertBox is the testable core: a client + namespace + spec.
+func upsertBox(ctx context.Context, cl ctrlclient.Client, namespace string, spec box.BoxSpec) error {
+	desired := boxFromSpec(spec, namespace)
+	var existing containariumv1alpha1.Box
+	err := cl.Get(ctx, ctrlclient.ObjectKey{Namespace: namespace, Name: desired.Name}, &existing)
+	if apierrors.IsNotFound(err) {
+		return cl.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+	existing.Spec = desired.Spec
+	return cl.Update(ctx, &existing)
+}
+
+// boxFromSpec maps a runtime-neutral box.BoxSpec onto a Box CR — the inverse of
+// specFromBox in the reconciler.
+func boxFromSpec(spec box.BoxSpec, namespace string) *containariumv1alpha1.Box {
+	autoStart := spec.AutoStart
+	return &containariumv1alpha1.Box{
+		ObjectMeta: metav1.ObjectMeta{Name: spec.Ref.Tenant, Namespace: namespace},
+		Spec: containariumv1alpha1.BoxSpec{
+			Tenant:  spec.Ref.Tenant,
+			Image:   spec.Image,
