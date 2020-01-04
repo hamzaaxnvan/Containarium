@@ -113,3 +113,60 @@ func runSecurityFindingsList(cmd *cobra.Command, _ []string) error {
 		q.Set("since", findingsSince)
 	}
 	if findingsState != "" {
+		q.Set("state", "FINDING_STATE_"+strings.ToUpper(findingsState))
+	}
+	if findingsLimit > 0 {
+		q.Set("limit", strconv.Itoa(findingsLimit))
+	}
+	base := strings.TrimSuffix(serverAddr, "/") + "/v1/security/findings"
+	reqURL := base
+	if enc := q.Encode(); enc != "" {
+		reqURL = base + "?" + enc
+	}
+	var out pb.ListFindingsResponse
+	if err := policyRoundTrip(http.MethodGet, reqURL, nil, &out); err != nil {
+		return err
+	}
+	w := cmd.OutOrStdout()
+	if findingsJSONOut {
+		b, err := protojson.MarshalOptions{Multiline: true}.Marshal(&out)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(w, string(b))
+		return err
+	}
+	if len(out.GetFindings()) == 0 {
+		fmt.Fprintln(w, "No findings.")
+		return nil
+	}
+	fmt.Fprintf(w, "%-6s %-28s %-10s %-8s %-14s %-6s %-10s %s\n",
+		"ID", "RULE", "SEVERITY", "STATE", "TENANT", "COUNT", "LAST SEEN", "SUBJECT")
+	for _, f := range out.GetFindings() {
+		fmt.Fprintf(w, "%-6d %-28s %-10s %-8s %-14s %-6d %-10s %s\n",
+			f.GetId(),
+			enumLabel(f.GetRule().String(), "THREAT_RULE_ID_"),
+			enumLabel(f.GetSeverity().String(), "THREAT_SEVERITY_"),
+			enumLabel(f.GetState().String(), "FINDING_STATE_"),
+			f.GetTenantId(),
+			f.GetCount(),
+			timestampText(f.GetLastSeen()),
+			f.GetSubject(),
+		)
+		ev := f.GetEvidence()
+		for _, c := range ev.GetConfigs() {
+			detail := fmt.Sprintf("%s=%s in %s", c.GetDirective(), c.GetValue(), c.GetPath())
+			if c.GetRemediated() {
+				detail += " (re-asserted)"
+			}
+			if c.GetNote() != "" {
+				detail += " — " + c.GetNote()
+			}
+			fmt.Fprintf(w, "       %s\n", detail)
+		}
+		for _, x := range ev.GetExecs() {
+			detail := fmt.Sprintf("exec pid %d %s (comm %s) argv %q", x.GetPid(), x.GetFilename(), x.GetComm(), x.GetArgv())
+			if x.GetSha256() != "" {
+				detail += " sha256 " + x.GetSha256()
+			}
+			if x.GetMatched() != "" {
