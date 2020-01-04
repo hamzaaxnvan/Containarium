@@ -50,29 +50,3 @@ func TestStateWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 	want := &api.InstanceState{Status: "Running"}
 	state, _, err := stateWithRetry("test", func() (*api.InstanceState, string, error) {
 		calls++
-		if calls < 3 {
-			return nil, "", errTransientState
-		}
-		return want, "etag", nil
-	})
-	if err != nil {
-		t.Fatalf("err = %v, want nil after transient retries", err)
-	}
-	if state != want {
-		t.Errorf("state = %v, want %v", state, want)
-	}
-	if calls != 3 {
-		t.Errorf("attempts = %d, want 3 (2 transient + 1 success)", calls)
-	}
-}
-
-// TestStateWithRetry_DoesNotRetryRealError: a genuine (non-transient)
-// failure must return immediately, on the first attempt.
-func TestStateWithRetry_DoesNotRetryRealError(t *testing.T) {
-	noStateBackoff(t)
-	calls := 0
-	realErr := errors.New("connection refused")
-	_, _, err := stateWithRetry("test", func() (*api.InstanceState, string, error) {
-		calls++
-		return nil, "", realErr
-	})
