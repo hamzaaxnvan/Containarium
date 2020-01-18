@@ -1,4 +1,2 @@
 package threatdetect
 
-import (
-	"os"
