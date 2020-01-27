@@ -30,3 +30,67 @@ func (p *episodeProber) AcknowledgeCredentialEpisodes(_ context.Context, _ Crede
 	var pending []CredentialEpisode
 	for _, e := range p.observation.Pending {
 		if !acknowledged[e.ID] {
+			pending = append(pending, e)
+		}
+	}
+	p.observation.Pending = pending
+	return nil
+}
+func testEpisodeDelivery(t *testing.T, store CredentialStateStore) {
+	t.Helper()
+	ctx := context.Background()
+	p := &episodeProber{fakeProber: oneTargetProber(srcInteractive)}
+	n := &recordingNotifier{}
+	watcher := NewCredentialWatcher(p, store, n)
+	watcher.Sweep(ctx)
+	// Failure and recovery between sweeps, plus another failure/recovery. Both
+	// episodes must notify even though current status is already healthy.
+	p.observation = CredentialEpisodes{Version: 1, Pending: []CredentialEpisode{{ID: "00000000-0000-0000-0000-000000000001"}, {ID: "00000000-0000-0000-0000-000000000002", AfterRecovery: true}}}
+	p.ackErr = errors.New("guest unavailable")
+	if got := watcher.Sweep(ctx); got != 2 {
+		t.Fatalf("alerts=%d want=2", got)
+	}
+	if len(p.acknowledged) != 0 {
+		t.Fatal("acknowledged failed guest write")
+	}
+	// Simulates restart after DB commits, but before guest acknowledgement.
+	watcher = NewCredentialWatcher(p, store, n)
+	p.ackErr = nil
+	if got := watcher.Sweep(ctx); got != 0 {
+		t.Fatalf("restart repeated %d alerts", got)
+	}
+	if n.count() != 2 || len(p.acknowledged) != 2 {
+		t.Fatalf("notifications=%d acknowledgements=%d", n.count(), len(p.acknowledged))
+	}
+	if got := watcher.Sweep(ctx); got != 0 {
+		t.Fatal("recovery notified")
+	}
+}
+func TestCredentialEpisodeDelivery(t *testing.T) { testEpisodeDelivery(t, newMemStateStore()) }
+func TestCredentialEpisodesPersistBeforeAck(t *testing.T) {
+	store := newMemStateStore()
+	store.recordErr = errors.New("database down")
+	p := &episodeProber{fakeProber: oneTargetProber(srcInteractive), observation: CredentialEpisodes{Version: 1, Active: true, Pending: []CredentialEpisode{{ID: "00000000-0000-0000-0000-000000000003"}}}}
+	n := &recordingNotifier{}
+	w := NewCredentialWatcher(p, store, n)
+	if w.Sweep(context.Background()) != 0 || len(p.acknowledged) > 0 {
+		t.Fatal("unpersisted failure notified/acknowledged")
+	}
+	store.recordErr = nil
+	if w.Sweep(context.Background()) != 1 {
+		t.Fatal("lost failure on database recovery")
+	}
+	if w.Sweep(context.Background()) != 0 {
+		t.Fatal("repeated active episode")
+	}
+}
+func TestCredentialEpisodeDoesNotRepeatTimestampAlert(t *testing.T) {
+	store := newMemStateStore()
+	_ = store.Record(context.Background(), "s1", srcExpired, time.Now())
+	p := &episodeProber{fakeProber: oneTargetProber(srcExpired), observation: CredentialEpisodes{Version: 1, Active: true, Pending: []CredentialEpisode{{ID: "00000000-0000-0000-0000-000000000004"}}}}
+	n := &recordingNotifier{}
+	w := NewCredentialWatcher(p, store, n)
+	if w.Sweep(context.Background()) != 0 || len(p.acknowledged) != 1 {
+		t.Fatal("repeated existing unhealthy transition")
+	}
+	p.observation.Pending = []CredentialEpisode{{ID: "00000000-0000-0000-0000-000000000005", AfterRecovery: true}}

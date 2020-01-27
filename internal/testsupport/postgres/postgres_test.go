@@ -107,3 +107,40 @@ func TestSchemaIsolationAndCleanup(t *testing.T) {
 			if err := conn.QueryRow(ctx, "SELECT current_schema()").Scan(&schemas[i]); err != nil {
 				t.Error(err)
 				return
+			}
+			if _, err := conn.Exec(ctx, "CREATE TABLE isolation_probe (id int); INSERT INTO isolation_probe VALUES (1); TRUNCATE isolation_probe; INSERT INTO isolation_probe VALUES (2)"); err != nil {
+				t.Error(err)
+				return
+			}
+			var id int
+			if err := conn.QueryRow(ctx, "SELECT id FROM isolation_probe").Scan(&id); err != nil || id != 2 {
+				t.Errorf("own row = %d, error=%v", id, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if t.Failed() {
+		return
+	}
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = admin.Close(context.Background()) }()
+	seen := map[string]bool{}
+	for _, schema := range schemas {
+		if !strings.HasPrefix(schema, "test_") || seen[schema] {
+			t.Fatalf("invalid or reused schema %q", schema)
+		}
+		seen[schema] = true
+		var exists bool
+		if err := admin.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname=$1)", schema).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists {
+			t.Errorf("schema %q was not cleaned up", schema)
+		}
+	}
+}
+
+func TestRunCleansUpAfterFailure(t *testing.T) {
