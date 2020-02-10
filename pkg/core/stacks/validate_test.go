@@ -16,9 +16,3 @@ func TestValidateStackID(t *testing.T) {
 
 func TestCheckStackID(t *testing.T) {
 	m := GetDefault()
-	if err := m.CheckStackID("nodejs"); err != nil {
-		t.Errorf("CheckStackID(nodejs) = %v", err)
-	}
-	err := m.CheckStackID("typo")
-	if err == nil {
-		t.Fatal("CheckStackID(typo) = nil, want an error")

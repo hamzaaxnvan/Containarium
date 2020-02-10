@@ -40,3 +40,24 @@ func (g *Gate) Checkpoint() []State {
 			if s.Delay == 0 {
 				s.Delay = g.policy.InitialDelay
 			}
+			if next := r.lease.Deadline.Add(s.Delay); s.Next.Before(next) {
+				s.Next = next
+			}
+		}
+		sort.Slice(s.Risks, func(i, j int) bool { return s.Risks[i].At.Before(s.Risks[j].At) })
+		rows = append(rows, s)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Key.Backend != rows[j].Key.Backend {
+			return rows[i].Key.Backend < rows[j].Key.Backend
+		}
+		return rows[i].Key.Egress < rows[j].Key.Egress
+	})
+	return rows
+}
+
+// Restore validates all checkpoint rows before replacing an empty controller.
+func (g *Gate) Restore(rows []State) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.entries) != 0 || len(rows) > g.policy.MaxBackends {
