@@ -178,3 +178,183 @@ func (s *ContainerServer) SetTrackerConnection(ctx context.Context, req *pb.SetT
 	})
 	return &pb.SetTrackerConnectionResponse{
 		Message:    msg,
+		Connection: toProtoTrackerConnection(conn),
+	}, nil
+}
+
+// GetTrackerConnection returns a single named connection's metadata.
+// Never returns the credential value — TrackerConnection only ever
+// carries the secret's name.
+func (s *ContainerServer) GetTrackerConnection(ctx context.Context, req *pb.GetTrackerConnectionRequest) (*pb.GetTrackerConnectionResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrackerAdmin); err != nil {
+		return nil, err
+	}
+	if s.trackerStore == nil {
+		return nil, status.Error(codes.Unavailable, "tracker store not configured on this daemon")
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	conn, err := s.trackerStore.Get(ctx, req.Username, req.Name)
+	if err != nil {
+		return nil, mapTrackerError(err)
+	}
+	return &pb.GetTrackerConnectionResponse{Connection: toProtoTrackerConnection(conn)}, nil
+}
+
+// ListTrackerConnections returns every connection a tenant owns.
+func (s *ContainerServer) ListTrackerConnections(ctx context.Context, req *pb.ListTrackerConnectionsRequest) (*pb.ListTrackerConnectionsResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrackerAdmin); err != nil {
+		return nil, err
+	}
+	if s.trackerStore == nil {
+		return nil, status.Error(codes.Unavailable, "tracker store not configured on this daemon")
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	list, err := s.trackerStore.List(ctx, req.Username)
+	if err != nil {
+		return nil, mapTrackerError(err)
+	}
+	out := make([]*pb.TrackerConnection, 0, len(list))
+	for i := range list {
+		out = append(out, toProtoTrackerConnection(&list[i]))
+	}
+	return &pb.ListTrackerConnectionsResponse{Connections: out}, nil
+}
+
+// DeleteTrackerConnection removes a named connection. Does not delete
+// the underlying credential secret.
+func (s *ContainerServer) DeleteTrackerConnection(ctx context.Context, req *pb.DeleteTrackerConnectionRequest) (*pb.DeleteTrackerConnectionResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrackerAdmin); err != nil {
+		return nil, err
+	}
+	if s.trackerStore == nil {
+		return nil, status.Error(codes.Unavailable, "tracker store not configured on this daemon")
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// Best-effort lookup purely to enrich the audit detail with which
+	// provider/project this connection pointed at — a failure here must
+	// never block the delete itself, so the error is discarded.
+	existing, _ := s.trackerStore.Get(ctx, req.Username, req.Name)
+
+	if err := s.trackerStore.Delete(ctx, req.Username, req.Name); err != nil {
+		return nil, mapTrackerError(err)
+	}
+	log.Printf("[tracker] connection deleted %s/%s", req.Username, req.Name)
+	detail := trackerConnectionAuditDetail{}
+	if existing != nil {
+		detail.Provider = existing.Provider.String()
+		detail.BaseURL = existing.BaseURL
+		detail.Project = existing.Project
+		detail.CredentialSecret = existing.CredentialSecret
+	}
+	s.auditTrackerConnectionWrite(ctx, "tracker.connection_deleted", req.Username, req.Name, detail)
+	return &pb.DeleteTrackerConnectionResponse{
+		Message: fmt.Sprintf("connection %s deleted", req.Name),
+	}, nil
+}
+
+// GetTrackerStatus probes a connection's credential live, against the
+// tracker itself — reachability, validity, scopes, expiry, and breadth
+// versus the provider's preferred credential type.
+func (s *ContainerServer) GetTrackerStatus(ctx context.Context, req *pb.GetTrackerStatusRequest) (*pb.GetTrackerStatusResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrackerAdmin); err != nil {
+		return nil, err
+	}
+	if s.trackerStore == nil {
+		return nil, status.Error(codes.Unavailable, "tracker store not configured on this daemon")
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	conn, err := s.trackerStore.Get(ctx, req.Username, req.Name)
+	if err != nil {
+		return nil, mapTrackerError(err)
+	}
+	resp := &pb.GetTrackerStatusResponse{Connection: toProtoTrackerConnection(conn)}
+
+	// Host git preflight (#1923, decision D2) — daemon-wide, not
+	// connection-specific, so it's set unconditionally here rather than
+	// gated behind the credential checks below: an operator should see
+	// "SubmitTrackerChange will fail for every connection on this
+	// daemon" even when the connection being checked has an unrelated
+	// problem (or none at all).
+	gitVersion, gitErr := submit.CheckHostGit()
+	resp.HostGitVersion = gitVersion
+	resp.HostGitSufficient = gitErr == nil
+
+	describer, derr := s.trackerProviderFor(conn.Provider)
+	if derr != nil {
+		resp.Detail = derr.Error()
+		return resp, nil
+	}
+	if s.secretsStore == nil {
+		resp.Detail = "secrets store not configured on this daemon"
+		return resp, nil
+	}
+	cred, cerr := s.secretsStore.BrokerCredential(ctx, conn.Username, conn.CredentialSecret)
+	if cerr != nil {
+		resp.Detail = fmt.Sprintf("resolve broker credential: %v", cerr)
+		return resp, nil
+	}
+
+	info, err := describer.DescribeCredential(ctx, tracker.Conn{
+		BaseURL: conn.BaseURL, Project: conn.Project, Credential: cred,
+	})
+	switch {
+	case err == nil:
+		resp.Reachable = true
+		resp.CredentialValid = true
+		resp.CredentialBreadth = breadthToProto(info.Breadth)
+		resp.CredentialKind = kindToProto(info.Kind)
+		resp.CredentialScopes = info.Scopes
+		if !info.ExpiresAt.IsZero() {
+			resp.CredentialExpiresAt = timestamppb.New(info.ExpiresAt)
+		}
+		// Keep the stored expiry in sync with what was just observed —
+		// the same best-effort persistence SetTrackerConnection does.
+		if serr := s.trackerStore.SetCredentialExpiry(ctx, conn.Username, conn.Name, info.ExpiresAt); serr != nil {
+			log.Printf("[tracker] %s/%s: persist credential expiry: %v", conn.Username, conn.Name, serr)
+		} else if resp.Connection != nil {
+			resp.Connection.CredentialExpiresAt = resp.CredentialExpiresAt
+		}
+	case errors.Is(err, tracker.ErrCredentialInvalid):
+		resp.Reachable = true
+		resp.CredentialValid = false
+		resp.Detail = err.Error()
+	case errors.Is(err, tracker.ErrUnreachable):
+		resp.Detail = err.Error()
+	default:
+		resp.Detail = err.Error()
+	}
+	return resp, nil
+}
+
+// describeCredentialBestEffort probes conn's own credential and, on
+// success, persists its expiry onto conn (in-memory) and the store.
+//
+// Best-effort by design: SetTrackerConnection's whole point is
+// registering a connection's METADATA (provider, project, which secret
+// to use), and a describe failure here — the tracker briefly
+// unreachable, a token not yet propagated upstream, a self-managed
+// instance reachable only from a network the daemon doesn't have a
