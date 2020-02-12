@@ -31,3 +31,37 @@ func newFakeForceDaemon(t *testing.T) *fakeForceDaemon {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/containers/alice":
 			d.calls = append(d.calls, "GET")
 			_, _ = w.Write([]byte(`{"container":{"name":"alice-container","username":"alice","state":"CONTAINER_STATE_RUNNING"}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/containers":
+			raw, _ := io.ReadAll(r.Body)
+			var body struct {
+				DryRun bool `json:"dryRun"`
+			}
+			_ = json.Unmarshal(raw, &body)
+			if !body.DryRun {
+				d.calls = append(d.calls, "CREATE")
+				_, _ = w.Write([]byte(`{"container":{"name":"alice-container","username":"alice","state":"CONTAINER_STATE_CREATING"}}`))
+				return
+			}
+			d.calls = append(d.calls, "DRYRUN")
+			if d.rejectDryRun {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"unknown stack \"typo\"; valid stacks: nodejs"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"dryRun":true,"message":"Dry run: accepted. Nothing was created."}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/containers/alice":
+			d.calls = append(d.calls, "DELETE")
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			d.calls = append(d.calls, "UNEXPECTED "+r.Method+" "+r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(d.srv.Close)
+	return d
+}
+
+func (d *fakeForceDaemon) sequence() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return strings.Join(d.calls, ",")
