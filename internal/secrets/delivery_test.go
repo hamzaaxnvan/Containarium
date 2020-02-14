@@ -45,3 +45,19 @@ func TestDeliveryConstants(t *testing.T) {
 	if DeliveryEnv != "env" {
 		t.Fatalf("DeliveryEnv = %q; want %q", DeliveryEnv, "env")
 	}
+	if DeliveryFile != "file" {
+		t.Fatalf("DeliveryFile = %q; want %q", DeliveryFile, "file")
+	}
+	if DeliveryCompose != "compose" {
+		t.Fatalf("DeliveryCompose = %q; want %q", DeliveryCompose, "compose")
+	}
+}
+
+func TestValidateValueForDelivery(t *testing.T) {
+	// Single-line values are fine for any mode.
+	for _, mode := range []string{DeliveryEnv, DeliveryFile, DeliveryCompose} {
+		if err := ValidateValueForDelivery(mode, "single-line-value"); err != nil {
+			t.Errorf("%s/single-line: unexpected error %v", mode, err)
+		}
+	}
+	// Multi-line values are fine for env/file (they don't render to a
