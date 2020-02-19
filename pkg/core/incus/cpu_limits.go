@@ -166,3 +166,59 @@ func formatCPULimitFromConfig(config map[string]string) string {
 	cores, ok := parseAllowanceCores(allowance)
 	if !ok {
 		return allowance
+	}
+	if cores == float64(int64(cores)) {
+		return strconv.FormatInt(int64(cores), 10)
+	}
+	milli := int64(math.Round(cores * 1000)) // 0.25 core → 250m
+	return strconv.FormatInt(milli, 10) + "m"
+}
+
+// parseAllowanceCores resolves a `limits.cpu.allowance` value back to a core
+// count: "400ms/100ms" → 4, "25%" → 0.25. Reports false for anything it
+// doesn't recognise (including a zero period, which would divide by zero).
+func parseAllowanceCores(allowance string) (float64, bool) {
+	if pctStr, ok := strings.CutSuffix(allowance, "%"); ok {
+		pct, err := strconv.ParseFloat(pctStr, 64)
+		if err != nil {
+			return 0, false
+		}
+		return pct / 100, true
+	}
+	quotaStr, periodStr, ok := strings.Cut(allowance, "/")
+	if !ok {
+		return 0, false
+	}
+	quota, qerr := strconv.ParseFloat(strings.TrimSuffix(quotaStr, "ms"), 64)
+	period, perr := strconv.ParseFloat(strings.TrimSuffix(periodStr, "ms"), 64)
+	if qerr != nil || perr != nil || period == 0 {
+		return 0, false
+	}
+	return quota / period, true
+}
+
+// CommittedCores resolves a Containarium CPU request string — the same form
+// stored on ContainerInfo.CPU — into the number of physical cores it commits,
+// for placement-level capacity accounting (#1029 direction 2). It is the
+// inverse of what CreateContainer wrote:
+//
+//	"4"           → 4     (whole-core; post-#1034 also carries an 800ms/100ms quota)
+//	"250m"        → 0.25  (millicpu)
+//	"1.5"         → 1.5   (decimal)
+//	"400ms/100ms" → 4     (a hard quota read straight back)
+//	"200%"        → 2     (a legacy soft-share allowance)
+//	"0-3"         → 4     (a CPU set / pinning range — its cardinality)
+//	""            → 0     (no limit recorded; contributes nothing to the sum)
+//
+// An unparseable request yields 0 rather than an error: capacity accounting is
+// advisory admission, and a single malformed entry must not make the whole
+// host un-schedulable. A "" / 0 result is deliberately conservative — an
+// unbounded container is under-counted, not over-counted — because the size
+// tiers that drive real tenants always carry an explicit request, so the only
+// things that land here empty are infra/legacy boxes the caller already
+// excludes.
+func CommittedCores(cpuRequest string) float64 {
+	s := strings.TrimSpace(cpuRequest)
+	if s == "" {
+		return 0
+	}

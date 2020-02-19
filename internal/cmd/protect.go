@@ -23,3 +23,28 @@ import (
 // A daemon too old to implement SetContainerDeletePolicy surfaces
 // codes.Unimplemented (gRPC) / HTTP 404 mapped to Unimplemented (REST); the CLI
 // degrades to a friendly no-op via isUnimplemented (shared with ttl.go) rather
+// than failing.
+
+var protectCmd = &cobra.Command{
+	Use:   "protect <username>",
+	Short: "Protect a container from automated/bulk deletion",
+	Long: `Mark a container as protected (#284). A protected box is skipped by
+the daemon's unattended deletion paths — the TTL sweeper's auto-reap and
+'containarium prune' — so a "clean up leaked boxes" sweep can never take out
+a box you want to keep (e.g. a persistent CI runner).
+
+Protection does NOT block a deliberate single-box delete: 'containarium delete'
+still removes a protected box. Use 'containarium unprotect' to clear it.
+
+Examples:
+  # Protect a long-lived runner from prune/auto-reap
+  containarium protect ci-runner
+
+  # Inspect the current policy (delete_policy field)
+  containarium get ci-runner`,
+	Args: cobra.ExactArgs(1),
+	RunE: runProtect,
+}
+
+var unprotectCmd = &cobra.Command{
+	Use:   "unprotect <username>",
