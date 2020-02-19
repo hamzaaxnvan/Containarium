@@ -388,3 +388,393 @@ static __always_inline void parse_l4(struct iphdr *ip, void *data_end, struct l4
         }
     }
 }
+
+// track_inbound runs on the egress hook for a packet toward the box (src=peer,
+// dst=box): creates or refreshes the flow's entry — only when the source is
+// validated (see the rules above).
+static __always_inline void track_inbound(struct __sk_buff *skb, __u32 ifindex,
+                                          __u32 peer_ip, __u32 box_ip,
+                                          __u8 proto, const struct l4_info *l4) {
+    if (!l4->ok)
+        return;
+    // Source validation, carried from the sender hook in the mark: a frame from
+    // a managed veth (SEEN) is trusted only if that hook validated its source
+    // (VALIDATED). An unmarked frame is trusted only when it is the host's own
+    // (ingress_ifindex 0) or entered on a known uplink; anything else unmarked
+    // — an unconfigured veth, a foreign namespace on the bridge, a rewritten
+    // mark — fails closed.
+    __u32 mark = skb->mark;
+    if (mark & NETPOLICY_MARK_SEEN) {
+        if (!(mark & NETPOLICY_MARK_VALIDATED))
+            return;
+    } else {
+        __u32 iif = skb->ingress_ifindex;
+        if (iif != 0 && !bpf_map_lookup_elem(&trusted_iif, &iif))
+            return;
+    }
+
+    struct inbound_key k = {};
+    k.ifindex = ifindex;
+    k.box_ip = box_ip;
+    k.peer_ip = peer_ip;
+    k.proto = proto;
+    if (proto == IPPROTO_TCP || proto == IPPROTO_UDP) {
+        k.box_port = l4->dport;
+        k.peer_port = l4->sport;
+    } else if (proto == IPPROTO_ICMP) {
+        if (!l4->icmp_echo || l4->icmp_type != ICMP_ECHO)
+            return; // only an echo request creates or refreshes; errors never do
+        k.peer_port = l4->icmp_id;
+    } else {
+        return;
+    }
+
+    __u64 now = bpf_ktime_get_ns();
+    __u64 *seen = bpf_map_lookup_elem(&inbound_flows, &k);
+    if (seen) {
+        *seen = now;
+        return;
+    }
+    // A TCP entry created by anything but a fresh SYN is a re-seed: the flow
+    // existed and its entry was evicted or idled out. Count it (see stats).
+    if (proto == IPPROTO_TCP && !(l4->tcp_syn && !l4->tcp_ack))
+        bump(STAT_INBOUND_RESEED);
+    bpf_map_update_elem(&inbound_flows, &k, &now, BPF_ANY);
+}
+
+// inbound_reply runs on the sender hook for a packet the box sends (src=box,
+// dst=peer) and reports whether it answers a flow a validated peer opened: the
+// reverse tuple is in inbound_flows, within its idle timeout, and the packet has
+// a reply shape — TCP: anything but a SYN without ACK; UDP: the same 5-tuple;
+// ICMP: an echo reply carrying the request's id (ICMP errors stay judged). Never
+// writes the map.
+static __always_inline int inbound_reply(__u32 ifindex, __u32 box_ip, __u32 peer_ip,
+                                         __u8 proto, const struct l4_info *l4) {
+    if (!l4->ok)
+        return 0;
+    struct inbound_key k = {};
+    k.ifindex = ifindex;
+    k.box_ip = box_ip;
+    k.peer_ip = peer_ip;
+    k.proto = proto;
+    if (proto == IPPROTO_TCP) {
+        if (l4->tcp_syn && !l4->tcp_ack)
+            return 0; // a fresh SYN opens a flow; it is never a reply
+        k.box_port = l4->sport;
+        k.peer_port = l4->dport;
+    } else if (proto == IPPROTO_UDP) {
+        k.box_port = l4->sport;
+        k.peer_port = l4->dport;
+    } else if (proto == IPPROTO_ICMP) {
+        if (!l4->icmp_echo || l4->icmp_type != ICMP_ECHOREPLY)
+            return 0;
+        k.peer_port = l4->icmp_id;
+    } else {
+        return 0;
+    }
+    __u64 *seen = bpf_map_lookup_elem(&inbound_flows, &k);
+    if (!seen)
+        return 0;
+    // Read the stamp before the clock: a refresh on another CPU between the two
+    // reads could otherwise make now - last underflow and drop a valid reply.
+    __u64 last = *seen;
+    __u64 now = bpf_ktime_get_ns();
+    if (now > last && now - last > inbound_idle_ns(proto))
+        return 0; // idled out; the peer's next packet re-creates it
+    return 1;
+}
+
+// Perf event ring for denied flows; the daemon's consumer turns each into an
+// audit row (action=net_deny).
+struct {
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+} events SEC(".maps");
+
+// Wire shape of a denied-flow event. Kept in lockstep with the Go decoder in
+// loader.go (denyEvent).
+struct deny_event {
+    __u32 ifindex;
+    __u32 tenant_id;
+    __u32 saddr;         // network byte order
+    __u32 daddr;
+    __u16 dport;         // host byte order
+    __u8  proto;
+    __u8  reason;        // DENY_REASON_* (was pad; size unchanged) #660
+    __u16 sig_id;        // matched signature id when reason==SIGNATURE, else 0 (#661)
+    __u8  verdict;       // DENY_VERDICT_* actually applied (was pad2's low byte; size unchanged) #2970
+    __u8  pad2;
+};
+
+// --- Tier 2 (#661): cleartext exploit-signature scanning --------------------
+//
+// The container's INBOUND direction (host→container, seen on the veth TC_EGRESS
+// hook) is scanned for a small set of operator-curated cleartext signatures, to
+// virtually patch a vulnerable service in the container (a WAF-style block of
+// e.g. a Log4Shell `${jndi:` request) before the vendor fix ships.
+//
+// The verifier-feasible shape (proved out in sigscan-proto.bpf.c): one bpf_loop
+// over the flattened (signature × offset) space with only the pattern-compare
+// loop unrolled, the payload window in a per-CPU scratch map re-looked-up inside
+// the callback, and tiered CONSTANT-size payload loads (a variable length gets
+// re-derived from skb arithmetic past every guard and rejected). Best-effort by
+// construction: single packet (no reassembly), cleartext only (TLS is opaque),
+// first SCAN_WINDOW bytes only.
+#define SIG_MAX_LEN   32   // bytes per signature pattern
+#define SIG_MAX_COUNT 32   // signature slots scanned per packet
+#define SCAN_WINDOW   256  // payload bytes scanned (power of two for index masking)
+#define SIG_SCAN_MIN  32   // don't bother scanning a payload shorter than this
+
+struct signature {
+    __u8  len;                 // active bytes in pat, 1..SIG_MAX_LEN (0 = empty slot)
+    __u8  enabled;             // 1 = scan this slot
+    __u16 id;                  // signature id (>0), echoed on a match
+    __u8  pat[SIG_MAX_LEN];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, struct signature);
+    __uint(max_entries, SIG_MAX_COUNT);
+} signatures SEC(".maps");
+
+// Per-CPU scratch for the copied payload window (per-CPU so concurrent packets on
+// different CPUs don't clobber it; one entry suffices).
+struct scan_scratch {
+    __u8 buf[SCAN_WINDOW];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, struct scan_scratch);
+    __uint(max_entries, 1);
+} scan_buf SEC(".maps");
+
+// sig_config[0] gates the whole scan: 0 = skip it entirely (the default, so the
+// bpf_loop cost is never paid on hosts that haven't opted into Tier 2). The
+// loader sets it to 1 only once signatures are populated.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 1);
+} sig_config SEC(".maps");
+
+static __always_inline int sig_scan_enabled(void) {
+    __u32 zero = 0;
+    __u32 *on = bpf_map_lookup_elem(&sig_config, &zero);
+    return on && *on;
+}
+
+struct sig_scan_ctx {
+    __u32 n;        // valid bytes in the window
+    __u32 match_id; // out: matched signature id, or 0
+};
+
+// sig_match_at is the bpf_loop callback over the flattened (signature, offset)
+// space. The verifier checks it ONCE regardless of trip count, so there is no
+// back-edge to mistake for an infinite loop.
+static long sig_match_at(__u32 idx, void *vctx) {
+    struct sig_scan_ctx *c = vctx;
+    if (c->match_id)
+        return 1; // already matched — stop
+
+    __u32 si = idx / SCAN_WINDOW;        // signature slot
+    __u32 i  = idx & (SCAN_WINDOW - 1);  // start offset in the window
+
+    struct signature *s = bpf_map_lookup_elem(&signatures, &si);
+    if (!s || !s->enabled)
+        return 0;
+    __u32 slen = s->len;
+    if (slen == 0 || slen > SIG_MAX_LEN || i + slen > c->n)
+        return 0;
+
+    __u32 zero = 0;
+    struct scan_scratch *sc = bpf_map_lookup_elem(&scan_buf, &zero);
+    if (!sc)
+        return 1;
+
+    int miss = 0;
+#pragma clang loop unroll(full)
+    for (__u32 j = 0; j < SIG_MAX_LEN; j++) {
+        if (j < slen) {
+            __u32 k = (i + j) & (SCAN_WINDOW - 1); // static bound; i+slen<=n<=WINDOW so never wraps a real compare
+            if (sc->buf[k] != s->pat[j])
+                miss = 1;
+        }
+    }
+    if (!miss) {
+        c->match_id = s->id;
+        return 1;
+    }
+    return 0;
+}
+
+// scan_inbound copies up to SCAN_WINDOW payload bytes (largest fitting power-of-
+// two via tiered constant loads) and searches for any enabled signature. Returns
+// the matched id, or 0.
+static __always_inline __u32 scan_inbound(struct __sk_buff *skb, __u32 off, __u32 avail) {
+    __u32 zero = 0;
+    struct scan_scratch *sc = bpf_map_lookup_elem(&scan_buf, &zero);
+    if (!sc)
+        return 0;
+    __u32 n;
+    // Each load size is a literal constant (a variable size is rejected — see the
+    // prototype notes). Largest window that fits the payload wins.
+    if (avail >= 256) {
+        if (bpf_skb_load_bytes(skb, off, sc->buf, 256) < 0)
+            return 0;
+        n = 256;
+    } else if (avail >= 128) {
+        if (bpf_skb_load_bytes(skb, off, sc->buf, 128) < 0)
+            return 0;
+        n = 128;
+    } else if (avail >= 64) {
+        if (bpf_skb_load_bytes(skb, off, sc->buf, 64) < 0)
+            return 0;
+        n = 64;
+    } else if (avail >= SIG_SCAN_MIN) {
+        if (bpf_skb_load_bytes(skb, off, sc->buf, SIG_SCAN_MIN) < 0)
+            return 0;
+        n = SIG_SCAN_MIN;
+    } else {
+        return 0; // too short to be worth scanning
+    }
+    struct sig_scan_ctx ctx = {.n = n, .match_id = 0};
+    bpf_loop(SIG_MAX_COUNT * SCAN_WINDOW, sig_match_at, &ctx, 0);
+    return ctx.match_id;
+}
+
+// account_flow tallies one packet against its 5-tuple in the flows map (#627).
+// First packet of a flow creates the entry; subsequent packets bump the
+// cumulative byte/packet counters and the last-seen timestamp.
+static __always_inline void account_flow(struct __sk_buff *skb, __u32 ifindex,
+                                         __u32 saddr, __u32 daddr,
+                                         __u16 sport, __u16 dport, __u8 proto) {
+    struct flow_key fk = {};
+    fk.ifindex = ifindex;
+    fk.saddr = saddr;
+    fk.daddr = daddr;
+    fk.sport = sport;
+    fk.dport = dport;
+    fk.proto = proto;
+
+    __u64 now = bpf_ktime_get_ns();
+    __u64 len = skb->len; // full L2+ length of this packet
+
+    struct flow_stat *fs = bpf_map_lookup_elem(&flows, &fk);
+    if (fs) {
+        __sync_fetch_and_add(&fs->packets, 1);
+        __sync_fetch_and_add(&fs->bytes, len);
+        fs->last_ns = now;
+        return;
+    }
+    struct flow_stat nfs = {};
+    nfs.packets = 1;
+    nfs.bytes = len;
+    nfs.first_ns = now;
+    nfs.last_ns = now;
+    bpf_map_update_elem(&flows, &fk, &nfs, BPF_ANY);
+}
+
+// account_reply tallies one reply packet (peer → container, seen on the veth
+// TC_EGRESS hook) into the rx_* counters of its flow (#631). The caller passes
+// the key already rebuilt in REQUEST orientation (src=container, dst=peer), so
+// the reply lands on the same entry the ingress hook created for the request.
+// If the request entry doesn't exist yet (reply observed first), create it with
+// only the rx counters set.
+static __always_inline void account_reply(struct __sk_buff *skb, __u32 ifindex,
+                                          __u32 saddr, __u32 daddr,
+                                          __u16 sport, __u16 dport, __u8 proto) {
+    struct flow_key fk = {};
+    fk.ifindex = ifindex;
+    fk.saddr = saddr;
+    fk.daddr = daddr;
+    fk.sport = sport;
+    fk.dport = dport;
+    fk.proto = proto;
+
+    __u64 now = bpf_ktime_get_ns();
+    __u64 len = skb->len;
+
+    struct flow_stat *fs = bpf_map_lookup_elem(&flows, &fk);
+    if (fs) {
+        __sync_fetch_and_add(&fs->rx_packets, 1);
+        __sync_fetch_and_add(&fs->rx_bytes, len);
+        fs->last_ns = now;
+        return;
+    }
+    struct flow_stat nfs = {};
+    nfs.rx_packets = 1;
+    nfs.rx_bytes = len;
+    nfs.first_ns = now;
+    nfs.last_ns = now;
+    bpf_map_update_elem(&flows, &fk, &nfs, BPF_ANY);
+}
+
+SEC("classifier/netpolicy")
+int netpolicy_ingress(struct __sk_buff *skb) {
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    // Only manage IPv4 for Phase A. Anything else passes untouched.
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return TC_ACT_OK;
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return TC_ACT_OK;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return TC_ACT_OK;
+
+    // Which container is this? Look up the veth's policy by ingress ifindex.
+    __u32 ifindex = skb->ingress_ifindex;
+    struct policy_cfg *cfg = bpf_map_lookup_elem(&veth_policy, &ifindex);
+    if (!cfg)
+        return TC_ACT_OK; // unmanaged veth — not ours to police.
+
+    __u32 saddr = ip->saddr;
+    __u32 daddr = ip->daddr;
+
+    // Source validation (#2618), first and for EVERY managed veth whatever its
+    // mode or flags: stamp the frame so the receiving veth's egress hook can tell
+    // a validated container frame from a forged one. SEEN says "a managed veth
+    // sent this"; VALIDATED says "with its own host-assigned address". A veth
+    // with no known address never validates. The mark is cleared of VALIDATED
+    // first so nothing upstream could have pre-set it (the kernel scrubs the
+    // mark on the netns crossing, so the box itself cannot).
+    __u32 mark = (skb->mark & ~NETPOLICY_MARK_VALIDATED) | NETPOLICY_MARK_SEEN;
+    if (cfg->box_ip && saddr == cfg->box_ip)
+        mark |= NETPOLICY_MARK_VALIDATED;
+    skb->mark = mark;
+
+    // A validate-only veth (control plane, untenanted instance): marked above,
+    // and nothing else — not accounted, not judged, never dropped.
+    if (cfg->flags & POLICY_FLAG_VALIDATE_ONLY)
+        return TC_ACT_OK;
+
+    bump(STAT_SEEN);
+
+    // Parse L4 once (ports in host byte order, TCP flags, ICMP echo id),
+    // bounds-checked for the verifier. Used for per-flow accounting (#627), the
+    // reply check (#2618), the virtual-patch port match (#3166) and the deny
+    // audit event below. ICMP and other L4 protocols carry 0 ports; so does a
+    // packet with IP options or a fragment (parse_l4 leaves it unparsed rather
+    // than read sender-chosen bytes as ports).
+    struct l4_info l4 = {};
+    parse_l4(ip, data_end, &l4);
+    __u16 sport = l4.sport, dport = l4.dport;
+
+    // Usage accounting for the traffic view (#627): tally every flow, allowed or
+    // not. Done before the policy decision so a would-deny flow is still counted.
+    // Fragments are skipped (#3166): a later fragment has no L4 header, and
+    // tallying fragments under ports 0 would split one flow's bytes across two
+    // entries. An options-bearing non-fragment is tallied under ports 0.
+    if (!ip_is_fragment(ip))
+        account_flow(skb, ifindex, saddr, daddr, sport, dport, ip->protocol);
+
+    // A managed box may only send with its own address. A forged source is never
