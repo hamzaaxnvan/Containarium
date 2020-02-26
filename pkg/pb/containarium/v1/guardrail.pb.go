@@ -838,3 +838,423 @@ func (x *GuardrailKindCount) Reset() {
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
+
+func (x *GuardrailKindCount) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GuardrailKindCount) ProtoMessage() {}
+
+func (x *GuardrailKindCount) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GuardrailKindCount.ProtoReflect.Descriptor instead.
+func (*GuardrailKindCount) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_guardrail_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GuardrailKindCount) GetKind() GuardrailKind {
+	if x != nil {
+		return x.Kind
+	}
+	return GuardrailKind_GUARDRAIL_KIND_UNSPECIFIED
+}
+
+func (x *GuardrailKindCount) GetFindings() int64 {
+	if x != nil {
+		return x.Findings
+	}
+	return 0
+}
+
+// GuardrailAttestation is the signed record a subject (a dataset directory,
+// a file) carries after a guardrail run. A consumer verifies the signature
+// with the signer's PUBLIC key, recomputes subject_sha256 over the bytes it
+// actually received, and requires verdict == PASS before using the data.
+//
+// What it proves: that these bytes are the ones the named engine scanned
+// under the named policy, and what the gate concluded. What it does not
+// prove: that the engine was any good. The key is held by whoever ran the
+// guardrail — the data owner — never by the consumer, otherwise the
+// consumer could attest its own input.
+type GuardrailAttestation struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// SHA-256 over the subject's canonical bytes (for a directory: every
+	// regular file, by relative path order, path and content).
+	SubjectSha256 string `protobuf:"bytes,1,opt,name=subject_sha256,json=subjectSha256,proto3" json:"subject_sha256,omitempty"`
+	EngineId      string `protobuf:"bytes,2,opt,name=engine_id,json=engineId,proto3" json:"engine_id,omitempty"`
+	EngineVersion string `protobuf:"bytes,3,opt,name=engine_version,json=engineVersion,proto3" json:"engine_version,omitempty"`
+	// SHA-256 over the canonical proto bytes of the GuardrailPolicy applied.
+	PolicyHash string `protobuf:"bytes,4,opt,name=policy_hash,json=policyHash,proto3" json:"policy_hash,omitempty"`
+	// Findings on the ORIGINAL subject, per kind, before redaction.
+	Found []*GuardrailKindCount `protobuf:"bytes,5,rep,name=found,proto3" json:"found,omitempty"`
+	// Findings on the REDACTED subject, per kind — what the gate judged.
+	Residual     []*GuardrailKindCount  `protobuf:"bytes,6,rep,name=residual,proto3" json:"residual,omitempty"`
+	CoverageGaps int64                  `protobuf:"varint,7,opt,name=coverage_gaps,json=coverageGaps,proto3" json:"coverage_gaps,omitempty"`
+	Verdict      GuardrailVerdict       `protobuf:"varint,8,opt,name=verdict,proto3,enum=containarium.v1.GuardrailVerdict" json:"verdict,omitempty"`
+	AttestedAt   *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=attested_at,json=attestedAt,proto3" json:"attested_at,omitempty"`
+	// Identifies the signing key (SHA-256 of the public key, hex) so a
+	// verifier holding several tenants' keys picks the right one.
+	KeyId string `protobuf:"bytes,10,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
+	// Ed25519 signature over the canonical proto bytes of this message with
+	// `signature` cleared.
+	Signature []byte `protobuf:"bytes,11,opt,name=signature,proto3" json:"signature,omitempty"`
+	// The kinds the engine was asked for — and, because an engine that cannot
+	// scan a requested kind answers FAILED_PRECONDITION rather than scanning
+	// the rest, the kinds that were actually covered. A consumer that needs
+	// SECRET covered checks for it here; a PASS that never looked for a kind
+	// must be distinguishable from one that did (#2362). Sorted ascending.
+	KindsScanned  []GuardrailKind `protobuf:"varint,12,rep,packed,name=kinds_scanned,json=kindsScanned,proto3,enum=containarium.v1.GuardrailKind" json:"kinds_scanned,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GuardrailAttestation) Reset() {
+	*x = GuardrailAttestation{}
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GuardrailAttestation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GuardrailAttestation) ProtoMessage() {}
+
+func (x *GuardrailAttestation) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GuardrailAttestation.ProtoReflect.Descriptor instead.
+func (*GuardrailAttestation) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_guardrail_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GuardrailAttestation) GetSubjectSha256() string {
+	if x != nil {
+		return x.SubjectSha256
+	}
+	return ""
+}
+
+func (x *GuardrailAttestation) GetEngineId() string {
+	if x != nil {
+		return x.EngineId
+	}
+	return ""
+}
+
+func (x *GuardrailAttestation) GetEngineVersion() string {
+	if x != nil {
+		return x.EngineVersion
+	}
+	return ""
+}
+
+func (x *GuardrailAttestation) GetPolicyHash() string {
+	if x != nil {
+		return x.PolicyHash
+	}
+	return ""
+}
+
+func (x *GuardrailAttestation) GetFound() []*GuardrailKindCount {
+	if x != nil {
+		return x.Found
+	}
+	return nil
+}
+
+func (x *GuardrailAttestation) GetResidual() []*GuardrailKindCount {
+	if x != nil {
+		return x.Residual
+	}
+	return nil
+}
+
+func (x *GuardrailAttestation) GetCoverageGaps() int64 {
+	if x != nil {
+		return x.CoverageGaps
+	}
+	return 0
+}
+
+func (x *GuardrailAttestation) GetVerdict() GuardrailVerdict {
+	if x != nil {
+		return x.Verdict
+	}
+	return GuardrailVerdict_GUARDRAIL_VERDICT_UNSPECIFIED
+}
+
+func (x *GuardrailAttestation) GetAttestedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AttestedAt
+	}
+	return nil
+}
+
+func (x *GuardrailAttestation) GetKeyId() string {
+	if x != nil {
+		return x.KeyId
+	}
+	return ""
+}
+
+func (x *GuardrailAttestation) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+func (x *GuardrailAttestation) GetKindsScanned() []GuardrailKind {
+	if x != nil {
+		return x.KindsScanned
+	}
+	return nil
+}
+
+// GuardrailTrustedSigner is a signing key an admin registered. A verifier
+// trusts these keys, never a key a deploy request carries.
+type GuardrailTrustedSigner struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// SHA-256 of public_key, hex (matches GuardrailAttestation.key_id). Set
+	// rejects a signer whose key_id is not the hash of its key.
+	KeyId string `protobuf:"bytes,1,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
+	// Ed25519 public key, 32 bytes.
+	PublicKey []byte `protobuf:"bytes,2,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+	// Reviewer-readable name. No personal data.
+	Label         string `protobuf:"bytes,3,opt,name=label,proto3" json:"label,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GuardrailTrustedSigner) Reset() {
+	*x = GuardrailTrustedSigner{}
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GuardrailTrustedSigner) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GuardrailTrustedSigner) ProtoMessage() {}
+
+func (x *GuardrailTrustedSigner) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GuardrailTrustedSigner.ProtoReflect.Descriptor instead.
+func (*GuardrailTrustedSigner) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_guardrail_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GuardrailTrustedSigner) GetKeyId() string {
+	if x != nil {
+		return x.KeyId
+	}
+	return ""
+}
+
+func (x *GuardrailTrustedSigner) GetPublicKey() []byte {
+	if x != nil {
+		return x.PublicKey
+	}
+	return nil
+}
+
+func (x *GuardrailTrustedSigner) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+// GuardrailRevokedKey is a signing key an admin revoked (#2729;
+// docs/architecture/guardrail-inbound-and-server-policy.md, "Signer rotation
+// and revocation"). Every attestation the key signed fails verification,
+// whatever its attested_at: the signer sets that timestamp, so whoever stole
+// the key could backdate it. Revocation is permanent: a Set that drops or
+// changes a stored entry is refused.
+type GuardrailRevokedKey struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// SHA-256 of the revoked Ed25519 public key, hex (as GuardrailTrustedSigner.key_id).
+	KeyId string `protobuf:"bytes,1,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
+	// Server-assigned by the Set that adds the entry; a value in the request is
+	// ignored.
+	RevokedAt *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=revoked_at,json=revokedAt,proto3" json:"revoked_at,omitempty"`
+	// Required. Reviewer-readable, no personal data. Named by every refused verify.
+	Reason        string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GuardrailRevokedKey) Reset() {
+	*x = GuardrailRevokedKey{}
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GuardrailRevokedKey) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GuardrailRevokedKey) ProtoMessage() {}
+
+func (x *GuardrailRevokedKey) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GuardrailRevokedKey.ProtoReflect.Descriptor instead.
+func (*GuardrailRevokedKey) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_guardrail_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *GuardrailRevokedKey) GetKeyId() string {
+	if x != nil {
+		return x.KeyId
+	}
+	return ""
+}
+
+func (x *GuardrailRevokedKey) GetRevokedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RevokedAt
+	}
+	return nil
+}
+
+func (x *GuardrailRevokedKey) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+// GuardrailTrustBundle is the trust a verifier needs without a server: the
+// trusted signers and the revoked keys. `guardrail verify --trust-bundle`
+// reads it as protojson. A key in `revoked` is refused even if it is also
+// listed in `signers`.
+type GuardrailTrustBundle struct {
+	state         protoimpl.MessageState    `protogen:"open.v1"`
+	Signers       []*GuardrailTrustedSigner `protobuf:"bytes,1,rep,name=signers,proto3" json:"signers,omitempty"`
+	Revoked       []*GuardrailRevokedKey    `protobuf:"bytes,2,rep,name=revoked,proto3" json:"revoked,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GuardrailTrustBundle) Reset() {
+	*x = GuardrailTrustBundle{}
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GuardrailTrustBundle) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GuardrailTrustBundle) ProtoMessage() {}
+
+func (x *GuardrailTrustBundle) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GuardrailTrustBundle.ProtoReflect.Descriptor instead.
+func (*GuardrailTrustBundle) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_guardrail_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *GuardrailTrustBundle) GetSigners() []*GuardrailTrustedSigner {
+	if x != nil {
+		return x.Signers
+	}
+	return nil
+}
+
+func (x *GuardrailTrustBundle) GetRevoked() []*GuardrailRevokedKey {
+	if x != nil {
+		return x.Revoked
+	}
+	return nil
+}
+
+// ServerGuardrailPolicy is the stored policy plus the server's bookkeeping.
+type ServerGuardrailPolicy struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The rules. GuardrailAttestation.policy_hash covers THIS message only, so
+	// rotating a trusted signer does not invalidate existing attestations.
+	Policy         *GuardrailPolicy          `protobuf:"bytes,1,opt,name=policy,proto3" json:"policy,omitempty"`
+	TrustedSigners []*GuardrailTrustedSigner `protobuf:"bytes,2,rep,name=trusted_signers,json=trustedSigners,proto3" json:"trusted_signers,omitempty"`
+	// Server-assigned, monotonic: every successful Set increments it by one.
+	Revision  int64                  `protobuf:"varint,3,opt,name=revision,proto3" json:"revision,omitempty"`
+	UpdatedAt *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// Authenticated subject that made the last Set.
+	UpdatedBy string `protobuf:"bytes,5,opt,name=updated_by,json=updatedBy,proto3" json:"updated_by,omitempty"`
+	// Revoked signing keys (#2729). Outside `policy`, so revoking a key leaves
+	// policy_hash unchanged. Never shrinks.
+	RevokedSigners []*GuardrailRevokedKey `protobuf:"bytes,6,rep,name=revoked_signers,json=revokedSigners,proto3" json:"revoked_signers,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ServerGuardrailPolicy) Reset() {
+	*x = ServerGuardrailPolicy{}
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ServerGuardrailPolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ServerGuardrailPolicy) ProtoMessage() {}
+
+func (x *ServerGuardrailPolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_guardrail_proto_msgTypes[12]

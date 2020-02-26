@@ -27,3 +27,93 @@ export default function TerminalDialog({ open, onClose, containerName, username,
   const terminalRef = useRef<HTMLDivElement>(null);
   const terminalInstance = useRef<Terminal | null>(null);
   const fitAddon = useRef<FitAddon | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+
+  const cleanup = useCallback(() => {
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+    if (terminalInstance.current) { terminalInstance.current.dispose(); terminalInstance.current = null; }
+    fitAddon.current = null;
+    setConnected(false); setConnecting(false); setError(null);
+  }, []);
+
+  const connect = useCallback(() => {
+    if (!terminalRef.current || connecting || connected) return;
+    setConnecting(true); setError(null);
+
+    const term = new Terminal({
+      cursorBlink: true, fontSize: 14,
+      fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+      theme: { background: '#09090b', foreground: '#d4d4d4', cursor: '#d4d4d4', selectionBackground: '#264f78' },
+    });
+
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.loadAddon(new WebLinksAddon());
+    term.open(terminalRef.current);
+    fit.fit();
+    terminalInstance.current = term;
+    fitAddon.current = fit;
+
+    let wsUrl = serverEndpoint.replace(/^http/, 'ws').replace(/\/v1\/?$/, '');
+    const cleanToken = token.replace(/\s+/g, '');
+    wsUrl = `${wsUrl}/v1/containers/${username}/terminal`;
+
+    term.writeln(`Connecting to ${containerName}...`);
+
+    // Phase 1.5 — auth via WebSocket subprotocol header
+    // (Sec-WebSocket-Protocol) so the JWT never lands in URL
+    // bars, access logs, or proxy logs. Server matches the
+    // 'containarium.bearer' marker and reads the next entry
+    // as the token; see internal/auth/ws_token.go.
+    const ws = new WebSocket(wsUrl, ['containarium.bearer', cleanToken]);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setConnected(true); setConnecting(false);
+      term.writeln('Connected!\r\n');
+      ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg: TerminalMessage = JSON.parse(event.data);
+        if (msg.type === 'output' && msg.data) term.write(msg.data);
+        else if (msg.type === 'error' && msg.data) { term.writeln(`\r\n\x1b[31mError: ${msg.data}\x1b[0m`); setError(msg.data); }
+      } catch { term.write(event.data); }
+    };
+
+    ws.onerror = () => { setError('WebSocket connection error'); setConnecting(false); term.writeln('\r\n\x1b[31mConnection error\x1b[0m'); };
+    ws.onclose = () => { setConnected(false); setConnecting(false); term.writeln('\r\n\x1b[33mConnection closed\x1b[0m'); };
+
+    term.onData((data) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'input', data }));
+    });
+
+    const handleResize = () => {
+      if (fitAddon.current && terminalInstance.current) {
+        fitAddon.current.fit();
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'resize', cols: terminalInstance.current.cols, rows: terminalInstance.current.rows }));
+        }
+      }
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [serverEndpoint, username, token, containerName, connecting, connected]);
+
+  useEffect(() => {
+    if (open) {
+      const t = setTimeout(() => {
+        if (terminalRef.current) connect();
+        else setTimeout(() => { if (terminalRef.current) connect(); }, 200);
+      }, 100);
+      return () => clearTimeout(t);
+    }
+  }, [open, connect]);
+
+  useEffect(() => { if (!open) cleanup(); }, [open, cleanup]);
+
+  useEffect(() => {

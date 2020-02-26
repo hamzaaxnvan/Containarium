@@ -299,3 +299,304 @@ service ContainerService {
     };
   }
 
+  // PrepareEncryptedMigration asks this daemon, as a migration
+  // DESTINATION, whether it can take over an encrypted container before
+  // any data is copied — and provisions the tenant's encrypted storage
+  // so the copy has somewhere correct to land.
+  //
+  // Two answers in one call, because they are needed at the same moment
+  // and only the destination can give either: whether its own key
+  // custody resolves the source's KeyRef, and which storage pool is
+  // sourced at that tenant's encryptionroot.
+  //
+  // Without the first, a migration can copy an entire container and only
+  // then discover the destination cannot unlock it, leaving an
+  // unstartable shell. Without the second, the copy lands on the
+  // destination's default pool and the container arrives unencrypted.
+  //
+  // Only the KeyRef crosses the wire; key material never does. Internal
+  // use only — operators don't call this.
+  rpc PrepareEncryptedMigration(PrepareEncryptedMigrationRequest) returns (PrepareEncryptedMigrationResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/prepare-encrypted-migration"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Pre-flight an encrypted migration (internal)";
+      description: "Called by the source daemon before MoveContainer copies anything. The destination reports whether its key custody can resolve the container's KeyRef, and provisions the tenant's encrypted storage pool so the copy lands inside the tenant's encryptionroot. Only the key reference is sent; key material never crosses the wire. Not intended for direct operator use.";
+      tags: "Container Operations";
+    };
+  }
+
+  // AdoptMigratedContainer is the destination-side helper RPC called by
+  // a peer's MoveContainer after `incus copy` has pushed the LXC to
+  // this daemon. It registers the container with this daemon's state
+  // (host user, route record at the new IP) so the LXC is fully
+  // operational under Containarium's API surface, then returns the
+  // container's new local IP for the caller to wire into the route
+  // store cutover. Internal use only — operators don't call this.
+  rpc AdoptMigratedContainer(AdoptMigratedContainerRequest) returns (AdoptMigratedContainerResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/adopt"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Adopt a migrated container (internal)";
+      description: "Called by the source daemon during MoveContainer after the LXC has been Incus-copied to this host. Registers the container's host-side accounts and route record so it's fully under Containarium's control. Not intended for direct operator use.";
+      tags: "Container Operations";
+    };
+  }
+
+  // ToggleMonitoring enables or disables application-emitted OTel
+  // on an existing container without recreate. When enabling, the
+  // daemon stamps OTEL_EXPORTER_OTLP_ENDPOINT and related env vars
+  // pointing at this VM's core OTel collector LXC, then restarts
+  // the container so the new env reaches the app process. When
+  // disabling, the four OTEL_* env vars are unset and the container
+  // is restarted so the SDK falls back to its built-in "no endpoint,
+  // buffer + drop" behavior. Requires the daemon to be wired with
+  // a collector endpoint (--otel-collector-endpoint or auto-ensured
+  // core collector); without one, enabling fails with
+  // FAILED_PRECONDITION rather than silently writing dead env vars.
+  rpc ToggleMonitoring(ToggleMonitoringRequest) returns (ToggleMonitoringResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/monitoring"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Enable or disable OTel monitoring on a container";
+      description: "Live-flip OTEL_EXPORTER_OTLP_ENDPOINT and related env vars on an existing container and restart it so the change reaches the app. Use this to retrofit monitoring onto containers created before --monitoring was wired into create_container.";
+      tags: "Container Operations";
+    };
+  }
+
+  // ToggleAutoSleep opts a container into manual auto-sleep tracking
+  // (Phase 1 of the serverless feature). Writes the per-container
+  // Incus user.* metadata keys; does NOT itself sleep or wake the
+  // container. The Phase 2 ticker (auto-sleep daemon) and Phase 3
+  // HTTP wake proxy are separate work — this RPC only sets the flag
+  // they will consume.
+  rpc ToggleAutoSleep(ToggleAutoSleepRequest) returns (ToggleAutoSleepResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/auto-sleep"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Enable or disable auto-sleep on a container";
+      description: "Writes the per-container auto-sleep opt-in metadata (Incus user.* keys). Does not itself stop the container — use stop_container for that. Phase 2 (the actual idle-tick) and Phase 3 (wake-on-HTTP) consume this flag.";
+      tags: "Container Operations";
+    };
+  }
+
+  // SetContainerTTL schedules or clears a container's auto-delete time.
+  // duration_seconds == 0 clears any existing TTL; > 0 sets
+  // ttl_expires_at to now() + duration. duration_seconds is capped at
+  // 604800 (7 days); larger values return InvalidArgument. Mirrors
+  // the 168h ceiling enforced by the `containarium ttl set` CLI
+  // (PR #297) — see internal/ttlsweeper for the consumer side.
+  //
+  // The daemon-side handler is not yet implemented; this scaffold PR
+  // adds the proto + sweeper decision logic only. Until the wiring PR
+  // lands, calls return Unimplemented and the CLI degrades to a
+  // graceful no-op (per PR #297).
+  rpc SetContainerTTL(SetContainerTTLRequest) returns (SetContainerTTLResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{name}/ttl"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Schedule or clear a container's auto-delete TTL";
+      description: "Stamps the container with a wall-clock auto-delete time consumed by the daemon's TTL sweeper. duration_seconds=0 clears any existing TTL; > 0 sets it to now()+duration. Capped at 604800 (7 days). Used by the containarium-run GitHub Action to auto-clean failed-CI debug boxes.";
+      tags: "Container Operations";
+    };
+  }
+
+  // SetContainerDeletePolicy protects or unprotects a container from the
+  // daemon's automated/bulk deletion paths (#284). DELETE_POLICY_PROTECTED
+  // makes the ttlsweeper auto-reap and `containarium prune` skip the box;
+  // DELETE_POLICY_UNSPECIFIED returns it to the default. A deliberate
+  // single-box delete always succeeds regardless. The policy is persisted on
+  // the Incus config under user.containarium.delete_policy, so it survives
+  // daemon restart with no separate store — read back on list/get.
+  rpc SetContainerDeletePolicy(SetContainerDeletePolicyRequest) returns (SetContainerDeletePolicyResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{name}/delete-policy"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Protect or unprotect a container from automated deletion";
+      description: "Sets the container's delete policy (#284). DELETE_POLICY_PROTECTED makes the ttlsweeper auto-reap and `containarium prune` skip the box (e.g. a persistent runner); DELETE_POLICY_UNSPECIFIED returns it to the default (eligible for both). A deliberate single-box delete always succeeds regardless.";
+      tags: "Container Operations";
+    };
+  }
+
+  // SetContainerToolAccess records the tool-access level for platform-started
+  // (unattended) agent runs on a container (#2944): NONE, BUILD_TOOLS or
+  // FULL_SUDO, or UNSPECIFIED to clear it. Persisted on the Incus config under
+  // user.containarium.tool_access, so it survives daemon restart with no
+  // separate store, and is read back on list/get as Container.tool_access.
+  rpc SetContainerToolAccess(SetContainerToolAccessRequest) returns (SetContainerToolAccessResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{name}/tool-access"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Record the tool-access level for platform-started runs";
+      description: "Sets the container's tool-access level (#2944). Only platform-started (headless) agent runs are governed by it; the owner's own login is unaffected. UNSPECIFIED clears it.";
+      tags: "Container Operations";
+    };
+  }
+
+  // SetContainerAttribution merges labels onto an EXISTING container's config
+  // (cloud #746). The hosted control plane stamps attribution labels
+  // (cloud_org_id / cloud_container_id / managed_by) at create time today; this
+  // endpoint lets it stamp them AFTER the fact, which the cloud's adopt flow
+  // (cloud #539) needs to bring a host's pre-existing (orphan) container under
+  // org management. Merge semantics: each provided label is set; labels not
+  // named are left intact. Cloud→daemon plumbing (like /authorized-keys/sentinel),
+  // not a standalone operator action — no CLI verb.
+  rpc SetContainerAttribution(SetContainerAttributionRequest) returns (SetContainerAttributionResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{name}/attribution"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Merge attribution labels onto an existing container";
+      description: "Sets the given labels on a live container's config, leaving other labels intact (cloud #746). Lets the hosted control plane stamp cloud attribution (cloud_org_id / cloud_container_id / managed_by) on a pre-existing box so its adopt flow can bring it under management (cloud #539). 404 when the container doesn't resolve.";
+      tags: "Container Operations";
+    };
+  }
+
+  // AddSSHKey adds an SSH public key to a container
+  rpc AddSSHKey(AddSSHKeyRequest) returns (AddSSHKeyResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/ssh-keys"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Add SSH key";
+      description: "Adds an SSH public key to a container's authorized_keys file, allowing SSH access with the corresponding private key.";
+      tags: "SSH Management";
+    };
+  }
+
+  // SetSSHKeys replaces the caller-managed SSH public keys of a container
+  rpc SetSSHKeys(SetSSHKeysRequest) returns (SetSSHKeysResponse) {
+    option (google.api.http) = {
+      put: "/v1/containers/{username}/ssh-keys"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Set SSH keys (replace all)";
+      description: "Makes the container user's authorized_keys contain exactly the given public keys. Keys not in the list are removed; keys the platform manages itself (the sentinel's upstream key) are never removed. Idempotent. The file is rewritten, not edited: each kept key is written as a regenerated canonical line (comment reduced to a safe charset), and comment lines, unparseable lines and any other line not in the list are dropped. At most 100 keys of 8 KB each. A dropped key is always removed from this container user's file. Its ssh_keys registry entry is handled as RemoveSSHKey does: one entry per key, owned by the first account to register it, until that entry is revoked, after which the next registration replaces it (an owner account also owns an entry its own collaborator account <owner>-container-<user> registered, since ownership compares user id); it is revoked when this container user owns it or it has no owner, and no other account (a collaborator account is a separate account) still holds the same public key in its own authorized_keys. A key another account holds is dropped from this file but its entry stays active, and the call still succeeds; if this container user owned the entry, the entry loses its owner, so the next account to register the key takes it over and the last holder's own drop revokes it. When another account owns the entry it stays active, so dropping a key is not a guaranteed revocation of a compromised key. Dropped keys are revoked before the file changes, so a registry failure leaves the file untouched and a retry repeats the revocation. An empty list removes every caller-managed key and must be requested with allow_empty=true. Every key must be a single-line public key with no authorized_keys options; one invalid key fails the whole call with no change. Requires the same access as AddSSHKey.";
+      tags: "SSH Management";
+    };
+  }
+
+  // RemoveSSHKey removes an SSH public key from a container
+  rpc RemoveSSHKey(RemoveSSHKeyRequest) returns (RemoveSSHKeyResponse) {
+    option (google.api.http) = {
+      delete: "/v1/containers/{username}/ssh-keys/{ssh_public_key}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Remove SSH key";
+      description: "Removes an SSH public key from a container's authorized_keys file, revoking that key's SSH access to this container. The key's ssh_keys registry entry (one per key, owned by the first account to register it; a revoked entry is replaced by the next registration) is revoked when this container user owns it or it has no owner. Ownership compares user id, so an owner account also owns an entry its own collaborator account <owner>-container-<user> registered on another box. If this call would revoke the entry but any other account (a collaborator account <owner>-container-<collab> is a separate account here) still holds the same public key in its own authorized_keys, the key is removed from this container user's file only and the entry stays active; the call still succeeds and does not say which account holds the key. If this container user owned that entry, the entry loses its owner: the next account to register the key takes it over, and the last holder's own removal revokes it. A key whose entry another account owns is likewise removed from the file with the entry left active, so removing a key is not a guaranteed revocation of a compromised key. The revocation happens before the file changes, so a registry failure leaves the key in place and a retry repeats it. The ssh_public_key should be URL-encoded.";
+      tags: "SSH Management";
+    };
+  }
+
+  // StartBoxRun starts (or resumes) a coding-agent run on a box through the
+  // daemon API, with no SSH client needed (#2193) — the host-with-no-SSH
+  // case ListBoxRuns/TailBoxRunLog could read but not drive. Same access as
+  // connecting to the box: ssh:write, and the box owner or one of its
+  // collaborators.
+  rpc StartBoxRun(StartBoxRunRequest) returns (StartBoxRunResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/code-runs"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Start a box's code run";
+      description: "Starts (or resumes) a coding-agent run on a box, no SSH client needed. The engine and its credential source come from the box's own ~/.containarium/code.json (`code install`); this call only says what to run. A previous run under the resolved run_name that is still RUNNING or UNKNOWN is FAILED_PRECONDITION, naming it. Box owner or collaborator, ssh:write scope.";
+      tags: "Code Runs";
+    };
+  }
+
+  // GetBoxRunUserStatus reports whether the unprivileged run user on a box has a
+  // usable agent sign-in: the same probe StartBoxRun applies before refusing a
+  // platform run, without queueing one (#3274). Names the credential source
+  // only; never reads, copies or prints a credential value. Same access as
+  // StartBoxRun.
+  rpc GetBoxRunUserStatus(GetBoxRunUserStatusRequest) returns (GetBoxRunUserStatusResponse) {
+    option (google.api.http) = {
+      get: "/v1/containers/{username}/run-user/status"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Report whether a box's run user is signed in";
+      description: "Read-only pre-check for StartBoxRun on a box with a recorded tool-access level: whether the unprivileged run user has a usable agent sign-in. Reports the credential source name only, never a value, and does not create the run user. Box owner or collaborator, ssh:write scope.";
+      tags: "Code Runs";
+    };
+  }
+
+  // ListBoxRuns lists the `code run` records on a box (#2123). Same access
+  // as connecting to the box: ssh:write, and the box owner or one of its
+  // collaborators.
+  rpc ListBoxRuns(ListBoxRunsRequest) returns (ListBoxRunsResponse) {
+    option (google.api.http) = {
+      get: "/v1/containers/{username}/code-runs"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List a box's code runs";
+      description: "Returns the box's current code-run records (containarium code run): name, start and end time, exit code, outcome (running/exited/unknown), and log path. Box owner or collaborator, ssh:write scope.";
+      tags: "Code Runs";
+    };
+  }
+
+  // TailBoxRunLog reads one byte window of a box run's log (#2123), the
+  // TailRunLog contract (#2096) for `code run` logs: resumable (pass
+  // end_offset back as start_offset) and bounded (max_bytes,
+  // follow_seconds). A framed log is demuxed to its stdout.
+  rpc TailBoxRunLog(TailBoxRunLogRequest) returns (TailBoxRunLogResponse) {
+    option (google.api.http) = {
+      get: "/v1/containers/{username}/code-runs/{run_name}/log"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Tail a box code run's log";
+      description: "Returns one byte window of a code run's log plus the offset to resume from; ended once the run has an exit code and the log is read to its end. Framed logs are demuxed to stdout, with stderr_dropped set when stderr frames were skipped. Box owner or collaborator, ssh:write scope.";
+      tags: "Code Runs";
+    };
+  }
+
+  // StopBoxRun stops a box's code run (#2603): the daemon-API counterpart to
+  // `containarium code stop`, for a caller with no SSH client. Same access as
+  // StartBoxRun: ssh:write, and the box owner or one of its collaborators.
+  rpc StopBoxRun(StopBoxRunRequest) returns (StopBoxRunResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/code-runs/{run_name}:stop"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Stop a box's code run";
+      description: "Sends SIGTERM (SIGKILL with force) to a running code run's process group and reports the result. Idempotent: a run that has already exited is not signaled and the call succeeds. A run whose outcome is unknown (it predates this boot, or died before its exit was recorded) is FAILED_PRECONDITION, because its PID may have been reassigned. Box owner or collaborator, ssh:write scope.";
+      tags: "Code Runs";
+    };
+  }
+
+  // SweepBoxRunCheckouts runs the per-run checkout sweep once on one box
+  // (#3296): removes directories directly under the owner's and the run
+  // user's ~/work named <repo>-run-<8 hex> that are older than the daemon's
+  // maximum age, not in use and not a live run's. dry_run lists the same set
+  // and removes nothing. Same access as StopBoxRun.
+  rpc SweepBoxRunCheckouts(SweepBoxRunCheckoutsRequest) returns (SweepBoxRunCheckoutsResponse) {
+    option (google.api.http) = {
+      post: "/v1/containers/{username}/code-run-checkouts:sweep"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Sweep a box's stale per-run checkouts";
+      description: "Removes stale per-run checkout directories of platform-started runs: entries directly under the box owner's and the run user's ~/work whose name matches ^[A-Za-z0-9._-]+-run-[0-9a-f]{8}$, that are directories (symlinks are never followed or removed), whose newest modification is older than the daemon's --run-checkout-max-age, that no process has as its working directory, and that are not a live run's. Nothing else is touched. dry_run=true lists exactly the set a real sweep would remove and removes nothing. Only a box that has had a platform-started run (a recorded tool-access level or a run record) is swept. A stopped box is FAILED_PRECONDITION, as is a daemon with the sweep turned off (max age 0). Box owner or collaborator, ssh:write scope.";
+      tags: "Code Runs";
+    };
+  }
+
+  // GetRunApprovalKey returns the public key a box's permission-request
