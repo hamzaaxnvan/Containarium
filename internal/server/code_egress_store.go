@@ -38,3 +38,43 @@ type CodingToolEgressPolicyStore interface {
 // --- in-memory ------------------------------------------------------
 
 // MemCodingToolEgressPolicyStore is goroutine-safe and does not survive a
+// restart; for --standalone daemons and tests.
+type MemCodingToolEgressPolicyStore struct {
+	mu       sync.RWMutex
+	m        map[string]*pb.CodingToolEgressPolicy
+	revision int64
+}
+
+func NewMemCodingToolEgressPolicyStore() *MemCodingToolEgressPolicyStore {
+	return &MemCodingToolEgressPolicyStore{m: make(map[string]*pb.CodingToolEgressPolicy)}
+}
+
+func (s *MemCodingToolEgressPolicyStore) Set(_ context.Context, p *pb.CodingToolEgressPolicy, updatedBy string) (*pb.CodingToolEgressPolicy, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var prev int64
+	if old, ok := s.m[p.GetTenant()]; ok {
+		prev = old.GetRevision()
+	}
+	s.revision++
+	np := cloneCodeEgressPolicy(p)
+	np.Revision = s.revision
+	np.UpdatedAt = timestamppb.New(time.Now().UTC())
+	np.UpdatedBy = updatedBy
+	s.m[p.GetTenant()] = np
+	return cloneCodeEgressPolicy(np), prev, nil
+}
+
+func (s *MemCodingToolEgressPolicyStore) Get(_ context.Context, tenant string) (*pb.CodingToolEgressPolicy, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.m[tenant]
+	if !ok {
+		return nil, ErrCodingToolEgressPolicyNotFound
+	}
+	return cloneCodeEgressPolicy(p), nil
+}
+
+func (s *MemCodingToolEgressPolicyStore) Delete(_ context.Context, tenant string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
