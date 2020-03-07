@@ -42,3 +42,48 @@ type ProviderCredentials struct {
 	APIToken string `json:"api_token,omitempty"`
 }
 
+// ConfigPath returns the full path to the hosting config file
+func ConfigPath() string {
+	return filepath.Join(DefaultConfigDir, DefaultConfigFile)
+}
+
+// LoadConfig loads the hosting configuration from the default location
+func LoadConfig() (*Config, error) {
+	return LoadConfigFromFile(ConfigPath())
+}
+
+// LoadConfigFromFile loads the hosting configuration from a specific file
+func LoadConfigFromFile(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("hosting config not found at %s (run 'containarium hosting setup' first)", path)
+		}
+		return nil, fmt.Errorf("read config file: %w", err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config file: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+// SaveConfig saves the hosting configuration to the default location
+func SaveConfig(cfg *Config) error {
+	return SaveConfigToFile(cfg, ConfigPath())
+}
+
+// SaveConfigToFile saves the hosting configuration to a specific file
+func SaveConfigToFile(cfg *Config, path string) error {
+	// Ensure directory exists
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
