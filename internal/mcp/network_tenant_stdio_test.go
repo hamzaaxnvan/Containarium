@@ -64,3 +64,36 @@ func TestNativeTenantMCPStdioInitializeCreateAndQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = in.Close()
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	})
+	scanner := bufio.NewScanner(out)
+	scanner.Buffer(make([]byte, 4096), 2<<20)
+	exchange := func(id int, method string, params any) json.RawMessage {
+		t.Helper()
+		req := struct {
+			JSONRPC string `json:"jsonrpc"`
+			ID      int    `json:"id"`
+			Method  string `json:"method"`
+			Params  any    `json:"params"`
+		}{"2.0", id, method, params}
+		if err := json.NewEncoder(in).Encode(req); err != nil {
+			t.Fatal(err)
+		}
+		if !scanner.Scan() {
+			t.Fatalf("MCP closed before %s: %v", method, scanner.Err())
+		}
+		var reply struct {
+			ID     int             `json:"id"`
+			Result json.RawMessage `json:"result"`
+			Error  json.RawMessage `json:"error"`

@@ -100,3 +100,309 @@ type ActuationServiceClient interface {
 	//     can't distinguish, by design.
 	//   - Unauthenticated: missing / invalid host-bearer.
 	ReportContainerState(ctx context.Context, in *ReportContainerStateRequest, opts ...grpc.CallOption) (*ReportContainerStateResponse, error)
+	// WatchAssignments is a long-lived server stream. The host opens
+	// it on startup and keeps it open; the cloud sends:
+	//  1. an immediate snapshot of the host's current assignments,
+	//  2. a fresh snapshot on each subsequent change.
+	//
+	// v1 implementation polls the store on a fixed interval and sends
+	// a batch every tick. Hosts treat each batch as authoritative
+	// and apply it idempotently. A future slice replaces the poll
+	// with a notification bus that wakes the loop on assignment
+	// mutations (currently scheduler-create / host-retire-cascade /
+	// stale-host-sweeper).
+	//
+	// No HTTP gateway annotation — grpc-gateway's SSE bridge for
+	// server-streams is awkward enough that hosts (which are always
+	// platform-daemons speaking real gRPC) should just use the
+	// native channel.
+	WatchAssignments(ctx context.Context, in *WatchAssignmentsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AssignmentBatch], error)
+	// GetSSHTrustBundle returns what this host needs to trust the cloud's SSH
+	// CA and refuse revoked certificates: the CA public keys for sshd's
+	// TrustedUserCAKeys, and a KRL spec for RevokedKeys.
+	//
+	// Auth: requires a valid `host-bearer` header — the same channel the host
+	// already uses for enrollment and heartbeats, so no new transport, no new
+	// credential, and nothing for an operator to wire up per host.
+	//
+	// Errors:
+	//   - Unauthenticated: missing / invalid host-bearer.
+	//   - Unimplemented: this daemon has no SSH CA configured.
+	GetSSHTrustBundle(ctx context.Context, in *GetSSHTrustBundleRequest, opts ...grpc.CallOption) (*GetSSHTrustBundleResponse, error)
+	// AuthorizeSSH is the managed-mode answer to SSHAuthzService.Authorize
+	// (#2516): the daemon forwards the sentinel's question with its host
+	// bearer and relays the answer. It reuses containarium.v1's messages so
+	// the daemon never translates, hence the lint exemption.
+	//
+	// Auth: requires a valid `host-bearer` header.
+	AuthorizeSSH(ctx context.Context, in *v1.AuthorizeSSHRequest, opts ...grpc.CallOption) (*v1.AuthorizeSSHResponse, error)
+}
+
+type actuationServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewActuationServiceClient(cc grpc.ClientConnInterface) ActuationServiceClient {
+	return &actuationServiceClient{cc}
+}
+
+func (c *actuationServiceClient) EnrollHost(ctx context.Context, in *EnrollHostRequest, opts ...grpc.CallOption) (*EnrollHostResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnrollHostResponse)
+	err := c.cc.Invoke(ctx, ActuationService_EnrollHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actuationServiceClient) ReportHostStatus(ctx context.Context, in *ReportHostStatusRequest, opts ...grpc.CallOption) (*ReportHostStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportHostStatusResponse)
+	err := c.cc.Invoke(ctx, ActuationService_ReportHostStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actuationServiceClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HeartbeatResponse)
+	err := c.cc.Invoke(ctx, ActuationService_Heartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actuationServiceClient) ReportContainerState(ctx context.Context, in *ReportContainerStateRequest, opts ...grpc.CallOption) (*ReportContainerStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportContainerStateResponse)
+	err := c.cc.Invoke(ctx, ActuationService_ReportContainerState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actuationServiceClient) WatchAssignments(ctx context.Context, in *WatchAssignmentsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AssignmentBatch], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ActuationService_ServiceDesc.Streams[0], ActuationService_WatchAssignments_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchAssignmentsRequest, AssignmentBatch]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ActuationService_WatchAssignmentsClient = grpc.ServerStreamingClient[AssignmentBatch]
+
+func (c *actuationServiceClient) GetSSHTrustBundle(ctx context.Context, in *GetSSHTrustBundleRequest, opts ...grpc.CallOption) (*GetSSHTrustBundleResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSSHTrustBundleResponse)
+	err := c.cc.Invoke(ctx, ActuationService_GetSSHTrustBundle_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *actuationServiceClient) AuthorizeSSH(ctx context.Context, in *v1.AuthorizeSSHRequest, opts ...grpc.CallOption) (*v1.AuthorizeSSHResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(v1.AuthorizeSSHResponse)
+	err := c.cc.Invoke(ctx, ActuationService_AuthorizeSSH_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ActuationServiceServer is the server API for ActuationService service.
+// All implementations must embed UnimplementedActuationServiceServer
+// for forward compatibility.
+type ActuationServiceServer interface {
+	// EnrollHost redeems a single-use join token and registers the BYO host.
+	// Self-authenticating via the token in the body (NOT host-bearer — the row
+	// doesn't exist yet).
+	EnrollHost(context.Context, *EnrollHostRequest) (*EnrollHostResponse, error)
+	// ReportHostStatus upserts the calling host's capability profile +
+	// `doctor` self-check and bumps its heartbeat. Requires a valid
+	// `host-bearer` header. Idempotent.
+	ReportHostStatus(context.Context, *ReportHostStatusRequest) (*ReportHostStatusResponse, error)
+	// Heartbeat updates hosts.last_heartbeat_at for the calling host.
+	// A stale gap (>2 × the host's expected interval) marks the host
+	// for the HostSweeper, which reassigns its containers. Hosts are
+	// expected to call this every N seconds with N << the staleness
+	// threshold.
+	//
+	// Auth: requires a valid `host-bearer` header. Returns
+	// Unauthenticated if missing / malformed / tombstoned. The
+	// method is otherwise idempotent.
+	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	// ReportContainerState records the calling host's observed state
+	// for one of its assigned containers. The cloud uses this to
+	// surface the user-facing containers.state field and (in a future
+	// slice) to react to FAILED reports with reassignment.
+	//
+	// Errors:
+	//   - InvalidArgument: malformed container_id, empty / unknown state.
+	//   - NotFound: no live assignment for that container belongs to
+	//     the calling host. Single error code for "container unknown"
+	//     and "container is on a different host" — the calling host
+	//     can't distinguish, by design.
+	//   - Unauthenticated: missing / invalid host-bearer.
+	ReportContainerState(context.Context, *ReportContainerStateRequest) (*ReportContainerStateResponse, error)
+	// WatchAssignments is a long-lived server stream. The host opens
+	// it on startup and keeps it open; the cloud sends:
+	//  1. an immediate snapshot of the host's current assignments,
+	//  2. a fresh snapshot on each subsequent change.
+	//
+	// v1 implementation polls the store on a fixed interval and sends
+	// a batch every tick. Hosts treat each batch as authoritative
+	// and apply it idempotently. A future slice replaces the poll
+	// with a notification bus that wakes the loop on assignment
+	// mutations (currently scheduler-create / host-retire-cascade /
+	// stale-host-sweeper).
+	//
+	// No HTTP gateway annotation — grpc-gateway's SSE bridge for
+	// server-streams is awkward enough that hosts (which are always
+	// platform-daemons speaking real gRPC) should just use the
+	// native channel.
+	WatchAssignments(*WatchAssignmentsRequest, grpc.ServerStreamingServer[AssignmentBatch]) error
+	// GetSSHTrustBundle returns what this host needs to trust the cloud's SSH
+	// CA and refuse revoked certificates: the CA public keys for sshd's
+	// TrustedUserCAKeys, and a KRL spec for RevokedKeys.
+	//
+	// Auth: requires a valid `host-bearer` header — the same channel the host
+	// already uses for enrollment and heartbeats, so no new transport, no new
+	// credential, and nothing for an operator to wire up per host.
+	//
+	// Errors:
+	//   - Unauthenticated: missing / invalid host-bearer.
+	//   - Unimplemented: this daemon has no SSH CA configured.
+	GetSSHTrustBundle(context.Context, *GetSSHTrustBundleRequest) (*GetSSHTrustBundleResponse, error)
+	// AuthorizeSSH is the managed-mode answer to SSHAuthzService.Authorize
+	// (#2516): the daemon forwards the sentinel's question with its host
+	// bearer and relays the answer. It reuses containarium.v1's messages so
+	// the daemon never translates, hence the lint exemption.
+	//
+	// Auth: requires a valid `host-bearer` header.
+	AuthorizeSSH(context.Context, *v1.AuthorizeSSHRequest) (*v1.AuthorizeSSHResponse, error)
+	mustEmbedUnimplementedActuationServiceServer()
+}
+
+// UnimplementedActuationServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedActuationServiceServer struct{}
+
+func (UnimplementedActuationServiceServer) EnrollHost(context.Context, *EnrollHostRequest) (*EnrollHostResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnrollHost not implemented")
+}
+func (UnimplementedActuationServiceServer) ReportHostStatus(context.Context, *ReportHostStatusRequest) (*ReportHostStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportHostStatus not implemented")
+}
+func (UnimplementedActuationServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedActuationServiceServer) ReportContainerState(context.Context, *ReportContainerStateRequest) (*ReportContainerStateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportContainerState not implemented")
+}
+func (UnimplementedActuationServiceServer) WatchAssignments(*WatchAssignmentsRequest, grpc.ServerStreamingServer[AssignmentBatch]) error {
+	return status.Error(codes.Unimplemented, "method WatchAssignments not implemented")
+}
+func (UnimplementedActuationServiceServer) GetSSHTrustBundle(context.Context, *GetSSHTrustBundleRequest) (*GetSSHTrustBundleResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSSHTrustBundle not implemented")
+}
+func (UnimplementedActuationServiceServer) AuthorizeSSH(context.Context, *v1.AuthorizeSSHRequest) (*v1.AuthorizeSSHResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AuthorizeSSH not implemented")
+}
+func (UnimplementedActuationServiceServer) mustEmbedUnimplementedActuationServiceServer() {}
+func (UnimplementedActuationServiceServer) testEmbeddedByValue()                          {}
+
+// UnsafeActuationServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ActuationServiceServer will
+// result in compilation errors.
+type UnsafeActuationServiceServer interface {
+	mustEmbedUnimplementedActuationServiceServer()
+}
+
+func RegisterActuationServiceServer(s grpc.ServiceRegistrar, srv ActuationServiceServer) {
+	// If the following call panics, it indicates UnimplementedActuationServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ActuationService_ServiceDesc, srv)
+}
+
+func _ActuationService_EnrollHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnrollHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActuationServiceServer).EnrollHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActuationService_EnrollHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActuationServiceServer).EnrollHost(ctx, req.(*EnrollHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActuationService_ReportHostStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportHostStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActuationServiceServer).ReportHostStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActuationService_ReportHostStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActuationServiceServer).ReportHostStatus(ctx, req.(*ReportHostStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActuationService_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActuationServiceServer).Heartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActuationService_Heartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActuationServiceServer).Heartbeat(ctx, req.(*HeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActuationService_ReportContainerState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportContainerStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
