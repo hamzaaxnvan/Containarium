@@ -44,3 +44,49 @@ func newAuditTestMux(t *testing.T) (*http.ServeMux, *auth.AuthMiddleware, string
 func TestAuditEndpoint_RejectsMissingAuth(t *testing.T) {
 	mux, _, _ := newAuditTestMux(t)
 	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/audit/logs", nil))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestAuditEndpoint_RejectsQueryStringToken(t *testing.T) {
+	mux, _, tok := newAuditTestMux(t)
+	// Old (vulnerable) pattern: token in URL query string.
+	req := httptest.NewRequest("GET", "/v1/audit/logs?token="+tok, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("query-string token must be rejected; got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Authorization header") {
+		t.Fatalf("error should point operator at the header: %s", rec.Body.String())
+	}
+}
+
+func TestAuditEndpoint_RejectsMalformedAuthHeader(t *testing.T) {
+	mux, _, tok := newAuditTestMux(t)
+	cases := []struct {
+		name   string
+		header string
+	}{
+		{"empty", ""},
+		{"no bearer prefix", tok},
+		{"wrong scheme", "Basic " + tok},
+		{"lowercase bearer", "bearer " + tok},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/v1/audit/logs", nil)
+			if tc.header != "" {
+				req.Header.Set("Authorization", tc.header)
+			}
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("%s: status = %d, want 401", tc.name, rec.Code)
+			}
+		})
+	}

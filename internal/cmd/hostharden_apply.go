@@ -32,15 +32,3 @@ import (
 // only caller that also builds on Windows), and on Windows the resulting
 // exec.Command calls simply fail fast (no iptables/incus binaries) and get
 // reported the same non-fatal way.
-func applyMetadataBlock(cmd *cobra.Command, bridge string) {
-	bin, err := os.Executable()
-	if err != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(), "⚠ could not resolve this binary's path (%v); skipping the metadata-endpoint block (#1103)\n", err)
-		return
-	}
-	applied, detail, err := hostharden.BlockMetadataFromBridge(bridge)
-	if err != nil {
-		fmt.Fprintf(cmd.ErrOrStderr(),
-			"⚠ could not block the cloud metadata endpoint from the container bridge (%v)\n"+
-				"  a tenant workload that escapes its container may be able to reach instance credentials via %s\n"+
-				"  this is NOT skippable — fix the environment and re-run `containarium hostharden block-metadata %s`\n",
