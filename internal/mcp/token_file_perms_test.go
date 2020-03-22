@@ -21,26 +21,3 @@ func TestReadToken_RejectsWorldReadable(t *testing.T) {
 	// 0o644 = owner rw + world readable. The dangerous case.
 	if err := os.WriteFile(path, []byte("a-valid-jwt"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
-	}
-
-	c := NewClient("http://example.invalid", "ignored")
-	c.SetTokenFile(path)
-	_, err := c.readToken()
-	if err == nil {
-		t.Fatal("readToken must reject world-readable token file")
-	}
-	if !strings.Contains(err.Error(), "insecure permissions") {
-		t.Fatalf("error should mention permissions: %v", err)
-	}
-}
-
-func TestReadToken_RejectsGroupReadable(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("unix file mode bits not meaningful on windows")
-	}
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, "jwt")
-	// 0o640 = owner rw + group readable. Also unacceptable —
-	// a sibling daemon running as the same group could read.
-	if err := os.WriteFile(path, []byte("a-valid-jwt"), 0o640); err != nil {
-		t.Fatalf("write: %v", err)
