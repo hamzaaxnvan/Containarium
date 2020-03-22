@@ -68,3 +68,38 @@ func mintRealRunToken(t *testing.T, user, runID, conn string) (string, *auth.Tok
 		t.Fatalf("lease credential = %+v, want the platform JWT with its jti", cred)
 	}
 	return tok, tm
+}
+
+// contextFromBearer presents the token the way the in-box platform MCP
+// does — `Authorization: Bearer <jwt>` on a REST call — and returns the
+// request context the real auth middleware hands to grpc-gateway, which
+// forwards it in-process to the gRPC handler. Every auth.*FromGRPCContext
+// accessor reads the claims off that context (the in-process fallback the
+// gateway annotator mirrors into metadata; the hop itself is pinned by
+// internal/gateway's *_EndToEndPropagation tests). No claim is hand-built:
+// everything the verb sees came from validating the real token.
+func contextFromBearer(t *testing.T, tm *auth.TokenManager, token, path string) context.Context {
+	t.Helper()
+	var captured context.Context
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Context()
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	auth.NewAuthMiddleware(tm).HTTPMiddleware(stub).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("auth middleware rejected the real run token: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	return captured
+}
+
+// realRunCtx is a gRPC context carrying a real run token minted for
+// `user` on connection "default" with run id runID.
+func realRunCtx(t *testing.T, user, runID string) context.Context {
+	t.Helper()
+	tok, tm := mintRealRunToken(t, user, runID, "default")
+	return contextFromBearer(t, tm, tok, "/v1/tracker/connections/"+user+"/default/issues/42")
+}
+
