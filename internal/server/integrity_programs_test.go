@@ -137,3 +137,50 @@ func TestComputeSelfMeasurement_ExecWatchOnlyWhenLoaded(t *testing.T) {
 	netObj := filepath.Join(dir, "netpolicy.bpf.o")
 	for name, b := range map[string]string{netObj: "n", filepath.Join(dir, netbpf.ExecObjectName): "e"} {
 		if err := os.WriteFile(name, []byte(b), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv(appconfig.EnvNetworkPolicyBPFObject, netObj)
+	count := func(probe func() bool) int {
+		s := &ContainerServer{}
+		if probe != nil {
+			s.SetIntegrityExecWatch(probe)
+		}
+		m, err := s.computeSelfMeasurement()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(m.ProgramDigests)
+	}
+	// Real watchers: constructed-but-never-started (enforcer nil, or load
+	// failed) reports not running; a started one is running.
+	unavailable := NewExecWatcher(nil)
+	unavailable.setStatus(execTelemetryUnavailable(errors.New("no BTF")))
+	loaded := NewExecWatcher(nil)
+	loaded.setStatus(execTelemetryOK)
+
+	cases := []struct {
+		name  string
+		probe func() bool
+		want  int
+	}{
+		{"no watcher wired", nil, 1}, // the 1 digest is the netpolicy object
+		{"constructed, never started (enforcer nil)", NewExecWatcher(nil).Running, 1},
+		{"constructed but unavailable", unavailable.Running, 1},
+		{"loaded", loaded.Running, 2},
+	}
+	for _, c := range cases {
+		if got := count(c.probe); got != c.want {
+			t.Errorf("%s: %d program digests, want %d", c.name, got, c.want)
+		}
+	}
+	// Live: the same server follows the watcher's status between heartbeats.
+	w := NewExecWatcher(nil)
+	s := &ContainerServer{}
+	s.SetIntegrityExecWatch(w.Running)
+	w.setStatus(execTelemetryOK)
+	m, _ := s.computeSelfMeasurement()
+	w.setStatus(execTelemetryUnavailable(errors.New("ring consumer exited")))
+	m2, _ := s.computeSelfMeasurement()
+	if len(m.ProgramDigests) != 2 || len(m2.ProgramDigests) != 1 {
+		t.Errorf("live probe: %d then %d", len(m.ProgramDigests), len(m2.ProgramDigests))
