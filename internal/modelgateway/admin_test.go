@@ -132,3 +132,70 @@ func TestAdminRevoke_Table(t *testing.T) {
 			method:     http.MethodPost,
 			body:       `{"expires_at":"2026-01-01T00:00:00Z"}`,
 			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "unparsable expires_at",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       `{"jti":"x","expires_at":"not-a-time"}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "no revocation store configured",
+			adminToken: adminToken,
+			withStore:  false,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       validBody,
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name:       "success",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       validBody,
+			wantStatus: http.StatusNoContent,
+		},
+		{
+			// expires_at is optional (#1820 review): omitting it must succeed
+			// — it means "never expires", not "bad request". Regression for
+			// the earlier admin.go bug that rejected an empty expires_at
+			// with 400 even though MemRevocations already treats a zero
+			// time.Time as never-expires.
+			name:       "success with expires_at omitted entirely",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       `{"jti":"jti-2"}`,
+			wantStatus: http.StatusNoContent,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				Secret:       []byte("s"),
+				Providers:    DefaultProviders(),
+				ProviderKeys: map[string]string{"anthropic": "k"},
+				AdminToken:   tc.adminToken,
+			}
+			if tc.withStore {
+				cfg.Revocations = NewMemRevocations()
+			}
+			gw := New(cfg)
+			srv := httptest.NewServer(gw.Handler())
+			defer srv.Close()
+
+			req, err := http.NewRequest(tc.method, srv.URL+"/__gateway/revoke", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			if tc.authHeader != "" {
+				req.Header.Set("Authorization", tc.authHeader)
+			}
+			resp, err := http.DefaultClient.Do(req)
