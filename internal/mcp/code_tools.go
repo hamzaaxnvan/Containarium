@@ -155,3 +155,81 @@ func handleCodeRun(client API, args map[string]interface{}) (string, error) {
 // mcpSessionSidecar is where the run called name keeps its session sidecar:
 // process_start puts every run's files under coderun.RunLogDir.
 func mcpSessionSidecar(name string) string {
+	return coderun.RunLogDir + "/" + name + ".session"
+}
+
+// mcpSnapshotSessionDirectory records the engine's existing session entries
+// before the run starts (see engine/session_discovery.go). False means no
+// snapshot, so discovery must be skipped: an absent id, never a wrong one.
+func mcpSnapshotSessionDirectory(ctx context.Context, sess *coderun.Session, name string) bool {
+	home, err := sess.HomeDir(ctx)
+	if err != nil {
+		return false
+	}
+	cmd, ok := engine.SessionDiscoveryPrepareCommand(engine.NameClaude, home, home, mcpSessionSidecar(name))
+	if !ok {
+		return false
+	}
+	_, err = sess.ShellExec(ctx, cmd)
+	return err == nil
+}
+
+// mcpStartSessionDiscovery best-effort backgrounds the lookup of this run's
+// session id on the box (#2193), the MCP-tool twin of code_run.go's
+// startSessionDiscovery. This tool only ever builds a Claude command (see
+// handleCodeRun), so the engine is fixed; a lookup failure is never fatal —
+// code_runs simply reports no session id for this run, which the AC already
+// allows.
+func mcpStartSessionDiscovery(ctx context.Context, sess *coderun.Session, name string) {
+	home, err := sess.HomeDir(ctx)
+	if err != nil {
+		return
+	}
+	cmd, ok := engine.SessionDiscoveryBackgroundCommand(engine.NameClaude, home, home, mcpSessionSidecar(name))
+	if !ok {
+		return
+	}
+	_, _ = sess.ShellExec(ctx, cmd)
+}
+
+// handleCodeAttach resumes a run's output from a byte offset. Passing back the
+// previous call's next_offset is what makes reconnection lossless: the reader
+// never re-derives a position, so nothing is skipped and nothing repeats.
+func handleCodeAttach(client API, args map[string]interface{}) (string, error) {
+	box := strings.TrimSpace(getStringArg(args, "box", ""))
+	if box == "" {
+		return "", fmt.Errorf("`box` is required")
+	}
+	name := codeRunNameArg(args)
+	var offset int64
+	if v, ok := getIntArg(args, "offset"); ok && v > 0 {
+		offset = int64(v)
+	}
+	streamJSON := getBoolArg(args, "stream_json", false)
+
+	sess, done, err := mcpCodeSession(client, box)
+	if err != nil {
+		return "", err
+	}
+	defer done()
+
+	ctx := context.Background()
+	listing, err := sess.ProcessList(ctx)
+	if err != nil {
+		return "", fmt.Errorf("process_list on %q: %w", box, err)
+	}
+	line, running := coderun.RunOutcomeLine(listing, name)
+	if line == "" {
+		return "", fmt.Errorf("no run named %q on %q — start one with code_run", name, box)
+	}
+	logPath, err := coderun.LogPathFromListing(listing, name)
+	if err != nil {
+		return "", err
+	}
+
+	out, next := readCodeWindow(ctx, sess, logPath, offset, streamJSON)
+	tail := fmt.Sprintf("(still running — call again with offset=%d)", next)
+	if !running {
+		// Say so explicitly: an agent polling a finished run would otherwise
+		// keep asking forever for output that will never arrive.
+		tail = "(run has finished; this is the end of its output)"
