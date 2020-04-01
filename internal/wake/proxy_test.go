@@ -88,3 +88,49 @@ func TestWakeProxy_HappyPath(t *testing.T) {
 		&fakeLookup{fullDomain: fullDomain, containerName: "alice-container", targetIP: host, targetPort: port},
 		&fakeRouteStore{},
 		nil, // no Router — schedule-swap-to-direct is gated on non-nil router
+		nil, // no AuditLogger — falls back to log.Printf
+		5*time.Second,
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "http://"+fullDomain+"/", nil)
+	req.Host = fullDomain
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "hello from container" {
+		t.Errorf("body: got %q, want %q", got, "hello from container")
+	}
+}
+
+// subjectCapturingStarter records the context it was invoked with so
+// the test can assert what identity the wake proxy stamps before
+// calling into the authz-gated StartContainer.
+type subjectCapturingStarter struct {
+	ready  bool
+	ip     string
+	port   int
+	gotCtx context.Context
+}
+
+func (s *subjectCapturingStarter) WakeForRequest(ctx context.Context, username string) (bool, string, int, error) {
+	s.gotCtx = ctx
+	return s.ready, s.ip, s.port, nil
+}
+
+// TestWakeProxy_StarterReceivesSystemIdentity is a regression test for
+// the wake-on-HTTP auth bug. The proxy used to invoke the starter with
+// a bare context.Background(), so StartContainer's RequireScope /
+// AuthorizeTenant gate rejected every wake with "no authenticated
+// subject in request context" — wake-on-HTTP could never succeed.
+// Wake is a daemon-internal action, so the proxy must stamp the
+// _system identity. If someone reverts to context.Background(), the
+// subject lookup below fails and this test catches it.
+func TestWakeProxy_StarterReceivesSystemIdentity(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
