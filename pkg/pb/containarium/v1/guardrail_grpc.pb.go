@@ -70,3 +70,75 @@ type GuardrailEngineServiceServer interface {
 }
 
 // UnimplementedGuardrailEngineServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedGuardrailEngineServiceServer struct{}
+
+func (UnimplementedGuardrailEngineServiceServer) Scan(context.Context, *GuardrailScanRequest) (*GuardrailScanResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Scan not implemented")
+}
+func (UnimplementedGuardrailEngineServiceServer) mustEmbedUnimplementedGuardrailEngineServiceServer() {
+}
+func (UnimplementedGuardrailEngineServiceServer) testEmbeddedByValue() {}
+
+// UnsafeGuardrailEngineServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to GuardrailEngineServiceServer will
+// result in compilation errors.
+type UnsafeGuardrailEngineServiceServer interface {
+	mustEmbedUnimplementedGuardrailEngineServiceServer()
+}
+
+func RegisterGuardrailEngineServiceServer(s grpc.ServiceRegistrar, srv GuardrailEngineServiceServer) {
+	// If the following call panics, it indicates UnimplementedGuardrailEngineServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&GuardrailEngineService_ServiceDesc, srv)
+}
+
+func _GuardrailEngineService_Scan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GuardrailScanRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GuardrailEngineServiceServer).Scan(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GuardrailEngineService_Scan_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GuardrailEngineServiceServer).Scan(ctx, req.(*GuardrailScanRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// GuardrailEngineService_ServiceDesc is the grpc.ServiceDesc for GuardrailEngineService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var GuardrailEngineService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.GuardrailEngineService",
+	HandlerType: (*GuardrailEngineServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Scan",
+			Handler:    _GuardrailEngineService_Scan_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/guardrail.proto",
+}
+
+const (
+	GuardrailPolicyService_GetGuardrailStatus_FullMethodName       = "/containarium.v1.GuardrailPolicyService/GetGuardrailStatus"
+	GuardrailPolicyService_GetGuardrailPolicy_FullMethodName       = "/containarium.v1.GuardrailPolicyService/GetGuardrailPolicy"
+	GuardrailPolicyService_SetGuardrailPolicy_FullMethodName       = "/containarium.v1.GuardrailPolicyService/SetGuardrailPolicy"
+	GuardrailPolicyService_SetGuardrailBaselineMode_FullMethodName = "/containarium.v1.GuardrailPolicyService/SetGuardrailBaselineMode"
+)
+

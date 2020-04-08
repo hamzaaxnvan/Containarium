@@ -210,3 +210,110 @@ func normaliseHoldIDs(ctx context.Context, tx pgx.Tx) error {
 	// the first of a group is the earliest and is the one kept.
 	groups := map[string][]*pb.LegalHold{}
 	var order []string
+	for _, h := range holds {
+		id := strings.TrimSpace(h.GetOrgId())
+		if id == "" {
+			id = retention.QuarantineOrgID(h.GetOrgId())
+		}
+		if _, seen := groups[id]; !seen {
+			order = append(order, id)
+		}
+		groups[id] = append(groups[id], h)
+	}
+	stored := func(h *pb.LegalHold, heldAs string) retention.UpgradeHoldDetail {
+		return retention.UpgradeHoldDetail{HeldAs: heldAs, StoredAs: retention.UpgradeHold{
+			OrgID: h.GetOrgId(), Reason: h.GetReason(), SetBy: h.GetSetBy(), SetAt: h.GetSetAt().AsTime().UTC(),
+		}}
+	}
+	for _, id := range order {
+		g := groups[id]
+		if len(g) == 1 && g[0].GetOrgId() == id {
+			continue // already normal
+		}
+		for _, h := range g[1:] {
+			log.Printf("Retention: removed the legal hold stored as %q (reason %q, set by %s at %s): org %q is held by an earlier hold",
+				h.GetOrgId(), h.GetReason(), h.GetSetBy(), h.GetSetAt().AsTime().Format(time.RFC3339), id)
+			if _, err := tx.Exec(ctx, `DELETE FROM retention_legal_holds WHERE org_id = $1`, h.GetOrgId()); err != nil {
+				return fmt.Errorf("normalise legal hold %q: %w", h.GetOrgId(), err)
+			}
+			if err := recordUpgrade(ctx, tx, retention.UpgradeActionHoldMerge, "legal_hold", id, stored(h, id)); err != nil {
+				return err
+			}
+		}
+		if first := g[0]; first.GetOrgId() != id {
+			if _, err := tx.Exec(ctx, `UPDATE retention_legal_holds SET org_id = $1 WHERE org_id = $2`, id, first.GetOrgId()); err != nil {
+				return fmt.Errorf("normalise legal hold %q: %w", first.GetOrgId(), err)
+			}
+			action := retention.UpgradeActionHoldNormalise
+			if strings.TrimSpace(first.GetOrgId()) == "" {
+				action = retention.UpgradeActionHoldQuarantine
+			}
+			log.Printf("Retention: the legal hold stored as %q is now stored as %q (%s)", first.GetOrgId(), id, action)
+			if err := recordUpgrade(ctx, tx, action, "legal_hold", id, stored(first, id)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// AuditUpgradeEvents implements retention.UpgradeAuditor. Each event is
+// locked, written and marked audited in a transaction of its own, so a
+// failed write leaves it (and the ones after it) pending; concurrent
+// callers skip each other's locked events.
+func (s *Store) AuditUpgradeEvents(ctx context.Context, write func(retention.UpgradeEvent) error) (int, error) {
+	n := 0
+	for {
+		found := false
+		err := s.inTx(ctx, func(tx pgx.Tx) error {
+			var ev retention.UpgradeEvent
+			err := tx.QueryRow(ctx, `SELECT id, action, resource_type, resource_id, detail, created_at
+				FROM retention_upgrade_events WHERE audited_at IS NULL ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`).
+				Scan(&ev.ID, &ev.Action, &ev.ResourceType, &ev.ResourceID, &ev.Detail, &ev.CreatedAt)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("read upgrade event: %w", err)
+			}
+			found = true
+			if err := write(ev); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE retention_upgrade_events SET audited_at = now() WHERE id = $1`, ev.ID); err != nil {
+				return fmt.Errorf("mark upgrade event %d audited: %w", ev.ID, err)
+			}
+			return nil
+		})
+		if err != nil {
+			return n, err
+		}
+		if !found {
+			return n, nil
+		}
+		n++
+	}
+}
+
+// maxDaysSQL is retention.MaxDays as SQL text for the CHECK constraint.
+var maxDaysSQL = strconv.Itoa(int(retention.MaxDays))
+
+// readPolicy reads the bookkeeping row and every window in one statement, so
+// a concurrent set can never be seen half applied. It never locks: SetPolicy
+// takes the row lock in a statement of its own first (see there). The row is
+// seeded at bootstrap, so no row is a damaged table and an error.
+func readPolicy(ctx context.Context, q interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}) (*pb.RetentionPolicy, map[pb.RetentionClass]int32, error) {
+	rows, err := q.Query(ctx, `SELECT p.revision, p.updated_at, p.updated_by, w.class, w.days
+		FROM retention_policy p LEFT JOIN retention_windows w ON true WHERE p.id = 1`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read retention policy: %w", err)
+	}
+	defer rows.Close()
+	var (
+		found     bool
+		revision  int64
+		updatedAt *time.Time
+		updatedBy string
+		set       = map[pb.RetentionClass]int32{}
