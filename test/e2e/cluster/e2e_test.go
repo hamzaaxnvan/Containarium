@@ -380,3 +380,386 @@ func (l *lane) stepCreate() error {
 		return fmt.Errorf("clientset: %w", err)
 	}
 	if l.dyn, err = dynamic.NewForConfig(restCfg); err != nil {
+		return fmt.Errorf("dynamic client: %w", err)
+	}
+
+	// The small group's min worker must register and go Ready — a
+	// kubeconfig against an empty cluster is not a working cluster.
+	err = l.waitFor("min worker Ready via kubeconfig", readyTimeout, 10*time.Second, func() (bool, string) {
+		ready, status := l.readyNodes()
+		workers := 0
+		for name := range ready {
+			if strings.Contains(name, "-small-") && ready[name] {
+				workers++
+			}
+		}
+		return workers >= 1, status
+	})
+	if err != nil {
+		return err
+	}
+
+	ready, _ := l.readyNodes()
+	l.baselineNodes = nil
+	for name := range ready {
+		l.baselineNodes = append(l.baselineNodes, name)
+	}
+	l.baselineInstances = l.clusterInstances()
+	l.t.Logf("baseline nodes: %v, instances: %v", l.baselineNodes, l.baselineInstances)
+
+	// Observed Incus state, not the daemon's report of itself: the
+	// nodes really are of the class this run asked for. Without this a
+	// container-mode lane whose daemon quietly provisioned VMs would
+	// run the whole journey and report VM behaviour as container
+	// behaviour (#1430).
+	if wrong := WrongClassInstances(l.observedInstances(), instancePrefix, l.isolation); len(wrong) > 0 {
+		return fmt.Errorf("isolation %s requested, but Incus reports instances of another class: %s",
+			l.isolation, strings.Join(wrong, ", "))
+	}
+	return nil
+}
+
+// --- step 2: overflow → Pending→Running via a new Ready node ------------
+
+func (l *lane) stepOverflowScaleUp() error {
+	scaleupTimeout := timeoutEnv("CONTAINARIUM_E2E_SCALEUP_TIMEOUT", 12*time.Minute)
+	ctx := context.Background()
+
+	// Two sleepers at 1500m each: one fills the initial small worker
+	// (2 CPU), the second cannot fit anywhere and must force a new
+	// node. Requests, not load — the autoscaler's currency (design:
+	// "Measured utilization triggers no scale-up anywhere").
+	replicas := int32(2)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "overflow"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "overflow"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "overflow"}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:    "sleep",
+						Image:   burnImage,
+						Command: []string{"sh", "-c", "sleep infinity"},
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("1500m"),
+								corev1.ResourceMemory: resource.MustParse("128Mi"),
+							},
+						},
+					}},
+				},
+			},
+		},
+	}
+	if _, err := l.cs.AppsV1().Deployments("default").Create(ctx, dep, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create overflow deployment: %w", err)
+	}
+
+	return l.waitFor("overflow Running on a new Ready node", scaleupTimeout, 10*time.Second, func() (bool, string) {
+		ready, status := l.readyNodes()
+		newNodes := NewReadyNodes(l.baselineNodes, ready)
+		pods, err := l.cs.CoreV1().Pods("default").List(ctx, metav1.ListOptions{LabelSelector: "app=overflow"})
+		if err != nil {
+			return false, err.Error()
+		}
+		running := 0
+		onNew := false
+		for _, p := range pods.Items {
+			if p.Status.Phase == corev1.PodRunning {
+				running++
+				for _, n := range newNodes {
+					if p.Spec.NodeName == n {
+						onNew = true
+					}
+				}
+			}
+		}
+		return running == int(replicas) && onNew,
+			fmt.Sprintf("running=%d/%d newReadyNodes=%v onNew=%v (%s)", running, replicas, newNodes, onNew, status)
+	})
+}
+
+// --- step 3: a pod too big for the small template -----------------------
+
+func (l *lane) stepLargerClass() error {
+	scaleupTimeout := timeoutEnv("CONTAINARIUM_E2E_SCALEUP_TIMEOUT", 12*time.Minute)
+	ctx := context.Background()
+
+	// 3 CPU cannot fit the small template (2 CPU): the autoscaler's fit
+	// simulation must pick a larger size class, not add another small.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "big"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:    "sleep",
+				Image:   burnImage,
+				Command: []string{"sh", "-c", "sleep infinity"},
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("3"),
+						corev1.ResourceMemory: resource.MustParse("256Mi"),
+					},
+				},
+			}},
+		},
+	}
+	if _, err := l.cs.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create big pod: %w", err)
+	}
+
+	return l.waitFor("big pod Running on a larger-class node", scaleupTimeout, 10*time.Second, func() (bool, string) {
+		p, err := l.cs.CoreV1().Pods("default").Get(ctx, "big", metav1.GetOptions{})
+		if err != nil {
+			return false, err.Error()
+		}
+		if p.Status.Phase != corev1.PodRunning {
+			return false, fmt.Sprintf("phase=%s node=%s", p.Status.Phase, p.Spec.NodeName)
+		}
+		larger := strings.Contains(p.Spec.NodeName, "-medium-") || strings.Contains(p.Spec.NodeName, "-large-")
+		return larger, fmt.Sprintf("running on %s (larger-class=%v)", p.Spec.NodeName, larger)
+	})
+}
+
+// --- step 4: VPA raises requests without restart-looping ----------------
+
+var vpaGVR = schema.GroupVersionResource{Group: "autoscaling.k8s.io", Version: "v1", Resource: "verticalpodautoscalers"}
+
+func (l *lane) stepVPA() error {
+	vpaTimeout := timeoutEnv("CONTAINARIUM_E2E_VPA_TIMEOUT", 15*time.Minute)
+	ctx := context.Background()
+
+	// A burner that actually uses CPU while requesting almost none —
+	// VPA is the single component licensed to turn usage into requests.
+	replicas := int32(2)
+	burn := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "burner"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "burner"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "burner"}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:    "burn",
+						Image:   burnImage,
+						Command: []string{"sh", "-c", "while :; do :; done"},
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("100m"),
+								corev1.ResourceMemory: resource.MustParse("64Mi"),
+							},
+						},
+					}},
+				},
+			},
+		},
+	}
+	if _, err := l.cs.AppsV1().Deployments("default").Create(ctx, burn, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create burner: %w", err)
+	}
+
+	// Tenant opt-in, exactly as #1416 documents it: a VPA object with
+	// updateMode InPlaceOrRecreate (stock VPA 1.7 on k8s 1.33).
+	vpa := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "autoscaling.k8s.io/v1",
+		"kind":       "VerticalPodAutoscaler",
+		"metadata":   map[string]interface{}{"name": "burner"},
+		"spec": map[string]interface{}{
+			"targetRef": map[string]interface{}{
+				"apiVersion": "apps/v1", "kind": "Deployment", "name": "burner",
+			},
+			"updatePolicy": map[string]interface{}{
+				"updateMode":  "InPlaceOrRecreate",
+				"minReplicas": int64(1),
+			},
+		},
+	}}
+	if _, err := l.dyn.Resource(vpaGVR).Namespace("default").Create(ctx, vpa, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create VPA object (is the VPA bundle deployed?): %w", err)
+	}
+
+	before, err := l.restartCounts(ctx, "app=burner")
+	if err != nil {
+		return err
+	}
+	origCPU := resource.MustParse("100m")
+
+	var loopErr error
+	waitErr := l.waitFor("burner request raised, no restart loop", vpaTimeout, 15*time.Second, func() (bool, string) {
+		pods, err := l.cs.CoreV1().Pods("default").List(ctx, metav1.ListOptions{LabelSelector: "app=burner"})
+		if err != nil {
+			return false, err.Error()
+		}
+		raised := false
+		var seen []string
+		for _, p := range pods.Items {
+			for _, c := range p.Spec.Containers {
+				req := c.Resources.Requests[corev1.ResourceCPU]
+				seen = append(seen, fmt.Sprintf("%s=%s", p.Name, req.String()))
+				if req.Cmp(origCPU) > 0 {
+					raised = true
+				}
+			}
+		}
+		after, err := l.restartCounts(ctx, "app=burner")
+		if err != nil {
+			return false, err.Error()
+		}
+		delta := MaxRestartDelta(before, after)
+		if delta > 1 {
+			// Abort the wait with a real error: a raised request via
+			// crash-looping is precisely the failure under test.
+			loopErr = fmt.Errorf("burner restart-looping: max restart delta %d (requests: %s)", delta, strings.Join(seen, " "))
+			return true, "restart loop detected"
+		}
+		return raised, fmt.Sprintf("requests: %s (restart delta %d)", strings.Join(seen, " "), delta)
+	})
+	if loopErr != nil {
+		return loopErr
+	}
+	return waitErr
+}
+
+// --- step 5: scale to zero → drained node, deleted VM -------------------
+
+func (l *lane) stepScaleToZero() error {
+	scaledownTimeout := timeoutEnv("CONTAINARIUM_E2E_SCALEDOWN_TIMEOUT", 30*time.Minute)
+	ctx := context.Background()
+
+	// Remove all tenant load. The surplus nodes must drain and their
+	// VMs disappear, back to the baseline shape (small group at min=1).
+	if err := l.cs.CoreV1().Pods("default").Delete(ctx, "big", metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("delete big pod: %w", err)
+	}
+	if err := l.dyn.Resource(vpaGVR).Namespace("default").Delete(ctx, "burner", metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("delete VPA: %w", err)
+	}
+	for _, name := range []string{"burner", "overflow"} {
+		if err := l.cs.AppsV1().Deployments("default").Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+			return fmt.Errorf("delete %s: %w", name, err)
+		}
+	}
+
+	baseline := map[string]bool{}
+	for _, v := range l.baselineInstances {
+		baseline[v] = true
+	}
+
+	return l.waitFor("surplus nodes drained and instances deleted", scaledownTimeout, 20*time.Second, func() (bool, string) {
+		// Observed k8s state: no surplus node is Ready anymore. (The
+		// Node *object* may linger NotReady after its instance dies —
+		// k3s has no cloud node-lifecycle controller to reap it — so
+		// Ready-ness plus the instance check below is the robust
+		// signal.)
+		ready, _ := l.readyNodes()
+		surplusNodes := NewReadyNodes(l.baselineNodes, ready)
+
+		// Observed Incus state: no instance beyond the baseline set.
+		var surplusInstances []string
+		for _, name := range l.clusterInstances() {
+			if !baseline[name] {
+				surplusInstances = append(surplusInstances, name)
+			}
+		}
+		return len(surplusNodes) == 0 && len(surplusInstances) == 0,
+			fmt.Sprintf("surplus nodes=%v surplus instances=%v", surplusNodes, surplusInstances)
+	})
+}
+
+// --- step 6: delete leaves nothing --------------------------------------
+
+func (l *lane) stepDelete() error {
+	deleteTimeout := timeoutEnv("CONTAINARIUM_E2E_DELETE_TIMEOUT", 10*time.Minute)
+
+	apiHost, err := KubeconfigServerHost(l.kubeconfig)
+	if err != nil {
+		return err
+	}
+
+	if out, err := l.runCLI("cluster", "delete", clusterName); err != nil {
+		return fmt.Errorf("cluster delete: %v\n%s", err, out)
+	}
+
+	return l.waitFor("no rows, no instances, no passthrough", deleteTimeout, 10*time.Second, func() (bool, string) {
+		// No rows, observed through the product API.
+		out, err := l.runCLI("cluster", "get", clusterName)
+		if err == nil {
+			return false, "cluster get still succeeds"
+		}
+		if !strings.Contains(strings.ToLower(out), "not") {
+			return false, fmt.Sprintf("cluster get: %s", strings.TrimSpace(out))
+		}
+
+		// No instances of either class, observed through Incus.
+		if insts := l.clusterInstances(); len(insts) > 0 {
+			return false, fmt.Sprintf("instances remain: %v", insts)
+		}
+
+		// No passthrough rule: the published API endpoint stopped
+		// accepting connections.
+		conn, dialErr := net.DialTimeout("tcp", apiHost, 3*time.Second)
+		if dialErr == nil {
+			_ = conn.Close()
+			return false, fmt.Sprintf("%s still accepts connections", apiHost)
+		}
+		return true, "gone"
+	})
+}
+
+// --- sabotage ------------------------------------------------------------
+
+// sabotageJoinTokens continuously corrupts the pre-pushed join token on
+// every worker instance and kills any running agent, so no worker can
+// ever register: the lane MUST go red. This is the #1418 guardrail — a
+// lane that stays green under this cannot fail, and proves nothing. It
+// is isolation-agnostic: Incus exec reaches a system container the same
+// way it reaches a VM, so the container lane proves itself the same way
+// (#1430).
+func (l *lane) sabotageJoinTokens(stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-time.After(3 * time.Second):
+		}
+		for _, vm := range l.clusterInstances() {
+			if strings.HasSuffix(vm, "-cp") {
+				continue
+			}
+			_, _, _ = l.incus.ExecWithOutput(vm, []string{"sh", "-c",
+				"echo sabotaged > " + clusterpkg.AgentTokenPath + "; pkill -f 'k3s agent' || true"})
+		}
+	}
+}
+
+// --- observation helpers -------------------------------------------------
+
+// readyNodes returns node name → Ready as observed through the tenant
+// kubeconfig, plus a status line for logs.
+func (l *lane) readyNodes() (map[string]bool, string) {
+	nodes, err := l.cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err.Error()
+	}
+	out := map[string]bool{}
+	var parts []string
+	for _, n := range nodes.Items {
+		ready := false
+		for _, c := range n.Status.Conditions {
+			if c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue {
+				ready = true
+			}
+		}
+		out[n.Name] = ready
+		parts = append(parts, fmt.Sprintf("%s ready=%v", n.Name, ready))
+	}
+	return out, strings.Join(parts, ", ")
+}
+
+// clusterInstances lists the lane cluster's Incus instances as Incus
+// sees them: VMs in VM mode, system containers in container mode.
+// ListContainers asks Incus for InstanceTypeAny and ClusterInstanceNames
+// matches on the name prefix alone, so one assertion sees both classes
+// (#1430) — see TestClusterInstanceNames for why the type is never a
