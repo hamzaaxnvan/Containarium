@@ -311,3 +311,160 @@ func TestRequiredFieldValidation(t *testing.T) {
 			args:     map[string]interface{}{"username": "alice"},
 			hasError: false,
 		},
+		{
+			name:     "delete_container with username",
+			toolName: "delete_container",
+			args:     map[string]interface{}{"username": "alice"},
+			hasError: false,
+		},
+	}
+
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Find tool
+			var tool *Tool
+			for i := range server.tools {
+				if server.tools[i].Name == tt.toolName {
+					tool = &server.tools[i]
+					break
+				}
+			}
+			require.NotNil(t, tool)
+
+			// Check if required fields are present
+			if required, ok := tool.InputSchema["required"].([]string); ok {
+				for _, req := range required {
+					if tt.hasError {
+						assert.NotContains(t, tt.args, req)
+					} else {
+						assert.Contains(t, tt.args, req, "Required field %s should be present", req)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestToolDescriptionQuality tests that tool descriptions are informative
+func TestToolDescriptionQuality(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	for _, tool := range server.tools {
+		t.Run(tool.Name, func(t *testing.T) {
+			desc := tool.Description
+
+			// Description should be non-empty
+			assert.NotEmpty(t, desc)
+
+			// Lower bound catches "TODO"-style placeholders; upper bound
+			// catches runaway formatting. Rich descriptions with multi-step
+			// workflows (see create_container, expose_port) are valuable
+			// for agents to learn affordances from the tool list itself —
+			// so the upper bound is generous.
+			assert.GreaterOrEqual(t, len(desc), 20, "Description too short")
+			assert.LessOrEqual(t, len(desc), 3000, "Description too long")
+
+			// Description should not contain TODO or placeholders
+			assert.NotContains(t, desc, "TODO")
+			assert.NotContains(t, desc, "XXX")
+			assert.NotContains(t, desc, "FIXME")
+			assert.NotContains(t, desc, "placeholder")
+		})
+	}
+}
+
+// TestToolParameterDescriptions tests that all parameters have descriptions
+func TestToolParameterDescriptions(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	for _, tool := range server.tools {
+		t.Run(tool.Name, func(t *testing.T) {
+			properties, ok := tool.InputSchema["properties"].(map[string]interface{})
+			if !ok {
+				return // No properties to check
+			}
+
+			for paramName, paramValue := range properties {
+				param := paramValue.(map[string]interface{})
+				desc, hasDesc := param["description"]
+
+				// All parameters should have descriptions
+				assert.True(t, hasDesc, "Parameter %s should have description", paramName)
+				if hasDesc {
+					descStr := desc.(string)
+					assert.NotEmpty(t, descStr, "Parameter %s description should not be empty", paramName)
+					assert.GreaterOrEqual(t, len(descStr), 10, "Parameter %s description too short", paramName)
+				}
+			}
+		})
+	}
+}
+
+// ----- get_backend ----------------------------------------------------
+
+func TestGetBackend_Found(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/backends", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"backends": [
+				{"id": "local-host", "type": "local", "healthy": true, "containerCount": 5},
+				{"id": "tunnel-gpu", "type": "tunnel", "healthy": true, "containerCount": 3,
+				 "gpus": [{"vendor": "NVIDIA", "modelName": "GeForce RTX 4090", "vramBytes": 25769803776}]}
+			]
+		}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-token")
+	out, err := handleGetBackend(client, map[string]interface{}{"id": "tunnel-gpu"})
+	require.NoError(t, err)
+	assert.Contains(t, out, "tunnel-gpu")
+	assert.Contains(t, out, "GeForce RTX 4090")
+	assert.NotContains(t, out, "local-host", "should only print the requested backend")
+}
+
+func TestGetBackend_NotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"backends":[{"id":"alpha","type":"local","healthy":true,"containerCount":0}]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-token")
+	_, err := handleGetBackend(client, map[string]interface{}{"id": "nope"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestGetBackend_RejectsMissingID(t *testing.T) {
+	client := NewClient("http://unused", "token")
+	_, err := handleGetBackend(client, map[string]interface{}{})
+	require.Error(t, err)
+}
+
+// ----- expose_port -----------------------------------------------------
+
+// TestGetIntArg tests the getIntArg helper across the JSON-decoded shapes
+// agents tend to produce (float64 from encoding/json) plus native ints.
+func TestGetIntArg(t *testing.T) {
+	cases := []struct {
