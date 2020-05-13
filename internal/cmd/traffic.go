@@ -282,3 +282,98 @@ func runTrafficConnections(cmd *cobra.Command, args []string) error {
 	out := cmd.OutOrStdout()
 	if trafficFormat == "json" {
 		return writeJSON(out, resp)
+	}
+	if len(resp.Connections) == 0 {
+		fmt.Fprintf(out, "No active connections for %q.\n", box)
+		return nil
+	}
+	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "PROTO\tSOURCE\tDESTINATION\tDIR\tSTATE\tSENT\tRECV")
+	for _, c := range resp.Connections {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			shortEnum(c.Protocol),
+			hostPort(c.SourceIP, c.SourcePort),
+			hostPort(c.DestIP, c.DestPort),
+			shortEnum(c.Direction), shortEnum(c.State),
+			humanBytes(int64(c.BytesSent)), humanBytes(int64(c.BytesReceived)))
+	}
+	_ = tw.Flush()
+	fmt.Fprintf(out, "\n%d connection(s).\n", resp.TotalCount)
+	return nil
+}
+
+func runTrafficSummary(cmd *cobra.Command, args []string) error {
+	box := args[0]
+	var resp connectionSummaryResp
+	if err := trafficGet(cmd.Context(), "/v1/containers/"+url.PathEscape(box)+"/connections/summary", nil, &resp); err != nil {
+		return err
+	}
+
+	out := cmd.OutOrStdout()
+	if trafficFormat == "json" {
+		return writeJSON(out, resp)
+	}
+	fmt.Fprintf(out, "Box:               %s\n", box)
+	fmt.Fprintf(out, "Active connections: %d (tcp %d, udp %d)\n", resp.ActiveConnections, resp.TCPConnections, resp.UDPConnections)
+	fmt.Fprintf(out, "Bytes sent / recv:  %s / %s\n", humanBytes(int64(resp.TotalBytesSent)), humanBytes(int64(resp.TotalBytesReceived)))
+	if len(resp.TopDestinations) > 0 {
+		fmt.Fprintln(out, "\nTop destinations:")
+		tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "  DEST IP\tCONNS\tBYTES")
+		for _, d := range resp.TopDestinations {
+			fmt.Fprintf(tw, "  %s\t%d\t%s\n", d.DestIP, d.ConnectionCount, humanBytes(int64(d.BytesTotal)))
+		}
+		_ = tw.Flush()
+	}
+	return nil
+}
+
+// historyWindow resolves the query window: --from/--to when given (RFC3339,
+// --to defaulting to now), otherwise a look-back of --since from now.
+func historyWindow(now time.Time) (start, end time.Time, err error) {
+	if trafficFrom == "" {
+		if trafficTo != "" {
+			return start, end, fmt.Errorf("--to needs --from")
+		}
+		return now.Add(-trafficSince), now, nil
+	}
+	if start, err = time.Parse(time.RFC3339, trafficFrom); err != nil {
+		return start, end, fmt.Errorf("--from: want RFC3339 like 2026-10-20T10:00:00Z: %w", err)
+	}
+	end = now
+	if trafficTo != "" {
+		if end, err = time.Parse(time.RFC3339, trafficTo); err != nil {
+			return start, end, fmt.Errorf("--to: want RFC3339 like 2026-10-20T11:00:00Z: %w", err)
+		}
+	}
+	if end.Before(start) {
+		return start, end, fmt.Errorf("--to is before --from")
+	}
+	return start, end, nil
+}
+
+func historyQuery(start, end time.Time, explicitEnd bool) url.Values {
+	q := url.Values{}
+	// google.protobuf.Timestamp query params are RFC3339 via grpc-gateway.
+	q.Set("startTime", start.UTC().Format(time.RFC3339))
+	if explicitEnd {
+		q.Set("endTime", end.UTC().Format(time.RFC3339))
+	}
+	if trafficDestIP != "" {
+		q.Set("destIp", trafficDestIP)
+	}
+	if trafficDestPort != 0 {
+		q.Set("destPort", strconv.FormatUint(uint64(trafficDestPort), 10))
+	}
+	if trafficLimit != 0 {
+		q.Set("limit", strconv.FormatInt(int64(trafficLimit), 10))
+	}
+	return q
+}
+
+func runTrafficHistory(cmd *cobra.Command, args []string) error {
+	box := args[0]
+	start, end, err := historyWindow(time.Now())
+	if err != nil {
+		return err
+	}
