@@ -31,3 +31,69 @@ func TestRunComposeCLI_NoArgs(t *testing.T) {
 
 func TestRunComposeCLI_UnknownVerb(t *testing.T) {
 	var out, errBuf bytes.Buffer
+	code := RunComposeCLI([]string{"nonsense"}, &out, &errBuf)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(errBuf.String(), "unknown compose verb") {
+		t.Errorf("stderr missing 'unknown' diagnosis: %q", errBuf.String())
+	}
+}
+
+func TestRunComposeCLI_EnableRequiresDir(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	code := RunComposeCLI([]string{"enable"}, &out, &errBuf)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1 (operation failure)", code)
+	}
+	// stdout must be valid JSON with ok:false; that's the daemon-parse
+	// contract — even on failure, daemon expects JSON it can introspect.
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout not valid JSON: %v\nbody: %q", err, out.String())
+	}
+	if got["ok"] != false {
+		t.Errorf("ok field = %v, want false", got["ok"])
+	}
+	if msg, _ := got["error"].(string); !strings.Contains(msg, "--dir is required") {
+		t.Errorf("error message missing 'dir' diagnosis: %q", msg)
+	}
+}
+
+func TestRunComposeCLI_DisableRequiresDir(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	code := RunComposeCLI([]string{"disable"}, &out, &errBuf)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout not valid JSON: %v", err)
+	}
+	if got["ok"] != false {
+		t.Errorf("ok = %v, want false", got["ok"])
+	}
+}
+
+func TestRunComposeCLI_StatusRequiresDir(t *testing.T) {
+	var out, errBuf bytes.Buffer
+	code := RunComposeCLI([]string{"status"}, &out, &errBuf)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout not valid JSON: %v", err)
+	}
+}
+
+func TestRunComposeCLI_StatusMissingComposeFile(t *testing.T) {
+	tmp := t.TempDir() // no compose file under here
+	var out, errBuf bytes.Buffer
+	code := RunComposeCLI([]string{"status", "--dir", tmp}, &out, &errBuf)
+	if code != 1 {
+		t.Errorf("exit code = %d, want 1 (no compose file)", code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout not valid JSON: %v", err)
