@@ -143,3 +143,75 @@ func TestCapabilityProfileCPUOnlySkipsGPUProbe(t *testing.T) {
 	ds := &DualServer{config: &DualServerConfig{Pool: "test-pool"}, containerServer: srv}
 	<-ds.startCapabilityProfile(context.Background())
 	p, ok := srv.capabStore().Current()
+	if !ok || p.GPUAvailable || p.CPUCores != 8 || p.MeasuredClass != "cpu-small" {
+		t.Fatalf("CPU-only host must record a CPU profile: %+v", p)
+	}
+}
+
+// TestPoolProfilePreservesExistingButExplicitProfileReplacesIt checks automatic preservation and intentional explicit replacement.
+func TestPoolProfilePreservesExistingButExplicitProfileReplacesIt(t *testing.T) {
+	srv := &ContainerServer{capabilityResources: capabilityTestResources}
+	srv.capabStore().Record(capabilities.HostFacts{Region: "original", Now: time.Unix(100, 0)})
+	srv.SetCapabilityIdentity("new-region", "")
+	ds := &DualServer{config: &DualServerConfig{Pool: "test-pool"}, containerServer: srv}
+	<-ds.startCapabilityProfile(context.Background())
+	p, _ := srv.capabStore().Current()
+	if p.Region != "original" || !p.ProfiledAt.Equal(time.Unix(100, 0)) {
+		t.Fatalf("existing profile overwritten: %+v", p)
+	}
+	got, err := srv.ProfileBackend(auth.ContextWithSystemIdentity(context.Background()), &pb.ProfileBackendRequest{SkipGpu: true})
+	if err != nil || got.Profile.Region != "new-region" {
+		t.Fatalf("explicit re-profile: %v, %v", got, err)
+	}
+}
+
+// TestPoolProfileDoesNotBlockStartup checks background startup and serialization with explicit profiling.
+func TestPoolProfileDoesNotBlockStartup(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	srv := &ContainerServer{capabilityResources: capabilityTestResources, capabilityBenchmark: func() (container.BenchmarkResult, error) {
+		close(entered)
+		<-release
+		return container.BenchmarkResult{CPUOpsPerSec: 1, MemBytesPerSec: 1, DurationMs: 1}, nil
+	}}
+	ds := &DualServer{config: &DualServerConfig{Pool: "test-pool"}, containerServer: srv}
+	returned := make(chan (<-chan struct{}), 1)
+	go func() { returned <- ds.startCapabilityProfile(context.Background()) }()
+	var done <-chan struct{}
+	defer func() {
+		close(release)
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("profile did not finish after releasing benchmark")
+			}
+		}
+	}()
+	select {
+	case done = <-returned:
+		select {
+		case <-done:
+			t.Fatal("measurement finished while benchmark blocked")
+		default:
+		}
+	case <-time.After(time.Second):
+		t.Fatal("profiling blocks startup")
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("benchmark not started")
+	}
+	// The startup measurement shares the explicit RPC's serialization guard.
+	_, err := srv.ProfileBackend(auth.ContextWithSystemIdentity(context.Background()), &pb.ProfileBackendRequest{SkipGpu: true})
+	if status.Code(err) != codes.Aborted {
+		t.Fatalf("concurrent explicit profile must not stack another benchmark: %v", err)
+	}
+}
+
+// TestUnpooledDaemonDoesNotAutomaticallyProfile checks that standalone daemons do not start automatic profiling.
+func TestUnpooledDaemonDoesNotAutomaticallyProfile(t *testing.T) {
+	srv := &ContainerServer{}
+	ds := &DualServer{config: &DualServerConfig{}, containerServer: srv}
+	<-ds.startCapabilityProfile(context.Background())
+	if _, ok := srv.capabStore().Current(); ok {

@@ -4,3 +4,6 @@
 # upstream sshd, so the VM only needs the SSH tooling + curl.
 package_update: true
 package_upgrade: false
+packages:
+  - openssh-server   # provides sshd, which the harness runs as a throwaway upstream
+  - openssh-client   # ssh, ssh-keygen
