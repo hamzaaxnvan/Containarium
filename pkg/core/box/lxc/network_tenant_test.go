@@ -12,10 +12,3 @@ func TestNativeTenantSpecAndProviderReadback(t *testing.T) {
 	if opts.Username != "workload" || opts.NetworkTenant != "team-a" {
 		t.Fatal(opts)
 	}
-	info := &incus.ContainerInfo{Name: "workload-container", Username: "workload", Tenant: "team-b", Labels: map[string]string{"tenant": "spoof", incus.CloudOrgIDLabel: "cloud-a"}}
-	st := StatusFromInfo(info)
-	if st.NetworkTenant != "team-b" || st.NetworkTenantSource != pb.NetworkTenantSource_NETWORK_TENANT_SOURCE_NATIVE || st.Ref.Tenant != "workload" {
-		t.Fatal(st)
-	}
-	info.Tenant = ""
-	st = StatusFromInfo(info)
