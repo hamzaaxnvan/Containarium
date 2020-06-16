@@ -37,3 +37,23 @@ func NewTrafficStoreAdapter(pool *pgxpool.Pool) *TrafficStoreAdapter {
 		return nil
 	}
 	return &TrafficStoreAdapter{pool: pool}
+}
+
+// LastNetworkActivity returns the max(last activity) for the given
+// container. Returns zero time on no rows; that's a distinct signal
+// the Decide rules treat as "no traffic ever recorded" rather than
+// confusing with epoch 0.
+//
+// An OPEN connection (ended_at IS NULL) counts as activity AS OF NOW, not
+// as of when it started. This is the fix for #524's "a box running an active
+// session is NOT stopped": a long-lived SSH/exec debug session is a single
+// TCP connection whose conntrack row has no ended_at until it closes. The
+// previous COALESCE(ended_at, started_at) pinned its activity to started_at,
+// so a session open LONGER than the idle threshold looked idle and the box
+// was slept out from under the person debugging it. Treating any open
+// connection as now-active keeps the box awake for exactly as long as someone
+// is connected; once the session closes the collector stamps ended_at (on the
+// conntrack destroy event) and the box becomes eligible to sleep again. A
+// closed connection contributes its ended_at (always set on close), which is
+// its true last-activity instant.
+func (a *TrafficStoreAdapter) LastNetworkActivity(ctx context.Context, containerName string) (time.Time, error) {

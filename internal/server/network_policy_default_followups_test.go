@@ -61,35 +61,3 @@ func TestPlanPolicies(t *testing.T) {
 	})
 
 	t.Run("store outage fails the pass and applies no default", func(t *testing.T) {
-		e := enforcerWithStore(defaultsTestStore{MemNetworkPolicyStore: NewMemNetworkPolicyStore(), err: errors.New("store unavailable")})
-		if err := e.SetDefaultEgress(netpolicy.DefaultEgressExtras{}); err != nil {
-			t.Fatal(err)
-		}
-		if got, err := e.planPolicies(context.Background(), views); err == nil || got != nil {
-			t.Errorf("planPolicies = %v, %v; want an error and no policies", got, err)
-		}
-	})
-
-	// A stored policy that no longer compiles is skipped, and its tenant runs
-	// the default allow-list (log-only) like a tenant with none. Pinned so the
-	// behaviour is a decision, not an accident.
-	t.Run("stored policy that fails to compile falls back to the default", func(t *testing.T) {
-		bad := &pb.NetworkPolicy{Tenant: "stored", EgressCidrs: []string{"not-a-cidr"}}
-		e := enforcerWithStore(defaultsTestStore{MemNetworkPolicyStore: NewMemNetworkPolicyStore(), list: []*pb.NetworkPolicy{bad}})
-		if err := e.SetDefaultEgress(netpolicy.DefaultEgressExtras{}); err != nil {
-			t.Fatal(err)
-		}
-		got, err := e.planPolicies(context.Background(), views)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if d, ok := got["stored"]; !ok || !d.LogOnly {
-			t.Errorf("tenant with an uncompilable stored policy = %+v, %v; want the log-only default", d, ok)
-		}
-	})
-}
-
-// #2997: the startup fallback. A bad extra keeps the built-in list (and says
-// so); only an explicit off disables the posture.
-func TestConfigureDefaultEgress(t *testing.T) {
-	for _, tc := range []struct {

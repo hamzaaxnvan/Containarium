@@ -106,3 +106,39 @@ func ExtractBearerForUpgrade(r *http.Request) (token string, source TokenSource)
 
 	// 2. Authorization header.
 	if v := r.Header.Get("Authorization"); strings.HasPrefix(v, "Bearer ") {
+		return strings.TrimPrefix(v, "Bearer "), TokenSourceAuthorizationHeader
+	}
+
+	// 3. Legacy query param. Deprecated — callers log WARNING.
+	if v := r.URL.Query().Get("token"); v != "" {
+		return v, TokenSourceQueryParam
+	}
+
+	return "", TokenSourceNone
+}
+
+// AckSubprotocol returns the value the server should reply
+// with in Sec-WebSocket-Protocol when the client used the
+// bearer subprotocol. Echoing the marker (without the token)
+// completes RFC 6455's subprotocol negotiation; the token
+// itself never appears in the response.
+//
+// Returns the empty string if the request didn't use the
+// subprotocol form — the server should then omit the response
+// header entirely (gorilla does this when no subprotocol is
+// selected).
+func AckSubprotocol(r *http.Request) string {
+	if v := r.Header.Get("Sec-WebSocket-Protocol"); v != "" {
+		for _, e := range splitSubprotocols(v) {
+			if e == WSSubprotocolBearer {
+				return WSSubprotocolBearer
+			}
+		}
+	}
+	return ""
+}
+
+// splitSubprotocols parses a comma-separated subprotocol list,
+// trimming whitespace and dropping empty entries.
+func splitSubprotocols(v string) []string {
+	parts := strings.Split(v, ",")
