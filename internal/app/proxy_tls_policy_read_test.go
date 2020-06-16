@@ -15,3 +15,55 @@ import (
 //
 // Duplicate policies aren't cosmetic: Caddy matches the first policy whose
 // subjects match, so a duplicate carrying different issuers can shadow the
+// intended one — and the caller got nil back either way.
+//
+// Same defect class fixed in EnsureTLSSubjects on #1589; this is the original.
+
+// askProxyOnPolicyGet serves a Caddy admin API whose TLS app reads fine but
+// whose policy read returns `status`, recording whether anything was written.
+func askProxyOnPolicyGet(t *testing.T, status int) (*ProxyManager, *bool) {
+	t.Helper()
+	wrote := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// Report the TLS app as present so ensureTLSApp doesn't short-circuit
+		// into createTLSApp before we reach the policy read.
+		case r.URL.Path == "/config/apps/tls" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"automation":{"policies":[]}}`))
+		case r.URL.Path == "/config/apps/tls/automation/policies" && r.Method == http.MethodGet:
+			http.Error(w, "boom", status)
+		default:
+			wrote = true
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return NewProxyManager(srv.URL, "example.com"), &wrote
+}
+
+func TestProvisionTLS_ErrorsOnUnexpectedPolicyGetStatus(t *testing.T) {
+	for _, status := range []int{
+		http.StatusInternalServerError,
+		http.StatusServiceUnavailable,
+		http.StatusBadGateway,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			p, wrote := askProxyOnPolicyGet(t, status)
+
+			err := p.ProvisionTLS("app.example.com")
+			if err == nil {
+				t.Fatal("want an error when the policy read fails, got nil — falling through " +
+					"POSTs a duplicate policy that can shadow the real one (#1590)")
+			}
+			if *wrote {
+				t.Fatal("must not write configuration after a failed policy read")
+			}
+		})
+	}
+}
+
+// The success path must be untouched: a 200 still reads, appends, and writes.
+func TestProvisionTLS_StillAppendsOnHealthyRead(t *testing.T) {
+	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"other.example.com"},
+		[]CaddyTLSIssuer{NewACMEIssuer()},
