@@ -21,26 +21,3 @@ func NewCoreServicesHandler() (*CoreServicesHandler, error) {
 	}
 	return &CoreServicesHandler{client: client}, nil
 }
-
-// CoreServiceInfo is the JSON representation of a single core service.
-type CoreServiceInfo struct {
-	Name      string `json:"name"`
-	Role      string `json:"role"`
-	State     string `json:"state"`
-	IPAddress string `json:"ipAddress"`
-}
-
-// HandleGetCoreServices handles GET /v1/system/core-services.
-func (h *CoreServicesHandler) HandleGetCoreServices(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	containers, err := h.client.ListContainers()
-	if err != nil {
-		log.Printf("core-services: failed to list containers: %v", err)
-		http.Error(w, `{"error":"failed to list containers"}`, http.StatusInternalServerError)
-		return
-	}
-
