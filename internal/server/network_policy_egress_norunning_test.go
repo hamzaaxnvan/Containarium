@@ -57,33 +57,3 @@ func TestEgressIncomplete_FailedRemovalWithNoRunningBox(t *testing.T) {
 	bob := containerView{Name: "bob-a", Tenant: "bob", TenantID: 2, Ifindex: 21, HasVeth: true, Running: true}
 	policies := map[string]netpolicy.CompiledPolicy{
 		"acme": egressPolicy(t, "acme", "192.0.2.0/24"),
-		"bob":  egressPolicy(t, "bob", "198.51.100.0/24"),
-	}
-	f := &fakeEgressApplier{}
-	egressPass(t, e, []containerView{acme, bob}, policies, f)
-
-	// acme's box is deleted and its policy removed; every acme entry fails to delete.
-	f.failDel = map[netbpf.EgressEntry]bool{}
-	for ee := range e.egressInstalled {
-		if ee.TenantID == acme.TenantID {
-			f.failDel[ee] = true
-		}
-	}
-	if len(f.failDel) == 0 {
-		t.Fatal("setup: pass 1 installed no acme allow-list entries")
-	}
-	delete(policies, "acme")
-	egressPass(t, e, []containerView{bob}, policies, f)
-
-	st := npStatusFor(t, e, true, "acme")
-	if !hasEgressIncomplete(st) {
-		t.Errorf("acme status = %v %v, want %v: its failed removal left destinations allowed", st.GetState(), st.GetUncoveredPaths(), egressIncompletePath)
-	}
-	if st.GetState() != pb.NetworkPolicyAppliedState_NETWORK_POLICY_APPLIED_STATE_NOT_LOADED {
-		t.Errorf("acme state = %v, want NOT_LOADED (no box)", st.GetState())
-	}
-
-	// Another tenant's status is unaffected.
-	if st := npStatusFor(t, e, true, "bob"); hasEgressIncomplete(st) || st.GetState() != pb.NetworkPolicyAppliedState_NETWORK_POLICY_APPLIED_STATE_LOADED {
-		t.Errorf("bob status = %v %v, want LOADED with a complete allow-list", st.GetState(), st.GetUncoveredPaths())
-	}
