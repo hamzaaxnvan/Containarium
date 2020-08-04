@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// AlertRule represents an alerting rule evaluated by vmalert
+message AlertRule {
+  // Unique identifier (UUID)
+  string id = 1;
+
+  // Human-readable name for the alert rule
+  string name = 2;
+
+  // PromQL expression to evaluate
+  string expr = 3;
+
+  // Duration the expression must be true before firing (e.g. "5m")
+  string duration = 4;
+
+  // Severity level: "critical", "warning", or "info"
+  string severity = 5;
+
+  // Human-readable description of what this alert means
+  string description = 6;
+
+  // Additional labels attached to the alert
+  map<string, string> labels = 7;
+
+  // Annotations (e.g. summary, runbook_url)
+  map<string, string> annotations = 8;
+
+  // Whether the rule is active
+  bool enabled = 9;
+
+  // Unix timestamp (seconds) when the rule was created
+  int64 created_at = 10;
+
+  // Unix timestamp (seconds) when the rule was last updated
+  int64 updated_at = 11;
+}
+
+// CreateAlertRuleRequest creates a new alert rule
+message CreateAlertRuleRequest {
+  string name = 1;
+  string expr = 2;
+  string duration = 3;
+  string severity = 4;
+  string description = 5;
+  map<string, string> labels = 6;
+  map<string, string> annotations = 7;
+  bool enabled = 8;
+}
+
+// CreateAlertRuleResponse returns the created alert rule
+message CreateAlertRuleResponse {
+  AlertRule rule = 1;
+}
+
+// GetAlertRuleRequest gets a single alert rule by ID
+message GetAlertRuleRequest {
+  string id = 1;
+}
+
+// GetAlertRuleResponse returns a single alert rule
+message GetAlertRuleResponse {
+  AlertRule rule = 1;
+}
+
+// ListAlertRulesRequest lists all alert rules
+message ListAlertRulesRequest {}
+
+// ListAlertRulesResponse returns all alert rules
+message ListAlertRulesResponse {
+  repeated AlertRule rules = 1;
+}
+
+// UpdateAlertRuleRequest updates an existing alert rule
+message UpdateAlertRuleRequest {
