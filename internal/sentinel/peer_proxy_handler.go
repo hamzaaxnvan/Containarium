@@ -43,26 +43,3 @@ const peerNotFoundBody = "not found"
 func (m *Manager) PeerProxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		backendID, remainingPath, ok := splitPeerPath(r.URL.Path)
-		if !ok {
-			peerNotFound(w)
-			return
-		}
-
-		backend := m.backends.Get(backendID)
-		if backend == nil {
-			// Same response as a malformed path, on purpose — see the
-			// file comment. Previously this was `backend %q not found`,
-			// which both confirmed the id was well-formed and reflected
-			// it back to the caller.
-			peerNotFound(w)
-			return
-		}
-
-		target := &url.URL{
-			Scheme: "http",
-			Host:   fmt.Sprintf("%s:%d", backend.IP, m.config.HealthPort),
-		}
-		proxy := httputil.NewSingleHostReverseProxy(target)
-		r.URL.Path = remainingPath
-		r.Host = target.Host
-		proxy.ServeHTTP(w, r)

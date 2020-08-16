@@ -22,27 +22,3 @@ const (
 // later sentinel restart cost it a full minute however healthy it had been.
 type reconnectBackoff struct {
 	cur time.Duration
-}
-
-func newReconnectBackoff() *reconnectBackoff {
-	return &reconnectBackoff{cur: reconnectInitialDelay}
-}
-
-// next returns how long to wait before the next connection attempt, given how
-// long the session that just ended lasted (0 for an attempt that never
-// connected).
-func (b *reconnectBackoff) next(sessionLasted time.Duration) time.Duration {
-	if sessionLasted >= reconnectStableAfter {
-		b.cur = reconnectInitialDelay
-	}
-	d := b.cur
-	b.cur *= 2
-	if b.cur > reconnectMaxDelay {
-		b.cur = reconnectMaxDelay
-	}
-	return d
-}
-
-// jitterDelay spreads d by up to ±20% so several clients that lost the same
-// sentinel do not all retry in the same instant. It reads crypto/rand because
-// the cost is irrelevant at reconnect frequency and it keeps the weak-RNG
