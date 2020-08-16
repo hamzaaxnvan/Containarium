@@ -55,31 +55,3 @@ cleanup() {
   trap - EXIT
   if "$needs_start"; then
     echo "Restoring backend after failure" >&2
-    start_backend || rc=1
-  fi
-  exit "$rc"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-baseline="$(identity)" || fail "cannot read sentinel identity"
-grep -Eq '^MainPID=[1-9][0-9]*$' <<< "$baseline" || fail "sentinel service is not running"
-initial_ip="$(backend_ip)"
-[[ -n "$initial_ip" ]] || fail "backend has no internal IP"
-probe_ssh || fail "SSH baseline failed"
-probe_https || fail "HTTPS baseline failed"
-backend_ready || fail "backend health baseline failed"
-assert_sentinel_alive() {
-  local current
-  current="$(identity)" || fail "sentinel became unreachable"
-  [[ "$current" == "$baseline" ]] || fail "sentinel restarted"
-}
-
-echo "Starting outage: $(date -u +%FT%TZ); requested duration=${OUTAGE_SECONDS}s"
-# Set before stopping: even an ambiguous stop failure must attempt recovery.
-needs_start=true
-gcloud compute instances stop "$BACKEND_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --quiet
-outage_start=$SECONDS
-if probe_ssh; then fail "SSH still works with the backend stopped; check the test target"; fi
-if probe_https; then fail "HTTPS still works with the backend stopped; check the test target"; fi
