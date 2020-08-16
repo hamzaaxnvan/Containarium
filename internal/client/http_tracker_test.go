@@ -321,3 +321,111 @@ func TestSubmitTrackerChange_PathMethodAndBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotMethod = r.Method
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"change": {"number": 6, "state": "TRACKER_ISSUE_STATE_OPEN", "url": "https://example.com/6", "branch": "agent/run-1/1-x"}}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+
+	change, err := c.SubmitTrackerChange(&pb.SubmitTrackerChangeRequest{
+		Username: "alice", Connection: "default", Issue: 1, Title: "My change", Description: "does the thing",
+	})
+	if err != nil {
+		t.Fatalf("SubmitTrackerChange: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/v1/tracker/connections/alice/default/changes" {
+		t.Errorf("path = %q, want /v1/tracker/connections/alice/default/changes", gotPath)
+	}
+	if !strings.Contains(string(gotBody), `"title":"My change"`) {
+		t.Errorf("request body = %s, want it to carry the title", gotBody)
+	}
+	if change.GetNumber() != 6 || change.GetBranch() != "agent/run-1/1-x" {
+		t.Errorf("change = %+v, want number=6 branch=agent/run-1/1-x", change)
+	}
+}
+
+func TestSubmitTrackerChangeFiles_PathMethodAndBody(t *testing.T) {
+	var gotPath, gotMethod string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"change": {"number": 8, "branch": "containarium/issue-1"}}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	change, err := c.SubmitTrackerChangeFiles(&pb.SubmitTrackerChangeFilesRequest{
+		Username: "alice", Connection: "default", Issue: 1, Title: "My change",
+		Files: []*pb.TrackerChangeFile{{Path: "docs/a.md", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("SubmitTrackerChangeFiles: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v1/tracker/connections/alice/default/changes:files" {
+		t.Errorf("%s %s, want POST /v1/tracker/connections/alice/default/changes:files", gotMethod, gotPath)
+	}
+	if !strings.Contains(string(gotBody), `"path":"docs/a.md"`) {
+		t.Errorf("request body = %s, want it to carry the files", gotBody)
+	}
+	if change.GetNumber() != 8 || change.GetBranch() != "containarium/issue-1" {
+		t.Errorf("change = %+v, want number=8 branch=containarium/issue-1", change)
+	}
+}
+
+func TestCommentOnTrackerIssue_PathMethodAndBody(t *testing.T) {
+	var gotPath, gotMethod string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"comment": {"author": "agent-bot", "body": "hello"}}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+
+	comment, err := c.CommentOnTrackerIssue(&pb.CommentOnTrackerIssueRequest{
+		Username: "alice", Connection: "default", Number: 7, Body: "hello",
+	})
+	if err != nil {
+		t.Fatalf("CommentOnTrackerIssue: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if gotPath != "/v1/tracker/connections/alice/default/issues/7/comments" {
+		t.Errorf("path = %q, want /v1/tracker/connections/alice/default/issues/7/comments", gotPath)
+	}
+	if !strings.Contains(string(gotBody), `"body":"hello"`) {
+		t.Errorf("request body = %s, want it to carry the comment body", gotBody)
+	}
+	if comment.GetAuthor() != "agent-bot" {
+		t.Errorf("comment = %+v, want author=agent-bot", comment)
+	}
+}
+
+func TestClaimTrackerIssue_PathMethodAndDecoding(t *testing.T) {
+	var gotPath, gotMethod string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
