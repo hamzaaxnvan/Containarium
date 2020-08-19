@@ -46,3 +46,52 @@ type WebhookConfigSource interface {
 type Notifier interface {
 	Notify(f *Finding)
 }
+
+// WebhookNotifier delivers MEDIUM+ findings straight to the operator's
+// configured webhook — deliberately bypassing vmalert/alertmanager (design
+// doc: that path needs the VictoriaMetrics container and is metrics-shaped;
+// a direct POST works on any backend, including minimal BYOC hosts). It
+// reuses the same webhook URL/secret config and HMAC-SHA256 signing scheme
+// the existing alert-webhook relay uses, so operators configure alerting
+// once.
+//
+// Delivery is asynchronous relative to the store write that triggers it:
+// Notify enqueues onto a bounded channel and returns immediately. One
+// worker goroutine drains it and does the actual HTTP POST with retry and
+// backoff. A full queue or a dead webhook drops/fails deliveries (recorded
+// as failed, when a DeliveryStore is wired) but never blocks the caller —
+// the caller is the detection hot path, which must never stall behind a
+// slow or unreachable webhook.
+type WebhookNotifier struct {
+	config   WebhookConfigSource
+	delivery *alert.DeliveryStore // nil = attempts are logged, not persisted
+	client   *http.Client
+	queue    chan *Finding
+	gate     *deliveryGate
+}
+
+// NewWebhookNotifier builds a notifier. config is required — without
+// somewhere to read the webhook URL/secret from, the notifier can't do
+// anything. delivery is optional (nil in degraded mode, when there's no
+// Postgres pool to back a DeliveryStore).
+func NewWebhookNotifier(config WebhookConfigSource, delivery *alert.DeliveryStore) *WebhookNotifier {
+	return &WebhookNotifier{
+		config:   config,
+		delivery: delivery,
+		client:   &http.Client{Timeout: notifierHTTPTimeout},
+		queue:    make(chan *Finding, notifierQueueCap),
+		gate:     newDeliveryGate(DefaultRenotifyInterval),
+	}
+}
+
+// SetRenotifyInterval changes how long an open finding stays quiet after a
+// delivery before the same condition is delivered again (#2643); <= 0
+// restores DefaultRenotifyInterval. Call before the first Notify.
+func (n *WebhookNotifier) SetRenotifyInterval(d time.Duration) {
+	n.gate = newDeliveryGate(d)
+}
+
+// Start runs the delivery worker until ctx is done. Call once, before the
+// first Notify.
+func (n *WebhookNotifier) Start(ctx context.Context) {
+	go func() {
