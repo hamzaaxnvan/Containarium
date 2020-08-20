@@ -24,3 +24,30 @@ fi
 
 BINARY_SRC="${BINARY_SRC:-/tmp/containariumd}"
 BINARY_DST="/usr/local/bin/containariumd"
+
+# Lab tunnel token — env-only (no default literal in this OSS-tracked
+# file; see CLAUDE.md OSS-disclosure rule). A prior committed literal
+# was rotated 2026-05-25.
+LAB_TOKEN="${CONTAINARIUM_TUNNEL_TOKEN:-}"
+SENTINEL_ADDR="${CONTAINARIUM_SENTINEL_ADDR:-<sentinel-host>:443}"
+SPOT_ID="${SPOT_ID:-lab-primary-1}"
+POOL="${POOL:-lab}"
+# Pool's public hostname — placeholder; the cluster's apex doesn't
+# belong in the repo per CLAUDE.md.
+PUBLIC_HOSTNAME="${CONTAINARIUM_PUBLIC_HOSTNAME:-<cluster>.example.com}"
+PUBLIC_PORT="${PUBLIC_PORT:-443}"
+
+if [[ -z "$LAB_TOKEN" ]]; then
+    echo "Error: CONTAINARIUM_TUNNEL_TOKEN env var required"
+    exit 1
+fi
+if [[ "$SENTINEL_ADDR" == *"<sentinel-host>"* ]]; then
+    echo "Error: CONTAINARIUM_SENTINEL_ADDR env var required (got placeholder)"
+    exit 1
+fi
+if [[ "$PUBLIC_HOSTNAME" == *"<cluster>.example.com"* ]]; then
+    echo "Error: CONTAINARIUM_PUBLIC_HOSTNAME env var required (got placeholder)"
+    exit 1
+fi
+
+if [[ ! -f "$BINARY_SRC" ]]; then
