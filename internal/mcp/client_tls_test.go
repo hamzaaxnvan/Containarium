@@ -30,3 +30,36 @@ func genTestCAPEM(t *testing.T) []byte {
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// Phase 2.2 — MCP client refuses plaintext HTTP by default and
+// supports CA pinning via env var. Audit C-HIGH-1.
+
+func TestBuildMCPTLSConfig_RefusesHTTPByDefault(t *testing.T) {
+	// Override the package-init helper that allows insecure for
+	// the rest of the test suite — we want to exercise the strict
+	// path here.
+	t.Setenv(mcpAllowInsecureEnv, "")
+	cfg, err := buildMCPTLSConfig("http://daemon.example.com:8080")
+	if err == nil {
+		t.Fatal("http:// baseURL must be refused by default")
+	}
+	if cfg != nil {
+		t.Fatal("config should be nil when the URL is refused")
+	}
+	if !strings.Contains(err.Error(), mcpAllowInsecureEnv) {
+		t.Fatalf("error should name the escape-hatch env var: %v", err)
+	}
+}
+
+func TestBuildMCPTLSConfig_AllowsHTTPWhenOptedIn(t *testing.T) {
+	t.Setenv(mcpAllowInsecureEnv, "true")
+	cfg, err := buildMCPTLSConfig("http://daemon.example.com:8080")
+	if err != nil {
