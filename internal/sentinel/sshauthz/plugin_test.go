@@ -150,3 +150,155 @@ func TestAuditOnlyMatrix(t *testing.T) {
 			if _, ok := c.Get(ck, true); ok != tt.retained {
 				t.Fatalf("retained = %v want %v", ok, tt.retained)
 			}
+		})
+	}
+}
+
+func TestGraceNeverRenewsAndDenyInvalidates(t *testing.T) {
+	now := time.Now()
+	c := NewCache(DefaultGrace, 10, func() time.Time { return now })
+	key := CacheKey{"backend", "alice", "fp"}
+	c.Put(key, "user", time.Second)
+	now = now.Add(time.Minute)
+	for range 4 {
+		if _, ok := c.Get(key, true); !ok {
+			t.Fatal("lost grace")
+		}
+		now = now.Add(time.Minute)
+	}
+	if _, ok := c.Get(key, true); ok {
+		t.Fatal("grace read renewed positive")
+	}
+	c.Put(key, "user", time.Second)
+	c.Delete(key)
+	if _, ok := c.Get(key, true); ok {
+		t.Fatal("denial retained positive")
+	}
+}
+
+func TestCacheTTLIsolationAndEviction(t *testing.T) {
+	now := time.Now()
+	c := NewCache(DefaultGrace, 2, func() time.Time { return now })
+	a := CacheKey{"a", "alice", "fp"}
+	b := CacheKey{"b", "alice", "fp"}
+	c.Put(a, "user-a", 2*time.Second)
+	now = now.Add(time.Second)
+	c.Put(b, "user-b", 10*time.Second)
+	for _, k := range []CacheKey{{"a", "bob", "fp"}, {"a", "alice", "different"}} {
+		if _, ok := c.Get(k, true); ok {
+			t.Fatal("cache key collision")
+		}
+	}
+	now = now.Add(time.Second)
+	if _, ok := c.Get(a, false); ok {
+		t.Fatal("TTL boundary must expire")
+	}
+	if user, ok := c.Get(b, false); !ok || user != "user-b" {
+		t.Fatal("backends not isolated")
+	}
+	c.Put(CacheKey{"c", "alice", "fp"}, "user-c", time.Minute)
+	if _, ok := c.Get(a, true); ok {
+		t.Fatal("oldest entry not evicted")
+	}
+	now = now.Add(DefaultGrace)
+	c.Get(b, true)
+	if len(c.entries) != 0 {
+		t.Fatal("expired entries not pruned")
+	}
+}
+
+// A control plane's TTL must not stretch the outage-admit window past grace:
+// an ALLOW is reused for at most min(ttl, grace) after it was checked.
+func TestCacheCapsAllowTTLAtGrace(t *testing.T) {
+	const grace = 2 * time.Minute
+	for _, tt := range []struct {
+		name      string
+		ttl, want time.Duration // want: the effective TTL
+	}{
+		{name: "above grace is capped", ttl: 10 * time.Minute, want: grace},
+		{name: "equal to grace is unchanged", ttl: grace, want: grace},
+		{name: "below grace is unchanged", ttl: 30 * time.Second, want: 30 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			start := time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)
+			now := start
+			c := NewCache(grace, 10, func() time.Time { return now })
+			key := CacheKey{"backend", "alice", "fp"}
+			c.Put(key, "user", tt.ttl)
+			now = start.Add(tt.want - time.Nanosecond)
+			if _, ok := c.Get(key, false); !ok {
+				t.Fatal("positive expired before its effective TTL")
+			}
+			now = start.Add(tt.want)
+			if _, ok := c.Get(key, false); ok {
+				t.Fatalf("positive still fresh at its effective TTL %v", tt.want)
+			}
+			if _, ok := c.Get(key, true); ok != (tt.want < grace) {
+				t.Fatalf("outage read at %v = %v, want %v", tt.want, ok, tt.want < grace)
+			}
+		})
+	}
+}
+
+func TestAuthorizationDeadline(t *testing.T) {
+	p, err := New(Config{Timeout: 10 * time.Millisecond, Resolver: resolverFunc(func(context.Context, string) (string, bool, error) { return "backend", true, nil }), Authorizer: authorizerFunc(func(ctx context.Context, _ string, _ *pb.AuthorizeSSHRequest) (*pb.AuthorizeSSHResponse, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	up, err := p.PluginConfig().PublicKeyCallback(&libplugin.ConnMeta{UserName: "alice"}, testKey(t).PublicKey().Marshal())
+	if err != nil || up.GetNextPlugin().Meta[sshsession.MetaDenyReason] != string(sshsession.DenyUpstreamUnavailable) {
+		t.Fatalf("timeout did not defer with denial: %v %v", up, err)
+	}
+}
+
+func TestOfferedKeyTypes(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaPub, err := ssh.NewPublicKey(&rsaKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := []struct {
+		key  ssh.PublicKey
+		want pb.SSHKeyType
+	}{
+		{testKey(t).PublicKey(), pb.SSHKeyType_SSH_KEY_TYPE_ED25519},
+		{rsaPub, pb.SSHKeyType_SSH_KEY_TYPE_RSA},
+	}
+	for _, curve := range []elliptic.Curve{elliptic.P256(), elliptic.P384(), elliptic.P521()} {
+		priv, err := ecdsa.GenerateKey(curve, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pub, err := ssh.NewPublicKey(&priv.PublicKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows = append(rows, struct {
+			key  ssh.PublicKey
+			want pb.SSHKeyType
+		}{pub, pb.SSHKeyType_SSH_KEY_TYPE_ECDSA})
+	}
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skED, err := ssh.ParsePublicKey(ssh.Marshal(struct {
+		Type        string
+		Key         []byte
+		Application string
+	}{ssh.KeyAlgoSKED25519, edKey.Public().(ed25519.PublicKey), "ssh:test"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecKey, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skEC, err := ssh.ParsePublicKey(ssh.Marshal(struct {
+		Type, Curve string
