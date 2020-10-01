@@ -29,3 +29,13 @@ func TestCollaboratorKeysFromRequest(t *testing.T) {
 			name: "repeated wins over legacy when both set",
 			req:  &pb.AddCollaboratorRequest{SshPublicKey: "ssh-ed25519 LEGACY x", SshPublicKeys: []string{"ssh-ed25519 AAA a"}},
 			want: []string{"ssh-ed25519 AAA a"},
+		},
+		{
+			name: "neither set yields nil",
+			req:  &pb.AddCollaboratorRequest{},
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := collaboratorKeysFromRequest(tt.req)
