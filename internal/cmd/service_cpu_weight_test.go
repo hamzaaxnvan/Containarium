@@ -37,3 +37,42 @@ func TestSystemdServiceCPUWeight(t *testing.T) {
 		t.Errorf("systemdServiceTemplate CPUWeight=%q, want %q (hostcheck.PlatformCPUWeight)", got, want)
 	}
 	if got := unitDirective(systemdServiceTemplate, "CPUAccounting"); got != "yes" {
+		t.Errorf("systemdServiceTemplate CPUAccounting=%q, want yes", got)
+	}
+}
+
+// The shipped copy (scripts/containarium.service) is not generated from the
+// template, so pin it to the same weight or the two drift apart silently.
+func TestShippedUnitCPUWeightMatchesTemplate(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "scripts", "containarium.service"))
+	if err != nil {
+		t.Fatalf("read shipped unit: %v", err)
+	}
+	if got, want := unitDirective(string(raw), "CPUWeight"), unitDirective(systemdServiceTemplate, "CPUWeight"); got != want {
+		t.Errorf("scripts/containarium.service CPUWeight=%q, template has %q", got, want)
+	}
+}
+
+// TestEnsureIncusCPUWeightDropIn: `incusd` is installed from the distro /
+// Zabbly package, so its unit is not ours to edit — the weight lands as a
+// drop-in under incus.service.d, written by the same install step that
+// writes the daemon unit, and idempotent like it.
+func TestEnsureIncusCPUWeightDropIn(t *testing.T) {
+	root := t.TempDir()
+	if err := ensureIncusCPUWeightDropIn(root); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	path := filepath.Join(root, incusCPUWeightDropInPath)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("drop-in not written at %s: %v", path, err)
+	}
+	unit := string(raw)
+	if !strings.HasPrefix(strings.TrimSpace(stripComments(unit)), "[Service]") {
+		t.Errorf("drop-in must start with [Service]:\n%s", unit)
+	}
+	if got, want := unitDirective(unit, "CPUWeight"), strconv.Itoa(hostcheck.PlatformCPUWeight); got != want {
+		t.Errorf("drop-in CPUWeight=%q, want %q", got, want)
+	}
+	if got := unitDirective(unit, "CPUAccounting"); got != "yes" {
+		t.Errorf("drop-in CPUAccounting=%q, want yes", got)
