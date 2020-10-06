@@ -223,3 +223,228 @@ func TestManager_MultipleContainersSomeSleepSomeDont(t *testing.T) {
 				AutoSleepEnabled:     false,
 				IdleThresholdMinutes: 15,
 				LastStartedAt:        now.Add(-2 * time.Hour),
+			},
+			{ // core role
+				Name:                 "containarium-core-postgres",
+				State:                "Running",
+				AutoSleepEnabled:     true,
+				IdleThresholdMinutes: 15,
+				Role:                 incus.RolePostgres,
+				LastStartedAt:        now.Add(-2 * time.Hour),
+			},
+		},
+	}
+	traffic := &fakeTraffic{per: map[string]time.Time{
+		"alice-container": now.Add(-90 * time.Minute), // idle
+		"bob-container":   now.Add(-1 * time.Minute),  // active
+		"carol-container": now.Add(-90 * time.Minute), // would-sleep, but not opted in
+	}}
+	stopper := &fakeStopper{}
+	audit := &fakeAudit{}
+	m := NewManager(inc, traffic, stopper, audit, Options{
+		Interval: time.Hour,
+		Clock:    func() time.Time { return now },
+	})
+	m.tick(context.Background())
+
+	calls := stopper.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 stop, got %d: %+v", len(calls), calls)
+	}
+	if calls[0].username != "alice" {
+		t.Errorf("stopped username = %q, want alice", calls[0].username)
+	}
+	if audits := audit.recorded(); len(audits) != 1 {
+		t.Fatalf("expected exactly 1 audit, got %d", len(audits))
+	}
+}
+
+// TestManager_IncusListError_LogsAndContinues — ListContainers
+// failure on tick #1 must not crash; tick #2 with a working list
+// proceeds normally. Verifies the loop survives transient incus
+// errors (the documented design).
+func TestManager_IncusListError_LogsAndContinues(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+
+	inc := &fakeIncus{err: errors.New("incus offline")}
+	stopper := &fakeStopper{}
+	m := NewManager(inc, nil, stopper, nil, Options{
+		Interval: time.Hour,
+		Clock:    func() time.Time { return now },
+	})
+	// Tick #1: error path — must not panic and must not call Stop.
+	m.tick(context.Background())
+	if calls := stopper.recorded(); len(calls) != 0 {
+		t.Fatalf("error tick must not call Stop, got %+v", calls)
+	}
+
+	// Tick #2: recover, normal eligible container should sleep.
+	inc.err = nil
+	inc.containers = []incus.ContainerInfo{{
+		Name:                 "alice-container",
+		State:                "Running",
+		AutoSleepEnabled:     true,
+		IdleThresholdMinutes: 15,
+		LastStartedAt:        now.Add(-2 * time.Hour),
+	}}
+	m.tick(context.Background())
+	if calls := stopper.recorded(); len(calls) != 1 {
+		t.Fatalf("post-recovery tick should sleep once, got %d", len(calls))
+	}
+}
+
+// TestManager_StopperError_ContinuesWithOthers — when the first
+// stop fails, the second eligible container still gets stopped.
+// One per-container failure must not poison the rest of the tick.
+func TestManager_StopperError_ContinuesWithOthers(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	inc := &fakeIncus{
+		containers: []incus.ContainerInfo{
+			{
+				Name: "alice-container", State: "Running",
+				AutoSleepEnabled: true, IdleThresholdMinutes: 15,
+				LastStartedAt: now.Add(-2 * time.Hour),
+			},
+			{
+				Name: "bob-container", State: "Running",
+				AutoSleepEnabled: true, IdleThresholdMinutes: 15,
+				LastStartedAt: now.Add(-2 * time.Hour),
+			},
+		},
+	}
+	traffic := &fakeTraffic{per: map[string]time.Time{
+		"alice-container": now.Add(-90 * time.Minute),
+		"bob-container":   now.Add(-90 * time.Minute),
+	}}
+	stopper := &fakeStopper{errs: []error{errors.New("stop boom")}}
+	audit := &fakeAudit{}
+
+	// Capture log output to verify the error is logged.
+	var buf bytes.Buffer
+	defer log.SetOutput(log.Writer())
+	log.SetOutput(&buf)
+
+	m := NewManager(inc, traffic, stopper, audit, Options{
+		Interval: time.Hour,
+		Clock:    func() time.Time { return now },
+	})
+	m.tick(context.Background())
+
+	calls := stopper.recorded()
+	if len(calls) != 2 {
+		t.Fatalf("both containers should be attempted, got %d: %+v", len(calls), calls)
+	}
+	// The successful one (second) must produce an audit; failure (first) must not.
+	if audits := audit.recorded(); len(audits) != 1 {
+		t.Fatalf("expected exactly 1 audit (only the successful Stop), got %d", len(audits))
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("stop boom")) {
+		t.Errorf("stopper error not logged; output:\n%s", buf.String())
+	}
+}
+
+// TestManager_NilTrafficSource_DegradesGracefully — nil TrafficSource
+// must not panic; behavior collapses to Decide's rule 5 (no-signal
+// fallback). Locks the constructor's "nil traffic is allowed" contract.
+func TestManager_NilTrafficSource_DegradesGracefully(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	inc := &fakeIncus{
+		containers: []incus.ContainerInfo{
+			{ // since-start path: 2h since start, threshold 15m → sleep
+				Name: "alice-container", State: "Running",
+				AutoSleepEnabled: true, IdleThresholdMinutes: 15,
+				LastStartedAt: now.Add(-2 * time.Hour),
+			},
+			{ // no last-start either → undecidable
+				Name: "bob-container", State: "Running",
+				AutoSleepEnabled: true, IdleThresholdMinutes: 15,
+			},
+		},
+	}
+	stopper := &fakeStopper{}
+	m := NewManager(inc, nil, stopper, nil, Options{
+		Interval: time.Hour,
+		Clock:    func() time.Time { return now },
+	})
+	m.tick(context.Background())
+	calls := stopper.recorded()
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 stop (since-start path), got %d: %+v", len(calls), calls)
+	}
+	if calls[0].username != "alice" {
+		t.Errorf("stopped %q, want alice", calls[0].username)
+	}
+}
+
+// TestManager_NilAuditLogger_NoPanic — nil AuditLogger falls back to
+// log.Printf; Stop still runs. Locks "audit is optional".
+func TestManager_NilAuditLogger_NoPanic(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	inc := &fakeIncus{
+		containers: []incus.ContainerInfo{{
+			Name: "alice-container", State: "Running",
+			AutoSleepEnabled: true, IdleThresholdMinutes: 15,
+			LastStartedAt: now.Add(-2 * time.Hour),
+		}},
+	}
+	traffic := &fakeTraffic{per: map[string]time.Time{
+		"alice-container": now.Add(-90 * time.Minute),
+	}}
+	stopper := &fakeStopper{}
+
+	var buf bytes.Buffer
+	defer log.SetOutput(log.Writer())
+	log.SetOutput(&buf)
+
+	m := NewManager(inc, traffic, stopper, nil, Options{
+		Interval: time.Hour,
+		Clock:    func() time.Time { return now },
+	})
+	m.tick(context.Background()) // must not panic
+	if calls := stopper.recorded(); len(calls) != 1 {
+		t.Fatalf("expected 1 stop, got %d", len(calls))
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("[autosleep] stopped")) {
+		t.Errorf("expected log.Printf fallback for audit, output:\n%s", buf.String())
+	}
+}
+
+// TestManager_StopIsIdempotent — Stop called twice must not panic and
+// must complete quickly both times. Uses a short interval so the
+// ticker is actively firing during the Stop window, which is the
+// stress shape that previously deadlocked Stop against the run loop.
+func TestManager_StopIsIdempotent(t *testing.T) {
+	now := time.Date(2026, 5, 18, 12, 0, 0, 0, time.UTC)
+	m := NewManager(&fakeIncus{}, nil, &fakeStopper{}, nil, Options{
+		Interval: 25 * time.Millisecond,
+		Clock:    func() time.Time { return now },
+	})
+	m.Start(context.Background())
+	time.Sleep(75 * time.Millisecond) // let several ticks fire
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		m.Stop()
+	}()
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Stop() blocked >2s")
+	}
+
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		m.Stop()
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second Stop() blocked >1s; expected no-op")
+	}
+}
+
+// TestManager_ContextCancellationStopsTicker — Start(ctx) with a
+// canceled ctx exits the run loop within a tick interval.
+func TestManager_ContextCancellationStopsTicker(t *testing.T) {
