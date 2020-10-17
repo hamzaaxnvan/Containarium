@@ -61,3 +61,34 @@ func runNotifyArgs(t *testing.T, stdin string, args ...string) (string, error) {
 	return out.String(), err
 }
 
+func TestNotifySetNtfy_TokenFromFile(t *testing.T) {
+	fake := withFakeNotifyClient(t)
+	tf := filepath.Join(t.TempDir(), "tok")
+	if err := os.WriteFile(tf, []byte("tk_abc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runNotifyArgs(t, "", "set", "ntfy", "--ntfy-server", "https://ntfy.example.com", "--topic", "my-runs", "--token-file", tf, "--redact-command")
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	r := fake.set
+	if r.GetServer() != "https://ntfy.example.com" || r.GetTopic() != "my-runs" || r.GetToken() != "tk_abc" || !r.GetRedactCommand() ||
+		r.GetKind() != pb.NotifyChannelKind_NOTIFY_CHANNEL_KIND_NTFY {
+		t.Fatalf("request = %v", r)
+	}
+	if serverAddr != "daemon.example.com:50051" {
+		t.Fatalf("global --server became %q", serverAddr)
+	}
+	if strings.Contains(out, "tk_abc") {
+		t.Fatalf("output shows the token: %s", out)
+	}
+}
+
+func TestNotifySetNtfy_TokenFromStdin(t *testing.T) {
+	fake := withFakeNotifyClient(t)
+	if out, err := runNotifyArgs(t, "tk_stdin\n", "set", "ntfy", "--ntfy-server", "https://ntfy.example.com", "--topic", "t", "--token-stdin"); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if fake.set.GetToken() != "tk_stdin" {
+		t.Fatalf("token = %q", fake.set.GetToken())
+	}
