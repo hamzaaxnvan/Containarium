@@ -22,3 +22,51 @@ const (
 	RuntimeLXC = "lxc"
 	RuntimeK8s = "k8s"
 )
+
+// newManager constructs the daemon's container.Manager for the given runtime.
+// For the lxc runtime a reachable incus is required (fatal on failure, as
+// always). For the k8s runtime incus is optional — a failed connection degrades
+// gracefully: box lifecycle goes through K8s; incus-only RPCs return errors.
+func newManager(runtime string) (*container.Manager, error) {
+	mgr, err := container.New()
+	if err != nil {
+		if runtime == RuntimeK8s {
+			log.Printf("[k8s] incus not reachable (%v); box lifecycle uses the Kubernetes backend — legacy incus-only RPCs will return errors", err)
+			return container.NewWithBackend(incus.NewUnavailableBackend()), nil
+		}
+		return nil, err
+	}
+	return mgr, nil
+}
+
+// newBoxBackend constructs the box-lifecycle backend for the given runtime.
+// For lxc it wraps the Manager (today's default). For k8s it builds the
+// Kubernetes backend from CONTAINARIUM_K8S_* env vars.
+func newBoxBackend(runtime string, mgr *container.Manager) (box.BoxBackend, error) {
+	switch runtime {
+	case RuntimeK8s:
+		return newK8sBackend()
+	case RuntimeLXC, "":
+		return boxlxc.New(mgr), nil
+	default:
+		return nil, fmt.Errorf("unknown runtime %q: must be %q or %q", runtime, RuntimeLXC, RuntimeK8s)
+	}
+}
+
+// maybeStartBoxOperator starts the Box CRD controller in the background when
+// the k8s runtime is selected and CONTAINARIUM_K8S_OPERATOR is set. Off by
+// default — the imperative API path is unaffected either way. The manager runs
+// for the daemon's lifetime; when disabled this is a no-op.
+func maybeStartBoxOperator(runtime string, bb box.BoxBackend) {
+	if runtime != RuntimeK8s || !config.LoadK8s().OperatorEnabled {
+		return
+	}
+	go func() {
+		log.Printf("[operator] Box controller enabled (CONTAINARIUM_K8S_OPERATOR); starting manager")
+		if err := controller.StartOperator(context.Background(), bb); err != nil {
+			log.Printf("[operator] Box controller stopped: %v", err)
+		}
+	}()
+}
+
+// newBoxWriterIfEnabled returns a BoxWriter for the convergent create path when

@@ -71,3 +71,39 @@ func primaryNICDevice(devices map[string]map[string]string) (string, map[string]
 // config (for the `volatile.<nic>.hwaddr` Incus assigns) and its expanded
 // devices (for `network`/`parent` and `ipv4.address`).
 func hostNICFor(config map[string]string, devices map[string]map[string]string) hostNIC {
+	name, dev := primaryNICDevice(devices)
+	if name == "" {
+		return hostNIC{}
+	}
+	n := hostNIC{
+		Network: dev["network"],
+		HWAddr:  strings.ToLower(strings.TrimSpace(firstNonEmpty(dev["hwaddr"], config["volatile."+name+".hwaddr"]))),
+	}
+	if n.Network == "" {
+		n.Network = dev["parent"]
+	}
+	if a, err := netip.ParseAddr(strings.TrimSpace(dev["ipv4.address"])); err == nil && a.Is4() {
+		n.StaticIP = a
+	}
+	return n
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// parseDnsmasqLeases reads a dnsmasq leases file — one lease per line,
+// `<expiry-unix> <mac> <ip> <hostname> <client-id>` — and returns the IPv4 each
+// lower-case MAC currently holds. An expiry of 0 is a permanent lease; a lease
+// whose expiry is before now is skipped. Malformed lines are skipped, not fatal.
+func parseDnsmasqLeases(r io.Reader, now time.Time) map[string]netip.Addr {
+	out := make(map[string]netip.Addr)
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) < 3 {
+			continue
+		}
