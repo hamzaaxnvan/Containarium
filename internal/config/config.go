@@ -34,15 +34,3 @@ func getString(key, def string) string {
 	}
 	return def
 }
-
-// getBool reports whether the environment variable key is set to a truthy value
-// ("1", "true", "yes", "on", case-insensitive). Anything else — including unset
-// — is false. This is a superset of the historical `== "1"` convention, so
-// existing "1" settings keep working.
-func getBool(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
