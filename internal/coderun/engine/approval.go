@@ -49,20 +49,3 @@ func WithApprovals(eng Engine, cmd, runName string, pub ed25519.PublicKey, timeo
 }
 
 // ApprovalPromptTool is the --permission-prompt-tool value.
-const ApprovalPromptTool = "mcp__" + approvalServerName + "__" + approvalToolName
-
-// approvalMCPConfig is the inline --mcp-config JSON that starts the approval
-// server. agent-box is found on the same PATH `code` sessions use to reach it.
-// The public key is not a secret; it is on the command line so that nothing on
-// the box can swap it after the run starts.
-func approvalMCPConfig(runName string, pub ed25519.PublicKey, timeout time.Duration) string {
-	script := coderun.AgentBoxPathPrefix + " exec agent-box approval-mcp --run " +
-		shellQuoteSingle(runName) + " --public-key " + hex.EncodeToString(pub) + " --timeout " + timeout.String()
-	type stdioServer struct {
-		Command string   `json:"command"`
-		Args    []string `json:"args"`
-	}
-	cfg := struct {
-		MCPServers map[string]stdioServer `json:"mcpServers"`
-	}{MCPServers: map[string]stdioServer{
-		approvalServerName: {Command: "sh", Args: []string{"-c", script}},

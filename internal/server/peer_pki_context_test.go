@@ -31,3 +31,14 @@ func TestFetchPeerPKI_HonoursContextCancellation(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		cancel()
 	}()
+
+	secret := make([]byte, auth.SentinelMinSecretLen)
+	for i := range secret {
+		secret[i] = 'x'
+	}
+
+	start := time.Now()
+	_, err := FetchPeerPKI(ctx, srv.URL, "peer-1", secret)
+	elapsed := time.Since(start)
+
+	if err == nil {
