@@ -37,3 +37,43 @@ type scorecardStep struct {
 }
 
 func loadScorecardWorkflow(t *testing.T) scorecardWorkflow {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(workflowDir, "scorecard.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wf scorecardWorkflow
+	if err := yaml.Unmarshal(b, &wf); err != nil {
+		t.Fatal(err)
+	}
+	return wf
+}
+
+func TestScorecardTrustedTriggers(t *testing.T) {
+	wf := loadScorecardWorkflow(t)
+	if len(wf.On) != 2 {
+		t.Fatal("Scorecard must run only on main pushes and the weekly schedule")
+	}
+	var push triggerFilter
+	pushNode := wf.On["push"]
+	if err := pushNode.Decode(&push); err != nil {
+		t.Fatal(err)
+	}
+	if len(push.Branches) != 1 || push.Branches[0] != "main" || len(push.Paths) != 0 || len(push.Tags) != 0 {
+		t.Error("every main push must run Scorecard, without path or tag filters")
+	}
+	var schedule []struct {
+		Cron string `yaml:"cron"`
+	}
+	scheduleNode := wf.On["schedule"]
+	if err := scheduleNode.Decode(&schedule); err != nil {
+		t.Fatal(err)
+	}
+	if len(schedule) != 1 || !regexp.MustCompile(`^[0-5]?\d [0-2]?\d \* \* [0-6]$`).MatchString(schedule[0].Cron) {
+		t.Error("Scorecard must have a weekly schedule")
+	}
+}
+
+func TestScorecardBadge(t *testing.T) {
+	b, err := os.ReadFile("../../README.md")
+	if err != nil {

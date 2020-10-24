@@ -107,3 +107,58 @@ func (s *RecipeServer) checkGuardrailGate(ctx context.Context, recipe *pb.Recipe
 	area, err := guardrailstage.New(s.guardrailStagingRoot)
 	if errors.Is(err, guardrailstage.ErrNoStagingRoot) {
 		return nil, gateRefusal("this daemon has no guardrail staging root configured")
+	}
+	if err != nil {
+		log.Printf("[recipe] guardrail gate: staging root: %v", err)
+		return nil, gateRefusal("the guardrail staging root is unavailable")
+	}
+	subject, _, _ := auth.SubjectFromGRPCContext(ctx) // deploy already refused a missing subject
+	ref, err := guardrailStagingRef(subject, in.GetStagingRef())
+	if err != nil {
+		return nil, gateRefusal("staging_ref: %v", err)
+	}
+	// Cheap checks first (signer, signature, policy hash, verdict, kinds):
+	// a bad attestation is refused before any dataset is copied. The full
+	// VerifyAttestation over the snapshot below is still what accepts.
+	if _, err := guardrailpolicy.VerifyClaims(in.GetAttestation(), policy, recipe.GetGuardrailGate().GetRequireKinds()); err != nil {
+		return nil, verifyFailure(err)
+	}
+	snapshot := (*guardrailstage.Area).Snapshot
+	if s.guardrailSnapshot != nil {
+		snapshot = s.guardrailSnapshot
+	}
+	snap, err := snapshot(area, ref, s.guardrailSnapshotParent)
+	if errors.Is(err, guardrailstage.ErrBadRef) {
+		return nil, gateRefusal("staging_ref %q: %v", in.GetStagingRef(), err)
+	}
+	if errors.Is(err, guardrailstage.ErrStagingRootUnavailable) {
+		return nil, gateRefusal("the guardrail staging root is unavailable")
+	}
+	if errors.Is(err, guardrailstage.ErrBadParent) {
+		log.Printf("[recipe] guardrail gate: snapshot dir %q: %v", s.guardrailSnapshotParent, err)
+		return nil, gateRefusal("the daemon's guardrail snapshot dir is misconfigured (it must be daemon-private and outside the staging root)")
+	}
+	if err != nil {
+		log.Printf("[recipe] guardrail gate: snapshot %q: %v", ref, err)
+		// Provisioned storage is the only capacity control on staged
+		// datasets, so a full disk is an expected, typed refusal. The
+		// stager has already removed its partial snapshot.
+		if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
+			return nil, status.Error(codes.ResourceExhausted, "guardrail gate: the daemon's storage is full; could not make a private copy of the staged dataset")
+		}
+		return nil, gateRefusal("could not make a private copy of the staged dataset (unreadable or changing while copied)")
+	}
+	if _, err := guardrailpolicy.VerifyAttestation(in.GetAttestation(), policy, snap.Dir, recipe.GetGuardrailGate().GetRequireKinds()); err != nil {
+		if rmErr := snap.Remove(); rmErr != nil {
+			log.Printf("[recipe] remove guardrail snapshot %s: %v", snap.Dir, rmErr)
+		}
+		return nil, verifyFailure(err)
+	}
+	return snap, nil
+}
+
+// verifyFailure maps a VerifyClaims/VerifyAttestation error to the caller's
+// status: the typed refusals keep their message (hashes and key ids only),
+// anything else is logged and answered generically.
+func verifyFailure(err error) error {
+	if isVerifyRefusal(err) {
