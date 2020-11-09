@@ -1264,3 +1264,1270 @@ func (*MiningBehaviorThresholds) ProtoMessage() {}
 
 func (x *MiningBehaviorThresholds) ProtoReflect() protoreflect.Message {
 	mi := &file_containarium_v1_threatdetection_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MiningBehaviorThresholds.ProtoReflect.Descriptor instead.
+func (*MiningBehaviorThresholds) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *MiningBehaviorThresholds) GetMinCores() float64 {
+	if x != nil {
+		return x.MinCores
+	}
+	return 0
+}
+
+func (x *MiningBehaviorThresholds) GetWindow() *durationpb.Duration {
+	if x != nil {
+		return x.Window
+	}
+	return nil
+}
+
+func (x *MiningBehaviorThresholds) GetFlowMinAge() *durationpb.Duration {
+	if x != nil {
+		return x.FlowMinAge
+	}
+	return nil
+}
+
+func (x *MiningBehaviorThresholds) GetStratumPorts() []uint32 {
+	if x != nil {
+		return x.StratumPorts
+	}
+	return nil
+}
+
+func (x *MiningBehaviorThresholds) GetMinFractionOfLimit() float64 {
+	if x != nil {
+		return x.MinFractionOfLimit
+	}
+	return 0
+}
+
+// Finding is a single security finding raised by the threat-detection
+// engine: an open or resolved instance of a rule firing for one tenant.
+type Finding struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Id       int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Rule     ThreatRuleId           `protobuf:"varint,2,opt,name=rule,proto3,enum=containarium.v1.ThreatRuleId" json:"rule,omitempty"`
+	Severity ThreatSeverity         `protobuf:"varint,3,opt,name=severity,proto3,enum=containarium.v1.ThreatSeverity" json:"severity,omitempty"`
+	TenantId string                 `protobuf:"bytes,4,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	// Container name, when the finding is attributable to one container.
+	Container string `protobuf:"bytes,5,opt,name=container,proto3" json:"container,omitempty"`
+	BackendId string `protobuf:"bytes,6,opt,name=backend_id,json=backendId,proto3" json:"backend_id,omitempty"`
+	// Dedupe scope within (rule, tenant_id): destination IP, peer tenant id,
+	// or "" — see FindingStore's open-finding unique index.
+	Subject string       `protobuf:"bytes,7,opt,name=subject,proto3" json:"subject,omitempty"`
+	State   FindingState `protobuf:"varint,8,opt,name=state,proto3,enum=containarium.v1.FindingState" json:"state,omitempty"`
+	// How many times this rule has fired for this (tenant, subject) since
+	// first_seen, without a new row being created.
+	Count     int64                  `protobuf:"varint,9,opt,name=count,proto3" json:"count,omitempty"`
+	Evidence  *Evidence              `protobuf:"bytes,10,opt,name=evidence,proto3" json:"evidence,omitempty"`
+	FirstSeen *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=first_seen,json=firstSeen,proto3" json:"first_seen,omitempty"`
+	LastSeen  *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=last_seen,json=lastSeen,proto3" json:"last_seen,omitempty"`
+	// What the process responder (#2636) did about this finding, if anything.
+	// Unset for findings no policy acts on.
+	Response      *FindingResponse `protobuf:"bytes,13,opt,name=response,proto3" json:"response,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Finding) Reset() {
+	*x = Finding{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Finding) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Finding) ProtoMessage() {}
+
+func (x *Finding) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Finding.ProtoReflect.Descriptor instead.
+func (*Finding) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *Finding) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *Finding) GetRule() ThreatRuleId {
+	if x != nil {
+		return x.Rule
+	}
+	return ThreatRuleId_THREAT_RULE_ID_UNSPECIFIED
+}
+
+func (x *Finding) GetSeverity() ThreatSeverity {
+	if x != nil {
+		return x.Severity
+	}
+	return ThreatSeverity_THREAT_SEVERITY_UNSPECIFIED
+}
+
+func (x *Finding) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
+func (x *Finding) GetContainer() string {
+	if x != nil {
+		return x.Container
+	}
+	return ""
+}
+
+func (x *Finding) GetBackendId() string {
+	if x != nil {
+		return x.BackendId
+	}
+	return ""
+}
+
+func (x *Finding) GetSubject() string {
+	if x != nil {
+		return x.Subject
+	}
+	return ""
+}
+
+func (x *Finding) GetState() FindingState {
+	if x != nil {
+		return x.State
+	}
+	return FindingState_FINDING_STATE_UNSPECIFIED
+}
+
+func (x *Finding) GetCount() int64 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
+}
+
+func (x *Finding) GetEvidence() *Evidence {
+	if x != nil {
+		return x.Evidence
+	}
+	return nil
+}
+
+func (x *Finding) GetFirstSeen() *timestamppb.Timestamp {
+	if x != nil {
+		return x.FirstSeen
+	}
+	return nil
+}
+
+func (x *Finding) GetLastSeen() *timestamppb.Timestamp {
+	if x != nil {
+		return x.LastSeen
+	}
+	return nil
+}
+
+func (x *Finding) GetResponse() *FindingResponse {
+	if x != nil {
+		return x.Response
+	}
+	return nil
+}
+
+// FindingResponse records what the process responder did about a finding
+// and when, so the finding itself tells the operator whether a box is
+// currently throttled or frozen because of it.
+type FindingResponse struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Action ProcessAction          `protobuf:"varint,1,opt,name=action,proto3,enum=containarium.v1.ProcessAction" json:"action,omitempty"`
+	State  ResponseState          `protobuf:"varint,2,opt,name=state,proto3,enum=containarium.v1.ResponseState" json:"state,omitempty"`
+	// True when the responder SIGKILLed the matched process (miner-signature
+	// finding with ProcessPolicy.kill_process, #2638).
+	ProcessKilled bool                   `protobuf:"varint,3,opt,name=process_killed,json=processKilled,proto3" json:"process_killed,omitempty"`
+	AppliedAt     *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=applied_at,json=appliedAt,proto3" json:"applied_at,omitempty"`
+	// When the TTL backstop will release the action if no operator does.
+	ExpiresAt  *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	ReleasedAt *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=released_at,json=releasedAt,proto3" json:"released_at,omitempty"`
+	// Who ended the action: "operator", "ttl", "orphan-sweep" (an apply that
+	// was never confirmed, undone by the sweep) or "container-deleted" (the box
+	// no longer exists, so nothing was restored; #2835). Empty while the
+	// action is in effect.
+	ReleasedBy string `protobuf:"bytes,7,opt,name=released_by,json=releasedBy,proto3" json:"released_by,omitempty"`
+	// Incus error text when state is FAILED.
+	Error string `protobuf:"bytes,8,opt,name=error,proto3" json:"error,omitempty"`
+	// Host pid (not a pid inside the box) of the process the responder last
+	// SIGKILLed; set with process_killed. A kill is delivered by the finding
+	// webhook (#2775), so a consumer learns which process died.
+	KilledPid uint32 `protobuf:"varint,9,opt,name=killed_pid,json=killedPid,proto3" json:"killed_pid,omitempty"`
+	// Why the last kill_process attempt did not kill; UNSPECIFIED when nothing
+	// was skipped. The detail (pid, cgroup, error text) stays in the audit row.
+	KillSkipReason KillSkipReason `protobuf:"varint,10,opt,name=kill_skip_reason,json=killSkipReason,proto3,enum=containarium.v1.KillSkipReason" json:"kill_skip_reason,omitempty"`
+	// How many processes the responder has killed for this finding. A miner
+	// that respawns is killed again each time; the webhook delivers the first
+	// kill at once and later ones at most once a minute, carrying this count
+	// and the latest killed_pid.
+	Kills uint32 `protobuf:"varint,11,opt,name=kills,proto3" json:"kills,omitempty"`
+	// The box this response is about. A miner-signature finding is keyed per
+	// tenant and pattern, so several boxes of one tenant can share it (#2766);
+	// each box's apply and release is a separate webhook delivery that names
+	// its box here (#2820). On the stored finding it names the box whose
+	// record the finding shows: while any box still holds an applied action
+	// that is a box still holding one, never a released box. Empty on
+	// responses recorded before this field existed.
+	Container     string `protobuf:"bytes,12,opt,name=container,proto3" json:"container,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FindingResponse) Reset() {
+	*x = FindingResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FindingResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FindingResponse) ProtoMessage() {}
+
+func (x *FindingResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FindingResponse.ProtoReflect.Descriptor instead.
+func (*FindingResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *FindingResponse) GetAction() ProcessAction {
+	if x != nil {
+		return x.Action
+	}
+	return ProcessAction_PROCESS_ACTION_UNSPECIFIED
+}
+
+func (x *FindingResponse) GetState() ResponseState {
+	if x != nil {
+		return x.State
+	}
+	return ResponseState_RESPONSE_STATE_UNSPECIFIED
+}
+
+func (x *FindingResponse) GetProcessKilled() bool {
+	if x != nil {
+		return x.ProcessKilled
+	}
+	return false
+}
+
+func (x *FindingResponse) GetAppliedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AppliedAt
+	}
+	return nil
+}
+
+func (x *FindingResponse) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
+}
+
+func (x *FindingResponse) GetReleasedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ReleasedAt
+	}
+	return nil
+}
+
+func (x *FindingResponse) GetReleasedBy() string {
+	if x != nil {
+		return x.ReleasedBy
+	}
+	return ""
+}
+
+func (x *FindingResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *FindingResponse) GetKilledPid() uint32 {
+	if x != nil {
+		return x.KilledPid
+	}
+	return 0
+}
+
+func (x *FindingResponse) GetKillSkipReason() KillSkipReason {
+	if x != nil {
+		return x.KillSkipReason
+	}
+	return KillSkipReason_KILL_SKIP_REASON_UNSPECIFIED
+}
+
+func (x *FindingResponse) GetKills() uint32 {
+	if x != nil {
+		return x.Kills
+	}
+	return 0
+}
+
+func (x *FindingResponse) GetContainer() string {
+	if x != nil {
+		return x.Container
+	}
+	return ""
+}
+
+// ProcessPolicy says what a HIGH mining finding does to its container
+// (#2636). Stored per backend (the default) and optionally per container
+// (an override, written by SetProcessPolicy with `container` set); the
+// effective policy is override → backend default → built-in
+// {ALERT, "10%", 24h, kill_process false}. Empty fields inherit from the
+// next level down.
+type ProcessPolicy struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Action ProcessAction          `protobuf:"varint,1,opt,name=action,proto3,enum=containarium.v1.ProcessAction" json:"action,omitempty"`
+	// limits.cpu.allowance applied by THROTTLE: an Incus allowance such as
+	// "10%" (share under contention) or "10ms/100ms" (hard CFS quota).
+	// Default "10%".
+	ThrottleAllowance string `protobuf:"bytes,2,opt,name=throttle_allowance,json=throttleAllowance,proto3" json:"throttle_allowance,omitempty"`
+	// How long an applied action stays in effect with no operator decision
+	// before the TTL backstop releases it. Default 24h.
+	Ttl *durationpb.Duration `protobuf:"bytes,3,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	// SIGKILL the matched process from the host when a miner-signature finding
+	// fires (#2638), in addition to `action`. Applies to MINER_SIGNATURE
+	// findings only; the mining-behavior rule never kills. The pid is
+	// re-checked against the container's cgroup first, so a reused pid is
+	// never signalled. Default false at every level; unset inherits.
+	KillProcess *bool `protobuf:"varint,4,opt,name=kill_process,json=killProcess,proto3,oneof" json:"kill_process,omitempty"`
+	// Thresholds of the mining-behavior rule (#2635). Backend-wide: honoured
+	// only on the backend default (container empty), rejected on a container
+	// override. Unset on Set leaves the stored thresholds untouched.
+	MiningBehavior *MiningBehaviorThresholds `protobuf:"bytes,5,opt,name=mining_behavior,json=miningBehavior,proto3" json:"mining_behavior,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ProcessPolicy) Reset() {
+	*x = ProcessPolicy{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProcessPolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProcessPolicy) ProtoMessage() {}
+
+func (x *ProcessPolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProcessPolicy.ProtoReflect.Descriptor instead.
+func (*ProcessPolicy) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ProcessPolicy) GetAction() ProcessAction {
+	if x != nil {
+		return x.Action
+	}
+	return ProcessAction_PROCESS_ACTION_UNSPECIFIED
+}
+
+func (x *ProcessPolicy) GetThrottleAllowance() string {
+	if x != nil {
+		return x.ThrottleAllowance
+	}
+	return ""
+}
+
+func (x *ProcessPolicy) GetTtl() *durationpb.Duration {
+	if x != nil {
+		return x.Ttl
+	}
+	return nil
+}
+
+func (x *ProcessPolicy) GetKillProcess() bool {
+	if x != nil && x.KillProcess != nil {
+		return *x.KillProcess
+	}
+	return false
+}
+
+func (x *ProcessPolicy) GetMiningBehavior() *MiningBehaviorThresholds {
+	if x != nil {
+		return x.MiningBehavior
+	}
+	return nil
+}
+
+type GetProcessPolicyRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Empty reads the backend default; a container name reads that
+	// container's override (policy is unset when none is stored).
+	Container     string `protobuf:"bytes,1,opt,name=container,proto3" json:"container,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetProcessPolicyRequest) Reset() {
+	*x = GetProcessPolicyRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetProcessPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetProcessPolicyRequest) ProtoMessage() {}
+
+func (x *GetProcessPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetProcessPolicyRequest.ProtoReflect.Descriptor instead.
+func (*GetProcessPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *GetProcessPolicyRequest) GetContainer() string {
+	if x != nil {
+		return x.Container
+	}
+	return ""
+}
+
+type GetProcessPolicyResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The policy stored at the requested level, unset if none is stored.
+	Policy *ProcessPolicy `protobuf:"bytes,1,opt,name=policy,proto3" json:"policy,omitempty"`
+	// True when `container` was given and an override is stored for it.
+	IsOverride bool `protobuf:"varint,2,opt,name=is_override,json=isOverride,proto3" json:"is_override,omitempty"`
+	// The fully-resolved policy the responder would apply at that level.
+	Effective     *ProcessPolicy `protobuf:"bytes,3,opt,name=effective,proto3" json:"effective,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetProcessPolicyResponse) Reset() {
+	*x = GetProcessPolicyResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetProcessPolicyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetProcessPolicyResponse) ProtoMessage() {}
+
+func (x *GetProcessPolicyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetProcessPolicyResponse.ProtoReflect.Descriptor instead.
+func (*GetProcessPolicyResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *GetProcessPolicyResponse) GetPolicy() *ProcessPolicy {
+	if x != nil {
+		return x.Policy
+	}
+	return nil
+}
+
+func (x *GetProcessPolicyResponse) GetIsOverride() bool {
+	if x != nil {
+		return x.IsOverride
+	}
+	return false
+}
+
+func (x *GetProcessPolicyResponse) GetEffective() *ProcessPolicy {
+	if x != nil {
+		return x.Effective
+	}
+	return nil
+}
+
+type SetProcessPolicyRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Empty sets the backend default; a container name sets that container's
+	// override.
+	Container string         `protobuf:"bytes,1,opt,name=container,proto3" json:"container,omitempty"`
+	Policy    *ProcessPolicy `protobuf:"bytes,2,opt,name=policy,proto3" json:"policy,omitempty"`
+	// With `container` set, removes the override instead of writing one.
+	ClearOverride bool `protobuf:"varint,3,opt,name=clear_override,json=clearOverride,proto3" json:"clear_override,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetProcessPolicyRequest) Reset() {
+	*x = SetProcessPolicyRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetProcessPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetProcessPolicyRequest) ProtoMessage() {}
+
+func (x *SetProcessPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetProcessPolicyRequest.ProtoReflect.Descriptor instead.
+func (*SetProcessPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *SetProcessPolicyRequest) GetContainer() string {
+	if x != nil {
+		return x.Container
+	}
+	return ""
+}
+
+func (x *SetProcessPolicyRequest) GetPolicy() *ProcessPolicy {
+	if x != nil {
+		return x.Policy
+	}
+	return nil
+}
+
+func (x *SetProcessPolicyRequest) GetClearOverride() bool {
+	if x != nil {
+		return x.ClearOverride
+	}
+	return false
+}
+
+type SetProcessPolicyResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Effective     *ProcessPolicy         `protobuf:"bytes,1,opt,name=effective,proto3" json:"effective,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetProcessPolicyResponse) Reset() {
+	*x = SetProcessPolicyResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetProcessPolicyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetProcessPolicyResponse) ProtoMessage() {}
+
+func (x *SetProcessPolicyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetProcessPolicyResponse.ProtoReflect.Descriptor instead.
+func (*SetProcessPolicyResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *SetProcessPolicyResponse) GetEffective() *ProcessPolicy {
+	if x != nil {
+		return x.Effective
+	}
+	return nil
+}
+
+type ReleaseProcessActionRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Container     string                 `protobuf:"bytes,1,opt,name=container,proto3" json:"container,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseProcessActionRequest) Reset() {
+	*x = ReleaseProcessActionRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseProcessActionRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseProcessActionRequest) ProtoMessage() {}
+
+func (x *ReleaseProcessActionRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseProcessActionRequest.ProtoReflect.Descriptor instead.
+func (*ReleaseProcessActionRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ReleaseProcessActionRequest) GetContainer() string {
+	if x != nil {
+		return x.Container
+	}
+	return ""
+}
+
+type ReleaseProcessActionResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The finding the action belonged to. Resolved, with its response in
+	// state RELEASED, unless finding_kept_open is set. While another box
+	// still holds an applied action on a shared finding, its response is
+	// that box's APPLIED record (#2820); this box's release is `released`.
+	Finding *Finding `protobuf:"bytes,1,opt,name=finding,proto3" json:"finding,omitempty"`
+	// The finding was left open because another box still holds it: a
+	// miner-signature finding is shared by every box of the tenant running
+	// the same miner, and another box still has an action open on it or a
+	// response queued. It is resolved when the last box is released.
+	FindingKeptOpen bool `protobuf:"varint,2,opt,name=finding_kept_open,json=findingKeptOpen,proto3" json:"finding_kept_open,omitempty"`
+	// This box's release record (state RELEASED, container = the released
+	// box), as the finding webhook delivered it (#2820).
+	Released      *FindingResponse `protobuf:"bytes,3,opt,name=released,proto3" json:"released,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReleaseProcessActionResponse) Reset() {
+	*x = ReleaseProcessActionResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReleaseProcessActionResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReleaseProcessActionResponse) ProtoMessage() {}
+
+func (x *ReleaseProcessActionResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReleaseProcessActionResponse.ProtoReflect.Descriptor instead.
+func (*ReleaseProcessActionResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ReleaseProcessActionResponse) GetFinding() *Finding {
+	if x != nil {
+		return x.Finding
+	}
+	return nil
+}
+
+func (x *ReleaseProcessActionResponse) GetFindingKeptOpen() bool {
+	if x != nil {
+		return x.FindingKeptOpen
+	}
+	return false
+}
+
+func (x *ReleaseProcessActionResponse) GetReleased() *FindingResponse {
+	if x != nil {
+		return x.Released
+	}
+	return nil
+}
+
+// RuleStatus is one registered rule's health, so a single panicking rule is
+// visible without taking down the sentry status as a whole.
+type RuleStatus struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Rule    ThreatRuleId           `protobuf:"varint,1,opt,name=rule,proto3,enum=containarium.v1.ThreatRuleId" json:"rule,omitempty"`
+	Healthy bool                   `protobuf:"varint,2,opt,name=healthy,proto3" json:"healthy,omitempty"`
+	// Empty when healthy. Set to the last recovered panic/error otherwise.
+	LastError     string                 `protobuf:"bytes,3,opt,name=last_error,json=lastError,proto3" json:"last_error,omitempty"`
+	LastErrorAt   *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=last_error_at,json=lastErrorAt,proto3" json:"last_error_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RuleStatus) Reset() {
+	*x = RuleStatus{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RuleStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RuleStatus) ProtoMessage() {}
+
+func (x *RuleStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RuleStatus.ProtoReflect.Descriptor instead.
+func (*RuleStatus) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *RuleStatus) GetRule() ThreatRuleId {
+	if x != nil {
+		return x.Rule
+	}
+	return ThreatRuleId_THREAT_RULE_ID_UNSPECIFIED
+}
+
+func (x *RuleStatus) GetHealthy() bool {
+	if x != nil {
+		return x.Healthy
+	}
+	return false
+}
+
+func (x *RuleStatus) GetLastError() string {
+	if x != nil {
+		return x.LastError
+	}
+	return ""
+}
+
+func (x *RuleStatus) GetLastErrorAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.LastErrorAt
+	}
+	return nil
+}
+
+type GetSentryStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetSentryStatusRequest) Reset() {
+	*x = GetSentryStatusRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSentryStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSentryStatusRequest) ProtoMessage() {}
+
+func (x *GetSentryStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSentryStatusRequest.ProtoReflect.Descriptor instead.
+func (*GetSentryStatusRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{18}
+}
+
+type GetSentryStatusResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	State SentryState            `protobuf:"varint,1,opt,name=state,proto3,enum=containarium.v1.SentryState" json:"state,omitempty"`
+	// Human-readable explanation, always set for DISABLED/UNAVAILABLE/
+	// DEGRADED, and also set while the state is OK but a rule is unhealthy
+	// ("rule <RULE> unhealthy: <last_error>"). The sentry-health loop (#2634)
+	// uses this exact string as the SENTRY_UNAVAILABLE finding's subject.
+	Reason string        `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	Rules  []*RuleStatus `protobuf:"bytes,3,rep,name=rules,proto3" json:"rules,omitempty"`
+	// Source of the per-container CPU samples the mining-behavior rule reads
+	// (#2645): "metrics-collector" (hook on the metrics collector's tick),
+	// "standalone (30s)" (the sentry polls Incus itself because no metrics
+	// collector runs), or "unavailable (<reason>)". Set only while the
+	// sentry is running (OK/DEGRADED).
+	CpuSampler string `protobuf:"bytes,4,opt,name=cpu_sampler,json=cpuSampler,proto3" json:"cpu_sampler,omitempty"`
+	// Host-side exec telemetry (#2637): "ok" while the execwatch eBPF object
+	// is attached and watching, or "unavailable (<reason>)" when the second
+	// object could not be loaded or attached (no BTF, verifier rejection,
+	// missing tracepoint, object not built). The flow rules keep running
+	// either way; the sentry-health loop treats "unavailable" as a fault with
+	// the stable subject "exec-telemetry unavailable". Set only while the
+	// sentry is running (OK/DEGRADED).
+	ExecTelemetry string `protobuf:"bytes,5,opt,name=exec_telemetry,json=execTelemetry,proto3" json:"exec_telemetry,omitempty"`
+	// Exec events the kernel could not hand over because the ring buffer was
+	// full, cumulative since the object loaded. Non-zero means a burst
+	// outran the consumer; the events are gone, never blocked the exec.
+	ExecEventsLost int64 `protobuf:"varint,6,opt,name=exec_events_lost,json=execEventsLost,proto3" json:"exec_events_lost,omitempty"`
+	// Exec hash requests the miner-signature hasher dropped because its queue
+	// was full, cumulative since the daemon started (#2768). Requests are made
+	// only while sha256 entries exist; a dropped exec is never hashed, so a
+	// sha256 entry can miss it (name and argv entries still matched it).
+	// An executable already hashed is served from a cache by (device, inode,
+	// size, mtime, ctime) without being read again, so the queue drains fast
+	// and a non-zero count means a burst of execs the worker could not keep
+	// up with.
+	ExecHashesDropped int64 `protobuf:"varint,7,opt,name=exec_hashes_dropped,json=execHashesDropped,proto3" json:"exec_hashes_dropped,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *GetSentryStatusResponse) Reset() {
+	*x = GetSentryStatusResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSentryStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSentryStatusResponse) ProtoMessage() {}
+
+func (x *GetSentryStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSentryStatusResponse.ProtoReflect.Descriptor instead.
+func (*GetSentryStatusResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *GetSentryStatusResponse) GetState() SentryState {
+	if x != nil {
+		return x.State
+	}
+	return SentryState_SENTRY_STATE_UNSPECIFIED
+}
+
+func (x *GetSentryStatusResponse) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *GetSentryStatusResponse) GetRules() []*RuleStatus {
+	if x != nil {
+		return x.Rules
+	}
+	return nil
+}
+
+func (x *GetSentryStatusResponse) GetCpuSampler() string {
+	if x != nil {
+		return x.CpuSampler
+	}
+	return ""
+}
+
+func (x *GetSentryStatusResponse) GetExecTelemetry() string {
+	if x != nil {
+		return x.ExecTelemetry
+	}
+	return ""
+}
+
+func (x *GetSentryStatusResponse) GetExecEventsLost() int64 {
+	if x != nil {
+		return x.ExecEventsLost
+	}
+	return 0
+}
+
+func (x *GetSentryStatusResponse) GetExecHashesDropped() int64 {
+	if x != nil {
+		return x.ExecHashesDropped
+	}
+	return 0
+}
+
+// ExecEvent is one live exec in a tenant container, as streamed by
+// StreamExecEvents (#2637). Not persisted: the stream is a window onto the
+// kernel's ring, plus a short in-memory replay (StreamExecEventsRequest.since).
+type ExecEvent struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Container string                 `protobuf:"bytes,1,opt,name=container,proto3" json:"container,omitempty"`
+	TenantId  string                 `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	// When the daemon decoded the event (host wall clock).
+	At            *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=at,proto3" json:"at,omitempty"`
+	Exec          *ExecEvidence          `protobuf:"bytes,4,opt,name=exec,proto3" json:"exec,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExecEvent) Reset() {
+	*x = ExecEvent{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecEvent) ProtoMessage() {}
+
+func (x *ExecEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecEvent.ProtoReflect.Descriptor instead.
+func (*ExecEvent) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ExecEvent) GetContainer() string {
+	if x != nil {
+		return x.Container
+	}
+	return ""
+}
+
+func (x *ExecEvent) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
+func (x *ExecEvent) GetAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.At
+	}
+	return nil
+}
+
+func (x *ExecEvent) GetExec() *ExecEvidence {
+	if x != nil {
+		return x.Exec
+	}
+	return nil
+}
+
+// StreamExecEventsResponse wraps one ExecEvent per stream message.
+type StreamExecEventsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Event         *ExecEvent             `protobuf:"bytes,1,opt,name=event,proto3" json:"event,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StreamExecEventsResponse) Reset() {
+	*x = StreamExecEventsResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamExecEventsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamExecEventsResponse) ProtoMessage() {}
+
+func (x *StreamExecEventsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamExecEventsResponse.ProtoReflect.Descriptor instead.
+func (*StreamExecEventsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *StreamExecEventsResponse) GetEvent() *ExecEvent {
+	if x != nil {
+		return x.Event
+	}
+	return nil
+}
+
+type StreamExecEventsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Only this container's execs; empty streams every watched container.
+	Container string `protobuf:"bytes,1,opt,name=container,proto3" json:"container,omitempty"`
+	// Replay buffered events from this far back before (or instead of) going
+	// live. The daemon keeps a bounded in-memory ring of recent events (no
+	// audit-log writes); older than the ring holds is simply not there.
+	// Unset means no replay.
+	Since *durationpb.Duration `protobuf:"bytes,2,opt,name=since,proto3" json:"since,omitempty"`
+	// Keep the stream open for new events after the replay. Unset returns
+	// once the replay is sent — the `exec-events` CLI without --follow.
+	Follow        bool `protobuf:"varint,3,opt,name=follow,proto3" json:"follow,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StreamExecEventsRequest) Reset() {
+	*x = StreamExecEventsRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StreamExecEventsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StreamExecEventsRequest) ProtoMessage() {}
+
+func (x *StreamExecEventsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StreamExecEventsRequest.ProtoReflect.Descriptor instead.
+func (*StreamExecEventsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *StreamExecEventsRequest) GetContainer() string {
+	if x != nil {
+		return x.Container
+	}
+	return ""
+}
+
+func (x *StreamExecEventsRequest) GetSince() *durationpb.Duration {
+	if x != nil {
+		return x.Since
+	}
+	return nil
+}
+
+func (x *StreamExecEventsRequest) GetFollow() bool {
+	if x != nil {
+		return x.Follow
+	}
+	return false
+}
+
+// BadDestinationEntry is one entry in the known-bad-destination list (#1641)
+// matched against flow destination IPs — a mining pool or other known-bad
+// endpoint.
+type BadDestinationEntry struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Exact IP ("203.0.113.7") or CIDR ("203.0.113.0/24").
+	Cidr  string `protobuf:"bytes,1,opt,name=cidr,proto3" json:"cidr,omitempty"`
+	Label string `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`
+	// "baseline" (embedded, versioned list, shipped with the daemon) or
+	// "operator" (added via AddBadDestination, without a daemon rebuild).
+	Source        string `protobuf:"bytes,3,opt,name=source,proto3" json:"source,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BadDestinationEntry) Reset() {
+	*x = BadDestinationEntry{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BadDestinationEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BadDestinationEntry) ProtoMessage() {}
+
+func (x *BadDestinationEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BadDestinationEntry.ProtoReflect.Descriptor instead.
+func (*BadDestinationEntry) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *BadDestinationEntry) GetCidr() string {
+	if x != nil {
+		return x.Cidr
+	}
+	return ""
+}
+
+func (x *BadDestinationEntry) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *BadDestinationEntry) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+type ListBadDestinationsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListBadDestinationsRequest) Reset() {
+	*x = ListBadDestinationsRequest{}
