@@ -1,0 +1,6 @@
+# Public SSH entrypoint. Agents connect here on :22; the Service forwards to
+# sshpiper's :2222. On bare-metal clusters without a LoadBalancer provider, swap
+# type to NodePort (or front it with your own LB) — see the runbook.
+apiVersion: v1
+kind: Service
+metadata:
