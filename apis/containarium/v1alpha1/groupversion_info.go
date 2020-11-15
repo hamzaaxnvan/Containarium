@@ -8,13 +8,3 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-)
-
-// GroupVersion is the group/version for the containarium.dev API.
-var GroupVersion = schema.GroupVersion{Group: "containarium.dev", Version: "v1alpha1"}
-
-// SchemeBuilder collects the containarium.dev types for registration with a
-// runtime.Scheme. Kept to apimachinery-only deps (no controller-runtime) so
-// the API package stays cheap to import.
