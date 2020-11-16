@@ -26,3 +26,17 @@ termination (raw L4), unlike 'route' which is an HTTPS reverse-proxy
 mapping. These routes are created via the daemon's API — use this command
 (rather than 'passthrough', which edits iptables on the local host) to
 manage passthrough routes on a remote box.
+
+Examples:
+  # Add a passthrough route
+  containarium passthrough-route add --port 9443 --target-ip 10.0.3.150 --target-port 50051 --server <host:port>
+
+  # List all passthrough routes
+  containarium passthrough-route list --server <host:port>
+
+  # Remove a passthrough route
+  containarium passthrough-route remove --port 9443 --server <host:port>`,
+}
+
+func init() {
+	rootCmd.AddCommand(passthroughRouteCmd)
