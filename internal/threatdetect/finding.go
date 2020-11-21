@@ -226,3 +226,117 @@ func mergeConfigEvidence(old, more []ConfigEvidence) []ConfigEvidence {
 
 // FindingResponse records what the process responder (#2636) did about a
 // finding: the action, its state, and when it was applied, expires and was
+// released. Stored as the security_findings.response JSONB column, with
+// enum names rather than numbers so the column reads in psql and survives
+// the enums growing.
+type FindingResponse struct {
+	Action        pb.ProcessAction
+	State         pb.ResponseState
+	ProcessKilled bool
+	// KilledPID is the host pid the responder last killed, Kills how many it
+	// has killed for this finding, and KillSkipReason why the last attempted
+	// kill did not happen. The webhook delivers them (#2775); see deliveryGate
+	// for how a respawning miner is bounded.
+	KilledPID      uint32
+	Kills          uint32
+	KillSkipReason pb.KillSkipReason
+	AppliedAt      time.Time
+	ExpiresAt      time.Time
+	ReleasedAt     time.Time
+	ReleasedBy     string
+	Error          string
+	// Container is the box this response is about (#2820): a shared
+	// miner-signature finding gets one record per box, each delivered on its
+	// own. See ResponseWriter for which box the stored finding shows.
+	Container string
+}
+
+// findingResponseJSON is the storage encoding of FindingResponse.
+type findingResponseJSON struct {
+	Action        string    `json:"action"`
+	State         string    `json:"state"`
+	ProcessKilled bool      `json:"process_killed,omitempty"`
+	KilledPID     uint32    `json:"killed_pid,omitempty"`
+	Kills         uint32    `json:"kills,omitempty"`
+	KillSkip      string    `json:"kill_skip_reason,omitempty"`
+	AppliedAt     time.Time `json:"applied_at,omitzero"`
+	ExpiresAt     time.Time `json:"expires_at,omitzero"`
+	ReleasedAt    time.Time `json:"released_at,omitzero"`
+	ReleasedBy    string    `json:"released_by,omitempty"`
+	Error         string    `json:"error,omitempty"`
+	Container     string    `json:"container,omitempty"`
+}
+
+// KeepKillOf makes the kill on record sticky (#2766, #2775): when prev has a
+// kill and r (a write from a box that killed nothing, such as its release)
+// has none, r takes prev's process_killed, latest pid, count and skip reason
+// (or its lack of one: #2816, a skip r carries does not survive), so the
+// stored response never says killed with pid 0 and a shared finding keeps
+// another box's kill. A write that carries its own kill is left alone unless
+// its count is lower than prev's: a stale kill (such as a release's fallback
+// to its action row's pid) never rolls the count back. stickyResponseSQL
+// does the same for the Postgres store in one UPDATE.
+func (r *FindingResponse) KeepKillOf(prev *FindingResponse) {
+	if prev == nil || !prev.ProcessKilled || r.ProcessKilled && r.Kills >= prev.Kills {
+		return
+	}
+	r.ProcessKilled, r.KilledPID, r.Kills, r.KillSkipReason = true, prev.KilledPID, prev.Kills, prev.KillSkipReason
+}
+
+// skipName is the stored name of a skip reason; none stores nothing.
+func skipName(r pb.KillSkipReason) string {
+	if r == pb.KillSkipReason_KILL_SKIP_REASON_UNSPECIFIED {
+		return ""
+	}
+	return r.String()
+}
+
+// MarshalJSON encodes enums by name.
+func (r FindingResponse) MarshalJSON() ([]byte, error) {
+	return json.Marshal(findingResponseJSON{
+		Action: r.Action.String(), State: r.State.String(), ProcessKilled: r.ProcessKilled,
+		KilledPID: r.KilledPID, Kills: r.Kills, KillSkip: skipName(r.KillSkipReason),
+		AppliedAt: r.AppliedAt, ExpiresAt: r.ExpiresAt, ReleasedAt: r.ReleasedAt,
+		ReleasedBy: r.ReleasedBy, Error: r.Error, Container: r.Container,
+	})
+}
+
+// UnmarshalJSON decodes enums by name; an unknown name decodes to the
+// UNSPECIFIED value rather than failing the whole finding read.
+func (r *FindingResponse) UnmarshalJSON(b []byte) error {
+	var j findingResponseJSON
+	if err := json.Unmarshal(b, &j); err != nil {
+		return err
+	}
+	*r = FindingResponse{
+		Action:        pb.ProcessAction(pb.ProcessAction_value[j.Action]),
+		State:         pb.ResponseState(pb.ResponseState_value[j.State]),
+		ProcessKilled: j.ProcessKilled, KilledPID: j.KilledPID, Kills: j.Kills,
+		KillSkipReason: pb.KillSkipReason(pb.KillSkipReason_value[j.KillSkip]),
+		AppliedAt:      j.AppliedAt, ExpiresAt: j.ExpiresAt, ReleasedAt: j.ReleasedAt,
+		ReleasedBy: j.ReleasedBy, Error: j.Error, Container: j.Container,
+	}
+	return nil
+}
+
+// ToProto converts the response to its wire form; nil for a nil receiver.
+func (r *FindingResponse) ToProto() *pb.FindingResponse {
+	if r == nil {
+		return nil
+	}
+	return &pb.FindingResponse{
+		Action:         r.Action,
+		State:          r.State,
+		ProcessKilled:  r.ProcessKilled,
+		KilledPid:      r.KilledPID,
+		Kills:          r.Kills,
+		KillSkipReason: r.KillSkipReason,
+		AppliedAt:      timestampProto(r.AppliedAt),
+		ExpiresAt:      timestampProto(r.ExpiresAt),
+		ReleasedAt:     timestampProto(r.ReleasedAt),
+		ReleasedBy:     r.ReleasedBy,
+		Error:          r.Error,
+		Container:      r.Container,
+	}
+}
+
