@@ -52,30 +52,3 @@ type baselineTee struct {
 	streaming bool
 	buf       []byte
 	over      bool
-	once      sync.Once
-}
-
-func (t *baselineTee) Read(p []byte) (int, error) {
-	n, err := t.src.Read(p)
-	if n > 0 && !t.over {
-		need := len(t.buf) + n
-		switch {
-		case need > t.limit:
-			t.over, t.buf = true, nil
-		case need > cap(t.buf):
-			// Double like append, but never past the limit.
-			grown := make([]byte, len(t.buf), min(max(2*cap(t.buf), need, 4096), t.limit))
-			copy(grown, t.buf)
-			t.buf = append(grown, p[:n]...)
-		default:
-			t.buf = append(t.buf, p[:n]...)
-		}
-	}
-	return n, err
-}
-
-// Close is called by the proxy after the last byte was written to the
-// client; the scan runs here, once.
-func (t *baselineTee) Close() error {
-	err := t.src.Close()
-	t.once.Do(t.finish)
