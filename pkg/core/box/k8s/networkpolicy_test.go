@@ -24,3 +24,56 @@ func TestNetworkPolicyIngressRestrictedToGateway(t *testing.T) {
 	rule := np.Spec.Ingress[0]
 
 	if len(rule.From) == 0 {
+		t.Fatal("ingress rule has no From peers: a port-only rule matches ALL sources, " +
+			"leaving :22 open cluster-wide (#1193)")
+	}
+	if len(rule.From) != 1 {
+		t.Fatalf("want a single From peer (AND semantics); got %d peers, which is OR "+
+			"and would admit any pod in the gateway ns OR any sshpiper-labelled pod anywhere",
+			len(rule.From))
+	}
+
+	peer := rule.From[0]
+	if peer.NamespaceSelector == nil {
+		t.Error("From peer has no NamespaceSelector; sshpiper-labelled pods in any namespace would be admitted")
+	} else if got := peer.NamespaceSelector.MatchLabels[nsNameLabel]; got != "agent-gateway" {
+		t.Errorf("NamespaceSelector %s = %q, want %q", nsNameLabel, got, "agent-gateway")
+	}
+	if peer.PodSelector == nil {
+		t.Error("From peer has no PodSelector; every pod in the gateway namespace would be admitted")
+	} else if got := peer.PodSelector.MatchLabels[sshpiperNameLabel]; got != "sshpiper" {
+		t.Errorf("PodSelector %s = %q, want %q", sshpiperNameLabel, got, "sshpiper")
+	}
+
+	// The port must still be SSH — narrowing the source must not widen the port.
+	if len(rule.Ports) != 1 {
+		t.Fatalf("want 1 ingress port, got %d", len(rule.Ports))
+	}
+	if got := rule.Ports[0].Port.IntValue(); got != sshPort {
+		t.Errorf("ingress port = %d, want %d", got, sshPort)
+	}
+	if rule.Ports[0].Protocol == nil || *rule.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("ingress protocol = %v, want TCP", rule.Ports[0].Protocol)
+	}
+}
+
+func TestNetworkPolicyEgressDNSRestrictedToClusterDNS(t *testing.T) {
+	np := networkPolicyObject("tenant-a", "alice", "agent-gateway")
+
+	if len(np.Spec.Egress) != 1 {
+		t.Fatalf("want exactly 1 egress rule, got %d", len(np.Spec.Egress))
+	}
+	rule := np.Spec.Egress[0]
+
+	if len(rule.To) == 0 {
+		t.Fatal("egress rule has no To peers: port-53 to any destination is a DNS-exfiltration " +
+			"channel out of a sandbox running untrusted code (#1193)")
+	}
+	if rule.To[0].NamespaceSelector == nil {
+		t.Fatal("egress To peer has no NamespaceSelector")
+	}
+	if got := rule.To[0].NamespaceSelector.MatchLabels[nsNameLabel]; got != dnsNamespace {
+		t.Errorf("egress NamespaceSelector %s = %q, want %q", nsNameLabel, got, dnsNamespace)
+	}
+
+	// Both UDP and TCP DNS must survive — TCP/53 carries large responses.
