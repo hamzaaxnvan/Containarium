@@ -26,3 +26,31 @@ func TestConfigFromEnv_Populated(t *testing.T) {
 	t.Setenv("CONTAINARIUM_BACKEND_ID", "node-7")
 	t.Setenv("CONTAINARIUM_TENANT_ID", "alice")
 	t.Setenv("SERVICE_VERSION", "v1.2.3")
+
+	cfg := ConfigFromEnv()
+	if cfg.Endpoint != "http://10.0.3.42:4318" {
+		t.Errorf("Endpoint = %q", cfg.Endpoint)
+	}
+	if cfg.ServiceName != "payment-api" {
+		t.Errorf("ServiceName = %q", cfg.ServiceName)
+	}
+	if cfg.ContainerID != "alice-container" {
+		t.Errorf("ContainerID = %q", cfg.ContainerID)
+	}
+	if cfg.BackendID != "node-7" {
+		t.Errorf("BackendID = %q", cfg.BackendID)
+	}
+	if cfg.TenantID != "alice" {
+		t.Errorf("TenantID = %q", cfg.TenantID)
+	}
+	if cfg.ServiceVersion != "v1.2.3" {
+		t.Errorf("ServiceVersion = %q", cfg.ServiceVersion)
+	}
+	if cfg.Headers != "Authorization=Bearer abc" {
+		t.Errorf("Headers = %q", cfg.Headers)
+	}
+}
+
+// clearEnv unsets all distro-relevant env vars for the duration of t.
+// t.Setenv handles cleanup; t.Helper signals this isn't a test step.
+func clearEnv(t *testing.T) {
