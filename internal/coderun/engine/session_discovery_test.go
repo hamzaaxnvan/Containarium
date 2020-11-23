@@ -134,3 +134,139 @@ func TestSessionDiscovery_AdoptsOnlyAFileCreatedAfterTheSnapshot(t *testing.T) {
 	for _, n := range []Name{NameClaude, NamePi} {
 		t.Run(string(n), func(t *testing.T) {
 			withShortDiscoveryBudget(t, 10)
+			f := newDiscoveryFixture(t, n)
+			f.seed("previous-conversation", time.Now().Add(-time.Hour))
+			f.prepare()
+			f.poll()
+			// The engine creates its file a little after the poll started.
+			time.Sleep(600 * time.Millisecond)
+			f.seed("this-runs-session", time.Now())
+
+			got, ok := f.waitSettled()
+			if !ok || got != "this-runs-session" {
+				t.Errorf("sidecar = %q (written=%v), want this-runs-session", got, ok)
+			}
+		})
+	}
+}
+
+// TestSessionDiscovery_OlderOnlyYieldsNoID pins "never fall back to the
+// newest older file": with only pre-existing conversations the sidecar is
+// never written.
+func TestSessionDiscovery_OlderOnlyYieldsNoID(t *testing.T) {
+	for _, n := range []Name{NameClaude, NamePi} {
+		t.Run(string(n), func(t *testing.T) {
+			withShortDiscoveryBudget(t, 5)
+			f := newDiscoveryFixture(t, n)
+			f.seed("previous-a", time.Now().Add(-2*time.Hour))
+			f.seed("previous-b", time.Now().Add(-time.Hour))
+			f.prepare()
+			f.poll()
+			if got, ok := f.waitSettled(); ok {
+				t.Errorf("sidecar written (%q) although no file was created by this run", got)
+			}
+		})
+	}
+}
+
+// TestSessionDiscovery_PreviousConversationStillBeingAppendedIsNotAdopted: an
+// older file that is modified after the snapshot is still not a NEW file.
+func TestSessionDiscovery_PreviousConversationStillBeingAppendedIsNotAdopted(t *testing.T) {
+	withShortDiscoveryBudget(t, 5)
+	f := newDiscoveryFixture(t, NameClaude)
+	f.seed("members-own", time.Now().Add(-time.Hour))
+	f.prepare()
+	f.seed("members-own", time.Now()) // appended to during the poll window
+	f.poll()
+	if got, ok := f.waitSettled(); ok {
+		t.Errorf("adopted an older, re-touched conversation: %q", got)
+	}
+}
+
+// TestSessionDiscovery_TwoNewFilesIsAmbiguousAndAdoptsNeither: two
+// conversations created in the same window cannot be told apart from the
+// directory, so neither is adopted.
+func TestSessionDiscovery_TwoNewFilesIsAmbiguousAndAdoptsNeither(t *testing.T) {
+	withShortDiscoveryBudget(t, 5)
+	f := newDiscoveryFixture(t, NameClaude)
+	f.prepare()
+	f.seed("run-a", time.Now())
+	f.seed("run-b", time.Now())
+	f.poll()
+	if got, ok := f.waitSettled(); ok {
+		t.Errorf("adopted %q although two new files appeared", got)
+	}
+}
+
+// TestSessionDiscovery_ConcurrentRunsDoNotAdoptEachOthersTranscript: run B
+// starts (snapshots) after run A's transcript exists, so B must pick its own
+// file, not A's, and A (which saw only its own file) picks A's.
+func TestSessionDiscovery_ConcurrentRunsDoNotAdoptEachOthersTranscript(t *testing.T) {
+	withShortDiscoveryBudget(t, 10)
+	a := newDiscoveryFixture(t, NameClaude)
+	b := &discoveryFixture{t: t, engine: NameClaude, home: a.home, cwd: a.cwd, dir: a.dir, suffix: a.suffix, sidecar: filepath.Join(t.TempDir(), "b.session")}
+
+	a.prepare()
+	a.poll()
+	time.Sleep(300 * time.Millisecond)
+	a.seed("session-of-a", time.Now())
+	if got, ok := a.waitSettled(); !ok || got != "session-of-a" {
+		t.Fatalf("run A sidecar = %q (written=%v), want session-of-a", got, ok)
+	}
+
+	b.prepare() // after A's file exists
+	b.poll()
+	time.Sleep(300 * time.Millisecond)
+	b.seed("session-of-b", time.Now())
+	if got, ok := b.waitSettled(); !ok || got != "session-of-b" {
+		t.Errorf("run B sidecar = %q (written=%v), want session-of-b", got, ok)
+	}
+}
+
+// TestSessionDiscovery_NoSnapshotFailsClosed: without the pre-launch snapshot
+// old and new cannot be told apart, so nothing is written.
+func TestSessionDiscovery_NoSnapshotFailsClosed(t *testing.T) {
+	withShortDiscoveryBudget(t, 3)
+	f := newDiscoveryFixture(t, NameClaude)
+	f.seed("whatever", time.Now())
+	f.poll()
+	if got, ok := f.waitSettled(); ok {
+		t.Errorf("sidecar written without a snapshot: %q", got)
+	}
+}
+
+// TestSessionDiscovery_ClaudeIgnoresNonTranscriptEntries: only *.jsonl
+// entries count (the project directory also holds per-session directories).
+func TestSessionDiscovery_ClaudeIgnoresNonTranscriptEntries(t *testing.T) {
+	withShortDiscoveryBudget(t, 10)
+	f := newDiscoveryFixture(t, NameClaude)
+	f.prepare()
+	f.poll()
+	mustMkdirAll(t, filepath.Join(f.dir, "some-subdir"))
+	time.Sleep(400 * time.Millisecond)
+	f.seed("real-session", time.Now())
+	if got, ok := f.waitSettled(); !ok || got != "real-session" {
+		t.Errorf("sidecar = %q (written=%v), want real-session", got, ok)
+	}
+}
+
+// TestSessionDiscovery_MembersSessionFirstThenOwnIsAmbiguous is the
+// interleaved ordering: a member's interactive transcript appears before this
+// run's own. The poll must NOT adopt the first one it sees; with two new
+// entries at the end nothing is written.
+func TestSessionDiscovery_MembersSessionFirstThenOwnIsAmbiguous(t *testing.T) {
+	for _, n := range []Name{NameClaude, NamePi} {
+		t.Run(string(n), func(t *testing.T) {
+			withShortDiscoveryBudget(t, 10)
+			f := newDiscoveryFixture(t, n)
+			f.prepare()
+			f.poll()
+			time.Sleep(300 * time.Millisecond)
+			f.seed("members-interactive", time.Now())
+			time.Sleep(700 * time.Millisecond)
+			f.seed("this-runs-transcript", time.Now())
+			if got, ok := f.waitSettled(); ok {
+				t.Errorf("adopted %q although two new transcripts appeared", got)
+			}
+		})
+	}
