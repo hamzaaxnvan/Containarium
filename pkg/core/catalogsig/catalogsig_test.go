@@ -43,3 +43,49 @@ func TestVerifyAcceptsGoodSignature(t *testing.T) {
 }
 
 func TestVerifyRejectsTamperedDataAndWrongKey(t *testing.T) {
+	pub, priv := genKey(t)
+	_, otherPriv := genKey(t)
+	v := &Verifier{keys: []ed25519.PublicKey{pub}}
+	data := []byte("skills:\n  - id: x\n")
+
+	// Tampered payload, valid-shape signature over the original.
+	if err := v.Verify([]byte("skills:\n  - id: evil\n"), ed25519.Sign(priv, data)); err == nil {
+		t.Fatal("expected tampered data to fail verification")
+	}
+	// Right data, signed by an untrusted key.
+	if err := v.Verify(data, ed25519.Sign(otherPriv, data)); err == nil {
+		t.Fatal("expected untrusted-key signature to fail verification")
+	}
+	// Wrong-size signature.
+	if err := v.Verify(data, []byte("short")); err == nil {
+		t.Fatal("expected wrong-size signature to fail verification")
+	}
+}
+
+func TestVerifyMultipleTrustedKeysAllowsRotation(t *testing.T) {
+	oldPub, _ := genKey(t)
+	newPub, newPriv := genKey(t)
+	v := &Verifier{keys: []ed25519.PublicKey{oldPub, newPub}}
+	data := []byte("crews:\n  - id: c\n")
+	if err := v.Verify(data, ed25519.Sign(newPriv, data)); err != nil {
+		t.Fatalf("rotation: signature under one trusted key should verify: %v", err)
+	}
+}
+
+func TestLoadVerifierRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	pub, priv := genKey(t)
+	keyPath := writeKeyFile(t, dir, pub)
+
+	v, err := LoadVerifier(keyPath)
+	if err != nil {
+		t.Fatalf("LoadVerifier: %v", err)
+	}
+	data := []byte("hello")
+	if err := v.Verify(data, ed25519.Sign(priv, data)); err != nil {
+		t.Fatalf("Verify after LoadVerifier: %v", err)
+	}
+}
+
+func TestLoadVerifierRejectsBadKeyFile(t *testing.T) {
+	dir := t.TempDir()
