@@ -4,5 +4,3 @@
     "os": "Ubuntu 24.04.1 LTS",
     "kernelVersion": "6.8.0-49-generic",
     "containersRunning": 22,
-    "containersStopped": 2,
-    "containersTotal": 24,
