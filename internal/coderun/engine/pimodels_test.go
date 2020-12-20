@@ -56,3 +56,62 @@ func TestPiModelsJSON(t *testing.T) {
 		t.Fatalf("rendered models.json is not valid JSON: %v", err)
 	}
 	p, ok := parsed.Providers[PiProviderID]
+	if !ok {
+		t.Fatalf("no %q provider in providers map; got keys %v", PiProviderID, parsed.Providers)
+	}
+	if p.BaseURL != "http://10.0.0.1:8866/v1/model/kafeido/v1" {
+		t.Errorf("baseUrl = %q; kafeido is OpenAI-shaped, so the base must carry the upstream's own /v1", p.BaseURL)
+	}
+	if p.API != "openai-completions" {
+		t.Errorf("api = %q, want openai-completions", p.API)
+	}
+	if len(p.Models) != 1 || p.Models[0].ID != "kafeido-coder" {
+		t.Errorf("models = %+v, want exactly [{kafeido-coder}]", p.Models)
+	}
+}
+
+// TestPiModelsJSON_NeverCarriesTheToken is the AC's "no provider key present
+// anywhere on the box" check, asserted at the point the file is produced.
+//
+// pi's docs state apiKey supports "$NAME or ${NAME} environment
+// interpolation", so the reference — not the secret — is what lands in
+// models.json. The token only ever reaches ~/.pi/gateway.env (0600).
+func TestPiModelsJSON_NeverCarriesTheToken(t *testing.T) {
+	const secret = "sk-super-secret-token-value"
+	got, err := RenderPiModelsJSON(PiModelsParams{
+		Provider:    pb.GatewayProvider_GATEWAY_PROVIDER_KAFEIDO,
+		GatewayBase: "http://10.0.0.1:8866/v1/model/kafeido",
+		TokenEnvVar: GatewayTokenEnvVar,
+		Model:       "kafeido-coder",
+		// Even if a caller mistakenly passes one, nothing must render it.
+		Token: secret,
+	})
+	if err != nil {
+		t.Fatalf("RenderPiModelsJSON: %v", err)
+	}
+	if strings.Contains(string(got), secret) {
+		t.Fatalf("models.json carries a live token:\n%s", got)
+	}
+	if !strings.Contains(string(got), "$"+GatewayTokenEnvVar) {
+		t.Errorf("models.json should reference $%s, not a literal key:\n%s", GatewayTokenEnvVar, got)
+	}
+	if strings.Contains(string(got), "sk-") {
+		t.Errorf("models.json contains an sk- prefixed value:\n%s", got)
+	}
+}
+
+// TestPiProviderMapping_EveryGatewayProviderIsMapped is the "enums over magic
+// strings" payoff: a new GatewayProvider enum value cannot ship without
+// someone deciding which pi api it speaks and what its base URL suffix is.
+// Without this test that decision would be made at runtime, on a box, as a 404.
+func TestPiProviderMapping_EveryGatewayProviderIsMapped(t *testing.T) {
+	for value, name := range pb.GatewayProvider_name {
+		p := pb.GatewayProvider(value)
+		if p == pb.GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED {
+			// UNSPECIFIED is an error everywhere else too; assert that.
+			if _, err := PiProviderShape(p); err == nil {
+				t.Error("UNSPECIFIED must not resolve to a pi provider shape")
+			}
+			continue
+		}
+		shape, err := PiProviderShape(p)
