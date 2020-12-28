@@ -14,3 +14,36 @@ import (
 func TestFetchSHA256_FindsNamedBinary(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/SHA256SUMS.txt") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(
+			"aaaa1111  containarium-linux-amd64\n" +
+				"bbbb2222  containariumd-linux-amd64\n" +
+				"cccc3333  containarium-windows-amd64.exe\n"))
+	}))
+	defer srv.Close()
+
+	orig := GitHubReleaseBaseURL
+	GitHubReleaseBaseURL = srv.URL
+	t.Cleanup(func() { GitHubReleaseBaseURL = orig })
+
+	got, err := FetchSHA256(context.Background(), "v0.55.0", "containariumd-linux-amd64")
+	if err != nil {
+		t.Fatalf("FetchSHA256: %v", err)
+	}
+	if got != "bbbb2222" {
+		t.Errorf("checksum = %q, want bbbb2222", got)
+	}
+}
+
+// TestFetchSHA256_UnknownBinaryIsError proves a name absent from the sums
+// file is a clear error, not a silently-empty/wrong checksum.
+func TestFetchSHA256_UnknownBinaryIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("aaaa1111  containarium-linux-amd64\n"))
+	}))
+	defer srv.Close()
+
+	orig := GitHubReleaseBaseURL
+	GitHubReleaseBaseURL = srv.URL
+	t.Cleanup(func() { GitHubReleaseBaseURL = orig })
