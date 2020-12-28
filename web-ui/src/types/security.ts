@@ -59,3 +59,65 @@ export interface TriggerScanResponse {
 /**
  * Parameters for listing ClamAV reports
  */
+export interface ListClamavReportsParams {
+  containerName?: string;
+  status?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * A queued ClamAV scan job
+ */
+export interface ScanJob {
+  id: number;
+  containerName: string;
+  username: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  retryCount: number;
+  errorMessage: string;
+  createdAt: string;
+  startedAt: string;
+  completedAt: string;
+  backendId?: string;
+}
+
+/**
+ * Response from GET /v1/security/scan-status
+ */
+export interface ScanStatusResponse {
+  jobs: ScanJob[];
+  pendingCount: number;
+  runningCount: number;
+  completedCount: number;
+  failedCount: number;
+}
+
+// ============= Pentest Types =============
+
+export interface PentestScanRun {
+  id: string;
+  trigger: string;
+  status: 'running' | 'completed' | 'failed';
+  modules: string;
+  targetsCount: number;
+  criticalCount: number;
+  highCount: number;
+  mediumCount: number;
+  lowCount: number;
+  infoCount: number;
+  errorMessage: string;
+  startedAt: string;
+  completedAt: string;
+  duration: string;
+  completedCount: number;
+}
+
+export interface PentestFinding {
+  id: number;
+  fingerprint: string;
+  category: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  title: string;

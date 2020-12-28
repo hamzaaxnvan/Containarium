@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "containarium/v1/ssh_ban.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// SentinelSSHUpstreamService is private to the local operator's Unix socket.
+// It is never registered on public gRPC or REST listeners.
+service SentinelSSHUpstreamService {
+  // Open a transport-supplied identity before any routing/authentication work.
+  rpc OpenSSHUpstreamConnection(OpenSSHUpstreamConnectionRequest) returns (OpenSSHUpstreamConnectionResponse);
+  // Reset provenance before calling the authoritative routing child.
+  rpc BeginSSHUpstreamRoute(BeginSSHUpstreamRouteRequest) returns (BeginSSHUpstreamRouteResponse);
+  // Reserve one bounded backend SSH setup; rejection never means client denial.
+  rpc AcquireSSHUpstream(AcquireSSHUpstreamRequest) returns (AcquireSSHUpstreamResponse);
+  // Settle exactly the admitted attempt, preserving prior jail-window history.
+  rpc CompleteSSHUpstream(CompleteSSHUpstreamRequest) returns (CompleteSSHUpstreamResponse);
+  // Consume one ordered observer disposition without parsing an error string.
+  rpc ConsumeSSHUpstreamFailure(ConsumeSSHUpstreamFailureRequest) returns (ConsumeSSHUpstreamFailureResponse);
+  // Bind the actual signed Ensure result to an existing anonymous connection.
+  rpc RegisterSSHAnonymousRoute(RegisterSSHAnonymousRouteRequest) returns (RegisterSSHAnonymousRouteResponse);
+  // Advance one probe deadline; never release jail-risk reservations.
+  rpc HintSSHUpstreamRecovery(HintSSHUpstreamRecoveryRequest) returns (HintSSHUpstreamRecoveryResponse);
+}
+
+// SSHUpstreamPolicy is explicit, validated controller configuration.
+message SSHUpstreamPolicy {
+  google.protobuf.Duration initial_delay = 1;
+  google.protobuf.Duration max_delay = 2;
+  google.protobuf.Duration window = 3;
+  google.protobuf.Duration setup_timeout = 4;
+  uint32 failure_budget = 5;
+  uint32 risk_per_attempt = 6;
+  uint32 max_backends = 7;
+  uint32 max_pending = 8;
+  uint32 max_connections = 9;
+  double jitter = 10;
+  string egress_group = 11;
+  // Operator-owned aliases used by the standalone controller and fixtures.
+  repeated SSHUpstreamRoute routes = 12;
+}
+
+// SSHUpstreamRoute is an authoritative backend endpoint, not a client claim.
+message SSHUpstreamRoute {
+  string backend_id = 1;
+  string endpoint = 2;
+}
+
+// SSHUpstreamConnection binds the listener, full remote transport and UUID.
+message SSHUpstreamConnection {
+  SSHBanListener listener = 1;
+  string connection_id = 2;
+  string remote_addr = 3;
+  string controller_generation = 4;
+}
+
+// OpenSSHUpstreamConnectionRequest has no generation on initial registration.
+message OpenSSHUpstreamConnectionRequest {
+  SSHUpstreamConnection connection = 1;
+}
+// OpenSSHUpstreamConnectionResponse returns the process generation and warmup.
