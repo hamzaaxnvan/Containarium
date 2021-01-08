@@ -19,3 +19,13 @@ func safeInt64(v uint64) int64 {
 	}
 	return int64(v)
 }
+
+// protoName renders an IP protocol number as the lowercase string used
+// throughout the evidence types (mirrors the equivalent unexported helper in
+// internal/server/network_policy_enforcer.go — duplicated here rather than
+// exported across the package boundary, since it's three lines and pulling
+// internal/server into internal/threatdetect would invert the dependency
+// direction the enforcer's SetFlowHook/SetDenyHook wiring already relies on).
+func protoName(proto uint8) string {
+	switch proto {
+	case 1:

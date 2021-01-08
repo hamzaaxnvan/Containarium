@@ -211,3 +211,216 @@ func (r *Reconciler) prepare(ctx context.Context, containerName, tenant string, 
 		return fmt.Errorf("tenantguard: %w", err)
 	}
 	// The box was just created and may not be listed yet, or be listed
+	// without a tenant label the caller already knows: make sure it is in
+	// the policy under its tenant so the ACL exists even for a tenant's
+	// first box on the host.
+	found := false
+	for i := range in.Boxes {
+		if in.Boxes[i].Name == containerName {
+			in.Boxes[i].Tenant = tenant
+			found = true
+		}
+	}
+	if !found {
+		in.Boxes = append(in.Boxes, Box{Name: containerName, Tenant: tenant})
+	}
+	pol, err := Compute(in)
+	if err != nil {
+		return fmt.Errorf("tenantguard: %w", err)
+	}
+	desired := pol.ACLs[tenant]
+	if _, err := nicguard.EnsureACL(r.be, desired); err != nil {
+		return fmt.Errorf("tenantguard: %w", err)
+	}
+	if err := r.attach(containerName, desired.Name); err != nil {
+		return fmt.Errorf("tenantguard: %w", err)
+	}
+	return nil
+}
+
+// ReconcileOnce performs one gather → compute → diff → write pass.
+//
+// Fail-safe shape: any error before the write phase returns with zero
+// writes and the previous ACLs left in force. A write error on one
+// container is recorded on its entry and the pass continues to the others;
+// the pass then reports the first such error.
+func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
+	if r.cfg.Mode != nicguard.ModeEnforce {
+		r.setStatus(func(s *Status) { s.Mode = r.cfg.Mode; s.LastPass = time.Now() })
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// One pass at a time, and never concurrently with Prepare: a pass that
+	// gathered before a box existed must not prune the ACL Prepare just
+	// created for it, and two writers must not race on one instance.
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
+	driver, err := nicguard.CheckSupport(r.be)
+	if err != nil {
+		r.setStatus(func(s *Status) { s.FirewallDriver = driver; s.Unsupported = nicguard.Unsupported(err) })
+		if nicguard.Unsupported(err) {
+			r.warnUnsupported(err)
+		}
+		return r.fail(fmt.Errorf("tenantguard: %w", err))
+	}
+	r.setStatus(func(s *Status) { s.Unsupported = false })
+
+	in, unresolved, unmanaged, err := r.gather(ctx)
+	if err != nil {
+		r.setStatus(func(s *Status) { s.FirewallDriver = driver })
+		return r.fail(fmt.Errorf("tenantguard: %w", err))
+	}
+
+	pol, err := Compute(in)
+	if err != nil {
+		return r.fail(err)
+	}
+
+	// Write phase: per tenant the ACL, then per box the NIC. An ACL that
+	// could not be written is never attached.
+	var firstErr error
+	note := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	aclOK := map[string]bool{}
+	for tenant, desired := range pol.ACLs {
+		if _, err := nicguard.EnsureACL(r.be, desired); err != nil {
+			note(err)
+			continue
+		}
+		aclOK[tenant] = true
+	}
+
+	entries := make([]Entry, 0, len(in.Boxes))
+	for _, b := range in.Boxes {
+		e := Entry{Container: b.Name, Tenant: b.Tenant, ACLName: ACLName(b.Tenant)}
+		if b.IPv4.IsValid() {
+			e.IP = b.IPv4.String()
+		}
+		if !aclOK[b.Tenant] {
+			e.LastError = "tenant ACL not written this pass"
+			entries = append(entries, e)
+			continue
+		}
+		if err := r.attach(b.Name, e.ACLName); err != nil {
+			if r.instanceGone(b.Name, err) {
+				// The instance was removed between the list that produced it and
+				// this write, typically the rollback of a failed create (#2850).
+				// There is nothing left to guard, so it is neither an entry nor
+				// a pass failure.
+				log.Printf("[tenantguard] %s was removed during the pass; skipping its NIC (%v)", b.Name, firstLine(err))
+				continue
+			}
+			e.LastError = err.Error()
+			note(err)
+			entries = append(entries, e)
+			continue
+		}
+		e.Attached = true
+		entries = append(entries, e)
+	}
+
+	// Garbage: ACLs for tenants that no longer have a box here.
+	if err := r.pruneStale(pol); err != nil {
+		note(err)
+	}
+	// Legacy: per-container ACLs written before #2359 may still carry
+	// ingress allows, which Incus evaluates next to ours and which could
+	// re-open what we close. Clear their ingress, keep their egress and
+	// attachments.
+	cleared, err := r.sanitizeLegacyACLs()
+	if err != nil {
+		note(err)
+	}
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Container < entries[j].Container })
+	sort.Strings(unresolved)
+	sort.Strings(unmanaged)
+	r.setStatus(func(s *Status) {
+		s.Mode = r.cfg.Mode
+		s.FirewallDriver = driver
+		s.Entries = entries
+		s.Unresolved = unresolved
+		s.Unmanaged = unmanaged
+		s.Tenants = len(pol.ACLs)
+		s.LegacyIngressCleared += cleared
+		s.LastPass = time.Now()
+		if firstErr != nil {
+			s.LastError = firstErr.Error()
+		} else {
+			s.LastError = ""
+			s.StaleSince = time.Time{}
+		}
+	})
+	if firstErr != nil {
+		return fmt.Errorf("tenantguard: %w", firstErr)
+	}
+	return nil
+}
+
+// gather reads the host into Inputs. Core-role containers become
+// initiators (when their role is one) and are never subjects; a container
+// with no resolvable tenant is reported, not guessed.
+func (r *Reconciler) gather(ctx context.Context) (Inputs, []string, []string, error) {
+	bridge, gateway, err := nicguard.ParseBridge(r.cfg.BridgeCIDR)
+	if err != nil {
+		return Inputs{}, nil, nil, err
+	}
+	containers, err := r.be.ListContainers()
+	if err != nil {
+		return Inputs{}, nil, nil, fmt.Errorf("list containers: %w", err)
+	}
+	in := Inputs{BridgeCIDR: bridge, HostGateway: gateway, Initiators: map[incus.Role][]netip.Addr{}}
+	if r.cfg.Policies != nil {
+		policies, perr := r.cfg.Policies.List(ctx)
+		if perr != nil {
+			// A policy read failure must not drop cross-tenant allows that
+			// were in force (a pass would then close doors mid-flight); fail
+			// the pass and keep yesterday's ACLs.
+			return Inputs{}, nil, nil, fmt.Errorf("list network policies: %w", perr)
+		}
+		for _, p := range policies {
+			if len(p.GetAllowFromTenants()) > 0 {
+				if in.CrossTenantAllow == nil {
+					in.CrossTenantAllow = map[string][]string{}
+				}
+				in.CrossTenantAllow[p.GetTenant()] = append([]string(nil), p.GetAllowFromTenants()...)
+			}
+		}
+	}
+	var unresolved, unmanaged []string
+	for _, c := range containers {
+		// ContainerInfo.IPAddress is the daemon's "primary" address and can
+		// come from an interface that is not the bridge (a podman box
+		// reports its cni/docker gateway first on some images). An address
+		// outside the bridge, or the gateway's own, must not reach Compute:
+		// it would fail validation and abort the whole pass — or, worse,
+		// end up in an allow rule for the wrong thing. Such a box is
+		// guarded (default drop) but contributes no sibling rule this pass.
+		if c.Role.IsCoreRole() {
+			if a, perr := netip.ParseAddr(c.IPAddress); perr == nil && (!a.Is4() || (bridge.Contains(a) && a != gateway)) {
+				in.Initiators[c.Role] = append(in.Initiators[c.Role], a)
+			}
+			continue
+		}
+		tenant := incus.ResolveTenant(c.Tenant, c.Labels[incus.CloudOrgIDLabel], c.Name)
+		if tenant == "" {
+			if c.Managed {
+				unresolved = append(unresolved, c.Name)
+			} else {
+				unmanaged = append(unmanaged, c.Name)
+			}
+			continue
+		}
+		b := Box{Name: c.Name, Tenant: tenant}
+		if a, perr := netip.ParseAddr(c.IPAddress); perr == nil && a.Is4() && bridge.Contains(a) && a != gateway {
+			b.IPv4 = a
+		}
+		in.Boxes = append(in.Boxes, b)
+	}
