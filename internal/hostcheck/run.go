@@ -53,3 +53,58 @@ func Run() []Check {
 	// 2. Effective capabilities. Diagnostic — the useradd probe (4) is the
 	// definitive test; a host can lack the readable mask yet still work, or
 	// have it yet be broken by other sandboxing.
+	checks = append(checks, capCheck())
+
+	// 3. Writable paths.
+	for _, p := range DaemonWritablePaths {
+		checks = append(checks, writableCheck(p))
+	}
+
+	// 4. The definitive capability-trap test: create + delete a throwaway user.
+	checks = append(checks, useraddProbe())
+
+	// 5. incus present (the unit orders itself After=/Wants=incus.service).
+	_, err := exec.LookPath("incus")
+	checks = append(checks, Check{
+		Name: "incus binary present", OK: err == nil, Required: true,
+		Detail: "incus not found on PATH",
+	})
+
+	return checks
+}
+
+// capCheck reads CapEff from /proc/self/status and verifies the required caps.
+func capCheck() Check {
+	c := Check{Name: "effective capabilities", Required: true}
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		c.Detail = fmt.Sprintf("cannot read /proc/self/status: %v", err)
+		return c
+	}
+	var capEff uint64
+	found := false
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "CapEff:") {
+			hexStr := strings.TrimSpace(strings.TrimPrefix(line, "CapEff:"))
+			v, perr := strconv.ParseUint(hexStr, 16, 64)
+			if perr != nil {
+				c.Detail = fmt.Sprintf("parse CapEff %q: %v", hexStr, perr)
+				return c
+			}
+			capEff = v
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.Detail = "CapEff not found in /proc/self/status"
+		return c
+	}
+	if missing := MissingCaps(capEff); len(missing) > 0 {
+		c.Detail = "missing: " + strings.Join(missing, ", ")
+		return c
+	}
+	c.OK = true
+	return c
+}
+
