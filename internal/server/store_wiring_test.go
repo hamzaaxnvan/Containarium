@@ -24,29 +24,3 @@ func TestCrewServer_SetRunStoreTakesEffect(t *testing.T) {
 	}
 }
 
-// A nil store must not blank out a working one: the daemon calls the setter
-// from a best-effort branch, and losing the in-memory fallback would leave the
-// server with no store at all.
-func TestCrewServer_SetRunStoreIgnoresNil(t *testing.T) {
-	s := NewCrewServer(nil)
-	before := s.runs
-	s.SetRunStore(nil)
-	if s.runs == nil || s.runs != before {
-		t.Error("SetRunStore(nil) cleared the existing store")
-	}
-}
-
-func TestAgentSkillServer_SetTaskQueueTakesEffect(t *testing.T) {
-	s := &AgentSkillServer{queue: NewMemAgentTaskQueue()}
-	swapped := NewMemAgentTaskQueue()
-	s.SetTaskQueue(swapped)
-	if s.queue != AgentTaskQueue(swapped) {
-		t.Fatal("SetTaskQueue did not replace the queue")
-	}
-
-	// And the swapped queue is the one actually used.
-	if _, err := s.queue.Enqueue(context.Background(), "s", ""); err != nil {
-		t.Fatalf("Enqueue on swapped queue: %v", err)
-	}
-	if d, _ := swapped.Depth(context.Background()); d != 1 {
-		t.Errorf("swapped queue depth = %d, want 1 — writes went elsewhere", d)

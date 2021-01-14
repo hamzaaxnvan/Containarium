@@ -178,3 +178,63 @@ func (g *postgresStartupGate) degradedReason() string {
 	defer g.mu.Unlock()
 	if g.failed == "" {
 		return ""
+	}
+	return g.results[g.failed].Error()
+}
+
+// postgresRecoveryWatcher decides when a daemon that started DEGRADED should
+// restart itself: after minUptime, and only after `required` successful pings
+// in a row.
+type postgresRecoveryWatcher struct {
+	ping      func(ctx context.Context) error
+	started   time.Time
+	now       func() time.Time
+	sleep     func(ctx context.Context, d time.Duration) bool // false when ctx ended
+	minUptime time.Duration
+	required  int
+	interval  time.Duration // between pings while Postgres answers; first backoff step
+	maxDelay  time.Duration // backoff cap while it does not
+}
+
+// newPostgresRecoveryWatcher returns nil unless the startup check failed and
+// CONTAINARIUM_RESTART_ON_POSTGRES_RECOVERY is on.
+func newPostgresRecoveryWatcher(failedDSN string) *postgresRecoveryWatcher {
+	if failedDSN == "" || !envBool(envRestartOnPostgresRecovery) {
+		return nil
+	}
+	return &postgresRecoveryWatcher{
+		ping: func(ctx context.Context) error {
+			pctx, cancel := context.WithTimeout(ctx, postgresPingTimeout)
+			defer cancel()
+			return pingPostgres(pctx, failedDSN)
+		},
+		started:   time.Now(),
+		now:       time.Now,
+		sleep:     sleepCtx,
+		minUptime: durationFromEnv(envPostgresRecoveryMinUptime, defaultPostgresRecoveryMinUptime),
+		required:  postgresRecoveryRequiredPings,
+		interval:  5 * time.Second,
+		maxDelay:  60 * time.Second,
+	}
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// run blocks until it decides to restart (true) or ctx ends (false). It logs
+// each state change once, not every ping.
+func (w *postgresRecoveryWatcher) run(ctx context.Context) bool {
+	log.Printf("Postgres recovery watcher: will restart the daemon once Postgres answers %d pings in a row (not before %s of uptime)", w.required, w.minUptime)
+	delay := w.interval
+	ok := 0
+	loggedUp, loggedUptime := false, false
+	for {
+		if !w.sleep(ctx, delay) {
