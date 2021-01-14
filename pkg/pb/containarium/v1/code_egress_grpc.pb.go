@@ -48,3 +48,53 @@ type CodingToolEgressPolicyServiceClient interface {
 	SetCodingToolEgressPolicy(ctx context.Context, in *SetCodingToolEgressPolicyRequest, opts ...grpc.CallOption) (*SetCodingToolEgressPolicyResponse, error)
 	// GetCodingToolEgressPolicy returns the stored policy for the key (absent
 	// when none is set) and the effective policy a run for that tenant takes.
+	// Which tenant: on GET /v1/code/egress-policy/{tenant} the URL value. On the
+	// bare GET /v1/code/egress-policy the optional ?tenant= query parameter,
+	// and with none the cluster default.
+	GetCodingToolEgressPolicy(ctx context.Context, in *GetCodingToolEgressPolicyRequest, opts ...grpc.CallOption) (*GetCodingToolEgressPolicyResponse, error)
+	// DeleteCodingToolEgressPolicy removes a policy. Idempotent. Which tenant:
+	// on DELETE /v1/code/egress-policy/{tenant} the URL value; on the bare
+	// DELETE /v1/code/egress-policy the optional ?tenant= query parameter, and
+	// with none the cluster default.
+	DeleteCodingToolEgressPolicy(ctx context.Context, in *DeleteCodingToolEgressPolicyRequest, opts ...grpc.CallOption) (*DeleteCodingToolEgressPolicyResponse, error)
+}
+
+type codingToolEgressPolicyServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewCodingToolEgressPolicyServiceClient(cc grpc.ClientConnInterface) CodingToolEgressPolicyServiceClient {
+	return &codingToolEgressPolicyServiceClient{cc}
+}
+
+func (c *codingToolEgressPolicyServiceClient) SetCodingToolEgressPolicy(ctx context.Context, in *SetCodingToolEgressPolicyRequest, opts ...grpc.CallOption) (*SetCodingToolEgressPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetCodingToolEgressPolicyResponse)
+	err := c.cc.Invoke(ctx, CodingToolEgressPolicyService_SetCodingToolEgressPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *codingToolEgressPolicyServiceClient) GetCodingToolEgressPolicy(ctx context.Context, in *GetCodingToolEgressPolicyRequest, opts ...grpc.CallOption) (*GetCodingToolEgressPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetCodingToolEgressPolicyResponse)
+	err := c.cc.Invoke(ctx, CodingToolEgressPolicyService_GetCodingToolEgressPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *codingToolEgressPolicyServiceClient) DeleteCodingToolEgressPolicy(ctx context.Context, in *DeleteCodingToolEgressPolicyRequest, opts ...grpc.CallOption) (*DeleteCodingToolEgressPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteCodingToolEgressPolicyResponse)
+	err := c.cc.Invoke(ctx, CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CodingToolEgressPolicyServiceServer is the server API for CodingToolEgressPolicyService service.
