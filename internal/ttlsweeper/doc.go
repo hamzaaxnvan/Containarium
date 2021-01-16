@@ -23,12 +23,3 @@
 //     it from the daemon's main loop, provides a real Deleter that
 //     invokes the existing DeleteContainer path with the right
 //     audit-event banner.
-//
-// The split keeps the bug-prone decision logic (clock math, grace
-// margins, nil-pointer hazards) reviewable in isolation with full unit
-// coverage, separately from the Incus + lifecycle-hook integration
-// work that needs deeper daemon knowledge to review safely.
-//
-// # Why a small grace margin
-//
-// Decide subtracts a 30-second graceMargin from the comparison clock.
