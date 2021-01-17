@@ -46,3 +46,27 @@ func TestTenantReviewUnknownFieldsAndAbsentPolicyHTTP(t *testing.T) {
 	}
 	if _, err = c.GetNetworkPolicy("missing"); !errors.Is(err, ErrNetworkPolicyAbsent) {
 		t.Fatal(err)
+	}
+	if p, err := c.GetNetworkPolicy("team-a"); err != nil || p.GetRevision() != "fixture" {
+		t.Fatalf("%v %v", p, err)
+	}
+	if _, err = c.PatchTenantAccess(&pb.PatchTenantAccessRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if networkTenantSourceFromProto(pb.NetworkTenantSource_NETWORK_TENANT_SOURCE_UNSPECIFIED) != "" {
+		t.Fatal("zero source is not empty")
+	}
+}
+
+type reviewPolicyFixture struct {
+	pb.UnimplementedNetworkPolicyServiceServer
+	received *pb.PatchTenantAccessRequest
+}
+
+func (f *reviewPolicyFixture) GetNetworkPolicy(context.Context, *pb.GetNetworkPolicyRequest) (*pb.GetNetworkPolicyResponse, error) {
+	return nil, status.Error(codes.NotFound, "absent")
+}
+func (f *reviewPolicyFixture) PatchTenantAccess(_ context.Context, r *pb.PatchTenantAccessRequest) (*pb.PatchTenantAccessResponse, error) {
+	f.received = r
+	return &pb.PatchTenantAccessResponse{}, nil
+}
