@@ -1,0 +1,3578 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log"
+	"net"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/footprintai/containarium/internal/alert"
+	"github.com/footprintai/containarium/internal/app"
+	"github.com/footprintai/containarium/internal/audit"
+	"github.com/footprintai/containarium/internal/auth"
+	"github.com/footprintai/containarium/internal/capabilities"
+	"github.com/footprintai/containarium/internal/capacity"
+	appconfig "github.com/footprintai/containarium/internal/config"
+	"github.com/footprintai/containarium/internal/controller"
+	"github.com/footprintai/containarium/internal/events"
+	"github.com/footprintai/containarium/internal/guacamole"
+	"github.com/footprintai/containarium/internal/integrity"
+	"github.com/footprintai/containarium/internal/metrics/cloudexport"
+	"github.com/footprintai/containarium/internal/metrics/platformstats"
+	"github.com/footprintai/containarium/internal/netbpf"
+	"github.com/footprintai/containarium/internal/poolcapacity"
+	"github.com/footprintai/containarium/internal/proofpack"
+	"github.com/footprintai/containarium/internal/releasecheck"
+	"github.com/footprintai/containarium/internal/runlease"
+	"github.com/footprintai/containarium/internal/safecast"
+	"github.com/footprintai/containarium/internal/secrets"
+	"github.com/footprintai/containarium/internal/sshauthz"
+	"github.com/footprintai/containarium/internal/toolaccess"
+	"github.com/footprintai/containarium/internal/tracker"
+	"github.com/footprintai/containarium/internal/tracker/submit"
+	"github.com/footprintai/containarium/pkg/core/backup"
+	"github.com/footprintai/containarium/pkg/core/box"
+	boxlxc "github.com/footprintai/containarium/pkg/core/box/lxc"
+	"github.com/footprintai/containarium/pkg/core/container"
+	"github.com/footprintai/containarium/pkg/core/incus"
+	"github.com/footprintai/containarium/pkg/core/network"
+	"github.com/footprintai/containarium/pkg/core/ostype"
+	"github.com/footprintai/containarium/pkg/core/stacks"
+	"github.com/footprintai/containarium/pkg/core/zfskey"
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+	"github.com/footprintai/containarium/pkg/version"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+// PendingCreation tracks an async container creation
+type PendingCreation struct {
+	Username     string
+	StartedAt    time.Time
+	Error        error
+	Done         bool
+	Provisioning bool // container is running but installing stack/packages
+	// Cancelled records that a DeleteContainer arrived while this creation
+	// was still in flight (#1035). Provisioning runs for minutes; a delete
+	// pulls the instance out from under the goroutine, which then fails with
+	// "Instance not found" — indistinguishable, in the journal, from a
+	// genuine create failure. Flagging the cancellation lets the goroutine
+	// log what actually happened, and keeps the doomed creation out of the
+	// CREATING/ERROR state that Get/List would otherwise report.
+	Cancelled bool
+}
+
+// active reports whether this creation is still legitimately in flight —
+// neither finished nor cancelled by a delete. Read/List overlays must use
+// this rather than !Done, or a cancelled create keeps reporting CREATING
+// for the rest of its (now pointless) provisioning run.
+func (p *PendingCreation) active() bool { return p != nil && !p.Done && !p.Cancelled }
+
+// ContainerServer implements the gRPC ContainerService
+type ContainerServer struct {
+	nativeTenantReady func() bool
+	pb.UnimplementedContainerServiceServer
+	// systemInfoFn overrides the local GetSystemInfo probe in ListBackends.
+	// Nil in production; a test seam for a wedged local incusd (#2318).
+	systemInfoFn func(context.Context, *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error)
+	// TrackerService is its own proto service (tracker.proto), not part
+	// of ContainerService — embedding its Unimplemented server here lets
+	// ContainerServer satisfy pb.TrackerServiceServer without a
+	// second struct, since TrackerService's handlers already need
+	// secretsStore for the broker-only credential cross-check.
+	pb.UnimplementedTrackerServiceServer
+	manager *container.Manager
+	// boxBackend is the runtime-neutral seam over the box substrate. Today it
+	// wraps the same *container.Manager (LXC/incus); a K8s backend slots in
+	// here behind a build tag. Box-lifecycle operations (Create/Get/…) route
+	// through it; the LXC-specific surface (Exec, config keys, security scans,
+	// app hosting) still calls manager directly during the transition.
+	boxBackend box.BoxBackend
+	// boxWriter, when non-nil (k8s runtime + operator enabled), makes the
+	// imperative create path write a Box CR instead of calling boxBackend
+	// directly — the operator then reconciles it, so both the imperative and
+	// declarative paths converge on one builder (#995, slice 4).
+	boxWriter *controller.BoxWriter
+	// keyProvider supplies per-tenant ZFS encryption keys. Nil on a
+	// daemon with no key custody configured — which is every OSS daemon
+	// today — in which case an encrypted create is refused rather than
+	// silently producing plaintext (#1198). The lifecycle hooks that
+	// consume it land in #1199/#1201.
+	keyProvider zfskey.KeyProvider
+	// encryption carries the per-tenant dataset hooks (#1199/#1201). A
+	// nil value is a valid no-op receiver, so the lifecycle paths do not
+	// branch on whether encryption is configured.
+	encryption *encryptionHooks
+	// snapshots is the container-snapshot surface (#1160). nil when the
+	// storage backend is not ZFS, which the handlers report rather than
+	// panic on.
+	snapshots           *snapshotOps
+	collaboratorManager *container.CollaboratorManager
+	// sshKeys is the ssh_keys registry the key write paths record into
+	// (#2517, ssh_key_registry.go). Nil when the daemon has no Postgres.
+	sshKeys sshauthz.KeyRegistry
+	// collabAccess and hostSessionKill are test seams for
+	// TerminateUserSessions (terminate_user_sessions.go); nil means the
+	// collaborator store and container.TerminateJumpAccountSessions.
+	collabAccess    collaboratorAccess
+	hostSessionKill func(account string) bool
+	// sshKeyNow and authorizedKeys are test seams for the key write paths;
+	// zero values mean time.Now and the host's real authorized_keys files.
+	sshKeyNow      func() time.Time
+	authorizedKeys authorizedKeysOps
+	// Box code-run reader (#2123, box_run_log.go). All four are test seams:
+	// boxRunExec replaces the container manager's exec, boxRunCollaborator
+	// the collaborator lookup, boxRunLogDir agent-box's log dir, and
+	// boxRunPoll the follow poll interval. Zero values mean production.
+	boxRunExec         boxScriptFunc
+	boxRunCollaborator collaboratorCheckFunc
+	boxRunLogDir       string
+	boxRunPoll         time.Duration
+	// boxRunStartExec is StartBoxRun's own exec seam (#2193), separate from
+	// boxRunExec: production needs to run AS the box's own Linux user (so the
+	// spawned engine reads that user's credentials and the files it creates
+	// are owned the same way an SSH-driven `code run` leaves them), which
+	// means wrapping the script in `su - <username> -c`. That wrapping is a
+	// production-exec-layer detail, not something boxRunStartScript's own
+	// text should encode — a test target has no real multi-user box to su
+	// into, so it sets this directly to a plain `sh -c` runner, exactly like
+	// boxRunExec's existing tests do for List/Tail.
+	boxRunStartExec boxRunStartFunc
+
+	// approvalSecret is what box approval keys are derived from (#2184,
+	// box_run_inputs.go): the daemon's JWT secret, set by DualServer. Nil
+	// leaves the approval RPCs Unavailable. runInputConfirmWait is a test
+	// seam for how long AnswerRunInput waits for the box's response; zero
+	// means the default.
+	approvalSecret      []byte
+	runInputConfirmWait time.Duration
+	// runInputJournalCap is a test seam for maxRunInputJournal; zero means
+	// the default.
+	runInputJournalCap int64
+
+	// Per-run checkout sweep (#3296, box_run_checkout_sweep.go).
+	// runCheckoutMaxAge is --run-checkout-max-age (0 = off), meaningful only
+	// once SetRunCheckoutMaxAge set runCheckoutMaxAgeSet; unset means the
+	// default. The rest are test seams, nil in production: runCheckoutNow the
+	// clock, runCheckoutHomes the box users' home lookup, runCheckoutBoxes the
+	// box list (and per-box status), runCheckoutLog the logger.
+	runCheckoutMaxAge    time.Duration
+	runCheckoutMaxAgeSet bool
+	runCheckoutNow       func() time.Time
+	runCheckoutHomes     func(box string, users []string) (map[string]string, error)
+	runCheckoutBoxes     func(ctx context.Context) ([]box.BoxStatus, error)
+	runCheckoutLog       func(format string, args ...any)
+	runCheckoutLocks     sync.Map // key: box name -> *sync.Mutex
+
+	// boxRunToolAccess overrides how StartBoxRun reads the tool-access level
+	// recorded for a box (#2944): "" = none recorded, so the run keeps the
+	// owner's identity. Tests set it; production reads the Incus config.
+	boxRunToolAccess      func(ctx context.Context, username string) (string, error)
+	boxRunEnsureToolchain func(username string) error // test seam; production uses manager
+	// boxRunLocks serializes StartBoxRun's check-then-write span (collision
+	// check through record write) per (box, name) (#2260 review: concurrent
+	// calls for the same not-yet-existing name could both pass the collision
+	// check, then race on the log truncate and the record write, corrupting
+	// the log and orphaning a PID with no record naming it). sync.Map's zero
+	// value is ready to use — no constructor needed, so test literals that
+	// build a bare &ContainerServer{} still get correct serialization.
+	boxRunLocks      sync.Map // key: box+":"+name -> *sync.Mutex
+	emitter          *events.Emitter
+	pendingCreations map[string]*PendingCreation
+	pendingMu        sync.RWMutex
+	// Monitoring URLs (set by DualServer after setup)
+	victoriaMetricsURL string
+	grafanaURL         string
+	// Alerting (set by DualServer after setup)
+	alertStore         *alert.Store
+	alertManager       *alert.Manager
+	alertDeliveryStore *alert.DeliveryStore
+	alertWebhookURL    string
+	alertWebhookSecret string
+	hostRelayURL       string                          // e.g. "http://10.100.0.1:8080/internal/alert-relay"
+	alertRelayConfigFn func(webhookURL, secret string) // callback to update gateway relay config
+	coreServices       *CoreServices
+	daemonConfigStore  daemonConfigKV
+	peerPool           *PeerPool
+	// backupMgr is the backup core's read side, wired in for the metrics
+	// export collector's backup-health series (set by DualServer after
+	// setup, #2294) — nil-safe like peerPool/alertStore above. Not used
+	// for anything but SetBackupManager's seam into serverPlatformSources.
+	backupMgr *backup.Manager
+	// Cloud-native metrics export (#1069). metricsExportMu guards the
+	// in-memory config so SetMetricsExport/GetMetricsExport round-trip
+	// without a daemon restart; daemonConfigStore (when present) makes
+	// the toggle survive one. metricsExportSinks maps a provider enum
+	// value to its Sink so the enable-time credential probe is
+	// injectable in tests without touching real GCP ADC. Both are wired
+	// once at startup (DualServer calls SetMetricsExportSinks with the
+	// real gcpSink) and otherwise left nil, which GetMetricsExport
+	// treats as "never configured" and SetMetricsExport treats as
+	// Unimplemented for that provider.
+	metricsExportMu           sync.RWMutex
+	metricsExportConfig       cloudexport.Config
+	metricsExportConfigLoaded bool
+	metricsExportSinks        map[pb.CloudMetricsProvider]cloudexport.Sink
+	// metricsExportCollector is the running host-series export pipeline
+	// (#1070), non-nil only while export is enabled. SetMetricsExport
+	// starts it on enable and stops it on disable; GetMetricsExport reads
+	// its health. Guarded by metricsExportMu, same as the config/sinks it
+	// lives beside — one lock for the whole export subsystem.
+	metricsExportCollector *cloudexport.CloudExportCollector
+	// metricsExportBuilder is a test seam over buildMetricsExportCollector:
+	// the real builder dials Incus and needs a live Manager, so server-
+	// level tests inject a fake that returns a collector over fake
+	// sources/exporter. nil in production (the real builder runs).
+	metricsExportBuilder func(ctx context.Context, cfg cloudexport.Config, sink cloudexport.Sink) (*cloudexport.CloudExportCollector, error)
+	// platformStats accumulates platform-domain facts (#1082 API
+	// request/error counts today; #1083/#1084 add more) for the platform
+	// metric group to observe at export tick. Recorded on the gRPC
+	// unary-interceptor hot path (DualServer wires
+	// platformstats.UnaryInterceptor over this same instance), read
+	// through cloudexport.PlatformSources by buildMetricsExportCollector.
+	// Lock-free (atomic counters inside), so no mutex needed here.
+	platformStats *platformstats.Stats
+	// localHealthCheckFn overrides localBackendHealthy's real Incus liveness
+	// probe (#920) — set by tests to simulate a wedged/unresponsive local
+	// backend without a live Incus daemon. nil in production; the real probe
+	// runs.
+	localHealthCheckFn func() bool
+	// localHealthOnce / localHealthState: the debounced, single-flight local
+	// liveness verdict behind localBackendHealthy (#2317). Built lazily on first
+	// use so the env override is read once.
+	localHealthOnce  sync.Once
+	localHealthState *localHealth
+	// CPU overcommit admission (#1029 direction 2). cpuOvercommitFactor is the
+	// ceiling multiple of physical cores a host may commit; <= 0 disables the
+	// gate (the default). cpuOvercommitEnforce=false makes an enabled gate
+	// advisory (log-only). hostCoresFn is a test seam for the host's physical
+	// core count (mirrors localHealthCheckFn); nil reads Incus in production.
+	// See cpu_admission.go.
+	cpuOvercommitFactor  float64
+	cpuOvercommitEnforce bool
+	hostCoresFn          func() (float64, error)
+	// cpuReservations closes the #1588 check-then-act race: admitCPUCapacity
+	// reads a snapshot of committed cores with no lock held across the
+	// caller's subsequent mutation, so two concurrent admits against the
+	// same host can each pass against a stale snapshot and jointly exceed
+	// the ceiling. Every admitted (or advisory-logged) request reserves its
+	// cores here for the duration of the caller's mutation; a later admit
+	// checks committed cores plus every other tenant's live reservation, not
+	// just the real (possibly stale) committed total. The caller releases
+	// its reservation once the mutation concludes, success or failure — see
+	// admitCPUCapacity's returned release func. cpuReservationTTL is a
+	// safety net, not the primary mechanism: a caller whose completion this
+	// package can't observe (the k8s Box-CR reconciliation path) never
+	// calls release, and would otherwise hold a reservation forever.
+	cpuReservationsMu sync.Mutex
+	cpuReservations   map[string]cpuReservation
+	// nowFn overrides cpuNow's real time.Now() (mirrors hostCoresFn /
+	// localHealthCheckFn above) so a test can exercise reservation TTL
+	// expiry without an actual 10-minute wait. nil in production.
+	nowFn             func() time.Time
+	cpuReservationSeq uint64
+	// capacityStore holds this backend's spare-capacity advertise/withdraw
+	// state + local policy (#680). Lazily initialized so an unwired server
+	// (tests) still answers GetCapacityHeadroom with "not advertised".
+	capacityStore     *capacity.Store
+	capacityStoreOnce sync.Once
+	// capabilityStore holds this backend's last-recorded hardware capability
+	// profile (#681). Lazily initialized like capacityStore so an unwired
+	// server (tests) answers GetCapabilityProfile with "not profiled yet".
+	capabilityStore     *capabilities.Store
+	capabilityStoreOnce sync.Once
+	// drainer performs the bounded graceful reclaim of guest workloads when a
+	// backend withdraws headroom (#682). Lazily initialized; a single in-flight
+	// drain at a time guards against repeated advertise/withdraw cycles wedging
+	// the host.
+	drainer     *capacity.Drainer
+	drainerOnce sync.Once
+	// profileMu serializes ProfileBackend: each profile spins a throwaway
+	// GPU-probe LXC + a benchmark on the host, so concurrent/repeated calls
+	// must coalesce rather than stack a probe storm that can wedge the runtime.
+	profileMu sync.Mutex
+	// Hardware operations default to the bounded benchmark and the manager's
+	// passthrough probe; injectable so failures can be exercised without Incus.
+	capabilityBenchmark func() (container.BenchmarkResult, error)
+	capabilityGPUProbe  func() container.GPUValidationResult
+	capabilityResources func() (*incus.SystemResources, error)
+	// region is the region this backend serves, wired from --region (falling
+	// back to the pool name). Recorded into the capability profile. Empty when
+	// unset.
+	region string
+	// integrityConfigState is the integrity-relevant policy/config posture this
+	// backend folds into its signed self-measurement (#683): base domain,
+	// network-policy enforcement posture, and any other config the control plane
+	// verifies hasn't been tampered with. Wired once via SetIntegrityConfig;
+	// nil/empty on an unwired server still yields a (config-empty) measurement.
+	integrityConfigState map[string]string
+	// integrityExecWatch reports, per measurement, whether the exec watcher
+	// actually loaded and attached its object (#3120). Nil means no watcher.
+	integrityExecWatch func() bool
+	// reportedClass is the self-reported hardware class the operator assigned
+	// this backend (defaults to the pool name). Reconciled against the measured
+	// class in the capability profile. Empty when unset.
+	reportedClass string
+	// startTime is when this daemon process started; ListBackends reports
+	// the local backend's uptime from it. Set by DualServer wiring
+	// (SetStartTime); zero on a server that was never wired, in which case
+	// uptime is reported as 0.
+	startTime time.Time
+	// Route / Caddy cleanup deps (set by DualServer wiring, may be nil if
+	// the daemon was started without --app-hosting). Used by DeleteContainer
+	// to cascade-remove the routes / TLS-automation subjects a container
+	// owned, so deleting an LXC actually deletes the public hostname too.
+	routeStore   routeLister
+	proxyManager *app.ProxyManager
+	// passthroughStore, when set, lets DeleteContainer also cascade-remove
+	// any TCP/UDP passthrough routes the container owned (#1462) — the
+	// passthrough analog of routeStore above. nil on a daemon with no
+	// Postgres-backed passthrough store configured, in which case this
+	// cascade step is skipped (matching routeStore's own nil handling).
+	passthroughStore network.PassthroughStore
+
+	// moveRunner shells out to `incus snapshot/copy/stop/start` for the
+	// MoveContainer migration flow. Nil on daemons that don't support
+	// migration (MoveContainer returns "not configured" then).
+	moveRunner incus.MigrationRunner
+
+	// secretsStore is the tenant-secrets backend. Nil on daemons
+	// that don't have Postgres wired up (--standalone); the
+	// SecretsService RPCs return Unavailable in that case.
+	// CreateContainer / StartContainer call LoadAllForUser to
+	// stamp environment.<NAME>=<value> at LXC start time.
+	secretsStore *secrets.Store
+
+	// trackerStore holds tracker connections (#1921). Nil on daemons that
+	// don't have Postgres wired up; the TrackerService RPCs return
+	// Unavailable in that case, same convention as secretsStore.
+	trackerStore *tracker.Store
+
+	// trackerDescribers overrides provider -> ReaderProvider resolution
+	// (tests only — see SetTrackerDescribers). Nil in production;
+	// trackerProviderFor constructs the real adapters. Named for its
+	// #1921 origin (DescribeCredential only); widened to the full
+	// ReaderProvider in #1922 rather than renamed, since every existing
+	// caller already only needs DescribeCredential and the field itself
+	// is package-private.
+	trackerDescribers map[pb.TrackerProvider]tracker.ReaderProvider
+
+	// runRegistry resolves a run id to the skill/model it belongs to,
+	// and answers "is this run still live" — the RunResolver seam
+	// #1922's tracker write verbs need (identity stamp, ClaimTrackerIssue).
+	// Wired from dual_server.go with the SAME *runlease.Registry
+	// instance AgentSkillServer populates; nil on daemons where that
+	// wiring hasn't happened (tests construct ContainerServer directly).
+	runRegistry *runlease.Registry
+
+	// claimLocks serializes ClaimTrackerIssue calls per (username,
+	// connection, issue) within this daemon process — see
+	// tracker.ClaimLocks' own doc comment for what the lock does and
+	// doesn't cover. Constructed once in dual_server.go; tests that
+	// don't exercise ClaimTrackerIssue can leave it nil, in which case
+	// the RPC returns Unavailable rather than racing unlocked.
+	claimLocks *tracker.ClaimLocks
+
+	// trackerRunStarter is how DispatchTrackerIssues (#2022) starts a
+	// run — the RunAgentSkill path, wired in dual_server.go. Nil keeps
+	// the RPC returning Unavailable.
+	trackerRunStarter tracker.RunStarter
+
+	// submitBoxRunner overrides the box-exec/file-read backend
+	// SubmitTrackerChange uses to extract a bundle (#1923). Nil in
+	// production, where the real handler falls back to s.manager —
+	// *container.Manager already satisfies submit.BoxRunner (same
+	// ExecWithOutput/ReadFile shape FetchGitSource uses). Tests
+	// substitute a fake here so a unit test never needs a real box.
+	submitBoxRunner submit.BoxRunner
+
+	// submitPusher overrides the git-push backend SubmitTrackerChange
+	// uses (#1923). Nil in production, where the real handler falls
+	// back to submit.NewGitPusher(). Tests substitute a fake so a unit
+	// test never shells out to real git or touches the network.
+	submitPusher submit.GitPusher
+	// proofPackExecer overrides the backend SubmitTrackerChange generates
+	// the run's Proof Pack through (#2798); nil means s.manager. Tests only.
+	proofPackExecer proofpack.Execer
+
+	// submitFilePusher overrides SubmitTrackerChangeFiles' commit-and-push
+	// backend (#3005). Nil in production (submit.NewGitPusher()).
+	submitFilePusher submit.FilePusher
+
+	// KMS status snapshot for the KmsService GetKMSStatus RPC.
+	// Set once at startup in dual_server.go alongside the secrets
+	// store. Read-only after wiring; reflects CONTAINARIUM_KMS_BACKEND
+	// + CONTAINARIUM_REQUIRE_ENVELOPE as resolved at boot.
+	kmsBackend      string
+	kmsDescription  string
+	kmsConfigured   bool
+	requireEnvelope bool
+
+	// wakeRouter applies the Caddy route swap when a container is
+	// auto-slept (SwapToWake) and woken back up (SwapToDirect).
+	// Nil on daemons without app hosting or with auto-sleep disabled;
+	// the StopForAutoSleep / StartContainer hooks are nil-safe.
+	wakeRouter WakeRouter
+
+	// otelCollectorEndpoint is the OTLP/HTTP URL of this daemon's
+	// core OTel collector LXC (e.g. "http://10.0.3.142:4318").
+	// Stamped into containers created with monitoring=true so the
+	// SDK inside ships telemetry without app-side config. Empty
+	// means the daemon was started without OTel app-monitoring
+	// support; create_container with monitoring=true will log a
+	// warning and skip the env-var injection.
+	otelCollectorEndpoint string
+	// Guacamole integration for Windows VM RDP access
+	guacamoleClient *guacamole.Client
+	guacamoleUser   string // Guacamole admin username
+	guacamolePass   string // Guacamole admin password
+
+	// sshHost is the public host clients dial to SSH into containers this
+	// daemon fronts — the sentinel's SSH endpoint (e.g. "region-a.example.com"),
+	// set by DualServer wiring from --ssh-host. Stamped onto Container.ssh_host
+	// in the read path (alongside Pool) so a client builds its connect target
+	// `username@ssh_host` without inferring the host from the IP / config.
+	// Empty (direct mode / no sentinel) leaves ssh_host empty and clients fall
+	// back to network.ip_address.
+	sshHost string
+
+	// managedBackupKey is true when the backup service built a managed-key
+	// wrapper (CONTAINARIUM_BACKUP_KMS_KEY_NAME); GetSystemInfo reports it so
+	// `backup status` knows unregistered tenants are still encrypted (#3213).
+	managedBackupKey bool
+
+	// auditStore records admin-initiated operations (TriggerUpgrade, etc.).
+	// Nil on daemons without a Postgres pool; nil is safe (ops are logged but
+	// not persisted). #354.
+	auditStore *audit.Store
+
+	// autoUpdater drives on-demand daemon upgrades (TriggerUpgrade). Nil on
+	// daemons started without an auto-update source (e.g. no sentinel), in
+	// which case TriggerUpgrade for the local backend returns Unavailable.
+	// upgradeJobs tracks in-flight/terminal upgrade jobs by upgrade_id, and
+	// upgradeBusy guards against concurrent upgrades per backend. A successful
+	// LOCAL upgrade restarts the daemon, so its job state does not survive —
+	// callers confirm via the backend version in ListBackends. #354 Phase B.
+	autoUpdater *AutoUpdater
+	upgradeMu   sync.Mutex
+	upgradeJobs map[string]*upgradeJob
+	upgradeBusy map[string]bool
+
+	// binaryPath is this daemon's own executable path, used by the
+	// GitHub-direct TriggerUpgrade path (req.GithubTag, #1028) to swap its
+	// binary in place. Wired unconditionally by DualServer — independent of
+	// autoUpdater, which stays nil until a sentinel URL is configured — so a
+	// GitHub-direct upgrade works even on a daemon with no sentinel. Empty
+	// (e.g. in unit tests that never call SetBinaryPath) makes the
+	// github_tag path return Unavailable, same as an unconfigured autoUpdater
+	// does for the sentinel path.
+	binaryPath string
+
+	// storagePools returns the pool capacity monitor's last snapshot (#2823).
+	// Nil until SetStoragePoolSource; GetSystemInfo then reports no pools.
+	storagePools func() poolcapacity.Snapshot
+	// headroom refuses creates and snapshots on a pool past its floor
+	// (#3128). Nil admits everything.
+	headroom *poolcapacity.Guard
+}
+
+// upgradeJob is the in-memory record of a daemon upgrade triggered via
+// TriggerUpgrade, polled by GetUpgradeStatus. #354.
+type upgradeJob struct {
+	id             string
+	backendID      string
+	status         string // in_progress | completed | failed | noop
+	currentVersion string
+	targetVersion  string // best-effort, "" when unknown (#2171)
+	errMsg         string
+	completedAt    string
+}
+
+// NewContainerServer creates a new container server. runtime selects the box
+// backend: "lxc" (default, empty) or "k8s". See RuntimeLXC / RuntimeK8s.
+func NewContainerServer(runtime string) (*ContainerServer, error) {
+	mgr, err := newManager(runtime)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create container manager: %w", err)
+	}
+	bb, err := newBoxBackend(runtime, mgr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to select box backend: %w", err)
+	}
+	// Start the declarative Box controller alongside the imperative API when
+	// enabled (k8s runtime + CONTAINARIUM_K8S_OPERATOR). No-op otherwise.
+	maybeStartBoxOperator(runtime, bb)
+	return &ContainerServer{
+		manager:          mgr,
+		boxBackend:       bb,
+		boxWriter:        newBoxWriterIfEnabled(runtime),
+		emitter:          events.NewEmitter(events.GetBus()),
+		pendingCreations: make(map[string]*PendingCreation),
+		platformStats:    platformstats.New(),
+	}, nil
+}
+
+// boxes returns the box-lifecycle backend. Production wires boxBackend in
+// NewContainerServer; this lazily wraps the Manager when it's unset so a
+// server constructed directly (legacy tests that set only `manager`) still
+// routes lifecycle calls through the same LXC seam. The wrapper is a cheap
+// struct over the Manager, so constructing it per call is fine.
+func (s *ContainerServer) boxes() box.BoxBackend {
+	if s.boxBackend != nil {
+		return s.boxBackend
+	}
+	return boxlxc.New(s.manager)
+}
+
+// Boxes exposes the box backend so daemon wiring (dual_server) can
+// type-assert runtime-specific capabilities — e.g. the K8s backend's
+// ClientKeyLister for the /authorized-keys handler.
+func (s *ContainerServer) Boxes() box.BoxBackend { return s.boxes() }
+
+// k8sBoxes returns the box backend when the daemon runs the k8s runtime.
+// Lifecycle handlers use it to route their action through the backend seam:
+// s.manager is the LXC/incus surface, which is wired to an unavailable stub
+// on the k8s runtime — so without this branch Start/Stop/Delete/Resize would
+// error on every call there. The incus-config side effects those handlers
+// stamp (autosleep timestamps, stopped_at, secrets re-stamping) are
+// LXC-runtime features and are skipped on k8s.
+func (s *ContainerServer) k8sBoxes() (box.BoxBackend, bool) {
+	if bb := s.boxes(); bb.Kind() == box.KindK8s {
+		return bb, true
+	}
+	return nil, false
+}
+
+// createTargetsPeer reports whether the create is bound for a remote backend,
+// by the same rule as the forwarding block in createContainerAuthorized. It is
+// evaluated AFTER pool placement has set req.BackendId, so a --pool create that
+// placement routes to a peer is a peer-bound create too (#2952).
+func (s *ContainerServer) createTargetsPeer(req *pb.CreateContainerRequest) bool {
+	return req.BackendId != "" && s.peerPool != nil && req.BackendId != s.peerPool.LocalBackendID()
+}
+
+// validateStackOnPeer checks req.Stack against the catalog of the peer the
+// create is bound for (#2952). It rejects only when it has read a non-empty
+// catalog that lacks the stack. Anything it cannot conclude (no stack asked
+// for, the peer unknown or unhealthy, the catalog unreadable or empty) is
+// let through: the forwarding block reports an unreachable peer with its own
+// error, and a peer validates every create it receives for itself, so this
+// check exists to fail early, before storage is allocated, not to be the only
+// line of defence.
+func (s *ContainerServer) validateStackOnPeer(ctx context.Context, req *pb.CreateContainerRequest) error {
+	if req.Stack == "" || s.peerPool == nil {
+		return nil
+	}
+	peer := s.peerPool.Get(req.BackendId)
+	if peer == nil || !peer.Healthy {
+		return nil
+	}
+	ids, err := peer.ForwardListStacks(ctx, extractAuthToken(ctx))
+	if err != nil {
+		log.Printf("[create] could not read backend %q's stack catalog (%v); leaving the stack check to the backend", req.BackendId, err)
+		return nil
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	for _, id := range ids {
+		if id == req.Stack {
+			return nil
+		}
+	}
+	sort.Strings(ids)
+	return status.Errorf(codes.InvalidArgument, "unknown stack %q on backend %q; valid stacks there: %s",
+		req.Stack, req.BackendId, strings.Join(ids, ", "))
+}
+
+// CreateContainer creates a new container
+func (s *ContainerServer) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*pb.CreateContainerResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	// Validate request
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+	return s.createContainerAuthorized(ctx, req)
+}
+
+// createContainerAuthorized is CreateContainer after its scope and tenant
+// checks: the validation and provisioning body, for a caller that has
+// already been authorised for req.Username at its own entry point. Today
+// that is only the recipe deploy path (#2504): DeployRecipe checks
+// containers:write, and a skill or crew run checks agents:run / crews:run,
+// each with AuthorizeTenant on the very box name they then hand here. That
+// is what lets an agents:run token provision the skill's own box — the
+// contract scopes.go states for it — without also holding containers:write.
+// Not a gRPC method: nothing on the wire reaches it.
+func (s *ContainerServer) createContainerAuthorized(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.CreateContainerResponse, err error) {
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	// Namespace normalization must not turn a caller's reused dry-run request
+	// into an apparently explicit assignment on the next call.
+	if req.NetworkTenant == "" && auth.RequireRole(ctx, auth.RoleAdmin) != nil && s.nativeTenantLocalLXC() {
+		req = proto.Clone(req).(*pb.CreateContainerRequest)
+	}
+	// Audit B-MED-1 / B-MED-2 / B-LOW-1: cap the unbounded
+	// repeated-string / map fields before any allocation-heavy
+	// work runs. Done after the tenant check (don't enumerate
+	// resource caps to unauthenticated callers) but before pool
+	// resolution and peer routing.
+	if err := validateCreateContainerBounds(req); err != nil {
+		return nil, err
+	}
+	// Pool resolution — if a pool is requested, either validate that
+	// the explicit backend_id belongs to that pool, or pick any
+	// healthy backend in the pool when backend_id is empty.
+	//
+	// This runs BEFORE the stack check and before any storage is allocated
+	// (#2952): it only chooses a backend (it sets req.BackendId), it provisions
+	// nothing, and the stack has to be checked against the catalog of the
+	// backend that will actually create the box.
+	if req.Pool != "" {
+		if err := s.resolvePoolPlacement(req); err != nil {
+			return nil, err
+		}
+	}
+	if err := authorizeNetworkTenantCreate(ctx, req, s.nativeTenantLocalLXC() && !s.createTargetsPeer(req), accountTenancyArmed()); err != nil {
+		return nil, err
+	}
+	if req.NetworkTenant != "" && (s.nativeTenantReady == nil || !s.nativeTenantReady()) {
+		return nil, status.Error(codes.FailedPrecondition, "native network Tenant requires ready enforced local LXC Guard")
+	}
+	// Unknown stack (#2860, #2952): refuse before any allocation. The catalog
+	// that counts is the one of the backend that will create the box: this
+	// daemon's, or the peer's, which may define stacks this daemon does not.
+	if s.createTargetsPeer(req) {
+		if err := s.validateStackOnPeer(ctx, req); err != nil {
+			return nil, err
+		}
+	} else if err := validateStackID(req.Stack); err != nil {
+		return nil, err
+	}
+	// #1294's unconditional refusal used to sit here, on the grounds that the
+	// create path did not provision an encrypted dataset. It now does
+	// (#1341), so that statement is no longer true and the blanket refusal is
+	// gone.
+	//
+	// What has NOT changed is the promise: validateEncryption below still
+	// refuses an encrypted create on a daemon with no KeyProvider, which is
+	// every OSS daemon until an operator configures one (#1342). That refusal
+	// is the load-bearing one — it is what stops the flag being accepted and
+	// silently ignored — and it is the last thing to go.
+	// Birth TTL (#523): reject an out-of-range TTL before we provision
+	// anything — fail fast rather than create a box and then reject its
+	// death date. Same bound (7 days) as SetContainerTTL; 0 = no TTL.
+	if err := validateTTLSeconds(req.TtlSeconds); err != nil {
+		return nil, err
+	}
+	// Birth idle-stop (#524): a negative threshold is nonsense; reject early.
+	// 0 = no auto-sleep; > 0 enables it with that idle threshold (minutes).
+	if req.IdleStopMinutes < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "idle_stop_minutes must be >= 0, got %d", req.IdleStopMinutes)
+	}
+	// disable_auto_sleep (#2759) means "no idle-stop timer"; asking for one in
+	// the same breath is a contradiction, not something to resolve by guessing.
+	// A standalone daemon otherwise ignores the flag: it never enables
+	// auto-sleep unless idle_stop_minutes > 0.
+	if req.DisableAutoSleep && req.IdleStopMinutes > 0 {
+		return nil, status.Error(codes.InvalidArgument, "disable_auto_sleep and idle_stop_minutes > 0 are contradictory: set one")
+	}
+	// Birth stopped→delete (#525): same — reject a negative window early.
+	// 0 = never delete on stop; > 0 reaps a box left stopped that long.
+	if req.DeleteAfterStoppedSeconds < 0 {
+		return nil, status.Errorf(codes.InvalidArgument, "delete_after_stopped_seconds must be >= 0, got %d", req.DeleteAfterStoppedSeconds)
+	}
+	// Per-tenant dataset encryption (#1198): refuse before provisioning
+	// anything. A create that accepts encrypted=true and then produces a
+	// plaintext dataset is worse than a rejected one — the caller would
+	// believe they had encryption at rest.
+	if err := validateTenantID(req.TenantId); err != nil {
+		return nil, err
+	}
+	if err := validateEncryption(req, s.keyProvider); err != nil {
+		return nil, err
+	}
+
+	// Per-tenant encrypted storage (#1341). Resolved BEFORE anything is
+	// provisioned: EnsureTenantStorage resolves the key first, so a key
+	// custody outage fails here having created nothing.
+	//
+	// A tenant's containers share one Incus storage pool, sourced at that
+	// tenant's encrypted dataset. Everything Incus creates inside it — images
+	// and instances alike — inherits that tenant's key, which is the only way
+	// an instance can be encrypted at all: Incus builds one by cloning the
+	// image, and a ZFS clone takes its key from where it is made (#1335).
+	var encPool string
+	var encRef zfskey.KeyRef
+	if req.GetEncrypted() && req.GetDryRun() {
+		// Validate only (#2925): EnsureTenantStorage creates the tenant's
+		// encrypted dataset and pool, which a dry run must not do. What it
+		// would have refused for lack of wiring it is still refused for here,
+		// with the same error as the real path below.
+		if !s.encryption.enabled() {
+			return nil, errEncryptionNotWired
+		}
+	} else if req.GetEncrypted() {
+		encPool, encRef, err = s.encryption.EnsureTenantStorage(ctx, encryptionTenantFor(req))
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+		// A resolved-empty pool means encryption is half-wired: a KeyProvider
+		// is configured but the hooks are not. Falling through would create
+		// the container on the daemon's default pool — unencrypted, reported
+		// as encrypted, which is precisely what #1294 refused to ship.
+		if encPool == "" {
+			return nil, errEncryptionNotWired
+		}
+	}
+
+	// Route to peer if backend_id specifies a remote backend
+	if req.BackendId != "" && s.peerPool != nil {
+		localID := s.peerPool.LocalBackendID()
+		if req.BackendId != localID && req.BackendId != "" {
+			peer := s.peerPool.Get(req.BackendId)
+			if peer == nil {
+				return nil, fmt.Errorf("backend %q not found", req.BackendId)
+			}
+			if !peer.Healthy {
+				return nil, fmt.Errorf("backend %q is not healthy", req.BackendId)
+			}
+			if req.GetDryRun() {
+				// #2925: not forwarded. A peer that predates dry_run would
+				// ignore it and really create the box. The stack was checked
+				// against the peer's catalog above (#2952); the peer's other
+				// checks are not run.
+				return &pb.CreateContainerResponse{
+					DryRun: true,
+					Message: fmt.Sprintf("Validated by this daemon, and the stack against backend %q's catalog; that backend's "+
+						"other checks (image policy, capacity) were not run.", req.BackendId),
+				}, nil
+			}
+			// Forward to peer — extract auth token from context
+			authToken := extractAuthToken(ctx)
+			respBody, err := peer.ForwardCreateContainer(authToken, req)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create container on backend %q: %w", req.BackendId, err)
+			}
+			return respBody, nil
+		}
+	}
+
+	// Validate SSH keys at the API boundary to reject placeholder strings early
+	for i, key := range req.SshKeys {
+		if err := container.ValidateSSHPublicKey(key); err != nil {
+			return nil, fmt.Errorf("ssh_keys[%d]: %w", i, err)
+		}
+	}
+
+	// Audit B-HIGH-1: validate the image against the registry
+	// allowlist before any runtime call. Empty allowlist accepts
+	// everything (with a startup WARNING); a configured allowlist
+	// rejects unknown registries.
+	if err := validateImageRegistry(req.Image); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	// Phase 3.1 follow-up: when CONTAINARIUM_REQUIRE_IMAGE_DIGEST
+	// is on, every image reference must carry an `@sha256:<64hex>`
+	// suffix so the operator pins the exact image bytes. Disabled
+	// by default — opt-in for supply-chain-paranoid deployments.
+	if err := validateImageDigest(req.Image); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	// Phase 3.1 Phase-B: when CONTAINARIUM_VERIFY_IMAGE_DIGEST
+	// is on, additionally verify the declared digest matches the
+	// registry's published index for that alias. Catches
+	// allowlisted-registry MITM and bytes-vs-declared-digest
+	// divergence. Pre-pull → fail fast, no bandwidth wasted, no
+	// state to clean up. See docs/security/IMAGE-DIGEST-VERIFY-DESIGN.md.
+	if err := verifyImageDigestAgainstRegistry(ctx, req.Image); err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+
+	// Audit A-HIGH-3: enable_podman=true implies privileged + apparmor=unconfined.
+	// Gate that elevation behind CONTAINARIUM_PRIVILEGED_PODMAN_POLICY so
+	// non-admin tenants don't auto-escalate just by setting the flag.
+	enablePodmanPrivileged := false
+	if req.EnablePodman {
+		allowed, err := AuthorizePrivilegedPodman(ctx)
+		if err != nil {
+			return nil, err
+		}
+		enablePodmanPrivileged = allowed
+	}
+
+	// Build the runtime-neutral box spec
+	spec := box.BoxSpec{
+		Ref:                    box.BoxRef{Tenant: req.Username},
+		NetworkTenant:          req.NetworkTenant,
+		Image:                  req.Image,
+		SSHKeys:                req.SshKeys,
+		Labels:                 req.Labels,
+		EnablePodman:           req.EnablePodman,
+		EnablePodmanPrivileged: enablePodmanPrivileged,
+		AutoStart:              true,
+		Stack:                  req.Stack,
+		StackParams:            req.StackParameters,
+		OSType:                 req.OsType,
+		Isolation:              req.Isolation,
+		GPUs:                   req.Gpus, // legacy singular `gpu` no longer honored (#673)
+		StaticIP:               req.StaticIp,
+		// OTel app-monitoring opt-in. The daemon-level collector
+		// endpoint is configured at startup via --otel-collector-
+		// endpoint (or auto-discovered from the core OTel collector
+		// LXC; configured by DualServer). OTelBackendID lets the
+		// collector tag emissions with the originating VM for
+		// cross-VM Grafana queries. Both are no-ops when
+		// req.Monitoring is false.
+		Monitoring:            req.Monitoring,
+		OTelCollectorEndpoint: s.otelCollectorEndpoint,
+		OTelBackendID:         s.localBackendID(),
+		// Git source provisioning (optional) — the daemon fetches the
+		// repo into the box at create time, no caller→box SSH.
+		GitSource:     req.GitSource,
+		GitRef:        req.GitRef,
+		GitCredential: req.GitCredential,
+		WorkspacePath: req.WorkspacePath,
+		// Empty for an unencrypted create, which leaves placement exactly as
+		// it was: the daemon-wide pool, or the default profile (#1339).
+		StoragePool: encPool,
+	}
+	// Phase 2.5 follow-up — load the OTel bearer for
+	// monitoring=true containers. Best-effort: an error
+	// loading the bearer leaves OTelBearer empty, which
+	// makes the env-stamping path skip the header (pre-2.5
+	// behavior). Operators see the WARNING in the daemon log.
+	if req.Monitoring {
+		bearer, err := LoadOrCreateOTelBearer()
+		if err != nil {
+			log.Printf("[create] OTel bearer load failed: %v (header omitted; collector remains open)", err)
+		}
+		spec.OTelBearer = bearer
+	}
+
+	// Set resource limits
+	if req.Resources != nil {
+		spec.Resources.CPU = req.Resources.Cpu
+		spec.Resources.Memory = req.Resources.Memory
+		spec.Resources.Disk = req.Resources.Disk
+		spec.Resources.StorageClass = req.Resources.StorageClass
+		spec.Resources.MemoryRequest = req.Resources.MemoryRequest
+		spec.Resources.CPURequest = req.Resources.CpuRequest
+	}
+
+	// Use defaults if not specified (os_type takes precedence in manager.go)
+	if spec.Image == "" && spec.OSType == 0 {
+		spec.Image = "images:ubuntu/24.04"
+	}
+	if spec.Resources.CPU == "" {
+		spec.Resources.CPU = "4"
+	}
+	if spec.Resources.Memory == "" {
+		spec.Resources.Memory = "4GB"
+	}
+	if spec.Resources.Disk == "" {
+		spec.Resources.Disk = "50GB"
+	}
+
+	// CPU capacity admission (#1029 direction 2). Runs once the effective CPU
+	// request is known and before any create sink (Box CR / async / sync), so
+	// all three paths are gated uniformly. No-op unless an operator enabled the
+	// gate; peer-routed creates already returned above and are gated by the
+	// target peer's own daemon. See cpu_admission.go.
+	//
+	// #1588: an admitted request reserves its cores until cpuRelease runs, so
+	// a concurrent admit against this host sees them as committed even
+	// before this container actually exists. Released below — inline for
+	// the Box-CR/sync paths (the top-level defer), inside the goroutine for
+	// async, matching exactly how asyncHandledInline already splits
+	// platformStats reporting between those two completion shapes.
+	// Pool headroom floor (#3128): refuse before anything is allocated on a
+	// pool past its floor. encPool is the tenant's pool for an encrypted
+	// create and "" (the daemon's default pool) otherwise. An encrypted dry
+	// run has not resolved its tenant pool, so there is no pool to check.
+	if !req.GetEncrypted() || encPool != "" {
+		if err := s.admitPoolHeadroom(encPool, poolcapacity.OperationCreate); err != nil {
+			return nil, err
+		}
+	}
+
+	cpuRelease, admitErr := s.admitCPUCapacity(req.Username, spec.Resources.CPU)
+	if admitErr != nil {
+		return nil, admitErr
+	}
+
+	// Validate only (#2925): every check above has passed and nothing has been
+	// provisioned. Release the cores admission just reserved, or a dry run
+	// would block real creates for the reservation TTL. Not counted as a
+	// provisioning attempt (#1083), which starts below.
+	if req.GetDryRun() {
+		cpuRelease()
+		return &pb.CreateContainerResponse{
+			DryRun:  true,
+			Message: fmt.Sprintf("Dry run: a create for %s would be accepted. Nothing was created.", req.Username),
+		}, nil
+	}
+
+	// #1083: everything past this point is a genuine attempt to provision
+	// a container — Box CR, async, or sync. Everything before it (auth,
+	// request validation, pool/peer routing, admission) is a client-side
+	// or routing rejection, not a provisioning attempt, and is
+	// deliberately not counted.
+	//
+	// The defer covers the Box CR and sync paths uniformly via the named
+	// return values (any of their many `return nil, err` statements below
+	// sets `err` before this runs, exactly as if written by hand at each
+	// site). The async path is different: its own synchronous return is
+	// always "accepted" (CREATING, no error), not the real outcome — that
+	// resolves later inside its background goroutine, which records its
+	// own attempt via the same provisionStart. asyncHandledInline, set
+	// once that goroutine is actually spawned, tells this defer to stand
+	// down so the async case isn't double-counted.
+	provisionStart := time.Now()
+	asyncHandledInline := false
+	defer func() {
+		if asyncHandledInline {
+			return
+		}
+		cpuRelease()
+		s.platformStats.RecordProvisionAttempt(platformstats.OperationCreate, err == nil, time.Since(provisionStart))
+	}()
+
+	// Convergence (#995): when the Box operator is running, the imperative
+	// create writes a Box CR and the reconciler builds the box — one builder
+	// for both the imperative and declarative (kubectl apply / GitOps) paths.
+	// Returns CREATING regardless of req.Async; the caller polls GET to track it.
+	//
+	// #1083: the top-level defer's success determination for this path means
+	// "the Box CR was accepted by the k8s operator for reconciliation," not
+	// "the box actually finished being built." The real reconciliation
+	// outcome lives in the k8s Box operator's own status/events and is out
+	// of scope for this PR — a future issue could feed that back into
+	// platformStats once the operator exposes it.
+	if s.boxWriter != nil {
+		if err := s.boxWriter.Upsert(ctx, spec); err != nil {
+			return nil, fmt.Errorf("create Box CR for %s: %w", req.Username, err)
+		}
+		return &pb.CreateContainerResponse{
+			Container: &pb.Container{
+				Name:     fmt.Sprintf("%s-container", req.Username),
+				Username: req.Username,
+				State:    pb.ContainerState_CONTAINER_STATE_CREATING,
+				Resources: &pb.ResourceLimits{
+					Cpu:           spec.Resources.CPU,
+					Memory:        spec.Resources.Memory,
+					Disk:          spec.Resources.Disk,
+					StorageClass:  spec.Resources.StorageClass,
+					MemoryRequest: spec.Resources.MemoryRequest,
+					CpuRequest:    spec.Resources.CPURequest,
+				},
+			},
+			Message: fmt.Sprintf("Box CR created for user %s; the operator is reconciling it. Poll GET /v1/containers/%s to check status.", req.Username, req.Username),
+		}, nil
+	}
+
+	// Async mode - return immediately and create in background
+	if req.Async {
+		// Check if already creating
+		s.pendingMu.Lock()
+		if pending, exists := s.pendingCreations[req.Username]; exists && !pending.Done {
+			s.pendingMu.Unlock()
+			return nil, fmt.Errorf("container creation already in progress for user %s", req.Username)
+		}
+
+		// Track pending creation
+		s.pendingCreations[req.Username] = &PendingCreation{
+			Username:  req.Username,
+			StartedAt: time.Now(),
+		}
+		s.pendingMu.Unlock()
+
+		// Set provisioning callback
+		spec.OnProvisioning = func() {
+			s.pendingMu.Lock()
+			if pending, exists := s.pendingCreations[req.Username]; exists {
+				pending.Provisioning = true
+			}
+			s.pendingMu.Unlock()
+		}
+
+		// Start async creation. Use a background context — the request ctx is
+		// cancelled once this handler returns the CREATING response.
+		//
+		// #1083: from here on the goroutine owns recording this attempt's
+		// outcome (its real completion, not this handler's synchronous
+		// "accepted" return) — stand the top-level defer down so it isn't
+		// double-counted.
+		asyncHandledInline = true
+		go func() {
+			// #1588: the top-level defer stood down for async (above), so
+			// this goroutine owns releasing the CPU reservation too — on
+			// every exit path, including the early "cancelled by delete"
+			// return below, which is exactly why this is its own defer
+			// rather than a call at the bottom of the function.
+			defer cpuRelease()
+			info, err := s.boxes().Create(context.Background(), spec)
+			// Same contract as the sync path: an encrypted box whose
+			// placement cannot be recorded is removed rather than left
+			// unopenable. The caller already has its CREATING response, so
+			// this surfaces through the pending state like every other
+			// async failure.
+			if err == nil {
+				if rerr := s.recordEncryptedPlacement(req, info.Ref.Name, encRef, encPool); rerr != nil {
+					err, info = rerr, nil
+				}
+			}
+
+			// Phase 3.1 Phase-C: post-pull verification.
+			// In async mode the HTTP response has already
+			// returned with CREATING; mismatch detection
+			// here can't reach the caller via the response
+			// body, so we delete the container and record
+			// the error in the pending state. The operator
+			// polling for status sees a Done=true,
+			// Error=<digest-mismatch> result.
+			if err == nil && info != nil {
+				if verr := verifyImageDigestPostPull(context.Background(), req.Image, info.Ref.Name, s.manager); verr != nil {
+					if delErr := s.manager.Delete(req.Username, true); delErr != nil {
+						log.Printf("[image-digest] async post-pull mismatch: failed to delete container %q: %v", info.Ref.Name, delErr)
+					}
+					err = verr
+					info = nil
+				}
+			}
+
+			// Birth TTL (#523), async path. The CREATING response already
+			// returned, so a failure can't reach the caller via the response
+			// body — it surfaces through the pending state (Done=true,
+			// Error=<ttl>) the same way the digest-mismatch path above does.
+			// stampBirthTTL deletes the box on failure so an ephemeral box
+			// never leaks just because the async stamp lost a race.
+			if err == nil && info != nil && req.TtlSeconds > 0 {
+				if terr := s.stampBirthTTL(context.Background(), info.Ref.Name, req.Username, req.TtlSeconds); terr != nil {
+					err = terr
+					info = nil
+				}
+			}
+
+			// Birth idle-stop (#524), async path. Best-effort like the sync
+			// path — auto-sleep is an optimization, not a leak contract, so a
+			// failed stamp never turns a created box into a failed creation.
+			if err == nil && info != nil && req.IdleStopMinutes > 0 {
+				s.stampBirthAutoSleep(info.Ref.Name, req.IdleStopMinutes)
+			}
+			// Birth stopped→delete (#525), async path. Best-effort like above.
+			if err == nil && info != nil && req.DeleteAfterStoppedSeconds > 0 {
+				s.stampBirthDeleteAfterStopped(info.Ref.Name, req.DeleteAfterStoppedSeconds)
+			}
+
+			// A delete that landed mid-provisioning owns this outcome, not
+			// the creation (#1035): drop the tracking entry and log the one
+			// line that describes what happened. Reporting it as a failure
+			// is what let cleanup deletes masquerade as independent
+			// confirmations of a create bug during cloud#920.
+			s.pendingMu.Lock()
+			pending, exists := s.pendingCreations[req.Username]
+			cancelled := exists && pending.Cancelled
+			switch {
+			case cancelled:
+				delete(s.pendingCreations, req.Username)
+			case exists:
+				pending.Done = true
+				pending.Error = err
+			}
+			s.pendingMu.Unlock()
+
+			if cancelled {
+				log.Printf("Async container creation for %s cancelled by delete request (provisioning aborted; any error above is a consequence of the delete, not a creation failure)", req.Username)
+				// The delete can land in the narrow window before the
+				// instance exists, in which case it deleted nothing and
+				// this goroutine went on to finish the box. Reap it —
+				// otherwise the caller's delete silently leaves behind the
+				// container it asked to remove.
+				if err == nil && info != nil {
+					if delErr := s.manager.Delete(req.Username, true); delErr != nil {
+						log.Printf("Async container creation for %s completed after its delete; removing it failed: %v", req.Username, delErr)
+					} else {
+						log.Printf("Async container creation for %s completed after its delete; removed the late box", req.Username)
+					}
+				}
+				return
+			}
+
+			// #1083: this is the REAL outcome of an async create — the
+			// synchronous return below is only "accepted", not "succeeded"
+			// (see asyncHandledInline above, which stood the top-level
+			// defer down so this is the only place an async attempt gets
+			// recorded). A cancelled-by-delete run already returned above
+			// without reaching here, matching the existing #1035 rule that
+			// a delete-cancelled create isn't a creation failure.
+			s.platformStats.RecordProvisionAttempt(platformstats.OperationCreate, err == nil, time.Since(provisionStart))
+
+			if err != nil {
+				log.Printf("Async container creation failed for %s: %v", req.Username, err)
+			}
+
+			// Emit event on success
+			if err == nil && info != nil {
+				s.refreshContainerIPMap()
+				s.emitter.EmitContainerCreated(toProtoContainer(info))
+				// Same SSH-readiness push as the sync path (cloud #971).
+				// It matters more here: this is the path the cloud control
+				// plane uses, so this is the transition the caller sees as
+				// CREATING → RUNNING and immediately tries to SSH into.
+				// context.Background() because the request context died
+				// with the CREATING response long before this ran.
+				s.notifySentinelKeyChange(context.Background(), "create_container "+req.Username)
+			}
+		}()
+
+		// Return immediately with CREATING state
+		return &pb.CreateContainerResponse{
+			Container: &pb.Container{
+				Name:     fmt.Sprintf("%s-container", req.Username),
+				Username: req.Username,
+				State:    pb.ContainerState_CONTAINER_STATE_CREATING,
+				Resources: &pb.ResourceLimits{
+					Cpu:           spec.Resources.CPU,
+					Memory:        spec.Resources.Memory,
+					Disk:          spec.Resources.Disk,
+					StorageClass:  spec.Resources.StorageClass,
+					MemoryRequest: spec.Resources.MemoryRequest,
+					CpuRequest:    spec.Resources.CPURequest,
+				},
+			},
+			Message: fmt.Sprintf("Container creation started for user %s. Poll GET /v1/containers/%s to check status.", req.Username, req.Username),
+		}, nil
+	}
+
+	// Sync mode - wait for completion
+	info, err := s.boxes().Create(ctx, spec)
+	if err != nil {
+		if errors.Is(err, container.ErrNICGuard) {
+			// Fail closed (tenant network guard): the box was removed
+			// rather than started reachable by co-tenants.
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		return nil, fmt.Errorf("failed to create container: %w", err)
+	}
+
+	// Record which key unlocks this container and which pool it lives on,
+	// before anything else touches it. See recordEncryptedPlacement: a
+	// container whose placement cannot be recorded is deleted, because it is
+	// encrypted and nothing can name its encryptionroot.
+	if err := s.recordEncryptedPlacement(req, info.Ref.Name, encRef, encPool); err != nil {
+		return nil, err
+	}
+
+	// Phase 3.1 Phase-C: post-pull defense-in-depth.
+	// Confirm the image landed on disk matches the digest
+	// the operator declared. Mismatch means cache tampering
+	// or an index race — delete the just-created container
+	// rather than leave the attacker's payload running.
+	if err := verifyImageDigestPostPull(ctx, req.Image, info.Ref.Name, s.manager); err != nil {
+		// Best-effort cleanup; the error we surface is the
+		// digest mismatch, which is the load-bearing
+		// signal. A failed delete is logged but doesn't
+		// shadow the security event.
+		if delErr := s.manager.Delete(req.Username, true); delErr != nil {
+			log.Printf("[image-digest] failed to delete container %q after post-pull mismatch: %v", info.Ref.Name, delErr)
+		}
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+
+	// Birth TTL (#523): stamp the death date now that the box exists, before
+	// any best-effort setup, so the ttlsweeper reaps it even if the client
+	// dies the instant create returns. stampBirthTTL deletes the box and
+	// errors if it can't honor the requested TTL — an ephemeral box that
+	// would leak is worse than no box.
+	if req.TtlSeconds > 0 {
+		if err := s.stampBirthTTL(ctx, info.Ref.Name, req.Username, req.TtlSeconds); err != nil {
+			return nil, err
+		}
+	}
+
+	// Birth idle-stop (#524): enable auto-sleep at create with the requested
+	// idle threshold, so the box is born with the stop timer and the
+	// autosleep loop reclaims its CPU/RAM if a job crashes/cancels without
+	// anyone calling toggle_auto_sleep. Best-effort: unlike the TTL (a leak
+	// contract), auto-sleep is an optimization — a failed stamp logs and the
+	// box keeps running (it can be toggled later), it never fails the create.
+	if req.IdleStopMinutes > 0 {
+		s.stampBirthAutoSleep(info.Ref.Name, req.IdleStopMinutes)
+	}
+
+	// Birth stopped→delete (#525): record the window so the ttlsweeper reaps
+	// the box once it's been stopped that long. Best-effort like the other
+	// lifecycle stamps. The clock only starts when the box actually stops
+	// (StopContainer stamps stopped_at), so just persisting the window here
+	// is enough.
+	if req.DeleteAfterStoppedSeconds > 0 {
+		s.stampBirthDeleteAfterStopped(info.Ref.Name, req.DeleteAfterStoppedSeconds)
+	}
+
+	// Deliver tenant secrets to the new box — env config on LXC, the
+	// mounted Secret on K8s (best-effort; a failure here doesn't fail the
+	// create, and RefreshSecrets is the retry). Runs after the box exists,
+	// which on K8s matters: the Secret lands in the tenant namespace, and
+	// that namespace is created with the box.
+	if s.secretsStore != nil {
+		if n, err := s.stampSecrets(ctx, req.Username); err != nil {
+			log.Printf("[secrets] failed to stamp on %s: %v (continuing)", info.Ref.Name, err)
+		} else if n > 0 {
+			log.Printf("[secrets] stamped %d secret(s) on %s at create time", n, info.Ref.Name)
+		}
+	}
+
+	// Refresh the collector's IP map so the new container's
+	// app-emitted OTLP is attributed correctly. Best-effort.
+	s.refreshContainerIPMap()
+
+	// Convert to protobuf
+	protoContainer := toProtoContainer(info)
+	protoContainer.Pool = s.resolvePool(protoContainer.BackendId)
+	protoContainer.SshHost = s.sshHost
+
+	// Emit container created event
+	s.emitter.EmitContainerCreated(protoContainer)
+
+	// Push the new box's SSH key into the sentinel's sshpiper routing table
+	// before returning, so RUNNING actually means SSH-reachable (cloud
+	// #971). Without this the caller races a 2-minute keysync tick and its
+	// first connections get `Permission denied (publickey)`.
+	s.notifySentinelKeyChange(ctx, "create_container "+req.Username)
+
+	resp = &pb.CreateContainerResponse{
+		Container: protoContainer,
+		Message:   fmt.Sprintf("Container %s created successfully", info.Ref.Name),
+	}
+
+	if ostype.IsWindows(req.OsType) {
+		// Windows VM: return RDP address, skip jump server account
+		resp.RdpAddress = protoContainer.RdpAddress
+
+		// Register RDP connection in Guacamole (best-effort, runs in background)
+		go func() {
+			rdpPassword := info.Labels["rdp-password"]
+			connID := s.registerGuacamoleConnection(info.Ref.Name, info.IPAddress, "Administrator", rdpPassword)
+			if connID != "" {
+				// Store connection ID as a label for cleanup on delete
+				_ = s.manager.AddLabel(req.Username, guacamoleConnectionIDLabel, connID)
+			}
+		}()
+	} else {
+		// Linux container: return SSH command and ensure jump server account.
+		resp.SshCommand = sshCommandFor(req.Username, protoContainer.SshHost, info.IPAddress)
+		go func() {
+			if err := container.EnsureJumpServerAccount(req.Username); err != nil {
+				log.Printf("Warning: failed to create jump server account for %s: %v", req.Username, err)
+				return
+			}
+			log.Printf("Jump server account ensured for %s", req.Username)
+
+			// Write the create-request ssh_keys to the HOST-SIDE
+			// authorized_keys (the jump-server account's file), the same
+			// file AddSSHKey writes and ServeAuthorizedKeys serves to the
+			// sentinel keysync. EnsureJumpServerAccount only creates the
+			// account with an empty .ssh; the request keys were applied to
+			// the LXC-internal authorized_keys (via Container.SSHKeys) but
+			// NOT here — so a box created with ssh_keys was reachable on the
+			// box itself yet REJECTED at the sentinel (publickey), because
+			// sshpiper validates the client against the host-side file. Mirror
+			// the request keys here so the sentinel authorizes exactly the
+			// keys the box does. Keys are already validated above. (#470)
+			// Each key written is also registered in ssh_keys (#2517).
+			s.syncCreateRequestKeys(context.Background(), req.Username, req.SshKeys)
+		}()
+	}
+
+	return resp, nil
+}
+
+// ListContainers lists all containers
+func (s *ContainerServer) ListContainers(ctx context.Context, req *pb.ListContainersRequest) (*pb.ListContainersResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
+		return nil, err
+	}
+	// Tenant isolation: non-admin callers may only see their own
+	// containers. Empty req.Username for a non-admin is rewritten to
+	// the authenticated subject (was "list everyone's"); an explicit
+	// different username is denied.
+	subject, roles, ok := auth.SubjectFromGRPCContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "no authenticated subject")
+	}
+	if !auth.HasRole(roles, auth.RoleAdmin) {
+		if req.Username != "" && req.Username != subject {
+			return nil, status.Error(codes.PermissionDenied, "not authorized for this tenant")
+		}
+		req.Username = subject
+	}
+
+	// Snapshot in-flight async creations so list state is provisioning-aware
+	// (#1036). GetContainer has reported CREATING/PROVISIONING from this map
+	// since #837; list bypassed it, so a box ~30s into a multi-minute
+	// provisioning run showed raw incus RUNNING to every list consumer
+	// (control-plane state sync, CLI list) — inviting SSH long before the
+	// box was actually ready. Failed creates (Done + Error) stay out of the
+	// list on purpose: their instance is gone, and GetContainer owns
+	// surfacing the ERROR until its cleanup.
+	pendingStates := map[string]pb.ContainerState{}
+	s.pendingMu.RLock()
+	for u, p := range s.pendingCreations {
+		if !p.active() {
+			continue
+		}
+		st := pb.ContainerState_CONTAINER_STATE_CREATING
+		if p.Provisioning {
+			st = pb.ContainerState_CONTAINER_STATE_PROVISIONING
+		}
+		pendingStates[u] = st
+	}
+	s.pendingMu.RUnlock()
+
+	// #1525: a K8s-backed daemon's manager wraps incus.UnavailableBackend,
+	// which fails every call with "incus backend not available on this
+	// host" — list has to dispatch through the runtime-neutral
+	// box.BoxBackend seam the same way create/delete/get already do,
+	// rather than assume Incus. box.BoxStatus already carries the
+	// runtime-neutral IsCore flag in place of Role.IsCoreRole(), so
+	// filtering mirrors the Incus path's logic exactly, just off the
+	// neutral type.
+	var protoContainers []*pb.Container
+	if bb, isK8s := s.k8sBoxes(); isK8s {
+		statuses, err := bb.List(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list containers: %w", err)
+		}
+		for i := range statuses {
+			st := &statuses[i]
+			if st.IsCore {
+				continue
+			}
+			if req.Username != "" && st.Ref.Tenant != req.Username {
+				continue
+			}
+			if len(req.LabelFilter) > 0 && !incus.MatchLabels(st.Labels, req.LabelFilter) {
+				continue
+			}
+			pc := toProtoContainer(st)
+			pc.Pool = s.resolvePool(pc.BackendId)
+			pc.SshHost = s.sshHost
+			s.withEncryptionState(ctx, pc)
+			protoContainers = append(protoContainers, pc)
+		}
+	} else {
+		containers, err := s.manager.List()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list containers: %w", err)
+		}
+
+		// Filter containers. The state filter is NOT applied here: it must
+		// match the provisioning-aware state the response reports (overlaid
+		// below), not the raw incus state — otherwise state=RUNNING would
+		// wrongly include a mid-provisioning box. applyProvisioningOverlay
+		// re-applies it post-overlay for these local entries (peer entries
+		// never went through the state filter — unchanged).
+		var filtered []incus.ContainerInfo
+		for _, c := range containers {
+			// Exclude core containers (postgres, caddy) from user-facing listings
+			if c.Role.IsCoreRole() {
+				continue
+			}
+
+			// Filter by username if specified
+			if req.Username != "" {
+				// Extract username from container name (format: username-container)
+				username := c.Name
+				if len(c.Name) > 10 && c.Name[len(c.Name)-10:] == "-container" {
+					username = c.Name[:len(c.Name)-10]
+				}
+				if username != req.Username {
+					continue
+				}
+			}
+
+			// Filter by labels if specified
+			if len(req.LabelFilter) > 0 {
+				if !incus.MatchLabels(c.Labels, req.LabelFilter) {
+					continue
+				}
+			}
+
+			filtered = append(filtered, c)
+		}
+
+		// Tag local containers with this daemon's backend ID
+		if s.peerPool != nil && s.peerPool.LocalBackendID() != "" {
+			for i := range filtered {
+				filtered[i].BackendID = s.peerPool.LocalBackendID()
+			}
+		}
+
+		// Convert to protobuf.
+		for i := range filtered {
+			st := boxlxc.StatusFromInfo(&filtered[i])
+			pc := toProtoContainer(&st)
+			pc.Pool = s.resolvePool(pc.BackendId)
+			pc.SshHost = s.sshHost
+			// Local boxes only. A peer's containers are described by the peer —
+			// asking THIS daemon's hooks about them would answer from the wrong
+			// key custody and report every remote container as unencrypted.
+			s.withEncryptionState(ctx, pc)
+			protoContainers = append(protoContainers, pc)
+		}
+	}
+
+	protoContainers = applyProvisioningOverlay(protoContainers, pendingStates,
+		req.Username, req.State, len(req.LabelFilter) > 0, s.sshHost)
+
+	// Add containers from peer backends. A peer that couldn't be reached
+	// contributes zero entries here — reported separately in
+	// unreachable_backends so callers can tell "unreachable" from "this
+	// backend genuinely has no containers" instead of both looking like a
+	// bare absence (#1902, sibling of #1901's GetMetrics fix).
+	var unreachableBackends []*pb.UnreachableBackend
+	if s.peerPool != nil {
+		authToken := extractAuthToken(ctx)
+		peerContainers, unreachable := s.peerPool.ListContainers(authToken)
+		for i := range peerContainers {
+			st := boxlxc.StatusFromInfo(&peerContainers[i])
+			pc := toProtoContainer(&st)
+			pc.Pool = s.resolvePool(pc.BackendId)
+			pc.SshHost = s.sshHost
+			protoContainers = append(protoContainers, pc)
+		}
+		for _, u := range unreachable {
+			unreachableBackends = append(unreachableBackends, &pb.UnreachableBackend{
+				BackendId: u.BackendID,
+				Reason:    u.Reason,
+			})
+		}
+	}
+
+	return &pb.ListContainersResponse{
+		Containers:          protoContainers,
+		TotalCount:          safecast.I32(len(protoContainers)),
+		UnreachableBackends: unreachableBackends,
+	}, nil
+}
+
+// applyProvisioningOverlay makes a list response honest about in-flight async
+// creations (#1036), in three steps:
+//
+//  1. A local entry whose username has a pending creation reports that
+//     pending state (CREATING/PROVISIONING) instead of the raw incus state —
+//     incus says "Running" the moment the instance boots, minutes before
+//     provisioning (package install, key setup) finishes and SSH works.
+//  2. A pending creation with no incus instance yet gets a synthetic entry
+//     (same shape GetContainer synthesizes), so a just-accepted create is
+//     visible in list at all. Synthetics are skipped when a label filter is
+//     in effect: a provisioning box's labels aren't stamped yet, so it can't
+//     genuinely match any label filter.
+//  3. The request's state filter is applied here, against the final overlaid
+//     state (the caller removed it from the raw-incus filtering pass).
+//
+// Pure function over the already-converted local entries so the overlay is
+// unit-testable without an incus-backed Manager.
+func applyProvisioningOverlay(local []*pb.Container, pending map[string]pb.ContainerState,
+	usernameFilter string, stateFilter pb.ContainerState, hasLabelFilter bool, sshHost string) []*pb.Container {
+
+	out := make([]*pb.Container, 0, len(local)+len(pending))
+	seen := make(map[string]bool, len(pending))
+	for _, pc := range local {
+		if st, ok := pending[pc.Username]; ok {
+			pc.State = st
+			seen[pc.Username] = true
+		}
+		if stateFilter != pb.ContainerState_CONTAINER_STATE_UNSPECIFIED && pc.State != stateFilter {
+			continue
+		}
+		out = append(out, pc)
+	}
+
+	if hasLabelFilter {
+		return out
+	}
+	for u, st := range pending {
+		if seen[u] {
+			continue
+		}
+		if usernameFilter != "" && u != usernameFilter {
+			continue
+		}
+		if stateFilter != pb.ContainerState_CONTAINER_STATE_UNSPECIFIED && st != stateFilter {
+			continue
+		}
+		out = append(out, &pb.Container{
+			Name:     u + "-container",
+			Username: u,
+			State:    st,
+			SshHost:  sshHost,
+		})
+	}
+	return out
+}
+
+// GetContainer gets information about a specific container
+func (s *ContainerServer) GetContainer(ctx context.Context, req *pb.GetContainerRequest) (*pb.GetContainerResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// Check if there's a pending async creation
+	s.pendingMu.RLock()
+	pending, hasPending := s.pendingCreations[req.Username]
+	s.pendingMu.RUnlock()
+
+	if pending.active() {
+		// Determine if creating or provisioning
+		state := pb.ContainerState_CONTAINER_STATE_CREATING
+		if pending.Provisioning {
+			state = pb.ContainerState_CONTAINER_STATE_PROVISIONING
+		}
+		return &pb.GetContainerResponse{
+			Container: &pb.Container{
+				Name:     fmt.Sprintf("%s-container", req.Username),
+				Username: req.Username,
+				State:    state,
+			},
+		}, nil
+	}
+
+	if hasPending && pending.Done && pending.Error != nil {
+		// Creation failed - return ERROR state with error details
+		log.Printf("Async creation failed for %s: %v", req.Username, pending.Error)
+		return &pb.GetContainerResponse{
+			Container: &pb.Container{
+				Name:     fmt.Sprintf("%s-container", req.Username),
+				Username: req.Username,
+				State:    pb.ContainerState_CONTAINER_STATE_ERROR,
+			},
+		}, nil
+	}
+
+	// Try to get from Incus
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil || info == nil {
+		// Not found locally — try peers
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			peerContainers, _ := s.peerPool.ListContainers(authToken)
+			containerName := req.Username + "-container"
+			for _, pc := range peerContainers {
+				if pc.Name == containerName {
+					st := boxlxc.StatusFromInfo(&pc)
+					proto := toProtoContainer(&st)
+					proto.Pool = s.resolvePool(proto.BackendId)
+					proto.SshHost = s.sshHost
+					return &pb.GetContainerResponse{
+						Container: proto,
+					}, nil
+				}
+			}
+		}
+
+		// If we had a pending creation that completed, clean it up
+		if hasPending && pending.Done {
+			s.pendingMu.Lock()
+			delete(s.pendingCreations, req.Username)
+			s.pendingMu.Unlock()
+		}
+		if err == nil {
+			err = fmt.Errorf("container not found")
+		}
+		return nil, fmt.Errorf("failed to get container: %w", err)
+	}
+
+	// Clean up pending creation if exists
+	if hasPending {
+		s.pendingMu.Lock()
+		delete(s.pendingCreations, req.Username)
+		s.pendingMu.Unlock()
+	}
+
+	protoInfo := toProtoContainer(info)
+	protoInfo.Pool = s.resolvePool(protoInfo.BackendId)
+	protoInfo.SshHost = s.sshHost
+	// #1202: surface KEY_UNAVAILABLE before someone trips over it. ZFS lets
+	// snapshots be taken with the key unloaded and refuses only to read them
+	// back, so without this a tenant accumulates unrestorable snapshots and
+	// nothing says so until a restore is attempted.
+	s.withEncryptionState(ctx, protoInfo)
+	return &pb.GetContainerResponse{
+		Container: protoInfo,
+		// TODO: Add metrics
+	}, nil
+}
+
+// DeleteContainer deletes a container
+func (s *ContainerServer) DeleteContainer(ctx context.Context, req *pb.DeleteContainerRequest) (resp *pb.DeleteContainerResponse, err error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	containerName := fmt.Sprintf("%s-container", req.Username)
+
+	// #1083: everything past this point is a genuine attempt to delete a
+	// container — k8s, peer-forwarded, or local-manager. Auth/validation
+	// above is a client-side rejection, not a provisioning attempt, and is
+	// deliberately not counted. Unlike CreateContainer, delete has no async
+	// path — every branch below resolves synchronously, so one defer over
+	// the named returns covers all three uniformly.
+	provisionStart := time.Now()
+	defer func() {
+		s.platformStats.RecordProvisionAttempt(platformstats.OperationDelete, err == nil, time.Since(provisionStart))
+	}()
+
+	// Claim any in-flight async creation before touching the instance (#1035).
+	// Provisioning takes minutes, so a delete very often lands mid-run; without
+	// this the goroutine reports the resulting "Instance not found" as
+	// "Async container creation failed", which reads in the journal exactly
+	// like a genuine create bug. Marking first (not after) matters: the
+	// misleading exec errors are produced by the delete itself.
+	cancelledCreate := s.cancelPendingCreation(req.Username)
+	if cancelledCreate {
+		log.Printf("Delete for %s arrived while its creation was still provisioning; cancelling the create", req.Username)
+	}
+
+	// Before deleting, deregister Guacamole connection if this is a Windows VM
+	s.deregisterGuacamoleConnection(req.Username)
+
+	if bb, isK8s := s.k8sBoxes(); isK8s {
+		// K8s runtime: deleting the Sandbox cascades to its pod + Service via
+		// owner refs; the backend keeps the namespace + data PVC (its
+		// delete-retains-data contract) and removes the gateway Pipe + Secrets.
+		if err := bb.Delete(ctx, box.BoxRef{Tenant: req.Username}, req.Force); err != nil {
+			s.uncancelPendingCreation(req.Username, cancelledCreate)
+			return nil, fmt.Errorf("failed to delete container: %w", err)
+		}
+		s.cascadeContainerCleanup(ctx, containerName, req.Username)
+		s.emitter.EmitContainerDeleted(containerName)
+		// Retire the box's sshpiper pipe now, not on the next tick — see
+		// the LXC delete path below for why (cloud #971).
+		s.notifySentinelKeyChange(ctx, "delete_container "+req.Username)
+		return &pb.DeleteContainerResponse{
+			Message:       fmt.Sprintf("Container for user %s deleted successfully", req.Username),
+			ContainerName: containerName,
+		}, nil
+	}
+
+	err = s.manager.Delete(req.Username, req.Force)
+	if err != nil {
+		// Not found locally — try peers
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+			if peer != nil {
+				forceParam := ""
+				if req.Force {
+					forceParam = "?force=true"
+				}
+				_, statusCode, fwdErr := peer.ForwardRequest("DELETE", fmt.Sprintf("/v1/containers/%s%s", req.Username, forceParam), authToken, nil)
+				if fwdErr != nil {
+					s.uncancelPendingCreation(req.Username, cancelledCreate)
+					return nil, fmt.Errorf("failed to delete container on peer %s: %w", peer.ID, fwdErr)
+				}
+				if statusCode >= 400 {
+					s.uncancelPendingCreation(req.Username, cancelledCreate)
+					return nil, fmt.Errorf("peer %s returned status %d for delete", peer.ID, statusCode)
+				}
+				return &pb.DeleteContainerResponse{
+					Message:       fmt.Sprintf("Container for user %s deleted on backend %s", req.Username, peer.ID),
+					ContainerName: containerName,
+				}, nil
+			}
+			// #1905: the container may genuinely be nowhere, or it may be
+			// sitting on one of these unreachable backends — reporting
+			// "deleted"/"not found" here would be a false positive/negative
+			// on a real container.
+			if len(unreachablePeers) > 0 {
+				s.uncancelPendingCreation(req.Username, cancelledCreate)
+				return nil, fmt.Errorf("cannot confirm delete for %s: %d backend(s) unreachable (%s)",
+					req.Username, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+		}
+		s.uncancelPendingCreation(req.Username, cancelledCreate)
+		return nil, fmt.Errorf("failed to delete container: %w", err)
+	}
+
+	// Cascade-clean the routes + TLS subjects + host user that this
+	// container owned. The LXC is gone above; without these steps the
+	// public hostname returns 502 (Caddy route still points at a
+	// deleted upstream IP) and Caddy keeps trying to ACME-renew an
+	// orphaned cert. All best-effort: any single failure logs a
+	// warning but doesn't block the response — the LXC delete already
+	// succeeded, and partial-cascade is better than telling the caller
+	// "delete failed" when the container is in fact gone.
+	s.cascadeContainerCleanup(ctx, containerName, req.Username)
+
+	// Emit container deleted event
+	s.emitter.EmitContainerDeleted(containerName)
+
+	// Drop the box's pipe from the sentinel's routing table now rather than
+	// leaving it live until the next tick (cloud #971 is the same clock,
+	// read from the other end: a deleted box's key stays routable for up to
+	// two minutes). Apply()'s stale-dir prune (#835) does the removal; this
+	// just stops it waiting on the timer.
+	s.notifySentinelKeyChange(ctx, "delete_container "+req.Username)
+
+	// Refresh the collector's IP map so the deleted container's IP
+	// is no longer claimed in source-IP attribution.
+	s.refreshContainerIPMap()
+
+	return &pb.DeleteContainerResponse{
+		Message:       fmt.Sprintf("Container for user %s deleted successfully", req.Username),
+		ContainerName: containerName,
+	}, nil
+}
+
+// cancelPendingCreation flags an in-flight async creation for this user as
+// cancelled-by-delete and reports whether it found one (#1035). The creating
+// goroutine can't be aborted mid-step — it's deep inside an image launch or a
+// package install — so cancellation is about attribution, not interruption:
+// the goroutine reads the flag on completion and logs a cancellation instead
+// of a failure, and Get/List stop reporting CREATING for a box that is being
+// torn down.
+func (s *ContainerServer) cancelPendingCreation(username string) bool {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	pending, exists := s.pendingCreations[username]
+	if !exists || pending.Done || pending.Cancelled {
+		return false
+	}
+	pending.Cancelled = true
+	return true
+}
+
+// uncancelPendingCreation reverts a cancellation whose delete then failed, so
+// a creation that is still genuinely running keeps reporting its real state.
+// No-op unless this delete is the one that set the flag.
+func (s *ContainerServer) uncancelPendingCreation(username string, cancelled bool) {
+	if !cancelled {
+		return
+	}
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if pending, exists := s.pendingCreations[username]; exists {
+		pending.Cancelled = false
+	}
+}
+
+// cascadeContainerCleanup removes the resources that DeleteContainer's
+// LXC-delete leaves behind. Documented as #69 / verified live against
+// the demo cluster on 2026-05-14.
+//
+// Order is deliberate:
+//  1. Route store first — kills the source of truth so RouteSyncJob
+//     will reap the Caddy srv0 route on its next tick (5s). Deleting
+//     directly from Caddy without this step lets the sync job
+//     resurrect the route within seconds, producing the 502-after-
+//     delete trap.
+//  2. TLS subject removal — stops Caddy's ACME renewal loop for the
+//     dead hostname. Harmless to keep (no upstream to challenge) but
+//     wastes rate-limit budget over time.
+//  3. Host user (jump-server account) — removes the Linux user, home,
+//     and the containarium-shell wrapper. sshpiper auto-reaps the
+//     user from its own config on the next keysync (2 min).
+//
+// On-disk Caddy cert at /data/caddy/certificates/... is intentionally
+// left in place — it's harmless after step 2 (no renewal attempts) and
+// avoids a "force" mode that the caller probably doesn't want.
+func (s *ContainerServer) cascadeContainerCleanup(ctx context.Context, containerName, username string) {
+	// 1. Route store: enumerate this container's routes and drop each.
+	//    Skip if routeStore was never wired (daemon without app-hosting).
+	if s.routeStore != nil {
+		routes, err := s.routeStore.ListByContainer(ctx, containerName)
+		if err != nil {
+			log.Printf("[delete-cascade] list routes for %s failed: %v", containerName, err)
+		}
+		for _, r := range routes {
+			if err := s.routeStore.Delete(ctx, r.FullDomain); err != nil {
+				log.Printf("[delete-cascade] delete route %s failed: %v", r.FullDomain, err)
+				continue
+			}
+			log.Printf("[delete-cascade] removed route %s (RouteSyncJob will reap Caddy entry)", r.FullDomain)
+
+			// 2. TLS subject: only if we also have a proxy manager.
+			if s.proxyManager != nil {
+				if err := s.proxyManager.RemoveTLSSubject(r.FullDomain); err != nil {
+					log.Printf("[delete-cascade] remove TLS subject %s failed: %v", r.FullDomain, err)
+				} else {
+					log.Printf("[delete-cascade] removed TLS automation subject %s", r.FullDomain)
+				}
+			}
+		}
+	}
+
+	// 2b. Passthrough store: same cascade, for TCP/UDP passthrough routes
+	//     (#1462). Without this a deleted box's external_port stays claimed
+	//     forever — a later recipe deploy wanting that same port fails with
+	//     a stale "already claimed" conflict against a container that no
+	//     longer exists.
+	if s.passthroughStore != nil {
+		routes, err := s.passthroughStore.ListByContainer(ctx, containerName)
+		if err != nil {
+			log.Printf("[delete-cascade] list passthrough routes for %s failed: %v", containerName, err)
+		}
+		for _, r := range routes {
+			if err := s.passthroughStore.Delete(ctx, r.ExternalPort, r.Protocol); err != nil {
+				log.Printf("[delete-cascade] delete passthrough route %d/%s failed: %v", r.ExternalPort, r.Protocol, err)
+				continue
+			}
+			log.Printf("[delete-cascade] removed passthrough route %d/%s (sync job will reap the iptables rule)",
+				r.ExternalPort, r.Protocol)
+		}
+	}
+
+	// 3. Host user. DeleteJumpServerAccount is idempotent (no-op if the
+	//    user doesn't exist), so calling it when there isn't one is fine.
+	if err := container.DeleteJumpServerAccount(username, false); err != nil {
+		log.Printf("[delete-cascade] delete host user %s failed: %v (manual: sudo userdel -r %s)", username, err, username)
+	} else {
+		log.Printf("[delete-cascade] removed host user %s", username)
+	}
+}
+
+// lifecycleError wraps a start/stop failure with a gRPC code so the gateway
+// stops reporting every failure as Unknown (#3242): a missing instance is
+// NotFound, anything else gets fallback. The message keeps the original text.
+func lifecycleError(fallback codes.Code, msg string, cause error) error {
+	if incus.IsNotFound(cause) {
+		return status.Error(codes.NotFound, msg)
+	}
+	return status.Error(fallback, msg)
+}
+
+// StartContainer starts a stopped container
+func (s *ContainerServer) StartContainer(ctx context.Context, req *pb.StartContainerRequest) (*pb.StartContainerResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	alreadyRunning := false
+	if bb, isK8s := s.k8sBoxes(); isK8s {
+		// K8s runtime: resume the Sandbox (operatingMode=Running); the
+		// agent-sandbox controller recreates the pod with the retained PVC.
+		if err := bb.Start(ctx, box.BoxRef{Tenant: req.Username}); err != nil {
+			return nil, fmt.Errorf("failed to start container: %w", err)
+		}
+	} else {
+		// Pre-start hook (#1199): unlock the dataset before the LXC
+		// boots. A failure stops the start — a container whose storage
+		// is unreadable is worse than one that refused to come up.
+		if err := s.encryption.PreStart(ctx, req.Username+"-container"); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		if c, err := s.manager.StartIfStopped(req.Username); err == nil {
+			alreadyRunning = !c
+		} else {
+			// Try peer
+			if s.peerPool != nil {
+				authToken := extractAuthToken(ctx)
+				peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+				if peer == nil && len(unreachablePeers) > 0 {
+					// #1905: don't report "failed to start" (which reads as
+					// "no such container") when the container may actually
+					// be sitting on a backend we just couldn't reach.
+					return nil, status.Errorf(codes.Unavailable, "cannot start %s: %d backend(s) unreachable (%s)",
+						req.Username, len(unreachablePeers), unreachablePeers[0].Reason)
+				}
+				if peer != nil {
+					body, _ := json.Marshal(map[string]interface{}{
+						"wait_for_ready":        req.WaitForReady,
+						"ready_timeout_seconds": req.ReadyTimeoutSeconds,
+					})
+					_, _, fwdErr := peer.ForwardRequest("POST", fmt.Sprintf("/v1/containers/%s/start", req.Username), authToken, body)
+					if fwdErr == nil {
+						// #1411: a peer-forwarded start reached the local
+						// stamp below only when Start succeeded on THIS
+						// daemon — never on this branch, so a container
+						// woken on a peer got none of the anti-thrash
+						// grace a locally-woken one does, and the very
+						// next autosleep tick could put it straight back
+						// to sleep. Best-effort, same as the local-success
+						// stamp: a failure here just means one extra
+						// wake→sleep flap, not a broken start.
+						if err := s.manager.SetConfig(req.Username+"-container", incus.LastStartedAtKey, time.Now().UTC().Format(time.RFC3339)); err != nil {
+							log.Printf("[autosleep] failed to stamp %s on %s after peer-forward: %v (continuing)", incus.LastStartedAtKey, req.Username, err)
+						}
+						return &pb.StartContainerResponse{
+							Message: fmt.Sprintf("Container for user %s started on backend %s", req.Username, peer.ID),
+						}, nil
+					}
+				}
+			}
+			return nil, lifecycleError(codes.Internal, fmt.Sprintf("failed to start container: %v", err), err)
+		}
+
+		// #3242: the end state already held; nothing changed, so skip the
+		// start-time stamps, secret re-delivery and the started event.
+		if alreadyRunning {
+			info, gerr := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+			if gerr != nil {
+				return nil, fmt.Errorf("container already running but failed to get info: %w", gerr)
+			}
+			resp := &pb.StartContainerResponse{
+				Message: fmt.Sprintf("Container for user %s was already running", req.Username),
+			}
+			if info != nil {
+				resp.Container = toProtoContainer(info)
+			}
+			return resp, nil
+		}
+
+		// Stamp last-start timestamp so the Phase 2 auto-sleep ticker can
+		// enforce its anti-thrash window (don't sleep within 2× threshold
+		// of the most recent start). Best-effort — if the SetConfig fails
+		// the container is already running, and the worst case is one
+		// extra wake → sleep flap.
+		if err := s.manager.SetConfig(req.Username+"-container", incus.LastStartedAtKey, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			log.Printf("[autosleep] failed to stamp %s on %s: %v (continuing)", incus.LastStartedAtKey, req.Username, err)
+		}
+
+		// Two-phase reaping (#525): the box is running again, so clear stopped_at.
+		// This resets the stopped→delete timer — a box someone keeps waking to
+		// investigate never gets reaped; only a box left continuously stopped past
+		// its window does. Best-effort + idempotent (UnsetConfig of an absent key
+		// is a no-op).
+		if err := s.manager.UnsetConfig(req.Username+"-container", incus.StoppedAtKey); err != nil {
+			log.Printf("[ttl] failed to clear %s on %s: %v (continuing)", incus.StoppedAtKey, req.Username, err)
+		}
+
+		// Re-deliver tenant secrets from the current DB state. Picks up
+		// any rotations that happened while the box was stopped; existing
+		// processes won't see the change (POSIX inherit-at-fork), but new
+		// execs and new sessions will.
+		if s.secretsStore != nil {
+			if n, err := s.stampSecrets(ctx, req.Username); err != nil {
+				log.Printf("[secrets] failed to re-deliver on start of %s's box: %v (continuing)", req.Username, err)
+			} else if n > 0 {
+				log.Printf("[secrets] re-delivered %d secret(s) to %s's box at start time", n, req.Username)
+			}
+		}
+	}
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("container started but failed to get info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("container started but not found on read-back")
+	}
+
+	timedOut := false
+	if req.WaitForReady {
+		timeoutSec := req.ReadyTimeoutSeconds
+		if timeoutSec <= 0 {
+			timeoutSec = 30
+		}
+		timedOut = s.waitForContainerReady(ctx, req.Username, info.IPAddress, time.Duration(timeoutSec)*time.Second)
+	}
+
+	s.emitter.EmitContainerStarted(toProtoContainer(info))
+
+	// Post-start: point this container's Caddy routes back at the
+	// container's direct IP/port (undo the wake-mode swap that
+	// StopForAutoSleep applied when the container went to sleep).
+	// Only fires for containers with auto-sleep enabled — that's the
+	// only path that could have left them in wake mode in the first
+	// place. Best-effort; RouteSyncJob re-converges if this fails.
+	if s.wakeRouter != nil && s.routeStore != nil && info != nil && info.AutoSleepEnabled {
+		containerName := req.Username + "-container"
+		routes, err := s.routeStore.ListByContainer(ctx, containerName)
+		if err != nil {
+			log.Printf("[wake] list routes for %s: %v (skipping swap-to-direct)", containerName, err)
+		} else if len(routes) > 0 {
+			if err := s.wakeRouter.SwapToDirect(ctx, containerName, routes); err != nil {
+				log.Printf("[wake] swap-to-direct %s: %v", containerName, err)
+			}
+		}
+	}
+
+	msg := fmt.Sprintf("Container for user %s started successfully", req.Username)
+	if req.WaitForReady && timedOut {
+		msg = fmt.Sprintf("Container for user %s started but readiness probe timed out", req.Username)
+	}
+
+	return &pb.StartContainerResponse{
+		Message:       msg,
+		Container:     toProtoContainer(info),
+		ReadyTimedOut: timedOut,
+	}, nil
+}
+
+// waitForContainerReady polls a TCP dial against the container's
+// primary exposed port until it accepts or the deadline elapses.
+// Returns true when the probe timed out. A nil routeStore, an absent
+// route record, an empty container IP, or a non-positive port all
+// short-circuit to "ready immediately" — the probe is opportunistic.
+func (s *ContainerServer) waitForContainerReady(ctx context.Context, username, containerIP string, total time.Duration) bool {
+	if s.routeStore == nil || containerIP == "" {
+		return false
+	}
+	containerName := username + "-container"
+	routes, err := s.routeStore.ListByContainer(ctx, containerName)
+	if err != nil || len(routes) == 0 {
+		return false
+	}
+	port := routes[0].TargetPort
+	if port <= 0 {
+		return false
+	}
+
+	addr := net.JoinHostPort(containerIP, strconv.Itoa(port))
+	deadline := time.Now().Add(total)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	return true
+}
+
+// StopContainer stops a running container
+func (s *ContainerServer) StopContainer(ctx context.Context, req *pb.StopContainerRequest) (*pb.StopContainerResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	alreadyStopped := false
+	if bb, isK8s := s.k8sBoxes(); isK8s {
+		// K8s runtime: suspend the Sandbox (operatingMode=Suspended); the
+		// controller deletes only the pod — PVC + Service + identity persist.
+		if err := bb.Stop(ctx, box.BoxRef{Tenant: req.Username}, req.Force); err != nil {
+			return nil, fmt.Errorf("failed to stop container: %w", err)
+		}
+	} else if c, err := s.manager.StopIfRunning(req.Username, req.Force); err != nil {
+		// Try peer
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+			if peer == nil && len(unreachablePeers) > 0 {
+				// #1905: don't report "failed to stop" as if the container
+				// didn't exist when its backend was merely unreachable.
+				return nil, status.Errorf(codes.Unavailable, "cannot stop %s: %d backend(s) unreachable (%s)",
+					req.Username, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+			if peer != nil {
+				body, _ := json.Marshal(map[string]bool{"force": req.Force})
+				_, _, fwdErr := peer.ForwardRequest("POST", fmt.Sprintf("/v1/containers/%s/stop", req.Username), authToken, body)
+				if fwdErr == nil {
+					return &pb.StopContainerResponse{
+						Message: fmt.Sprintf("Container for user %s stopped on backend %s", req.Username, peer.ID),
+					}, nil
+				}
+			}
+		}
+		return nil, lifecycleError(codes.Internal, fmt.Sprintf("failed to stop container: %v", err), err)
+	} else if !c {
+		// #3242: the end state already held. Nothing changed, so none of the
+		// post-stop work runs: re-stamping stopped_at would keep postponing the
+		// stopped->delete timer (#525) on every redundant stop.
+		alreadyStopped = true
+	}
+
+	if alreadyStopped {
+		info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+		if err != nil {
+			return nil, fmt.Errorf("container already stopped but failed to get info: %w", err)
+		}
+		resp := &pb.StopContainerResponse{
+			Message: fmt.Sprintf("Container for user %s was already stopped", req.Username),
+		}
+		if info != nil {
+			resp.Container = toProtoContainer(info)
+		}
+		return resp, nil
+	}
+
+	// Post-stop hook (#1201): drop the encryption key so the stopped
+	// container's dataset is ciphertext, including to host root. Runs
+	// only once the LXC is actually down — unloading a key under a
+	// running container would pull its storage away.
+	//
+	// Best-effort by design: the container has already stopped, so a
+	// failed unload cannot be reported as a failed stop. The operator
+	// learns from the log, and "key still in use" (a co-tenant still
+	// running under the same encryptionroot) is the expected case.
+	s.encryption.PostStop(ctx, req.Username+"-container")
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("container stopped but failed to get info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("container stopped but not found on read-back")
+	}
+
+	// Two-phase reaping (#525): record when the box became stopped so the
+	// ttlsweeper's stopped→delete timer runs from here. Best-effort — a failed
+	// stamp just means the stopped→delete clock doesn't start until a later
+	// stop restamps it; it never fails the stop. Only matters for boxes that
+	// opted into delete_after_stopped, but stamping unconditionally keeps the
+	// timestamp honest for any box and costs one config write. LXC-only: the
+	// stopped→delete rule isn't modeled on the k8s runtime yet.
+	if _, isK8s := s.k8sBoxes(); !isK8s {
+		if serr := s.manager.SetConfig(info.Ref.Name, incus.StoppedAtKey, time.Now().UTC().Format(time.RFC3339)); serr != nil {
+			log.Printf("[ttl] failed to stamp %s on %s: %v (stopped→delete timer not started)", incus.StoppedAtKey, info.Ref.Name, serr)
+		}
+	}
+
+	s.emitter.EmitContainerStopped(toProtoContainer(info))
+
+	return &pb.StopContainerResponse{
+		Message:   fmt.Sprintf("Container for user %s stopped successfully", req.Username),
+		Container: toProtoContainer(info),
+	}, nil
+}
+
+// StopForAutoSleep is the entry point for the autosleep ticker. It
+// reuses StopContainer's full plumbing (manager.Stop, event emission)
+// so observers can't distinguish an auto-sleep from a manual stop on
+// the bus — by design — and prepends a tagged log line so operators
+// can grep for the reason that triggered it.
+//
+// Lives on ContainerServer rather than the autosleep package so the
+// ticker depends on a narrow interface (Stopper) rather than the full
+// internal/server import graph.
+func (s *ContainerServer) StopForAutoSleep(ctx context.Context, username, reason string, idleMinutes int) error {
+	// Autosleep is daemon-internal — promote the context to the system
+	// identity so the StopContainer authz check passes.
+	ctx = auth.ContextWithSystemIdentity(ctx)
+	log.Printf("[autosleep] stopping username=%s reason=%q idle_minutes=%d", username, reason, idleMinutes)
+
+	// Swap Caddy routes to the wake handler BEFORE stopping the
+	// container. Doing the swap first means any request arriving in
+	// the brief stop-window lands on /wake/, which (since the
+	// container is still Running at that instant) returns ready=true
+	// immediately and proxies through — one extra hop, but no 502.
+	// The reverse order leaves Caddy pointing at a dead container
+	// for the duration of the graceful stop, which is a guaranteed
+	// 502 window on every auto-sleep event. See #224.
+	if s.wakeRouter != nil && s.routeStore != nil {
+		containerName := username + "-container"
+		routes, err := s.routeStore.ListByContainer(ctx, containerName)
+		if err != nil {
+			log.Printf("[autosleep] list routes for %s: %v (skipping swap-to-wake)", containerName, err)
+		} else if len(routes) > 0 {
+			if err := s.wakeRouter.SwapToWake(ctx, containerName, routes); err != nil {
+				log.Printf("[autosleep] swap-to-wake %s: %v", containerName, err)
+				// Don't fail the stop — RouteSyncJob will re-converge.
+			}
+		}
+	}
+
+	if _, err := s.StopContainer(ctx, &pb.StopContainerRequest{Username: username, Force: false}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ResizeContainer dynamically resizes container resources
+func (s *ContainerServer) ResizeContainer(ctx context.Context, req *pb.ResizeContainerRequest) (*pb.ResizeContainerResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// At least one resource must be specified
+	if req.Cpu == "" && req.Memory == "" && req.Disk == "" && req.CpuRequest == "" && req.MemoryRequest == "" {
+		return nil, fmt.Errorf("at least one resource (cpu, memory, disk, cpu_request, or memory_request) must be specified")
+	}
+
+	containerName := fmt.Sprintf("%s-container", req.Username)
+
+	if bb, isK8s := s.k8sBoxes(); isK8s {
+		ref := box.BoxRef{Tenant: req.Username}
+		if err := bb.Resize(ctx, ref, box.ResourceLimits{CPU: req.Cpu, Memory: req.Memory, Disk: req.Disk, CPURequest: req.CpuRequest, MemoryRequest: req.MemoryRequest}); err != nil {
+			return nil, fmt.Errorf("failed to resize container: %w", err)
+		}
+		// The agent-sandbox controller doesn't restart a live pod on template
+		// drift, so bounce a running box (suspend → resume, i.e. pod recreate)
+		// to apply the new limits now — same downtime as the StatefulSet
+		// rolling restart the old path triggered. A stopped box just picks the
+		// limits up at its next start.
+		if cur, gerr := bb.Get(ctx, ref); gerr == nil && cur != nil && cur.State == pb.ContainerState_CONTAINER_STATE_RUNNING {
+			if err := bb.Stop(ctx, ref, false); err != nil {
+				return nil, fmt.Errorf("resized but failed to restart (stop) container: %w", err)
+			}
+			if err := bb.Start(ctx, ref); err != nil {
+				return nil, fmt.Errorf("resized but failed to restart (start) container: %w", err)
+			}
+		}
+		info, err := s.boxes().Get(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get updated container info: %w", err)
+		}
+		if info == nil {
+			return nil, fmt.Errorf("container resized but not found on read-back")
+		}
+		return &pb.ResizeContainerResponse{
+			Message:   fmt.Sprintf("Container %s resized successfully", containerName),
+			Container: toProtoContainer(info),
+		}, nil
+	}
+
+	// CPU capacity admission (#1579): only when the gate is enabled and the
+	// resize actually names a new CPU value, and only once the container is
+	// confirmed to live on THIS host — checked here, before the local resize
+	// attempt below, rather than unconditionally before the local/peer
+	// dispatch decision, so a resize routed to a peer is never evaluated
+	// against the wrong host's capacity. The peer's own ResizeContainer
+	// handler runs this same check against its own host once the request is
+	// forwarded, so no forwarding-side admission logic is needed here.
+	//
+	// #1588: an admitted resize reserves its cores until cpuRelease runs.
+	// ResizeContainer is fully synchronous with several return points below
+	// (local success, peer-forwarded success, various errors) — deferring a
+	// closure over cpuRelease, rather than calling it inline, releases the
+	// reservation on every one of them uniformly instead of needing a call
+	// at each site.
+	cpuRelease := noopRelease
+	defer func() { cpuRelease() }()
+	if s.cpuOvercommitFactor > 0 && req.Cpu != "" {
+		if current, gerr := s.manager.GetInfo(containerName); gerr == nil && current != nil {
+			rel, aerr := s.admitCPUResize(req.Username, current.CPU, req.Cpu)
+			if aerr != nil {
+				return nil, aerr
+			}
+			cpuRelease = rel
+		}
+	}
+
+	// Perform resize — try local first, then peer
+	if err := s.manager.Resize(containerName, req.Cpu, req.Memory, req.Disk, false); err != nil {
+		// Container not found locally — check peers
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			log.Printf("[resize] container %s not local, searching peers (token len=%d)", containerName, len(authToken))
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+			if peer == nil && len(unreachablePeers) > 0 {
+				// #1905: don't report "failed to resize" as if the
+				// container didn't exist when its backend was merely
+				// unreachable.
+				return nil, fmt.Errorf("cannot resize %s: %d backend(s) unreachable (%s)",
+					req.Username, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+			if peer != nil {
+				log.Printf("[resize] found %s on peer %s, forwarding", containerName, peer.ID)
+				body, _ := json.Marshal(map[string]string{
+					"cpu":           req.Cpu,
+					"memory":        req.Memory,
+					"disk":          req.Disk,
+					"memoryRequest": req.MemoryRequest,
+					"cpuRequest":    req.CpuRequest,
+				})
+				respBody, statusCode, fwdErr := peer.ForwardRequest("PUT", fmt.Sprintf("/v1/containers/%s/resize", req.Username), authToken, body)
+				if fwdErr != nil {
+					return nil, fmt.Errorf("failed to resize container on peer %s: %w", peer.ID, fwdErr)
+				}
+				if statusCode >= 400 {
+					return nil, fmt.Errorf("peer %s returned status %d for resize: %s", peer.ID, statusCode, string(respBody))
+				}
+				return &pb.ResizeContainerResponse{
+					Message: fmt.Sprintf("Container %s resized on backend %s", containerName, peer.ID),
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to resize container: %w", err)
+	}
+
+	// Get updated container info
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get updated container info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("container resized but not found on read-back")
+	}
+
+	// Convert to protobuf
+	protoContainer := toProtoContainer(info)
+
+	return &pb.ResizeContainerResponse{
+		Message:   fmt.Sprintf("Container %s resized successfully", containerName),
+		Container: protoContainer,
+	}, nil
+}
+
+// CleanupDisk frees disk space inside a container
+func (s *ContainerServer) CleanupDisk(ctx context.Context, req *pb.CleanupDiskRequest) (*pb.CleanupDiskResponse, error) {
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	message, freedBytes, err := s.manager.CleanupDisk(req.Username)
+	if err != nil {
+		// Try peer
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+			if peer == nil && len(unreachablePeers) > 0 {
+				// #1905: don't report "failed to cleanup" as if the
+				// container didn't exist when its backend was merely
+				// unreachable.
+				return nil, fmt.Errorf("cannot cleanup disk for %s: %d backend(s) unreachable (%s)",
+					req.Username, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+			if peer != nil {
+				respBody, statusCode, fwdErr := peer.ForwardRequest("POST", fmt.Sprintf("/v1/containers/%s/cleanup-disk", req.Username), authToken, nil)
+				if fwdErr != nil {
+					return nil, fmt.Errorf("failed to cleanup disk on peer %s: %w", peer.ID, fwdErr)
+				}
+				if statusCode >= 400 {
+					return nil, fmt.Errorf("peer %s returned status %d for cleanup: %s", peer.ID, statusCode, string(respBody))
+				}
+				// Parse peer response
+				var peerResp struct {
+					Message    string `json:"message"`
+					FreedBytes int64  `json:"freedBytes"`
+				}
+				if jsonErr := json.Unmarshal(respBody, &peerResp); jsonErr == nil {
+					return &pb.CleanupDiskResponse{
+						Message:    peerResp.Message,
+						FreedBytes: peerResp.FreedBytes,
+					}, nil
+				}
+				return &pb.CleanupDiskResponse{
+					Message: fmt.Sprintf("Disk cleaned on backend %s", peer.ID),
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to clean up disk: %w", err)
+	}
+
+	// Get updated container info
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("disk cleaned but failed to get container info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("disk cleaned but container not found on read-back")
+	}
+
+	return &pb.CleanupDiskResponse{
+		Message:    message,
+		FreedBytes: freedBytes,
+		Container:  toProtoContainer(info),
+	}, nil
+}
+
+// InstallStack installs a software stack or base script on a running container
+func (s *ContainerServer) InstallStack(ctx context.Context, req *pb.InstallStackRequest) (*pb.InstallStackResponse, error) {
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if req.StackId == "" {
+		return nil, fmt.Errorf("stack_id is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// Reject stack installation on Windows VMs
+	if containerInfo, getErr := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username}); getErr == nil && containerInfo != nil {
+		if osLabel, ok := containerInfo.Labels[ostype.OSTypeLabelKey]; ok {
+			if ostype.IsWindows(ostype.OSTypeFromLabel(osLabel)) {
+				return nil, fmt.Errorf("stack installation is not supported on Windows VMs")
+			}
+		}
+	}
+
+	if err := s.manager.InstallStack(req.Username, req.StackId); err != nil {
+		return nil, fmt.Errorf("failed to install stack: %w", err)
+	}
+
+	// Get updated container info
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("stack installed but failed to get container info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("stack installed but container not found on read-back")
+	}
+
+	return &pb.InstallStackResponse{
+		Message:   fmt.Sprintf("Stack %q installed successfully on %s-container", req.StackId, req.Username),
+		Container: toProtoContainer(info),
+	}, nil
+}
+
+// ListStacks returns the catalog of available software stacks and their
+// parameter schemas. The web UI uses this to render the Create Container
+// dialog's stack dropdown and any dynamically-shown parameter inputs.
+func (s *ContainerServer) ListStacks(ctx context.Context, req *pb.ListStacksRequest) (*pb.ListStacksResponse, error) {
+	// Static built-in stack catalog, but still behind a read scope (#1718):
+	// before this, any caller reaching the surface got it with no token authority
+	// at all.
+	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
+		return nil, err
+	}
+	mgr := stacks.GetDefault()
+	all := mgr.GetAllStacks()
+
+	out := make([]*pb.StackInfo, 0, len(all))
+	for _, stk := range all {
+		params := make([]*pb.StackParameter, 0, len(stk.Parameters))
+		for _, p := range stk.Parameters {
+			params = append(params, &pb.StackParameter{
+				Name:        p.Name,
+				Label:       p.Label,
+				Description: p.Description,
+				Type:        p.Type,
+				Default:     p.Default,
+				Required:    p.Required,
+			})
+		}
+		out = append(out, &pb.StackInfo{
+			Id:          stk.ID,
+			Name:        stk.Name,
+			Description: stk.Description,
+			Icon:        stk.Icon,
+			Parameters:  params,
+		})
+	}
+
+	return &pb.ListStacksResponse{Stacks: out}, nil
+}
+
+// AdoptMigratedContainer is the destination-side helper called by a
+// peer's MoveContainer after the LXC has been `incus copy`'d to this
+// daemon. The LXC exists on this host's incusd but Containarium
+// doesn't know about it yet — no host user, no shell wrapper, no
+// route record. This RPC fills that in and returns the container's
+// new local IP for the source to use in its route store cutover.
+//
+// Idempotent on retry: if the host user already exists,
+// EnsureJumpServerAccount is a no-op; starting an already-running
+// container is a no-op; etc. So a transient network failure
+// mid-adoption can be safely re-driven.
+func (s *ContainerServer) AdoptMigratedContainer(ctx context.Context, req *pb.AdoptMigratedContainerRequest) (*pb.AdoptMigratedContainerResponse, error) {
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	// AdoptMigratedContainer is called peer-to-peer with the
+	// destination daemon's system token (admin role). It has no
+	// user-facing semantic — it's the receiving half of
+	// MoveContainer's handshake. Admin-only at both gates: the
+	// RequireRole check stops any user token from crafting an
+	// adoption request, even one that names their own username
+	// (which AuthorizeTenant would otherwise pass).
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	containerName := fmt.Sprintf("%s-container", req.Username)
+
+	// Encryption placement first: a container this daemon cannot unlock must
+	// be refused before any host-side state is created for it (#1203).
+	if err := s.recordAdoptedPlacement(req); err != nil {
+		return nil, err
+	}
+
+	// Host-side jump-server account. EnsureJumpServerAccount handles
+	// the idempotent case so re-running this RPC won't error.
+	if err := container.EnsureJumpServerAccount(req.Username); err != nil {
+		return nil, fmt.Errorf("ensure jump server account: %w", err)
+	}
+
+	// OTel env-var re-stamping. If the migrated container had
+	// monitoring=true on the source, the OTEL_* env vars are still
+	// pointing at the SOURCE daemon's collector IP — which is unreachable
+	// (or wrong tenant!) from this destination. Re-stamp them with our
+	// local collector endpoint before starting the container, so the
+	// SDK inside picks up the new endpoint on its first batch flush.
+	//
+	// Reading MonitoringEnabled from the just-arrived LXC's Incus config
+	// is reliable: the env vars themselves are the source of truth, and
+	// `incus copy` preserves them, so if the source had monitoring on,
+	// OTEL_EXPORTER_OTLP_ENDPOINT is non-empty in the destination's
+	// config map right now (just pointing at the wrong place).
+	if s.otelCollectorEndpoint != "" {
+		if info, _ := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username}); info != nil && info.MonitoringEnabled {
+			// Phase 2.5 follow-up — re-stamp the bearer at
+			// the destination too. Best-effort; an empty
+			// bearer omits the header so monitoring still
+			// works (collector remains open).
+			bearer, _ := LoadOrCreateOTelBearer()
+			envVars := container.OTelEnvVarsForMigrationWithBearer(
+				req.Username, container.OTelContainerID(info.Labels, containerName), s.localBackendID(), s.otelCollectorEndpoint, bearer,
+			)
+			for k, v := range envVars {
+				if err := s.manager.SetEnv(containerName, k, v); err != nil {
+					log.Printf("[adopt] failed to re-stamp %s on %s: %v (continuing — partial OTel beats none)", k, containerName, err)
+				}
+			}
+			// Re-drop the dotenv file at the destination too, so
+			// docker apps pick up the new collector endpoint. #370.
+			if err := s.manager.WriteOTelEnvFile(containerName, envVars); err != nil {
+				log.Printf("[adopt] failed to write env file on %s: %v (continuing)", containerName, err)
+			}
+			log.Printf("[adopt] re-stamped OTel env vars on %s for destination collector", containerName)
+		}
+	}
+
+	// Start the container — the source already pushed the LXC's
+	// filesystem state. Idempotent if already running.
+	if s.moveRunner != nil {
+		if err := s.moveRunner.Start(containerName); err != nil {
+			return nil, fmt.Errorf("start adopted container: %w", err)
+		}
+	}
+
+	// Get the new IP. The box backend's Get() reads from the substrate.
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("get adopted container info: %w", err)
+	}
+	newIP := ""
+	if info != nil {
+		newIP = info.IPAddress
+	}
+	if newIP == "" {
+		return nil, fmt.Errorf("adopted container has no IP address yet (still initializing?)")
+	}
+
+	// The adopted container now lives on this VM under a new IP —
+	// refresh the local collector's IP map so its OTLP traffic is
+	// attributed correctly. The source VM will refresh its own map
+	// when it deletes/cleans the migrated-out shell.
+	s.refreshContainerIPMap()
+
+	// Note: we deliberately do NOT create matching route store rows
+	// here. The source-side orchestrator owns the route lifecycle —
+	// it updates the existing route rows' target_ip after we return
+	// the new IP. This keeps the source of truth on one side and
+	// avoids a transient "route exists on both sides at different
+	// IPs" window.
+	//
+	// req.SourceRoutes is accepted (and logged) for forward
+	// compatibility: if a future variant of the protocol wants the
+	// destination to be authoritative over its own route store, the
+	// data is already on the wire.
+	if len(req.SourceRoutes) > 0 {
+		log.Printf("[adopt] %s arriving with %d source routes (source owns the swap)", req.Username, len(req.SourceRoutes))
+	}
+
+	return &pb.AdoptMigratedContainerResponse{
+		Message:      fmt.Sprintf("Container %s adopted, ready at %s", req.Username, newIP),
+		NewIpAddress: newIP,
+	}, nil
+}
+
+// otelEnvKeys lists the environment variables the toggle path
+// stamps / unsets. Includes both the legacy OTEL_* form (read by
+// OTel SDKs auto-discovering) and the split CONTAINARIUM_* form
+// (read by the platform sidecar's compose interpolation). Both
+// shapes have to be unset on disable so the LXC's env is fully
+// clean afterward; otherwise a leftover CONTAINARIUM_CONTAINER_ID
+// would still appear in `printenv` and confuse audit / debug.
+var otelEnvKeys = []string{
+	"OTEL_EXPORTER_OTLP_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_PROTOCOL",
+	"OTEL_EXPORTER_OTLP_HEADERS", // Phase 2.5 follow-up — bearer auth
+	"OTEL_SERVICE_NAME",
+	"OTEL_RESOURCE_ATTRIBUTES",
+	"CONTAINARIUM_CONTAINER_ID",
+	"CONTAINARIUM_BACKEND_ID",
+	"CONTAINARIUM_TENANT_ID",
+}
+
+// ToggleMonitoring enables / disables app-emitted OTel on an existing
+// container without recreating it. Per the OTel design doc's v2 TODO.
+//
+// Enable path: requires the daemon to have a collector endpoint
+// configured (FailedPrecondition if not). Stamps the four OTEL_*
+// env vars via incus config-update, then stops + starts the LXC so
+// the env reaches the app process — env-var changes don't take
+// effect on a running container's processes.
+//
+// Disable path: deletes the four OTEL_* env keys from the LXC's
+// Incus config (so the SDK falls back to its no-endpoint defaults
+// rather than seeing literal empty strings, which some SDKs flag
+// as misconfig), then stops + starts the LXC.
+//
+// Core containers are refused — they don't run user code and don't
+// need app-emitted telemetry.
+func (s *ContainerServer) ToggleMonitoring(ctx context.Context, req *pb.ToggleMonitoringRequest) (*pb.ToggleMonitoringResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found: %v", req.Username, err)
+	}
+	if info == nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found", req.Username)
+	}
+	if info.IsCore {
+		return nil, status.Errorf(codes.InvalidArgument, "container %s is a core container; monitoring is for user containers only", info.Ref.Name)
+	}
+
+	containerName := info.Ref.Name
+
+	if req.Enabled {
+		if s.otelCollectorEndpoint == "" {
+			return nil, status.Error(codes.FailedPrecondition, "OTel collector endpoint is not configured on this daemon; cannot enable monitoring")
+		}
+		// Phase 2.5 follow-up — bearer load is best-effort.
+		// On failure the header is omitted and the collector
+		// stays open (pre-2.5 behavior), so monitoring still
+		// works for the operator.
+		bearer, _ := LoadOrCreateOTelBearer()
+		envVars := container.OTelEnvVarsForMigrationWithBearer(
+			req.Username, container.OTelContainerID(info.Labels, containerName), s.localBackendID(), s.otelCollectorEndpoint, bearer,
+		)
+		for k, v := range envVars {
+			if err := s.manager.SetEnv(containerName, k, v); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to stamp %s: %v", k, err)
+			}
+		}
+		// Also drop the dotenv file so nested docker / docker-compose
+		// apps (which don't inherit the LXC env) can consume the config
+		// via `env_file:`. Best-effort — the Incus-config env above
+		// already covers native-LXC apps. See #370.
+		if err := s.manager.WriteOTelEnvFile(containerName, envVars); err != nil {
+			log.Printf("[togglemonitor] %s: failed to write env file: %v (native-LXC env still stamped)", containerName, err)
+		}
+	} else {
+		for _, k := range otelEnvKeys {
+			if err := s.manager.UnsetEnv(containerName, k); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to unset %s: %v", k, err)
+			}
+		}
+		if err := s.manager.RemoveOTelEnvFile(containerName); err != nil {
+			log.Printf("[togglemonitor] %s: failed to remove env file: %v", containerName, err)
+		}
+	}
+
+	// Restart so the new env reaches the app. The container was
+	// running before — we ignore stop errors (LXC might be already
+	// stopped, in which case stop is a no-op).
+	wasRunning := info.State == pb.ContainerState_CONTAINER_STATE_RUNNING
+	if wasRunning {
+		if err := s.manager.Stop(req.Username, false); err != nil {
+			log.Printf("[togglemonitor] %s stop returned %v (continuing)", containerName, err)
+		}
+		if err := s.manager.Start(req.Username); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to start container after env update: %v", err)
+		}
+	}
+
+	// Refresh the collector's IP map — the container may have a
+	// new IP after restart, and we want source-IP attribution to
+	// stay accurate.
+	s.refreshContainerIPMap()
+
+	msg := "monitoring disabled"
+	if req.Enabled {
+		msg = "monitoring enabled"
+	}
+	if wasRunning {
+		msg += " — container restarted"
+	} else {
+		msg += " — container was stopped; new env takes effect on next start"
+	}
+
+	return &pb.ToggleMonitoringResponse{
+		Message:           msg,
+		MonitoringEnabled: req.Enabled,
+	}, nil
+}
+
+// ToggleAutoSleep writes the per-container auto-sleep opt-in flag
+// (Phase 1 of the serverless feature). Works on running or stopped
+// containers; Incus accepts config updates in either state.
+//
+// On enable, both the flag and the threshold key are written. The
+// threshold key persists across disables so a re-enable restores
+// the prior value; an explicit idle_threshold_minutes > 0 always
+// overwrites, otherwise the existing key or the 15-minute default
+// applies. Core containers are refused — they don't represent user
+// workloads and shouldn't be sleeping.
+func (s *ContainerServer) ToggleAutoSleep(ctx context.Context, req *pb.ToggleAutoSleepRequest) (*pb.ToggleAutoSleepResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found: %v", req.Username, err)
+	}
+	if info == nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found", req.Username)
+	}
+	if info.IsCore {
+		return nil, status.Errorf(codes.InvalidArgument, "container %s is a core container; auto-sleep is for user containers only", info.Ref.Name)
+	}
+
+	containerName := info.Ref.Name
+	effectiveThreshold := info.IdleThresholdMinutes
+	if req.IdleThresholdMinutes > 0 {
+		effectiveThreshold = req.IdleThresholdMinutes
+	}
+	if effectiveThreshold < 1 {
+		effectiveThreshold = incus.DefaultIdleThresholdMinutes
+	}
+
+	enabledStr := "false"
+	if req.Enabled {
+		enabledStr = "true"
+	}
+	if err := s.manager.SetConfig(containerName, incus.AutoSleepEnabledKey, enabledStr); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to set %s: %v", incus.AutoSleepEnabledKey, err)
+	}
+	if req.Enabled || req.IdleThresholdMinutes > 0 {
+		if err := s.manager.SetConfig(containerName, incus.IdleThresholdMinutesKey, strconv.Itoa(int(effectiveThreshold))); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to set %s: %v", incus.IdleThresholdMinutesKey, err)
+		}
+	}
+
+	msg := "auto-sleep disabled"
+	if req.Enabled {
+		msg = fmt.Sprintf("auto-sleep enabled at %dm", effectiveThreshold)
+	}
+	return &pb.ToggleAutoSleepResponse{
+		Message:              msg,
+		AutoSleepEnabled:     req.Enabled,
+		IdleThresholdMinutes: effectiveThreshold,
+	}, nil
+}
+
+// AddSSHKey appends an SSH public key to the user's host-side
+// authorized_keys file (/home/<username>/.ssh/authorized_keys).
+//
+// Scope note: this writes the host-side file, not the LXC-internal
+// one. That's the file sshpiper's keysync (running on the sentinel)
+// reads from via /authorized-keys to authenticate inbound SSH. Adding
+// only inside the LXC would not let anyone SSH in via the sentinel.
+//
+// The intended use case is recovery after a lost ephemeral key: an
+// agent or operator generates a fresh keypair locally, calls this RPC
+// with the public half, and the key is live for SSH by the time this
+// returns — the sentinel is told to re-pull immediately rather than
+// the caller waiting out the keysync tick (cloud #971). If the
+// sentinel is unreachable the key still goes live on that next tick.
+//
+// Idempotent — a key already present is a no-op success.
+func (s *ContainerServer) AddSSHKey(ctx context.Context, req *pb.AddSSHKeyRequest) (*pb.AddSSHKeyResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSSHWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if req.SshPublicKey == "" {
+		return nil, fmt.Errorf("ssh_public_key is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// Heal a box created before #2489 without SSH keys: it has a container but
+	// no host-side jump account, so AddAuthorizedKey would refuse it forever
+	// ("host user ... does not exist"). The tenant is already authorized above
+	// and the container must exist, so creating the (idempotent) account here
+	// cannot mint accounts for names that are not boxes.
+	if s.manager != nil {
+		if _, gerr := s.manager.Get(req.Username); gerr == nil {
+			if err := container.EnsureJumpServerAccount(req.Username); err != nil {
+				return nil, fmt.Errorf("ensure host account: %w", err)
+			}
+		}
+	}
+
+	if err := s.authorizedKeys.addKey(req.Username, req.SshPublicKey); err != nil {
+		return nil, fmt.Errorf("add authorized key: %w", err)
+	}
+	// Register after the file write: a registry failure leaves the key in
+	// authorized_keys but unknown to the authorization decider, so report
+	// it and let the caller retry this idempotent call.
+	if err := s.registerSSHKey(ctx, req.Username, req.SshPublicKey, sshauthz.SourceAPI); err != nil {
+		return nil, registryError("add ssh key", err)
+	}
+
+	total, err := s.authorizedKeys.countKeys(req.Username)
+	if err != nil {
+		// Counting failed but the add succeeded — return success with
+		// zero so the caller still knows the add went through.
+		log.Printf("[add-ssh-key] count after add failed for %s: %v", req.Username, err)
+		total = 0
+	}
+
+	s.notifySentinelKeyChange(ctx, "add_ssh_key "+req.Username)
+
+	return &pb.AddSSHKeyResponse{
+		Message:   fmt.Sprintf("SSH key added for %s (sentinel resynced; falls back to the periodic keysync if it was unreachable)", req.Username),
+		TotalKeys: total,
+	}, nil
+}
+
+// setSSHKeysRegistryTimeout bounds the registry work SetSSHKeys does while
+// holding the per-user authorized_keys lock. A var so tests can shorten it.
+var setSSHKeysRegistryTimeout = 10 * time.Second
+
+// SetSSHKeys makes the user's host-side authorized_keys hold exactly the
+// requested keys (#2945). Authorization is AddSSHKey's: ssh:write plus
+// tenant access to the box.
+//
+// Every key is validated before any write, so one bad entry fails the call
+// with no change. Platform-managed lines (the sentinel's upstream key) are
+// preserved by the file layer and never revoked, so a caller cannot lock the
+// platform out. Keys dropped by the call are revoked in the ssh_keys
+// registry exactly as RemoveSSHKey does (only the entries this account owns,
+// #3187), except that a key another account still holds is dropped from this
+// account's file without being revoked (#3222). Kept keys are registered like
+// AddSSHKey does. An empty list is accepted only with allow_empty, so an
+// omitted field cannot wipe a box.
+func (s *ContainerServer) SetSSHKeys(ctx context.Context, req *pb.SetSSHKeysRequest) (*pb.SetSSHKeysResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSSHWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+	if len(req.SshPublicKeys) > container.MaxAuthorizedKeys {
+		return nil, status.Errorf(codes.InvalidArgument, "ssh_public_keys has %d entries, over the limit of %d", len(req.SshPublicKeys), container.MaxAuthorizedKeys)
+	}
+	switch {
+	case len(req.SshPublicKeys) == 0 && !req.AllowEmpty:
+		return nil, status.Error(codes.InvalidArgument, "ssh_public_keys is empty: set allow_empty=true to remove every key")
+	case len(req.SshPublicKeys) > 0 && req.AllowEmpty:
+		return nil, status.Error(codes.InvalidArgument, "allow_empty must be false when ssh_public_keys is given")
+	}
+	fingerprints := make(map[string]bool, len(req.SshPublicKeys))
+	for i, k := range req.SshPublicKeys {
+		if err := container.ValidateStrictSSHPublicKey(k); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "ssh_public_keys[%d]: %v", i, err)
+		}
+		rec, err := sshauthz.NewKeyRecord(k, req.Username, sshauthz.SourceAPI, s.sshKeyClock())
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "ssh_public_keys[%d]: %v", i, err)
+		}
+		fingerprints[rec.Fingerprint] = true
+	}
+
+	// Same heal as AddSSHKey for a box created without a host account.
+	if s.manager != nil {
+		if _, gerr := s.manager.Get(req.Username); gerr == nil {
+			if err := container.EnsureJumpServerAccount(req.Username); err != nil {
+				return nil, fmt.Errorf("ensure host account: %w", err)
+			}
+		}
+	}
+
+	// Both registry steps run inside the file layer's per-user critical
+	// section, so concurrent Sets are ordered end to end (a later Set's
+	// revocation can never be undone by an earlier Set's registration), and
+	// each is bounded so a slow registry cannot hold the lock indefinitely.
+	//
+	// Revoke first: if it fails nothing is written and a retry still sees the
+	// keys. (Revoked but still in the file, if the write then fails, is the
+	// safe direction.) Register after the write; it is idempotent, so a
+	// failure here is retried by repeating the call.
+	removed, err := s.authorizedKeys.replaceKeys(req.Username, req.SshPublicKeys, container.ReplaceHooks{
+		BeforeWrite: func(drop []string) error {
+			rctx, cancel := context.WithTimeout(ctx, setSSHKeysRegistryTimeout)
+			defer cancel()
+			for _, k := range drop {
+				err := s.revokeSSHKey(rctx, req.Username, k)
+				if errors.Is(err, sshauthz.ErrKeyHeldByOtherAccount) {
+					// Another account still holds this key: this call only
+					// removes this account's entry (#3222). The registry row
+					// stays active for the other holder.
+					continue
+				}
+				if err != nil {
+					return registryError("set ssh keys", err)
+				}
+			}
+			return nil
+		},
+		AfterWrite: func() error {
+			rctx, cancel := context.WithTimeout(ctx, setSSHKeysRegistryTimeout)
+			defer cancel()
+			for _, k := range req.SshPublicKeys {
+				if err := s.registerSSHKey(rctx, req.Username, k, sshauthz.SourceAPI); err != nil {
+					return registryError("set ssh keys", err)
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("replace authorized keys: %w", err)
+	}
+
+	// Revoked keys left in sshpiper's table would stay working credentials.
+	s.notifySentinelKeyChange(ctx, "set_ssh_keys "+req.Username)
+
+	return &pb.SetSSHKeysResponse{
+		Message:     fmt.Sprintf("SSH keys set for %s", req.Username),
+		RemovedKeys: safecast.I32(len(removed)),
+		TotalKeys:   safecast.I32(len(fingerprints)),
+	}, nil
+}
+
+// RemoveSSHKey removes a specific SSH public key from the user's
+// host-side authorized_keys file. No-op if the key isn't present.
+func (s *ContainerServer) RemoveSSHKey(ctx context.Context, req *pb.RemoveSSHKeyRequest) (*pb.RemoveSSHKeyResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSSHWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if req.SshPublicKey == "" {
+		return nil, fmt.Errorf("ssh_public_key is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// Revoke before the file changes, as SetSSHKeys does: a registry failure
+	// leaves the key in place and is reported, so the caller's retry repeats
+	// the revocation. Only the entry this account owns is revoked (#3187), and
+	// not while another account still holds the key (#3222).
+	if err := s.revokeSSHKey(ctx, req.Username, req.SshPublicKey); err != nil {
+		if !errors.Is(err, sshauthz.ErrKeyHeldByOtherAccount) {
+			return nil, registryError("remove ssh key", err)
+		}
+		// Another account still holds this key: only this account's entry is
+		// removed and the registry row stays active for the other holder
+		// (#3222), as SetSSHKeys does. The response does not name the holder; an
+		// unreadable account fails the call with ErrHolderUnknown, which names
+		// no account either (the daemon log does).
+		log.Printf("[remove-ssh-key] %s dropped a key another account still holds; registry entry left active", req.Username)
+	}
+	if err := s.authorizedKeys.removeKey(req.Username, req.SshPublicKey); err != nil {
+		return nil, fmt.Errorf("remove authorized key: %w", err)
+	}
+
+	total, err := s.authorizedKeys.countKeys(req.Username)
+	if err != nil {
+		log.Printf("[remove-ssh-key] count after remove failed for %s: %v", req.Username, err)
+		total = 0
+	}
+
+	// A revoked key that stays in sshpiper's table is still a working
+	// credential, so this one is worth not leaving on a timer.
+	s.notifySentinelKeyChange(ctx, "remove_ssh_key "+req.Username)
+
+	return &pb.RemoveSSHKeyResponse{
+		Message:   fmt.Sprintf("SSH key removed for %s", req.Username),
+		TotalKeys: total,
+	}, nil
+}
+
+// GetMetrics gets runtime metrics for containers
+func (s *ContainerServer) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
+	// Tenant isolation: as with ListContainers, empty username for a
+	// non-admin is rewritten to the authenticated subject (was "all
+	// containers"); a different explicit username is denied.
+	subject, roles, ok := auth.SubjectFromGRPCContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "no authenticated subject")
+	}
+	if !auth.HasRole(roles, auth.RoleAdmin) {
+		if req.Username != "" && req.Username != subject {
+			return nil, status.Error(codes.PermissionDenied, "not authorized for this tenant")
+		}
+		req.Username = subject
+	}
+
+	var protoMetrics []*pb.ContainerMetrics
+	var unreachableBackends []*pb.UnreachableBackend
+
+	if req.Username != "" {
+		// Get metrics for a specific container — try local first, then peers
+		metrics, err := s.manager.GetMetrics(req.Username)
+		if err != nil {
+			// Not found locally — try peers
+			if s.peerPool != nil {
+				authToken := extractAuthToken(ctx)
+				peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+				if peer != nil {
+					body, peerErr := peer.ForwardGetMetrics(authToken, req.Username)
+					if peerErr == nil {
+						// Parse and return peer metrics (use protojson for enum handling)
+						var peerResp pb.GetMetricsResponse
+						if jsonErr := protojson.Unmarshal(body, &peerResp); jsonErr == nil {
+							return &peerResp, nil
+						}
+					}
+				}
+				if peer == nil && len(unreachablePeers) > 0 {
+					// #1905: report the unreachable backend structurally
+					// (same contract #1901 introduced) instead of an error
+					// that reads as "no such container."
+					for _, u := range unreachablePeers {
+						unreachableBackends = append(unreachableBackends, &pb.UnreachableBackend{
+							BackendId: u.BackendID,
+							Reason:    u.Reason,
+						})
+					}
+					return &pb.GetMetricsResponse{UnreachableBackends: unreachableBackends}, nil
+				}
+			}
+			return nil, fmt.Errorf("failed to get metrics: %w", err)
+		}
+		protoMetrics = append(protoMetrics, toProtoMetrics(metrics))
+	} else {
+		// Get metrics for all containers (local)
+		allMetrics, err := s.manager.GetAllMetrics()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get metrics: %w", err)
+		}
+		for _, m := range allMetrics {
+			protoMetrics = append(protoMetrics, toProtoMetrics(m))
+		}
+
+		// Merge metrics from all healthy peers. A peer that can't be reached
+		// contributes zero entries to `metrics` — that's reported separately
+		// in `unreachable_backends` so callers can tell "unreachable" from
+		// "genuinely idle/no usage" instead of rendering both as blank (#1901).
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			for _, peer := range s.peerPool.Peers() {
+				if !peer.Healthy {
+					unreachableBackends = append(unreachableBackends, &pb.UnreachableBackend{
+						BackendId: peer.ID,
+						Reason:    "peer marked unhealthy by sentinel",
+					})
+					continue
+				}
+				body, err := peer.ForwardGetMetrics(authToken, "")
+				if err != nil {
+					log.Printf("[metrics] peer %s: %v", peer.ID, err)
+					unreachableBackends = append(unreachableBackends, &pb.UnreachableBackend{
+						BackendId: peer.ID,
+						Reason:    fmt.Sprintf("peer fetch failed: %v", err),
+					})
+					continue
+				}
+				var peerMetricsResp pb.GetMetricsResponse
+				if err := protojson.Unmarshal(body, &peerMetricsResp); err != nil {
+					log.Printf("[metrics] peer %s parse error: %v", peer.ID, err)
+					unreachableBackends = append(unreachableBackends, &pb.UnreachableBackend{
+						BackendId: peer.ID,
+						Reason:    fmt.Sprintf("peer response unparseable: %v", err),
+					})
+					continue
+				}
+				protoMetrics = append(protoMetrics, peerMetricsResp.Metrics...)
+			}
+		}
+	}
+
+	return &pb.GetMetricsResponse{
+		Metrics:             protoMetrics,
+		UnreachableBackends: unreachableBackends,
+	}, nil
+}
+
+// daemonReleaseChecker caches the latest GitHub release across requests so a
+// busy fleet's status checks don't burn the unauthenticated GitHub rate
+// limit. Package-level (not per-request) for that shared cache. #354.
+var daemonReleaseChecker = releasecheck.New()
+
+// GetLatestRelease reports the latest published Containarium release vs this
+// daemon's running version. Admin-only, matching the other System endpoints.
+// Best-effort: a failed/rate-limited GitHub lookup yields an empty
+// latest_release (and update_available=false) rather than an error. #354.
+func (s *ContainerServer) GetLatestRelease(ctx context.Context, req *pb.GetLatestReleaseRequest) (*pb.GetLatestReleaseResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	current := version.GetVersion()
+	latest, _ := daemonReleaseChecker.Latest(ctx) // empty on persistent failure
+	return &pb.GetLatestReleaseResponse{
+		LatestRelease:   latest,
+		CurrentVersion:  current,
+		UpdateAvailable: releasecheck.UpdateAvailable(current, latest),
+		TargetVersion:   s.upgradeTargetVersion(ctx, ""),
+	}, nil
+}
+
+// upgradeTargetVersion is the version a TriggerUpgrade with this github_tag
+// would install: the tag itself (resolving "latest" via the cached release
+// check), or else the sentinel-served binary's version. Best-effort — ""
+// when unknown, never an error, since it only informs the caller. #2171.
+func (s *ContainerServer) upgradeTargetVersion(ctx context.Context, githubTag string) string {
+	switch githubTag {
+	case "":
+	case "latest":
+		latest, _ := daemonReleaseChecker.Latest(ctx)
+		return strings.TrimPrefix(latest, "v")
+	default:
+		return strings.TrimPrefix(githubTag, "v")
+	}
+	if s.autoUpdater == nil {
+		return ""
+	}
+	v, err := s.autoUpdater.ServedVersion(ctx)
+	if err != nil {
+		log.Printf("[upgrade] sentinel-served version unavailable: %v", err)
+		return ""
+	}
+	return v
+}
+
+// ValidateGPU launches a throwaway nvidia.runtime LXC on the target backend,
+// runs nvidia-smi inside, tears it down, and reports whether the GPU is usable.
+// Admin-only. An empty (or local) backend_id runs the check on this daemon's
+// own host; a peer backend_id forwards to that peer's daemon, which runs the
+// same check locally on its host. See #316.
+func (s *ContainerServer) ValidateGPU(ctx context.Context, req *pb.ValidateGPURequest) (*pb.ValidateGPUResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+
+	// Remote backend → forward to the owning peer (it validates its own GPU).
+	if req.BackendId != "" && req.BackendId != s.localBackendID() {
+		if s.peerPool == nil {
+			return nil, status.Errorf(codes.Unavailable, "backend %q: no peer pool configured on this daemon", req.BackendId)
+		}
+		peer := s.peerPool.Get(req.BackendId)
+		if peer == nil {
+			return nil, status.Errorf(codes.NotFound, "backend %q not found (see 'containarium backends list')", req.BackendId)
+		}
+		body, err := protojson.Marshal(req)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "marshal validate-gpu request: %v", err)
+		}
+		respBody, st, err := peer.ForwardRequest("POST", "/v1/validate-gpu", extractAuthToken(ctx), body)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "forward validate-gpu to %s: %v", req.BackendId, err)
+		}
+		if st >= 400 {
+			return nil, status.Errorf(codes.Internal, "peer %s returned status %d for validate-gpu", req.BackendId, st)
+		}
+		var resp pb.ValidateGPUResponse
+		if err := protojson.Unmarshal(respBody, &resp); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse peer %s validate-gpu response: %v", req.BackendId, err)
+		}
+		resp.BackendId = req.BackendId
+		return &resp, nil
+	}
+
+	// Local backend.
+	res := s.manager.ValidateGPU(req.Pci)
+	return &pb.ValidateGPUResponse{
+		Status:        gpuValidationStatusToProto(res.Status),
+		GpuModel:      res.Model,
+		DriverVersion: res.DriverVersion,
+		Detail:        res.Detail,
+		BackendId:     req.BackendId,
+	}, nil
+}
+
+// gpuValidationStatusToProto maps the manager's GPU validation status string to
+// the proto enum.
+func gpuValidationStatusToProto(s string) pb.ValidateGPUResponse_GPUStatus {
+	switch s {
+	case container.GPUStatusOK:
+		return pb.ValidateGPUResponse_GPU_STATUS_OK
+	case container.GPUStatusUnavailable:
+		return pb.ValidateGPUResponse_GPU_STATUS_UNAVAILABLE
+	default:
+		return pb.ValidateGPUResponse_GPU_STATUS_UNSPECIFIED
+	}
+}
+
+// TriggerUpgrade upgrades a backend's daemon to the binary the sentinel
+// currently serves, immediately rather than on the periodic auto-update tick.
+// Admin-only. An empty (or local) backend_id upgrades this daemon; a peer
+// backend_id forwards to that peer, which upgrades itself. The upgrade is
+// async: a successful local swap restarts this daemon, so callers confirm the
+// result via the backend version in ListBackends (the in-memory job is lost on
+// restart, so GetUpgradeStatus then returns "unknown"). #354 Phase B.
+func (s *ContainerServer) TriggerUpgrade(ctx context.Context, req *pb.TriggerUpgradeRequest) (*pb.TriggerUpgradeResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	// #3057: enforce the same scope the MCP layer maps this tool to, so a
+	// scoped admin token cannot bypass it over REST/gRPC. A nil scope claim
+	// stays unrestricted (legacy tokens), per RequireScope.
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+
+	// Remote backend → forward to the owning peer (it upgrades its own daemon).
+	if req.BackendId != "" && req.BackendId != s.localBackendID() {
+		if s.peerPool == nil {
+			return nil, status.Errorf(codes.Unavailable, "backend %q: no peer pool configured on this daemon", req.BackendId)
+		}
+		peer := s.peerPool.Get(req.BackendId)
+		if peer == nil {
+			return nil, status.Errorf(codes.NotFound, "backend %q not found (see 'containarium backends list')", req.BackendId)
+		}
+		body, err := protojson.Marshal(req)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "marshal upgrade request: %v", err)
+		}
+		respBody, st, err := peer.ForwardRequest("POST", "/v1/backends/upgrade", extractAuthToken(ctx), body)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "forward upgrade to %s: %v", req.BackendId, err)
+		}
+		if st >= 400 {
+			return nil, status.Errorf(codes.Internal, "peer %s returned status %d for upgrade", req.BackendId, st)
+		}
+		var resp pb.TriggerUpgradeResponse
+		if err := protojson.Unmarshal(respBody, &resp); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse peer %s upgrade response: %v", req.BackendId, err)
+		}
+		resp.BackendId = req.BackendId
+		return &resp, nil
+	}
+
+	// Local backend. Two upgrade sources: the default sentinel-served binary,
+	// or (opt-in, #1028) a specific GitHub release tag. github_tag chooses
+	// the path; the sentinel path's own gating (autoUpdater == nil) is
+	// unchanged.
+	usingGitHub := req.GithubTag != ""
+	if usingGitHub {
+		if s.binaryPath == "" {
+			return nil, status.Error(codes.Unavailable, "GitHub-direct upgrade is not configured on this daemon (no binary path wired)")
+		}
+		// #3059: report a refused downgrade on the RPC itself rather than as
+		// a failed async job. runGitHubUpgrade re-checks as defense in depth.
+		if err := checkDowngrade(runningVersion(), req.GithubTag, req.AllowDowngrade); err != nil {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+	} else if s.autoUpdater == nil {
+		// cloud#1547: this used to return with NO log line at all — on a BYOC
+		// host whose containariumd was started without --sentinel-url (a
+		// daemon startup flag, separate from `pool join`'s own tunnel
+		// registration; a host can join and heartbeat fine while missing
+		// this), every upgrade attempt died here silently. An operator
+		// SSHed into the target host during a live incident saw nothing
+		// arrive, before or after, which is what made the cloud-side "no
+		// capacity in pool" error look like a fleet/capacity problem
+		// instead of a one-line daemon misconfiguration. Log it, and name
+		// the flag in the error too so the message alone (three hops away,
+		// no log access) is actionable.
+		log.Printf("[upgrade] rejected: TriggerUpgrade called on backend %q with no auto-updater configured (missing --sentinel-url at daemon startup)", s.localBackendID())
+		return nil, status.Error(codes.Unavailable, "auto-update is not configured on this daemon — start containariumd with --sentinel-url (or CONTAINARIUM_SENTINEL_URL) to enable it")
+	}
+
+	current := version.GetVersion()
+	target := s.upgradeTargetVersion(ctx, req.GithubTag)
+	backendKey := s.localBackendID()
+
+	s.upgradeMu.Lock()
+	if s.upgradeJobs == nil {
+		s.upgradeJobs = make(map[string]*upgradeJob)
+		s.upgradeBusy = make(map[string]bool)
+	}
+	if s.upgradeBusy[backendKey] {
+		s.upgradeMu.Unlock()
+		return nil, status.Error(codes.FailedPrecondition, "an upgrade is already in progress on this backend")
+	}
+	id := fmt.Sprintf("upg-%d", time.Now().UnixNano())
+	job := &upgradeJob{id: id, backendID: req.BackendId, status: "in_progress", currentVersion: current, targetVersion: target}
+	s.upgradeJobs[id] = job
+	s.upgradeBusy[backendKey] = true
+	s.upgradeMu.Unlock()
+
+	subject, _, _ := auth.SubjectFromGRPCContext(ctx)
+	if usingGitHub {
+		log.Printf("[upgrade] triggered by %q on backend %q (from %s, github_tag=%s, force=%v, job=%s)", subject, backendKey, current, req.GithubTag, req.Force, id)
+	} else {
+		log.Printf("[upgrade] triggered by %q on backend %q (from %s, force=%v, job=%s)", subject, backendKey, current, req.Force, id)
+	}
+	s.logUpgradeAudit(ctx, subject, backendKey, id, "triggered", "")
+
+	// Run async: a successful swap restarts the daemon, so neither this
+	// goroutine nor the in-memory job survives a local upgrade. We still
+	// record terminal state for the noop/failure paths, which return WITHOUT a
+	// restart. Detach from the request's cancellation (the handler returns
+	// immediately) while keeping its values — the upgrade must outlive the RPC.
+	upgradeCtx := context.WithoutCancel(ctx)
+	go func() {
+		var changed bool
+		var err error
+		if usingGitHub {
+			changed, err = runGitHubUpgrade(upgradeCtx, s.binaryPath, req.GithubTag, req.Force, req.AllowDowngrade)
+		} else {
+			changed, err = s.autoUpdater.TriggerNow(upgradeCtx, req.Force)
+		}
+		s.upgradeMu.Lock()
+		defer s.upgradeMu.Unlock()
+		s.upgradeBusy[backendKey] = false
+		switch {
+		case err != nil:
+			job.status = "failed"
+			job.errMsg = err.Error()
+			job.completedAt = time.Now().UTC().Format(time.RFC3339)
+			log.Printf("[upgrade] job %s failed: %v", id, err)
+			s.logUpgradeAudit(upgradeCtx, subject, backendKey, id, "failed", err.Error())
+		case !changed:
+			job.status = "noop"
+			job.completedAt = time.Now().UTC().Format(time.RFC3339)
+			s.logUpgradeAudit(upgradeCtx, subject, backendKey, id, "noop", "")
+		default:
+			// changed: restart imminent; daemon will not record "completed" since
+			// it is about to die. The post-restart version in ListBackends is the
+			// canonical confirmation.
+			s.logUpgradeAudit(upgradeCtx, subject, backendKey, id, "binary_swapped", "")
+		}
+	}()
+
+	return &pb.TriggerUpgradeResponse{
+		UpgradeId:      id,
+		Status:         "in_progress",
+		CurrentVersion: current,
+		Message:        "upgrade started; if a new binary is applied the daemon restarts — confirm via the backend version in ListBackends",
+		BackendId:      req.BackendId,
+		TargetVersion:  target,
+	}, nil
+}
+
+// GetUpgradeStatus polls an upgrade started by TriggerUpgrade. Admin-only.
+// Returns status "unknown" for an unrecognized id — including the common case
+// where a successful local self-upgrade restarted the daemon and dropped the
+// in-memory job; callers should compare the backend version in ListBackends.
+// #354.
+func (s *ContainerServer) GetUpgradeStatus(ctx context.Context, req *pb.GetUpgradeStatusRequest) (*pb.GetUpgradeStatusResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	// #3057: enforce the same scope the MCP layer maps this tool to, so a
+	// scoped admin token cannot bypass it over REST/gRPC. A nil scope claim
+	// stays unrestricted (legacy tokens), per RequireScope.
+	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
+		return nil, err
+	}
+	if req.UpgradeId == "" {
+		return nil, status.Error(codes.InvalidArgument, "upgrade_id is required")
+	}
+	// Read the job's fields under the same lock TriggerUpgrade's completion
+	// goroutine writes them under — job is a plain struct, not synchronized
+	// itself, so unlocking before reading its fields (as this used to do)
+	// races with that goroutine. Surfaced by -race once a test polled status
+	// immediately after triggering an upgrade (#1028).
+	s.upgradeMu.Lock()
+	defer s.upgradeMu.Unlock()
+	job := s.upgradeJobs[req.UpgradeId]
+	if job == nil {
+		return &pb.GetUpgradeStatusResponse{
+			Status:         "unknown",
+			CurrentVersion: version.GetVersion(),
+		}, nil
+	}
+	return &pb.GetUpgradeStatusResponse{
+		Status:         job.status,
+		CurrentVersion: job.currentVersion,
+		Error:          job.errMsg,
+		CompletedAt:    job.completedAt,
+		TargetVersion:  job.targetVersion,
+	}, nil
+}
+
+// GetSystemInfo gets information about the Incus host
+func (s *ContainerServer) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error) {
+	// Admin-only: exposes fleet-internal details (hostname, OS,
+	// Incus version, container counts across tenants). A user
+	// token has no legitimate reason to read this — they care
+	// about their own container, not the daemon's identity.
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	// Get basic system info from container manager
+	containers, err := s.manager.List()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get containers: %w", err)
+	}
+
+	// Count running/stopped containers
+	var running, stopped int32
+	for _, c := range containers {
+		if c.State == "Running" {
+			running++
+		} else {
+			stopped++
+		}
+	}
+
+	// Get Incus server info
+	client, err := incus.New()
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Incus: %w", err)
+	}
+
+	serverInfo, err := client.GetServerInfo()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get server info: %w", err)
+	}
+
+	// Get network CIDR
+	networkCIDR, err := client.GetNetworkSubnet("incusbr0")
+	if err != nil {
+		// Fallback to default if network info not available
+		networkCIDR = "10.100.0.0/24"
+	}
+
+	// Get system resources (CPU, memory, disk)
+	sysResources, err := client.GetSystemResources()
+	if err != nil {
+		// Log warning but continue - resource info is optional
+		sysResources = &incus.SystemResources{}
+	}
+
+	// Build response
+	info := &pb.SystemInfo{
+		IncusVersion:         serverInfo.Environment.ServerVersion,
+		Os:                   serverInfo.Environment.OSName,
+		KernelVersion:        serverInfo.Environment.KernelVersion,
+		ContainersRunning:    running,
+		ContainersStopped:    stopped,
+		ContainersTotal:      int32(len(containers)), // #nosec G115 -- container count cannot overflow int32
+		Hostname:             serverInfo.Environment.ServerName,
+		NetworkCidr:          networkCIDR,
+		TotalCpus:            sysResources.TotalCPUs,
+		TotalMemoryBytes:     sysResources.TotalMemoryBytes,
+		AvailableMemoryBytes: sysResources.TotalMemoryBytes - sysResources.UsedMemoryBytes,
+		TotalDiskBytes:       sysResources.TotalDiskBytes,
+		AvailableDiskBytes:   sysResources.TotalDiskBytes - sysResources.UsedDiskBytes,
+		CpuLoad_1Min:         sysResources.CPULoad1Min,
+		CpuLoad_5Min:         sysResources.CPULoad5Min,
+		CpuLoad_15Min:        sysResources.CPULoad15Min,
+		// Advertise where monitoring=true containers ship telemetry so
+		// tenants/agents can point docker-in-LXC apps (which don't
+		// inherit the env-stamped value) at the collector. Empty when
+		// the daemon has no OTel collector. See #370.
+		OtelCollectorEndpoint: s.otelCollectorEndpoint,
+		// This backend's daemon version, so the fleet's running versions +
+		// drift are visible via get_system_info / /v1/backends. See #354.
+		DaemonVersion: version.GetVersion(),
+		// Advertised public SSH entrypoint (sentinel host), or empty for
+		// direct/in-network mode — so an agent can tell from get_system_info
+		// whether an external SSH/deploy entrypoint exists. See #1011.
+		SshIngressHost: s.sshHost,
+		// How this daemon's peer calls are secured (#3079).
+		PeerTransport: peerTransportOf(s.peerPool),
+		// Tenant-committed CPU cores on this host — pairs with TotalCpus to
+		// answer "is this host over its CPU overcommit ceiling right now"
+		// (#1580). Reuses the same containers list already fetched above,
+		// and the same core-role exclusion the admission gate (#1029) uses,
+		// via committedTenantCores — one summation shared by both, not two.
+		CommittedCpuCores: committedTenantCores(containers, nil),
+		// Optional API features, so a client can gate request fields an
+		// older daemon would reject.
+		Capabilities: daemonCapabilities(),
+	}
+	// The rest of the CPU budget (#2284): the platform's own core-role
+	// commitment next to the tenant one, and the gate's posture so a
+	// reader can tell whether being over the ceiling is being acted on.
+	// Same container list, one assembly shared with the boot-time log.
+	budget := s.cpuBudget(containers, float64(sysResources.TotalCPUs))
+	info.CoreCommittedCpuCores = budget.CoreCommittedCores
+	info.CpuAdmissionMode = cpuAdmissionModeToProto(budget.AdmissionMode)
+	info.CpuOvercommitFactor = budget.OvercommitFactor
+	s.withBackupKeyInfo(info)
+
+	// The storage pool backing this backend's containers, and whether it
+	// isolates tenant volumes (#1209). Left null when the pool can't be read:
+	// an unread pool must not be reported as isolated. Carried on SystemInfo
+	// so peers report it through the fan-out ListBackends already uses.
+	if driver, derr := client.PoolDriver("default"); derr == nil {
+		info.Storage = backendStorageFromPool("default", driver)
+	}
+	info.StoragePools = s.storagePoolCapacities()
+
+	// This backend's spare-capacity advertisement (#680) and capability
+	// profile (#681), so a peer's GetSystemInfo carries them to the
+	// ListBackends fan-out with no extra forwarded call (#2135). Both stay
+	// null when absent, same as on the local BackendInfo.
+	info.Headroom, info.CapabilityProfile = s.capacitySignals(hostStateFrom(containers, sysResources, time.Now()))
+
+	// Populate GPU info
+	for _, gpu := range sysResources.GPUs {
+		info.Gpus = append(info.Gpus, &pb.GPUInfo{
+			Vendor:        mapGPUVendor(gpu.Vendor),
+			Model:         mapGPUModel(gpu.Model),
+			ModelName:     gpu.Model,
+			PciAddress:    gpu.PCIAddress,
+			DriverVersion: gpu.DriverVersion,
+			CudaVersion:   gpu.CUDAVersion,
+			VramBytes:     gpu.VRAMBytes,
+		})
+	}

@@ -22,3 +22,15 @@ var _ box.TTLCapable = (*Backend)(nil)
 
 // SetTTL stamps (or clears, expiresAt == nil) the box's absolute auto-delete
 // time.
+//
+// Two cooperating mechanisms, one patch:
+//   - spec.shutdownTime + shutdownPolicy Retain: the agent-sandbox controller
+//     stops the pod at the deadline even if the daemon is down (defense in
+//     depth). Retain — not Delete — because a controller-side Sandbox delete
+//     would orphan everything the daemon owns around it (Pipe, Secrets, PVC,
+//     namespace, Caddy routes) and skip the DeleteContainer audit cascade.
+//   - the ttl_expires_at meta annotation: the daemon's sweeper reads it off
+//     List() and routes the actual delete through DeleteContainer, so the
+//     full cascade fires exactly as it does for an LXC box.
+func (b *Backend) SetTTL(ctx context.Context, ref box.BoxRef, expiresAt *time.Time) error {
+	var patch []byte
