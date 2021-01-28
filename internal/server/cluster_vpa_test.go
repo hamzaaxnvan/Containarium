@@ -27,3 +27,13 @@ func TestReconciler_DeploysVPAOntoCP(t *testing.T) {
 	if !strings.Contains(manifests, "vpa-recommender") || !strings.Contains(manifests, "@sha256:") {
 		t.Fatal("digest-pinned VPA manifests not deployed to the CP")
 	}
+	secretA := string(host.files[cp+":"+clustercore.VPACertsPath])
+	if !strings.Contains(secretA, "vpa-tls-certs") {
+		t.Fatal("VPA webhook secret not deployed")
+	}
+	// Further passes never rotate the webhook secret.
+	rec.ReconcileOnce(ctx)
+	if string(host.files[cp+":"+clustercore.VPACertsPath]) != secretA {
+		t.Fatal("reconciler pass rotated the deployed VPA webhook secret")
+	}
+
