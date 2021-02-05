@@ -343,3 +343,349 @@ func (x *AppResources) ProtoReflect() protoreflect.Message {
 		if ms.LoadMessageInfo() == nil {
 			ms.StoreMessageInfo(mi)
 		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AppResources.ProtoReflect.Descriptor instead.
+func (*AppResources) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *AppResources) GetCpu() string {
+	if x != nil {
+		return x.Cpu
+	}
+	return ""
+}
+
+func (x *AppResources) GetMemory() string {
+	if x != nil {
+		return x.Memory
+	}
+	return ""
+}
+
+func (x *AppResources) GetDisk() string {
+	if x != nil {
+		return x.Disk
+	}
+	return ""
+}
+
+// BuildpackOptions for auto-generating Dockerfiles/Containerfiles
+type BuildpackOptions struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Node.js version (e.g., "18", "20")
+	NodeVersion string `protobuf:"bytes,1,opt,name=node_version,json=nodeVersion,proto3" json:"node_version,omitempty"`
+	// Python version (e.g., "3.11", "3.12")
+	PythonVersion string `protobuf:"bytes,2,opt,name=python_version,json=pythonVersion,proto3" json:"python_version,omitempty"`
+	// Go version (e.g., "1.21", "1.22")
+	GoVersion string `protobuf:"bytes,3,opt,name=go_version,json=goVersion,proto3" json:"go_version,omitempty"`
+	// Rust version (e.g., "1.75")
+	RustVersion string `protobuf:"bytes,4,opt,name=rust_version,json=rustVersion,proto3" json:"rust_version,omitempty"`
+	// Enable/disable auto-detection (default: true)
+	AutoDetect    bool `protobuf:"varint,5,opt,name=auto_detect,json=autoDetect,proto3" json:"auto_detect,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BuildpackOptions) Reset() {
+	*x = BuildpackOptions{}
+	mi := &file_containarium_v1_app_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BuildpackOptions) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BuildpackOptions) ProtoMessage() {}
+
+func (x *BuildpackOptions) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BuildpackOptions.ProtoReflect.Descriptor instead.
+func (*BuildpackOptions) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *BuildpackOptions) GetNodeVersion() string {
+	if x != nil {
+		return x.NodeVersion
+	}
+	return ""
+}
+
+func (x *BuildpackOptions) GetPythonVersion() string {
+	if x != nil {
+		return x.PythonVersion
+	}
+	return ""
+}
+
+func (x *BuildpackOptions) GetGoVersion() string {
+	if x != nil {
+		return x.GoVersion
+	}
+	return ""
+}
+
+func (x *BuildpackOptions) GetRustVersion() string {
+	if x != nil {
+		return x.RustVersion
+	}
+	return ""
+}
+
+func (x *BuildpackOptions) GetAutoDetect() bool {
+	if x != nil {
+		return x.AutoDetect
+	}
+	return false
+}
+
+// DetectedLanguage information
+type DetectedLanguage struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Language name (e.g., "Node.js", "Python", "Go")
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Detected version
+	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	// true if user provided Dockerfile
+	DockerfileProvided bool `protobuf:"varint,3,opt,name=dockerfile_provided,json=dockerfileProvided,proto3" json:"dockerfile_provided,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *DetectedLanguage) Reset() {
+	*x = DetectedLanguage{}
+	mi := &file_containarium_v1_app_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DetectedLanguage) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DetectedLanguage) ProtoMessage() {}
+
+func (x *DetectedLanguage) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DetectedLanguage.ProtoReflect.Descriptor instead.
+func (*DetectedLanguage) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *DetectedLanguage) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *DetectedLanguage) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *DetectedLanguage) GetDockerfileProvided() bool {
+	if x != nil {
+		return x.DockerfileProvided
+	}
+	return false
+}
+
+// DeployAppRequest deploys a new app or updates existing
+type DeployAppRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username (from JWT)
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// App name (alphanumeric + hyphens)
+	AppName string `protobuf:"bytes,2,opt,name=app_name,json=appName,proto3" json:"app_name,omitempty"`
+	// Gzipped tarball of source code
+	SourceTarball []byte `protobuf:"bytes,3,opt,name=source_tarball,json=sourceTarball,proto3" json:"source_tarball,omitempty"`
+	// Path to Dockerfile (default: "./Dockerfile")
+	DockerfilePath string `protobuf:"bytes,4,opt,name=dockerfile_path,json=dockerfilePath,proto3" json:"dockerfile_path,omitempty"`
+	// App port (default: 3000)
+	Port int32 `protobuf:"varint,5,opt,name=port,proto3" json:"port,omitempty"`
+	// Environment variables
+	EnvVars map[string]string `protobuf:"bytes,6,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Custom subdomain (optional, defaults to app_name)
+	Subdomain string `protobuf:"bytes,7,opt,name=subdomain,proto3" json:"subdomain,omitempty"`
+	// Buildpack options for auto-generated Dockerfiles/Containerfiles
+	Buildpack     *BuildpackOptions `protobuf:"bytes,8,opt,name=buildpack,proto3" json:"buildpack,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeployAppRequest) Reset() {
+	*x = DeployAppRequest{}
+	mi := &file_containarium_v1_app_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeployAppRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeployAppRequest) ProtoMessage() {}
+
+func (x *DeployAppRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeployAppRequest.ProtoReflect.Descriptor instead.
+func (*DeployAppRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *DeployAppRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *DeployAppRequest) GetAppName() string {
+	if x != nil {
+		return x.AppName
+	}
+	return ""
+}
+
+func (x *DeployAppRequest) GetSourceTarball() []byte {
+	if x != nil {
+		return x.SourceTarball
+	}
+	return nil
+}
+
+func (x *DeployAppRequest) GetDockerfilePath() string {
+	if x != nil {
+		return x.DockerfilePath
+	}
+	return ""
+}
+
+func (x *DeployAppRequest) GetPort() int32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *DeployAppRequest) GetEnvVars() map[string]string {
+	if x != nil {
+		return x.EnvVars
+	}
+	return nil
+}
+
+func (x *DeployAppRequest) GetSubdomain() string {
+	if x != nil {
+		return x.Subdomain
+	}
+	return ""
+}
+
+func (x *DeployAppRequest) GetBuildpack() *BuildpackOptions {
+	if x != nil {
+		return x.Buildpack
+	}
+	return nil
+}
+
+type DeployAppResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Deployed app
+	App *App `protobuf:"bytes,1,opt,name=app,proto3" json:"app,omitempty"`
+	// Status message
+	Message string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	// URL to stream build logs
+	BuildLogUrl string `protobuf:"bytes,3,opt,name=build_log_url,json=buildLogUrl,proto3" json:"build_log_url,omitempty"`
+	// Detected language information
+	DetectedLanguage *DetectedLanguage `protobuf:"bytes,4,opt,name=detected_language,json=detectedLanguage,proto3" json:"detected_language,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *DeployAppResponse) Reset() {
+	*x = DeployAppResponse{}
+	mi := &file_containarium_v1_app_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeployAppResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeployAppResponse) ProtoMessage() {}
+
+func (x *DeployAppResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeployAppResponse.ProtoReflect.Descriptor instead.
+func (*DeployAppResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DeployAppResponse) GetApp() *App {
+	if x != nil {
+		return x.App
+	}
+	return nil
+}
+
+func (x *DeployAppResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *DeployAppResponse) GetBuildLogUrl() string {
+	if x != nil {

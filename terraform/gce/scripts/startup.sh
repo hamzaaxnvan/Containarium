@@ -204,3 +204,106 @@ for mod in "$${MODULES[@]}"; do
         modprobe "$mod"
         echo "$mod" >> /etc/modules-load.d/containarium.conf
         echo "✓ Loaded $mod"
+    fi
+done
+
+# Configure sysctl for containers and Docker
+echo "==> Configuring sysctl for containers..."
+cat > /etc/sysctl.d/99-containarium.conf <<EOF
+# Enable IP forwarding
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+
+# Bridge netfilter
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+
+# Increase inotify limits (for many containers)
+fs.inotify.max_user_instances = 1024
+fs.inotify.max_user_watches = 524288
+EOF
+
+sysctl --system
+echo "✓ Sysctl configured"
+
+# Configure SSH for security
+echo "==> Hardening SSH configuration..."
+cat >> /etc/ssh/sshd_config.d/containarium.conf <<EOF
+# Containarium SSH hardening
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+X11Forwarding no
+MaxAuthTries 3
+LoginGraceTime 20s
+EOF
+
+systemctl restart sshd
+echo "✓ SSH hardened"
+
+# Set up admin users (from Terraform variable)
+echo "==> Setting up admin users..."
+IFS=',' read -ra USERS <<< "$ADMIN_USERS"
+for username in "$${USERS[@]}"; do
+    if ! id "$username" &>/dev/null; then
+        # Create user without creating a new primary group (use existing or
+        # fall back to "users") — a bare useradd tries to auto-create a
+        # same-named primary group, which fails outright if a group of that
+        # name already exists (e.g. "admin" collides with a pre-existing
+        # system group shipped in the stock Ubuntu image; kafeido-infra#41).
+        useradd -m -s /bin/bash -N -G sudo "$username" || useradd -m -s /bin/bash -g users -G sudo "$username"
+        echo "$username ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/"$username"
+        chmod 0440 /etc/sudoers.d/"$username"
+        echo "✓ Created user: $username"
+    else
+        echo "✓ User already exists: $username"
+    fi
+done
+
+# Install monitoring agents (if enabled)
+if [ "$ENABLE_MONITORING" = "true" ]; then
+    echo "==> Installing Google Cloud monitoring agent..."
+    curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+    bash add-google-cloud-ops-agent-repo.sh --also-install
+    rm add-google-cloud-ops-agent-repo.sh
+    echo "✓ Monitoring agent installed"
+fi
+
+# Create containarium directory structure
+echo "==> Creating Containarium directory structure..."
+mkdir -p /opt/containarium/{bin,config,logs}
+chmod 755 /opt/containarium
+
+# Install Containarium daemon
+echo "==> Installing Containarium daemon..."
+CONTAINARIUM_VERSION="${containarium_version}"
+CONTAINARIUM_BINARY_URL="${containarium_binary_url}"
+
+if [ -n "$CONTAINARIUM_BINARY_URL" ]; then
+    # Download from specified URL (e.g., GitHub releases)
+    echo "Downloading from: $CONTAINARIUM_BINARY_URL"
+    curl -fsSL "$CONTAINARIUM_BINARY_URL" -o /usr/local/bin/containariumd
+    chmod +x /usr/local/bin/containariumd
+    # Rollout Phase 1 (#1781): keep the old name working as a symlink so any
+    # runbook/cron this inventory missed keeps working.
+    ln -sf /usr/local/bin/containariumd /usr/local/bin/containarium
+    echo "✓ Containarium daemon downloaded"
+else
+    echo "⚠ No Containarium binary URL provided, daemon not installed"
+    echo "  You can manually install it later by copying the binary to /usr/local/bin/containariumd"
+fi
+
+# Verify installation
+if [ -f /usr/local/bin/containariumd ]; then
+    /usr/local/bin/containariumd version || echo "Containarium binary installed (version command not available)"
+    echo "✓ Containarium daemon ready"
+fi
+
+# Create welcome message
+cat > /etc/motd <<'EOF'
+   ____            _        _                 _
+  / ___|___  _ __ | |_ __ _(_)_ __   __ _ _ __(_)_   _ _ __ ___
+ | |   / _ \| '_ \| __/ _` | | '_ \ / _` | '__| | | | | '_ ` _ \
+ | |__| (_) | | | | || (_| | | | | | (_| | |  | | |_| | | | | | |
+  \____\___/|_| |_|\__\__,_|_|_| |_|\__,_|_|  |_|\__,_|_| |_| |_|
+
