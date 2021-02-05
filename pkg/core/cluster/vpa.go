@@ -52,3 +52,57 @@ const (
 	VPACertsPath    = "/var/lib/rancher/k3s/server/manifests/containarium-vpa-certs.yaml"
 )
 
+// vpaWebhookDNS is the admission webhook's in-cluster service name —
+// the SAN its serving cert must carry.
+const vpaWebhookDNS = "vpa-webhook.kube-system.svc"
+
+// GenerateVPAWebhookSecret generates a fresh per-cluster CA + serving
+// cert for the VPA admission webhook and renders the vpa-tls-certs
+// Secret (key names are the admission-controller's flag defaults).
+// Per-cluster generation, never shared, never persisted by the
+// platform — the Secret lives only inside the tenant's cluster.
+func GenerateVPAWebhookSecret() ([]byte, error) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          vpaSerial(),
+		Subject:               pkix.Name{CommonName: "containarium vpa-webhook CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		return nil, err
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return nil, err
+	}
+
+	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	srvTmpl := &x509.Certificate{
+		SerialNumber: vpaSerial(),
+		Subject:      pkix.Name{CommonName: vpaWebhookDNS},
+		DNSNames:     []string{vpaWebhookDNS, vpaWebhookDNS + ".cluster.local"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTmpl, caCert, &srvKey.PublicKey, caKey)
+	if err != nil {
+		return nil, err
+	}
+	srvKeyDER, err := x509.MarshalPKCS8PrivateKey(srvKey)
+	if err != nil {
+		return nil, err
+	}
+

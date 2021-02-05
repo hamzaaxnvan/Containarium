@@ -56,32 +56,3 @@ func LoadTrustedProxies() ([]netip.Prefix, error) {
 	for _, e := range strings.Split(raw, ",") {
 		e = strings.TrimSpace(e)
 		if e == "" {
-			continue
-		}
-		// Accept bare IPs as /32 (/128 for v6) for convenience.
-		if !strings.Contains(e, "/") {
-			addr, err := netip.ParseAddr(e)
-			if err != nil {
-				return nil, fmt.Errorf("invalid IP %q in %s: %w", e, trustedProxiesEnv, err)
-			}
-			out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
-			continue
-		}
-		p, err := netip.ParsePrefix(e)
-		if err != nil {
-			return nil, fmt.Errorf("invalid CIDR %q in %s: %w", e, trustedProxiesEnv, err)
-		}
-		if p.Bits() == 0 {
-			return nil, fmt.Errorf("wildcard CIDR %q in %s would defeat the gate; refuse", e, trustedProxiesEnv)
-		}
-		out = append(out, p)
-	}
-	log.Printf("[wake] trusted proxies: %v", out)
-	return out, nil
-}
-
-// isTrustedSource returns true if `r.RemoteAddr` is loopback or
-// matches one of the configured trusted prefixes. When the
-// allowlist is empty (env unset), returns true — backwards-
-// compatible fail-open for the rollout window.
-func isTrustedSource(r *http.Request, allowlist []netip.Prefix) bool {

@@ -30,3 +30,36 @@ func fastGoneChecks(t *testing.T) {
 func removeFromHost(f *fakeBackend, name string) func(string) {
 	return func(string) {
 		kept := f.containers[:0:0]
+		for _, c := range f.containers {
+			if c.Name != name {
+				kept = append(kept, c)
+			}
+		}
+		f.containers = kept
+	}
+}
+
+// An instance that is removed while the pass is attaching NICs is not a
+// failure of the pass: the other boxes are still guarded and the pass
+// reports success, with nothing recorded against the vanished box.
+func TestReconcile_InstanceRemovedMidPassIsSkippedNotFailed(t *testing.T) {
+	fastGoneChecks(t)
+	f := twoTenantHost()
+	f.ensureErrs = map[string]error{"bob-container": errDatasetGone}
+	f.onEnsureErr = removeFromHost(f, "bob-container")
+
+	r := NewReconciler(f, enforceCfg())
+	if err := r.ReconcileOnce(context.Background()); err != nil {
+		t.Fatalf("a box deleted mid-pass failed the whole pass: %v", err)
+	}
+	st := r.Status()
+	if st.LastError != "" {
+		t.Errorf("LastError = %q, want none", st.LastError)
+	}
+	var attached int
+	for _, e := range st.Entries {
+		if e.Container == "bob-container" {
+			t.Errorf("the removed box is still reported: %+v", e)
+		}
+		if e.Attached {
+			attached++
