@@ -177,3 +177,93 @@ func (s *ContainerServer) readRunInputs(box, username, name string) (runInputsSt
 		if !ok || b64 == "-" {
 			continue
 		}
+		if size, big := strings.CutPrefix(b64, "big "); big {
+			return runInputsState{}, status.Errorf(codes.ResourceExhausted,
+				"the permission journal of run %q is %s bytes, over the %d-byte limit; it cannot be read", name, size, s.journalCap())
+		}
+		raw, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return runInputsState{}, status.Errorf(codes.Internal, "decode the permission journal of run %q: %v", name, err)
+		}
+		if int64(len(raw)) > s.journalCap() {
+			return runInputsState{}, status.Errorf(codes.ResourceExhausted,
+				"the permission journal of run %q grew past the %d-byte limit while it was read; it cannot be read", name, s.journalCap())
+		}
+		if n := bytes.Count(raw, []byte{'\n'}); n > maxRunInputEvents {
+			return runInputsState{}, status.Errorf(codes.ResourceExhausted,
+				"the permission journal of run %q has %d lines, over the %d-line limit; it cannot be read", name, n, maxRunInputEvents)
+		}
+		st.events = coderun.ParseInputJournal(raw)
+	}
+	return st, nil
+}
+
+// runInputRecord is what the journal says about one request: the first
+// request line for its id (a later line with the same id is the agent's, not
+// the box's: the id is random and unknown before the box writes it) and the
+// first response to it.
+type runInputRecord struct {
+	request  coderun.InputEvent
+	response *coderun.InputEvent
+}
+
+func findRunInput(events []coderun.InputEvent, id string) (runInputRecord, bool) {
+	var rec runInputRecord
+	found := false
+	for i, e := range events {
+		if e.RequestID != id {
+			continue
+		}
+		switch e.Kind {
+		case coderun.KindInputRequest:
+			if !found {
+				rec.request, found = e, true
+			}
+		case coderun.KindInputResponse:
+			if found && rec.response == nil {
+				rec.response = &events[i]
+			}
+		}
+	}
+	return rec, found
+}
+
+func runInputAnswerProto(a coderun.Answer) pb.RunInputAnswer {
+	switch a {
+	case coderun.AnswerAllow:
+		return pb.RunInputAnswer_RUN_INPUT_ANSWER_ALLOW
+	case coderun.AnswerDeny:
+		return pb.RunInputAnswer_RUN_INPUT_ANSWER_DENY
+	}
+	return pb.RunInputAnswer_RUN_INPUT_ANSWER_UNSPECIFIED
+}
+
+func runInputCloseReasonProto(r coderun.ResponseReason) pb.RunInputCloseReason {
+	switch r {
+	case coderun.ReasonAnswered:
+		return pb.RunInputCloseReason_RUN_INPUT_CLOSE_REASON_ANSWERED
+	case coderun.ReasonExpired:
+		return pb.RunInputCloseReason_RUN_INPUT_CLOSE_REASON_EXPIRED
+	case coderun.ReasonCancelled:
+		return pb.RunInputCloseReason_RUN_INPUT_CLOSE_REASON_CANCELLED
+	case coderun.ReasonNoKey:
+		return pb.RunInputCloseReason_RUN_INPUT_CLOSE_REASON_NO_KEY
+	case coderun.ReasonTooLarge:
+		return pb.RunInputCloseReason_RUN_INPUT_CLOSE_REASON_TOO_LARGE
+	}
+	return pb.RunInputCloseReason_RUN_INPUT_CLOSE_REASON_UNSPECIFIED
+}
+
+func runInputProto(e coderun.InputEvent) *pb.RunInput {
+	kind := pb.RunInputKind_RUN_INPUT_KIND_UNSPECIFIED
+	if e.RequestKind == coderun.RequestKindPermission {
+		kind = pb.RunInputKind_RUN_INPUT_KIND_PERMISSION
+	}
+	in := &pb.RunInput{RequestId: e.RequestID, Kind: kind, Tool: e.Tool, Prompt: e.Prompt, Input: e.Input, CreatedAt: timestamppb.New(e.T)}
+	if !e.ExpiresAt.IsZero() {
+		in.ExpiresAt = timestamppb.New(e.ExpiresAt)
+	}
+	return in
+}
+
+// ListRunInputs lists a box run's open permission requests and its counts.
