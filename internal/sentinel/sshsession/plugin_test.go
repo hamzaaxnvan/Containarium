@@ -131,3 +131,136 @@ func TestPlugin_RawPublicKeySession_RecordsFingerprint(t *testing.T) {
 		t.Fatalf("PublicKeyCallback: %v", err)
 	}
 	for k, v := range deferredMeta(t, upstream) {
+		conn.Metadata[k] = v
+	}
+
+	p.Config().PipeStartCallback(conn)
+
+	if len(rec.recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(rec.recs))
+	}
+	got := rec.recs[0]
+	if got.AuthMethod != AuthMethodPublicKey {
+		t.Errorf("auth method = %q, want publickey", got.AuthMethod)
+	}
+	want := ssh.FingerprintSHA256(pub)
+	if got.KeyFingerprint != want {
+		t.Errorf("key fingerprint = %q, want %q", got.KeyFingerprint, want)
+	}
+	if got.KeyID != "" || got.Serial != 0 {
+		t.Errorf("raw key record should carry no cert fields, got %+v", got)
+	}
+}
+
+func TestPlugin_ClientIPIsAlwaysDownstream(t *testing.T) {
+	// Acceptance criterion 4: the recorded client_ip is the real
+	// downstream address; an upstream/proxy-local address must never
+	// appear there. Plugin only ever sees libplugin.ConnMetadata, which
+	// sshpiperd populates from the DOWNSTREAM side for PipeStart/
+	// PipeError (see plugin.go's doc comment) -- this test pins that
+	// whatever RemoteAddr() reports lands verbatim in ClientIP, so a
+	// regression that swapped in some other address would be caught.
+	const downstreamAddr = "203.0.113.42:4242"
+	const upstreamLocalAddr = "127.0.0.1:20022" // must NEVER appear as client_ip
+
+	rec := &fakeRecorder{}
+	p := &Plugin{Recorder: rec}
+	conn := &libplugin.ConnMeta{
+		UserName: "boxuser",
+		FromAddr: downstreamAddr,
+		UniqId:   "session-ip",
+	}
+
+	p.Config().PipeStartCallback(conn)
+	p.Config().PipeErrorCallback(conn, nil)
+
+	for _, got := range rec.recs {
+		if got.ClientIP != "203.0.113.42" {
+			t.Errorf("client_ip = %q, want 203.0.113.42 (the downstream address)", got.ClientIP)
+		}
+		if got.ClientIP == "127.0.0.1" {
+			t.Fatalf("client_ip leaked the upstream-local address %q", upstreamLocalAddr)
+		}
+		if got.ClientPort != 4242 {
+			t.Errorf("client_port = %d, want 4242", got.ClientPort)
+		}
+	}
+}
+
+func TestPlugin_PublicKeyCallback_NeverBlocksOnParseFailure(t *testing.T) {
+	// Acceptance criterion 9 (by extension): observing a credential must
+	// never turn into a reason to reject or delay authentication that
+	// sshpiper's own routing plugin would otherwise have allowed.
+	p := &Plugin{}
+	conn := &libplugin.ConnMeta{UserName: "boxuser", FromAddr: "203.0.113.1:1", UniqId: "s"}
+
+	upstream, err := p.Config().PublicKeyCallback(conn, []byte("not a key"))
+	if err != nil {
+		t.Fatalf("PublicKeyCallback returned an error for an unparsable key: %v", err)
+	}
+	if upstream.GetNextPlugin() == nil {
+		t.Fatal("PublicKeyCallback must always defer via NextPluginAuth, even on parse failure")
+	}
+}
+
+func TestPlugin_PublicKeyCallback_NeverLeaksRawKeyBytes(t *testing.T) {
+	// Acceptance criterion 8: no private key, token, or session content
+	// in any record -- including the metadata this plugin stashes for
+	// itself in-flight, which is exactly the kind of internal state a
+	// careless implementation could leak raw bytes through.
+	ca := newTestCA(t)
+	cert, _ := newTestUserCert(t, ca, "alice", 42)
+	raw := cert.Marshal()
+
+	p := &Plugin{}
+	conn := &libplugin.ConnMeta{UserName: "boxuser", FromAddr: "203.0.113.1:1", UniqId: "s"}
+
+	upstream, err := p.Config().PublicKeyCallback(conn, raw)
+	if err != nil {
+		t.Fatalf("PublicKeyCallback: %v", err)
+	}
+
+	for k, v := range deferredMeta(t, upstream) {
+		if bytes.Contains([]byte(v), raw) {
+			t.Fatalf("metadata key %q leaks the raw certificate bytes", k)
+		}
+	}
+}
+
+func TestPlugin_Shutdown_ClosesOutOpenSessionsOnly(t *testing.T) {
+	// Acceptance criterion 5: an abnormally-ended session (proxy
+	// restarted mid-session) either emits a close with a reason, or is
+	// distinguishable from a session still open. Shutdown is what
+	// supplies that close when the plugin process itself is stopping.
+	rec := &fakeRecorder{}
+	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	p := &Plugin{Recorder: rec, Now: func() time.Time { return fixedNow }}
+
+	stillOpen := &libplugin.ConnMeta{UserName: "boxuser", FromAddr: "203.0.113.1:1", UniqId: "open-session"}
+	alreadyClosed := &libplugin.ConnMeta{UserName: "boxuser", FromAddr: "203.0.113.2:2", UniqId: "closed-session"}
+
+	cfg := p.Config()
+	cfg.PipeStartCallback(stillOpen)
+	cfg.PipeStartCallback(alreadyClosed)
+	cfg.PipeErrorCallback(alreadyClosed, errors.New("ssh: disconnect, reason 11: disconnected by user"))
+
+	rec.recs = nil // discard the two opens + one normal close above
+	p.Shutdown()
+
+	if len(rec.recs) != 1 {
+		t.Fatalf("Shutdown emitted %d records, want exactly 1 (only the still-open session): %+v", len(rec.recs), rec.recs)
+	}
+	got := rec.recs[0]
+	if got.SessionID != "open-session" {
+		t.Errorf("Shutdown closed out session %q, want open-session", got.SessionID)
+	}
+	if got.Phase != SessionPhaseClose {
+		t.Errorf("phase = %q, want close", got.Phase)
+	}
+	if got.CloseReason != CloseReasonProxyShutdown {
+		t.Errorf("close reason = %q, want proxy_shutdown", got.CloseReason)
+	}
+
+	// A second Shutdown call must not re-emit anything already flushed.
+	rec.recs = nil
+	p.Shutdown()

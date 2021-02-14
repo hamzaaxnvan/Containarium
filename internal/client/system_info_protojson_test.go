@@ -35,3 +35,21 @@ func TestGetSystemInfoAcceptsProtoJSON(t *testing.T) {
 			if len(info.StoragePools) != 1 || info.StoragePools[0].UsedBytes != 96 || info.StoragePools[0].TotalBytes != 100 {
 				t.Errorf("storage pools not decoded: %+v", info.StoragePools)
 			}
+		})
+	}
+}
+
+func TestSystemInfoInvalidResponses(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"missing info", 200, `{}`, "no system info returned"},
+		{"null info", 200, `{"info":null}`, "no system info returned"},
+		{"malformed JSON", 200, `{"info":`, "failed to parse response"},
+		{"invalid int64", 200, `{"info":{"totalMemoryBytes":"invalid"}}`, "failed to parse response"},
+		{"HTTP error", 403, `{"error":"scope required: containers:read","code":403}`, "scope required: containers:read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
