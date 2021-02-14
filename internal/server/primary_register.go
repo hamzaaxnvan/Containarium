@@ -1,0 +1,101 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/footprintai/containarium/internal/auth"
+)
+
+// primaryRegisterTTL must align with sentinel.PrimaryTTL. Hardcoded here to
+// avoid importing internal/sentinel from internal/server (the sentinel package
+// imports from server in tests, so a back-edge would create a cycle).
+const primaryRegisterTTL = 90 * time.Second
+
+// primaryHeartbeatInterval is one third of TTL — gives two missed beats before
+// eviction.
+const primaryHeartbeatInterval = primaryRegisterTTL / 3
+
+// PrimaryRegisterConfig describes the inputs needed to advertise a primary
+// daemon to the sentinel registry.
+type PrimaryRegisterConfig struct {
+	SentinelURL       string   // e.g. http://10.128.0.5:8888
+	Pool              string   // pool name (must match peers' --pool)
+	PublicHostname    string   // primary's own subdomain (e.g. prod.example.com)
+	PublicAliases     []string // additional hostnames the primary's Caddy serves (e.g. api.example.com, voice.example.com)
+	PublicBaseDomains []string // suffix-match anchors: <anything>.<one-of-these> routes here. A single backend can host multiple parent domains by listing each.
+	Port              int      // public HTTPS port (typically 443 or 8443)
+	BackendID         string   // optional; for ops visibility in /sentinel/primaries
+	// Secret is the cluster-wide sentinel HMAC secret
+	// (CONTAINARIUM_SENTINEL_AUTH_SECRET), the same one that already gates
+	// /sentinel/certs and /sentinel/keys/resync. /sentinel/primaries is
+	// gated the same way — a stale or absent Secret here means every
+	// registration/heartbeat/deregister call below is rejected, not sent
+	// unsigned.
+	Secret []byte
+}
+
+// runPrimaryRegistration registers with the sentinel, sends periodic
+// heartbeats, and unregisters on context cancellation. It returns immediately
+// if any required field is missing — primary registration is opt-in.
+//
+// The registration request is best-effort: sentinel reachability is not
+// required for the daemon to start. Failures are logged and retried on the
+// next heartbeat tick.
+func runPrimaryRegistration(ctx context.Context, cfg PrimaryRegisterConfig) {
+	if cfg.SentinelURL == "" || cfg.Pool == "" || cfg.PublicHostname == "" || cfg.Port == 0 {
+		// Opt-in: silently skip if the operator hasn't configured all fields.
+		return
+	}
+	if len(cfg.Secret) < auth.SentinelMinSecretLen {
+		// The same misconfiguration notifySentinelKeyChange already guards
+		// against (#687): /sentinel/primaries is HMAC-gated the same as
+		// /sentinel/keys/resync, so an absent or too-short secret means
+		// every call below would be rejected. Skip rather than retry a
+		// doomed request on every heartbeat tick.
+		log.Printf("[primary-register] not registering pool %q: no usable sentinel HMAC secret configured", cfg.Pool)
+		return
+	}
+
+	base := strings.TrimRight(cfg.SentinelURL, "/")
+	registerURL := base + "/sentinel/primaries"
+	heartbeatURL := base + "/sentinel/primaries/" + cfg.Pool
+
+	body := map[string]any{
+		"pool":         cfg.Pool,
+		"hostname":     cfg.PublicHostname,
+		"aliases":      cfg.PublicAliases,
+		"base_domains": cfg.PublicBaseDomains,
+		"port":         cfg.Port,
+		"backend_id":   cfg.BackendID,
+		// IP intentionally omitted — sentinel infers from RemoteAddr.
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Initial registration. Failures are non-fatal: heartbeat ticker will retry.
+	if err := postJSON(ctx, client, registerURL, body, cfg.Secret); err != nil {
+		log.Printf("[primary-register] initial registration failed: %v (will retry)", err)
+	} else {
+		log.Printf("[primary-register] registered: pool=%q hostname=%q aliases=%v base_domains=%v port=%d", cfg.Pool, cfg.PublicHostname, cfg.PublicAliases, cfg.PublicBaseDomains, cfg.Port)
+	}
+
+	go func() {
+		ticker := time.NewTicker(primaryHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				// Best-effort deregister with a fresh short-lived context.
+				deregCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				if err := deleteRequest(deregCtx, client, heartbeatURL, cfg.Secret); err != nil {
+					log.Printf("[primary-register] deregister failed: %v", err)
+				} else {
+					log.Printf("[primary-register] deregistered: pool=%q", cfg.Pool)
