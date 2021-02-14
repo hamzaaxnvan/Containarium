@@ -221,3 +221,78 @@ func (s *Scanner) waitForSpider(ctx context.Context, scanID string) error {
 		statusStr, _ := resp["status"].(string)
 		status, _ := strconv.Atoi(statusStr)
 		if status >= 100 {
+			return nil
+		}
+	}
+}
+
+// startActiveScan initiates a ZAP active scan
+func (s *Scanner) startActiveScan(url string) (string, error) {
+	resp, err := s.apiGet(fmt.Sprintf("/JSON/ascan/action/scan/?url=%s&recurse=true&inScopeOnly=false", url))
+	if err != nil {
+		return "", err
+	}
+	scanID, ok := resp["scan"].(string)
+	if !ok {
+		if num, ok := resp["scan"].(float64); ok {
+			scanID = strconv.Itoa(int(num))
+		} else {
+			return "", fmt.Errorf("unexpected active scan response: %v", resp)
+		}
+	}
+	return scanID, nil
+}
+
+// waitForActiveScan waits for an active scan to complete
+func (s *Scanner) waitForActiveScan(ctx context.Context, scanID string) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+
+		resp, err := s.apiGet(fmt.Sprintf("/JSON/ascan/view/status/?scanId=%s", scanID))
+		if err != nil {
+			return err
+		}
+		statusStr, _ := resp["status"].(string)
+		status, _ := strconv.Atoi(statusStr)
+		if status >= 100 {
+			return nil
+		}
+	}
+}
+
+// zapAlertJSON represents a ZAP alert from the API
+type zapAlertJSON struct {
+	PluginID    string `json:"pluginId"`
+	Alert       string `json:"alert"`
+	Risk        string `json:"risk"`       // "High", "Medium", "Low", "Informational"
+	Confidence  string `json:"confidence"` // "High", "Medium", "Low", "False Positive"
+	Description string `json:"description"`
+	URL         string `json:"url"`
+	Method      string `json:"method"`
+	Evidence    string `json:"evidence"`
+	Solution    string `json:"solution"`
+	Reference   string `json:"reference"`
+	CWEId       string `json:"cweid"`
+	WASCId      string `json:"wascid"`
+}
+
+// getAlerts retrieves all alerts for a URL from ZAP's API
+func (s *Scanner) getAlerts(baseURL string) ([]Alert, error) {
+	resp, err := s.apiGetRaw(fmt.Sprintf("/JSON/core/view/alerts/?baseurl=%s&start=0&count=500", baseURL))
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Alerts []zapAlertJSON `json:"alerts"`
+	}
+	if err := json.Unmarshal([]byte(resp), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse ZAP alerts: %w", err)
+	}
+
+	var alerts []Alert
+	for _, za := range result.Alerts {
