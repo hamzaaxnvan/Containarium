@@ -1,0 +1,52 @@
+variables {
+  project_id      = "ssh-ban-test"
+  anon_door_addr  = "127.0.0.1:2223"
+  anon_daemon_url = "https://daemon.example.test"
+}
+
+run "defaults" {
+  command = plan
+  assert {
+    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : strcontains(unit, "ssh-ban-plugin") && strcontains(unit, "--max-failures 100") && strcontains(unit, "--ban-duration 300s")])
+    error_message = "Both listeners must invoke the inspectable plugin at the existing policy defaults."
+  }
+  assert {
+    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : strcontains(unit, "ssh-upstream-plugin") && length(regexall("--upstream-control-socket /run/containarium/ssh-upstream/control.sock", unit)) >= 2])
+    error_message = "Routing and source accounting in both listeners must share one guarded controller."
+  }
+  assert {
+    condition = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : strcontains(unit, "After=network.target containarium-sentinel.service") && strcontains(unit, "BindsTo=containarium-sentinel.service") && strcontains(unit, "PartOf=containarium-sentinel.service")])
+    error_message = "Both guarded listeners must follow the lifetime and startup ordering of the controller owner."
+  }
+}
+
+run "custom_policy" {
+  command = plan
+  variables {
+    ssh_ban_max_failures     = 240
+    ssh_ban_duration_seconds = 45
+    ssh_ban_ignore_cidrs     = ["192.0.2.4/32", "2001:db8::/48"]
+  }
+  assert {
+    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : strcontains(unit, "--max-failures 240") && strcontains(unit, "--ban-duration 45s") && strcontains(unit, "--ignore-ip 192.0.2.4/32") && strcontains(unit, "--ignore-ip 2001:db8::/48")])
+    error_message = "Both listeners must receive exactly the configured policy and exemptions."
+  }
+}
+
+# The text after the last ssh-ban-plugin mention is that plugin's own flags
+# (it is the final plugin in each chain).
+run "audit_records_off_by_default" {
+  command = plan
+  assert {
+    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : !strcontains(element(split("ssh-ban-plugin", unit), length(split("ssh-ban-plugin", unit)) - 1), "--records-file")])
+    error_message = "Without ssh_ban_audit_records the ban plugin must not be given --records-file (an older binary rejects the flag)."
+  }
+}
+
+run "audit_records_on" {
+  command = plan
+  variables { ssh_ban_audit_records = true }
+  assert {
+    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : strcontains(element(split("ssh-ban-plugin", unit), length(split("ssh-ban-plugin", unit)) - 1), "--records-file /var/log/containarium/ssh-sessions.jsonl")])
+    error_message = "With ssh_ban_audit_records both listeners' ban plugins must write to the shared session records file."
+  }

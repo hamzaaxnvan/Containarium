@@ -1,0 +1,52 @@
+package sentinel
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"sync"
+	"time"
+)
+
+// userspaceForwarder is a TCP proxy that runs on the sentinel host,
+// listening on a small set of ports and forwarding each accepted
+// connection to a fixed backend with an optional PROXY v2 header
+// prepended. It exists for the "simple proxy" sentinel mode (single
+// GCP spot VM behind the sentinel) — in that mode the legacy code
+// path uses kernel iptables DNAT, which cannot inject a PROXY v2
+// header because there is no userspace process in the hot path. With
+// PROXY v2 missing, the downstream Caddy sees the connection peer as
+// the sentinel-NAT'd address (a bridge gateway or sentinel IP, not
+// the real client), so visitor-IP-dependent features (logs, audit,
+// XFF-aware app code) all see the wrong IP.
+//
+// This forwarder is only activated when --proxy-protocol is set AND
+// the sentinel is NOT already running the multiplexed ConnMux path
+// (the multi-pool / tunnel-promoted-primary mode, which has its own
+// PROXY v2 emit via buildSNIRoutingHandler). The two paths are
+// mutually exclusive so we don't double-listen on :443.
+type userspaceForwarder struct {
+	mu        sync.Mutex
+	listeners []net.Listener
+	dialer    *net.Dialer
+	emitProxy bool
+}
+
+// newUserspaceForwarder constructs an idle forwarder. Call start()
+// once with the backend address and ports to serve.
+func newUserspaceForwarder(emitProxyV2 bool) *userspaceForwarder {
+	return &userspaceForwarder{
+		// KeepAlive detects dead backend connections (e.g. a same-IP hard
+		// reboot where the kernel resets the TCP stack without sending RSTs).
+		// Without it, stale io.Copy goroutine pairs accumulate without bound
+		// and can exhaust the sentinel's FDs / goroutines (#769).
+		dialer:    &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second},
+		emitProxy: emitProxyV2,
+	}
+}
+
+// start binds listeners on each port and begins serving. Each
+// accepted connection dials backend:port (the same port — this is a
+// dumb port-for-port forwarder, not a port-remapping proxy), and if
+// emitProxy is true, prepends a PROXY v2 frame before the first byte
