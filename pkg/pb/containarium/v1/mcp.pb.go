@@ -1144,3 +1144,385 @@ func (x *MCPContent) GetContent() isMCPContent_Content {
 	if x != nil {
 		return x.Content
 	}
+	return nil
+}
+
+func (x *MCPContent) GetText() *MCPTextContent {
+	if x != nil {
+		if x, ok := x.Content.(*MCPContent_Text); ok {
+			return x.Text
+		}
+	}
+	return nil
+}
+
+func (x *MCPContent) GetImage() *MCPImageContent {
+	if x != nil {
+		if x, ok := x.Content.(*MCPContent_Image); ok {
+			return x.Image
+		}
+	}
+	return nil
+}
+
+func (x *MCPContent) GetResource() *MCPResourceContent {
+	if x != nil {
+		if x, ok := x.Content.(*MCPContent_Resource); ok {
+			return x.Resource
+		}
+	}
+	return nil
+}
+
+type isMCPContent_Content interface {
+	isMCPContent_Content()
+}
+
+type MCPContent_Text struct {
+	Text *MCPTextContent `protobuf:"bytes,1,opt,name=text,proto3,oneof"`
+}
+
+type MCPContent_Image struct {
+	Image *MCPImageContent `protobuf:"bytes,2,opt,name=image,proto3,oneof"`
+}
+
+type MCPContent_Resource struct {
+	Resource *MCPResourceContent `protobuf:"bytes,3,opt,name=resource,proto3,oneof"`
+}
+
+func (*MCPContent_Text) isMCPContent_Content() {}
+
+func (*MCPContent_Image) isMCPContent_Content() {}
+
+func (*MCPContent_Resource) isMCPContent_Content() {}
+
+// MCPTextContent represents text content
+type MCPTextContent struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Content type (always "text")
+	Type string `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
+	// Text content
+	Text          string `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MCPTextContent) Reset() {
+	*x = MCPTextContent{}
+	mi := &file_containarium_v1_mcp_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MCPTextContent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MCPTextContent) ProtoMessage() {}
+
+func (x *MCPTextContent) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_mcp_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MCPTextContent.ProtoReflect.Descriptor instead.
+func (*MCPTextContent) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_mcp_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *MCPTextContent) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+func (x *MCPTextContent) GetText() string {
+	if x != nil {
+		return x.Text
+	}
+	return ""
+}
+
+// MCPImageContent represents image content
+type MCPImageContent struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Content type (always "image")
+	Type string `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
+	// Image data (base64 encoded)
+	Data string `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	// MIME type (e.g., "image/png")
+	MimeType      string `protobuf:"bytes,3,opt,name=mime_type,json=mimeType,proto3" json:"mime_type,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MCPImageContent) Reset() {
+	*x = MCPImageContent{}
+	mi := &file_containarium_v1_mcp_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MCPImageContent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MCPImageContent) ProtoMessage() {}
+
+func (x *MCPImageContent) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_mcp_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MCPImageContent.ProtoReflect.Descriptor instead.
+func (*MCPImageContent) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_mcp_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *MCPImageContent) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+func (x *MCPImageContent) GetData() string {
+	if x != nil {
+		return x.Data
+	}
+	return ""
+}
+
+func (x *MCPImageContent) GetMimeType() string {
+	if x != nil {
+		return x.MimeType
+	}
+	return ""
+}
+
+// MCPResourceContent represents a resource reference
+type MCPResourceContent struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Content type (always "resource")
+	Type string `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"`
+	// Resource URI
+	Uri string `protobuf:"bytes,2,opt,name=uri,proto3" json:"uri,omitempty"`
+	// MIME type
+	MimeType      string `protobuf:"bytes,3,opt,name=mime_type,json=mimeType,proto3" json:"mime_type,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MCPResourceContent) Reset() {
+	*x = MCPResourceContent{}
+	mi := &file_containarium_v1_mcp_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MCPResourceContent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MCPResourceContent) ProtoMessage() {}
+
+func (x *MCPResourceContent) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_mcp_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MCPResourceContent.ProtoReflect.Descriptor instead.
+func (*MCPResourceContent) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_mcp_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *MCPResourceContent) GetType() string {
+	if x != nil {
+		return x.Type
+	}
+	return ""
+}
+
+func (x *MCPResourceContent) GetUri() string {
+	if x != nil {
+		return x.Uri
+	}
+	return ""
+}
+
+func (x *MCPResourceContent) GetMimeType() string {
+	if x != nil {
+		return x.MimeType
+	}
+	return ""
+}
+
+// MCPToolExecutionRequest is the internal request for tool execution
+// (converted from MCPToolsCallRequest)
+type MCPToolExecutionRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Tool name
+	ToolName string `protobuf:"bytes,1,opt,name=tool_name,json=toolName,proto3" json:"tool_name,omitempty"`
+	// Parsed arguments
+	StringArgs map[string]string  `protobuf:"bytes,2,rep,name=string_args,json=stringArgs,proto3" json:"string_args,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	IntArgs    map[string]int64   `protobuf:"bytes,3,rep,name=int_args,json=intArgs,proto3" json:"int_args,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	DoubleArgs map[string]float64 `protobuf:"bytes,4,rep,name=double_args,json=doubleArgs,proto3" json:"double_args,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
+	BoolArgs   map[string]bool    `protobuf:"bytes,5,rep,name=bool_args,json=boolArgs,proto3" json:"bool_args,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	// Raw JSON for complex types
+	RawJson       string `protobuf:"bytes,6,opt,name=raw_json,json=rawJson,proto3" json:"raw_json,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MCPToolExecutionRequest) Reset() {
+	*x = MCPToolExecutionRequest{}
+	mi := &file_containarium_v1_mcp_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MCPToolExecutionRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MCPToolExecutionRequest) ProtoMessage() {}
+
+func (x *MCPToolExecutionRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_mcp_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MCPToolExecutionRequest.ProtoReflect.Descriptor instead.
+func (*MCPToolExecutionRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_mcp_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *MCPToolExecutionRequest) GetToolName() string {
+	if x != nil {
+		return x.ToolName
+	}
+	return ""
+}
+
+func (x *MCPToolExecutionRequest) GetStringArgs() map[string]string {
+	if x != nil {
+		return x.StringArgs
+	}
+	return nil
+}
+
+func (x *MCPToolExecutionRequest) GetIntArgs() map[string]int64 {
+	if x != nil {
+		return x.IntArgs
+	}
+	return nil
+}
+
+func (x *MCPToolExecutionRequest) GetDoubleArgs() map[string]float64 {
+	if x != nil {
+		return x.DoubleArgs
+	}
+	return nil
+}
+
+func (x *MCPToolExecutionRequest) GetBoolArgs() map[string]bool {
+	if x != nil {
+		return x.BoolArgs
+	}
+	return nil
+}
+
+func (x *MCPToolExecutionRequest) GetRawJson() string {
+	if x != nil {
+		return x.RawJson
+	}
+	return ""
+}
+
+// MCPToolExecutionResponse is the internal response from tool execution
+type MCPToolExecutionResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Success or error
+	Success bool `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	// Result text
+	Result string `protobuf:"bytes,2,opt,name=result,proto3" json:"result,omitempty"`
+	// Error message (if success = false)
+	ErrorMessage string `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	// Additional metadata
+	Metadata      map[string]string `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MCPToolExecutionResponse) Reset() {
+	*x = MCPToolExecutionResponse{}
+	mi := &file_containarium_v1_mcp_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MCPToolExecutionResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MCPToolExecutionResponse) ProtoMessage() {}
+
+func (x *MCPToolExecutionResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_mcp_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MCPToolExecutionResponse.ProtoReflect.Descriptor instead.
+func (*MCPToolExecutionResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_mcp_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *MCPToolExecutionResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *MCPToolExecutionResponse) GetResult() string {
+	if x != nil {
+		return x.Result
+	}
+	return ""
+}
