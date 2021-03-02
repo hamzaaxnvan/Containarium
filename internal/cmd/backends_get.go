@@ -28,3 +28,34 @@ Example:
 	RunE: runBackendsGet,
 }
 
+func init() {
+	backendsCmd.AddCommand(backendsGetCmd)
+	backendsGetCmd.Flags().StringVarP(&backendsListFormat, "format", "f", "table",
+		"Output format: table, json")
+}
+
+func runBackendsGet(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (the platform daemon's HTTP address)")
+	}
+	id := args[0]
+
+	// Implementation note: the daemon doesn't have a /v1/backends/{id}
+	// route — only /v1/backends/{id}/system-info, which forwards to
+	// the peer for system info, not metadata. So we list-and-filter.
+	// Cheap (the list is small) and means the CLI stays in sync if a
+	// dedicated endpoint lands later.
+	url := strings.TrimSuffix(serverAddr, "/") + "/v1/backends"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request %s: %w", url, err)
+	}
+	defer resp.Body.Close()
