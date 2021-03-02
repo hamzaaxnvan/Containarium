@@ -65,3 +65,204 @@ func TestAdminRevoke_Table(t *testing.T) {
 		b, err := json.Marshal(RevokeRequest{
 			JTI:       "jti-1",
 			ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339),
+		})
+		if err != nil {
+			t.Fatalf("marshal fixture body: %v", err)
+		}
+		return string(b)
+	}()
+
+	cases := []struct {
+		name       string
+		adminToken string // Config.AdminToken; "" means the route must not exist
+		withStore  bool   // wire a MemRevocations into Config.Revocations
+		authHeader string
+		method     string
+		body       string
+		wantStatus int
+	}{
+		{
+			name:       "no admin token configured: route does not exist",
+			adminToken: "",
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       validBody,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "missing Authorization header",
+			adminToken: adminToken,
+			withStore:  true,
+			method:     http.MethodPost,
+			body:       validBody,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "wrong bearer token",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer wrong",
+			method:     http.MethodPost,
+			body:       validBody,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "wrong method",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodGet,
+			body:       validBody,
+			wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:       "malformed JSON",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       "{not json",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "missing jti",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       `{"expires_at":"2026-01-01T00:00:00Z"}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "unparsable expires_at",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       `{"jti":"x","expires_at":"not-a-time"}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "no revocation store configured",
+			adminToken: adminToken,
+			withStore:  false,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       validBody,
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name:       "success",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       validBody,
+			wantStatus: http.StatusNoContent,
+		},
+		{
+			// expires_at is optional (#1820 review): omitting it must succeed
+			// — it means "never expires", not "bad request". Regression for
+			// the earlier admin.go bug that rejected an empty expires_at
+			// with 400 even though MemRevocations already treats a zero
+			// time.Time as never-expires.
+			name:       "success with expires_at omitted entirely",
+			adminToken: adminToken,
+			withStore:  true,
+			authHeader: "Bearer " + adminToken,
+			method:     http.MethodPost,
+			body:       `{"jti":"jti-2"}`,
+			wantStatus: http.StatusNoContent,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				Secret:       []byte("s"),
+				Providers:    DefaultProviders(),
+				ProviderKeys: map[string]string{"anthropic": "k"},
+				AdminToken:   tc.adminToken,
+			}
+			if tc.withStore {
+				cfg.Revocations = NewMemRevocations()
+			}
+			gw := New(cfg)
+			srv := httptest.NewServer(gw.Handler())
+			defer srv.Close()
+
+			req, err := http.NewRequest(tc.method, srv.URL+"/__gateway/revoke", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			if tc.authHeader != "" {
+				req.Header.Set("Authorization", tc.authHeader)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				b, _ := io.ReadAll(resp.Body)
+				t.Errorf("status = %d, want %d (body: %s)", resp.StatusCode, tc.wantStatus, b)
+			}
+		})
+	}
+
+	t.Run("a successful revoke actually revokes", func(t *testing.T) {
+		store := NewMemRevocations()
+		gw := New(Config{
+			Secret:       []byte("s"),
+			Providers:    DefaultProviders(),
+			ProviderKeys: map[string]string{"anthropic": "k"},
+			AdminToken:   adminToken,
+			Revocations:  store,
+		})
+		srv := httptest.NewServer(gw.Handler())
+		defer srv.Close()
+
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/__gateway/revoke", strings.NewReader(validBody))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", resp.StatusCode)
+		}
+
+		revoked, err := store.IsRevoked(t.Context(), "jti-1")
+		if err != nil {
+			t.Fatalf("IsRevoked: %v", err)
+		}
+		if !revoked {
+			t.Error("jti-1 was not revoked after a 204 response")
+		}
+	})
+
+	// Regression for the CLI bug (#1820 review): `revoke --jti` without
+	// --expires-at used to default the wire request to "now+24h", which
+	// MemRevocations' sweep then used to silently un-revoke the entry once
+	// 24h passed — long before a real (e.g. 365-day recipe-box) token's
+	// actual exp. Reproduced end to end through the HTTP handler with an
+	// injected clock: revoke with expires_at omitted, jump the clock well
+	// past what any such guessed window would have covered, and confirm the
+	// jti is still revoked.
+	t.Run("a revoke with expires_at omitted stays revoked far past any guessed default", func(t *testing.T) {
+		clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		store := NewMemRevocations()
+		store.now = func() time.Time { return clock }
+
+		gw := New(Config{
+			Secret:       []byte("s"),
+			Providers:    DefaultProviders(),
+			ProviderKeys: map[string]string{"anthropic": "k"},
+			AdminToken:   adminToken,
+			Revocations:  store,
+		})
+		srv := httptest.NewServer(gw.Handler())
+		defer srv.Close()
+
+		body, err := json.Marshal(RevokeRequest{JTI: "jti-never-expires"})
