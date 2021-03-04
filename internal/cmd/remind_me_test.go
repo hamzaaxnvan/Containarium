@@ -25,31 +25,3 @@ func TestRemindMeCmd_WriteAndClear(t *testing.T) {
 	old := remindMeFile
 	remindMeFile = filepath.Join(t.TempDir(), "remind-me")
 	t.Cleanup(func() { remindMeFile = old; remindMeClear = false })
-
-	// Not an anonymous box: the daemon never created the file.
-	if err := remindMeCmd.RunE(remindMeCmd, []string{"alice@example.com"}); err == nil || !strings.Contains(err.Error(), "not an anonymous box") {
-		t.Fatalf("missing file: %v", err)
-	}
-	if err := os.WriteFile(remindMeFile, nil, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	var sb strings.Builder
-	remindMeCmd.SetOut(&sb)
-	if err := remindMeCmd.RunE(remindMeCmd, []string{"Alice@Example.com"}); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := os.ReadFile(remindMeFile); string(got) != "alice@example.com\n" {
-		t.Errorf("file = %q", got)
-	}
-	if !strings.Contains(sb.String(), "alice@example.com") {
-		t.Errorf("output = %q", sb.String())
-	}
-	// Replace.
-	if err := remindMeCmd.RunE(remindMeCmd, []string{"bob@example.com"}); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := os.ReadFile(remindMeFile); string(got) != "bob@example.com\n" {
-		t.Errorf("replace: file = %q", got)
-	}
-	// Clear.
-	remindMeClear = true
