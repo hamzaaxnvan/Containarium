@@ -14,35 +14,3 @@ mkdir -p "$tmp/bin" "$tmp/state/lists/partial" "$tmp/cache/archives/partial" "$t
 : >"$tmp/etc/sources.list"
 for cmd in incus zfs jq curl; do ln -s /bin/true "$tmp/bin/$cmd"; done
 cat >"$tmp/bin/dpkg" <<'EOF'
-#!/bin/bash
-for arg; do
-  case "$arg" in
-    --print-architecture) echo amd64 ;;
-    *.deb)
-      [[ "$arg" = /* ]] && [ -f "$arg" ] || exit 42
-      printf '%s\n' "${arg##*/}" >>"$TEST_UNPACKED"
-      ;;
-  esac
-done
-exit 0
-EOF
-chmod +x "$tmp/bin/dpkg"
-cat >"$tmp/apt.conf" <<EOF
-Dir::Etc "$tmp/etc";
-Dir::State "$tmp/state";
-Dir::State::status "$tmp/state/status";
-Dir::State::lists "$tmp/state/lists";
-Dir::Cache "$tmp/cache";
-Dir::Cache::archives "$tmp/cache/archives";
-Dir::Log "$tmp/log";
-Dir::Bin::dpkg "$tmp/bin/dpkg";
-APT::Architecture "amd64";
-APT::Sandbox::User "";
-Debug::NoLocking "true";
-EOF
-export APT_CONFIG="$tmp/apt.conf" TEST_UNPACKED="$tmp/unpacked"
-for pkg in offline-test-base offline-test-app; do
-  mkdir -p "$tmp/$pkg/DEBIAN"
-  {
-    printf 'Package: %s\nVersion: 1\nArchitecture: all\n' "$pkg"
-    printf 'Maintainer: test <test@example.invalid>\nDescription: offline fixture\n'

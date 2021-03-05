@@ -15,3 +15,21 @@ func (d *debianPkgMgr) CreateUserCmd(username, gecos string) []string {
 	if gecos == "" {
 		gecos = ""
 	}
+	return []string{"adduser", "--disabled-password", "--gecos", gecos, username}
+}
+
+func (d *debianPkgMgr) SudoGroup() string {
+	return "sudo"
+}
+
+func (d *debianPkgMgr) SSHServiceName() string {
+	return "ssh"
+}
+
+func (d *debianPkgMgr) BasePackages() []string {
+	return []string{
+		"openssh-server",
+		"sudo",
+		"curl",
+		"git",
+		"vim",
