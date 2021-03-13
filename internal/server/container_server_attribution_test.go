@@ -53,3 +53,58 @@ func newAttributionTestServer(t *testing.T, seed map[string]*incus.ContainerInfo
 // label is stamped and the response echoes the merged set.
 func TestSetContainerAttribution_MergesLabels(t *testing.T) {
 	s, store := newAttributionTestServer(t, map[string]*incus.ContainerInfo{
+		"alice-container": {Name: "alice-container", State: "Running"},
+	})
+	// Pre-existing unrelated label must survive the merge.
+	store["alice-container"] = map[string]string{"os-type": "ubuntu"}
+
+	resp, err := s.SetContainerAttribution(testCtx(), &pb.SetContainerAttributionRequest{
+		Name: "alice",
+		Labels: map[string]string{
+			"cloud_org_id":       "org-A",
+			"cloud_container_id": "cc-1",
+			"managed_by":         "containarium-cloud",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("nil response")
+	}
+	for k, want := range map[string]string{
+		"cloud_org_id": "org-A", "cloud_container_id": "cc-1",
+		"managed_by": "containarium-cloud", "os-type": "ubuntu",
+	} {
+		if resp.Labels[k] != want {
+			t.Errorf("label %q = %q, want %q (full: %+v)", k, resp.Labels[k], want, resp.Labels)
+		}
+	}
+}
+
+// TestSetContainerAttribution_EmptyLabelsRejected — an empty map is a no-op the
+// caller shouldn't make; reject it rather than silently succeed.
+func TestSetContainerAttribution_EmptyLabelsRejected(t *testing.T) {
+	s, _ := newAttributionTestServer(t, map[string]*incus.ContainerInfo{
+		"alice-container": {Name: "alice-container", State: "Running"},
+	})
+	_, err := s.SetContainerAttribution(testCtx(), &pb.SetContainerAttributionRequest{Name: "alice"})
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.InvalidArgument {
+		t.Errorf("error = %v, want InvalidArgument", err)
+	}
+}
+
+// TestSetContainerAttribution_MissingName — universal precondition check.
+func TestSetContainerAttribution_MissingName(t *testing.T) {
+	s := &ContainerServer{}
+	_, err := s.SetContainerAttribution(testCtx(), &pb.SetContainerAttributionRequest{
+		Labels: map[string]string{"cloud_org_id": "org-A"},
+	})
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.InvalidArgument {
+		t.Errorf("error = %v, want InvalidArgument", err)
+	}
+}
+
+// TestSetContainerAttribution_UnknownContainer — NotFound, not Internal.
+func TestSetContainerAttribution_UnknownContainer(t *testing.T) {
+	mock := incustest.NewMockBackend()
