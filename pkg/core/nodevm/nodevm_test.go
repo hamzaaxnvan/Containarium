@@ -71,3 +71,39 @@ func TestRenderBootstrap(t *testing.T) {
 		"incus admin init --auto",
 		"containariumd service install",
 		"--pool 'gpu'",
+		"--spot-id 'gpu-node-gpu'",
+		"--sentinel-addr 'sentinel:443'",
+		"nvidia", // GPU node installs the driver
+		"CONTAINARIUM_TUNNEL_TOKEN=\"$(cat /etc/containarium/tunnel.token)\"", // token from file, not argv
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("bootstrap missing %q in:\n%s", want, script)
+		}
+	}
+	// CPU node must NOT install the nvidia driver.
+	if strings.Contains(RenderBootstrap(cpuSpec(), guestTokenPath), "nvidia") {
+		t.Errorf("cpu bootstrap should not install nvidia driver")
+	}
+	// The token value itself must never appear in the script.
+	s := cpuSpec()
+	s.TunnelToken = "SUPERSECRET"
+	if strings.Contains(RenderBootstrap(s, guestTokenPath), "SUPERSECRET") {
+		t.Errorf("token value leaked into bootstrap script")
+	}
+}
+
+// fakeRunner records calls; "list" returns canned VM rows.
+type fakeRunner struct {
+	calls   []string
+	listOut string
+	failOn  string // substring of a joined call to fail
+}
+
+func (f *fakeRunner) Run(args ...string) (string, error) {
+	joined := strings.Join(args, " ")
+	f.calls = append(f.calls, joined)
+	if f.failOn != "" && strings.Contains(joined, f.failOn) {
+		return "", fmt.Errorf("forced failure on %q", f.failOn)
+	}
+	if strings.HasPrefix(joined, "list type=virtual-machine") {
+		return f.listOut, nil
