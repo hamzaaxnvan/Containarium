@@ -73,3 +73,41 @@ const openHarnesses: Harness[] = [];
 function startHarness(expectedToken: string): Promise<Harness> {
   let calls = 0;
   const countingEngine: Engine = {
+    name: "counting",
+    async run(task, _c, journal) {
+      calls++;
+      journal.append({ kind: "tool_use", tool: "shell", input: task });
+      return { outputJson: '{"ok":true}' };
+    },
+  };
+  const journalRoot = mkdtempSync(join(tmpdir(), "journal-a2a-"));
+  const opts: A2AServerOptions = {
+    seed,
+    engine: countingEngine,
+    cfg,
+    journals: serveJournals({ root: journalRoot, skillId: "hello-agent", secrets: [], warn: () => {} }),
+    expectedToken,
+    warn: () => {},
+  };
+  const server = createA2AServer(opts);
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as AddressInfo;
+      const h: Harness = {
+        url: `http://127.0.0.1:${port}`,
+        journalRoot,
+        engineCalls: () => calls,
+        close: () => new Promise((done) => { server.close(() => { done(); }); }),
+      };
+      openHarnesses.push(h);
+      resolve(h);
+    });
+  });
+}
+
+afterEach(async () => {
+  await Promise.all(openHarnesses.splice(0).map((h) => h.close()));
+});
+
+function postTask(url: string, headers: Record<string, string>, runId = "run-victim"): Promise<Response> {
+  return fetch(`${url}/tasks`, {
