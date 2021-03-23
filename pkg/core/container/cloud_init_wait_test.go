@@ -47,3 +47,20 @@ func TestCloudInitPresent(t *testing.T) {
 		{"exec transport failure", 0, errors.New("boom"), false},
 	}
 	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewWithBackend(&cloudInitProbeBackend{probeExitCode: tt.exitCode, probeErr: tt.err})
+			if got := m.cloudInitPresent("box-container"); got != tt.want {
+				t.Errorf("cloudInitPresent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInstallPackages_SkipsWaitWhenCloudInitAbsent(t *testing.T) {
+	m := NewWithBackend(&cloudInitProbeBackend{probeExitCode: 1}) // `command -v cloud-init` not found
+	m.cloudInitWait = 2 * time.Second                             // would show up in elapsed if hit
+
+	start := time.Now()
+	_ = m.installPackages("box-container", false, "", nil, "alice", ostype.Debian)
+	elapsed := time.Since(start)
+
