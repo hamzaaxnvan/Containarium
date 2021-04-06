@@ -40,25 +40,3 @@ func (a *Adapter) OpenChange(ctx context.Context, conn tracker.Conn, req tracker
 		conn.Credential, reqBody, &pr); err != nil {
 		return tracker.Change{}, err
 	}
-
-	return tracker.Change{
-		Number: pr.Number,
-		// A freshly opened PR is always "open" and unmerged;
-		// pullStateToTracker still goes through the response rather
-		// than hardcoding OPEN, so a provider quirk (e.g. auto-merge
-		// firing instantly) is reflected rather than assumed away.
-		State: pullStateToTracker(pr),
-		// No CI has run yet for a pull request that was just created —
-		// a combined-status lookup would report the same NONE this
-		// avoids the extra API call for.
-		CIVerdict: pb.TrackerCiVerdict_TRACKER_CI_VERDICT_NONE,
-		URL:       pr.HTMLURL,
-		Branch:    req.HeadBranch,
-	}, nil
-}
-
-// FindOpenChange returns the open pull request whose head is headBranch
-// in conn.Project itself (#3288): GET /repos/{owner}/{repo}/pulls with
-// head=<owner>:<branch> and state=open. A pull request from a fork's
-// same-named branch is not a match.
-func (a *Adapter) FindOpenChange(ctx context.Context, conn tracker.Conn, headBranch string) (tracker.Change, bool, error) {
