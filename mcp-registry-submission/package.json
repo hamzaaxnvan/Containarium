@@ -1,0 +1,35 @@
+{
+  "name": "@modelcontextprotocol/server-containarium",
+  "version": "0.1.0",
+  "description": "MCP server for Containarium - Manage LXC containers directly from Claude Desktop using natural language",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "FootprintAI",
+    "url": "https://github.com/hamzaaxnvan"
+  },
+  "homepage": "https://github.com/hamzaaxnvan/containarium",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hamzaaxnvan/containarium.git",
+    "directory": "cmd/mcp-server"
+  },
+  "bugs": {
+    "url": "https://github.com/hamzaaxnvan/containarium/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "containers",
+    "lxc",
+    "incus",
+    "devops",
+    "infrastructure",
+    "virtualization",
+    "claude",
+    "ai-tools"
+  ],
+  "mcpServer": {
+    "transport": "stdio",
+    "capabilities": {
+      "tools": true
+    },

@@ -137,3 +137,73 @@ func Generate(ctx context.Context, ex Execer, box string, opts Options) (*pb.Pro
 // records the source on pack.
 func resolveSteps(ex Execer, box, dir string, pack *pb.ProofPack) ([]Step, error) {
 	stdout, stderr, rc, err := ex.ExecWithExitCode(box, []string{
+		"sh", "-c", probeScript, "proofpack-probe", dir, DeclarationPath, strconv.Itoa(MaxDeclarationBytes + 1),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("proofpack: probe %s: %w", box, err)
+	}
+	switch rc {
+	case 97:
+		return nil, fmt.Errorf("proofpack: repo dir %q does not exist in %s", dir, box)
+	case 95:
+		// A declaration that exists but cannot be read must not fall back
+		// to `make test`: the repository declared something else.
+		return nil, fmt.Errorf("proofpack: cannot read %s in %s: %s", DeclarationPath, box, strings.TrimSpace(stderr))
+	case 10, 11, 12, 13, 14, 15, 16, 17:
+	default:
+		return nil, fmt.Errorf("proofpack: probe %s exited %d: %s", box, rc, strings.TrimSpace(stderr))
+	}
+	hasDecl := (rc-10)&1 != 0
+	hasMakefile := (rc-10)&2 != 0
+	noTimeout := (rc-10)&4 != 0
+	steps, err := pickSteps(stdout, hasDecl, hasMakefile, pack)
+	if err != nil {
+		return nil, err
+	}
+	if noTimeout && len(steps) > 0 {
+		return nil, fmt.Errorf("proofpack: %s has no `timeout` command (coreutils); steps cannot be bounded", box)
+	}
+	return steps, nil
+}
+
+// pickSteps chooses the declared steps, the `make test` fallback, or none.
+func pickSteps(stdout string, hasDecl, hasMakefile bool, pack *pb.ProofPack) ([]Step, error) {
+
+	if hasDecl {
+		if len(stdout) > MaxDeclarationBytes {
+			return nil, fmt.Errorf("proofpack: %s is larger than %d bytes", DeclarationPath, MaxDeclarationBytes)
+		}
+		steps, ok, err := ParseDeclaration([]byte(stdout))
+		if err != nil {
+			return nil, fmt.Errorf("proofpack: %w", err)
+		}
+		if ok {
+			pack.CommandSource = pb.ProofCommandSource_PROOF_COMMAND_SOURCE_DECLARED
+			pack.DeclarationSha256 = LogDigest([]byte(stdout))
+			return steps, nil
+		}
+	}
+	if hasMakefile {
+		pack.CommandSource = pb.ProofCommandSource_PROOF_COMMAND_SOURCE_FALLBACK_MAKE_TEST
+		return FallbackSteps(), nil
+	}
+	pack.CommandSource = pb.ProofCommandSource_PROOF_COMMAND_SOURCE_NONE
+	return nil, nil
+}
+
+// gitCommit is HEAD of dir, or "" when dir is not a git checkout (or git
+// is missing). It is informational, so failure is not an error.
+func gitCommit(ex Execer, box, dir string) string {
+	stdout, _, rc, err := ex.ExecWithExitCode(box, []string{
+		"git", "-c", "safe.directory=*", "-C", dir, "rev-parse", "HEAD",
+	})
+	if err != nil || rc != 0 {
+		return ""
+	}
+	return strings.TrimSpace(stdout)
+}
+
+func runStep(ex Execer, box string, opts Options, timeoutSecs int64, s Step) (*pb.ProofStep, error) {
+	start := opts.Now()
+	stdout, stderr, rc, err := ex.ExecWithExitCode(box, []string{
+		"sh", "-c", stepScript, "proofpack-step",
