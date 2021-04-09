@@ -88,3 +88,94 @@ func TestRouteStore_SaveIsAnUpsertByDomain(t *testing.T) {
 	}
 	if got.TargetIP != "10.0.0.99" || got.TargetPort != 9090 {
 		t.Errorf("route points at %s:%d, want the updated 10.0.0.99:9090 — this is the write "+
+			"MoveContainer makes after a migration, so a stale value sends traffic to the host "+
+			"the container just left", got.TargetIP, got.TargetPort)
+	}
+}
+
+// The migration path: MoveContainer lists a container's routes and rewrites
+// each target_ip. Both halves are exercised here because a mismatch between
+// them is silent — the write succeeds and the read returns yesterday's IP.
+func TestRouteStore_ListByContainerSeesTheRewrittenTarget(t *testing.T) {
+	ctx := context.Background()
+	store, suffix := newRouteStoreForTest(t)
+	container := "movable-" + suffix
+	domains := []string{"one-" + suffix + ".example.com", "two-" + suffix + ".example.com"}
+	t.Cleanup(func() {
+		for _, d := range domains {
+			_ = store.Delete(context.Background(), d)
+		}
+	})
+
+	for i, d := range domains {
+		if err := store.Save(ctx, &RouteRecord{
+			Subdomain: fmt.Sprintf("s%d-%s", i, suffix), FullDomain: d,
+			TargetIP: "10.0.0.10", TargetPort: 8080 + i, Protocol: "http",
+			ContainerName: container, Active: true,
+		}); err != nil {
+			t.Fatalf("Save(%s): %v", d, err)
+		}
+	}
+
+	routes, err := store.ListByContainer(ctx, container)
+	if err != nil {
+		t.Fatalf("ListByContainer: %v", err)
+	}
+	if len(routes) != 2 {
+		t.Fatalf("ListByContainer returned %d routes, want 2 — a migration rewrites what this "+
+			"returns, so a missing row is a domain left pointing at the old host", len(routes))
+	}
+
+	for _, r := range routes {
+		r.TargetIP = "10.9.9.9"
+		if err := store.Save(ctx, r); err != nil {
+			t.Fatalf("rewrite %s: %v", r.FullDomain, err)
+		}
+	}
+
+	after, err := store.ListByContainer(ctx, container)
+	if err != nil {
+		t.Fatalf("ListByContainer after rewrite: %v", err)
+	}
+	for _, r := range after {
+		if r.TargetIP != "10.9.9.9" {
+			t.Errorf("%s still points at %s after the rewrite", r.FullDomain, r.TargetIP)
+		}
+	}
+}
+
+// activeOnly is what the gateway filters on. A route that is inactive but
+// still served, or active but hidden, is a traffic bug either way.
+func TestRouteStore_ActiveFlagFiltersListAndCount(t *testing.T) {
+	ctx := context.Background()
+	store, suffix := newRouteStoreForTest(t)
+	domain := "toggle-" + suffix + ".example.com"
+	t.Cleanup(func() { _ = store.Delete(context.Background(), domain) })
+
+	if err := store.Save(ctx, &RouteRecord{
+		Subdomain: "toggle-" + suffix, FullDomain: domain,
+		TargetIP: "10.0.0.10", TargetPort: 8080, Protocol: "http", Active: true,
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	activeBefore, err := store.Count(ctx, true)
+	if err != nil {
+		t.Fatalf("Count(active): %v", err)
+	}
+
+	if err := store.SetActive(ctx, domain, false); err != nil {
+		t.Fatalf("SetActive(false): %v", err)
+	}
+
+	activeAfter, err := store.Count(ctx, true)
+	if err != nil {
+		t.Fatalf("Count(active) after deactivation: %v", err)
+	}
+	if activeAfter != activeBefore-1 {
+		t.Errorf("active count went %d -> %d, want a decrease of exactly 1 — the gateway serves "+
+			"what this filter returns", activeBefore, activeAfter)
+	}
+
+	// And it must still be readable by domain: deactivated is not deleted.
+	got, err := store.GetByDomain(ctx, domain)
