@@ -46,19 +46,3 @@ func TestSecretsRPCs_ReservedGatewayNamespaceIsInvisible(t *testing.T) {
 			t.Errorf("code = %v, want NotFound", status.Code(err))
 		}
 	})
-
-	t.Run("SetSecret", func(t *testing.T) {
-		if _, err := s.SetSecret(ctx, &pb.SetSecretRequest{Username: reserved, Name: "KAFEIDO", Value: "sk-hostile"}); status.Code(err) != codes.NotFound {
-			t.Errorf("code = %v, want NotFound", status.Code(err))
-		}
-	})
-
-	t.Run("DeleteSecret", func(t *testing.T) {
-		if _, err := s.DeleteSecret(ctx, &pb.DeleteSecretRequest{Username: reserved, Name: "KAFEIDO"}); status.Code(err) != codes.NotFound {
-			t.Errorf("code = %v, want NotFound", status.Code(err))
-		}
-	})
-}
-
-// A tenant username can never collide with the namespace, because the prefix
-// contains a '/' and a tenant username cannot. This pins that the discriminator
