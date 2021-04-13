@@ -31,37 +31,3 @@ func TestCompileConfig(t *testing.T) {
 }
 
 func TestCompileConfig_Metadata(t *testing.T) {
-	// Default: metadata denied (AllowMetadata 0).
-	def := CompileConfig(1, mustCompile(t, &pb.NetworkPolicy{Tenant: "a"}))
-	if def.AllowMetadata != 0 {
-		t.Errorf("default AllowMetadata = %d, want 0 (deny)", def.AllowMetadata)
-	}
-	// Explicit opt-in.
-	on := CompileConfig(1, mustCompile(t, &pb.NetworkPolicy{Tenant: "a", AllowMetadata: true}))
-	if on.AllowMetadata != 1 {
-		t.Errorf("opted-in AllowMetadata = %d, want 1", on.AllowMetadata)
-	}
-}
-
-func TestCompileConfig_DefaultsLogOnly(t *testing.T) {
-	// Unspecified mode resolves to LOG_ONLY in Compile; AllowIntra false.
-	c := mustCompile(t, &pb.NetworkPolicy{Tenant: "bob"})
-	got := CompileConfig(7, c)
-	if got.Mode != ModeLogOnly {
-		t.Errorf("Mode = %d, want ModeLogOnly(%d)", got.Mode, ModeLogOnly)
-	}
-	if got.AllowIntra != 0 {
-		t.Errorf("AllowIntra = %d, want 0", got.AllowIntra)
-	}
-}
-
-func TestCompileEgress(t *testing.T) {
-	c := mustCompile(t, &pb.NetworkPolicy{
-		Tenant:      "alice",
-		EgressCidrs: []string{"10.0.0.0/8", "1.2.3.4/24"}, // 1.2.3.4/24 masks to 1.2.3.0/24
-	})
-	entries, err := CompileEgress(99, c)
-	if err != nil {
-		t.Fatalf("CompileEgress: %v", err)
-	}
-	if len(entries) != 2 {

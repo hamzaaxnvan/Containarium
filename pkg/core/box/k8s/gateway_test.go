@@ -61,3 +61,66 @@ func TestCreateProgramsPipe(t *testing.T) {
 		t.Fatalf("spec.from len = %d, want 1", len(from))
 	}
 	f0 := from[0].(map[string]any)
+	if f0["username"] != "alice" {
+		t.Errorf("from.username = %v, want alice", f0["username"])
+	}
+	wantKeys := base64.StdEncoding.EncodeToString([]byte("ssh-ed25519 AAAA\n"))
+	if f0["authorized_keys_data"] != wantKeys {
+		t.Errorf("authorized_keys_data = %v, want %v", f0["authorized_keys_data"], wantKeys)
+	}
+
+	host, _, _ := unstructured.NestedString(p.Object, "spec", "to", "host")
+	if host != "box.tenant-alice.svc.cluster.local:2222" {
+		t.Errorf("to.host = %q", host)
+	}
+	user, _, _ := unstructured.NestedString(p.Object, "spec", "to", "username")
+	if user != "agent" {
+		t.Errorf("to.username = %q, want agent", user)
+	}
+
+	// Host-key pinning: known_hosts_data set (exact format), ignore_hostkey gone.
+	if _, ignore, _ := unstructured.NestedBool(p.Object, "spec", "to", "ignore_hostkey"); ignore {
+		t.Error("Pipe should not set ignore_hostkey when pinning")
+	}
+	khd, _, _ := unstructured.NestedString(p.Object, "spec", "to", "known_hosts_data")
+	if khd == "" {
+		t.Fatal("Pipe should pin the box host key via known_hosts_data")
+	}
+	raw, _ := base64.StdEncoding.DecodeString(khd)
+	// Both host keys pinned (sshpiper may negotiate either), bracketed [host]:port.
+	if !strings.Contains(string(raw), "[box.tenant-alice.svc.cluster.local]:2222 ssh-ed25519 ") {
+		t.Errorf("known_hosts missing ed25519 line: %q", raw)
+	}
+	if !strings.Contains(string(raw), "[box.tenant-alice.svc.cluster.local]:2222 ssh-rsa ") {
+		t.Errorf("known_hosts missing rsa line: %q", raw)
+	}
+}
+
+func TestSetAuthorizedKeysUpdatesPipe(t *testing.T) {
+	b, dyn := gatewayBackend()
+	ctx := context.Background()
+	ref := box.BoxRef{Tenant: "bob"}
+	if _, err := b.Create(ctx, box.BoxSpec{Ref: ref, Image: "x", SSHKeys: []string{"old"}, AutoStart: true}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := b.SetAuthorizedKeys(ctx, ref, []string{"rotated-key"}); err != nil {
+		t.Fatalf("SetAuthorizedKeys: %v", err)
+	}
+	p := getPipe(t, dyn, "bob")
+	from, _, _ := unstructured.NestedSlice(p.Object, "spec", "from")
+	f0 := from[0].(map[string]any)
+	want := base64.StdEncoding.EncodeToString([]byte("rotated-key\n"))
+	if f0["authorized_keys_data"] != want {
+		t.Errorf("rotated authorized_keys_data = %v, want %v", f0["authorized_keys_data"], want)
+	}
+}
+
+func TestDeleteRemovesPipe(t *testing.T) {
+	b, dyn := gatewayBackend()
+	ctx := context.Background()
+	ref := box.BoxRef{Tenant: "carol"}
+	if _, err := b.Create(ctx, box.BoxSpec{Ref: ref, Image: "x", AutoStart: true}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	getPipe(t, dyn, "carol") // present
+	if err := b.Delete(ctx, ref, true); err != nil {
