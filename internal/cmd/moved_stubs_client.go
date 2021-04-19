@@ -46,19 +46,3 @@ var movedServerCommands = []string{
 	"hypervisor-agent",
 	"egress-relay",
 	"upgrade-watchdog",
-	"sync-accounts",
-	"recover",
-	"image-bake",
-	"doctor",
-	"hosting",
-	"portforward",
-	"passthrough",
-	"audit",
-	"export",
-	"cloud",
-}
-
-// movedCommandMessage is the stub's stderr line — factored out so the exact
-// wording is covered by a plain unit test without going through cobra/exit.
-func movedCommandMessage(name string) string {
-	return fmt.Sprintf("%s lives in containariumd on the host; this is the client binary", name)
