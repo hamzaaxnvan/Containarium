@@ -103,3 +103,38 @@ func realRunCtx(t *testing.T, user, runID string) context.Context {
 	return contextFromBearer(t, tm, tok, "/v1/tracker/connections/"+user+"/default/issues/42")
 }
 
+// TestTrackerVerbs_RealRunToken_AuthorizesOwnTenant is the #2268 "Done
+// means" test: a tracker read verb and a tracker write verb, called with
+// a token the real run-token mint path produced, succeed for the tenant
+// the run was started for — the tenant named in the dispatch input and
+// passed back as req.Username by the in-box tracker_* tools.
+func TestTrackerVerbs_RealRunToken_AuthorizesOwnTenant(t *testing.T) {
+	const user = "tracker-real-run-token-own-tenant"
+	issue := tracker.Issue{Number: 42, Title: "idea", Body: "Please write a PRD.", Labels: []string{"scope:product"},
+		State: pb.TrackerIssueState_TRACKER_ISSUE_STATE_OPEN}
+	provider := &fakeWriterProvider{fakeReaderProvider: fakeReaderProvider{issue: issue, issues: []tracker.Issue{issue}}}
+	s, _, _ := setUpCreateConnection(t, user, provider, nil)
+	const runID = "run-real-token-own"
+	s.runRegistry.Register(runID, runlease.Info{SkillID: "product-define", Model: "fable"})
+	run := realRunCtx(t, user, runID)
+
+	// Read verb.
+	got, err := s.GetTrackerIssue(run, &pb.GetTrackerIssueRequest{Username: user, Connection: "default", Number: 42})
+	if err != nil {
+		t.Fatalf("GetTrackerIssue with a real run token for its own tenant: %v (code %v), want success", err, status.Code(err))
+	}
+	if got.GetIssue().GetNumber() != 42 {
+		t.Fatalf("GetTrackerIssue = %+v, want issue #42", got.GetIssue())
+	}
+
+	// Write verb: the comment lands on the forge, stamped with the run's
+	// identity (run id + skill), not the box's subject.
+	if _, err := s.CommentOnTrackerIssue(run, &pb.CommentOnTrackerIssueRequest{
+		Username: user, Connection: "default", Number: 42, Body: "Claimed; starting the PRD.",
+	}); err != nil {
+		t.Fatalf("CommentOnTrackerIssue with a real run token for its own tenant: %v (code %v), want success", err, status.Code(err))
+	}
+	if len(provider.commentNumbers) != 1 || provider.commentNumbers[0] != 42 {
+		t.Fatalf("comments on the forge = %v, want exactly one on #42", provider.commentNumbers)
+	}
+	if !strings.Contains(provider.commentBody, runID) || !strings.Contains(provider.commentBody, "product-define") {

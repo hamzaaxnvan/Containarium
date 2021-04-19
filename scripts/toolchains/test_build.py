@@ -73,3 +73,41 @@ class ToolchainBuildTest(unittest.TestCase):
             Path(args[args.index("-o") + 1]).write_bytes(b"#!/bin/sh\necho rebuilt\n")
 
         info = {"Sum": "h1:fixture", "Dir": str(self.root)}
+        with mock.patch.object(self.builder.subprocess, "check_output", return_value=json.dumps(info).encode()), \
+             mock.patch.object(self.builder.subprocess, "run", side_effect=compile_tool):
+            self.builder.build(self.lock, "amd64", "v0.1.0", self.root / "rebuilt", self.root / "cache")
+        args, kwargs = invoked[0]
+        self.assertIn("go/bin/go", args[0])
+        self.assertEqual(kwargs["env"]["GOTOOLCHAIN"], "local")
+        self.assertEqual(kwargs["env"]["GOSUMDB"], "sum.golang.org")
+        self.assertEqual(kwargs["env"]["GOARCH"], "amd64")
+
+    def test_staticcheck_source_checksum_mismatch_stops_build(self):
+        tool = next(t for t in self.lock["tools"] if t["name"] == "staticcheck")
+        tool.update(module="honnef.co/go/tools", module_version="v0.8.2", module_sum="h1:expected")
+        info = {"Sum": "h1:wrong", "Dir": str(self.root)}
+        with mock.patch.object(self.builder.subprocess, "check_output", return_value=json.dumps(info).encode()), \
+             mock.patch.object(self.builder.subprocess, "run") as compiler:
+            with self.assertRaisesRegex(ValueError, "source checksum"):
+                self.builder.build(self.lock, "amd64", "v0.1.0", self.root / "rebuilt", self.root / "cache")
+        compiler.assert_not_called()
+
+    def test_npm_security_dependency_is_replaced_and_inventoried(self):
+        patch = self.root / "undici.tgz"
+        with tarfile.open(patch, "w:gz") as archive:
+            content = b'{"name":"undici","version":"6.29.1"}'
+            entry = tarfile.TarInfo("package/package.json")
+            entry.size, entry.mode = len(content), 0o644
+            archive.addfile(entry, io.BytesIO(content))
+        npm = next(t for t in self.lock["tools"] if t["name"] == "npm")
+        npm["security_dependencies"] = [{"name": "undici", "version": "6.29.1", "artifact": {
+            "url": patch.as_uri(), "sha256": hashlib.sha256(patch.read_bytes()).hexdigest(), "format": "tar"}}]
+        destination = self.root / "patched"
+        self.builder.build(self.lock, "amd64", "v0.1.0", destination, self.root / "cache")
+        package = json.loads((destination / "npm/node_modules/undici/package.json").read_text())
+        self.assertEqual(package["version"], "6.29.1")
+        manifest = json.loads((destination / "manifest.json").read_text())
+        npm = next(t for t in manifest["tools"] if t["name"] == "npm")
+        self.assertEqual(npm["security_dependencies"][0]["version"], "6.29.1")
+
+    def test_checksum_mismatch_cannot_produce_a_release(self):
