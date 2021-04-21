@@ -58,3 +58,33 @@ func (m *Manager) startSSHUpstream() (func(), error) {
 	if err != nil {
 		_ = controller.Close()
 		return nil, err
+	}
+	m.sshUpstreamMu.Lock()
+	m.sshUpstream = controller
+	m.sshUpstreamMu.Unlock()
+	return func() { stop(); _ = controller.Close() }, nil
+}
+
+// sshUpstreamController snapshots the owner without racing startup retries.
+func (m *Manager) sshUpstreamController() *sshcontrol.Controller {
+	m.sshUpstreamMu.RLock()
+	defer m.sshUpstreamMu.RUnlock()
+	return m.sshUpstream
+}
+
+// superviseSSHUpstream isolates guard faults and retries without resetting risk.
+func (m *Manager) superviseSSHUpstream(ctx context.Context, interval time.Duration) func() {
+	if m.config.SSHUpstreamPolicy == "" {
+		return func() {}
+	}
+	var stop func()
+	retry := func() {
+		if c := m.sshUpstreamController(); c != nil {
+			if c.Faulted() {
+				if err := c.Recover(); err != nil {
+					log.Printf("[sentinel] SSH upstream fault remains: %v", err)
+				}
+			}
+			return
+		}
+		var err error
