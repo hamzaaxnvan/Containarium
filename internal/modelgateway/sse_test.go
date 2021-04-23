@@ -120,3 +120,64 @@ func TestSSE_UnknownChunkPassthrough(t *testing.T) {
 // toolSSE mimics Gemini's OpenAI-compat streaming for a tool call: a chunk with
 // a tool_calls delta, then a SEPARATE finish chunk with the non-conformant
 // finish_reason "stop" (Gemini's quirk) + usage, then [DONE].
+const toolSSE = `data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"arguments":"{}","name":"list_containers"},"id":"abc","type":"function"}]},"index":0}]}` + "\n\n" +
+	`data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":33,"completion_tokens":10}}` + "\n\n" +
+	"data: [DONE]\n\n"
+
+// With the leak filter ON (a system prompt is present — the workspace agent's
+// normal state), tool calls must NOT be dropped and the turn's finish_reason
+// must be normalized "stop" -> "tool_calls" so the agent client runs the tool.
+func TestSSE_ToolCall_FilterOn_PreservesCallAndNormalizesFinish(t *testing.T) {
+	out, u := runFilter(t, toolSSE, "You are a senior product manager. Ask clarifying questions before proposing anything.")
+	if !strings.Contains(out, `"name":"list_containers"`) {
+		t.Fatalf("tool_calls dropped by filter; out=%q", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("finish_reason not normalized to tool_calls; out=%q", out)
+	}
+	if strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Fatalf("non-conformant finish_reason \"stop\" leaked to client; out=%q", out)
+	}
+	if u.OutputTokens != 10 {
+		t.Fatalf("usage out = %d, want 10 (metered on a tool-call turn)", u.OutputTokens)
+	}
+}
+
+// With the filter OFF (no system prompt), tool calls already pass through, but
+// the finish_reason still needs normalizing.
+func TestSSE_ToolCall_FilterOff_NormalizesFinish(t *testing.T) {
+	out, _ := runFilter(t, toolSSE, "")
+	if !strings.Contains(out, `"name":"list_containers"`) {
+		t.Fatalf("tool_calls missing; out=%q", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"tool_calls"`) || strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Fatalf("finish_reason not normalized; out=%q", out)
+	}
+}
+
+// A plain text turn (no tool call) must keep finish_reason "stop" — we only
+// rewrite when a tool call was actually seen.
+func TestSSE_PlainStop_NotRewritten(t *testing.T) {
+	out, _ := runFilter(t, chunk("hi", "stop")+"data: [DONE]\n\n", "")
+	if !strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Fatalf("plain stop should be preserved; out=%q", out)
+	}
+	if strings.Contains(out, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("plain stop wrongly rewritten to tool_calls; out=%q", out)
+	}
+}
+
+// With the filter ON, re-serialized chunks must carry the upstream envelope
+// (id/object/created/model) — a minimal chunk makes strict clients (LibreChat
+// v0.8.6) drop it and the stream hangs.
+func TestSSE_FilterOn_FullChunkShape(t *testing.T) {
+	sys := "You are a senior product manager. Ask clarifying questions before proposing anything."
+	sse := `data: {"id":"chatcmpl-xyz","object":"chat.completion.chunk","created":123,"model":"gemini-flash-latest","choices":[{"delta":{"content":"Sure, here is the plan."},"index":0}]}` + "\n\n" +
+		`data: {"id":"chatcmpl-xyz","object":"chat.completion.chunk","created":123,"model":"gemini-flash-latest","choices":[{"delta":{},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":5,"completion_tokens":6}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	out, u := runFilter(t, sse, sys)
+	if got := sseContent(out); got != "Sure, here is the plan." {
+		t.Fatalf("content altered: %q", got)
+	}
+	for _, want := range []string{`"object":"chat.completion.chunk"`, `"id":"chatcmpl-xyz"`, `"model":"gemini-flash-latest"`} {
+		if !strings.Contains(out, want) {

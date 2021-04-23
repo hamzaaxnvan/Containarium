@@ -26,31 +26,3 @@ export function useApps(server: Server | null, username?: string) {
     swrKey,
     fetcher,
     {
-      // No polling - rely on SSE for real-time updates
-      refreshInterval: 0,
-      revalidateOnFocus: true,
-      dedupingInterval: 5000,
-    }
-  );
-
-  // Handle app events from SSE
-  const handleEvent = useCallback(
-    (event: ServerEvent) => {
-      if (!isAppEvent(event)) return;
-
-      // Revalidate app list on any app event
-      mutate();
-    },
-    [mutate]
-  );
-
-  // Subscribe to app events via SSE
-  const { status: eventStatus, reconnect } = useEventStream(server, {
-    resourceTypes: ['RESOURCE_TYPE_APP'],
-    onEvent: handleEvent,
-  });
-
-  /**
-   * Stop an app
-   */
-  const stopApp = async (appUsername: string, appName: string) => {
