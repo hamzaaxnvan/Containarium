@@ -1,0 +1,28 @@
+// Copy this file to terraform.tfvars (gitignored) and fill in real values.
+//
+//   cp terraform.tfvars.example terraform.tfvars
+//   $EDITOR terraform.tfvars
+//   terraform init && terraform apply
+
+// REQUIRED: GCP project to create resources in.
+project_id = "your-gcp-project-id"
+
+// REQUIRED: SSH public key for the admin user. The admin can SSH into
+// the sentinel to issue JWTs. Add multiple keys if a team is recording.
+admin_ssh_keys = {
+  admin = "ssh-ed25519 AAAAC3Nz... admin@example.com"
+}
+
+// REQUIRED: random JWT signing secret. Generate with:
+//   openssl rand -hex 32
+// Keep this secret — anyone who has it can mint admin tokens.
+jwt_secret = "REPLACE_ME_WITH_OPENSSL_RAND_HEX_32"
+
+// REQUIRED on v0.22.x: shared HMAC secret the sentinel uses to
+// authenticate keysync/certsync to the backend daemon. An empty value
+// makes every sentinel↔daemon sync 401 — SSH key sync never wires up
+// and the create→ssh→install demo flow silently breaks. Generate a
+// separate value from jwt_secret:
+//   openssl rand -hex 32
+sentinel_auth_secret = "REPLACE_ME_WITH_OPENSSL_RAND_HEX_32"
+

@@ -154,3 +154,81 @@ const (
 	// unlocked, or could not be read, so the bucket copy is not immutable.
 	FindingNoLockedRetention
 	// FindingUnrecognisedObject: an object under the prefix is not named like
+	// an anchor. Never counted as an anchor.
+	FindingUnrecognisedObject
+	// FindingBelowChainBase: anchored checkpoints lie below the chain base, so
+	// their rows were purged by retention (#2878). They are compared between
+	// the bucket and the local file, not with the database.
+	FindingBelowChainBase
+)
+
+func (k BucketFindingKind) String() string {
+	switch k {
+	case FindingLocalRootDiffers:
+		return "local-root-differs"
+	case FindingMissingLocally:
+		return "missing-locally"
+	case FindingAboveChainTip:
+		return "above-chain-tip"
+	case FindingContentMismatch:
+		return "content-mismatch"
+	case FindingDatabaseRootDiffers:
+		return "database-root-differs"
+	case FindingLocalNewerThanBucket:
+		return "local-newer-than-bucket"
+	case FindingNoLockedRetention:
+		return "no-locked-retention"
+	case FindingUnrecognisedObject:
+		return "unrecognised-object"
+	case FindingBelowChainBase:
+		return "below-chain-base"
+	}
+	return "unspecified"
+}
+
+// BucketAnchorFinding is one failure or warning. Checkpoint is 0 when the
+// finding is not about one checkpoint.
+type BucketAnchorFinding struct {
+	Kind       BucketFindingKind
+	Checkpoint int64
+	Detail     string
+}
+
+// BucketAnchorReport is the result of VerifyAnchorsAgainstBucket. Failures
+// make verify-anchor exit non-zero; Warnings do not.
+type BucketAnchorReport struct {
+	Failures []BucketAnchorFinding
+	Warnings []BucketAnchorFinding
+	// CheckedCheckpoints counts the bucket checkpoints compared with the
+	// database: well-formed ones at or below the database's highest row id.
+	CheckedCheckpoints int
+	// LatestCheckpoint and LatestRoot are the highest such checkpoint; 0 and
+	// "" when there is none.
+	LatestCheckpoint int64
+	LatestRoot       string
+	// TailCheckpoint and TailRoot are the highest checkpoint at or below the
+	// database's highest row id in EITHER copy: where the chain-consistency
+	// check of the rows logged after it starts.
+	TailCheckpoint int64
+	TailRoot       string
+	// BelowChainBase counts the anchored checkpoints (in either copy) below the
+	// chain base, whose rows retention purged (#2878). They are not compared
+	// with the database.
+	BelowChainBase int
+}
+
+// OK reports whether there are no failures.
+func (r BucketAnchorReport) OK() bool { return len(r.Failures) == 0 }
+
+// VerifyAnchorsAgainstBucket compares the bucket's anchors with the database
+// and with the local anchor file:
+//
+//   - every well-formed bucket checkpoint at or below the database's highest
+//     row id must match the database row hash and the local file's record;
+//   - a bucket checkpoint above that row id, or whose content does not match
+//     its name, is a failure, as is one missing from the local file;
+//   - a checkpoint only the local file holds (an upload not yet done, or a
+//     wrong or empty bucket prefix) is still compared with the database, so
+//     turning the bucket on never weakens the local-file check; the bucket
+//     does not vouch for it, which is a warning;
+//   - a bucket without a locked retention policy is a warning.
