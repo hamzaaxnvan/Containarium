@@ -39,3 +39,45 @@ func TestGuardrailPolicyProvider_FollowsDurableInstall(t *testing.T) {
 	}
 	if err := s.InstallDurableStore(func() (guardrailpolicy.Store, error) { return durable, nil }); err != nil {
 		t.Fatalf("InstallDurableStore: %v", err)
+	}
+	if !s.Durable() {
+		t.Fatal("Durable() = false after install")
+	}
+	got, err := provider.Get(context.Background())
+	if err != nil {
+		t.Fatalf("startup-captured provider.Get after install = %v, want the durable store's policy", err)
+	}
+	if got.GetRevision() != 1 {
+		t.Fatalf("provider.Get revision = %d, want 1 (the durable store's policy)", got.GetRevision())
+	}
+	resp, err := s.GetGuardrailPolicy(gpUserCtx(), &pb.GetGuardrailPolicyRequest{})
+	if err != nil || !resp.GetConfigured() {
+		t.Fatalf("Get after install = %v, %v; want the durable policy", resp, err)
+	}
+}
+
+func TestCodeEgressPolicy_DurableFollowsInstall(t *testing.T) {
+	s := startupServer(t)
+	if s.Durable() {
+		t.Fatal("Durable() = true on the stand-in")
+	}
+	if err := s.InstallDurableStore(func() (CodingToolEgressPolicyStore, error) {
+		return NewMemCodingToolEgressPolicyStore(), nil
+	}); err != nil {
+		t.Fatalf("InstallDurableStore: %v", err)
+	}
+	if !s.Durable() {
+		t.Fatal("Durable() = false after install")
+	}
+}
+
+// The swap happens while RPCs are in flight; run with -race.
+func TestPolicyStoreSwap_ConcurrentWithReads(t *testing.T) {
+	gp := NewGuardrailPolicyServer(guardrailPolicyStartupStore(true, nil))
+	ce := startupServer(t)
+	provider := gp.Provider()
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
