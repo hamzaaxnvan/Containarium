@@ -17,3 +17,41 @@ func peerBackendFor(t *testing.T, systemInfoJSON string) *pb.BackendInfo {
 	t.Helper()
 	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/system/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(systemInfoJSON))
+	}))
+	t.Cleanup(peerSrv.Close)
+
+	pool := NewPeerPool("local-spot", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-peer"] = &PeerClient{
+		ID:      "tunnel-peer",
+		Addr:    peerSrv.Listener.Addr().String(),
+		Healthy: true,
+		client:  peerSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	s := &ContainerServer{peerPool: pool, startTime: time.Now().Add(-time.Minute)}
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+	resp, err := s.ListBackends(ctx, &pb.ListBackendsRequest{})
+	if err != nil {
+		t.Fatalf("ListBackends: %v", err)
+	}
+	for _, b := range resp.Backends {
+		if b.Id == "tunnel-peer" {
+			return b
+		}
+	}
+	t.Fatal("tunnel-peer missing from the backend list")
+	return nil
+}
+
+// The fleet view must carry each peer's Incus server version, so an operator
+// can audit daemon patch levels from one admin call instead of per-host
+// shell access.
+func TestListBackends_PeerReportsIncusVersion(t *testing.T) {
+	peer := peerBackendFor(t, `{"info":{"hostname":"byoc-host","incusVersion":"6.23"}}`)
