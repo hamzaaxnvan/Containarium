@@ -42,3 +42,25 @@ type platformMCPSeed struct {
 // or ok=false when this run should not get one: a run not bound to a tracker
 // connection has nothing to reach through the tracker tools, and without the
 // daemon's HTTP port the URL would be unusable.
+//
+// Fail-open, deliberately: if the box's default route can't be resolved, the
+// script writes nothing and exits 0. The run proceeds without tracker tools
+// rather than failing the whole seed — the same posture the model-gateway env
+// script takes — and never leaves an `http://:8080` file behind that would mount
+// a broken server without saying so.
+func platformMCPSeedScript(seedDir string, httpPort int, trackerConnection string) (script string, ok bool) {
+	if trackerConnection == "" || httpPort <= 0 {
+		return "", false
+	}
+	// The URL is plain http:// to the daemon over the box's private bridge — the
+	// same hop the model gateway already uses — but the MCP client refuses any
+	// http:// base URL unless CONTAINARIUM_MCP_ALLOW_INSECURE=true (audit
+	// C-HIGH-1). Without the opt-in every tracker tool call in a dispatched run
+	// failed with "MCP client refuses http:// baseURL" and the run ended in
+	// error (#2508). The runtime hands the platform MCP only the three
+	// CONTAINARIUM_* variables it builds itself, so the opt-in rides in the
+	// seed's own command: `env VAR=true mcp-server`. That scopes it to this one
+	// process, needs no runtime change (the seed is rewritten on every run, so
+	// an existing box picks it up with the daemon alone), and the token it
+	// protects never leaves the host's bridge.
+	raw, err := json.Marshal(platformMCPSeed{
