@@ -50,29 +50,3 @@ func (p *ProxyManager) ConfigureClientIP(headers []string, trustedCIDRs []string
 	}
 
 	config, err := p.getFullConfig()
-	if err != nil {
-		return fmt.Errorf("get full config: %w", err)
-	}
-	srv := getMapField(getMapField(getMapField(getMapField(config, "apps"), "http"), "servers"), p.serverName)
-	if srv == nil {
-		return fmt.Errorf("HTTP server %q missing from config", p.serverName)
-	}
-
-	applyClientIPTrust(srv, headers, trustedCIDRs, p.proxyProtocolTrusted)
-
-	if err := p.loadConfig(config); err != nil {
-		return fmt.Errorf("load config with client-IP trust: %w", err)
-	}
-	p.clientIPHeaders = append(p.clientIPHeaders[:0], headers...)
-	p.trustedProxyCIDRs = append(p.trustedProxyCIDRs[:0], trustedCIDRs...)
-	return nil
-}
-
-// applyClientIPTrust sets client_ip_headers (when any are configured) and
-// trusted_proxies = union(proxyTrusted, extraTrusted) on the server map in
-// place. Shared by ConfigureClientIP and EnableProxyProtocol so the two are
-// order-independent and the self-heal path emits the same shape.
-func applyClientIPTrust(srv map[string]interface{}, headers, extraTrusted, proxyTrusted []string) {
-	if len(headers) > 0 {
-		srv["client_ip_headers"] = toAnySlice(headers)
-	}

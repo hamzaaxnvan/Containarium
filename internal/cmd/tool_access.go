@@ -58,3 +58,63 @@ var toolAccessGetCmd = &cobra.Command{
 	Use:   "get <username>",
 	Short: "Show a box's recorded tool-access level",
 	Args:  cobra.ExactArgs(1),
+	RunE:  runToolAccessGet,
+}
+
+var toolAccessRunUserCmd = &cobra.Command{
+	Use:   "run-user <username>",
+	Short: "Show whether a box's run user is signed in",
+	Long: `Show whether the unprivileged run user (#2944) on a box has a usable agent
+sign-in: the same check 'StartBoxRun' applies before it refuses a platform run,
+without starting one (#3274). Prints the credential source's name only, never a
+value, and does not create the run user.
+
+States: interactive and api-key mean a run would proceed; none means the run
+user has never signed in (or does not exist yet); expired means it must sign in
+again. A box with no tool-access level recorded runs as its owner, so there is
+no run user to check.
+
+Examples:
+  containarium tool-access run-user alice`,
+	Args: cobra.ExactArgs(1),
+	RunE: runToolAccessRunUser,
+}
+
+func init() {
+	toolAccessCmd.AddCommand(toolAccessSetCmd, toolAccessClearCmd, toolAccessGetCmd, toolAccessRunUserCmd)
+	rootCmd.AddCommand(toolAccessCmd)
+}
+
+// parseToolAccess maps a CLI level name to the proto enum. UNSPECIFIED is not
+// a level a caller names; clearing has its own verb.
+func parseToolAccess(s string) (pb.BoxToolAccess, error) {
+	switch strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), "_", "-")) {
+	case "none":
+		return pb.BoxToolAccess_BOX_TOOL_ACCESS_NONE, nil
+	case "build-tools":
+		return pb.BoxToolAccess_BOX_TOOL_ACCESS_BUILD_TOOLS, nil
+	case "full-sudo":
+		return pb.BoxToolAccess_BOX_TOOL_ACCESS_FULL_SUDO, nil
+	}
+	return pb.BoxToolAccess_BOX_TOOL_ACCESS_UNSPECIFIED, fmt.Errorf("unknown level %q (want none, build-tools or full-sudo)", s)
+}
+
+// toolAccessName is the CLI spelling of a level, "(none recorded)" for UNSPECIFIED.
+func toolAccessName(a pb.BoxToolAccess) string {
+	switch a {
+	case pb.BoxToolAccess_BOX_TOOL_ACCESS_NONE:
+		return "none"
+	case pb.BoxToolAccess_BOX_TOOL_ACCESS_BUILD_TOOLS:
+		return "build-tools"
+	case pb.BoxToolAccess_BOX_TOOL_ACCESS_FULL_SUDO:
+		return "full-sudo"
+	}
+	return "(none recorded)"
+}
+
+func runToolAccessSet(cmd *cobra.Command, args []string) error {
+	level, err := parseToolAccess(args[1])
+	if err != nil {
+		return err
+	}
+	return setToolAccess(args[0], level, fmt.Sprintf("✓ %s: tool access recorded as %s (for platform-started runs only)\n", args[0], toolAccessName(level)))
