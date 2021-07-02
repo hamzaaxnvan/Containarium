@@ -29,3 +29,14 @@ func safeInt64(v uint64) int64 {
 func protoName(proto uint8) string {
 	switch proto {
 	case 1:
+		return "icmp"
+	case 6:
+		return "tcp"
+	case 17:
+		return "udp"
+	default:
+		return ""
+	}
+}
+
+// denyReasonName renders a DenyEvent.Reason as the short label an operator
