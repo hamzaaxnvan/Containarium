@@ -1,0 +1,486 @@
+package server
+
+import (
+	"context"
+	"net/netip"
+	"os"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/footprintai/containarium/internal/agentengine"
+	"github.com/footprintai/containarium/internal/auth"
+	"github.com/footprintai/containarium/internal/netbpf"
+	"github.com/footprintai/containarium/internal/netpolicy"
+	"github.com/footprintai/containarium/pkg/core/skills"
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+)
+
+func TestBuildAgentSeedScript(t *testing.T) {
+	seedDir := seedDirFor("run-1")
+	script := buildAgentSeedScript(seedDir, "be helpful", "tok-123", `{"q":"hi"}`, `{"id":"x"}`)
+
+	for _, want := range []string{
+		"set -euo pipefail",
+		"umask 077",
+		"mkdir -p " + seedDir,
+		seedDir + "/system_prompt.txt",
+		seedDir + "/token",
+		seedDir + "/input.json",
+		seedDir + "/agent-card.json",
+		"chmod 600 " + seedDir + "/token",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("seed script missing %q\n---\n%s", want, script)
+		}
+	}
+}
+
+func TestBuildAgentSeedScriptDefaultsInput(t *testing.T) {
+	script := buildAgentSeedScript(seedDirFor("run-1"), "p", "t", "", "")
+	if !strings.Contains(script, "'{}'") {
+		t.Errorf("empty input should default to {}, got:\n%s", script)
+	}
+}
+
+// TestSendAgentTaskRejectsDisallowedPeer is the moat as a test: an agent whose
+// allowed_peers does not include the target is rejected at the API boundary,
+// BEFORE any A2A send is attempted. The caller identity is taken from the
+// authenticated token subject (agent-<skill-id>), not the caller-asserted
+// field, so an agent box can't spoof a different caller to bypass the gate.
+func TestSendAgentTaskRejectsDisallowedPeer(t *testing.T) {
+	// hello-agent ships with allowed_peers: [] (a leaf), so every peer is denied.
+	s := &AgentSkillServer{catalog: skills.GetDefault()}
+
+	// Authenticate as the agent box itself; agents:call scope present.
+	ctx := auth.ContextWithTestSubjectScopes(
+		context.Background(), "agent-hello-agent", nil, []string{auth.ScopeAgentsCall})
+
+	// from_skill_id deliberately lies ("admin-ish") — the authenticated subject
+	// must win, so the call is still denied.
+	_, err := s.SendAgentTask(ctx, &pb.SendAgentTaskRequest{
+		FromSkillId: "some-privileged-skill",
+		ToPeerId:    "other-peer",
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied for a peer not in allowed_peers, got %v", err)
+	}
+}
+
+// TestMintedAgentTokenScopes_CallerRestrictedToAgentsRunGetsNoResourceScopes
+// is the #1676 regression: a caller holding only agents:run must not receive
+// a token carrying a manifest scope it never held itself.
+func TestMintedAgentTokenScopes_CallerRestrictedToAgentsRunGetsNoResourceScopes(t *testing.T) {
+	skill := &pb.AgentSkill{Id: "hello-agent", AllowedScopes: []string{auth.ScopeContainersRead}}
+	ctx := auth.ContextWithTestSubjectScopes(
+		context.Background(), "some-caller", nil, []string{auth.ScopeAgentsRun})
+
+	got := mintedAgentTokenScopes(ctx, skill)
+	if len(got) != 0 {
+		t.Fatalf("mintedAgentTokenScopes = %v, want no resource scopes for a caller holding only agents:run", got)
+	}
+}
+
+// TestMintedAgentTokenScopes_ManifestScopeCallerLacksNeverGranted is the
+// regression named explicitly in #1676's acceptance criteria: a manifest
+// declaring a scope the caller doesn't hold must never produce a token
+// carrying it.
+func TestMintedAgentTokenScopes_ManifestScopeCallerLacksNeverGranted(t *testing.T) {
+	skill := &pb.AgentSkill{
+		Id:            "escalating-skill",
+		AllowedScopes: []string{auth.ScopeContainersRead, auth.ScopeSecretsWrite},
+	}
+	ctx := auth.ContextWithTestSubjectScopes(
+		context.Background(), "some-caller", nil, []string{auth.ScopeAgentsRun, auth.ScopeContainersRead})
+
+	got := mintedAgentTokenScopes(ctx, skill)
+	if slices.Contains(got, auth.ScopeSecretsWrite) {
+		t.Fatalf("mintedAgentTokenScopes = %v; caller never held %q", got, auth.ScopeSecretsWrite)
+	}
+	if len(got) != 1 || got[0] != auth.ScopeContainersRead {
+		t.Fatalf("mintedAgentTokenScopes = %v, want [%q]", got, auth.ScopeContainersRead)
+	}
+}
+
+// TestMintedAgentTokenScopes_UnrestrictedCallerKeepsManifestUnchanged covers
+// the Phase 1.7 backwards-compat path: a pre-scopes-claim caller (nil scopes)
+// is unrestricted, so the manifest passes through as it did before #1676.
+func TestMintedAgentTokenScopes_UnrestrictedCallerKeepsManifestUnchanged(t *testing.T) {
+	skill := &pb.AgentSkill{Id: "hello-agent", AllowedScopes: []string{auth.ScopeContainersRead}}
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(), "some-caller", nil, nil)
+
+	got := mintedAgentTokenScopes(ctx, skill)
+	if len(got) != 1 || got[0] != auth.ScopeContainersRead {
+		t.Fatalf("mintedAgentTokenScopes = %v, want manifest unchanged [%q]", got, auth.ScopeContainersRead)
+	}
+}
+
+// TestMintedAgentTokenScopes_TrackerAdminNeverGranted is the fix for a
+// gap caught in code review of #1924 (CWE-862): tracker:admin gates
+// tracker connection CRUD, an operator decision that must never reach a
+// bounded skill run — no matter how permissive the dispatching caller or
+// the skill manifest's own allowed_scopes are. Covers both the
+// unrestricted-caller path (IntersectScopes would otherwise pass the
+// manifest through unchanged) and the explicit-caller-holds-it path.
+func TestMintedAgentTokenScopes_TrackerAdminNeverGranted(t *testing.T) {
+	skill := &pb.AgentSkill{
+		Id:            "misconfigured-skill",
+		AllowedScopes: []string{auth.ScopeContainersRead, auth.ScopeTrackerAdmin},
+	}
+
+	t.Run("unrestricted caller", func(t *testing.T) {
+		ctx := auth.ContextWithTestSubjectScopes(context.Background(), "some-caller", nil, nil)
+		got := mintedAgentTokenScopes(ctx, skill)
+		if slices.Contains(got, auth.ScopeTrackerAdmin) {
+			t.Fatalf("mintedAgentTokenScopes = %v, must never carry tracker:admin", got)
+		}
+		if !slices.Contains(got, auth.ScopeContainersRead) {
+			t.Fatalf("mintedAgentTokenScopes = %v, want containers:read still granted (only tracker:admin is stripped)", got)
+		}
+	})
+
+	t.Run("caller explicitly holds tracker:admin", func(t *testing.T) {
+		ctx := auth.ContextWithTestSubjectScopes(context.Background(), "some-caller", nil,
+			[]string{auth.ScopeContainersRead, auth.ScopeTrackerAdmin})
+		got := mintedAgentTokenScopes(ctx, skill)
+		if slices.Contains(got, auth.ScopeTrackerAdmin) {
+			t.Fatalf("mintedAgentTokenScopes = %v, must never carry tracker:admin even when the caller holds it", got)
+		}
+	})
+}
+
+// TestMintedAgentTokenScopes_TokensDelegateNeverGranted is #2069: a run
+// token holding tokens:delegate could call ExchangeDelegatedToken and mint a
+// token with no run_id, which skips every run-token guard (#2060's lineage
+// binding, #2112's taskRunID) because they all apply only `if runID != ""`.
+// No shipped skill grants it, but a custom skill (CONTAINARIUM_SKILLS_DIR)
+// could — so it is stripped at mint the same way tracker:admin is.
+func TestMintedAgentTokenScopes_TokensDelegateNeverGranted(t *testing.T) {
+	skill := &pb.AgentSkill{
+		Id:            "custom-delegating-skill",
+		AllowedScopes: []string{auth.ScopeContainersRead, auth.ScopeTokensDelegate},
+	}
+
+	t.Run("unrestricted caller", func(t *testing.T) {
+		ctx := auth.ContextWithTestSubjectScopes(context.Background(), "some-caller", nil, nil)
+		got := mintedAgentTokenScopes(ctx, skill)
+		if slices.Contains(got, auth.ScopeTokensDelegate) {
+			t.Fatalf("mintedAgentTokenScopes = %v, must never carry tokens:delegate", got)
+		}
+		if !slices.Contains(got, auth.ScopeContainersRead) {
+			t.Fatalf("mintedAgentTokenScopes = %v, want containers:read still granted (only tokens:delegate is stripped)", got)
+		}
+	})
+
+	t.Run("caller explicitly holds tokens:delegate", func(t *testing.T) {
+		ctx := auth.ContextWithTestSubjectScopes(context.Background(), "some-caller", nil,
+			[]string{auth.ScopeContainersRead, auth.ScopeTokensDelegate})
+		got := mintedAgentTokenScopes(ctx, skill)
+		if slices.Contains(got, auth.ScopeTokensDelegate) {
+			t.Fatalf("mintedAgentTokenScopes = %v, must never carry tokens:delegate even when the caller holds it", got)
+		}
+	})
+}
+
+// TestMintedAgentTokenScopes_CodeAnswerNeverGranted is #3191: code:answer
+// answers the run's own permission requests, so a skill run's in-box token
+// must never carry it, whatever the caller or a custom manifest grants.
+func TestMintedAgentTokenScopes_CodeAnswerNeverGranted(t *testing.T) {
+	skill := &pb.AgentSkill{
+		Id:            "custom-answering-skill",
+		AllowedScopes: []string{auth.ScopeContainersRead, auth.ScopeCodeAnswer},
+	}
+	for name, callerScopes := range map[string][]string{
+		"unrestricted caller":      nil,
+		"caller holds code:answer": {auth.ScopeContainersRead, auth.ScopeCodeAnswer},
+		"wildcard caller":          {auth.ScopeWildcard},
+	} {
+		ctx := auth.ContextWithTestSubjectScopes(context.Background(), "some-caller", nil, callerScopes)
+		got := mintedAgentTokenScopes(ctx, skill)
+		if slices.Contains(got, auth.ScopeCodeAnswer) {
+			t.Errorf("%s: mintedAgentTokenScopes = %v, must never carry code:answer", name, got)
+		}
+		if !slices.Contains(got, auth.ScopeContainersRead) {
+			t.Errorf("%s: mintedAgentTokenScopes = %v, want containers:read still granted", name, got)
+		}
+	}
+}
+
+// TestSendAgentTaskRequiresCallScope confirms the agents:call gate.
+func TestSendAgentTaskRequiresCallScope(t *testing.T) {
+	s := &AgentSkillServer{catalog: skills.GetDefault()}
+	// Authenticated, but without agents:call.
+	ctx := auth.ContextWithTestSubjectScopes(
+		context.Background(), "agent-hello-agent", nil, []string{auth.ScopeAgentsRead})
+	_, err := s.SendAgentTask(ctx, &pb.SendAgentTaskRequest{ToPeerId: "x"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected PermissionDenied without agents:call, got %v", err)
+	}
+}
+
+// TestMintedAgentAct_DerivedFromAuthenticatedCaller is the #1677 AC
+// "RunAgentSkill populates it at mint": a single-hop caller (a human/CLI
+// token with no act of its own) produces a depth-1 chain naming them.
+func TestMintedAgentAct_DerivedFromAuthenticatedCaller(t *testing.T) {
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", "user")
+	got := mintedAgentAct(ctx)
+	if got == nil {
+		t.Fatal("mintedAgentAct = nil, want a chain naming the authenticated caller")
+	}
+	if got.Subject != "alice" {
+		t.Errorf("got.Subject = %q, want alice", got.Subject)
+	}
+	if got.Act != nil {
+		t.Errorf("got.Act = %+v, want nil (caller had no delegation of its own)", got.Act)
+	}
+}
+
+// TestMintedAgentAct_NestsCallersOwnAct is the #1677 AC "a second hop nests
+// rather than overwrites": a caller that is itself a derived agent token
+// (its own act names a human) produces a depth-2 chain wrapping both,
+// never one that drops the human by overwriting with just the immediate
+// caller.
+func TestMintedAgentAct_NestsCallersOwnAct(t *testing.T) {
+	callerAct := &auth.Actor{Subject: "alice"}
+	ctx := auth.ContextWithTestSubjectAct(context.Background(), "agent-relay-agent", nil, callerAct)
+
+	got := mintedAgentAct(ctx)
+	if got == nil {
+		t.Fatal("mintedAgentAct = nil, want a chain")
+	}
+	if got.Subject != "agent-relay-agent" {
+		t.Errorf("got.Subject = %q, want agent-relay-agent", got.Subject)
+	}
+	if got.Act == nil || got.Act.Subject != "alice" {
+		t.Fatalf("got.Act = %+v, want {Subject: alice} — the human must not be dropped", got.Act)
+	}
+}
+
+// TestMintedAgentAct_UnauthenticatedContextReturnsNil covers the defensive
+// case (unreachable in production once RequireScope has already run, but a
+// public contract of this standalone function): no authenticated subject in
+// ctx means nothing meaningful to record, not a garbage/zero-value Actor.
+func TestMintedAgentAct_UnauthenticatedContextReturnsNil(t *testing.T) {
+	if got := mintedAgentAct(context.Background()); got != nil {
+		t.Errorf("mintedAgentAct(unauthenticated ctx) = %+v, want nil", got)
+	}
+}
+
+// TestMintedAgentAct_IgnoresRequestFields is the #1677 anti-forgery AC,
+// made explicit: mintedAgentAct's signature takes only ctx — there is no
+// request parameter for a caller to inject an act through. This test pins
+// that contract so a future refactor can't silently add one; it is the
+// structural counterpart to the behavioral round-trip tests in
+// internal/auth/delegation_test.go.
+func TestMintedAgentAct_IgnoresRequestFields(t *testing.T) {
+	fn := reflect.TypeOf(mintedAgentAct)
+	if fn.NumIn() != 1 || fn.In(0).String() != "context.Context" {
+		t.Fatalf("mintedAgentAct signature = %v, want func(context.Context) *auth.Actor — "+
+			"any additional parameter (e.g. a request) would be a place for a caller to forge act", fn)
+	}
+}
+
+func TestAgentNetworkPolicyConfigDomains(t *testing.T) {
+	t.Run("defaults to the model providers when unset", func(t *testing.T) {
+		_ = os.Unsetenv("CONTAINARIUM_AGENT_EGRESS_DOMAINS")
+		_, domains, _ := agentNetworkPolicyConfig()
+		// The provider defaults: Anthropic, OpenAI, and Gemini (the Gemini engine
+		// added generativelanguage.googleapis.com so an ENFORCE policy doesn't
+		// strand a Gemini agent). Assert against the source-of-truth slice.
+		if len(domains) != len(defaultAgentEgressDomains) || domains[0] != "api.anthropic.com" {
+			t.Errorf("default domains = %v, want %v", domains, defaultAgentEgressDomains)
+		}
+	})
+	t.Run("operator override wins", func(t *testing.T) {
+		t.Setenv("CONTAINARIUM_AGENT_EGRESS_DOMAINS", "api.example.com, llm.internal")
+		_, domains, _ := agentNetworkPolicyConfig()
+		if len(domains) != 2 || domains[0] != "api.example.com" || domains[1] != "llm.internal" {
+			t.Errorf("override domains = %v", domains)
+		}
+	})
+}
+
+func TestCompileAllowedPeersPolicySetsDomains(t *testing.T) {
+	p := compileAllowedPeersPolicy("agent-x", []string{"peer-a"},
+		func(string) (string, bool) { return "10.0.0.5", true },
+		nil, []string{"api.anthropic.com"}, "", true)
+	if len(p.EgressDomains) != 1 || p.EgressDomains[0] != "api.anthropic.com" {
+		t.Errorf("egress_domains = %v, want [api.anthropic.com]", p.EgressDomains)
+	}
+}
+
+func TestCompileAllowedPeersPolicy_GatewayPinning(t *testing.T) {
+	// #674 inc 4: with a gatewayCIDR set, the box's model egress is the gateway
+	// host and the direct provider domains are DROPPED — so it can't bypass the
+	// gateway. Peers + platform CIDRs are still allowed.
+	resolve := func(string) (string, bool) { return "10.0.0.5", true }
+	p := compileAllowedPeersPolicy("agent-x", []string{"peer-a"}, resolve,
+		nil, []string{"api.anthropic.com", "api.openai.com"}, "10.100.0.1/32", true)
+
+	if len(p.EgressDomains) != 0 {
+		t.Errorf("gateway mode must drop direct provider domains, got %v", p.EgressDomains)
+	}
+	if !slices.Contains(p.EgressCidrs, "10.100.0.1/32") {
+		t.Errorf("gateway host must be in egress cidrs, got %v", p.EgressCidrs)
+	}
+	if !slices.Contains(p.EgressCidrs, "10.0.0.5/32") {
+		t.Errorf("peer must still be allowed, got %v", p.EgressCidrs)
+	}
+}
+
+func TestCompileAllowedPeersPolicy_NoGatewayKeepsDomains(t *testing.T) {
+	// Direct mode (no gatewayCIDR): provider domains are served as before, and
+	// the gateway host is NOT injected.
+	resolve := func(string) (string, bool) { return "10.0.0.5", true }
+	p := compileAllowedPeersPolicy("agent-x", []string{"peer-a"}, resolve,
+		nil, []string{"api.anthropic.com"}, "", false)
+	if len(p.EgressDomains) != 1 || p.EgressDomains[0] != "api.anthropic.com" {
+		t.Errorf("direct mode must keep provider domains, got %v", p.EgressDomains)
+	}
+	if slices.Contains(p.EgressCidrs, "10.100.0.1/32") {
+		t.Errorf("no gateway host should be injected in direct mode, got %v", p.EgressCidrs)
+	}
+}
+
+func TestSetGatewayProvisioning_EgressCIDR(t *testing.T) {
+	s := &AgentSkillServer{}
+	s.SetGatewayProvisioning("anthropic", 8080, []byte("secret"), "10.100.0.1", nil, nil, nil)
+	if s.gateway.egressCIDR != "10.100.0.1/32" {
+		t.Errorf("egressCIDR = %q, want 10.100.0.1/32", s.gateway.egressCIDR)
+	}
+	// Empty host IP → no pinning CIDR (direct provider egress retained).
+	s.SetGatewayProvisioning("anthropic", 8080, []byte("secret"), "", nil, nil, nil)
+	if s.gateway.egressCIDR != "" {
+		t.Errorf("empty hostIP must yield no egressCIDR, got %q", s.gateway.egressCIDR)
+	}
+}
+
+func TestParseArtifactOutput(t *testing.T) {
+	t.Run("output", func(t *testing.T) {
+		out, err := parseArtifactOutput([]byte(`{"outputJson":"{\"ok\":true}","engine":"claude","model":"claude-opus-4-8"}`))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if out != `{"ok":true}` {
+			t.Errorf("output = %q", out)
+		}
+	})
+	t.Run("error field surfaces", func(t *testing.T) {
+		_, err := parseArtifactOutput([]byte(`{"outputJson":"","error":"model egress blocked"}`))
+		if err == nil || !strings.Contains(err.Error(), "egress") {
+			t.Errorf("expected the artifact error to surface, got %v", err)
+		}
+	})
+	t.Run("malformed", func(t *testing.T) {
+		if _, err := parseArtifactOutput([]byte("not json")); err == nil {
+			t.Error("expected decode error for malformed artifact")
+		}
+	})
+}
+
+func TestAgentRuntimeReleaseTag(t *testing.T) {
+	// version.GetVersion() is the bare semver at runtime (the release workflow
+	// builds with VERSION=${tag#v}); the recipe needs the v-prefixed git tag or
+	// the artifact URLs 404 and box assembly silently skips. The helper must
+	// re-add the prefix without double-prefixing an already-tagged value.
+	got := agentRuntimeReleaseTag()
+	if !strings.HasPrefix(got, "v") {
+		t.Errorf("agentRuntimeReleaseTag() = %q, want a v-prefixed tag", got)
+	}
+	if strings.HasPrefix(got, "vv") {
+		t.Errorf("agentRuntimeReleaseTag() = %q, double-prefixed", got)
+	}
+}
+
+func TestGenTraceID(t *testing.T) {
+	a, b := genTraceID(), genTraceID()
+	if len(a) != 32 { // 16 bytes hex
+		t.Errorf("trace id len = %d, want 32", len(a))
+	}
+	if a == "" || a == b {
+		t.Errorf("trace ids should be non-empty and unique: %q %q", a, b)
+	}
+}
+
+func TestAuditHopNilStoreNoPanic(t *testing.T) {
+	// With no audit store wired, auditHop must be a safe no-op.
+	s := &AgentSkillServer{}
+	s.auditHop(context.Background(), "trace", "from", "to", "delivered", "")
+}
+
+// #1678 — auditAttributionFromContext is what makes auditHop's "record both
+// the agent and the dispatching human" AC true; it's unit-tested directly
+// since auditHop itself only runs against a real *audit.Store.
+
+func TestAuditAttributionFromContext_NoDelegation(t *testing.T) {
+	ctx := auth.ContextWithTestSubject(context.Background(), "agent-hello-agent", "user")
+	actor, chain, tokenID := auditAttributionFromContext(ctx)
+	if actor != "" || chain != "" || tokenID != "" {
+		t.Fatalf("got actor=%q chain=%q tokenID=%q, want all empty for a non-delegated context", actor, chain, tokenID)
+	}
+}
+
+func TestAuditAttributionFromContext_ResolvesRootActor(t *testing.T) {
+	act := &auth.Actor{Subject: "agent-relay-agent", Act: &auth.Actor{Subject: "human-alice"}}
+	ctx := auth.ContextWithTestSubjectAct(context.Background(), "agent-hello-agent", []string{"user"}, act)
+
+	actor, chain, _ := auditAttributionFromContext(ctx)
+	if actor != "human-alice" {
+		t.Fatalf("actor = %q, want the root human human-alice", actor)
+	}
+	if !strings.Contains(chain, "human-alice") || !strings.Contains(chain, "agent-relay-agent") {
+		t.Fatalf("delegationChain = %q, want the full chain serialized", chain)
+	}
+}
+
+func TestAuditAttributionFromContext_ResolvesTokenID(t *testing.T) {
+	ctx := auth.ContextWithTestSubject(context.Background(), "agent-hello-agent", "user")
+	ctx = auth.ContextWithTestJTI(ctx, "jti-abc123")
+
+	_, _, tokenID := auditAttributionFromContext(ctx)
+	if tokenID != "jti-abc123" {
+		t.Fatalf("tokenID = %q, want jti-abc123", tokenID)
+	}
+}
+
+func TestBuildAgentSeedScriptEscapesSingleQuotes(t *testing.T) {
+	// A system prompt containing a single quote must be escaped so it can't
+	// break out of the shell-quoted printf argument.
+	script := buildAgentSeedScript(seedDirFor("run-1"), "don't panic", "t", "{}", "{}")
+	if strings.Contains(script, "don't") && !strings.Contains(script, `don'\''t`) {
+		t.Errorf("single quote not escaped in seed script:\n%s", script)
+	}
+}
+
+func TestCompileAllowedPeersPolicy(t *testing.T) {
+	running := map[string]string{"peer-a": "10.0.0.5", "peer-b": "10.0.0.6"}
+	resolve := func(id string) (string, bool) { ip, ok := running[id]; return ip, ok }
+
+	// peer-c is not running, so it must be omitted from the allowlist.
+	p := compileAllowedPeersPolicy("agent-caller", []string{"peer-a", "peer-b", "peer-c"}, resolve, nil, nil, "", false)
+
+	if p.Tenant != "agent-caller" {
+		t.Errorf("tenant = %q, want agent-caller", p.Tenant)
+	}
+	if p.Mode != pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY {
+		t.Errorf("mode = %v, want LOG_ONLY (observe-only until enforcement is armed)", p.Mode)
+	}
+	if p.AllowMetadata {
+		t.Error("allow_metadata must be false for an agent box")
+	}
+	if p.AllowIntraTenant {
+		t.Error("allow_intra_tenant must be false (deny-by-default)")
+	}
+	want := []string{"10.0.0.5/32", "10.0.0.6/32"}
+	if len(p.EgressCidrs) != len(want) {
+		t.Fatalf("egress_cidrs = %v, want %v", p.EgressCidrs, want)
+	}
+	for i := range want {
+		if p.EgressCidrs[i] != want[i] {
+			t.Errorf("egress_cidrs[%d] = %q, want %q", i, p.EgressCidrs[i], want[i])
+		}
