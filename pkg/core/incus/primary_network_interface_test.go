@@ -69,3 +69,27 @@ func TestPrimaryNetworkInterface_UnrecognizedNameFallsBackButSkipsBridges(t *tes
 	got := primaryNetworkInterface(network)
 	if got != "10.9.9.9" {
 		t.Fatalf("primaryNetworkInterface() = %q, want the unrecognized-but-non-bridge interface 10.9.9.9", got)
+	}
+}
+
+// TestPrimaryNetworkInterface_OnlyBridgesPresentIsLastResort proves pass 3
+// (true last resort) still returns something rather than "" when every
+// interface is a known bridge — better than the daemon treating the VM as
+// having no network at all when it plainly has an address.
+func TestPrimaryNetworkInterface_OnlyBridgesPresentIsLastResort(t *testing.T) {
+	network := map[string]api.InstanceStateNetwork{
+		"cni0": {Addresses: globalInet("10.42.0.1")},
+	}
+	got := primaryNetworkInterface(network)
+	if got != "10.42.0.1" {
+		t.Fatalf("primaryNetworkInterface() = %q, want the last-resort bridge address 10.42.0.1", got)
+	}
+}
+
+// TestPrimaryNetworkInterface_NoGlobalInetAddressReturnsEmpty covers a
+// link-local-only or IPv6-only interface set: no candidate at all means "".
+func TestPrimaryNetworkInterface_NoGlobalInetAddressReturnsEmpty(t *testing.T) {
+	network := map[string]api.InstanceStateNetwork{
+		"eth0": {Addresses: []api.InstanceStateNetworkAddress{
+			{Family: "inet6", Scope: "link", Address: "fe80::1"},
+		}},
