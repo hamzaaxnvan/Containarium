@@ -10,3 +10,28 @@ import (
 
 // pki is the Phase 0.5 peer-CA management command — distinct from
 // the older `cert` command which manages the daemon's gRPC mTLS
+// keypair. The two PKIs don't overlap; this one is owned by the
+// sentinel and used for peer-to-peer HTTPS.
+var pkiCmd = &cobra.Command{
+	Use:   "pki",
+	Short: "Manage the sentinel-owned peer-CA used for peer-to-peer HTTPS",
+	Long: `Phase 0.5 peer-CA. A single operator-managed RSA private key on
+the sentinel acts as the CA root. The CA certificate is generated
+at runtime from that key; per-peer leaf certs are minted on demand
+with a configurable short TTL (default 7 days).
+
+This command is the one-time bootstrap step: it generates the CA
+private key. Persist the output to a mode-0400 file on the sentinel,
+back it up off-host, and point the sentinel at it with
+CONTAINARIUM_CA_KEY_FILE.`,
+}
+
+var pkiGenerateCACmd = &cobra.Command{
+	Use:   "generate-ca",
+	Short: "Generate a fresh RSA-4096 CA private key (PEM, PKCS#1) to stdout",
+	Long: `Outputs a PEM-encoded RSA-4096 private key to stdout. Capture it
+to a file mode 0400 owned by root on the sentinel:
+
+    containarium pki generate-ca > /etc/containarium/ca.key
+    chmod 0400 /etc/containarium/ca.key
+
