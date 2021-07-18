@@ -32,3 +32,72 @@ export interface PlatformMcpConfig {
   // CONTAINARIUM_MCP_TOOLS allow-list, e.g. "tracker_*". Never empty (see
   // parsePlatformMcp): an empty list means "every tool" to the MCP server.
   tools: string;
+}
+
+export interface Seed {
+  systemPrompt: string;
+  inputJson: string;
+  agentCard: AgentCard | null;
+  // Path to the scoped platform JWT (for the platform MCP). The runtime does
+  // not read the token itself — an engine that mounts the platform MCP points
+  // it at this file. Null if absent.
+  tokenPath: string | null;
+  // The platform MCP to mount as a second MCP server, or null when the daemon
+  // did not seed one (the run is not bound to a tracker connection).
+  platformMcp: PlatformMcpConfig | null;
+  // agent_card.output_schema_json parsed into the JSON Schema object the
+  // engines enforce (#2002), or null when the skill declares none.
+  outputSchema: Record<string, unknown> | null;
+}
+
+function readIfPresent(dir: string, file: string): string {
+  const p = join(dir, file);
+  return existsSync(p) ? readFileSync(p, "utf8") : "";
+}
+
+function requireString(obj: Record<string, unknown>, field: string): string {
+  const v = obj[field];
+  if (typeof v !== "string" || v.trim() === "") {
+    throw new Error(`platform_mcp.json: "${field}" must be a non-empty string`);
+  }
+  return v;
+}
+
+// parsePlatformMcp validates platform_mcp.json. It throws on anything malformed
+// instead of degrading: a silently dropped file would leave the agent with no
+// tracker tools and no signal why, and a lenient parse of `tools` could mount
+// the entire tool catalog.
+export function parsePlatformMcp(raw: string): PlatformMcpConfig {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`platform_mcp.json: not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+    throw new Error("platform_mcp.json: must be a JSON object");
+  }
+  const o = obj as Record<string, unknown>;
+  const args = o.args ?? [];
+  if (!Array.isArray(args) || !args.every((a) => typeof a === "string")) {
+    throw new Error('platform_mcp.json: "args" must be an array of strings');
+  }
+  return {
+    command: requireString(o, "command"),
+    args: args as string[],
+    serverUrl: requireString(o, "server_url"),
+    tokenFile: requireString(o, "token_file"),
+    tools: requireString(o, "tools"),
+  };
+}
+
+// parseOutputSchema validates a declared agent_card.output_schema_json. Like
+// parsePlatformMcp it throws rather than degrades: the catalog declared a
+// contract for this artifact, and a run that silently dropped it would be
+// unenforced with no signal why — the exact failure #2002 is about.
+export function parseOutputSchema(raw: string): Record<string, unknown> {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`agent-card.json: output_schema_json is not valid JSON: ${e instanceof Error ? e.message : String(e)}`);

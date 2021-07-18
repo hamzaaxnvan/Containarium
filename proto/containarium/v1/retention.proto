@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+// Retention policy and legal holds (#2576, slice A #2875;
+// docs/security/DATA-FLOW-AND-RETENTION.md).
+//
+// This service stores the policy (one window per data class for the whole
+// daemon, and a legal hold per org) and reports what a sweep would remove
+// (#2876). Nothing is swept or deleted by anything in this file; enforcement
+// is a later slice (#2877, #2878, #2879).
+
+// RetentionClass is a kind of customer data with its own retention window.
+enum RetentionClass {
+  RETENTION_CLASS_UNSPECIFIED = 0;
+  // Prompts sent to a model or an agent (default 30 days).
+  RETENTION_CLASS_PROMPTS = 1;
+  // Model and agent responses (default 30 days).
+  RETENTION_CLASS_RESPONSES = 2;
+  // Gateway and API access logs (default 90 days).
+  RETENTION_CLASS_GATEWAY_LOGS = 3;
+  // Session transcripts and session records (default 90 days).
+  RETENTION_CLASS_SESSION_TRANSCRIPTS = 4;
+  // Evidence bundles such as Proof Packs (default 365 days).
+  RETENTION_CLASS_EVIDENCE_BUNDLES = 5;
+}
+
+// RetentionWindow is how long one class is kept, at most.
+message RetentionWindow {
+  RetentionClass class = 1;
+  // Days a record of this class is kept, at most. Must be between 1 and
+  // 36500 (100 years); the cap keeps a sweeper's cutoff arithmetic in range.
+  int32 days = 2;
+  // True when no admin has set this class and days is the built-in default.
+  // Ignored on a set.
+  bool is_default = 3;
+}
+
+// RetentionPolicy is the daemon-wide policy: one window for every class.
+message RetentionPolicy {
+  // Every class, in enum order, set or default.
+  repeated RetentionWindow windows = 1;
+  // 0 until the first set; every set adds 1.
+  int64 revision = 2;
+  google.protobuf.Timestamp updated_at = 3;
+  string updated_by = 4;
+}
+
+// LegalHold stops deletion of an org's records, in every class, until an
+// admin releases it. A hold has no expiry.
+message LegalHold {
+  string org_id = 1;
+  string reason = 2;
+  string set_by = 3;
+  google.protobuf.Timestamp set_at = 4;
+}
+
