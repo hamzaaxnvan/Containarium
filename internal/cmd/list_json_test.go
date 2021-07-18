@@ -36,22 +36,3 @@ func TestListJSONShape(t *testing.T) {
 		}
 	}
 	if len(got) != 2 {
-		t.Errorf("`list --json` emits %d keys, want exactly 2: %v", len(got), keysOfRaw(got))
-	}
-}
-
-func TestGroupedListJSONShape(t *testing.T) {
-	out := groupedListJSON{
-		GroupBy:    "env",
-		Groups:     map[string][]incus.ContainerInfo{"prod": {{Name: "alice-container"}}},
-		GroupCount: 1,
-		TotalCount: 1,
-	}
-
-	b, err := json.Marshal(out)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-
-	var got map[string]json.RawMessage
-	if err := json.Unmarshal(b, &got); err != nil {
