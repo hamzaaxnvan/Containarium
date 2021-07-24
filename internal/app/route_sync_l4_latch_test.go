@@ -48,28 +48,3 @@ func TestSyncL4Routes_LatchesActiveAcrossEmptyRouteSet(t *testing.T) {
 		t.Fatal("L4 should be active after the first passthrough route")
 	}
 	assertHTTPOff443(t, srv.URL)
-	if got := l4SNIs(t, m); len(got) != 1 || got[0] != "box-a.example" {
-		t.Fatalf("expected 1 SNI route [box-a.example], got %v", got)
-	}
-
-	// 2) Route set empties → the OLD code deactivated L4 here (deleting the
-	//    layer4 app and moving :443 back to srv0), bouncing the listener.
-	//    The latch must instead keep L4 active and just drain the SNI route.
-	if err := j.syncL4Routes(nil); err != nil {
-		t.Fatalf("syncL4Routes(empty): %v", err)
-	}
-	if !m.IsL4Active() {
-		t.Fatal("REGRESSION (#416): L4 was deactivated on an empty route set — " +
-			"this restarts the :443 listener and drops in-flight TLS connections")
-	}
-	assertHTTPOff443(t, srv.URL)
-	if got := l4SNIs(t, m); len(got) != 0 {
-		t.Fatalf("expected SNI routes drained to none, got %v", got)
-	}
-
-	// 3) A new route arrives again → no re-activation needed (L4 still owns
-	//    :443), the route is simply added. This is the steady-state CI path:
-	//    box churn no longer touches the listener.
-	route2 := &RouteRecord{
-		FullDomain: "box-b.example",
-		TargetIP:   "203.0.113.8",
