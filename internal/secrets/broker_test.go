@@ -140,3 +140,51 @@ func TestLoadAllForUserWithDelivery_ExcludesBrokerRows(t *testing.T) {
 		t.Fatalf("Set env: %v", err)
 	}
 
+	full, err := store.LoadAllForUserWithDelivery(ctx, user)
+	if err != nil {
+		t.Fatalf("LoadAllForUserWithDelivery: %v", err)
+	}
+	if _, ok := full["GH_TOKEN"]; ok {
+		t.Errorf("broker row GH_TOKEN present in LoadAllForUserWithDelivery, want excluded")
+	}
+	if v, ok := full["OPENAI_KEY"]; !ok || v.Value != "sk-live" {
+		t.Errorf("env row OPENAI_KEY = %+v, ok=%v, want sk-live present", v, ok)
+	}
+
+	// LoadAllForUser delegates to the above — same exclusion applies.
+	flat, err := store.LoadAllForUser(ctx, user)
+	if err != nil {
+		t.Fatalf("LoadAllForUser: %v", err)
+	}
+	if _, ok := flat["GH_TOKEN"]; ok {
+		t.Errorf("broker row GH_TOKEN present in LoadAllForUser, want excluded")
+	}
+
+	// List (metadata only) still shows the broker row with its mode —
+	// only decrypt-and-deliver paths exclude it.
+	all, err := store.List(ctx, user)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	found := false
+	for _, m := range all {
+		if m.Name == "GH_TOKEN" {
+			found = true
+			if m.Delivery != DeliveryBroker {
+				t.Errorf("List GH_TOKEN delivery = %q, want %q", m.Delivery, DeliveryBroker)
+			}
+		}
+	}
+	if !found {
+		t.Error("List did not include the broker row at all — metadata should still be visible")
+	}
+}
+
+func TestRewrapTenant_IncludesBrokerRows(t *testing.T) {
+	dsn := os.Getenv("CONTAINARIUM_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set CONTAINARIUM_TEST_DSN to run this against Postgres (the store-integration lane does)")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {

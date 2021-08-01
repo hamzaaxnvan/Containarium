@@ -37,3 +37,42 @@ type Comment struct {
 	CreatedAt time.Time
 	Body      string
 }
+
+// Change is the provider-neutral shape of a GitHub pull request or
+// GitLab merge request.
+type Change struct {
+	Number    int64
+	State     pb.TrackerIssueState
+	CIVerdict pb.TrackerCiVerdict
+	URL       string
+	// Branch is the branch the change's head points at (#1923). OpenChange
+	// echoes the HeadBranch the caller told it to use; GetChange and
+	// FindOpenChange report the provider's head/source branch (#3288).
+	Branch string
+}
+
+// IssueFilter narrows ListIssues. The zero value matches every issue.
+type IssueFilter struct {
+	// State filters by issue state; UNSPECIFIED matches any state.
+	State pb.TrackerIssueState
+	// Labels, when non-empty, requires ALL of these labels (both
+	// providers' native list APIs support this as an AND filter).
+	Labels []string
+	// Search is a free-text query against title/body, passed through to
+	// the provider's own search — no normalization possible across two
+	// different search implementations, so treat results as
+	// best-effort, not authoritative.
+	Search string
+}
+
+// OpenChangeRequest is #1923's submit-path input. Declared here now so
+// the full Provider interface (below) is complete and both adapters
+// satisfy it from the day they exist, even though nothing calls
+// OpenChange until #1923 wires the submit path that builds one.
+type OpenChangeRequest struct {
+	HeadBranch  string
+	BaseBranch  string
+	Title       string
+	Description string
+	Draft       bool
+}
