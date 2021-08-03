@@ -11,3 +11,16 @@ import (
 // session records (#2741). This plugin then gets PipeStart and PipeError for a
 // connection whose credential it never saw, and must write nothing for it, or
 // the session would be recorded twice.
+func TestPlugin_SkipUnobserved(t *testing.T) {
+	ca := newTestCA(t)
+	cert, _ := newTestUserCert(t, ca, "alice", 7)
+	for _, tt := range []struct {
+		name     string
+		skip     bool
+		observed bool
+		want     int
+	}{
+		{name: "observed connection is recorded", skip: true, observed: true, want: 4},
+		{name: "unobserved connection is skipped", skip: true},
+		{name: "without SkipUnobserved every connection is recorded", want: 4},
+	} {

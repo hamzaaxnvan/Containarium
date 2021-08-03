@@ -10,16 +10,3 @@ import (
 // are billed per ingested sample).
 const DefaultIntervalSeconds = 60
 
-// ConfigStoreKey is the single daemon-config-store key the whole Config
-// struct is persisted under (JSON-encoded). One key holding the
-// complete struct — rather than spreading Enabled/Provider/
-// IntervalSeconds across three loose keys — means every read and write
-// is a full-config round trip by construction, not a partial update
-// that could clobber a sibling field (the failure mode fixed for the
-// BYOC ingress "listen" array in #1062/#1064).
-const ConfigStoreKey = "metrics_export_config"
-
-// Config is the typed, persisted state of the cloud-native metrics
-// export toggle (#1069): whether export is on, which provider it
-// targets, and the export cadence. It round-trips through
-// SetMetricsExport / GetMetricsExport and survives a daemon restart via
