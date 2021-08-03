@@ -50,3 +50,55 @@ func deliveryPool(t *testing.T) *pgxpool.Pool {
 // The #1643 acceptance test: a successful delivery is recorded in the real
 // DeliveryStore an operator queries via the existing alert-delivery surface
 // — not just logged.
+func TestWebhookNotifier_RecordsSuccessfulDeliveryInRealDeliveryStore(t *testing.T) {
+	ctx := context.Background()
+	pool := deliveryPool(t)
+	deliveryStore, err := alert.NewDeliveryStore(ctx, pool)
+	if err != nil {
+		t.Fatalf("alert.NewDeliveryStore: %v", err)
+	}
+
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(buf)
+		gotBody = buf
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := newFakeConfigSource(srv.URL, "")
+	n := NewWebhookNotifier(cfg, deliveryStore)
+	notifyCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	n.Start(notifyCtx)
+
+	f := testFinding(pb.ThreatSeverity_THREAT_SEVERITY_HIGH)
+	n.Notify(f)
+
+	waitFor(t, 2*time.Second, func() bool {
+		deliveries, _, err := deliveryStore.List(ctx, 10, 0)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		for _, d := range deliveries {
+			if d.Source == "threatdetect" {
+				return true
+			}
+		}
+		return false
+	})
+
+	deliveries, _, err := deliveryStore.List(ctx, 10, 0)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	var found *alert.WebhookDelivery
+	for i := range deliveries {
+		if deliveries[i].Source == "threatdetect" {
+			found = &deliveries[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no webhook_deliveries row with source=threatdetect")

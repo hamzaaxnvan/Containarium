@@ -17,9 +17,3 @@ type TunnelSessionStats struct {
 	CleartextRefused uint64
 }
 
-// renderTunnelMetrics builds the Prometheus exposition for the tunnel
-// transport counters. Pure, so it is unit-testable without an HTTP round
-// trip.
-func renderTunnelMetrics(s TunnelSessionStats) string {
-	var b bytes.Buffer
-	fmt.Fprint(&b, "# HELP sentinel_tunnel_sessions_tls Registered tunnel sessions carried over TLS.\n")
