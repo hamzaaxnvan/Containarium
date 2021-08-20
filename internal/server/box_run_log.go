@@ -131,3 +131,136 @@ tail -c +%d <&3 | head -c %d
 // boxRunView is one record as the reader sees it.
 type boxRunView struct {
 	fileName  string
+	record    agentbox.RunRecord
+	sessionID string
+	tools     []*pb.BoxRunTool
+}
+
+func decodeB64Field(s string) ([]byte, error) {
+	if s == "-" {
+		return nil, nil
+	}
+	return base64.StdEncoding.DecodeString(s)
+}
+
+// parseBoxRunViews decodes the list script's output into its records (newest
+// first), the boot id, and the set of live PIDs. A record that does not decode,
+// or whose file name is not a valid run name, is skipped: one bad file must not
+// hide every other run.
+func parseBoxRunViews(out string) (views []boxRunView, boot string, alive map[int]bool) {
+	alive = map[int]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		kind, rest, _ := strings.Cut(line, " ")
+		switch kind {
+		case "B":
+			boot = strings.TrimSpace(rest)
+		case "P":
+			for _, f := range strings.Fields(rest) {
+				if pid, err := strconv.Atoi(f); err == nil {
+					alive[pid] = true
+				}
+			}
+		case "R":
+			fields := strings.Fields(rest)
+			if len(fields) != 6 || !agentbox.IsCurrentRecordFile(fields[0]) {
+				continue
+			}
+			name := strings.TrimSuffix(fields[0], ".json")
+			if !validRunPathID(name) {
+				continue
+			}
+			recData, err := decodeB64Field(fields[1])
+			if err != nil {
+				continue
+			}
+			record, err := agentbox.DecodeRunRecord(recData)
+			if err != nil {
+				continue
+			}
+			sidecar, err := decodeB64Field(fields[2])
+			if err != nil {
+				sidecar = nil
+			}
+			sessionIDBytes, err := decodeB64Field(fields[3])
+			if err != nil {
+				sessionIDBytes = nil
+			}
+			sessionID := strings.TrimSpace(string(sessionIDBytes))
+			// A structured run's own result object, when present and valid,
+			// is authoritative over any sidecar (the engine's reported id is
+			// the one to resume next).
+			if resBytes, err := decodeB64Field(fields[4]); err == nil && len(resBytes) > 0 {
+				if id := structuredSessionID(resBytes); id != "" {
+					sessionID = id
+				}
+			}
+			// The run wrapper's own toolchain report (#2954); absent or malformed
+			// means no tools, never an error.
+			var tools []*pb.BoxRunTool
+			if toolBytes, err := decodeB64Field(fields[5]); err == nil && len(toolBytes) > 0 {
+				tools = parseBoxRunTools(toolBytes)
+			}
+			views = append(views, boxRunView{
+				fileName:  name,
+				record:    agentbox.FoldExitSidecar(record, sidecar),
+				sessionID: sessionID,
+				tools:     tools,
+			})
+		}
+	}
+	sort.SliceStable(views, func(i, j int) bool {
+		a, b := views[i].record.StartedAt, views[j].record.StartedAt
+		if !a.Equal(b) {
+			return a.After(b)
+		}
+		return views[i].fileName < views[j].fileName
+	})
+	return views, boot, alive
+}
+
+// parseBoxRunList turns the list script's output into protos, newest first.
+func parseBoxRunList(out, dir string) []*pb.BoxRun {
+	views, boot, alive := parseBoxRunViews(out)
+	runs := make([]*pb.BoxRun, 0, len(views))
+	for _, v := range views {
+		outcome := agentbox.ResolveOutcome(v.record, boot, func(pid int) bool { return pid > 0 && alive[pid] })
+		run := boxRunProto(v.fileName, dir, v.record, outcome)
+		run.SessionId = v.sessionID
+		run.Tools = v.tools
+		runs = append(runs, run)
+	}
+	return runs
+}
+
+func boxRunProto(name, dir string, r agentbox.RunRecord, outcome agentbox.RunOutcome) *pb.BoxRun {
+	run := &pb.BoxRun{
+		RunName:     name,
+		StartedAt:   timestamppb.New(r.StartedAt),
+		LogPath:     boxRunLogPath(dir, name),
+		CaptureMode: pb.CaptureMode_CAPTURE_MODE_COMBINED,
+	}
+	if r.CaptureMode == agentbox.CaptureFramed {
+		run.CaptureMode = pb.CaptureMode_CAPTURE_MODE_FRAMED
+	}
+	switch outcome {
+	case agentbox.RunOutcomeRunning:
+		run.Outcome = pb.BoxRunOutcome_BOX_RUN_OUTCOME_RUNNING
+	case agentbox.RunOutcomeExited:
+		run.Outcome = pb.BoxRunOutcome_BOX_RUN_OUTCOME_EXITED
+	default:
+		run.Outcome = pb.BoxRunOutcome_BOX_RUN_OUTCOME_UNKNOWN
+	}
+	run.Model = r.Model
+	if r.ExitCode != nil {
+		code := int32(*r.ExitCode) // #nosec G115 -- a process exit status fits in int32
+		run.ExitCode = &code
+	}
+	if r.FinishedAt != nil {
+		run.EndedAt = timestamppb.New(*r.FinishedAt)
+	}
+	return run
+}
+
+// boxRunLogPath is the log the reader reads: always derived from the run
+// name, never the record's own log_path, which the box's user can write.
+func boxRunLogPath(dir, name string) string { return dir + "/" + name + ".log" }
