@@ -24,3 +24,16 @@ func TestPlugin_SkipUnobserved(t *testing.T) {
 		{name: "unobserved connection is skipped", skip: true},
 		{name: "without SkipUnobserved every connection is recorded", want: 4},
 	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := &fakeRecorder{}
+			p := &Plugin{Recorder: rec, SkipUnobserved: tt.skip}
+			cfg := p.Config()
+			conn := &libplugin.ConnMeta{UserName: "boxuser", FromAddr: "203.0.113.7:1", UniqId: "s", Metadata: map[string]string{}}
+			if tt.observed {
+				up, err := cfg.PublicKeyCallback(conn, cert.Marshal())
+				if err != nil {
+					t.Fatal(err)
+				}
+				for k, v := range deferredMeta(t, up) {
+					conn.Metadata[k] = v
+				}
