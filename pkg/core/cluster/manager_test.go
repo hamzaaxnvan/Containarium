@@ -394,3 +394,400 @@ func TestPushCreatesParentDirectoryFirst(t *testing.T) {
 // runs — a worker cannot produce that file itself until it has already
 // joined (#1448). Ordering is the assertion: pushing it after the
 // agent starts would be the same deadlock wearing a different hat.
+func TestProvisionWorkerPushesContainerdTemplateBeforeBootstrap(t *testing.T) {
+	f := newFakeHost()
+	f.files["alice-k8s-demo-cp:"+NodeTokenPath] = []byte("K10hash::server:secret\n")
+	f.files["alice-k8s-demo-cp:"+ContainerdGeneratedConfigPath] = []byte(
+		"version = 3\n[plugins.'io.containerd.cri.v1.runtime']\n  enable_unprivileged_ports = true\n  enable_unprivileged_icmp = true\n")
+	// The node must be able to answer what it observes about itself:
+	// the reservation trigger asks it after boot (#1466). These
+	// fixtures are an honest node — it sees its own limits.
+	f.setNodeProc("alice-k8s-demo-cp", 2, 3906244)
+	f.setNodeProc("alice-k8s-demo-small-1", 2, 3906244)
+
+	if err := testManager(f).ProvisionWorker("alice", "demo", IsolationContainer,
+		DesiredGroup{Name: "small", CPU: "2", Memory: "4GB", Disk: "40GB"},
+		"alice-k8s-demo-small-1", "10.0.0.1"); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+
+	got := string(f.files["alice-k8s-demo-small-1:"+ContainerdConfigTemplatePath])
+	if !strings.Contains(got, "enable_unprivileged_ports = false") ||
+		!strings.Contains(got, "enable_unprivileged_icmp = false") {
+		t.Fatalf("worker did not receive a derived containerd template, got %q", got)
+	}
+
+	tmplAt, bootstrapAt := -1, -1
+	for i, call := range f.calls {
+		if tmplAt < 0 && strings.Contains(call, "push ") && strings.Contains(call, ContainerdConfigTemplatePath) {
+			tmplAt = i
+		}
+		if bootstrapAt < 0 && strings.Contains(call, "exec ") && strings.Contains(call, bootstrapScriptPath) {
+			bootstrapAt = i
+		}
+	}
+	if tmplAt < 0 || bootstrapAt < 0 || tmplAt > bootstrapAt {
+		t.Fatalf("template must be pushed before the bootstrap runs (tmpl %d, bootstrap %d): %v", tmplAt, bootstrapAt, f.calls)
+	}
+}
+
+// A control plane whose generated config cannot be read must fail the
+// worker loudly: shipping a node with pod sandboxes broken and a green
+// bootstrap is exactly the silent failure #1448 warned against.
+func TestProvisionWorkerFailsLoudlyWithoutCPContainerdConfig(t *testing.T) {
+	f := newFakeHost()
+	f.files["alice-k8s-demo-cp:"+NodeTokenPath] = []byte("K10hash::server:secret\n")
+	// No CP containerd config on purpose.
+
+	err := testManager(f).ProvisionWorker("alice", "demo", IsolationContainer,
+		DesiredGroup{Name: "small", CPU: "2", Memory: "4GB", Disk: "40GB"},
+		"alice-k8s-demo-small-1", "10.0.0.1")
+	if err == nil {
+		t.Fatal("provisioning must fail when the containerd template cannot be derived")
+	}
+	if !strings.Contains(err.Error(), "containerd") {
+		t.Errorf("error does not name what failed: %v", err)
+	}
+}
+
+// #1440 added KubeletArgs and its rendering, but nothing ever populated
+// it — the reservation was dead code and the tests pinned rendering
+// rather than wiring (#1452). These assert the WIRING: what the manager
+// actually writes into the node's bootstrap script.
+func TestProvisionWiresContainerKubeletArgs(t *testing.T) {
+	f := newFakeHost()
+	f.files["alice-k8s-demo-cp:"+NodeTokenPath] = []byte("K10hash::server:secret\n")
+	f.files["alice-k8s-demo-cp:"+ContainerdGeneratedConfigPath] = []byte(
+		"version = 3\n  enable_unprivileged_ports = true\n  enable_unprivileged_icmp = true\n")
+	// The node must be able to answer what it observes about itself:
+	// the reservation trigger asks it after boot (#1466). These
+	// fixtures are an honest node — it sees its own limits.
+	f.setNodeProc("alice-k8s-demo-cp", 2, 3906244)
+	f.setNodeProc("alice-k8s-demo-small-1", 2, 3906244)
+	m := testManager(f)
+
+	if _, err := m.ProvisionCP("alice", "demo", IsolationContainer,
+		DesiredGroup{CPU: "2", Memory: "4GB", Disk: "40GB"}, []string{"203.0.113.10"}); err != nil {
+		t.Fatalf("ProvisionCP: %v", err)
+	}
+	cpScript := string(f.files["alice-k8s-demo-cp:"+bootstrapScriptPath])
+	if !strings.Contains(cpScript, "KubeletInUserNamespace=true") {
+		t.Errorf("control-plane script has no KubeletInUserNamespace gate:\n%s", cpScript)
+	}
+
+	if err := m.ProvisionWorker("alice", "demo", IsolationContainer,
+		DesiredGroup{Name: "small", CPU: "2", Memory: "4GB", Disk: "40GB"},
+		"alice-k8s-demo-small-1", "10.0.0.1"); err != nil {
+		t.Fatalf("ProvisionWorker: %v", err)
+	}
+	workerScript := string(f.files["alice-k8s-demo-small-1:"+bootstrapScriptPath])
+	if !strings.Contains(workerScript, "KubeletInUserNamespace=true") {
+		t.Errorf("worker script has no KubeletInUserNamespace gate:\n%s", workerScript)
+	}
+
+	// The VM path must not acquire container-only kubelet flags.
+	f2 := newFakeHost()
+	f2.files["alice-k8s-demo-cp:"+NodeTokenPath] = []byte("K10hash::server:secret\n")
+	m2 := testManager(f2)
+	if _, err := m2.ProvisionCP("alice", "demo", IsolationVM,
+		DesiredGroup{CPU: "2", Memory: "4GB", Disk: "40GB"}, []string{"203.0.113.10"}); err != nil {
+		t.Fatalf("ProvisionCP(vm): %v", err)
+	}
+	if strings.Contains(string(f2.files["alice-k8s-demo-cp:"+bootstrapScriptPath]), "KubeletInUserNamespace") {
+		t.Error("VM control-plane script carries a container-only kubelet gate")
+	}
+}
+
+// A container node must not be handed a reservation inferred from the
+// daemon host's /proc. Where lxcfs works the node sees its own limits,
+// and such a reservation exceeds the node's entire capacity — kubelet
+// rejects it and refuses to start, which is worse than an uncorrected
+// allocatable (#1456, observed on the CI runner in run 11).
+//
+// Since #1466 this test also pins the environment it was implicitly
+// assuming: the fixture is a node observing its own limits, and the
+// assertion is that such a node gets no reservation. The complementary
+// case — a node observing the outer host, which must get one — lives in
+// TestContainerNodeReservationFollowsWhatTheNodeObserves.
+func TestProvisionDoesNotReserveFromHostCapacity(t *testing.T) {
+	f := newFakeHost()
+	f.files["alice-k8s-demo-cp:"+NodeTokenPath] = []byte("K10hash::server:secret\n")
+	f.files["alice-k8s-demo-cp:"+ContainerdGeneratedConfigPath] = []byte(
+		"version = 3\n  enable_unprivileged_ports = true\n  enable_unprivileged_icmp = true\n")
+	// The node must be able to answer what it observes about itself:
+	// the reservation trigger asks it after boot (#1466). These
+	// fixtures are an honest node — it sees its own limits.
+	f.setNodeProc("alice-k8s-demo-cp", 2, 3906244)
+	f.setNodeProc("alice-k8s-demo-small-1", 2, 3906244)
+	m := testManager(f)
+
+	if _, err := m.ProvisionCP("alice", "demo", IsolationContainer,
+		DesiredGroup{CPU: "2", Memory: "4GB", Disk: "40GB"}, []string{"203.0.113.10"}); err != nil {
+		t.Fatalf("ProvisionCP: %v", err)
+	}
+	script := string(f.files["alice-k8s-demo-cp:"+bootstrapScriptPath])
+	if strings.Contains(script, "system-reserved") {
+		t.Errorf("node was given a reservation inferred from the daemon host (#1456):\n%s", script)
+	}
+	// The gate that makes kubelet start at all must still be there.
+	if !strings.Contains(script, "KubeletInUserNamespace=true") {
+		t.Error("dropping the reservation also dropped the user-namespace gate")
+	}
+}
+
+// Incus refuses to delete a running instance ("Instance is running"),
+// so a node must be stopped first. The tenant container path has always
+// done this (pkg/core/container/manager.go stops if running, then
+// deletes); the cluster path did not, which meant scale-down could
+// never remove a node and `cluster delete` left every instance of the
+// cluster running on the host (#1475).
+func TestDeleteNodeStopsBeforeDeleting(t *testing.T) {
+	f := newFakeHost()
+	m := NewManager(f, DefaultArtifactBase)
+
+	if err := m.DeleteVM("alice-k8s-demo-small-1"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+
+	var stopAt, deleteAt = -1, -1
+	for i, c := range f.calls {
+		switch c {
+		case "stop alice-k8s-demo-small-1":
+			stopAt = i
+		case "delete alice-k8s-demo-small-1":
+			deleteAt = i
+		}
+	}
+	if stopAt < 0 {
+		t.Fatalf("node was never stopped; Incus will refuse the delete:\n%v", f.calls)
+	}
+	if deleteAt < 0 || deleteAt < stopAt {
+		t.Fatalf("delete must follow the stop, got %v", f.calls)
+	}
+}
+
+// An already-stopped node reports an error from stop, and that must not
+// prevent the delete — otherwise a node that was stopped by any other
+// means becomes undeletable.
+func TestDeleteNodeDeletesEvenWhenStopFails(t *testing.T) {
+	f := newFakeHost()
+	f.stopErr = errors.New("The instance is already stopped")
+	m := NewManager(f, DefaultArtifactBase)
+
+	if err := m.DeleteVM("alice-k8s-demo-small-1"); err != nil {
+		t.Fatalf("a failing stop must not block the delete: %v", err)
+	}
+	found := false
+	for _, c := range f.calls {
+		if c == "delete alice-k8s-demo-small-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("delete was never attempted: %v", f.calls)
+	}
+}
+
+// The delete's own error is what the caller must see — the autoscaler
+// retries on it, and swallowing it would make a failed scale-down look
+// like a successful one.
+func TestDeleteNodeReturnsTheDeleteError(t *testing.T) {
+	f := newFakeHost()
+	f.deleteErr = errors.New("boom")
+	m := NewManager(f, DefaultArtifactBase)
+	m.deleteRetryDelay = time.Millisecond
+
+	if err := m.DeleteVM("alice-k8s-demo-small-1"); err == nil {
+		t.Fatal("a failed delete must be reported, not swallowed")
+	}
+}
+
+// #1882: Incus can report a delete as failing with "Instance is
+// running" for a brief window after Stop's own operation has already
+// completed — the instance's queryable state has not necessarily
+// settled to Stopped by the time the very next API call runs. A node
+// hitting exactly that race must not come back as a permanent failure
+// the caller (the autoscaler, or `cluster delete`) has to retry from
+// scratch — this run reproduced it hanging a scale-down for the
+// autoscaler's entire 30-minute test budget on one node while a
+// sibling node in the same batch deleted cleanly.
+func TestDeleteVM_RetriesThroughATransientRunningError(t *testing.T) {
+	f := newFakeHost()
+	f.deleteErr = errors.New("incus: instance is running")
+	f.deleteFailTimes = 2 // fails twice, succeeds on the third attempt
+	m := NewManager(f, DefaultArtifactBase)
+	m.deleteRetryDelay = time.Millisecond
+
+	if err := m.DeleteVM("alice-k8s-demo-small-1"); err != nil {
+		t.Fatalf("DeleteVM = %v, want the transient race retried away", err)
+	}
+	if !f.deleted["alice-k8s-demo-small-1"] {
+		t.Fatal("instance was never recorded as deleted")
+	}
+	got := 0
+	for _, c := range f.calls {
+		if c == "delete alice-k8s-demo-small-1" {
+			got++
+		}
+	}
+	if got != 3 {
+		t.Errorf("delete attempts = %d, want 3 (fail, fail, succeed)", got)
+	}
+}
+
+// The retry must be bounded: a genuinely, persistently broken instance
+// (not a brief settle race) has to surface as a real failure — an
+// unbounded retry loop would hang the RPC (and the autoscaler behind
+// it) forever instead of letting the caller's own retry-with-backoff
+// take over.
+func TestDeleteVM_GivesUpAfterBoundedRetries(t *testing.T) {
+	f := newFakeHost()
+	f.deleteErr = errors.New("incus: instance is running")
+	f.deleteFailTimes = 1000 // never succeeds within any reasonable bound
+	m := NewManager(f, DefaultArtifactBase)
+	m.deleteRetryDelay = time.Millisecond
+
+	if err := m.DeleteVM("alice-k8s-demo-small-1"); err == nil {
+		t.Fatal("a persistently failing delete must still be reported, not retried forever")
+	}
+	got := 0
+	for _, c := range f.calls {
+		if c == "delete alice-k8s-demo-small-1" {
+			got++
+		}
+	}
+	if got != deleteRetries {
+		t.Errorf("delete attempts = %d, want exactly deleteRetries (%d)", got, deleteRetries)
+	}
+}
+
+// #1466: the reservation's trigger. A container node gets a
+// reservation only when it ACTUALLY misreports, established by asking
+// the node itself after boot — never inferred from the daemon host's
+// /proc, which is what #1456 got wrong in the other direction.
+//
+// The two environments are the whole point of the test: on a plain
+// Incus host lxcfs works and the node sees its own limits, so any
+// reservation is harmful (kubelet refuses a reservation exceeding
+// capacity); on a nested host lxcfs masking does not reach the inner
+// instance, the node sees the outer host, and without a reservation
+// the scheduler and the autoscaler's fit simulation both believe a
+// node four times its real size — so scale-up never triggers.
+func TestContainerNodeReservationFollowsWhatTheNodeObserves(t *testing.T) {
+	// The nested-host measurement from the design's Amendment 1 §2.
+	const (
+		nestedCPU   = 8
+		nestedMemKB = 65841348
+	)
+
+	tests := []struct {
+		name        string
+		nodeCPU     int
+		nodeMemKB   int64
+		wantReserve bool
+		wantArgs    []string
+	}{
+		{
+			name:      "plain host: the node sees its own limits, so nothing is reserved",
+			nodeCPU:   2,
+			nodeMemKB: 3906244, // ~4GB, what a 4GB node reports where lxcfs works
+		},
+		{
+			name:        "nested host: the node sees the outer host, so the gap is reserved",
+			nodeCPU:     nestedCPU,
+			nodeMemKB:   nestedMemKB,
+			wantReserve: true,
+			wantArgs: []string{
+				fmt.Sprintf("--kubelet-arg=system-reserved=cpu=%d,memory=%d",
+					nestedCPU-2, nestedMemKB*1024-4_000_000_000),
+				"--kubelet-arg=enforce-node-allocatable=pods",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, role := range []string{"control-plane", "worker"} {
+				t.Run(role, func(t *testing.T) {
+					f := newFakeHost()
+					f.files["alice-k8s-demo-cp:"+NodeTokenPath] = []byte("K10hash::server:secret\n")
+					f.files["alice-k8s-demo-cp:"+ContainerdGeneratedConfigPath] = []byte(
+						"version = 3\n  enable_unprivileged_ports = true\n  enable_unprivileged_icmp = true\n")
+
+					node := "alice-k8s-demo-cp"
+					if role == "worker" {
+						node = "alice-k8s-demo-small-1"
+						f.setNodeProc("alice-k8s-demo-cp", 2, 3906244)
+					}
+					f.setNodeProc(node, tt.nodeCPU, tt.nodeMemKB)
+					m := testManager(f)
+
+					if _, err := m.ProvisionCP("alice", "demo", IsolationContainer,
+						DesiredGroup{CPU: "2", Memory: "4GB", Disk: "40GB"}, []string{"203.0.113.10"}); err != nil {
+						t.Fatalf("ProvisionCP: %v", err)
+					}
+					if role == "worker" {
+						if err := m.ProvisionWorker("alice", "demo", IsolationContainer,
+							DesiredGroup{Name: "small", CPU: "2", Memory: "4GB", Disk: "40GB"},
+							node, "10.0.0.1"); err != nil {
+							t.Fatalf("ProvisionWorker: %v", err)
+						}
+					}
+
+					script := string(f.files[node+":"+bootstrapScriptPath])
+					if !tt.wantReserve {
+						if strings.Contains(script, "system-reserved") {
+							t.Errorf("node observing its own limits was given a reservation:\n%s", script)
+						}
+					}
+					for _, want := range tt.wantArgs {
+						if !strings.Contains(script, want) {
+							t.Errorf("script is missing %q:\n%s", want, script)
+						}
+					}
+					// Whatever the reservation, the gate without which
+					// kubelet's ContainerManager never starts must stay.
+					if !strings.Contains(script, "KubeletInUserNamespace=true") {
+						t.Errorf("%s script lost the user-namespace gate:\n%s", role, script)
+					}
+				})
+			}
+		})
+	}
+}
+
+// A VM node has its own kernel and reports honestly, so it must never
+// be probed for a correction, let alone given one — the probe is an
+// Exec into the node, and running it on the VM path would be both
+// pointless and a behaviour change to the class this issue does not
+// touch.
+func TestVMNodeIsNeverProbedForCapacity(t *testing.T) {
+	f := newFakeHost()
+	f.files["alice-k8s-demo-cp:"+NodeTokenPath] = []byte("K10hash::server:secret\n")
+	m := testManager(f)
+
+	if _, err := m.ProvisionCP("alice", "demo", IsolationVM,
+		DesiredGroup{CPU: "2", Memory: "4GB", Disk: "40GB"}, []string{"203.0.113.10"}); err != nil {
+		t.Fatalf("ProvisionCP: %v", err)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, ProcCPUInfoPath) || strings.Contains(c, ProcMemInfoPath) {
+			t.Errorf("VM node was probed for observed capacity: %q", c)
+		}
+	}
+	if strings.Contains(string(f.files["alice-k8s-demo-cp:"+bootstrapScriptPath]), "system-reserved") {
+		t.Error("VM node was given a container-only reservation")
+	}
+}
+
+// A node whose /proc cannot be read fails the provision rather than
+// silently proceeding without a reservation. An unreadable /proc means
+// the lie cannot be measured, not that there is no lie — and a node
+// that quietly advertises four times its size is the exact failure
+// (#1466) this trigger exists to prevent, with nothing to say so.
+func TestContainerNodeUnreadableProcFailsClosed(t *testing.T) {
+	f := newFakeHost()
+	f.files["alice-k8s-demo-cp:"+NodeTokenPath] = []byte("K10hash::server:secret\n")
+	m := testManager(f)
+	// No setNodeProc: the node answers with nothing.
+

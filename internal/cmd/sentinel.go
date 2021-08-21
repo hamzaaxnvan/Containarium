@@ -1,0 +1,455 @@
+//go:build !windows && !containarium_client
+
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"go.opentelemetry.io/otel/sdk/resource"
+
+	"github.com/footprintai/containarium/internal/config"
+	"github.com/footprintai/containarium/internal/metrics/cloudexport"
+	"github.com/footprintai/containarium/internal/sentinel"
+	"github.com/footprintai/containarium/internal/sentinel/sshsession"
+	"github.com/spf13/cobra"
+)
+
+var (
+	sentinelProvider               string
+	sentinelSpotVM                 string
+	sentinelZone                   string
+	sentinelProject                string
+	sentinelBackendAddr            string
+	sentinelHealthPort             int
+	sentinelCheckInterval          time.Duration
+	sentinelHTTPPort               int
+	sentinelHTTPSPort              int
+	sentinelForwardedPorts         string
+	sentinelHealthyThreshold       int
+	sentinelUnhealthyThreshold     int
+	sentinelFailbackChecks         int
+	sentinelSelfCheckFailThreshold int
+	sentinelBinaryPort             int
+	sentinelRecoveryTimeout        time.Duration
+	sentinelRecoveryBackoffInitial time.Duration
+	sentinelRecoveryBackoffMax     time.Duration
+	sentinelCertSyncInterval       time.Duration
+	sentinelKeySyncInterval        time.Duration
+	sentinelTunnelToken            string
+	sentinelTunnelTokenPolicies    []string
+	sentinelTunnelTLSIdentity      string
+	sentinelTunnelAllowCleartext   bool
+	sentinelTunnelAPIBindAddr      string
+	sentinelProxyProtocol          bool
+	sentinelAlertWebhookURL        string
+	sentinelMetricsExport          bool
+	sentinelMetricsExportProject   string
+	sentinelMetricsExportInterval  int32
+	sentinelConsoleRouterAddr      string
+	sentinelConsoleRouterToken     string
+	sentinelWatchSpotVMs           []string
+	sentinelUpstreamPolicy         string
+	sentinelUpstreamState          string
+	sentinelUpstreamSocket         string
+
+	// Domains the in-fleet backend is registered for; its certificate
+	// sync may only supply certificates inside them.
+	sentinelBackendHostname    string
+	sentinelBackendAliases     []string
+	sentinelBackendBaseDomains []string
+
+	// SSH session shipper (#2415): ships the ssh-session-plugin's JSONL sink
+	// into each backend's tamper-evident audit chain.
+	sentinelShipSSHSessions      bool
+	sentinelSSHSessionsFile      string
+	sentinelSSHSessionsCkpt      string
+	sentinelSSHSessionsInterval  time.Duration
+	sentinelSSHSessionsDefaultBE string
+)
+
+var sentinelCmd = &cobra.Command{
+	Use:   "sentinel",
+	Short: "Run as an HA sentinel that proxies traffic to a spot VM",
+	Long: `Run Containarium in sentinel mode. The sentinel sits on a tiny always-on VM,
+owns the static IP, and forwards traffic to the backend spot VM via iptables DNAT.
+
+When the backend is healthy (TCP check passes), traffic is forwarded transparently.
+When the backend is unhealthy, the sentinel serves a maintenance page and attempts
+to restart the backend VM.
+
+Examples:
+  # GCP mode (production)
+  containarium sentinel --spot-vm my-spot-vm --zone us-central1-a --project my-project
+
+  # Local testing (no cloud, no iptables)
+  containarium sentinel --provider=none --backend-addr=127.0.0.1 --health-port 8080 --http-port 9090
+
+  # Tunnel mode (accept reverse tunnel connections from firewalled spots on port 443)
+  containarium sentinel --provider=tunnel --tunnel-token SECRET`,
+	RunE: runSentinel,
+}
+
+func init() {
+	rootCmd.AddCommand(sentinelCmd)
+	sentinelCmd.Flags().StringVar(&sentinelUpstreamPolicy, "ssh-upstream-policy", os.Getenv("CONTAINARIUM_SSH_UPSTREAM_POLICY"), "Strict protobuf JSON policy enabling shared backend SSH admission")
+	sentinelCmd.Flags().StringVar(&sentinelUpstreamState, "ssh-upstream-state", "", "Private durable upstream risk checkpoint")
+	sentinelCmd.Flags().StringVar(&sentinelUpstreamSocket, "ssh-upstream-socket", "", "Private upstream control socket shared by both SSH listeners")
+
+	sentinelCmd.Flags().StringVar(&sentinelProvider, "provider", "gcp", "Cloud provider: \"gcp\", \"none\" (local testing), or \"tunnel\" (reverse tunnel)")
+	sentinelCmd.Flags().StringVar(&sentinelTunnelToken, "tunnel-token", "", "Pre-shared token for tunnel authentication, allowed for any pool (legacy; use --tunnel-token-policy for pool-restricted tokens, or CONTAINARIUM_TUNNEL_TOKEN env)")
+	sentinelCmd.Flags().StringSliceVar(&sentinelTunnelTokenPolicies, "tunnel-token-policy", nil, "Pool-restricted token in the form 'token=pool1,pool2'. Repeatable. Use '*' to mean any pool. Combined with --tunnel-token if both are provided.")
+	sentinelCmd.Flags().StringVar(&sentinelTunnelTLSIdentity, "tunnel-tls-identity", sentinel.DefaultTunnelIdentityPath, "Tunnel identity file (ECDSA key + self-signed certificate, mode 0600). Created on first start if absent; its pin is logged at startup and printed by 'containarium sentinel tunnel-identity'. Keep it across redeploys: tunnel clients pin it.")
+	sentinelCmd.Flags().BoolVar(&sentinelTunnelAllowCleartext, "tunnel-allow-cleartext", false, "Deprecated: cleartext tunnel sessions are no longer supported. false is accepted and does nothing; true is refused at startup.")
+	sentinelCmd.Flags().StringVar(&sentinelTunnelAPIBindAddr, "tunnel-api-bind-addr", sentinel.DefaultTunnelAPIBindAddr, "IP the per-backend API port of each tunnel backend binds to on the sentinel. Loopback by default; set an internal address only if a daemon on another host lists that port in --peers.")
+	_ = sentinelCmd.Flags().MarkDeprecated("tunnel-allow-cleartext", "tunnel sessions always require TLS; remove the flag")
+	sentinelCmd.Flags().StringVar(&sentinelConsoleRouterAddr, "console-router-addr", "", "If set (host:port), run the console router — makes any connected tunnel spot's advertised port publicly reachable, gated by --console-router-token. Opt-in: unset means no console router runs. See FootprintAI/Containarium#1756.")
+	sentinelCmd.Flags().StringVar(&sentinelConsoleRouterToken, "console-router-token", "", "Pre-shared token authorizing console-router requests (or CONTAINARIUM_CONSOLE_ROUTER_TOKEN env). A separate, coarser credential from --tunnel-token — the real per-guest check happens downstream at the hypervisor-agent.")
+	sentinelCmd.Flags().StringVar(&sentinelSpotVM, "spot-vm", "", "Name of the backend VM instance (required for gcp provider)")
+	sentinelCmd.Flags().StringVar(&sentinelZone, "zone", "", "Cloud zone (required for gcp provider)")
+	sentinelCmd.Flags().StringVar(&sentinelProject, "project", "", "Cloud project ID (required for gcp provider)")
+	sentinelCmd.Flags().StringVar(&sentinelBackendAddr, "backend-addr", "", "Direct backend IP/host (for local testing with provider=none)")
+	sentinelCmd.Flags().IntVar(&sentinelHealthPort, "health-port", 8080, "TCP port to health-check on backend")
+	sentinelCmd.Flags().DurationVar(&sentinelCheckInterval, "check-interval", 15*time.Second, "Health check interval")
+	sentinelCmd.Flags().IntVar(&sentinelHTTPPort, "http-port", 80, "Maintenance page HTTP port")
+	sentinelCmd.Flags().IntVar(&sentinelHTTPSPort, "https-port", 443, "Maintenance page HTTPS port")
+	sentinelCmd.Flags().StringVar(&sentinelForwardedPorts, "forwarded-ports", "80,443", "Comma-separated ports to DNAT forward (port 22 handled by sshpiper)")
+	sentinelCmd.Flags().IntVar(&sentinelHealthyThreshold, "healthy-threshold", 2, "Consecutive healthy checks before switching to proxy")
+	sentinelCmd.Flags().IntVar(&sentinelUnhealthyThreshold, "unhealthy-threshold", 2, "Consecutive unhealthy checks before switching to maintenance")
+	sentinelCmd.Flags().IntVar(&sentinelFailbackChecks, "failback-checks", 4, "Consecutive healthy checks a better-priority backend (e.g. the recovered primary) needs before traffic fails back to it; 0 = default (4), never below --healthy-threshold, negative disables failback")
+	sentinelCmd.Flags().IntVar(&sentinelSelfCheckFailThreshold, "self-check-failure-threshold", 3, "Consecutive failed end-to-end self-checks of the sentinel's OWN proxy pipeline (independent of backend health) before it exits and lets systemd (Restart=always) recreate it; 0 disables")
+	sentinelCmd.Flags().IntVar(&sentinelBinaryPort, "binary-port", 8888, "Port to serve containarium binary for spot VM downloads (0 to disable)")
+	sentinelCmd.Flags().DurationVar(&sentinelRecoveryTimeout, "recovery-timeout", 10*time.Minute, "Warn if recovery takes longer than this (0 to disable)")
+	sentinelCmd.Flags().DurationVar(&sentinelRecoveryBackoffInitial, "recovery-backoff-initial", 30*time.Second, "Initial interval between StartInstance retries while a backend is down (#514)")
+	sentinelCmd.Flags().DurationVar(&sentinelRecoveryBackoffMax, "recovery-backoff-max", 5*time.Minute, "Max interval between StartInstance retries (exponential backoff cap)")
+	sentinelCmd.Flags().DurationVar(&sentinelCertSyncInterval, "cert-sync-interval", 6*time.Hour, "Interval for syncing TLS certificates from backend (0 to use default 6h)")
+	sentinelCmd.Flags().DurationVar(&sentinelKeySyncInterval, "key-sync-interval", 2*time.Minute, "Interval for syncing SSH keys from backend for sshpiper (0 to use default 2m)")
+	sentinelCmd.Flags().StringVar(&sentinelBackendHostname, "backend-hostname", "", "Hostname the in-fleet backend (--spot-vm / --backend-addr) serves. Its certificate sync may only supply certificates for this hostname, --backend-alias and --backend-base-domain; with none of the three set, none of its certificates are served.")
+	sentinelCmd.Flags().StringSliceVar(&sentinelBackendAliases, "backend-alias", nil, "Additional hostname the in-fleet backend serves, for certificate scoping. Repeatable.")
+	sentinelCmd.Flags().StringSliceVar(&sentinelBackendBaseDomains, "backend-base-domain", nil, "Base domain the in-fleet backend serves, for certificate scoping: covers the domain itself, its wildcard and every name under it. Repeatable.")
+	sentinelCmd.Flags().BoolVar(&sentinelProxyProtocol, "proxy-protocol", false, "Prepend a PROXY v2 header to forwarded HTTPS streams so the backend Caddy sees the real client IP (requires Caddy with proxy_protocol listener wrapper trusting the sentinel)")
+	sentinelCmd.Flags().BoolVar(&sentinelMetricsExport, "metrics-export", false,
+		"Push sentinel health series (state, failovers, per-backend health, RSS/goroutines/fds) to Cloud Monitoring (#1358). OFF by default: custom metrics are billed per ingested sample.")
+	sentinelCmd.Flags().StringVar(&sentinelMetricsExportProject, "metrics-export-project", "",
+		"GCP project for --metrics-export. Empty infers it from the metadata server.")
+	sentinelCmd.Flags().Int32Var(&sentinelMetricsExportInterval, "metrics-export-interval", 60,
+		"Export cadence in seconds for --metrics-export. Clamped up to the 60s billing floor.")
+
+	sentinelCmd.Flags().BoolVar(&sentinelShipSSHSessions, "ssh-session-shipper", true,
+		"Ship the ssh-session-plugin's JSONL records into each backend's tamper-evident audit chain (#2415). A backend with no registered token (sentinel register-token --kind audit-ingest) is retried with a loud log line, never skipped.")
+	sentinelCmd.Flags().StringVar(&sentinelSSHSessionsFile, "ssh-session-records-file", sshsession.DefaultRecordsFile, "SSH session records sink the shipper tails (must match the plugin's --records-file)")
+	sentinelCmd.Flags().StringVar(&sentinelSSHSessionsCkpt, "ssh-session-checkpoint-file", sshsession.DefaultCheckpointFile, "Where the shipper persists its progress")
+	sentinelCmd.Flags().DurationVar(&sentinelSSHSessionsInterval, "ssh-session-ship-interval", 5*time.Second, "How often the shipper checks the sink for new records")
+	sentinelCmd.Flags().StringVar(&sentinelSSHSessionsDefaultBE, "ssh-session-default-backend", "", "Backend id that receives records whose login routes to no backend (e.g. a user deleted before the record shipped). Empty skips and counts them.")
+
+	sentinelCmd.Flags().StringVar(&sentinelAlertWebhookURL, "alert-webhook-url", os.Getenv(config.EnvSentinelAlertWebhook), "Webhook POSTed on spot preempted/recovered (always-on alert path; the on-spot vmalert dies with the VM). Falls back to $CONTAINARIUM_SENTINEL_ALERT_WEBHOOK (#514)")
+	sentinelCmd.Flags().StringSliceVar(&sentinelWatchSpotVMs, "watch-spot-vm", nil,
+		"Additional GCP VM to watch for preemption/stop and auto-restart, as 'name:zone' or 'name:zone:project' (project defaults to --project). Repeatable. Unlike --spot-vm, a watch target is NOT added to the HTTP proxy pool and never becomes this sentinel's forwarding target — use it for an independent host (different tenants, possibly a different zone) that just happens to also run on preemptible capacity and has no sentinel of its own watching it.")
+}
+
+// loadPersistedTunnelTokens applies every dynamically-registered tunnel
+// token this sentinel has ever persisted (#936) on top of the
+// CLI-flag-built policy, so a restart doesn't silently forget a token
+// that a prior `sentinel register-token` call (or a cloud control
+// plane's BYOC join flow) made valid at runtime. A missing/unreadable
+// store is logged and otherwise ignored — the sentinel still starts and
+// serves its static CLI-flag tokens either way.
+func loadPersistedTunnelTokens(policy *sentinel.TokenPolicy) {
+	entries, err := sentinel.LoadTunnelTokenStore(sentinel.DefaultTunnelTokenStorePath)
+	if err != nil {
+		log.Printf("[sentinel] WARNING: failed to load persisted tunnel tokens from %s: %v", sentinel.DefaultTunnelTokenStorePath, err)
+		return
+	}
+	if len(entries) > 0 {
+		log.Printf("[sentinel] loaded %d persisted tunnel token(s) from %s", len(entries), sentinel.DefaultTunnelTokenStorePath)
+	}
+	sentinel.ApplyTunnelTokenStore(entries, policy)
+}
+
+// startSentinelMetricsExport starts the Cloud Monitoring push exporter when
+// --metrics-export is set, returning a stop func (a no-op when disabled or on
+// failure).
+//
+// Failure to export NEVER stops the sentinel. It is a traffic forwarder first
+// and a metrics source second: refusing to start the apex because Cloud
+// Monitoring credentials are missing would trade a monitoring gap for an
+// outage. Same posture as the cert/key sync failures elsewhere in this daemon
+// — log loudly, keep serving.
+func startSentinelMetricsExport(ctx context.Context, m *sentinel.Manager) func() {
+	noop := func() {}
+	if !sentinelMetricsExport {
+		return noop
+	}
+
+	id, err := os.Hostname()
+	if err != nil || id == "" {
+		id = "sentinel"
+	}
+
+	sink := cloudexport.NewGCPSink()
+	if perr := sink.Probe(ctx); perr != nil {
+		// Probe carries an actionable remediation hint; surfacing it here
+		// means the operator learns at startup rather than from silently
+		// absent dashboards.
+		log.Printf("[sentinel] WARNING: metrics export disabled — Cloud Monitoring credentials unusable: %v", perr)
+		return noop
+	}
+
+	exporter, err := sink.NewExporter(ctx, cloudexport.SinkConfig{ProjectID: sentinelMetricsExportProject})
+	if err != nil {
+		log.Printf("[sentinel] WARNING: metrics export disabled — could not build exporter: %v", err)
+		return noop
+	}
+
+	var res *resource.Resource
+	if rp, ok := sink.(cloudexport.ResourceProvider); ok {
+		if r, derr := rp.DetectResource(ctx); derr == nil {
+			res = r
+		} else {
+			log.Printf("[sentinel] metrics export: resource detection failed, using default resource: %v", derr)
+		}
+	}
+
+	stop, err := sentinel.StartMetricsExport(m, sentinel.MetricsExportOptions{
+		Exporter:        exporter,
+		Resource:        res,
+		SentinelID:      id,
+		IntervalSeconds: sentinelMetricsExportInterval,
+	})
+	if err != nil {
+		log.Printf("[sentinel] WARNING: metrics export disabled — %v", err)
+		return noop
+	}
+	log.Printf("[sentinel] metrics export ON → Cloud Monitoring as sentinel=%q every %ds", id, sentinelMetricsExportInterval)
+
+	return func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if serr := stop(shutCtx); serr != nil {
+			log.Printf("[sentinel] metrics export shutdown: %v", serr)
+		}
+	}
+}
+
+// wireWatchOnlyBackends parses --watch-spot-vm entries and registers each
+// as an independent GCPProvider on manager (see AddWatchOnlyBackend /
+// internal/sentinel/watch_recovery.go) — preemption-watched and
+// auto-restarted, but never added to the primary+failover HTTP proxy
+// pool. Must be called before manager.Run(). The returned cleanup func
+// closes every provider's GCP API clients; call it via defer alongside
+// the primary provider's own Close().
+func wireWatchOnlyBackends(ctx context.Context, manager *sentinel.Manager) (cleanup func(), err error) {
+	var providers []*sentinel.GCPProvider
+	cleanup = func() {
+		for _, p := range providers {
+			_ = p.Close()
+		}
+	}
+
+	for _, spec := range sentinelWatchSpotVMs {
+		parts := strings.Split(spec, ":")
+		if len(parts) < 2 || len(parts) > 3 {
+			return cleanup, fmt.Errorf("invalid --watch-spot-vm %q: want name:zone or name:zone:project", spec)
+		}
+		name, zone := parts[0], parts[1]
+		project := sentinelProject
+		if len(parts) == 3 {
+			project = parts[2]
+		}
+		if name == "" || zone == "" {
+			return cleanup, fmt.Errorf("invalid --watch-spot-vm %q: name and zone are required", spec)
+		}
+		if project == "" {
+			return cleanup, fmt.Errorf("invalid --watch-spot-vm %q: no project given and --project is empty", spec)
+		}
+
+		p, perr := sentinel.NewGCPProvider(ctx, project, zone, name)
+		if perr != nil {
+			return cleanup, fmt.Errorf("failed to create watch-only GCP provider for %q: %w", name, perr)
+		}
+		providers = append(providers, p)
+		manager.AddWatchOnlyBackend(name, p)
+		log.Printf("[sentinel] watch-only recovery configured for %s (zone=%s project=%s)", name, zone, project)
+	}
+	return cleanup, nil
+}
+
+func runSentinel(cmd *cobra.Command, args []string) error {
+	if err := checkDeprecatedCleartextFlag(sentinelTunnelAllowCleartext); err != nil {
+		return err
+	}
+	// Parse forwarded ports
+	ports, err := parseForwardedPorts(sentinelForwardedPorts)
+	if err != nil {
+		return fmt.Errorf("invalid forwarded-ports: %w", err)
+	}
+	inFleetCertScope, err := inFleetCertScopeFromFlags(sentinelBackendHostname, sentinelBackendAliases, sentinelBackendBaseDomains)
+	if err != nil {
+		return err
+	}
+
+	// Create cloud provider
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var provider sentinel.CloudProvider
+
+	switch sentinelProvider {
+	case "gcp":
+		if sentinelSpotVM == "" || sentinelZone == "" || sentinelProject == "" {
+			return fmt.Errorf("--spot-vm, --zone, and --project are required for gcp provider")
+		}
+		gcpProvider, err := sentinel.NewGCPProvider(ctx, sentinelProject, sentinelZone, sentinelSpotVM)
+		if err != nil {
+			return fmt.Errorf("failed to create GCP provider: %w", err)
+		}
+		defer func() { _ = gcpProvider.Close() }()
+		provider = gcpProvider
+
+		// Hybrid mode: GCP + tunnel if --tunnel-token OR
+		// --tunnel-token-policy is provided. Issue #337 — previously
+		// gated on --tunnel-token alone, which contradicted the
+		// --help text labeling --tunnel-token as "legacy; use
+		// --tunnel-token-policy for pool-restricted tokens." Operators
+		// following the documented rotation pattern (stage NEW via
+		// policy, drop legacy) silently lost the tunnel-server when
+		// they finished step 2.
+		tunnelToken := sentinelTunnelToken
+		if tunnelToken == "" {
+			tunnelToken = os.Getenv("CONTAINARIUM_TUNNEL_TOKEN")
+		}
+		if tunnelToken != "" || len(sentinelTunnelTokenPolicies) > 0 {
+			// Hybrid mode: GCP + tunnel on the same port 443 via ConnMux.
+			// The ConnMux routes tunnel sessions (TLS with the tunnel ALPN, or the
+			// legacy cleartext handshake) apart from ordinary HTTPS.
+			// HTTPS is proxied as raw TCP to the spot VM (Caddy handles TLS via SNI).
+			log.Printf("[sentinel] hybrid mode: GCP + tunnel (ConnMux on port %d)", sentinelHTTPSPort)
+
+			config := sentinel.Config{
+				SSHUpstreamPolicy: sentinelUpstreamPolicy, SSHUpstreamState: sentinelUpstreamState, SSHUpstreamSocket: sentinelUpstreamSocket,
+				HealthPort:                sentinelHealthPort,
+				CheckInterval:             sentinelCheckInterval,
+				HTTPPort:                  sentinelHTTPPort,
+				HTTPSPort:                 sentinelHTTPSPort,
+				ForwardedPorts:            ports,
+				HealthyThreshold:          sentinelHealthyThreshold,
+				UnhealthyThreshold:        sentinelUnhealthyThreshold,
+				FailbackChecks:            sentinelFailbackChecks,
+				SelfCheckFailureThreshold: sentinelSelfCheckFailThreshold,
+				BinaryPort:                sentinelBinaryPort,
+				RecoveryTimeout:           sentinelRecoveryTimeout,
+				RecoveryBackoffInitial:    sentinelRecoveryBackoffInitial,
+				RecoveryBackoffMax:        sentinelRecoveryBackoffMax,
+				CertSyncInterval:          sentinelCertSyncInterval,
+				InFleetCertScope:          inFleetCertScope,
+				KeySyncInterval:           sentinelKeySyncInterval,
+				SSHAuthzSocket:            sentinelSSHAuthzSocket,
+				HybridMode:                true,
+				ProxyProtocol:             sentinelProxyProtocol,
+				AlertWebhookURL:           sentinelAlertWebhookURL,
+			}
+
+			manager := sentinel.NewManager(config, gcpProvider)
+
+			watchCleanup, werr := wireWatchOnlyBackends(ctx, manager)
+			defer watchCleanup()
+			if werr != nil {
+				return werr
+			}
+
+			// Start ConnMux on port 443 — multiplexes tunnel and HTTPS
+			muxAddr := fmt.Sprintf(":%d", sentinelHTTPSPort)
+			connMux, err := sentinel.NewConnMux(muxAddr)
+			if err != nil {
+				return fmt.Errorf("failed to start ConnMux on %s: %w", muxAddr, err)
+			}
+			defer func() { _ = connMux.Close() }()
+
+			registry := sentinel.NewTunnelRegistry()
+			// Issue #337 §"Related observations" — drain the registry
+			// on shutdown so per-spot loopback aliases (127.0.0.x)
+			// get removed. Without this, restarting the sentinel
+			// inherits stale aliases that block fresh allocations
+			// and force a manual `ip addr del`.
+			defer registry.UnregisterAll()
+			tunnelPolicy, polErr := sentinel.PolicyFromCLI(tunnelToken, sentinelTunnelTokenPolicies)
+			if polErr != nil {
+				return polErr
+			}
+			loadPersistedTunnelTokens(tunnelPolicy)
+			tunnelServer := sentinel.NewTunnelServer("", tunnelPolicy, registry, sentinelHTTPSPort)
+			if _, err := configureTunnelTransport(tunnelServer, sentinelTunnelTLSIdentity); err != nil {
+				return err
+			}
+			if err := applyTunnelAPIBindAddr(tunnelServer, sentinelTunnelAPIBindAddr); err != nil {
+				return err
+			}
+			tunnelServer.OnConnect = manager.OnTunnelConnect
+			tunnelServer.OnDisconnect = manager.OnTunnelDisconnect
+			manager.SetTunnelRegistry(registry)
+			manager.InitBYOCRoutes(sentinel.DefaultBYOCRouteStorePath)
+			manager.SetTunnelPolicy(tunnelPolicy)
+			manager.SetHTTPSListener(connMux.HTTPSChanListener())
+			if err := maybeStartConsoleRouter(ctx, registry); err != nil {
+				return err
+			}
+
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+			go func() {
+				sig := <-sigChan
+				log.Printf("[sentinel] received signal: %v", sig)
+				cancel()
+			}()
+
+			go connMux.Run()
+			go func() {
+				if err := tunnelServer.Serve(ctx, connMux.TunnelListener()); err != nil {
+					log.Printf("[sentinel] tunnel server error: %v", err)
+				}
+			}()
+
+			defer startSentinelMetricsExport(ctx, manager)()
+			defer startSSHSessionShipper(ctx, manager)()
+			return manager.Run(ctx)
+		}
+
+	case "none":
+		if sentinelBackendAddr == "" {
+			return fmt.Errorf("--backend-addr is required for provider=none")
+		}
+		provider = sentinel.NewNoOpProvider(sentinelBackendAddr)
+
+	case "tunnel":
+		tunnelToken := sentinelTunnelToken
+		if tunnelToken == "" {
+			tunnelToken = os.Getenv("CONTAINARIUM_TUNNEL_TOKEN")
+		}
+		// Issue #337 — accept --tunnel-token-policy as a sufficient
+		// enablement signal too. The --help text frames --tunnel-token
+		// as "legacy; use --tunnel-token-policy for pool-restricted
+		// tokens", so requiring both is a contradiction.
+		if tunnelToken == "" && len(sentinelTunnelTokenPolicies) == 0 {
+			return fmt.Errorf("--tunnel-token, --tunnel-token-policy, or CONTAINARIUM_TUNNEL_TOKEN is required for tunnel provider")
+		}
+		registry := sentinel.NewTunnelRegistry()
+		// Issue #337 §"Related observations" — drain on shutdown so
+		// per-spot 127.0.0.x aliases get removed (else the next start
+		// inherits them and has to ip-addr-del them by hand).
+		defer registry.UnregisterAll()
+		provider = sentinel.NewTunnelProvider(registry, "")
+
+		config := sentinel.Config{
+			SSHUpstreamPolicy: sentinelUpstreamPolicy, SSHUpstreamState: sentinelUpstreamState, SSHUpstreamSocket: sentinelUpstreamSocket,
+			HealthPort:                sentinelHealthPort,
+			CheckInterval:             sentinelCheckInterval,
+			HTTPPort:                  sentinelHTTPPort,
+			HTTPSPort:                 sentinelHTTPSPort,
