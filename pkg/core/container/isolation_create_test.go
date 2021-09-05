@@ -56,3 +56,23 @@ func TestCreate_IsolationVM_CreatesLinuxVM(t *testing.T) {
 	}
 	if got.Image == BakedImageAliasFor("images:ubuntu/24.04") {
 		t.Errorf("Image = %q: the baked-image (container) fast path must not apply to a VM", got.Image)
+	}
+}
+
+// TestCreate_IsolationUnspecified_KeepsContainer is the regression guard:
+// a request that says nothing about isolation still produces a container
+// from the plain image, exactly as before #2196.
+func TestCreate_IsolationUnspecified_KeepsContainer(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	b := &stagesBackend{}
+	m := NewWithBackend(b)
+
+	if _, err := m.Create(stagesOpts()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if b.createdConfig.InstanceType != "" && b.createdConfig.InstanceType != incusapi.InstanceTypeContainer {
+		t.Errorf("InstanceType = %q, want container/default", b.createdConfig.InstanceType)
+	}
+	if strings.Contains(b.createdConfig.Image, "/cloud") {
+		t.Errorf("Image = %q: container create must not pick the VM image variant", b.createdConfig.Image)
