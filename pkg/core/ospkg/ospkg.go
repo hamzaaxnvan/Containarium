@@ -31,14 +31,3 @@ type PackageManager interface {
 	// PodmanAvailableInBaseRepos returns true if podman is in the distro's base repos.
 	PodmanAvailableInBaseRepos() bool
 
-	// PodmanRepoScript returns a bash script to add the Podman repo (empty if not needed).
-	PodmanRepoScript() string
-
-	// PipInstallCmd returns the command to install pip.
-	PipInstallCmd() []string
-
-	// CleanCmd returns the command to clean package caches.
-	CleanCmd() []string
-}
-
-// ForFamily returns the appropriate PackageManager for the given OS family.

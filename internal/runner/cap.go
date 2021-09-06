@@ -26,3 +26,31 @@ const DefaultMaxRunnersTotal = 20
 // it with t.Setenv.
 func MaxRunnersTotal() int {
 	raw := strings.TrimSpace(os.Getenv("MAX_RUNNERS_TOTAL"))
+	if raw == "" {
+		return DefaultMaxRunnersTotal
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		// A typo'd/garbage value should fail safe to the default
+		// rather than disable the cap (n<=0) or crash.
+		return DefaultMaxRunnersTotal
+	}
+	return n
+}
+
+// CountLiveRunners reports how many runner boxes currently exist on
+// the daemon — the capacity signal the cap is enforced against. We
+// count BOXES (via deps.Boxes.List) rather than GitHub-registered
+// runners on purpose: a box counts against the cap the moment it
+// exists (that's what's billed), even before it registers with
+// GitHub and after it finishes a job but before teardown. GitHub's
+// registered view lags box lifecycle in both directions, so it's
+// the wrong primary gate.
+//
+// namePrefix defaults to "ci-runner" — the same default Provision
+// uses — and only boxes whose name starts with it are counted, so
+// non-runner containers never consume runner headroom.
+func CountLiveRunners(ctx context.Context, deps Deps, namePrefix string) (int, error) {
+	if namePrefix == "" {
+		namePrefix = "ci-runner"
+	}
