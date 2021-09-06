@@ -318,3 +318,110 @@ func (ts *TunnelServer) validate(conn net.Conn, hs *TunnelHandshake) error {
 	return validateHandshakeV2(hs, ts.policy, ekm)
 }
 
+// loopbackPortsFor returns the subset of ports that should get a per-spot
+// loopback proxy listener, excluding the sentinel's own ConnMux HTTPS port
+// (httpsPort) and, if set, a promoted primary's PublicPort. Neither ever
+// needs a per-spot listener: the ConnMux holds a wildcard bind on its port,
+// so a per-spot listener there can never succeed, and HTTPS traffic to every
+// backend (promoted primary or not) already reaches it via
+// TunnelRegistry.DialTunnel() through the SNI router instead (#1710).
+// httpsPort/publicPort of 0 disable the corresponding exclusion.
+func loopbackPortsFor(ports []int, httpsPort, publicPort int) []int {
+	filtered := make([]int, 0, len(ports))
+	for _, p := range ports {
+		if p == httpsPort || (publicPort != 0 && p == publicPort) {
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	return filtered
+}
+
+// startProxies opens a local TCP listener on localIP:port for each port.
+// Connections to these listeners are proxied through the yamux session.
+// If binding to localIP fails (e.g., loopback alias not available on non-Linux),
+// it falls back to 127.0.0.1.
+// For the health port (8080), it also binds on APIBindAddr:externalPort
+// (loopback by default), giving this tunnel backend's API a stable
+// per-backend port on the sentinel.
+func (ts *TunnelServer) startProxies(ctx context.Context, spotID string, gen uint64, localIP string, externalPort int, ports []int, session *yamux.Session) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	// Close any existing proxies for this spot — this registration supersedes
+	// whatever was there.
+	if existing, ok := ts.proxies[spotID]; ok && existing.gen > gen {
+		// A newer registration already installed its listeners while we were
+		// getting here; ours are the stale ones. Bail rather than clobber.
+		log.Printf("[tunnel-server] not installing proxies for spot %q gen=%d — gen=%d is already current", spotID, gen, existing.gen)
+		return
+	}
+	ts.closeProxiesLocked(spotID)
+
+	var listeners []net.Listener
+	for _, port := range ports {
+		// Use a high-port offset for port 22 to avoid conflicting with sshpiper
+		// which binds *:22. The offset port (e.g., 20022) is used in sshpiper
+		// config so that tunnel SSH traffic goes: sshpiper -> 127.0.0.x:20022
+		// -> yamux tunnel -> spot:22.
+		listenPort := port
+		if port == 22 {
+			listenPort = 20022
+		}
+		addr := fmt.Sprintf("%s:%d", localIP, listenPort)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			// Fall back to 127.0.0.1 if the loopback alias isn't available
+			fallbackAddr := fmt.Sprintf("127.0.0.1:%d", listenPort)
+			ln, err = net.Listen("tcp", fallbackAddr)
+			if err != nil {
+				log.Printf("[tunnel-server] failed to listen on %s (and fallback %s) for spot %s: %v", addr, fallbackAddr, spotID, err)
+				continue
+			}
+			log.Printf("[tunnel-server] proxy listening on %s (fallback) → tunnel → spot %s (remote port %d)", fallbackAddr, spotID, port)
+		} else {
+			log.Printf("[tunnel-server] proxy listening on %s → tunnel → spot %s (remote port %d)", addr, spotID, port)
+		}
+		listeners = append(listeners, ln)
+		ts.spawn(func() { ts.proxyLoop(ctx, ln, port, session, spotID) })
+
+		// For the health/API port (8080), also bind the per-backend API port.
+		if port == 8080 && externalPort > 0 {
+			bindIP := ts.APIBindAddr
+			if bindIP == "" {
+				bindIP = DefaultTunnelAPIBindAddr
+			}
+			extAddr := net.JoinHostPort(bindIP, strconv.Itoa(externalPort))
+			extLn, extErr := net.Listen("tcp", extAddr)
+			if extErr != nil {
+				log.Printf("[tunnel-server] failed to bind external port %s for spot %s: %v", extAddr, spotID, extErr)
+			} else {
+				log.Printf("[tunnel-server] external proxy listening on %s → tunnel → spot %s (per-backend API port)", extAddr, spotID)
+				listeners = append(listeners, extLn)
+				ts.spawn(func() { ts.proxyLoop(ctx, extLn, port, session, spotID) })
+			}
+		}
+	}
+	ts.proxies[spotID] = proxySet{gen: gen, listeners: listeners}
+}
+
+// proxyLoop accepts connections on the local listener and forwards them
+// through the yamux session to the spot's corresponding port.
+func (ts *TunnelServer) proxyLoop(ctx context.Context, ln net.Listener, port int, session *yamux.Session, spotID string) {
+	for {
+		localConn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				// Listener closed (spot disconnected)
+				return
+			}
+		}
+		ts.spawn(func() { ts.proxyConnection(localConn, port, session, spotID) })
+	}
+}
+
+// proxyConnection forwards a single connection through yamux to the spot.
+// The protocol: the sentinel opens a yamux stream, sends a 2-byte port number,
