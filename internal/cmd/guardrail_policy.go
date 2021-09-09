@@ -37,3 +37,43 @@ var errNoGuardrailServer = errors.New("--server is required for guardrail policy
 
 // newGuardrailPolicyAPI builds the client from the global --server/--http
 // flags. A variable so tests can substitute a fake.
+var newGuardrailPolicyAPI = func() (guardrailPolicyAPI, func(), error) {
+	return dialGuardrailPolicyService()
+}
+
+// guardrailPolicyServiceClient is every GuardrailPolicyService call the CLI
+// makes; both typed clients satisfy it.
+type guardrailPolicyServiceClient interface {
+	guardrailPolicyAPI
+	guardrailStatusAPI
+	guardrailBaselineAPI
+}
+
+func dialGuardrailPolicyService() (guardrailPolicyServiceClient, func(), error) {
+	if serverAddr == "" {
+		return nil, nil, errNoGuardrailServer
+	}
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return nil, nil, err
+		}
+		return h, func() { _ = h.Close() }, nil
+	}
+	g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return nil, nil, err
+	}
+	return g, func() { _ = g.Close() }, nil
+}
+
+var guardrailPolicyCmd = &cobra.Command{
+	Use:   "policy",
+	Short: "Read or replace the server-side guardrail policy (talks to the daemon)",
+}
+
+var guardrailPolicyGetCmd = &cobra.Command{
+	Use:   "get",
+	Short: "Show the server's guardrail policy, trusted signers, revision and hash",
+	Long: `Print the cluster-wide guardrail policy. Any authenticated caller may
+read it. "not configured" means no policy was ever set.
