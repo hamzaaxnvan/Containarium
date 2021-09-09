@@ -66,3 +66,71 @@ func (s *Store) initSchema(ctx context.Context) error {
 
 	_, err := s.pool.Exec(ctx, schema)
 	return err
+}
+
+// Create inserts a new alert rule and returns it with the generated ID
+func (s *Store) Create(ctx context.Context, rule *AlertRule) (*AlertRule, error) {
+	labelsJSON, err := json.Marshal(rule.Labels)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal labels: %w", err)
+	}
+	annotationsJSON, err := json.Marshal(rule.Annotations)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal annotations: %w", err)
+	}
+
+	query := `
+		INSERT INTO alert_rules (name, expr, duration, severity, description, labels, annotations, enabled)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING id, created_at, updated_at
+	`
+
+	var id string
+	var createdAt, updatedAt time.Time
+	err = s.pool.QueryRow(ctx, query,
+		rule.Name, rule.Expr, rule.Duration, rule.Severity,
+		rule.Description, labelsJSON, annotationsJSON, rule.Enabled,
+	).Scan(&id, &createdAt, &updatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert alert rule: %w", err)
+	}
+
+	rule.ID = id
+	rule.CreatedAt = createdAt
+	rule.UpdatedAt = updatedAt
+	return rule, nil
+}
+
+// Get retrieves a single alert rule by ID
+func (s *Store) Get(ctx context.Context, id string) (*AlertRule, error) {
+	query := `
+		SELECT id, name, expr, duration, severity, description,
+			labels, annotations, enabled, created_at, updated_at
+		FROM alert_rules WHERE id = $1
+	`
+
+	rule := &AlertRule{}
+	var labelsJSON, annotationsJSON []byte
+	err := s.pool.QueryRow(ctx, query, id).Scan(
+		&rule.ID, &rule.Name, &rule.Expr, &rule.Duration, &rule.Severity,
+		&rule.Description, &labelsJSON, &annotationsJSON,
+		&rule.Enabled, &rule.CreatedAt, &rule.UpdatedAt,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, fmt.Errorf("alert rule not found: %s", id)
+		}
+		return nil, fmt.Errorf("failed to get alert rule: %w", err)
+	}
+
+	if err := json.Unmarshal(labelsJSON, &rule.Labels); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal labels: %w", err)
+	}
+	if err := json.Unmarshal(annotationsJSON, &rule.Annotations); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal annotations: %w", err)
+	}
+
+	return rule, nil
+}
+
+// List retrieves all alert rules
