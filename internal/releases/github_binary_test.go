@@ -47,3 +47,20 @@ func TestFetchSHA256_UnknownBinaryIsError(t *testing.T) {
 	orig := GitHubReleaseBaseURL
 	GitHubReleaseBaseURL = srv.URL
 	t.Cleanup(func() { GitHubReleaseBaseURL = orig })
+
+	if _, err := FetchSHA256(context.Background(), "v0.55.0", "does-not-exist"); err == nil {
+		t.Fatal("expected an error for a binary name absent from SHA256SUMS.txt")
+	}
+}
+
+// TestFetchSHA256_NonOKStatusIsError proves a 404 (e.g. a bad/unpublished
+// tag) surfaces as an error rather than an empty checksum match.
+func TestFetchSHA256_NonOKStatusIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	orig := GitHubReleaseBaseURL
+	GitHubReleaseBaseURL = srv.URL
+	t.Cleanup(func() { GitHubReleaseBaseURL = orig })
