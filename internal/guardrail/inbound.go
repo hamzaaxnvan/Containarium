@@ -47,27 +47,3 @@ var inboundReasonNames = map[InboundReason]string{
 	InboundReasonEngineError:       "engine_error",
 	InboundReasonOverLimit:         "over_limit",
 	InboundReasonPolicyUnavailable: "policy_unavailable",
-}
-
-// String is the stable name used in logs, counters and audit details.
-func (r InboundReason) String() string {
-	if s, ok := inboundReasonNames[r]; ok {
-		return s
-	}
-	return "unknown"
-}
-
-// InboundDecision is the typed block decision for one model response.
-//
-// It carries counts and kinds only. No field can hold the flagged span or
-// any response text (TestInboundDecision_NoTextBearingField enforces this
-// by reflection); EngineID is the engine's own identifier.
-type InboundDecision struct {
-	Blocked  bool
-	Kinds    []pb.GuardrailKind // kinds with at least one finding, sorted
-	Findings int
-	Gaps     int
-	EngineID string
-	Reason   InboundReason
-}
-
