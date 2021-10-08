@@ -23,3 +23,28 @@ func TestBackupCreate_KeyModeFlagReachesRequest(t *testing.T) {
 		{"rot13", pb.BackupKeyMode_BACKUP_KEY_MODE_UNSPECIFIED, true},
 	} {
 		t.Run("--key-mode="+tc.flag, func(t *testing.T) {
+			f := withRecordingBackupClient(t)
+			resetBackupCreateFlags(t)
+			backupCreateKeyMode = tc.flag
+
+			err := runBackupCreate(backupCreateCmd, []string{"alice"})
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "--key-mode") {
+					t.Fatalf("err = %v, want a --key-mode usage error", err)
+				}
+				if f.gotCreate != nil {
+					t.Error("an invalid --key-mode still reached the daemon")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("runBackupCreate: %v", err)
+			}
+			if f.gotCreate == nil {
+				t.Fatal("CreateBackup was not called")
+			}
+			if f.gotCreate.KeyMode != tc.want {
+				t.Errorf("request key_mode = %v, want %v", f.gotCreate.KeyMode, tc.want)
+			}
+		})
+	}
