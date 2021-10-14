@@ -34,15 +34,3 @@ for i in 1 2 3 4 5 6; do tries_old=$i; curl -s -o /dev/null "http://127.0.0.1:$P
 
 # New helper against a fresh stub (3 x 503, then 200).
 kill "$SRV"; wait "$SRV" 2>/dev/null
-python3 "$TMP/stub.py" "$PORT" 3 & SRV=$!
-for _ in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done
-tries=0
-for i in $(seq 1 10); do tries=$i; daemon_is_ready "$PORT" "$URL" && break; sleep 0.1; done
-[ "$tries" = 4 ] && check "helper waits through 503s and stops on the 4th try" ok || check "helper waits through 503s (stopped at try $tries, want 4)" no
-
-# Connection refused (000) is not ready.
-kill "$SRV"; wait "$SRV" 2>/dev/null
-daemon_is_ready "$PORT" "$URL" && check "helper treats 000 as not ready" no || check "helper treats 000 as not ready" ok
-
-# A non-503 error (401 from an auth-gated route) counts as ready.
-cat > "$TMP/s401.py" <<'PY'
