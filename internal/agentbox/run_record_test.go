@@ -136,3 +136,72 @@ func TestWriteReadRunRecord_RoundTrip(t *testing.T) {
 	got, found, err := readRunRecord("my-run")
 	if err != nil {
 		t.Fatalf("readRunRecord: %v", err)
+	}
+	if !found {
+		t.Fatal("readRunRecord: found = false, want true")
+	}
+	if got.Name != record.Name || got.PID != record.PID || got.Command != record.Command {
+		t.Errorf("readRunRecord = %+v, want %+v", got, record)
+	}
+	if !got.StartedAt.Equal(record.StartedAt) {
+		t.Errorf("StartedAt = %v, want %v", got.StartedAt, record.StartedAt)
+	}
+	if got.ExitCode != nil {
+		t.Errorf("ExitCode = %v, want nil (unreaped run)", *got.ExitCode)
+	}
+	if got.FinishedAt != nil {
+		t.Errorf("FinishedAt = %v, want nil (unreaped run)", *got.FinishedAt)
+	}
+}
+
+func TestReadRunRecord_MissingReturnsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	restore := setProcessLogDirForTest(dir)
+	defer restore()
+
+	_, found, err := readRunRecord("does-not-exist")
+	if err != nil {
+		t.Fatalf("readRunRecord: unexpected error %v", err)
+	}
+	if found {
+		t.Error("found = true for a record that was never written")
+	}
+}
+
+// TestWriteRunRecord_ExitCodeZeroDistinctFromAbsent is the regression named
+// directly in #1672's design doc: ExitCode/FinishedAt are pointers so a
+// clean `exit 0` is never confused with "not yet reaped."
+func TestWriteRunRecord_ExitCodeZeroDistinctFromAbsent(t *testing.T) {
+	dir := t.TempDir()
+	restore := setProcessLogDirForTest(dir)
+	defer restore()
+
+	zero := 0
+	finishedAt := time.Now()
+	record := RunRecord{
+		Version:    RunRecordVersion,
+		Name:       "clean-exit",
+		PID:        999,
+		BootID:     "boot-a",
+		StartedAt:  time.Now(),
+		ExitCode:   &zero,
+		FinishedAt: &finishedAt,
+	}
+	if err := writeRunRecord(record); err != nil {
+		t.Fatalf("writeRunRecord: %v", err)
+	}
+	got, found, err := readRunRecord("clean-exit")
+	if err != nil || !found {
+		t.Fatalf("readRunRecord: found=%v err=%v", found, err)
+	}
+	if got.ExitCode == nil {
+		t.Fatal("ExitCode = nil, want a pointer to 0")
+	}
+	if *got.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0", *got.ExitCode)
+	}
+	if got.FinishedAt == nil {
+		t.Fatal("FinishedAt = nil, want set")
+	}
+}
+
