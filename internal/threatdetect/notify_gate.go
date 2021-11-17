@@ -49,3 +49,54 @@ const gateMaxEntries = 4096
 // resolve as the second half of a release.
 type deliveryGate struct {
 	mu       sync.Mutex
+	interval time.Duration
+	now      func() time.Time
+	last     map[int64]gateEntry
+}
+
+type gateEntry struct {
+	at       time.Time
+	severity pb.ThreatSeverity
+	// boxes is the response state last delivered per box
+	// (FindingResponse.Container; "" for a response that names none). A box
+	// not in it has had no response delivered: NONE.
+	boxes  map[string]pb.ResponseState
+	kill   killKey
+	killAt time.Time // when a changed kill outcome was last delivered
+	// skipSent: a skipped kill has been delivered for this finding. The
+	// "first skip is immediate" fast path fires once per finding; a delivered
+	// kill clears the skip on the delivered entry, so the entry's kill alone
+	// cannot tell a first skip from a later one (#2775 review).
+	skipSent bool
+}
+
+// KillRenotifyInterval bounds the webhook posts a respawning miner can cause
+// (#2775): the first kill and the first skipped kill of a finding are
+// delivered at once, and any later change in its kill outcome (another pid,
+// a higher kill count, another skip reason) at most once per interval,
+// carrying the latest pid and the count. A change that lands inside the
+// interval is held back until the finding's next write after it, so the
+// webhook never sees one post per kill.
+const KillRenotifyInterval = time.Minute
+
+// killKey is the kill outcome on a finding's response: a change in it is news
+// (#2775). Under ALERT a kill leaves the response state at NONE, so the state
+// alone never shows it.
+type killKey struct {
+	killed bool
+	pid    uint32
+	kills  uint32
+	skip   pb.KillSkipReason
+}
+
+func killOf(f *Finding) killKey {
+	if f.Response == nil {
+		return killKey{}
+	}
+	r := f.Response
+	return killKey{r.ProcessKilled, r.KilledPID, r.Kills, r.KillSkipReason}
+}
+
+// killNews reports whether f's kill outcome should reach the webhook now,
+// given what was last delivered for it. Skipped kills are keyed on the reason
+// kind, never on text, so a process that exits before every kill is one
