@@ -92,3 +92,34 @@ func LoadVerifier(path string) (*Verifier, error) {
 		keys = append(keys, key)
 	}
 	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read trusted catalog keys %q: %w", path, err)
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("trusted catalog keys file %q has no usable keys", path)
+	}
+	return &Verifier{keys: keys}, nil
+}
+
+// Verify reports whether sig is a valid ed25519 signature of data under any of
+// the trusted keys. It returns nil on success and a descriptive error otherwise.
+func (v *Verifier) Verify(data, sig []byte) error {
+	if v == nil {
+		return fmt.Errorf("no verifier configured")
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("signature is %d bytes, want %d", len(sig), ed25519.SignatureSize)
+	}
+	for _, k := range v.keys {
+		if ed25519.Verify(k, data, sig) {
+			return nil
+		}
+	}
+	return fmt.Errorf("no trusted key verifies this signature")
+}
+
+// ReadDetachedSig reads and base64-decodes the detached signature sitting next
+// to a catalog file (catalogPath + SigSuffix). A missing or malformed signature
+// is a hard error — the load must not silently skip it.
+func ReadDetachedSig(catalogPath string) ([]byte, error) {
+	sigPath := catalogPath + SigSuffix
+	raw, err := os.ReadFile(sigPath)
