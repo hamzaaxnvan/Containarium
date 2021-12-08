@@ -22,3 +22,11 @@ def verify(body: bytes, secret: str, signature: str) -> bool:
 func verify(body []byte, secret, signature string) bool {
     mac := hmac.New(sha256.New, []byte(secret))
     mac.Write(body)
+    expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+    return hmac.Equal([]byte(expected), []byte(signature))
+}`},{lang:"Node.js",code:`const crypto = require('crypto');
+
+function verify(body, secret, signature) {
+  const expected = 'sha256=' + crypto
+    .createHmac('sha256', secret)
+    .update(body)

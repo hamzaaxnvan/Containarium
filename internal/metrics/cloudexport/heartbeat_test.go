@@ -67,3 +67,37 @@ func TestHeartbeatSurvivesSourceError(t *testing.T) {
 				t.Fatalf("heartbeat = %d, want 1 even when Sources fails", hb.ival)
 			}
 			// The heartbeat is the ONLY series on a failed tick: no host
+			// gauge leaks a stale value.
+			if len(pts) != 1 {
+				t.Fatalf("expected only the heartbeat on a failed tick, got %d series", len(pts))
+			}
+		})
+	}
+}
+
+// TestHeartbeatLabels locks the heartbeat's label allowlist from the design
+// (backend_id, hostname, daemon_version) — note daemon_version, not region:
+// a dead-man alert wants to see which daemon build stopped reporting. No
+// tenant/org label ever appears.
+func TestHeartbeatLabels(t *testing.T) {
+	labels := Labels{
+		BackendID:     "backend-xyz",
+		Hostname:      "host-1",
+		Region:        "us-central1",
+		DaemonVersion: "v0.60.0",
+	}
+	pts := flattenGauges(t, collectOnce(t, &fakeSources{sr: sampleResources()}, labels))
+	hb := heartbeatOf(t, pts)
+
+	want := map[string]string{
+		LabelBackendID:     "backend-xyz",
+		LabelHostname:      "host-1",
+		LabelDaemonVersion: "v0.60.0",
+	}
+	got := map[string]string{}
+	iter := hb.attrs.Iter()
+	for iter.Next() {
+		kv := iter.Attribute()
+		got[string(kv.Key)] = kv.Value.AsString()
+	}
+	// region is a host-series label, not a heartbeat label — its presence
