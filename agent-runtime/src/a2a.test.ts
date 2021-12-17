@@ -111,3 +111,41 @@ afterEach(async () => {
 
 function postTask(url: string, headers: Record<string, string>, runId = "run-victim"): Promise<Response> {
   return fetch(`${url}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify({ id: "t1", inputJson: '{"q":"hi"}', runId }),
+  });
+}
+
+describe("POST /tasks authentication (#2125)", () => {
+  it("accepts a task carrying the box's own secret (the daemon's crew hop)", async () => {
+    const h = await startHarness(BOX_SECRET);
+    const res = await postTask(h.url, { authorization: `Bearer ${BOX_SECRET}` }, "run-9");
+    expect(res.status).toBe(200);
+    const art = (await res.json()) as { state: string; outputJson: string };
+    expect(art.state).toBe("AGENT_TASK_STATE_COMPLETED");
+    expect(art.outputJson).toBe('{"ok":true}');
+    expect(h.engineCalls()).toBe(1);
+    expect(existsSync(join(h.journalRoot, "run-9", "hello-agent.jsonl"))).toBe(true);
+  });
+
+  it("accepts a lowercase bearer scheme (RFC 7235: the scheme is case-insensitive)", async () => {
+    const h = await startHarness(BOX_SECRET);
+    const res = await postTask(h.url, { authorization: `bearer ${BOX_SECRET}` }, "run-9");
+    expect(res.status).toBe(200);
+    expect(h.engineCalls()).toBe(1);
+  });
+
+  const refusals: { name: string; headers: Record<string, string>; want: number; seeded?: string }[] = [
+    { name: "a peer box's own secret (a differing credential)", headers: { authorization: "Bearer 9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0" }, want: 403 },
+    { name: "a token of the right length but one byte off", headers: { authorization: `Bearer ${BOX_SECRET.slice(0, -1)}b` }, want: 403 },
+    { name: "a prefix of the real secret", headers: { authorization: `Bearer ${BOX_SECRET.slice(0, 16)}` }, want: 403 },
+    { name: "no Authorization header at all", headers: {}, want: 401 },
+    { name: "an empty Authorization header", headers: { authorization: "" }, want: 401 },
+    { name: "a bare Bearer with no token", headers: { authorization: "Bearer" }, want: 401 },
+    { name: "a Bearer with an empty token", headers: { authorization: "Bearer " }, want: 401 },
+    { name: "a non-Bearer scheme", headers: { authorization: `Basic ${BOX_SECRET}` }, want: 401 },
+    { name: "the secret with no scheme", headers: { authorization: BOX_SECRET }, want: 401 },
+    // Fail closed: a box the daemon never seeded a secret to serves nothing,
+    // rather than accepting everything.
+    { name: "any credential when the box was seeded no secret", headers: { authorization: `Bearer ${BOX_SECRET}` }, want: 401, seeded: "" },
