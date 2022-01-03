@@ -1,0 +1,1085 @@
+package sentinel
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/netip"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/footprintai/containarium/internal/auth"
+	appconfig "github.com/footprintai/containarium/internal/config"
+	"github.com/footprintai/containarium/internal/sentinel/sshcontrol"
+	"github.com/footprintai/containarium/pkg/core/pki"
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+)
+
+// State represents the current sentinel mode.
+type State string
+
+const (
+	StateProxy       State = "proxy"
+	StateMaintenance State = "maintenance"
+)
+
+// sentinelDialer is used for all sentinel→backend TCP dials. The 15s
+// KeepAlive causes the OS to probe idle connections so a hard-reset
+// backend (no TCP RST sent) is detected within ~45 s instead of
+// never, preventing goroutine/FD leaks from stuck io.Copy pairs (#769).
+var sentinelDialer = &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
+
+// Config holds the sentinel configuration.
+type Config struct {
+	// SSHUpstreamPolicy enables the shared private upstream controller when set.
+	SSHUpstreamPolicy string
+	SSHUpstreamState  string
+	SSHUpstreamSocket string
+	// Private manager-to-sshpiperd bridge. Empty disables it for embedders.
+	SSHAuthzSocket     string
+	HealthPort         int
+	CheckInterval      time.Duration
+	HTTPPort           int
+	HTTPSPort          int
+	ForwardedPorts     []int
+	HealthyThreshold   int
+	UnhealthyThreshold int
+	BinaryPort         int           // port to serve containarium binary for spot VM downloads (0 = disabled)
+	RecoveryTimeout    time.Duration // warn if recovery takes longer than this (0 = no warning)
+	// RecoveryBackoffInitial / RecoveryBackoffMax bound the periodic
+	// re-attempt of StartInstance while the backend is stuck down (e.g.
+	// spot capacity unavailable). Without this the sentinel attempts a
+	// start once at the proxy→maintenance transition and then waits
+	// passively (#514). With it, recovery is retried on an exponential
+	// schedule (Initial, doubling up to Max) so a preempted spot
+	// self-heals when capacity returns, without hammering the cloud API.
+	// Zero values fall back to defaults (30s / 5m). Initial<=0 with a
+	// provider still recovers using the defaults.
+	RecoveryBackoffInitial time.Duration
+	RecoveryBackoffMax     time.Duration
+	CertSyncInterval       time.Duration // interval for syncing TLS certs from backend (0 = default 6h)
+	KeySyncInterval        time.Duration // interval for syncing SSH keys from backend (0 = default 2m)
+	// InFleetCertScope is the set of domains the in-fleet backend (the
+	// --spot-vm / --backend-addr host, backend ID "gcp") is registered
+	// for. Its certificate sync may only supply certificates inside this
+	// scope; when empty, none of its certificates are served. Tunnel
+	// backends are scoped by their primary registration instead.
+	InFleetCertScope CertScope
+	// PrimaryReachabilityInterval is how often checkTunnelPrimaries probes
+	// every tunnel-promoted primary's Hostname/Aliases end-to-end (0 =
+	// default 30s). See #1872: registration in PrimaryRegistry proves the
+	// sentinel can route SNI to a primary, not that the primary's own
+	// Caddy actually serves every declared hostname.
+	PrimaryReachabilityInterval time.Duration
+	TunnelMode                  bool // if true, the Manager waits for tunnel connections instead of resolving IP at startup
+	HybridMode                  bool // if true, GCP + tunnel backends coexist
+	ProxyProtocol               bool // if true, prepend a PROXY v2 header to forwarded HTTPS streams so the downstream Caddy sees the real client IP
+	// AlertWebhookURL, when set, receives a JSON POST when the spot is
+	// preempted ("preempted") and when it comes back ("recovered"). The
+	// on-spot vmalert/VictoriaMetrics stack dies WITH the spot, so the
+	// always-on sentinel is the only thing that can alert on the spot's
+	// own outage — it does so by an outbound webhook, not the on-spot
+	// alert chain (#514 follow-up). Empty disables the webhook; the
+	// /metrics endpoint (counters) is always served regardless.
+	AlertWebhookURL string
+	// SelfCheckFailureThreshold is the number of consecutive failed
+	// end-to-end self-checks (see selfCheckProxyPath) while actively
+	// proxying before the sentinel treats its OWN forwarding pipeline as
+	// wedged and exits — systemd's Restart=always (sentinel_unit.go)
+	// then recreates it with fresh listeners/dispatch state. This exists
+	// because healthCheckAll only proves the BACKEND is reachable: if the
+	// backend's health endpoint stays up throughout (as it did during a
+	// real incident) while the sentinel's own ConnMux/dispatch pipeline
+	// wedges — TCP accepts succeed, nothing downstream ever responds —
+	// nothing else here notices, and only a by-hand restart clears it.
+	// Zero disables the self-check. Only armed in ConnMux/hybrid mode
+	// (httpsDispatch != nil).
+	SelfCheckFailureThreshold int
+
+	// FailbackChecks is how many CONSECUTIVE healthy checks a backend with a
+	// better (lower) Priority than the current primary must show before the
+	// sentinel switches back to it (#2476). 0 = defaultFailbackChecks; it is
+	// never below HealthyThreshold; negative disables failback.
+	FailbackChecks int
+}
+
+// Manager is the core sentinel orchestrator.
+// It health-checks backend VMs and switches between proxy and maintenance modes.
+// Supports multiple backends (GCP + tunnel) in hybrid mode.
+type Manager struct {
+	// sshBanSockets overrides local plugin endpoints in isolated tests.
+	sshBanSockets           map[pb.SSHBanListener]string
+	sshUpstream             *sshcontrol.Controller
+	sshUpstreamMu           sync.RWMutex
+	sshUpstreamStartupFault atomic.Bool
+	config                  Config
+	provider                CloudProvider // primary provider (GCP in hybrid mode)
+
+	state atomic.Value // holds State
+
+	// selfDialLogNanos is when the self-dial refusal was last logged (unix
+	// nanos); the log line is rate-limited so a flood of connections that all
+	// hit it cannot flood the journal.
+	selfDialLogNanos atomic.Int64
+
+	// Multi-backend support
+	mu       sync.RWMutex
+	backends *BackendPool
+	primary  *Backend // currently active backend for HTTP forwarding
+
+	// Primary daemon registry (one entry per pool, populated by daemon
+	// self-registration). Used by the SNI router for hostname-based dispatch.
+	primaries *PrimaryRegistry
+
+	// Tunnel registry (set by cmd/sentinel.go via SetTunnelRegistry). Lets
+	// the SNI router open a yamux stream directly to tunnel-promoted
+	// primaries instead of going through a loopback TCP proxy listener
+	// — which would collide with the sentinel's own ConnMux on :443.
+	tunnelRegistry *TunnelRegistry
+
+	// byocRoutes holds cloud-pushed BYOC public-ingress bindings
+	// (subdomain → tunnel host). The SNI router consults it to terminate
+	// TLS for a tenant subdomain and plaintext-forward to the box over the
+	// tunnel. Populated ONLY by the admin-secret-gated push endpoint (never
+	// by a host self-announce = anti-hijack). byocRouteStorePath overrides
+	// the default persist path (tests set it). See #733.
+	byocRoutes         *BYOCRouteRegistry
+	byocRouteStorePath string
+	// byocDial opens a plaintext stream to a box over the tunnel for BYOC
+	// ingress. Defaults to tunnelRegistry.DialTunnel; tests inject a fake.
+	byocDial func(spotID string, port int) (net.Conn, error)
+
+	// reachabilityDial opens a stream to a tunnel-promoted primary's local
+	// port for checkTunnelPrimaries' end-to-end probes. Defaults to
+	// tunnelRegistry.DialTunnel; tests inject a fake. Same seam pattern as
+	// byocDial above.
+	reachabilityDial func(spotID string, port int) (net.Conn, error)
+
+	// proxyIdleTimeout overrides sniProxyIdleTimeout for
+	// buildSNIRoutingHandler's copy loop. Zero (the production default,
+	// via a bare &Manager{} or NewManager) means "use
+	// sniProxyIdleTimeout"; tests set a short value so a simulated
+	// vanished peer (#1349) surfaces without a real 120s wait.
+	proxyIdleTimeout time.Duration
+
+	stopMaintenance func() // stops the HTTP/HTTPS maintenance servers
+	certStore       *CertStore
+	keyStore        *KeyStore
+
+	// keyResyncGates serializes event-driven key resyncs per backend so a
+	// burst of container creates collapses into the minimum number of
+	// upstream pulls without any caller's key being skipped (cloud #971).
+	// Lazily populated by resyncGate; keyResyncMu guards the map only, not
+	// the per-backend gate locks inside it.
+	keyResyncMu    sync.Mutex
+	keyResyncGates map[string]*keyResyncGate
+
+	// Tunnel/hybrid mode: ConnMux-based HTTPS handling
+	httpsDispatch *dispatchListener // from ConnMux, dispatches to proxy or maintenance
+
+	// Simple-proxy mode (no ConnMux): userspace TCP forwarder used when
+	// --proxy-protocol is set, so connections to :80/:443 traverse a Go
+	// process that can prepend a PROXY v2 header instead of going through
+	// kernel iptables DNAT (which can't inject headers and therefore
+	// destroys the real client IP via MASQUERADE).
+	userspaceFwd *userspaceForwarder
+
+	// Recovery tracking
+	outageStart    time.Time // when the current outage began
+	lastPreemption time.Time // when the last preemption event was detected
+	preemptCount   int       // total preemption events observed ("down" counter)
+	recoveredCount int       // total returns-to-proxy after an outage ("up" counter); alert on preemptCount-recoveredCount > 0
+
+	// Backoff schedule for periodic recovery retries while stuck in
+	// maintenance (#514). nextRecoveryAttempt gates re-attempts;
+	// recoveryBackoff is the current interval, doubled on each failed
+	// StartInstance up to RecoveryBackoffMax and reset when the backend
+	// recovers. Accessed only from the single Run() event-loop goroutine
+	// (healthCheckAll / handleEvent / diagnoseAndRecover), so no lock.
+	recoveryBackoff     time.Duration
+	nextRecoveryAttempt time.Time
+
+	// watchOnly holds additional GCP-backed instances this sentinel
+	// watches for preemption/stop and attempts to restart, entirely
+	// independent of the primary+failover HTTP proxy pool above. Unlike
+	// the "gcp" backend, these never become m.primary and are never
+	// considered by SelectPrimary — they may be wholly unrelated hosts
+	// (different tenants, different zone) that just happen to also run
+	// on preemptible capacity. Each entry owns its own recovery/backoff
+	// timeline (see watch_recovery.go) so independent targets can't
+	// corrupt one another's state the way a single shared timeline
+	// would. Populated via AddWatchOnlyBackend before Run() starts the
+	// per-target goroutines; read-only afterward, so no lock needed.
+	watchOnly []*watchedBackend
+
+	// Backend-failover observability (#1358). failoverTotal is atomic and
+	// backendHealth is mutex-guarded because both are written by the
+	// health-check loop and read by the /metrics HTTP goroutine. The older
+	// preemptCount/recoveredCount above are plain ints on the "single event
+	// loop writes" convention; these are new, so they use the safe form
+	// rather than extending that assumption to a concurrently-read map.
+	failoverTotal   atomic.Int64
+	failbackTotal   atomic.Int64
+	backendHealthMu sync.RWMutex
+	backendHealth   map[string]bool
+
+	// switchToProxyFn is the seam over switchToProxy so failoverPrimary's
+	// wiring is testable. The real implementation syncs certs/keys over the
+	// network and rewrites iptables, none of which a unit test can do — which
+	// previously meant the failover COUNTER could be deleted without a single
+	// test failing. Same injection pattern as byocDial below. nil = the real
+	// method; tests substitute a stub.
+	switchToProxyFn func(*Backend) error
+
+	// checkHealthFn is the seam over CheckHealth so healthCheckAll can be driven
+	// tick by tick in tests (the real probe dials the backend). nil = CheckHealth.
+	checkHealthFn func(ip string) bool
+
+	// selfCheckFn is the seam over selfCheckProxyPath so runSelfCheckLoop's
+	// wiring is testable without a real listener. nil = the real method
+	// (probes 127.0.0.1:HTTPSPort); tests substitute a stub. exitFn is
+	// invoked once SelfCheckFailureThreshold consecutive failures are
+	// observed; defaults to os.Exit(1) in NewManager so systemd's
+	// Restart=always recreates the process. Tests override it to observe
+	// the trigger without actually exiting.
+	selfCheckFn func() error
+	exitFn      func()
+
+	// hmacSecret is the shared HMAC secret used to sign
+	// /sentinel/peers responses (and reused for keysync/certsync
+	// request auth via loadSentinelSecret). Held per-Manager so
+	// tests can inject it without poking the package-global cache.
+	// Production wiring calls SetHMACSecret() with the env var
+	// CONTAINARIUM_SENTINEL_AUTH_SECRET at startup.
+	hmacSecret []byte
+
+	// authHealth records, per primary, whether its last request to a
+	// daemon-AUTH-gated route authenticated or got 401 (#2892). Zero value
+	// is ready to use. See primary_auth_health.go.
+	authHealth primaryAuthTracker
+
+	// adminSecret gates POST /sentinel/tunnel-tokens (registering a
+	// freshly-minted tunnel-join token at runtime). Deliberately a
+	// different secret than hmacSecret — see EnvSentinelAdminSecret.
+	// Loaded from CONTAINARIUM_SENTINEL_ADMIN_SECRET in NewManager;
+	// tests can override with SetAdminSecret.
+	adminSecret []byte
+
+	// tunnelPolicy is the token-authorization policy the tunnel
+	// server was constructed with (see PolicyFromCLI in
+	// internal/cmd/sentinel.go). Wired in via SetTunnelPolicy so the
+	// TunnelTokenRegisterHandler can add tokens at runtime — the
+	// policy is otherwise 100% static after startup. nil in modes
+	// that don't run a tunnel server (e.g. provider=gcp with no
+	// tunnel token configured), in which case the register endpoint
+	// responds 501.
+	tunnelPolicy *TokenPolicy
+
+	// tunnelTokenStorePath is where TunnelTokenRegisterHandler persists
+	// each dynamic registration (#936) so a sentinel restart doesn't
+	// silently forget it. Empty means DefaultTunnelTokenStorePath; tests
+	// override via SetTunnelTokenStorePath to use a tmp dir.
+	tunnelTokenStorePath string
+
+	// auditIngestTokenStorePath / auditIngestTokenStoreMu: the per-backend
+	// audit-ingest token file (#2415). Empty path means
+	// DefaultAuditIngestTokenStorePath; tests override it.
+	auditIngestTokenStorePath string
+	auditIngestTokenStoreMu   sync.Mutex
+	// tunnelTokenStoreMu serializes the WHOLE load-modify-save sequence in
+	// persistTunnelToken/unpersistTunnelToken (cloud#999 step 4 review
+	// follow-up): without it, a register racing a deregister (or two
+	// concurrent deregisters) can both read the same on-disk snapshot,
+	// and whichever writes second silently discards the other's change —
+	// a revoked token could reappear, or a freshly-registered one could
+	// vanish, purely from write-order luck.
+	tunnelTokenStoreMu sync.Mutex
+
+	// pki holds the operator-bootstrapped peer-CA and the sentinel's
+	// own server cert. Set when CONTAINARIUM_CA_KEY_FILE points at a
+	// valid RSA key — see NewManager and SetCertProvisioner.
+	//
+	// When nil, /sentinel/ca returns 503 and the HTTPS binary
+	// server doesn't start; daemons fall back to plain HTTP on the
+	// existing port 8888, which is the pre-Phase-0.5 behavior. The
+	// audit-critical leak (Bearer JWTs in cleartext on peer-to-peer
+	// calls) is only fully closed once the CA is in place and every
+	// daemon is talking to the HTTPS endpoint.
+	pki             *pki.Provisioner
+	sentinelCertPEM []byte
+	sentinelKeyPEM  []byte
+	pkiMu           sync.RWMutex
+
+	// fail2banRunner is the Fail2BanRunner Fail2BanBansHandler and
+	// Fail2BanUnbanHandler shell out through (#1962). nil means the
+	// production default (execFail2BanRunner, the real fail2ban-client
+	// binary on $PATH); tests inject a fake via SetFail2BanRunner so they
+	// don't need a real fail2ban install.
+	fail2banRunner Fail2BanRunner
+}
+
+// SetHMACSecret wires the sentinel↔daemon shared HMAC secret. Used
+// by PeersHandler to sign the discovery response so a compromised
+// network path can't inject attacker peer URLs. Passing a value
+// shorter than auth.SentinelMinSecretLen disables signing — the
+// daemon's verifier will then fail-closed or log a rollout warning,
+// depending on its own configuration. See finding C-CRIT-2.
+func (m *Manager) SetHMACSecret(secret []byte) {
+	m.hmacSecret = secret
+}
+
+// HMACSecretConfigured reports whether the sentinel↔daemon HMAC secret
+// is present and long enough. False means every keysync/certsync to the
+// daemons is silently 401ing; the /status endpoint surfaces this so
+// monitoring can alert without scraping logs. See #341.
+func (m *Manager) HMACSecretConfigured() bool {
+	return len(m.hmacSecret) >= auth.SentinelMinSecretLen
+}
+
+// SetCertProvisioner installs the peer-CA the sentinel will use for
+// HTTPS peer-to-peer (Phase 0.5). When set, the sentinel issues
+// itself a server certificate at construction time and serves the
+// `/sentinel/ca` endpoint so daemons can pin the CA.
+//
+// Tests use this directly; production wiring calls it indirectly
+// via NewManager → CONTAINARIUM_CA_KEY_FILE.
+func (m *Manager) SetCertProvisioner(p *pki.Provisioner) error {
+	if p == nil {
+		return fmt.Errorf("nil provisioner")
+	}
+	// Issue the sentinel's own server cert. SANs include the
+	// reachable hostnames — operators may add more via the env var
+	// CONTAINARIUM_SENTINEL_CERT_SANS (comma-separated). Loopback
+	// addresses are always included so in-process / same-host tests
+	// work without DNS gymnastics.
+	dnsNames := []string{"localhost", "containarium-sentinel"}
+	if extra := os.Getenv(appconfig.EnvSentinelCertSANs); extra != "" {
+		for _, name := range strings.Split(extra, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				dnsNames = append(dnsNames, name)
+			}
+		}
+	}
+	ips := []net.IP{net.ParseIP("127.0.0.1"), net.IPv6loopback}
+	certPEM, keyPEM, err := p.IssueSentinelServerCert(dnsNames, ips)
+	if err != nil {
+		return fmt.Errorf("issue sentinel server cert: %w", err)
+	}
+	m.pkiMu.Lock()
+	m.pki = p
+	m.sentinelCertPEM = certPEM
+	m.sentinelKeyPEM = keyPEM
+	m.pkiMu.Unlock()
+	return nil
+}
+
+// HasCertProvisioner reports whether the sentinel has a peer-CA
+// configured. Callers (binaryserver, CAHandler) use this to decide
+// whether to enable HTTPS / serve the CA bundle.
+func (m *Manager) HasCertProvisioner() bool {
+	m.pkiMu.RLock()
+	defer m.pkiMu.RUnlock()
+	return m.pki != nil
+}
+
+// SentinelServerCertPEM returns the PEM-encoded server cert and key
+// that the HTTPS binary server should present. Returns (nil, nil)
+// when no provisioner is configured.
+func (m *Manager) SentinelServerCertPEM() (certPEM, keyPEM []byte) {
+	m.pkiMu.RLock()
+	defer m.pkiMu.RUnlock()
+	return m.sentinelCertPEM, m.sentinelKeyPEM
+}
+
+// CACertPEM returns the peer-CA cert in PEM form, for daemons to
+// pin via /sentinel/ca. Returns nil when no provisioner is set.
+func (m *Manager) CACertPEM() []byte {
+	m.pkiMu.RLock()
+	defer m.pkiMu.RUnlock()
+	if m.pki == nil {
+		return nil
+	}
+	return m.pki.CACertPEM()
+}
+
+// IssuePeerCert mints a peer leaf cert via the sentinel's CA. Used
+// by PeerCertHandler. Returns an error if no provisioner is set
+// (caller should map to 503).
+func (m *Manager) IssuePeerCert(peerID string) (certPEM, keyPEM []byte, err error) {
+	m.pkiMu.RLock()
+	p := m.pki
+	m.pkiMu.RUnlock()
+	if p == nil {
+		return nil, nil, fmt.Errorf("peer CA not configured")
+	}
+	return p.IssuePeerCert(peerID, nil, nil)
+}
+
+// NewManager creates a new sentinel manager. Reads
+// CONTAINARIUM_SENTINEL_AUTH_SECRET once at construction time and
+// stores it on the Manager so PeersHandler can sign the discovery
+// response. Tests can override with SetHMACSecret without touching
+// the environment.
+func NewManager(config Config, provider CloudProvider) *Manager {
+	// Recovery-backoff defaults (#514). 30s initial keeps a transient
+	// blip recovering quickly; doubling to a 5m cap stops a sustained
+	// capacity outage from hammering the cloud API every tick.
+	if config.RecoveryBackoffInitial <= 0 {
+		config.RecoveryBackoffInitial = 30 * time.Second
+	}
+	if config.RecoveryBackoffMax <= 0 {
+		config.RecoveryBackoffMax = 5 * time.Minute
+	}
+	if config.RecoveryBackoffMax < config.RecoveryBackoffInitial {
+		config.RecoveryBackoffMax = config.RecoveryBackoffInitial
+	}
+	m := &Manager{
+		config:     config,
+		provider:   provider,
+		backends:   NewBackendPool(),
+		primaries:  NewPrimaryRegistry(),
+		byocRoutes: NewBYOCRouteRegistry(),
+		certStore:  NewCertStore(),
+		keyStore:   NewKeyStore(),
+		exitFn:     func() { os.Exit(1) },
+	}
+	m.certStore.SetScopeResolver(m.certScopeFor)
+	if raw := os.Getenv(appconfig.EnvSentinelAuthSecret); raw != "" {
+		if len(raw) < auth.SentinelMinSecretLen {
+			// #nosec G706 -- both args are ints (len(raw) and a
+			// const) so there is no log-injection vector; gosec's
+			// taint chases `raw` upstream and flags any descendant.
+			log.Printf("[sentinel] WARNING: CONTAINARIUM_SENTINEL_AUTH_SECRET is %d bytes, want >=%d — /sentinel/peers responses will be unsigned and daemons will reject them",
+				len(raw), auth.SentinelMinSecretLen)
+		}
+		m.hmacSecret = []byte(raw)
+	} else {
+		log.Printf("[sentinel] WARNING: CONTAINARIUM_SENTINEL_AUTH_SECRET is unset — /sentinel/peers responses will be unsigned (daemons in rollout mode accept them with a warning; once fully rolled out they will reject)")
+	}
+	if raw := os.Getenv(appconfig.EnvSentinelAdminSecret); raw != "" {
+		if len(raw) < auth.SentinelMinSecretLen {
+			// #nosec G706 -- both args are ints (len(raw) and a
+			// const) so there is no log-injection vector; gosec's
+			// taint chases `raw` upstream and flags any descendant.
+			log.Printf("[sentinel] WARNING: CONTAINARIUM_SENTINEL_ADMIN_SECRET is %d bytes, want >=%d — /sentinel/tunnel-tokens will reject every request",
+				len(raw), auth.SentinelMinSecretLen)
+		}
+		m.adminSecret = []byte(raw)
+	} else {
+		log.Printf("[sentinel] WARNING: CONTAINARIUM_SENTINEL_ADMIN_SECRET is unset — /sentinel/tunnel-tokens is disabled (fresh tunnel-join tokens can only be added by restarting the sentinel with --tunnel-token-policy), AND /peer/ now rejects every request with 401 (#1102). If a control plane drives tunnel-joined backends through this sentinel, set this secret or those backends become undrivable.")
+	}
+
+	// Phase 0.5: peer-CA bootstrap. Operators provision a single
+	// RSA private key on the sentinel (mode 0400) and point this
+	// env var at it. Sentinel auto-generates a self-signed CA cert
+	// from the key, then issues itself a server cert for HTTPS.
+	// Without the key the sentinel runs in pre-0.5 (HTTP-only)
+	// mode — backwards compatible during rollout.
+	if caKeyPath := os.Getenv("CONTAINARIUM_CA_KEY_FILE"); caKeyPath != "" {
+		// #nosec G304 G703 -- caKeyPath is operator-controlled config
+		// (CONTAINARIUM_CA_KEY_FILE), not user input. The operator
+		// is trusted to point this at a real CA key on disk; if it
+		// were attacker-controlled the sentinel would already be
+		// compromised at a deeper layer. gosec emits both G304 and
+		// G703 for the same finding, so both IDs are suppressed.
+		caKeyPEM, err := os.ReadFile(caKeyPath)
+		// Sanitize caKeyPath into a quoted form before logging so
+		// gosec's G706 taint analysis sees the explicit escape
+		// step. %q already quotes/escapes control chars, but the
+		// analyzer chases the raw env-var taint rather than the
+		// formatter — so we materialize the sanitized form
+		// upfront.
+		safeCAPath := strconv.Quote(caKeyPath)
+		if err != nil {
+			log.Printf("[sentinel] WARNING: CONTAINARIUM_CA_KEY_FILE=%s is unreadable (%v) — Phase 0.5 HTTPS/mTLS disabled, falling back to HTTP", safeCAPath, err)
+		} else {
+			provisioner, err := pki.NewFromKey(caKeyPEM, 0 /* default leaf TTL */)
+			if err != nil {
+				log.Printf("[sentinel] WARNING: failed to parse CA key at %s (%v) — Phase 0.5 HTTPS/mTLS disabled", safeCAPath, err)
+			} else if err := m.SetCertProvisioner(provisioner); err != nil {
+				log.Printf("[sentinel] WARNING: failed to install peer-CA provisioner: %v", err)
+			} else {
+				// #nosec G706 -- safeCAPath is strconv.Quote'd; gosec's
+				// taint analysis doesn't recognize Quote as a
+				// sanitizer, so suppress the residual warning.
+				log.Printf("[sentinel] peer-CA loaded from %s, leaf TTL=%s", safeCAPath, provisioner.LeafExpiry())
+			}
+		}
+	} else {
+		log.Printf("[sentinel] CONTAINARIUM_CA_KEY_FILE is unset — Phase 0.5 HTTPS/mTLS disabled. Peer-to-peer JWT travels in cleartext (audit C-CRIT-1).")
+	}
+
+	m.state.Store(StateMaintenance)
+	return m
+}
+
+// SetTunnelRegistry wires in the tunnel registry so the SNI router can open
+// yamux streams directly to tunnel-promoted primaries. Optional — if unset,
+// the SNI router falls back to TCP-dialing the primary's IP:Port.
+func (m *Manager) SetTunnelRegistry(reg *TunnelRegistry) {
+	m.tunnelRegistry = reg
+}
+
+// InitBYOCRoutes sets the persist path for cloud-pushed BYOC public-ingress
+// bindings and loads any previously-persisted set into the registry, so a
+// restart re-serves tenant subdomains before the cloud's next reconcile tick.
+// A missing/unreadable store is logged and ignored. See #733.
+func (m *Manager) InitBYOCRoutes(storePath string) {
+	if storePath == "" {
+		storePath = DefaultBYOCRouteStorePath
+	}
+	m.byocRouteStorePath = storePath
+	if m.byocRoutes == nil {
+		m.byocRoutes = NewBYOCRouteRegistry()
+	}
+	routes, err := LoadBYOCRouteStore(storePath)
+	if err != nil {
+		log.Printf("[sentinel] WARNING: failed to load persisted byoc routes from %s: %v", storePath, err)
+		return
+	}
+	if len(routes) > 0 {
+		log.Printf("[sentinel] loaded %d persisted byoc route(s) from %s", len(routes), storePath)
+	}
+	m.byocRoutes.ReplaceAll(routes)
+}
+
+// SetTunnelPolicy wires in the token-authorization policy the tunnel
+// server was constructed with, so TunnelTokenRegisterHandler can add
+// tokens to it at runtime. Called from internal/cmd/sentinel.go right
+// after PolicyFromCLI builds the policy.
+func (m *Manager) SetTunnelPolicy(policy *TokenPolicy) {
+	m.tunnelPolicy = policy
+}
+
+// SetTunnelTokenStorePath overrides where dynamic tunnel-token
+// registrations are persisted (#936). Tests use this to point at a tmp
+// dir; production wiring (internal/cmd/sentinel.go) leaves it unset and
+// relies on the DefaultTunnelTokenStorePath fallback in
+// persistTunnelToken.
+func (m *Manager) SetTunnelTokenStorePath(path string) {
+	m.tunnelTokenStorePath = path
+}
+
+// persistTunnelToken upserts (token, pools) into the on-disk dynamic
+// tunnel-token store (#936) so a future sentinel restart re-applies it
+// via ApplyTunnelTokenStore instead of silently forgetting it. Best-effort
+// by design at the call site (TunnelTokenRegisterHandler still returns
+// success on a persistence failure) — the token is already valid in this
+// process's TokenPolicy either way; persistence only affects survival
+// across a restart, and a disk hiccup here must not block a legitimate
+// BYOC join.
+func (m *Manager) persistTunnelToken(token string, pools []Pool) error {
+	m.tunnelTokenStoreMu.Lock()
+	defer m.tunnelTokenStoreMu.Unlock()
+	path := m.tunnelTokenStorePath
+	if path == "" {
+		path = DefaultTunnelTokenStorePath
+	}
+	entries, err := LoadTunnelTokenStore(path)
+	if err != nil {
+		return err
+	}
+	entries = upsertTunnelTokenEntry(entries, token, pools)
+	return SaveTunnelTokenStore(path, entries)
+}
+
+// unpersistTunnelToken removes token from the on-disk dynamic tunnel-token
+// store (cloud#999 step 4) so a future sentinel restart does not re-apply
+// a registration this process just revoked via TokenPolicy.Deny.
+// Best-effort at the call site, same reasoning as persistTunnelToken: the
+// in-memory policy is already updated either way, and a disk hiccup here
+// must not fail a legitimate deregistration.
+func (m *Manager) unpersistTunnelToken(token string) error {
+	m.tunnelTokenStoreMu.Lock()
+	defer m.tunnelTokenStoreMu.Unlock()
+	path := m.tunnelTokenStorePath
+	if path == "" {
+		path = DefaultTunnelTokenStorePath
+	}
+	entries, err := LoadTunnelTokenStore(path)
+	if err != nil {
+		return err
+	}
+	entries = removeTunnelTokenEntry(entries, token)
+	return SaveTunnelTokenStore(path, entries)
+}
+
+// unpersistTunnelTokensByPrefix removes every token starting with prefix
+// from the on-disk dynamic tunnel-token store (#1963) — the host-id-prefix
+// sibling of unpersistTunnelToken, for the {"token_prefix": "<host-id>."}
+// deregistration path used by a registrar that never retained the
+// plaintext token and can only identify the host it wants to decommission.
+// Best-effort at the call site, same reasoning as unpersistTunnelToken: the
+// in-memory policy is already updated either way, and a disk hiccup here
+// must not fail a legitimate deregistration.
+func (m *Manager) unpersistTunnelTokensByPrefix(prefix string) error {
+	m.tunnelTokenStoreMu.Lock()
+	defer m.tunnelTokenStoreMu.Unlock()
+	path := m.tunnelTokenStorePath
+	if path == "" {
+		path = DefaultTunnelTokenStorePath
+	}
+	entries, err := LoadTunnelTokenStore(path)
+	if err != nil {
+		return err
+	}
+	entries = removeTunnelTokenEntriesByPrefix(entries, prefix)
+	return SaveTunnelTokenStore(path, entries)
+}
+
+// SetAdminSecret wires the secret that gates POST
+// /sentinel/tunnel-tokens. Tests can use this to inject a secret
+// without setting CONTAINARIUM_SENTINEL_ADMIN_SECRET in the
+// environment.
+func (m *Manager) SetAdminSecret(secret []byte) {
+	m.adminSecret = secret
+}
+
+// SetFail2BanRunner overrides the Fail2BanRunner used by
+// Fail2BanBansHandler / Fail2BanUnbanHandler (#1962). Tests use this to
+// inject a fake that returns canned fail2ban-client output/exit codes
+// without a real fail2ban install; production leaves this unset and
+// fail2ban() falls back to the real execFail2BanRunner.
+func (m *Manager) SetFail2BanRunner(r Fail2BanRunner) {
+	m.fail2banRunner = r
+}
+
+// fail2ban returns the Fail2BanRunner to use — the injected one if a
+// test set one via SetFail2BanRunner, otherwise the production
+// execFail2BanRunner that shells out to the real fail2ban-client binary.
+func (m *Manager) fail2ban() Fail2BanRunner {
+	if m.fail2banRunner != nil {
+		return m.fail2banRunner
+	}
+	return execFail2BanRunner{}
+}
+
+// SetHTTPSListener sets a ConnMux HTTPS chanListener for tunnel/hybrid mode.
+// The manager wraps it in a dispatchListener to swap between proxy and maintenance.
+func (m *Manager) SetHTTPSListener(ln *chanListener) {
+	m.httpsDispatch = newDispatchListener(ln)
+}
+
+// PeersHandler returns an HTTP handler that serves the list of tunnel backend peers.
+// This allows the primary daemon to discover tunnel backends and their reachable addresses.
+//
+// Optional query parameter:
+//
+// Pool data is daemon-only (#3119): a request without a valid daemon signature
+// (same HMAC secret as /sentinel/primaries) gets the peers without `pool`, and
+// ?pool= is ignored, so the route cannot be used to enumerate or probe pool
+// names. The rest of this comment describes the signed caller's view.
+//
+//	?pool=<name>  Return only peers in the named pool. Pass ?pool= (empty value)
+//	              to return only peers without a pool tag. Omit the parameter
+//	              entirely to return all peers (back-compat default).
+func (m *Manager) PeersHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		type peerInfo struct {
+			ID        string `json:"id"`
+			ProxyPath string `json:"proxy_path"` // path prefix on binary server, e.g. "/peer/tunnel-node-a-gpu"
+			Healthy   bool   `json:"healthy"`
+			Pool      Pool   `json:"pool,omitempty"`
+		}
+
+		// Signed daemon callers only; an unconfigured secret trusts nobody.
+		signed := len(m.hmacSecret) >= auth.SentinelMinSecretLen &&
+			auth.VerifySentinelRequest(r, m.hmacSecret, time.Now()) == nil
+
+		poolFilter, hasPoolFilter := r.URL.Query()["pool"]
+		hasPoolFilter = hasPoolFilter && signed
+		var wantPool Pool
+		if hasPoolFilter {
+			wantPool = Pool(poolFilter[0])
+		}
+
+		backends := m.backends.All()
+		peers := make([]peerInfo, 0)
+		for _, b := range backends {
+			if b.Type != BackendTunnel {
+				continue
+			}
+			if hasPoolFilter && b.Pool != wantPool {
+				continue
+			}
+			pi := peerInfo{
+				ID:        b.ID,
+				ProxyPath: "/peer/" + b.ID,
+				Healthy:   b.Healthy,
+			}
+			if signed {
+				pi.Pool = b.Pool
+			}
+			peers = append(peers, pi)
+		}
+
+		// Marshal first so we can sign the exact bytes the daemon will
+		// see. Using a streaming Encoder here would race the signing
+		// header against the body write.
+		body, err := json.Marshal(map[string]interface{}{
+			"peers": peers,
+		})
+		if err != nil {
+			http.Error(w, `{"error":"marshal"}`, http.StatusInternalServerError)
+			return
+		}
+
+		// Sign the response so a compromised network path (or future
+		// sentinel-impersonator) can't inject attacker peer URLs. The
+		// daemon verifies before trusting any peer entry. Prefer ed25519
+		// (#688) when a signing key is configured; else fall back to the
+		// shared-secret HMAC. When neither is set, no headers are written
+		// and the daemon's verifier fails closed — operators see the
+		// peer-discovery failure rather than silently trusting an unsigned
+		// list. See finding C-CRIT-2.
+		if priv := loadSentinelSigningKey(); len(priv) == ed25519.PrivateKeySize {
+			auth.SignSentinelResponseEd25519(w, priv, body)
+		} else {
+			auth.SignSentinelResponse(w, m.hmacSecret, body)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}
+}
+
+// PrimariesHandler returns an HTTP handler that serves the primary registry.
+//
+// Methods:
+//
+//	GET    /sentinel/primaries           list all live primaries (optional ?pool=)
+//	POST   /sentinel/primaries           register a primary (body: Primary JSON)
+//	PUT    /sentinel/primaries/{pool}    heartbeat (refresh LastHeartbeat)
+//	DELETE /sentinel/primaries/{pool}    unregister
+//
+// Stale entries (no heartbeat within PrimaryTTL) are excluded from GET.
+func (m *Manager) PrimariesHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Path is either "/sentinel/primaries" or "/sentinel/primaries/{pool}"
+		rest := strings.TrimPrefix(r.URL.Path, "/sentinel/primaries")
+		rest = strings.TrimPrefix(rest, "/")
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == http.MethodGet && rest == "":
+			poolFilter, hasPoolFilter := r.URL.Query()["pool"]
+			var wantPool Pool
+			if hasPoolFilter {
+				wantPool = Pool(poolFilter[0])
+			}
+			out := make([]*Primary, 0)
+			for _, p := range m.primaries.All() {
+				if hasPoolFilter && p.Pool != wantPool {
+					continue
+				}
+				out = append(out, p)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"primaries": out})
+
+		case r.Method == http.MethodPost && rest == "":
+			var p Primary
+			if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+				http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+				return
+			}
+			if p.IP == "" {
+				// Fall back to the request's source IP — saves the daemon
+				// from having to know its own routable IP.
+				if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+					p.IP = host
+				}
+			}
+			if p.Pool == "" || p.Hostname == "" || p.IP == "" || p.Port == 0 {
+				http.Error(w, `{"error":"pool, hostname, port required (ip optional, inferred from RemoteAddr)"}`, http.StatusBadRequest)
+				return
+			}
+			stored := m.primaries.Register(p)
+			// Only reachable behind daemonAuthGate: the request authenticated,
+			// so its pool may now be tied to its source address (#2892).
+			m.authHealth.bind(stored.Pool, requestSourceAddr(r))
+			log.Printf("[sentinel] primary registered: pool=%q host=%q base_domains=%v ip=%s:%d", stored.Pool, stored.Hostname, stored.BaseDomains, stored.IP, stored.Port)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(stored)
+
+		case r.Method == http.MethodPut && rest != "":
+			updated := m.primaries.Heartbeat(Pool(rest))
+			if updated == nil {
+				http.Error(w, `{"error":"pool not registered"}`, http.StatusNotFound)
+				return
+			}
+			m.authHealth.bind(updated.Pool, requestSourceAddr(r))
+			_ = json.NewEncoder(w).Encode(updated)
+
+		case r.Method == http.MethodDelete && rest != "":
+			if !m.primaries.Unregister(Pool(rest)) {
+				http.Error(w, `{"error":"pool not registered"}`, http.StatusNotFound)
+				return
+			}
+			// Kept after deregistration: a daemon restarted with a new secret
+			// deregisters with the old one, then 401s re-registering.
+			m.authHealth.bind(Pool(rest), requestSourceAddr(r))
+			log.Printf("[sentinel] primary unregistered: pool=%q", rest)
+			w.WriteHeader(http.StatusNoContent)
+
+		default:
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+// Run is the main loop. Blocks until ctx is cancelled.
+func (m *Manager) Run(ctx context.Context) error {
+	stopUpstream := m.superviseSSHUpstream(ctx, 5*time.Second)
+	defer stopUpstream()
+	if ctx.Err() != nil {
+		return nil
+	}
+	if m.config.SSHAuthzSocket != "" {
+		stop, err := m.startSSHAuthzBridge(m.config.SSHAuthzSocket)
+		if err != nil {
+			// Audit-only must not bring down the sentinel on a sink failure.
+			log.Printf("[sentinel] ssh authz bridge unavailable: %v", err)
+		} else {
+			defer stop()
+		}
+	}
+	log.Printf("[sentinel] starting (check-interval=%s, health-port=%d, forwarded-ports=%v, hybrid=%v)",
+		m.config.CheckInterval, m.config.HealthPort, m.config.ForwardedPorts, m.config.HybridMode)
+
+	// Start binary server if configured (also serves /sentinel/peers for peer discovery)
+	if m.config.BinaryPort > 0 {
+		stopBinary, err := StartBinaryServer(m.config.BinaryPort, m)
+		if err != nil {
+			log.Printf("[sentinel] warning: binary server not started: %v", err)
+		} else {
+			defer stopBinary()
+		}
+	}
+
+	if m.config.TunnelMode && !m.config.HybridMode {
+		// Pure tunnel mode: wait for tunnel connections
+		log.Printf("[sentinel] tunnel mode: waiting for remote spot to connect...")
+	} else if m.config.HybridMode {
+		// Hybrid mode: resolve GCP backend, also accept tunnels
+		if err := m.initGCPBackend(ctx); err != nil {
+			return err
+		}
+		log.Printf("[sentinel] hybrid mode: GCP backend active, also accepting tunnel connections...")
+	} else {
+		// Standard GCP-only mode
+		if err := m.initGCPBackend(ctx); err != nil {
+			return err
+		}
+	}
+
+	// Start in maintenance mode
+	if err := m.switchToMaintenance(); err != nil {
+		return err
+	}
+
+	// Start event watcher if provider supports it (GCP preemption detection)
+	eventCh := make(chan VMEvent, 10)
+	if watcher, ok := m.provider.(EventWatcher); ok {
+		go func() {
+			log.Printf("[sentinel] event watcher started (polling GCP operations every 10s)")
+			if err := watcher.WatchEvents(ctx, eventCh); err != nil {
+				log.Printf("[sentinel] event watcher error: %v", err)
+			}
+		}()
+	}
+
+	// Independent end-to-end self-check of the sentinel's OWN proxy
+	// pipeline — see runSelfCheckLoop / selfCheckProxyPath. Runs on its
+	// own goroutine/ticker rather than piggybacking on the main loop
+	// below so a wedged pipeline (the exact thing it's checking for)
+	// can't also stall event processing.
+	go m.runSelfCheckLoop(ctx)
+
+	// Watch-only backends (see AddWatchOnlyBackend / watch_recovery.go):
+	// one independent goroutine per target, each with its own event
+	// watcher and backoff timeline. Never touches m.backends/m.primary.
+	for _, wb := range m.watchOnly {
+		go m.runWatchOnlyRecovery(ctx, wb)
+	}
+
+	// End-to-end reachability probe for tunnel-promoted primaries (#1872):
+	// registering in PrimaryRegistry only proves the sentinel can route
+	// SNI to a primary, not that the primary's own Caddy actually serves
+	// every declared hostname/alias. No-op outside tunnel/hybrid mode.
+	go m.runPrimaryReachabilityLoop(ctx)
+
+	ticker := time.NewTicker(m.config.CheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[sentinel] shutting down...")
+			m.cleanup()
+			return nil
+
+		case event := <-eventCh:
+			m.handleEvent(ctx, event)
+
+		case <-ticker.C:
+			m.healthCheckAll(ctx)
+			// Periodic recovery while stuck in maintenance: re-attempt
+			// StartInstance on the backoff schedule so a preempted spot
+			// self-heals when capacity returns (#514). No-op outside
+			// maintenance or before the backoff window elapses.
+			m.maybeRetryRecovery(ctx)
+			m.checkRecoveryTimeout()
+		}
+	}
+}
+
+// initGCPBackend resolves the GCP spot VM IP and registers it as a backend.
+func (m *Manager) initGCPBackend(ctx context.Context) error {
+	ip, err := m.provider.GetInstanceIP(ctx)
+	if err != nil {
+		return err
+	}
+
+	b := &Backend{
+		ID:       inFleetBackendID,
+		Type:     BackendGCP,
+		IP:       ip,
+		Provider: m.provider,
+		Priority: 0, // GCP is highest priority for HTTP
+	}
+	m.backends.Add(b)
+
+	// Start sync loops for GCP backend
+	m.startSyncLoops(ctx, b)
+
+	log.Printf("[sentinel] GCP backend registered: %s", ip)
+	if m.config.InFleetCertScope.Empty() {
+		log.Printf("[sentinel] WARNING: no domains declared for the in-fleet backend (--backend-hostname / --backend-alias / --backend-base-domain); none of its certificates will be served")
+	}
+	return nil
+}
+
+// inFleetBackendID is the backend ID of the in-fleet backend registered by
+// initGCPBackend.
+const inFleetBackendID = "gcp"
+
+// certScopeFor returns the domains backendID is registered for: the
+// configured InFleetCertScope for the in-fleet backend, the primary
+// registration for a tunnel backend, and an empty scope otherwise.
+func (m *Manager) certScopeFor(backendID string) CertScope {
+	if backendID == inFleetBackendID {
+		return m.config.InFleetCertScope
+	}
+	if m.primaries == nil {
+		return CertScope{}
+	}
+	return m.primaries.ScopeForBackend(backendID)
+}
+
+// startSyncLoops starts cert and key sync loops for a backend.
+func (m *Manager) startSyncLoops(parentCtx context.Context, b *Backend) {
+	ctx, cancel := context.WithCancel(parentCtx)
+	b.syncCancel = cancel
+
+	certInterval := m.config.CertSyncInterval
+	if certInterval == 0 {
+		certInterval = 6 * time.Hour
+	}
+	go m.certStore.RunSyncLoop(ctx, b.ID, b.IP, m.config.HealthPort, certInterval)
+
+	keyInterval := m.config.KeySyncInterval
+	if keyInterval == 0 {
+		keyInterval = 2 * time.Minute
+	}
+	go m.keyStore.RunSyncLoop(ctx, b.ID, b.IP, m.config.HealthPort, keyInterval)
+}
+
+// healthCheckAll runs health checks on all registered backends and manages state transitions.
+func (m *Manager) healthCheckAll(ctx context.Context) {
+	backends := m.backends.All()
+	if len(backends) == 0 {
+		// No backends registered (pure tunnel mode, no tunnel connected yet)
+		return
+	}
+
+	anyHealthy := false
+	for _, b := range backends {
+		healthy := m.probeBackend(b.IP)
+
+		if healthy {
+			b.unhealthyCount = 0
+			b.healthyCount++
+			if b.healthyCount >= m.config.HealthyThreshold && !b.Healthy {
+				b.Healthy = true
+				m.recordBackendHealth(b.ID, true)
+				if controller := m.sshUpstreamController(); controller != nil {
+					if _, err := controller.HintSSHUpstreamRecovery(ctx, &pb.HintSSHUpstreamRecoveryRequest{BackendId: b.ID}); err != nil {
+						log.Printf("[sentinel] SSH recovery hint: %v", err)
+					}
+				}
+				log.Printf("[sentinel] backend %s (%s) is healthy", b.ID, b.IP)
+			}
+		} else {
+			b.healthyCount = 0
+			b.unhealthyCount++
+			if b.unhealthyCount >= m.config.UnhealthyThreshold && b.Healthy {
+				b.Healthy = false
+				m.recordBackendHealth(b.ID, false)
+				log.Printf("[sentinel] backend %s (%s) is unhealthy", b.ID, b.IP)
+
+				// If this was the primary, try failover
+				m.mu.RLock()
+				wasPrimary := m.primary == b
+				m.mu.RUnlock()
+				if wasPrimary {
+					m.failoverPrimary(ctx, b)
+				}
+			}
+		}
+
+		if b.Healthy {
+			anyHealthy = true
+		}
+	}
+
+	// State transitions
+	if anyHealthy && m.currentState() == StateMaintenance {
+		best := m.backends.SelectPrimary()
+		if best != nil {
+			log.Printf("[sentinel] backend available, switching to proxy via %s (%s)", best.ID, best.IP)
+			if err := m.switchToProxy(best); err != nil {
+				log.Printf("[sentinel] failed to switch to proxy: %v", err)
+			}
+			// Recovered — the "instance is back" event. Bump the up-counter
+			// and notify, then clear the outage + backoff schedule so the
+			// next outage starts fresh (#514).
+			outage := time.Duration(0)
+			if !m.outageStart.IsZero() {
+				outage = time.Since(m.outageStart)
+			}
+			m.recoveredCount++
+			m.fireAlert("recovered", best.ID, outage)
+			m.outageStart = time.Time{}
+			m.resetRecovery()
+		}
+	}
+	if !anyHealthy && m.currentState() == StateProxy {
+		log.Printf("[sentinel] all backends unhealthy, switching to maintenance")
+		m.outageStart = time.Now()
+		m.resetRecovery() // fresh backoff for this outage
+		if err := m.switchToMaintenance(); err != nil {
+			log.Printf("[sentinel] failed to switch to maintenance: %v", err)
+		}
+		// First recovery attempt immediately; maybeRetryRecovery then
