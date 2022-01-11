@@ -14,12 +14,3 @@ export function useAudit(server: Server | null, params?: AuditLogsParams) {
   const fetcher = async (): Promise<AuditLogsResponse> => {
     if (!server) throw new Error('No server');
     const client = getClient(server);
-    return client.getAuditLogs(params);
-  };
-
-  // Include params in the SWR key so changes trigger refetch
-  const swrKey = server
-    ? `audit-logs-${server.id}-${JSON.stringify(params || {})}`
-    : null;
-
-  const { data, error, isLoading, mutate } = useSWR<AuditLogsResponse>(

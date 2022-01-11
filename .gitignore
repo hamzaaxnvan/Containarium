@@ -29,34 +29,3 @@ go.work.sum
 
 # IDE and editor files
 .vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Terraform files
-*.tfstate
-*.tfstate.*
-*.tfstate.backup
-.terraform/
-.terraform.lock.hcl
-*.tfvars
-!*.tfvars.example
-crash.log
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
-
-# Backend configuration (use backend-*.tf.example templates)
-backend.tf
-
-# Environment-specific configs (use environments/*.tfvars.example templates)
-environments/*.tfvars
-
-# Environment files
-.env
-.env.*
-!.env.example
-

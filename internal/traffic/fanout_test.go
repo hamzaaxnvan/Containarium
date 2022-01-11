@@ -32,3 +32,37 @@ func TestAggregateEgress_DistinctDestinationsAndCount(t *testing.T) {
 	if len(stats) != 2 {
 		t.Fatalf("len(stats) = %d, want 2 (%+v)", len(stats), stats)
 	}
+	// Sorted by name: crawler before normal.
+	if stats[0].ContainerName != "crawler" || stats[1].ContainerName != "normal" {
+		t.Errorf("not sorted by name: %+v", stats)
+	}
+
+	c, _ := statByName(stats, "crawler")
+	if c.DistinctDestinations != 4 {
+		t.Errorf("crawler distinct destinations = %d, want 4", c.DistinctDestinations)
+	}
+	if c.EgressConnections != 5 {
+		t.Errorf("crawler egress connections = %d, want 5", c.EgressConnections)
+	}
+	if c.ContainerID != "uuid-c" {
+		t.Errorf("crawler container id = %q, want uuid-c", c.ContainerID)
+	}
+
+	n, _ := statByName(stats, "normal")
+	if n.DistinctDestinations != 1 {
+		t.Errorf("normal distinct destinations = %d, want 1 (fan-out signal separates it from the crawler)", n.DistinctDestinations)
+	}
+	if n.EgressConnections != 3 {
+		t.Errorf("normal egress connections = %d, want 3", n.EgressConnections)
+	}
+}
+
+func TestAggregateEgress_EmptyAndNilID(t *testing.T) {
+	if got := aggregateEgress(nil, nil); got == nil || len(got) != 0 {
+		t.Errorf("aggregateEgress(nil,nil) = %+v, want empty non-nil slice", got)
+	}
+	// nil idForName must not panic and leaves ContainerID empty (standalone box).
+	stats := aggregateEgress([]egressConn{{"solo", "8.8.8.8"}}, nil)
+	if len(stats) != 1 || stats[0].ContainerID != "" || stats[0].DistinctDestinations != 1 {
+		t.Fatalf("stats = %+v, want one solo @ 1 distinct, empty id", stats)
+	}
