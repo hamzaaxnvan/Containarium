@@ -24,3 +24,29 @@ func TestRecordToProto_CarriesHookAndEncryptionFields(t *testing.T) {
 		ID: "alice-db-dump-20260913T000000Z", Username: "alice", Database: "db-dump",
 		Engine: backup.EngineHook, Hook: "/opt/backup/db-dump.sh",
 		Encrypted: true, AgeRecipient: "age1examplerecipient",
+	}
+	got := recordToProto(r)
+	if got.Engine != pb.BackupEngine_BACKUP_ENGINE_HOOK {
+		t.Errorf("engine = %v, want HOOK", got.Engine)
+	}
+	if got.Hook != r.Hook {
+		t.Errorf("hook = %q, want %q", got.Hook, r.Hook)
+	}
+	if !got.Encrypted || got.AgeRecipient != r.AgeRecipient {
+		t.Errorf("encrypted/recipient = %v/%q, want true/%q", got.Encrypted, got.AgeRecipient, r.AgeRecipient)
+	}
+	plain := recordToProto(&backup.Record{ID: "x", Engine: backup.EnginePostgres})
+	if plain.Encrypted || plain.AgeRecipient != "" || plain.Hook != "" {
+		t.Errorf("plaintext pg_dump record grew #1831 fields: %+v", plain)
+	}
+}
+
+// An empty database means "back up every database" (#954) — but only on
+// the pg_dump path. A hook backup names no database at all, and must run
+// exactly once, not once per database the daemon happens to find.
+func TestBackupAllRequested(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		req  *pb.CreateBackupRequest
+		want bool
+	}{
