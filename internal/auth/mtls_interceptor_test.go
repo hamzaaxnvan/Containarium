@@ -22,3 +22,53 @@ func TestAssertMTLSPeer_NoPeerInfo(t *testing.T) {
 	if status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("want Unauthenticated, got %v (%v)", status.Code(err), err)
 	}
+}
+
+func TestAssertMTLSPeer_NonTLSPeer(t *testing.T) {
+	// peer with no AuthInfo (plaintext connection).
+	ctx := peer.NewContext(context.Background(), &peer.Peer{
+		AuthInfo: nil,
+	})
+	err := assertMTLSPeer(ctx)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("plaintext peer must be rejected; got %v", err)
+	}
+}
+
+func TestAssertMTLSPeer_TLSWithoutClientCert(t *testing.T) {
+	// TLS connection but no verified client cert — e.g. server-only
+	// TLS without mTLS. Must be rejected for the mTLS path.
+	ctx := peer.NewContext(context.Background(), &peer.Peer{
+		AuthInfo: credentials.TLSInfo{
+			State: tls.ConnectionState{
+				// No VerifiedChains populated.
+			},
+		},
+	})
+	err := assertMTLSPeer(ctx)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("TLS-without-client-cert must be rejected; got %v", err)
+	}
+}
+
+func TestAssertMTLSPeer_VerifiedClientCert(t *testing.T) {
+	// Synthesize a fake verified chain — the interceptor just
+	// checks for presence, doesn't re-verify (that's gRPC's job).
+	cert := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test-peer"},
+	}
+	ctx := peer.NewContext(context.Background(), &peer.Peer{
+		AuthInfo: credentials.TLSInfo{
+			State: tls.ConnectionState{
+				VerifiedChains: [][]*x509.Certificate{{cert}},
+			},
+		},
+	})
+	if err := assertMTLSPeer(ctx); err != nil {
+		t.Fatalf("verified client cert must pass: %v", err)
+	}
+}
+
+func TestMTLSPeerCN_ReturnsCommonName(t *testing.T) {
+	cert := &x509.Certificate{

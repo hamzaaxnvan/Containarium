@@ -175,3 +175,91 @@ func ServeAuthorizedKeys(homeRoot string, containerExistsFn func(username string
 			if !entry.IsDir() {
 				continue
 			}
+			username := entry.Name()
+			akPath := filepath.Join(homeRoot, username, ".ssh", "authorized_keys")
+			// akPath is built from os.ReadDir output (entry.Name() has
+			// no path separators) joined with a fixed suffix — caller
+			// can't inject a traversal.
+			// #nosec G304 -- safe path construction (see above)
+			data, err := os.ReadFile(akPath)
+			if err != nil {
+				continue // no authorized_keys file, skip
+			}
+			content := strings.TrimSpace(string(data))
+			if content == "" {
+				continue
+			}
+			if containerExistsFn != nil && !containerExistsFn(username) {
+				// Only count/warn about accounts the orphan-reaper will
+				// actually touch. reapOnce (orphan_reaper.go) refuses to
+				// delete anything whose login shell isn't the
+				// containarium-managed wrapper — a real host admin login
+				// (e.g. the VM's own cloud-init "ubuntu" user) can share
+				// this directory shape without ever being reap-eligible.
+				// Without this gate the WARNING claims "orphan-reaper will
+				// clean up on next tick" forever for an account the reaper
+				// will never touch.
+				if shell, shellErr := container.UserLoginShell(username); shellErr == nil && container.IsContainerManagedShell(shell) {
+					orphanCount++
+				}
+				continue
+			}
+			keys = append(keys, UserKeys{
+				Username:       username,
+				AuthorizedKeys: content,
+			})
+		}
+		if orphanCount > 0 {
+			log.Printf("[keys] WARNING: %d orphan authorized_keys found (no live container); orphan-reaper will clean up on next tick", orphanCount)
+		}
+
+		resp := KeysResponse{Keys: keys}
+		// SSHPort deliberately omitted (0): on the LXC runtime boxes are
+		// reached on the node's own sshd port, which is the sentinel's
+		// legacy 22/20022 convention.
+		if trustBundle != nil {
+			if content, version, ok := trustBundle(); ok {
+				resp.TrustedUserCAKeys = content
+				resp.SSHTrustVersion = version
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// sentinelKeyMarker is the comment line that flags the next line as the
+// sentinel's current upstream pubkey in a user's authorized_keys file.
+// applySentinelKey uses this marker to find and replace stale entries on
+// rotation (sentinel VM replacement → new upstream keypair → old marker
+// block must go, new one must take its place).
+const sentinelKeyMarker = container.SentinelKeyMarker
+
+// ServeSentinelKey returns an HTTP handler that accepts a POST with the
+// sentinel's current upstream public key and installs it in every jump
+// server user's authorized_keys file. Replaces any prior sentinel-marker
+// block so that rotating the sentinel doesn't leave containers stranded
+// with the old upstream key.
+func ServeSentinelKey() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req SentinelKeyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
+			return
+		}
+
+		pubKey := strings.TrimSpace(req.PublicKey)
+		if pubKey == "" {
+			http.Error(w, `{"error":"public_key is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		updated, rotated, err := applySentinelKey("/home", pubKey)
+		if err != nil {
+			log.Printf("[keys] sentinel-key apply failed: %v", err)
