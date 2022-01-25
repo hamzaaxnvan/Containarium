@@ -33,3 +33,20 @@ func TestNodeContainerConfig(t *testing.T) {
 			wantDiskSize: "40GB",
 		},
 		{
+			name:         "container node carries the container profile",
+			spec:         spec,
+			isolation:    IsolationContainer,
+			wantType:     api.InstanceTypeContainer,
+			wantNesting:  true,
+			wantDisk:     true,
+			wantDiskSize: "40GB",
+		},
+		{
+			name:      "no disk size means no root device, not an empty one",
+			spec:      NodeSpec{Name: "t-k8s-c-small-1", CPU: "2", Memory: "4GB"},
+			isolation: IsolationVM,
+			wantType:  api.InstanceTypeVM,
+			wantDisk:  false,
+		},
+	}
+	for _, tt := range tests {
