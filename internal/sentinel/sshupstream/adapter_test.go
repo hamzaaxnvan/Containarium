@@ -189,3 +189,67 @@ func TestAdapterForwardsChildVerifier(t *testing.T) {
 	}
 	if child.verify.Netaddress != "192.0.2.1:22" || !proto.Equal(child.verify.Meta, meta) || string(child.verify.Key) != string(key) {
 		t.Fatalf("child verifier context changed: %v", child.verify)
+	}
+	if child.verifyDeadline.IsZero() || time.Until(child.verifyDeadline) > 30*time.Second {
+		t.Fatal("child verifier can outlive its bounded SSH setup")
+	}
+	child.err = errors.New("child rejected host key")
+	if err := cfg.VerifyHostKeyCallback(meta, "backend.example:22", u.Uri, key); !errors.Is(err, child.err) {
+		t.Fatalf("child verifier denial lost: %v", err)
+	}
+}
+
+// ListCallbacks declares only the child methods a fixture actually implements.
+func (c *routingClient) ListCallbacks(context.Context, *libplugin.ListCallbackRequest, ...grpc.CallOption) (*libplugin.ListCallbackResponse, error) {
+	return &libplugin.ListCallbackResponse{Callbacks: c.callbacks}, nil
+}
+
+// PublicKeyAuth captures the whole typed request and returns an independent
+// message so adapter mutation cannot hide loss of routing/authentication data.
+func (c *routingClient) PublicKeyAuth(_ context.Context, req *libplugin.PublicKeyAuthRequest, _ ...grpc.CallOption) (*libplugin.PublicKeyAuthResponse, error) {
+	c.request = proto.Clone(req).(*libplugin.PublicKeyAuthRequest)
+	return &libplugin.PublicKeyAuthResponse{Upstream: proto.Clone(c.upstream).(*libplugin.Upstream)}, c.err
+}
+
+// TestAdapterBindsEveryAuthorizedAttempt pins the selected-routing seam rather
+// than NewConnection, which misses authentication retries on the same socket.
+func TestAdapterBindsEveryAuthorizedAttempt(t *testing.T) {
+	upstream := &libplugin.Upstream{Uri: "tcp://127.0.0.1:22022", UserName: "backend-user", Env: map[string]string{"TAG": "kept"}, Auth: libplugin.CreatePrivateKeyAuth([]byte("upstream-key"))}
+	child := &routingClient{callbacks: []string{"PublicKeyAuth"}, upstream: upstream}
+	var attempts []Attempt
+	cfg, err := NewAdapter(t.Context(), child, func(_ context.Context, a Attempt) (net.Conn, error) {
+		attempts = append(attempts, a)
+		client, server := net.Pipe()
+		t.Cleanup(func() { _ = server.Close() })
+		return client, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := &libplugin.ConnMeta{UniqId: "same-connection", UserName: "tenant", FromAddr: "127.0.0.2:12345", Metadata: map[string]string{"authz": "ALLOW", "approval": "verified"}}
+	if cfg.UpstreamAuthFailureCallback == nil {
+		t.Fatal("adapter cannot release failed setups for legitimate authentication retries")
+	}
+	var ids []string
+	for range 2 {
+		u, err := cfg.PublicKeyCallback(meta, []byte("offered-key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !proto.Equal(child.request.Meta, meta) || string(child.request.PublicKey) != "offered-key" {
+			t.Fatalf("authorization request changed: %v", child.request)
+		}
+		copy := proto.Clone(u).(*libplugin.Upstream)
+		copy.Uri = upstream.Uri
+		if !proto.Equal(copy, upstream) || u.Uri == upstream.Uri {
+			t.Fatalf("routing, credentials, host identity or attempt binding lost: %v", u)
+		}
+		conn, err := cfg.CreateConnCallback(u.Uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+		cfg.UpstreamAuthFailureCallback(meta, "publickey", errors.New("test setup ended"), []string{"publickey"})
+		ids = append(ids, attempts[len(attempts)-1].ID)
+	}
+	if len(attempts) != 2 || ids[0] == ids[1] {

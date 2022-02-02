@@ -45,26 +45,3 @@ func servePIIOnlyEngine(t *testing.T) (addr string, eng *piiOnlyEngine) {
 	eng = &piiOnlyEngine{}
 	srv := grpc.NewServer()
 	pb.RegisterGuardrailEngineServiceServer(srv, eng)
-	go func() { _ = srv.Serve(lis) }()
-	t.Cleanup(srv.Stop)
-	return lis.Addr().String(), eng
-}
-
-// #2362: the default policy says REDACT SECRET. Against an engine that
-// cannot scan secrets, apply must FAIL before writing anything — never
-// attest a PASS that only ever looked for PII.
-func TestGuardrail_ApplyFailsClosedWhenEngineCannotCoverPolicy(t *testing.T) {
-	addr, eng := servePIIOnlyEngine(t)
-	work := t.TempDir()
-	in := filepath.Join(work, "raw")
-	must(t, os.MkdirAll(in, 0o755))
-	must(t, os.WriteFile(filepath.Join(in, "a.txt"), []byte("mail ann@example.com\n"), 0o644))
-	out := filepath.Join(work, "clean")
-
-	o, err := runGuardrail(t, "apply", in, "--out", out, "--engine", addr)
-	if err == nil || !strings.Contains(err.Error(), "FailedPrecondition") || !strings.Contains(err.Error(), "pii,secret") {
-		t.Fatalf("apply must fail closed naming the kinds it asked for; got err=%v\n%s", err, o)
-	}
-	if eng.calls != 1 {
-		t.Errorf("engine called %d times; want exactly the first scan, no re-scan", eng.calls)
-	}
