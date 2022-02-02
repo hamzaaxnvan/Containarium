@@ -38,3 +38,17 @@ func (k *sentinelTokenKind) Set(v string) error {
 		return nil
 	}
 	return fmt.Errorf("invalid kind %q (want %q or %q)", v, sentinelTokenKindTunnelJoin, sentinelTokenKindAuditIngest)
+}
+
+func (k *sentinelTokenKind) Type() string { return "kind" }
+
+// sendSentinelAdminRequest signs body with the sentinel admin secret and
+// sends it, treating anything but 204 as an error. Shared by register and
+// deregister for both kinds.
+func sendSentinelAdminRequest(method, endpoint, secret string, body []byte) error {
+	req, err := http.NewRequest(method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	auth.SignSentinelRequest(req, []byte(secret))
