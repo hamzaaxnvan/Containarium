@@ -1,0 +1,4886 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Containarium API",
+    "description": "Container management API for LXC-based development environments. Provides both gRPC and REST interfaces for managing containers, SSH keys, and system resources.",
+    "version": "1.0",
+    "contact": {
+      "name": "Containarium",
+      "url": "https://github.com/hamzaaxnvan/containarium"
+    },
+    "license": {
+      "name": "Apache 2.0",
+      "url": "https://github.com/hamzaaxnvan/containarium/blob/main/LICENSE"
+    }
+  },
+  "tags": [
+    {
+      "name": "ContainerService",
+      "description": "ContainerService provides container management operations"
+    },
+    {
+      "name": "SSHAuthzService",
+      "description": "SSHAuthzService is the per-connection SSH authorization contract\n(docs/architecture/ssh-live-authorization.md, component 1; #2516). The\nsentinel's ssh-authz plugin asks the backend daemon, at connection time,\nwhether the credential offered may open a session as `login` on this\nbackend. The daemon answers from local state (self-host) or forwards to\nthe cloud over ActuationService.AuthorizeSSH, which reuses these same\nmessages so neither side translates.\n\nThe REST route is mounted behind the sentinel request signature\n(auth.SentinelVerifier), not a JWT: it is sentinel-to-daemon plumbing."
+    },
+    {
+      "name": "ActuationService"
+    },
+    {
+      "name": "NetworkService",
+      "description": "NetworkService provides network and firewall management"
+    },
+    {
+      "name": "GuardrailEngineService",
+      "description": "GuardrailEngineService is implemented by an ENGINE, not by the\nContainarium daemon: the CLI (and later the daemon) is its client.\nStateless by contract — nothing is persisted on the engine side and\nrepeating a request repeats the scan. No REST mapping: this is an\ninternal plug point between two processes on the same side of a trust\nboundary, not a product endpoint."
+    },
+    {
+      "name": "GuardrailPolicyService",
+      "description": "GuardrailPolicyService is the daemon's store for the server-side policy.\nGet and GetStatus: any authenticated caller (a data owner needs the policy\nto run `guardrail apply` against it). Set: admin role only, audited."
+    },
+    {
+      "name": "RecipeService",
+      "description": "RecipeService provides one-command deployment of declarative GPU/app\nrecipes onto Containarium backends."
+    },
+    {
+      "name": "ModelGatewayService",
+      "description": "ModelGatewayService is the control surface for the daemon's model gateway\n(internal/modelgateway): who owns which upstream provider key, and the\nshort-lived scoped tokens a box presents instead of one.\n\nThe gateway's DATA plane is not here — it stays the HTTP proxy at\n/v1/model/\u003cprovider\u003e that a box calls with its gateway token. This service\nis the admin + mint surface around it:\n\n  - Set/Delete/GetStatus for one key owner's real upstream key. Admin-only\n    (gateway:admin); the key goes in, and only a fingerprint ever comes back\n    out. The keys live in the daemon's encrypted secrets store under a\n    reserved namespace no tenant can list and no delivery mode ships into a\n    box (internal/secrets.GatewayKeyLocation).\n  - MintGatewayToken, which issues a scoped, revocable, short-lived token\n    for a box the CALLER OWNS (gateway:mint). The token's key_owner claim —\n    the box's cloud-org attribution when stamped, else its owning username —\n    is what makes the call spend that owner's upstream key rather than the\n    daemon operator's.\n  - ListGatewayModels, the upstream model list read through the gateway, so\n    a caller can see what it may ask for without ever holding a real key.\n\nDesign: docs/architecture/workspace-own-inference-key.md (cloud repo),\ncomponent 2 / contract C1."
+    },
+    {
+      "name": "ProofPackService",
+      "description": "ProofPackService verifies a sealed Proof Pack from a client (#3064), so a\ncaller that is not on the daemon host (where `containarium proof-pack\nverify` reads Postgres directly) can check one."
+    },
+    {
+      "name": "AgentSkillService",
+      "description": "AgentSkillService manages and runs individual packaged agents."
+    },
+    {
+      "name": "CrewService",
+      "description": "CrewService runs collaborating sets of skills bound to a task purpose."
+    },
+    {
+      "name": "AnonymousBoxService",
+      "description": "AnonymousBoxService is the daemon side of the `ssh new.\u003ccloud-domain\u003e`\ndoor (docs/architecture/ssh-new-anonymous-box.md): a Linux VM per SSH\nkey fingerprint, no account required, claimable into a tenant by\nsigning up, destroyed at TTL otherwise. The sentinel's door plugin calls\nEnsureAnonymousBox; the cloud control plane (or an admin) calls\nClaimAnonymousBox; everything else is operator surface."
+    },
+    {
+      "name": "AppService",
+      "description": "AppService provides application deployment and management"
+    },
+    {
+      "name": "SentinelSSHBanService",
+      "description": "SentinelSSHBanService controls the enforcing plugin, not system fail2ban.\nThe sentinel mounts REST behind its admin HMAC and forwards to a local socket."
+    },
+    {
+      "name": "AuditService",
+      "description": "AuditService — the proto-defined surface of the tamper-evident audit\nstore (internal/audit). Today it carries one write RPC (#2415): the\nsentinel ships the SSH session records its sshpiperd plugin appends\nlocally (internal/sentinel/sshsession) into THIS backend's audit chain,\nso the platform's front-door logins get the same hash chain and\nexternal anchoring (#1706) as in-box sessions and API calls.\n\nReads stay on the legacy /v1/audit/logs gateway route for now."
+    },
+    {
+      "name": "BackupService",
+      "description": "BackupService provides logical (pg_dump) database backups for the\ndatabases running inside Containarium containers, stored off-host.\nSee docs/DB-BACKUP-OPERATIONS.md for the operational runbook and the\nISO 27001 A.8.13 control mapping."
+    },
+    {
+      "name": "SandboxService",
+      "description": "SandboxService is the two-digit-ms spawn path\n(docs/architecture/two-digit-ms-sandbox-spawn.md): an isolated Linux\nprocess for an agent inner loop, claimed against a pool rather than\ncreated fresh per request.\n\nA sandbox is NOT a persistent box. It has no per-tenant Linux account and\nno SSH — access is exclusively these RPCs, over a connection the daemon\nalready holds open. That is the scope cut that makes the latency target\nreachable (see the design note's \"What's in it\" section); a caller that\nneeds `ssh \u003cuser\u003e@box` wants ContainerService instead.\n\nPhase 1 (this contract's first implementation) is the cold path only —\nevery SpawnSandbox call creates a fresh container, same floor as\nContainerService.CreateContainer minus identity seeding. served_from is\nalways COLD until Phase 3 adds the warm pool; the field exists now so\nthat Phase 3 is not a breaking proto change."
+    },
+    {
+      "name": "SpawnService",
+      "description": "SpawnService is agent-box's resident, low-latency counterpart to\nSandboxService's per-call Incus round-trips (#1488 Phase 2). Each Incus\nexec websocket-upgrades at ~50-150ms; a warm gRPC connection straight to\nthe box does the same work in ~3ms. The daemon reaches this over a\nbind-mounted unix socket (see the design note's \"Transport\" section),\nnever over the network.\n\nThis is deliberately the only service in this package with NO\ngoogle.api.http annotations: it is not part of the public API surface —\nSandboxService is what external callers (CLI, MCP, SDK) talk to, and its\nimplementation is what will route through SpawnService once a warm pool\nexists (Phase 3). Nothing here is reachable through the REST gateway,\nand it must not be registered there.\n\nagent-box runs as PID 1 inside a pool member (see the design note's flow\ndiagram), so it owns reaping every process it forks — a design this\nservice inherits from the existing process_start/shell_exec MCP tools in\ninternal/agentbox, not a new mechanism."
+    },
+    {
+      "name": "ClusterService",
+      "description": "ClusterService manages tenant-facing managed Kubernetes clusters (#1413).\n\nA managed cluster is a platform-operated k3s control plane plus worker\nnodes that are Containarium VMs, grouped into typed size classes the\ncluster-autoscaler expands by fit simulation. The tenant's only surface\nis this service and the kubeconfig it returns — the control-plane VM is\nplatform territory (no tenant SSH, absent from the tenant's container\nlist), and worker VMs are cluster-internal.\n\nDesign: docs/architecture/managed-k8s-clusters.md. Provisioning is\nasynchronous: CreateCluster records the desired cluster and returns; a\ndaemon-side reconciler (#1414) converges VMs and flips the cluster to\nREADY. Kubeconfig and node-join material are read on demand from the\ncontrol-plane VM and are never persisted by the platform."
+    },
+    {
+      "name": "CodingToolEgressPolicyService",
+      "description": "CodingToolEgressPolicyService — the admin-approved egress allowlist for the\ncoding CLI's own traffic (#2370, docs/architecture/coding-cli-egress-allowlist.md).\n\nSeparate from NetworkPolicyService on purpose: a coding-tool policy never\nchanges what a tenant's own NetworkPolicy means. This service is the policy\nstore only; the kernel-side enforcement is a later increment."
+    },
+    {
+      "name": "ComposeAutostartService"
+    },
+    {
+      "name": "TrafficService",
+      "description": "TrafficService provides container traffic monitoring capabilities"
+    },
+    {
+      "name": "ThreatDetectionService",
+      "description": "ThreatDetectionService serves the background security-sentry's status and\nfindings. GetSentryStatus ships with #1640 (background detection loop);\n*BadDestination* ships with #1641 (known-bad destination rule);\nListFindings/ResolveFinding ship with #1643 (findings delivery + triage);\nrule-config RPCs remain unimplemented — see\ndocs/architecture/continuous-threat-detection.md."
+    },
+    {
+      "name": "EventService",
+      "description": "EventService provides real-time event streaming"
+    },
+    {
+      "name": "KmsService",
+      "description": "KmsService exposes read + migration-trigger operations for the\ntenant-secrets envelope-encryption layer (see\ndocs/security/KMS-ENVELOPE-DESIGN.md). It deliberately does NOT\nexpose backend *configuration* — selecting a KMS backend and\nsupplying its credentials stays an operator/systemd concern\n(CONTAINARIUM_KMS_BACKEND + the per-backend env vars), never an\nover-the-wire action. Every RPC requires the `kms:admin` scope\nAND the admin role; these are platform-wide, not tenant-scoped."
+    },
+    {
+      "name": "NetworkPolicyService",
+      "description": "NetworkPolicyService — the control-plane CRUD for per-tenant network\nisolation policies (Phase A of the eBPF network-isolation design, #315).\n\nThis is the policy *store* surface: operators (and the cloud control plane)\nset/get/list/delete a tenant's NetworkPolicy here; the per-veth TC_INGRESS\nBPF loader (a later increment) consumes the stored policies and programs the\nkernel. Admin-only — policies are fleet-shaping config, not tenant-editable."
+    },
+    {
+      "name": "NotifyService",
+      "description": "NotifyService — where the daemon pushes a `code run --approvals ask`\npermission request that is waiting on the developer (#2185,\ndocs/product/phone-approval.md Story 3).\n\nOne channel per user. The daemon itself sends the push: it reads each live\nrun's input journal on the user's box and publishes to the channel, so the\nchannel's access token never reaches a box. The token is stored with the\ntenant secrets store as a broker-only secret named\nCONTAINARIUM_NOTIFY_NTFY_TOKEN_\u003crandom\u003e, a new one per token (the channel\nswitches to it in one write), and is never returned by any RPC.\n\nWhich user: the request's username, or the caller's own when empty. Reads\nneed secrets:read and writes secrets:write, as for the tenant's secrets."
+    },
+    {
+      "name": "PentestService",
+      "description": "PentestService provides automated penetration testing and vulnerability scanning"
+    },
+    {
+      "name": "RetentionService",
+      "description": "RetentionService stores the retention policy and legal holds and reports\nwhat a sweep would remove. Every RPC is\nadmin-only. A set, a hold and a release write an audit entry naming the\ncaller when the daemon has an audit store; a failed audit write fails the\nchange and leaves the store unchanged."
+    },
+    {
+      "name": "SecurityService",
+      "description": "SecurityService provides container security scanning and reporting"
+    },
+    {
+      "name": "SentinelSSHUpstreamService",
+      "description": "SentinelSSHUpstreamService is private to the local operator's Unix socket.\nIt is never registered on public gRPC or REST listeners."
+    },
+    {
+      "name": "TokensService",
+      "description": "TokensService is the admin surface for JWT lifecycle.\n\nRevokeToken requires an admin role + tokens:write scope;\ntenants can't revoke other tenants' tokens. RefreshToken\nis open to any holder of a valid refresh token — that's\nthe whole point of the exchange flow."
+    },
+    {
+      "name": "TrackerService",
+      "description": "TrackerService manages tracker connections — the daemon-custody seam\nthe tracker broker's issue/change-request verbs (#1922, #1923) build\non. Connection CRUD is gated by tracker:admin, deliberately separate\nfrom the tracker:read / tracker:write scopes an agent's run-scoped JWT\ncarries for the verbs themselves: naming where the tracker is and\nwhich credential to trust is an operator decision, not something a\nskill run should be able to change."
+    },
+    {
+      "name": "VolumeService",
+      "description": "VolumeService manages shared, multi-writer data volumes (#384).\n\nThe only storage mechanism that lets N containers mount the SAME volume\nread-write without corruption is a CephFS custom (filesystem) volume:\nCephFS's MDS + capability/lease protocol coordinates concurrent POSIX\nwriters, which a block device on a non-cluster filesystem (ext4/xfs/zfs)\ncannot. So this service is capability-gated: it only works on hosts\nbacked by a `cephfs` Incus storage pool, and rejects create/attach on\nsingle-node ZFS hosts (today's default) with a clear error. Callers\ncheck support via ListVolumes.shared_volumes_supported.\n\nNOTE: this is a single-writer-safe DATA volume, not an instance rootfs\n(Incus restricts the cephfs driver to custom volumes)."
+    },
+    {
+      "name": "ZapService",
+      "description": "ZapService provides OWASP ZAP web application security scanning"
+    }
+  ],
+  "schemes": [
+    "https",
+    "http"
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/sentinel/ssh-bans/{listener}": {
+      "get": {
+        "summary": "Page through current bans on one independently enforcing listener.",
+        "operationId": "SentinelSSHBanService_ListSSHBans",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListSSHBansResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "listener",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "enum": [
+              "SSH_BAN_LISTENER_UNSPECIFIED",
+              "SSH_BAN_LISTENER_MAIN",
+              "SSH_BAN_LISTENER_ANONYMOUS"
+            ]
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "name": "pageToken",
+            "description": "Last returned normalized IP; iteration is in lexical IP order.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "SentinelSSHBanService"
+        ]
+      }
+    },
+    "/sentinel/ssh-bans/{listener}/unban": {
+      "post": {
+        "summary": "Atomically clear exactly one source's counter and ban; admin-only.",
+        "operationId": "SentinelSSHBanService_UnbanSSHSource",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/UnbanSSHSourceResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "listener",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "enum": [
+              "SSH_BAN_LISTENER_UNSPECIFIED",
+              "SSH_BAN_LISTENER_MAIN",
+              "SSH_BAN_LISTENER_ANONYMOUS"
+            ]
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/UnbanSSHSourceBody"
+            }
+          }
+        ],
+        "tags": [
+          "SentinelSSHBanService"
+        ]
+      }
+    },
+    "/sentinel/ssh-bans/{listener}/{ip}": {
+      "get": {
+        "summary": "Inspect one source IP, including tracked, banned, and exempt states.",
+        "operationId": "SentinelSSHBanService_GetSSHBan",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetSSHBanResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "listener",
+            "in": "path",
+            "required": true,
+            "type": "string",
+            "enum": [
+              "SSH_BAN_LISTENER_UNSPECIFIED",
+              "SSH_BAN_LISTENER_MAIN",
+              "SSH_BAN_LISTENER_ANONYMOUS"
+            ]
+          },
+          {
+            "name": "ip",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "SentinelSSHBanService"
+        ]
+      }
+    },
+    "/v1/actuation/containers/{containerId}/state": {
+      "post": {
+        "summary": "ReportContainerState records the calling host's observed state\nfor one of its assigned containers. The cloud uses this to\nsurface the user-facing containers.state field and (in a future\nslice) to react to FAILED reports with reassignment.",
+        "description": "Errors:\n  - InvalidArgument: malformed container_id, empty / unknown state.\n  - NotFound: no live assignment for that container belongs to\n    the calling host. Single error code for \"container unknown\"\n    and \"container is on a different host\" — the calling host\n    can't distinguish, by design.\n  - Unauthenticated: missing / invalid host-bearer.",
+        "operationId": "ActuationService_ReportContainerState",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ReportContainerStateResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerId",
+            "description": "The container the host is reporting about. The host must hold a\nlive container_assignments row for this container; cross-host\nreports collapse to NotFound for probe resistance (the calling\nhost can't tell whether the container exists on another host).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ReportContainerStateBody"
+            }
+          }
+        ],
+        "tags": [
+          "ActuationService"
+        ]
+      }
+    },
+    "/v1/actuation/enroll": {
+      "post": {
+        "summary": "EnrollHost redeems a single-use join token and registers the BYO host.\nSelf-authenticating via the token in the body (NOT host-bearer — the row\ndoesn't exist yet).",
+        "operationId": "ActuationService_EnrollHost",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/EnrollHostResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "EnrollHostRequest carries the single-use join token a BYO host redeems to\nregister itself with the cloud (BYO-compute report path). Unlike every other\nActuationService RPC this one is NOT host-bearer authed — the host row\ndoesn't exist yet; the cloud validates + single-use-redeems the token.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/EnrollHostRequest"
+            }
+          }
+        ],
+        "tags": [
+          "ActuationService"
+        ]
+      }
+    },
+    "/v1/actuation/heartbeat": {
+      "post": {
+        "summary": "Heartbeat updates hosts.last_heartbeat_at for the calling host.\nA stale gap (\u003e2 × the host's expected interval) marks the host\nfor the HostSweeper, which reassigns its containers. Hosts are\nexpected to call this every N seconds with N \u003c\u003c the staleness\nthreshold.",
+        "description": "Auth: requires a valid `host-bearer` header. Returns\nUnauthenticated if missing / malformed / tombstoned. The\nmethod is otherwise idempotent.",
+        "operationId": "ActuationService_Heartbeat",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/HeartbeatResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "HeartbeatRequest is intentionally empty for v1. The host's identity\ncomes from the bearer; there's nothing else the cloud needs to\nknow to bump last_heartbeat_at. Future fields (current observed\nstate, host-side health flags) are additive.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/HeartbeatRequest"
+            }
+          }
+        ],
+        "tags": [
+          "ActuationService"
+        ]
+      }
+    },
+    "/v1/actuation/ssh-trust-bundle": {
+      "get": {
+        "summary": "GetSSHTrustBundle returns what this host needs to trust the cloud's SSH\nCA and refuse revoked certificates: the CA public keys for sshd's\nTrustedUserCAKeys, and a KRL spec for RevokedKeys.",
+        "description": "Auth: requires a valid `host-bearer` header — the same channel the host\nalready uses for enrollment and heartbeats, so no new transport, no new\ncredential, and nothing for an operator to wire up per host.\n\nErrors:\n  - Unauthenticated: missing / invalid host-bearer.\n  - Unimplemented: this daemon has no SSH CA configured.",
+        "operationId": "ActuationService_GetSSHTrustBundle",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetSSHTrustBundleResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "knownVersion",
+            "description": "Optional. The version the caller already has applied. When it matches\nthe current one the response sets `unchanged` and omits the payload, so\na frequent poll costs almost nothing.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "ActuationService"
+        ]
+      }
+    },
+    "/v1/actuation/status": {
+      "post": {
+        "summary": "ReportHostStatus upserts the calling host's capability profile +\n`doctor` self-check and bumps its heartbeat. Requires a valid\n`host-bearer` header. Idempotent.",
+        "operationId": "ActuationService_ReportHostStatus",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ReportHostStatusResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "ReportHostStatusRequest is a BYO host's push of its self-measured\ncapability profile + `doctor` self-check. Host-bearer authed; the host id\ncomes from the bearer, never the body.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ReportHostStatusRequest"
+            }
+          }
+        ],
+        "tags": [
+          "ActuationService"
+        ]
+      }
+    },
+    "/v1/agent-engines": {
+      "get": {
+        "summary": "List agent engines and their readiness",
+        "description": "Returns one row per agent engine: whether a skill naming it would be refused right now, why, and which catalog skills name it explicitly.",
+        "operationId": "AgentSkillService_ListAgentEngines",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListAgentEnginesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-runs/{runId}/log": {
+      "get": {
+        "summary": "Tail a run's journal",
+        "description": "Returns one byte window of a run member's journal plus the offset to resume from. Resumable across dropped connections; follow_seconds waits briefly for new bytes.",
+        "operationId": "AgentSkillService_TailRunLog",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/TailRunLogResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "runId",
+            "description": "The run to read: a RunAgentSkill run id or a RunCrew run id.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "skillId",
+            "description": "Which member's journal to read. Empty = the only member of a skill run,\nor the entry skill (first member) of a crew run.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "startOffset",
+            "description": "Byte offset to start reading from; 0 = from the beginning. Pass the\nprevious response's end_offset to resume without loss or repetition.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "int64"
+          },
+          {
+            "name": "maxBytes",
+            "description": "Upper bound on chunk size in bytes: \u003c= 262144; 0 means 65536.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "followSeconds",
+            "description": "0..10: when no bytes are available at start_offset, wait up to this many\nseconds for the journal to grow before answering with an empty chunk.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "gatewayAfterSeq",
+            "description": "Model-gateway calls recorded for this run and member after this sequence\nnumber (#2928); 0 = from the first. Pass the previous response's\ngateway_next_seq to resume. Independent of start_offset: the calls are\nrecorded by the daemon, not written to the journal file.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "int64"
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-skills": {
+      "get": {
+        "summary": "List agent skills",
+        "description": "Returns all packaged agent skills that can be run individually or composed into a crew.",
+        "operationId": "AgentSkillService_ListAgentSkills",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListAgentSkillsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-skills/{id}": {
+      "get": {
+        "summary": "Get agent skill",
+        "description": "Returns one skill's definition, including its agent card, allowed scopes, and allowed peers.",
+        "operationId": "AgentSkillService_GetAgentSkill",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetAgentSkillResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-skills/{skillId}/credential-status": {
+      "get": {
+        "summary": "Check a skill box's coding-agent credential source",
+        "description": "Reports the NAME of the credential source (interactive sign-in, a user-placed key, or none) the skill's box would use for its configured engine — never the credential's value, never read/logged/transmitted.",
+        "operationId": "AgentSkillService_GetSkillBoxCredentialStatus",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetSkillBoxCredentialStatusResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "skillId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-skills/{skillId}/provision-box": {
+      "post": {
+        "summary": "Provision a skill's box ahead of any run",
+        "description": "Creates or reuses the skill's deterministic box with no token minted, nothing seeded, and no model call — so a human can sign in to its coding agent before any inference credential exists.",
+        "operationId": "AgentSkillService_ProvisionSkillBox",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ProvisionSkillBoxResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "skillId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ProvisionSkillBoxBody"
+            }
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-skills/{skillId}/run": {
+      "post": {
+        "summary": "Run an agent skill",
+        "description": "Provisions the skill's box, mints a scoped token, runs one task, and returns the artifact.",
+        "operationId": "AgentSkillService_RunAgentSkill",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/RunAgentSkillResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "skillId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RunAgentSkillBody"
+            }
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-skills/{skillId}/worker": {
+      "post": {
+        "summary": "Start a pull-queue worker for a skill",
+        "description": "Provisions the skill's box, mints an agents:run queue credential, and launches the in-box runtime in poll mode to lease and run queued tasks.",
+        "operationId": "AgentSkillService_StartAgentWorker",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/StartAgentWorkerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "skillId",
+            "description": "Skill whose box runs as the worker (its persona is the worker's; the\nworker leases only this skill's tasks).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/StartAgentWorkerBody"
+            }
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-skills/{toPeerId}/call": {
+      "post": {
+        "summary": "Send a task to a peer agent (A2A)",
+        "description": "Delegates a task to a running peer agent over the agent-to-agent transport and returns the peer's artifact.",
+        "operationId": "AgentSkillService_SendAgentTask",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SendAgentTaskResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "toPeerId",
+            "description": "The target peer to deliver the task to.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SendAgentTaskBody"
+            }
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-tasks": {
+      "post": {
+        "summary": "Enqueue an agent task (pull queue)",
+        "description": "Places a task on the pull queue for a skill; worker boxes lease and run it.",
+        "operationId": "AgentSkillService_EnqueueAgentTask",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/EnqueueAgentTaskResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "EnqueueAgentTaskRequest places one task on the pull queue.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/EnqueueAgentTaskRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-tasks/lease": {
+      "post": {
+        "summary": "Lease the next agent task (pull queue)",
+        "description": "Worker boxes poll this to lease the next task; the task is hidden from other workers until completed or the lease expires.",
+        "operationId": "AgentSkillService_LeaseAgentTask",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/LeaseAgentTaskResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "LeaseAgentTaskRequest asks for the next runnable task.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/LeaseAgentTaskRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/agent-tasks/{taskId}/complete": {
+      "post": {
+        "summary": "Complete a leased agent task (pull queue)",
+        "description": "Worker boxes report a leased task's artifact/error here; a stale lease is rejected.",
+        "operationId": "AgentSkillService_CompleteAgentTask",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/CompleteAgentTaskResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "taskId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/CompleteAgentTaskBody"
+            }
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/alerts": {
+      "get": {
+        "summary": "List alert rules",
+        "description": "Returns all custom alert rules stored in the database.",
+        "operationId": "ContainerService_ListAlertRules",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListAlertRulesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "Alerts"
+        ]
+      },
+      "post": {
+        "summary": "Create alert rule",
+        "description": "Creates a new custom alert rule. The rule is persisted in PostgreSQL and synced to vmalert for evaluation.",
+        "operationId": "ContainerService_CreateAlertRule",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/CreateAlertRuleResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/CreateAlertRuleRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Alerts"
+        ]
+      }
+    },
+    "/v1/alerts/defaults": {
+      "get": {
+        "summary": "List default alert rules",
+        "description": "Returns the built-in default alert rules for system and container monitoring. These rules are always active and cannot be modified.",
+        "operationId": "ContainerService_ListDefaultAlertRules",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListDefaultAlertRulesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "Alerts"
+        ]
+      }
+    },
+    "/v1/alerts/{id}": {
+      "get": {
+        "summary": "Get alert rule",
+        "description": "Returns a single alert rule by its ID.",
+        "operationId": "ContainerService_GetAlertRule",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetAlertRuleResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Alerts"
+        ]
+      },
+      "delete": {
+        "summary": "Delete alert rule",
+        "description": "Deletes an alert rule by ID. The rule is removed from both the database and vmalert.",
+        "operationId": "ContainerService_DeleteAlertRule",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DeleteAlertRuleResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Alerts"
+        ]
+      },
+      "put": {
+        "summary": "Update alert rule",
+        "description": "Updates an existing alert rule. Changes are synced to vmalert automatically.",
+        "operationId": "ContainerService_UpdateAlertRule",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/UpdateAlertRuleResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/UpdateAlertRuleBody"
+            }
+          }
+        ],
+        "tags": [
+          "Alerts"
+        ]
+      }
+    },
+    "/v1/anon/boxes": {
+      "get": {
+        "summary": "List anonymous boxes",
+        "description": "Every live anonymous box with its fingerprint hash, expiry and claim state. Admin only.",
+        "operationId": "AnonymousBoxService_ListAnonymousBoxes",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListAnonymousBoxesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "AnonymousBox"
+        ]
+      }
+    },
+    "/v1/anon/boxes:claim": {
+      "post": {
+        "summary": "Claim anonymous box",
+        "description": "Bind an anonymous box to a tenant using its claim token. Admin / control plane only.",
+        "operationId": "AnonymousBoxService_ClaimAnonymousBox",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ClaimAnonymousBoxResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ClaimAnonymousBoxRequest"
+            }
+          }
+        ],
+        "tags": [
+          "AnonymousBox"
+        ]
+      }
+    },
+    "/v1/anon/boxes:ensure": {
+      "post": {
+        "summary": "Ensure anonymous box",
+        "description": "Resolve or create the anonymous VM for an SSH public key. Sentinel door / admin only.",
+        "operationId": "AnonymousBoxService_EnsureAnonymousBox",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/EnsureAnonymousBoxResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/EnsureAnonymousBoxRequest"
+            }
+          }
+        ],
+        "tags": [
+          "AnonymousBox"
+        ]
+      }
+    },
+    "/v1/anon/door": {
+      "get": {
+        "summary": "Get anonymous door config",
+        "description": "Kill switch, bans and the fixed per-box limits of the anonymous tier. Admin only.",
+        "operationId": "AnonymousBoxService_GetAnonymousDoorConfig",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/AnonymousDoorConfig"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "AnonymousBox"
+        ]
+      },
+      "put": {
+        "summary": "Set anonymous door config",
+        "description": "Enable/disable the anonymous door and edit banned fingerprints. Admin only.",
+        "operationId": "AnonymousBoxService_SetAnonymousDoorConfig",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/AnonymousDoorConfig"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "config",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AnonymousDoorConfig"
+            }
+          }
+        ],
+        "tags": [
+          "AnonymousBox"
+        ]
+      }
+    },
+    "/v1/apps": {
+      "get": {
+        "summary": "List applications",
+        "description": "Returns a list of deployed applications with optional filtering by state or username.",
+        "operationId": "AppService_ListApps",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListAppsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username (empty for all - admin only)",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "stateFilter",
+            "description": "Filter by state\n\n - APP_STATE_UNSPECIFIED: Unspecified state (should not be used)\n - APP_STATE_UPLOADING: Source code is being uploaded\n - APP_STATE_BUILDING: Container image is being built (using Podman)\n - APP_STATE_RUNNING: App is running and healthy\n - APP_STATE_STOPPED: App is stopped by user\n - APP_STATE_FAILED: Build or runtime failure\n - APP_STATE_RESTARTING: App is restarting",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "enum": [
+              "APP_STATE_UNSPECIFIED",
+              "APP_STATE_UPLOADING",
+              "APP_STATE_BUILDING",
+              "APP_STATE_RUNNING",
+              "APP_STATE_STOPPED",
+              "APP_STATE_FAILED",
+              "APP_STATE_RESTARTING"
+            ],
+            "default": "APP_STATE_UNSPECIFIED"
+          }
+        ],
+        "tags": [
+          "Applications"
+        ]
+      },
+      "post": {
+        "summary": "Deploy an application",
+        "description": "Deploys a new application or updates an existing one. Accepts source code + Dockerfile/Containerfile or auto-detects language and generates one.",
+        "operationId": "AppService_DeployApp",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DeployAppResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/DeployAppRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
+    "/v1/apps/{username}/{appName}": {
+      "get": {
+        "summary": "Get application details",
+        "description": "Returns detailed information about a specific application including state, domain, and configuration.",
+        "operationId": "AppService_GetApp",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetAppResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "appName",
+            "description": "App name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Applications"
+        ]
+      },
+      "delete": {
+        "summary": "Delete an application",
+        "description": "Permanently deletes an application and optionally removes associated data volumes.",
+        "operationId": "AppService_DeleteApp",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DeleteAppResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "appName",
+            "description": "App name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "removeData",
+            "description": "Remove persistent data volumes",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "Applications"
+        ]
+      }
+    },
+    "/v1/apps/{username}/{appName}/logs": {
+      "get": {
+        "summary": "Get application logs",
+        "description": "Returns application logs with optional streaming. Use follow=true for real-time log streaming.",
+        "operationId": "AppService_GetAppLogs",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/GetAppLogsResponse"
+                },
+                "error": {
+                  "$ref": "#/definitions/rpc.Status"
+                }
+              },
+              "title": "Stream result of GetAppLogsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "appName",
+            "description": "App name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "tailLines",
+            "description": "Number of lines from end (default: 100)",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "follow",
+            "description": "Stream logs (Server-Sent Events)",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "Application Operations"
+        ]
+      }
+    },
+    "/v1/apps/{username}/{appName}/restart": {
+      "post": {
+        "summary": "Restart an application",
+        "description": "Restarts an application by stopping and starting it.",
+        "operationId": "AppService_RestartApp",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/RestartAppResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "appName",
+            "description": "App name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RestartAppBody"
+            }
+          }
+        ],
+        "tags": [
+          "Application Operations"
+        ]
+      }
+    },
+    "/v1/apps/{username}/{appName}/start": {
+      "post": {
+        "summary": "Start an application",
+        "description": "Starts a stopped application.",
+        "operationId": "AppService_StartApp",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/StartAppResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "appName",
+            "description": "App name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/StartAppBody"
+            }
+          }
+        ],
+        "tags": [
+          "Application Operations"
+        ]
+      }
+    },
+    "/v1/apps/{username}/{appName}/stop": {
+      "post": {
+        "summary": "Stop an application",
+        "description": "Stops a running application. The application can be started again later.",
+        "operationId": "AppService_StopApp",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/StopAppResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "appName",
+            "description": "App name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/StopAppBody"
+            }
+          }
+        ],
+        "tags": [
+          "Application Operations"
+        ]
+      }
+    },
+    "/v1/audit/ssh-sessions/ingest": {
+      "post": {
+        "summary": "Ingest sentinel SSH session records",
+        "description": "Append sentinel SSH session open/close records to this backend's tamper-evident audit chain. Idempotent per (session_id, phase); all-or-nothing per batch. Requires the audit:ingest scope.",
+        "operationId": "AuditService_IngestSSHSessionRecords",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/IngestSSHSessionRecordsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/IngestSSHSessionRecordsRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Audit"
+        ]
+      }
+    },
+    "/v1/backends": {
+      "get": {
+        "summary": "List backends",
+        "description": "Lists every backend in the fleet (local daemon + tunnel peers) with health, version, OS, running container count, and GPU inventory. Admin-only — discloses fleet topology.",
+        "operationId": "ContainerService_ListBackends",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListBackendsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "System"
+        ]
+      }
+    },
+    "/v1/backends/upgrade": {
+      "post": {
+        "summary": "Trigger daemon upgrade on a backend",
+        "description": "Upgrades a backend's daemon to the binary the sentinel currently serves, immediately instead of on the periodic tick. SHA-verified and smoke-tested before an atomic swap; the daemon restarts. Admin-only. Returns an upgrade_id for GetUpgradeStatus.",
+        "operationId": "ContainerService_TriggerUpgrade",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/TriggerUpgradeResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "TriggerUpgradeRequest asks a backend to upgrade its daemon binary now instead\nof waiting for the periodic auto-update tick. The daemon pulls the binary the\nsentinel currently serves (SHA-verified), smoke-tests it, swaps atomically\n(keeping the previous binary as .old), and restarts. See #354 Phase B.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/TriggerUpgradeRequest"
+            }
+          }
+        ],
+        "tags": [
+          "System"
+        ]
+      }
+    },
+    "/v1/backups": {
+      "get": {
+        "summary": "List backups",
+        "description": "Lists stored backup records (newest first), optionally filtered by tenant.",
+        "operationId": "BackupService_ListBackups",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListBackupsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Optional tenant filter. Empty lists backups for all tenants\n(admin view).",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Backups"
+        ]
+      },
+      "post": {
+        "summary": "Create a backup",
+        "description": "Runs pg_dump inside the tenant's container and stores the dump at the chosen off-host destination (local backup dir or GCS). Leave connection.database empty to back up every non-template database found; set it to back up just one. scope=BACKUP_SCOPE_BOX backs up the whole box instead: no connection or hook, and an explicit encryption key_mode is required.",
+        "operationId": "BackupService_CreateBackup",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/CreateBackupResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "CreateBackupRequest dumps a container's database and stores it at the\nchosen destination.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/CreateBackupRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Backups"
+        ]
+      }
+    },
+    "/v1/backups/prune": {
+      "post": {
+        "summary": "Prune old backups, keeping the newest N per database",
+        "description": "Deletes older backup records for a tenant, keeping the newest `keep` per (username, database) — or per (username, label) for a hook backup. One failing delete never aborts pruning the rest. #1839.",
+        "operationId": "BackupService_PruneBackups",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/PruneBackupsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "PruneBackupsRequest deletes older backups for a tenant, keeping only the\nnewest `keep` per (username, database) group — or per (username, label)\nfor a `--hook` backup, since a hook backup's label fills the same\ndatabase field (#1839). Retention POLICY (when, how often, how many) is\nstill the caller's decision; this RPC is the mechanism that makes\n\"how many\" actually enforceable instead of a cron job hand-rolling\n`rm` against the daemon's backup directory.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PruneBackupsRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Backups"
+        ]
+      }
+    },
+    "/v1/backups/{id}": {
+      "get": {
+        "summary": "Get a backup",
+        "description": "Returns the metadata for a single stored backup.",
+        "operationId": "BackupService_GetBackup",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetBackupResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Backups"
+        ]
+      },
+      "delete": {
+        "summary": "Delete a backup",
+        "description": "Deletes a stored dump and its metadata by id. See PruneBackups for keep-newest-N retention instead of naming ids one at a time.",
+        "operationId": "BackupService_DeleteBackup",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DeleteBackupResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Backups"
+        ]
+      }
+    },
+    "/v1/backups/{id}/restore": {
+      "post": {
+        "summary": "Restore a backup",
+        "description": "Streams a stored dump back into a container's database via pg_restore. Destructive when clean=true.",
+        "operationId": "BackupService_RestoreBackup",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/RestoreBackupResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "description": "Backup to restore. A SNAPSHOT backup restarts its source box on a new\nPVC in the same namespace, retaining the old PVC. connection, clean,\nage_identity and target_container must be unset for snapshot restores.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RestoreBackupBody"
+            }
+          }
+        ],
+        "tags": [
+          "Backups"
+        ]
+      }
+    },
+    "/v1/backups/{id}/verify": {
+      "post": {
+        "summary": "Verify a backup",
+        "description": "Restore-tests a stored dump by loading it into a throwaway database inside a target container and running sanity checks, then dropping the scratch database. Never touches the source container. An encrypted backup needs age_identity to decrypt; a wrong identity comes back as a FAILED result, not an error. Records the outcome on the backup as durable A.8.13 evidence.",
+        "operationId": "BackupService_VerifyBackup",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/VerifyBackupResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "description": "Backup to verify.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/VerifyBackupBody"
+            }
+          }
+        ],
+        "tags": [
+          "Backups"
+        ]
+      }
+    },
+    "/v1/capabilities/profile": {
+      "get": {
+        "summary": "Get a backend's capability profile",
+        "description": "Returns a backend's last-recorded capability profile (hardware class, GPU probe, micro-benchmark, region) without re-running it. Admin-only.",
+        "operationId": "ContainerService_GetCapabilityProfile",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetCapabilityProfileResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "backendId",
+            "description": "Backend to read. Empty = the local/primary daemon's own host.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "System"
+        ]
+      },
+      "post": {
+        "summary": "Profile a backend's hardware capability",
+        "description": "Records a backend's capability profile (hardware class, GPU probe, bounded CPU/memory micro-benchmark, region) and reconciles measured vs self-reported class. Surfaced through ListBackends. Admin-only.",
+        "operationId": "ContainerService_ProfileBackend",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ProfileBackendResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "ProfileBackendRequest asks a backend to (re)record its capability profile:\nread system info, run the GPU passthrough probe and the bounded\nCPU/memory micro-benchmark, derive the measured class, and persist it. See\n#681.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ProfileBackendRequest"
+            }
+          }
+        ],
+        "tags": [
+          "System"
+        ]
+      }
+    },
+    "/v1/capacity/headroom": {
+      "get": {
+        "summary": "Get spare scheduling capacity",
+        "description": "Returns this backend's current headroom advertisement and recomputed spare figures. Admin-only.",
+        "operationId": "ContainerService_GetCapacityHeadroom",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetCapacityHeadroomResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "System"
+        ]
+      },
+      "delete": {
+        "summary": "Withdraw spare scheduling capacity",
+        "description": "Withdraws this backend's headroom advertisement. Idempotent — succeeds even when nothing is currently advertised. Admin-only.",
+        "operationId": "ContainerService_WithdrawCapacity",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/WithdrawCapacityResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "drain",
+            "description": "When true the backend also reclaims the guest workloads it had implicitly\noffered, draining them gracefully within a bounded window instead of\nhard-killing them. Each drained workload is stopped through the normal\nstop path so the control plane observes a stop event and can reschedule.\nWhen false (default) withdraw only flips the advertisement off and leaves\nrunning guests untouched. See #682.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "drainWindowSeconds",
+            "description": "Bounded wall-clock budget (seconds) for the graceful drain. Once exhausted\nany still-running candidate is force-stopped so the host is reliably\nreclaimed (no wedge on repeated advertise/withdraw cycles). 0 applies the\nbackend default (120s). Only honored when drain is true.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "System"
+        ]
+      },
+      "post": {
+        "summary": "Advertise spare scheduling capacity",
+        "description": "Publishes this backend's spare scheduling headroom (spare CPU/memory/disk + host idle fraction) to the control plane, bounded by a local policy. Surfaced through ListBackends. Admin-only.",
+        "operationId": "ContainerService_AdvertiseCapacity",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/AdvertiseCapacityResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "AdvertiseCapacityRequest publishes (or republishes) this backend's spare\nscheduling headroom to the control plane, bounded by the supplied policy.\nSee #680.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AdvertiseCapacityRequest"
+            }
+          }
+        ],
+        "tags": [
+          "System"
+        ]
+      }
+    },
+    "/v1/clusters": {
+      "get": {
+        "summary": "List managed clusters",
+        "operationId": "ClusterService_ListClusters",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListClustersResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "owner",
+            "description": "Owner filter. Non-admin callers may only list their own clusters;\nempty = the authenticated caller (admins: all clusters).",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Clusters"
+        ]
+      },
+      "post": {
+        "summary": "Create a managed Kubernetes cluster",
+        "description": "Records the cluster and returns immediately in state PROVISIONING; a reconciler provisions the control-plane and worker VMs asynchronously. Fails fast on hosts that cannot run VMs.",
+        "operationId": "ClusterService_CreateCluster",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/CreateClusterResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/CreateClusterRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Clusters"
+        ]
+      }
+    },
+    "/v1/clusters/{name}": {
+      "get": {
+        "summary": "Get a managed cluster",
+        "operationId": "ClusterService_GetCluster",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetClusterResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "owner",
+            "description": "Owning tenant. Empty = the authenticated caller.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Clusters"
+        ]
+      },
+      "delete": {
+        "summary": "Delete a managed cluster",
+        "description": "Tears down control-plane and worker VMs, the published API endpoint, and all cluster state. A re-created cluster of the same name starts empty.",
+        "operationId": "ClusterService_DeleteCluster",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DeleteClusterResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "owner",
+            "description": "Owning tenant. Empty = the authenticated caller.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Clusters"
+        ]
+      }
+    },
+    "/v1/clusters/{name}/kubeconfig": {
+      "get": {
+        "summary": "Get a cluster's kubeconfig",
+        "description": "Only available once the cluster is READY. The kubeconfig is read from the control-plane VM on each call and is not persisted by the platform.",
+        "operationId": "ClusterService_GetClusterKubeconfig",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetClusterKubeconfigResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "owner",
+            "description": "Owning tenant. Empty = the authenticated caller.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Clusters"
+        ]
+      }
+    },
+    "/v1/clusters/{name}/node-pool": {
+      "post": {
+        "summary": "Update a cluster's node groups",
+        "operationId": "ClusterService_UpdateClusterNodePool",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/UpdateClusterNodePoolResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/UpdateClusterNodePoolBody"
+            }
+          }
+        ],
+        "tags": [
+          "Clusters"
+        ]
+      }
+    },
+    "/v1/clusters/{name}/status": {
+      "get": {
+        "summary": "Get a cluster's status",
+        "description": "Control-plane health, per-node-group counts vs min/max, and the most recent scale events with reasons.",
+        "operationId": "ClusterService_GetClusterStatus",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetClusterStatusResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "owner",
+            "description": "Owning tenant. Empty = the authenticated caller.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "eventsLimit",
+            "description": "Max scale events to return, newest first. 0 = server default (20).",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "Clusters"
+        ]
+      }
+    },
+    "/v1/code/egress-policy": {
+      "get": {
+        "summary": "Get coding-tool egress policy",
+        "description": "Return the stored and effective coding-tool egress policy. On GET /v1/code/egress-policy/{tenant} the tenant is the URL value; on the bare GET /v1/code/egress-policy it is the optional ?tenant= query parameter, and with none the cluster default (admin only). Admin, or the tenant itself holding the code-egress:read scope.",
+        "operationId": "CodingToolEgressPolicyService_GetCodingToolEgressPolicy2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetCodingToolEgressPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "tenant",
+            "description": "Empty = the cluster default.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "CodingToolEgressPolicy"
+        ]
+      },
+      "delete": {
+        "summary": "Delete coding-tool egress policy",
+        "description": "Remove a coding-tool egress policy (idempotent). On DELETE /v1/code/egress-policy/{tenant} the tenant is the URL value; on the bare DELETE /v1/code/egress-policy it is the optional ?tenant= query parameter, and with none the cluster default. Admin-only.",
+        "operationId": "CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DeleteCodingToolEgressPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "tenant",
+            "description": "Empty = the cluster default.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "CodingToolEgressPolicy"
+        ]
+      },
+      "put": {
+        "summary": "Set coding-tool egress policy",
+        "description": "Create or replace the coding tool's egress allowlist. Admin-only. On PUT /v1/code/egress-policy/{policy.tenant} the tenant is the URL value, which wins over any policy.tenant in the body (path parameters are applied after the body is decoded). On the bare PUT /v1/code/egress-policy the tenant is policy.tenant from the body; an empty tenant sets the cluster default. mode is required: LOG_ONLY or ENFORCE; UNSPECIFIED is rejected with INVALID_ARGUMENT.",
+        "operationId": "CodingToolEgressPolicyService_SetCodingToolEgressPolicy2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SetCodingToolEgressPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "policy",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/CodingToolEgressPolicy"
+            }
+          }
+        ],
+        "tags": [
+          "CodingToolEgressPolicy"
+        ]
+      }
+    },
+    "/v1/code/egress-policy/{policy.tenant}": {
+      "put": {
+        "summary": "Set coding-tool egress policy",
+        "description": "Create or replace the coding tool's egress allowlist. Admin-only. On PUT /v1/code/egress-policy/{policy.tenant} the tenant is the URL value, which wins over any policy.tenant in the body (path parameters are applied after the body is decoded). On the bare PUT /v1/code/egress-policy the tenant is policy.tenant from the body; an empty tenant sets the cluster default. mode is required: LOG_ONLY or ENFORCE; UNSPECIFIED is rejected with INVALID_ARGUMENT.",
+        "operationId": "CodingToolEgressPolicyService_SetCodingToolEgressPolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SetCodingToolEgressPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "policy.tenant",
+            "description": "Empty tenant = the cluster default. On the REST path with {policy.tenant}\nthe URL value replaces whatever is sent here.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "policy",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "$ref": "#/definitions/containarium.v1.NetworkPolicyMode",
+                  "description": "Required. LOG_ONLY records what would be dropped, ENFORCE drops it.\nUnlike NetworkPolicy there is no default: UNSPECIFIED (or an unknown\nvalue) is INVALID_ARGUMENT, so a forgotten mode never stores a policy\nthat drops nothing."
+                },
+                "egressCidrs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "description": "Validated and normalized by the same rules as NetworkPolicy."
+                },
+                "egressDomains": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "revision": {
+                  "type": "string",
+                  "format": "int64",
+                  "description": "Server-assigned and monotonic; ignored on input."
+                },
+                "updatedAt": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "updatedBy": {
+                  "type": "string"
+                }
+              },
+              "description": "CodingToolEgressPolicy is the admin's allowlist for the coding tool's own\ntraffic. A tenant policy replaces the cluster default; it does not merge\nwith it."
+            }
+          }
+        ],
+        "tags": [
+          "CodingToolEgressPolicy"
+        ]
+      }
+    },
+    "/v1/code/egress-policy/{tenant}": {
+      "get": {
+        "summary": "Get coding-tool egress policy",
+        "description": "Return the stored and effective coding-tool egress policy. On GET /v1/code/egress-policy/{tenant} the tenant is the URL value; on the bare GET /v1/code/egress-policy it is the optional ?tenant= query parameter, and with none the cluster default (admin only). Admin, or the tenant itself holding the code-egress:read scope.",
+        "operationId": "CodingToolEgressPolicyService_GetCodingToolEgressPolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetCodingToolEgressPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "tenant",
+            "description": "Empty = the cluster default.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "CodingToolEgressPolicy"
+        ]
+      },
+      "delete": {
+        "summary": "Delete coding-tool egress policy",
+        "description": "Remove a coding-tool egress policy (idempotent). On DELETE /v1/code/egress-policy/{tenant} the tenant is the URL value; on the bare DELETE /v1/code/egress-policy it is the optional ?tenant= query parameter, and with none the cluster default. Admin-only.",
+        "operationId": "CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DeleteCodingToolEgressPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "tenant",
+            "description": "Empty = the cluster default.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "CodingToolEgressPolicy"
+        ]
+      }
+    },
+    "/v1/containers": {
+      "get": {
+        "summary": "List all containers",
+        "description": "Returns a list of containers with optional filtering by state, username, or labels. Use query parameters to filter results.",
+        "operationId": "ContainerService_ListContainers",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListContainersResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "state",
+            "description": "Filter by state (optional, empty means all states)\n\n - CONTAINER_STATE_UNSPECIFIED: Unspecified state (should not be used)\n - CONTAINER_STATE_RUNNING: Container is running\n - CONTAINER_STATE_STOPPED: Container is stopped\n - CONTAINER_STATE_FROZEN: Container is frozen (paused)\n - CONTAINER_STATE_CREATING: Container is being created\n - CONTAINER_STATE_ERROR: Container creation failed or is in error state\n - CONTAINER_STATE_PROVISIONING: Container is running but provisioning (installing stack/packages)",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "enum": [
+              "CONTAINER_STATE_UNSPECIFIED",
+              "CONTAINER_STATE_RUNNING",
+              "CONTAINER_STATE_STOPPED",
+              "CONTAINER_STATE_FROZEN",
+              "CONTAINER_STATE_CREATING",
+              "CONTAINER_STATE_ERROR",
+              "CONTAINER_STATE_PROVISIONING"
+            ],
+            "default": "CONTAINER_STATE_UNSPECIFIED"
+          },
+          {
+            "name": "username",
+            "description": "Filter by username (optional, empty means all users)",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "labelFilter",
+            "description": "Filter by labels (optional, empty means no filter)",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Containers"
+        ]
+      },
+      "post": {
+        "summary": "Create a new container",
+        "description": "Creates a new LXC container with specified resources and configuration. The container will be started automatically after creation.",
+        "operationId": "ContainerService_CreateContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/CreateContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/CreateContainerRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Containers"
+        ]
+      }
+    },
+    "/v1/containers/{containerName}/connections": {
+      "get": {
+        "summary": "Get active connections",
+        "description": "Returns active network connections for a container tracked by conntrack.",
+        "operationId": "TrafficService_GetConnections",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetConnectionsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerName",
+            "description": "Container name (required)",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "protocol",
+            "description": "Filter by protocol (optional)\n\n - PROTOCOL_UNSPECIFIED: Unspecified protocol (should not be used)\n - PROTOCOL_TCP: TCP protocol\n - PROTOCOL_UDP: UDP protocol\n - PROTOCOL_ICMP: ICMP protocol",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "enum": [
+              "PROTOCOL_UNSPECIFIED",
+              "PROTOCOL_TCP",
+              "PROTOCOL_UDP",
+              "PROTOCOL_ICMP"
+            ],
+            "default": "PROTOCOL_UNSPECIFIED"
+          },
+          {
+            "name": "destIpPrefix",
+            "description": "Filter by destination IP prefix (optional, e.g., \"10.100.\")",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "destPort",
+            "description": "Filter by destination port (optional, 0 = all)",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "name": "limit",
+            "description": "Maximum number of connections to return (default: 100)",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "Traffic"
+        ]
+      }
+    },
+    "/v1/containers/{containerName}/connections/summary": {
+      "get": {
+        "summary": "Get connection summary",
+        "description": "Returns aggregate connection statistics for a container.",
+        "operationId": "TrafficService_GetConnectionSummary",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetConnectionSummaryResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerName",
+            "description": "Container name (required)",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Traffic"
+        ]
+      }
+    },
+    "/v1/containers/{containerName}/traffic/aggregates": {
+      "get": {
+        "summary": "Get traffic aggregates",
+        "description": "Returns aggregated traffic statistics over time for analysis.",
+        "operationId": "TrafficService_GetTrafficAggregates",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetTrafficAggregatesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerName",
+            "description": "Container name (required)",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "startTime",
+            "description": "Start time",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "date-time"
+          },
+          {
+            "name": "endTime",
+            "description": "End time",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "date-time"
+          },
+          {
+            "name": "interval",
+            "description": "Aggregation interval (e.g., \"1m\", \"5m\", \"1h\", \"1d\")",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "groupByDestIp",
+            "description": "Group by destination IP",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "groupByDestPort",
+            "description": "Group by destination port",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "Traffic"
+        ]
+      }
+    },
+    "/v1/containers/{containerName}/traffic/history": {
+      "get": {
+        "summary": "Query traffic history",
+        "description": "Returns historical connection data from persistent storage. Without a container_name (GET /v1/traffic/history) the query spans every box on the backend; that form is admin-only, needs start_time, and is limited to a 7-day window. Each row names its box. Returns FAILED_PRECONDITION when traffic persistence is not enabled on the host.",
+        "operationId": "TrafficService_QueryTrafficHistory",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/QueryTrafficHistoryResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "containerName",
+            "description": "Container name. When empty the query spans every box on this backend\n(host-wide): that reveals other tenants' connection history, so it\nrequires the admin role, an explicit start_time, and a window of at most\n7 days.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "startTime",
+            "description": "Start of the query range (inclusive: started_at \u003e= start_time).\nRequired for a host-wide query.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "date-time"
+          },
+          {
+            "name": "endTime",
+            "description": "End of the query range (inclusive: started_at \u003c= end_time).\nDefaults to now when unset.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "date-time"
+          },
+          {
+            "name": "destIp",
+            "description": "Filter by destination IP (optional)",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "destPort",
+            "description": "Filter by destination port (optional, 0 = all)",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "name": "offset",
+            "description": "Pagination: offset",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "limit",
+            "description": "Pagination: limit (default: 100, max: 1000)",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "Traffic"
+        ]
+      }
+    },
+    "/v1/containers/{name}/attribution": {
+      "post": {
+        "summary": "Merge attribution labels onto an existing container",
+        "description": "Sets the given labels on a live container's config, leaving other labels intact (cloud #746). Lets the hosted control plane stamp cloud attribution (cloud_org_id / cloud_container_id / managed_by) on a pre-existing box so its adopt flow can bring it under management (cloud #539). 404 when the container doesn't resolve.",
+        "operationId": "ContainerService_SetContainerAttribution",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SetContainerAttributionResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "description": "Container name — the bare username, matching the per-container RPC\nconvention (the handler resolves \u003cusername\u003e-container; see SetContainerTTL).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SetContainerAttributionBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{name}/delete-policy": {
+      "post": {
+        "summary": "Protect or unprotect a container from automated deletion",
+        "description": "Sets the container's delete policy (#284). DELETE_POLICY_PROTECTED makes the ttlsweeper auto-reap and `containarium prune` skip the box (e.g. a persistent runner); DELETE_POLICY_UNSPECIFIED returns it to the default (eligible for both). A deliberate single-box delete always succeeds regardless.",
+        "operationId": "ContainerService_SetContainerDeletePolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SetContainerDeletePolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "description": "Container name — the bare username, matching the per-container RPC\nconvention (the handler appends \"-container\"; see SetContainerTTL).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SetContainerDeletePolicyBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{name}/tool-access": {
+      "post": {
+        "summary": "Record the tool-access level for platform-started runs",
+        "description": "Sets the container's tool-access level (#2944). Only platform-started (headless) agent runs are governed by it; the owner's own login is unaffected. UNSPECIFIED clears it.",
+        "operationId": "ContainerService_SetContainerToolAccess",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SetContainerToolAccessResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "description": "Container name — the bare username, matching the per-container RPC\nconvention (the handler appends \"-container\"; see SetContainerDeletePolicy).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SetContainerToolAccessBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{name}/ttl": {
+      "post": {
+        "summary": "Schedule or clear a container's auto-delete TTL",
+        "description": "Stamps the container with a wall-clock auto-delete time consumed by the daemon's TTL sweeper. duration_seconds=0 clears any existing TTL; \u003e 0 sets it to now()+duration. Capped at 604800 (7 days). Used by the containarium-run GitHub Action to auto-clean failed-CI debug boxes.",
+        "operationId": "ContainerService_SetContainerTTL",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SetContainerTTLResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "description": "Container name (e.g. \"alice-container\"). Matches the URL path\nsegment used by other per-container RPCs.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SetContainerTTLBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{ownerUsername}/collaborators": {
+      "get": {
+        "summary": "List collaborators",
+        "description": "Returns all collaborators with access to a container.",
+        "operationId": "ContainerService_ListCollaborators",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListCollaboratorsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "ownerUsername",
+            "description": "Container owner's username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Collaborators"
+        ]
+      },
+      "post": {
+        "summary": "Add collaborator",
+        "description": "Adds a collaborator to a container. The collaborator can SSH via ProxyJump and sudo su to the container owner with full session logging for audit trail.",
+        "operationId": "ContainerService_AddCollaborator",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/AddCollaboratorResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "ownerUsername",
+            "description": "Container owner's username (e.g., \"alice\")",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AddCollaboratorBody"
+            }
+          }
+        ],
+        "tags": [
+          "Collaborators"
+        ]
+      }
+    },
+    "/v1/containers/{ownerUsername}/collaborators/{collaboratorUsername}": {
+      "delete": {
+        "summary": "Remove collaborator",
+        "description": "Removes a collaborator's access to a container, deleting both jump server and container accounts.",
+        "operationId": "ContainerService_RemoveCollaborator",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/RemoveCollaboratorResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "ownerUsername",
+            "description": "Container owner's username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "collaboratorUsername",
+            "description": "Collaborator's username to remove",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Collaborators"
+        ]
+      }
+    },
+    "/v1/containers/{username}": {
+      "get": {
+        "summary": "Get container details",
+        "description": "Returns detailed information about a specific container including state, resources, network info, and current metrics.",
+        "operationId": "ContainerService_GetContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container to get",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Containers"
+        ]
+      },
+      "delete": {
+        "summary": "Delete a container",
+        "description": "Permanently deletes a container. Use force=true query parameter to delete running containers.",
+        "operationId": "ContainerService_DeleteContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DeleteContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container to delete",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "force",
+            "description": "Force delete even if container is running",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "Containers"
+        ]
+      }
+    },
+    "/v1/containers/{username}/acl": {
+      "get": {
+        "summary": "Get container firewall rules",
+        "description": "Returns the network ACL (firewall rules) configured for a user's DevBox container.",
+        "operationId": "NetworkService_GetContainerACL",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetContainerACLResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username (container owner)",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Network"
+        ]
+      },
+      "put": {
+        "summary": "Update container firewall rules",
+        "description": "Updates the network ACL for a DevBox container. Use a preset for common configurations or specify custom rules.",
+        "operationId": "NetworkService_UpdateContainerACL",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/UpdateContainerACLResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username (container owner)",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/UpdateContainerACLBody"
+            }
+          }
+        ],
+        "tags": [
+          "Network"
+        ]
+      }
+    },
+    "/v1/containers/{username}/adopt": {
+      "post": {
+        "summary": "Adopt a migrated container (internal)",
+        "description": "Called by the source daemon during MoveContainer after the LXC has been Incus-copied to this host. Registers the container's host-side accounts and route record so it's fully under Containarium's control. Not intended for direct operator use.",
+        "operationId": "ContainerService_AdoptMigratedContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/AdoptMigratedContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the migrated container.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AdoptMigratedContainerBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/auto-sleep": {
+      "post": {
+        "summary": "Enable or disable auto-sleep on a container",
+        "description": "Writes the per-container auto-sleep opt-in metadata (Incus user.* keys). Does not itself stop the container — use stop_container for that. Phase 2 (the actual idle-tick) and Phase 3 (wake-on-HTTP) consume this flag.",
+        "operationId": "ContainerService_ToggleAutoSleep",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ToggleAutoSleepResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ToggleAutoSleepBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/cleanup-disk": {
+      "post": {
+        "summary": "Clean up container disk space",
+        "description": "Frees disk space inside a container by removing temporary files, package manager caches, and trimming journal logs. Useful when disk is full and resize fails.",
+        "operationId": "ContainerService_CleanupDisk",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/CleanupDiskResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/CleanupDiskBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/code-run-checkouts:sweep": {
+      "post": {
+        "summary": "Sweep a box's stale per-run checkouts",
+        "description": "Removes stale per-run checkout directories of platform-started runs: entries directly under the box owner's and the run user's ~/work whose name matches ^[A-Za-z0-9._-]+-run-[0-9a-f]{8}$, that are directories (symlinks are never followed or removed), whose newest modification is older than the daemon's --run-checkout-max-age, that no process has as its working directory, and that are not a live run's. Nothing else is touched. dry_run=true lists exactly the set a real sweep would remove and removes nothing. Only a box that has had a platform-started run (a recorded tool-access level or a run record) is swept. A stopped box is FAILED_PRECONDITION, as is a daemon with the sweep turned off (max age 0). Box owner or collaborator, ssh:write scope.",
+        "operationId": "ContainerService_SweepBoxRunCheckouts",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SweepBoxRunCheckoutsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The box owner's username (the box is \u003cusername\u003e-container).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SweepBoxRunCheckoutsBody"
+            }
+          }
+        ],
+        "tags": [
+          "Code Runs"
+        ]
+      }
+    },
+    "/v1/containers/{username}/code-runs": {
+      "get": {
+        "summary": "List a box's code runs",
+        "description": "Returns the box's current code-run records (containarium code run): name, start and end time, exit code, outcome (running/exited/unknown), and log path. Box owner or collaborator, ssh:write scope.",
+        "operationId": "ContainerService_ListBoxRuns",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListBoxRunsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The box owner's username (the box is \u003cusername\u003e-container).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Code Runs"
+        ]
+      },
+      "post": {
+        "summary": "Start a box's code run",
+        "description": "Starts (or resumes) a coding-agent run on a box, no SSH client needed. The engine and its credential source come from the box's own ~/.containarium/code.json (`code install`); this call only says what to run. A previous run under the resolved run_name that is still RUNNING or UNKNOWN is FAILED_PRECONDITION, naming it. Box owner or collaborator, ssh:write scope.",
+        "operationId": "ContainerService_StartBoxRun",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/StartBoxRunResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The box owner's username (the box is \u003cusername\u003e-container).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/StartBoxRunBody"
+            }
+          }
+        ],
+        "tags": [
+          "Code Runs"
+        ]
+      }
+    },
+    "/v1/containers/{username}/code-runs/{runName}/inputs": {
+      "get": {
+        "summary": "List a box code run's open permission requests",
+        "description": "Returns the run's open permission requests (id, tool, one-line prompt, complete input, created and expiry times) and its per-run request counts, read from the run's journal on the box. The journal is written by the box's own user, so it is advisory: the box acts only on an answer signed for the tool call it asked. A journal over 8 MiB is refused (RESOURCE_EXHAUSTED). Box owner or collaborator, ssh:write scope.",
+        "operationId": "ContainerService_ListRunInputs",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListRunInputsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The box owner's username (the box is \u003cusername\u003e-container).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "runName",
+            "description": "The run's name, as ListBoxRuns reports it.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Code Runs"
+        ]
+      }
+    },
+    "/v1/containers/{username}/code-runs/{runName}/inputs/{requestId}:answer": {
+      "post": {
+        "summary": "Answer a box code run's permission request",
+        "description": "Signs allow or deny for one request and the tool call the caller showed (request_sha256), writes it to the box, and waits briefly for the run's journal to show a response. Already closed or expired requests are reported, not changed. The box ignores an answer signed for a tool call other than the one it asked. Box owner or collaborator, ssh:write and code:answer scopes; the wildcard scope and an unscoped token do not carry code:answer.",
+        "operationId": "ContainerService_AnswerRunInput",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/AnswerRunInputResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The box owner's username (the box is \u003cusername\u003e-container).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "runName",
+            "description": "The run's name, as ListBoxRuns reports it.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "requestId",
+            "description": "A request_id from ListRunInputs.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AnswerRunInputBody"
+            }
+          }
+        ],
+        "tags": [
+          "Code Runs"
+        ]
+      }
+    },
+    "/v1/containers/{username}/code-runs/{runName}/log": {
+      "get": {
+        "summary": "Tail a box code run's log",
+        "description": "Returns one byte window of a code run's log plus the offset to resume from; ended once the run has an exit code and the log is read to its end. Framed logs are demuxed to stdout, with stderr_dropped set when stderr frames were skipped. Box owner or collaborator, ssh:write scope.",
+        "operationId": "ContainerService_TailBoxRunLog",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/TailBoxRunLogResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The box owner's username (the box is \u003cusername\u003e-container).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "runName",
+            "description": "A run_name from ListBoxRuns.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "startOffset",
+            "description": "Byte offset into the log file to start from; 0 = from the beginning.\nPass the previous response's end_offset to resume without loss or\nrepetition. For a FRAMED log this is an offset into the framed file,\nso it must be one a previous response returned (a frame boundary).",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "int64"
+          },
+          {
+            "name": "maxBytes",
+            "description": "Upper bound on log-file bytes consumed per call: \u003c= 262144; 0 means\n65536. A FRAMED log is never split mid-frame, so one call always\nconsumes at least one whole frame.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "followSeconds",
+            "description": "0..10: when no bytes are available at start_offset, wait up to this\nmany seconds for the log to grow before answering with an empty chunk.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "Code Runs"
+        ]
+      }
+    },
+    "/v1/containers/{username}/code-runs/{runName}:stop": {
+      "post": {
+        "summary": "Stop a box's code run",
+        "description": "Sends SIGTERM (SIGKILL with force) to a running code run's process group and reports the result. Idempotent: a run that has already exited is not signaled and the call succeeds. A run whose outcome is unknown (it predates this boot, or died before its exit was recorded) is FAILED_PRECONDITION, because its PID may have been reassigned. Box owner or collaborator, ssh:write scope.",
+        "operationId": "ContainerService_StopBoxRun",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/StopBoxRunResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The box owner's username (the box is \u003cusername\u003e-container).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "runName",
+            "description": "The run's name, as ListBoxRuns reports it.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/StopBoxRunBody"
+            }
+          }
+        ],
+        "tags": [
+          "Code Runs"
+        ]
+      }
+    },
+    "/v1/containers/{username}/code-runs:approval-key": {
+      "get": {
+        "summary": "Get a box's approval public key",
+        "description": "Returns the hex Ed25519 public key the daemon signs this box's permission-request answers with; `code run --approvals ask` passes it to the box. Box owner or collaborator, ssh:write scope.",
+        "operationId": "ContainerService_GetRunApprovalKey",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetRunApprovalKeyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The box owner's username (the box is \u003cusername\u003e-container).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Code Runs"
+        ]
+      }
+    },
+    "/v1/containers/{username}/console-log": {
+      "get": {
+        "summary": "Get a VM instance's console log",
+        "description": "Returns the instance's boot-time console ring-buffer log. For LXC containers (no serial console) this returns an empty log rather than an error.",
+        "operationId": "ContainerService_GetConsoleLog",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetConsoleLogResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container to fetch the console log for",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Containers"
+        ]
+      }
+    },
+    "/v1/containers/{username}/debug": {
+      "get": {
+        "summary": "Debug a container's SSH path",
+        "description": "Inspects backend-local state for the container: container runtime state, host /etc/passwd entry, whether the shell wrapper exists, and recent sshd journal lines matching the username. Returns a structured diagnosis with likely_cause and ordered next_actions for the caller to apply.",
+        "operationId": "ContainerService_DebugContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DebugContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container to debug",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Containers"
+        ]
+      }
+    },
+    "/v1/containers/{username}/install-stack": {
+      "post": {
+        "summary": "Install a software stack on a container",
+        "description": "Installs a pre-configured software stack or base script on an existing running container.",
+        "operationId": "ContainerService_InstallStack",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/InstallStackResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/InstallStackBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/monitoring": {
+      "post": {
+        "summary": "Enable or disable OTel monitoring on a container",
+        "description": "Live-flip OTEL_EXPORTER_OTLP_ENDPOINT and related env vars on an existing container and restart it so the change reaches the app. Use this to retrofit monitoring onto containers created before --monitoring was wired into create_container.",
+        "operationId": "ContainerService_ToggleMonitoring",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ToggleMonitoringResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ToggleMonitoringBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/move": {
+      "post": {
+        "summary": "Migrate container to peer daemon",
+        "description": "Pre-copy snapshot-based migration to a peer daemon. Sub-second downtime on ZFS/btrfs storage with low write rate; up to minutes on dir-pool or active workloads. Caller must have incus remotes configured both directions between the source and target hosts.",
+        "operationId": "ContainerService_MoveContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/MoveContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container to move (required). Must exist on the\nlocal daemon — moving a container the caller doesn't own returns\nPermissionDenied.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/MoveContainerBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/prepare-encrypted-migration": {
+      "post": {
+        "summary": "Pre-flight an encrypted migration (internal)",
+        "description": "Called by the source daemon before MoveContainer copies anything. The destination reports whether its key custody can resolve the container's KeyRef, and provisions the tenant's encrypted storage pool so the copy lands inside the tenant's encryptionroot. Only the key reference is sent; key material never crosses the wire. Not intended for direct operator use.",
+        "operationId": "ContainerService_PrepareEncryptedMigration",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/PrepareEncryptedMigrationResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container about to be migrated.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/PrepareEncryptedMigrationBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/resize": {
+      "put": {
+        "summary": "Resize container resources",
+        "description": "Dynamically adjusts CPU, memory, and disk resources without container restart. Disk can only be increased, not decreased.",
+        "operationId": "ContainerService_ResizeContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ResizeContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container to resize",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/ResizeContainerBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/rewrap": {
+      "post": {
+        "summary": "Rotate a tenant's encryption key",
+        "description": "Rewraps the tenant's ZFS encryptionroot onto new key material supplied as a key reference. Only the wrapping key changes, so the cost is independent of dataset size. Affects every container the tenant owns, which the response lists. Admin only.",
+        "operationId": "ContainerService_RewrapContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/RewrapContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The container whose tenant's key is being rotated.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RewrapContainerBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/run-user/status": {
+      "get": {
+        "summary": "Report whether a box's run user is signed in",
+        "description": "Read-only pre-check for StartBoxRun on a box with a recorded tool-access level: whether the unprivileged run user has a usable agent sign-in. Reports the credential source name only, never a value, and does not create the run user. Box owner or collaborator, ssh:write scope.",
+        "operationId": "ContainerService_GetBoxRunUserStatus",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetBoxRunUserStatusResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The box owner's username (the box is \u003cusername\u003e-container).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Code Runs"
+        ]
+      }
+    },
+    "/v1/containers/{username}/snapshots": {
+      "get": {
+        "summary": "List a container's snapshots",
+        "description": "Lists the container's ZFS snapshots, each with the bytes it uniquely holds (what deleting it would free) and the bytes it references in total.",
+        "operationId": "ContainerService_ListContainerSnapshots",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListContainerSnapshotsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      },
+      "post": {
+        "summary": "Snapshot a container",
+        "description": "Takes a point-in-time ZFS snapshot of the container's dataset. Instant and space-efficient: it shares blocks with the live dataset until they diverge. Works while the container runs, and while its encryption key is unloaded.",
+        "operationId": "ContainerService_CreateContainerSnapshot",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/CreateContainerSnapshotResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "The container to snapshot.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/CreateContainerSnapshotBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/snapshots/{name}": {
+      "delete": {
+        "summary": "Delete a container snapshot",
+        "description": "Removes the snapshot and reports the bytes reclaimed. Works while the container's encryption key is unloaded.",
+        "operationId": "ContainerService_DeleteContainerSnapshot",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/DeleteContainerSnapshotResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/snapshots/{name}/rollback": {
+      "post": {
+        "summary": "Roll a container back to a snapshot",
+        "description": "Discards everything written since the snapshot. Refuses a running container unless force is set, refuses to destroy newer snapshots unless destroy_newer is set, and refuses when the container's encryption key is unavailable.",
+        "operationId": "ContainerService_RollbackContainerSnapshot",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/RollbackContainerSnapshotResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "name",
+            "description": "The snapshot to roll back to.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RollbackContainerSnapshotBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/ssh-keys": {
+      "post": {
+        "summary": "Add SSH key",
+        "description": "Adds an SSH public key to a container's authorized_keys file, allowing SSH access with the corresponding private key.",
+        "operationId": "ContainerService_AddSSHKey",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/AddSSHKeyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/AddSSHKeyBody"
+            }
+          }
+        ],
+        "tags": [
+          "SSH Management"
+        ]
+      },
+      "put": {
+        "summary": "Set SSH keys (replace all)",
+        "description": "Makes the container user's authorized_keys contain exactly the given public keys. Keys not in the list are removed; keys the platform manages itself (the sentinel's upstream key) are never removed. Idempotent. The file is rewritten, not edited: each kept key is written as a regenerated canonical line (comment reduced to a safe charset), and comment lines, unparseable lines and any other line not in the list are dropped. At most 100 keys of 8 KB each. A dropped key is always removed from this container user's file. Its ssh_keys registry entry is handled as RemoveSSHKey does: one entry per key, owned by the first account to register it, until that entry is revoked, after which the next registration replaces it (an owner account also owns an entry its own collaborator account \u003cowner\u003e-container-\u003cuser\u003e registered, since ownership compares user id); it is revoked when this container user owns it or it has no owner, and no other account (a collaborator account is a separate account) still holds the same public key in its own authorized_keys. A key another account holds is dropped from this file but its entry stays active, and the call still succeeds; if this container user owned the entry, the entry loses its owner, so the next account to register the key takes it over and the last holder's own drop revokes it. When another account owns the entry it stays active, so dropping a key is not a guaranteed revocation of a compromised key. Dropped keys are revoked before the file changes, so a registry failure leaves the file untouched and a retry repeats the revocation. An empty list removes every caller-managed key and must be requested with allow_empty=true. Every key must be a single-line public key with no authorized_keys options; one invalid key fails the whole call with no change. Requires the same access as AddSSHKey.",
+        "operationId": "ContainerService_SetSSHKeys",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SetSSHKeysResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SetSSHKeysBody"
+            }
+          }
+        ],
+        "tags": [
+          "SSH Management"
+        ]
+      }
+    },
+    "/v1/containers/{username}/ssh-keys/{sshPublicKey}": {
+      "delete": {
+        "summary": "Remove SSH key",
+        "description": "Removes an SSH public key from a container's authorized_keys file, revoking that key's SSH access to this container. The key's ssh_keys registry entry (one per key, owned by the first account to register it; a revoked entry is replaced by the next registration) is revoked when this container user owns it or it has no owner. Ownership compares user id, so an owner account also owns an entry its own collaborator account \u003cowner\u003e-container-\u003cuser\u003e registered on another box. If this call would revoke the entry but any other account (a collaborator account \u003cowner\u003e-container-\u003ccollab\u003e is a separate account here) still holds the same public key in its own authorized_keys, the key is removed from this container user's file only and the entry stays active; the call still succeeds and does not say which account holds the key. If this container user owned that entry, the entry loses its owner: the next account to register the key takes it over, and the last holder's own removal revokes it. A key whose entry another account owns is likewise removed from the file with the entry left active, so removing a key is not a guaranteed revocation of a compromised key. The revocation happens before the file changes, so a registry failure leaves the key in place and a retry repeats it. The ssh_public_key should be URL-encoded.",
+        "operationId": "ContainerService_RemoveSSHKey",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/RemoveSSHKeyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "sshPublicKey",
+            "description": "SSH public key to remove (exact match)",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "SSH Management"
+        ]
+      }
+    },
+    "/v1/containers/{username}/start": {
+      "post": {
+        "summary": "Start a container",
+        "description": "Starts a stopped container. The container must exist and be in STOPPED state.",
+        "operationId": "ContainerService_StartContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/StartContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container to start",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/StartContainerBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/containers/{username}/stop": {
+      "post": {
+        "summary": "Stop a container",
+        "description": "Gracefully stops a running container with optional timeout and force parameters. The container can be started again later.",
+        "operationId": "ContainerService_StopContainer",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/StopContainerResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "username",
+            "description": "Username of the container to stop",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/StopContainerBody"
+            }
+          }
+        ],
+        "tags": [
+          "Container Operations"
+        ]
+      }
+    },
+    "/v1/crew-runs/{id}": {
+      "get": {
+        "summary": "Get crew run",
+        "description": "Returns the state, trace id, and (when complete) the artifact of a crew execution.",
+        "operationId": "CrewService_GetCrewRun",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetCrewRunResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/crews": {
+      "get": {
+        "summary": "List crews",
+        "description": "Returns all crews (collaborating skill sets) available to run.",
+        "operationId": "CrewService_ListCrews",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/ListCrewsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/crews/{crewId}/run": {
+      "post": {
+        "summary": "Run a crew",
+        "description": "Provisions each skill's box, gates A2A traffic with network policy compiled from allowed_peers, runs the collaboration, and returns the run handle.",
+        "operationId": "CrewService_RunCrew",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/RunCrewResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "crewId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/RunCrewBody"
+            }
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/crews/{id}": {
+      "get": {
+        "summary": "Get crew",
+        "description": "Returns one crew's definition, including its topology and member skills.",
+        "operationId": "CrewService_GetCrew",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetCrewResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "Agents"
+        ]
+      }
+    },
+    "/v1/events/subscribe": {
+      "get": {
+        "summary": "Subscribe to real-time events",
+        "description": "Opens a Server-Sent Events stream for real-time resource updates. Filter by resource types using query parameters.",
+        "operationId": "EventService_SubscribeEvents",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/Event"
+                },
+                "error": {
+                  "$ref": "#/definitions/rpc.Status"
+                }
+              },
+              "title": "Stream result of Event"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "resourceTypes",
+            "description": "Filter by resource types (empty = all types)\n\n - RESOURCE_TYPE_UNSPECIFIED: Unspecified resource type\n - RESOURCE_TYPE_CONTAINER: Container resource\n - RESOURCE_TYPE_APP: App resource\n - RESOURCE_TYPE_ROUTE: Route resource\n - RESOURCE_TYPE_METRICS: Metrics resource\n - RESOURCE_TYPE_TRAFFIC: Traffic resource\n - RESOURCE_TYPE_SECURITY_FINDING: Security finding resource",
+            "in": "query",
+            "required": false,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "RESOURCE_TYPE_UNSPECIFIED",
+                "RESOURCE_TYPE_CONTAINER",
+                "RESOURCE_TYPE_APP",
+                "RESOURCE_TYPE_ROUTE",
+                "RESOURCE_TYPE_METRICS",
+                "RESOURCE_TYPE_TRAFFIC",
+                "RESOURCE_TYPE_SECURITY_FINDING",
+                "RESOURCE_TYPE_ANON_BOX"
+              ]
+            },
+            "collectionFormat": "multi"
+          },
+          {
+            "name": "includeMetrics",
+            "description": "Include metrics events (can be noisy, default false)",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "metricsIntervalSeconds",
+            "description": "Metrics interval in seconds (default: 5, min: 1, max: 60)",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "Events"
+        ]
+      }
+    },
+    "/v1/guardrail/baseline": {
+      "put": {
+        "summary": "Set the baseline response scan mode",
+        "description": "Switch the baseline response scan between LOG (default: stream unchanged, scan at the end, audit a match) and BLOCK (hold the response, block a match). Stored separately from the server policy, so it never turns the baseline off; it applies only while no policy is configured. UNSPECIFIED is INVALID_ARGUMENT. Increments the setting's revision. On a daemon with an audit store it writes an audit entry naming the caller, and if that write fails the switch fails with INTERNAL and the mode is unchanged; with no audit store (no Postgres, REST disabled, or an audit store that failed to start) the switch succeeds and writes no entry. Admin role only.",
+        "operationId": "GuardrailPolicyService_SetGuardrailBaselineMode",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SetGuardrailBaselineModeResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SetGuardrailBaselineModeRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Guardrail"
+        ]
+      }
+    },
+    "/v1/guardrail/policy": {
+      "get": {
+        "summary": "Get the server guardrail policy",
+        "description": "Return the cluster-wide guardrail policy, its trusted signers, revision and policy hash. configured=false when no policy was ever set. Any authenticated caller.",
+        "operationId": "GuardrailPolicyService_GetGuardrailPolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetGuardrailPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "Guardrail"
+        ]
+      },
+      "put": {
+        "summary": "Set the server guardrail policy",
+        "description": "Replace the cluster-wide guardrail policy and trusted signers. Validated first (no unspecified or duplicate kind, max_residual \u003e= 0, every signer key_id equal to the SHA-256 of its Ed25519 key, every revoked key with a reason and not also trusted); an invalid policy is INVALID_ARGUMENT and the stored policy is untouched. A request that drops or changes a stored revoked key is FAILED_PRECONDITION (revocation is permanent); an expected_revision that is not the stored revision is ABORTED. Increments the revision and writes an audit entry. Admin role only.",
+        "operationId": "GuardrailPolicyService_SetGuardrailPolicy",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/SetGuardrailPolicyResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/SetGuardrailPolicyRequest"
+            }
+          }
+        ],
+        "tags": [
+          "Guardrail"
+        ]
+      }
+    },
+    "/v1/guardrail/status": {
+      "get": {
+        "summary": "Get the effective response guardrail policy",
+        "description": "Report what scans model responses: NONE (a policy is configured with no inbound BLOCK rule), BASELINE (no policy was ever set; built-in rules, log-only) or ADMIN (the policy has an inbound BLOCK rule). A store read error is an error, never NONE or BASELINE. Any authenticated caller.",
+        "operationId": "GuardrailPolicyService_GetGuardrailStatus",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/GetGuardrailStatusResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpc.Status"
+            }
+          }
+        },
+        "tags": [
+          "Guardrail"
+        ]

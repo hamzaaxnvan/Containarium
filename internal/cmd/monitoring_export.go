@@ -71,3 +71,149 @@ Examples:
 }
 
 var monitoringExportStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show cloud-native metrics export status",
+	Long: `Print whether cloud-native metrics export is enabled, which
+provider it targets, the export interval, and last-known health
+(last success time, last error, failure count — populated once the
+metrics collector lands in a follow-up issue).
+
+Examples:
+  containarium monitoring export status`,
+	Args: cobra.NoArgs,
+	RunE: runMetricsExportStatus,
+}
+
+func init() {
+	monitoringExportEnableCmd.Flags().StringVar(&metricsExportProvider, "provider", "", "cloud provider to export to (gcp)")
+	monitoringExportEnableCmd.Flags().StringVar(&metricsExportGroups, "groups", "", "comma-separated metric groups to enable (host,container,platform); omit for host only")
+
+	monitoringCmd.AddCommand(monitoringExportCmd)
+	monitoringExportCmd.AddCommand(monitoringExportEnableCmd)
+	monitoringExportCmd.AddCommand(monitoringExportDisableCmd)
+	monitoringExportCmd.AddCommand(monitoringExportStatusCmd)
+}
+
+// parseMetricsExportProvider maps the CLI's lowercase --provider flag
+// to the typed CloudMetricsProvider enum. No magic strings past this
+// boundary — every other layer (client, server, config) speaks the
+// enum. Unknown strings are rejected here (a client-side typo like
+// "gpc"); UNSPECIFIED and AWS are passed through so the server's own
+// validation (InvalidArgument / Unimplemented) is the single source of
+// truth for "is this provider usable".
+func parseMetricsExportProvider(s string) (pb.CloudMetricsProvider, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "":
+		return pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_UNSPECIFIED, fmt.Errorf("--provider is required (e.g. --provider gcp)")
+	case "gcp":
+		return pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_GCP, nil
+	case "aws":
+		return pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_AWS, nil
+	default:
+		return pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_UNSPECIFIED, fmt.Errorf("unknown provider %q (supported: gcp)", s)
+	}
+}
+
+// parseMetricsExportGroups maps the CLI's comma-separated --groups flag
+// to a typed CloudMetricsGroup list. No magic strings past this boundary
+// — every other layer (client, server, config, collector) speaks the
+// enum. An empty flag returns nil so the server applies its host-only
+// default; an unknown token is rejected here (a client-side typo like
+// "hosts") with the supported list. Whitespace and empty elements are
+// tolerated so `--groups "host, platform"` works.
+func parseMetricsExportGroups(s string) ([]pb.CloudMetricsGroup, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	var groups []pb.CloudMetricsGroup
+	for _, tok := range strings.Split(s, ",") {
+		switch strings.ToLower(strings.TrimSpace(tok)) {
+		case "":
+			continue
+		case "host":
+			groups = append(groups, pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST)
+		case "container":
+			groups = append(groups, pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_CONTAINER)
+		case "platform":
+			groups = append(groups, pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_PLATFORM)
+		default:
+			return nil, fmt.Errorf("unknown metric group %q (supported: host, container, platform)", strings.TrimSpace(tok))
+		}
+	}
+	return groups, nil
+}
+
+// metricsExportGroupsLabel renders a group list the way an operator types
+// it back on the CLI (lowercase, comma-separated). An empty list renders
+// as "host" — the server's effective default — so status output never
+// shows a blank group set.
+func metricsExportGroupsLabel(groups []pb.CloudMetricsGroup) string {
+	if len(groups) == 0 {
+		return "host"
+	}
+	labels := make([]string, 0, len(groups))
+	for _, g := range groups {
+		switch g {
+		case pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST:
+			labels = append(labels, "host")
+		case pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_CONTAINER:
+			labels = append(labels, "container")
+		case pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_PLATFORM:
+			labels = append(labels, "platform")
+		default:
+			labels = append(labels, strings.ToLower(g.String()))
+		}
+	}
+	return strings.Join(labels, ",")
+}
+
+func runMetricsExportEnable(cmd *cobra.Command, args []string) error {
+	provider, err := parseMetricsExportProvider(metricsExportProvider)
+	if err != nil {
+		return err
+	}
+	groups, err := parseMetricsExportGroups(metricsExportGroups)
+	if err != nil {
+		return err
+	}
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for metrics export (no local fallback)")
+	}
+
+	resp, err := setMetricsExportClient(true, provider, groups)
+	if err != nil {
+		return fmt.Errorf("failed to enable cloud metrics export: %w", err)
+	}
+
+	fmt.Printf("✓ cloud metrics export enabled (provider=%s, groups=%s, interval=%ds)\n",
+		metricsExportProviderLabel(resp.Provider), metricsExportGroupsLabel(resp.Groups), resp.IntervalSeconds)
+	if resp.Message != "" {
+		fmt.Println(resp.Message)
+	}
+	return nil
+}
+
+func runMetricsExportDisable(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for metrics export (no local fallback)")
+	}
+
+	resp, err := setMetricsExportClient(false, pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_UNSPECIFIED, nil)
+	if err != nil {
+		return fmt.Errorf("failed to disable cloud metrics export: %w", err)
+	}
+
+	fmt.Println("✓ cloud metrics export disabled")
+	if resp.Message != "" {
+		fmt.Println(resp.Message)
+	}
+	return nil
+}
+
+func runMetricsExportStatus(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for metrics export (no local fallback)")
+	}
+
+	resp, err := getMetricsExportClient()
+	if err != nil {
