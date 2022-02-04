@@ -60,3 +60,34 @@ func init() {
 }
 
 // boxRunsAPI is what code runs/logs need from a daemon client.
+type boxRunsAPI interface {
+	runlog.BoxLister
+	runlog.BoxTailer
+	Close() error
+}
+
+func newBoxRunsClient() (boxRunsAPI, error) {
+	if serverAddr == "" {
+		return nil, fmt.Errorf("--server is required")
+	}
+	if httpMode {
+		return client.NewHTTPClient(serverAddr, authToken)
+	}
+	return client.NewGRPCClient(serverAddr, certsDir, insecure)
+}
+
+func runCodeRuns(cmd *cobra.Command, args []string) error {
+	if err := validateBoxName(args[0]); err != nil {
+		return err
+	}
+	c, err := newBoxRunsClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	return codeRuns(c, args[0], os.Stdout)
+}
+
+func runCodeLogs(cmd *cobra.Command, args []string) error {
+	if err := validateBoxName(args[0]); err != nil {
+		return err

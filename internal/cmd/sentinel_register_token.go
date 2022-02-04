@@ -73,3 +73,28 @@ func init() {
 	sentinelRegisterTokenCmd.Flags().Var(&sentinelRegisterTokenKind, "kind", `Which credential to register: "tunnel-join" (default, BYOC join token) or "audit-ingest" (per-backend audit:ingest JWT for the SSH session shipper)`)
 	sentinelRegisterTokenCmd.Flags().StringVar(&sentinelRegisterTokenBackend, "backend", "", "Backend id the token belongs to (required for --kind audit-ingest)")
 
+	_ = sentinelRegisterTokenCmd.MarkFlagRequired("url")
+	_ = sentinelRegisterTokenCmd.MarkFlagRequired("token")
+}
+
+func runSentinelRegisterToken(cmd *cobra.Command, args []string) error {
+	if sentinelRegisterTokenSecret == "" {
+		return fmt.Errorf("sentinel admin secret is required — pass --secret or set CONTAINARIUM_SENTINEL_ADMIN_SECRET")
+	}
+
+	var (
+		endpoint string
+		body     []byte
+		err      error
+	)
+	switch sentinelRegisterTokenKind {
+	case sentinelTokenKindAuditIngest:
+		if sentinelRegisterTokenBackend == "" {
+			return fmt.Errorf("--backend is required with --kind audit-ingest")
+		}
+		if len(sentinelRegisterTokenPools) > 0 {
+			return fmt.Errorf("--pool does not apply to --kind audit-ingest (tokens are per backend, not per pool)")
+		}
+		endpoint = sentinelRegisterTokenSentinelURL + "/sentinel/audit-ingest-tokens"
+		body, err = json.Marshal(sentinel.AuditIngestTokenRegisterRequest{
+			BackendID: sentinelRegisterTokenBackend,
