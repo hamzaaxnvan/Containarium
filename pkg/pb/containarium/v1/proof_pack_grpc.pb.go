@@ -100,3 +100,37 @@ type ProofPackServiceServer interface {
 	// Size: the request is bounded at 32 steps and 4 MiB encoded. The gRPC
 	// receive limit applies first on that transport; on REST the body is
 	// decoded by the gateway before this check, so put a body limit on the
+	// reverse proxy in front of the daemon.
+	VerifyProofPack(context.Context, *VerifyProofPackRequest) (*VerifyProofPackResponse, error)
+	mustEmbedUnimplementedProofPackServiceServer()
+}
+
+// UnimplementedProofPackServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedProofPackServiceServer struct{}
+
+func (UnimplementedProofPackServiceServer) VerifyProofPack(context.Context, *VerifyProofPackRequest) (*VerifyProofPackResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyProofPack not implemented")
+}
+func (UnimplementedProofPackServiceServer) mustEmbedUnimplementedProofPackServiceServer() {}
+func (UnimplementedProofPackServiceServer) testEmbeddedByValue()                          {}
+
+// UnsafeProofPackServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ProofPackServiceServer will
+// result in compilation errors.
+type UnsafeProofPackServiceServer interface {
+	mustEmbedUnimplementedProofPackServiceServer()
+}
+
+func RegisterProofPackServiceServer(s grpc.ServiceRegistrar, srv ProofPackServiceServer) {
+	// If the following call panics, it indicates UnimplementedProofPackServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ProofPackService_ServiceDesc, srv)
