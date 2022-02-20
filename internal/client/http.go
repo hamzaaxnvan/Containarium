@@ -1,0 +1,2172 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/footprintai/containarium/internal/runlog"
+	"github.com/footprintai/containarium/internal/toolaccess"
+	"github.com/footprintai/containarium/pkg/core/incus"
+	"github.com/footprintai/containarium/pkg/core/ostype"
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+	"github.com/footprintai/containarium/pkg/version"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+)
+
+// HTTPClient wraps an HTTP connection to the containarium REST API
+type HTTPClient struct {
+	baseURL    string
+	token      string
+	httpClient *http.Client
+}
+
+// HTTPClientOption configures the HTTP transport used by the typed client.
+type HTTPClientOption func(*HTTPClient)
+
+// WithHTTPClient reuses a caller's transport, TLS trust and timeouts. The
+// caller must finish configuring it before making requests.
+func WithHTTPClient(httpClient *http.Client) HTTPClientOption {
+	return func(c *HTTPClient) {
+		if httpClient != nil {
+			c.httpClient = httpClient
+		}
+	}
+}
+
+// NewHTTPClient creates a new HTTP client
+func NewHTTPClient(baseURL string, token string, options ...HTTPClientOption) (*HTTPClient, error) {
+	if baseURL == "" {
+		return nil, ErrNoServerConfigured
+	}
+
+	// Ensure baseURL has proper format
+	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+		baseURL = "http://" + baseURL
+	}
+	// Remove trailing slash
+	baseURL = strings.TrimSuffix(baseURL, "/")
+
+	// Pin HTTP/1.1. Go's default client negotiates HTTP/2 via ALPN against
+	// an HTTPS server, but a long-running request (a container create can
+	// take minutes) carried on an HTTP/2 connection through a fronting TLS
+	// edge intermittently gets the connection reset with
+	// `remote error: tls: internal error` — the server still completes the
+	// work (the box is provisioned), only the response connection dies. The
+	// identical request over HTTP/1.1 (e.g. curl's default) is clean. This
+	// REST client issues one request per process, so HTTP/2 multiplexing
+	// buys nothing here. Clearing TLSNextProto on a cloned default transport
+	// is the documented way to force HTTP/1.1 on net/http while keeping the
+	// default dial/timeout/proxy behaviour. See FootprintAI/Containarium#422.
+	//
+	// Clearing TLSNextProto only removes the h2 *handler* — it does NOT
+	// constrain ALPN. A fronting edge that defaults to h2 when the client
+	// advertises no ALPN protocols (e.g. Cloudflare) then still negotiates
+	// HTTP/2, the server sends h2 frames, and the h1 parser chokes on them:
+	// `malformed HTTP response "\x00\x00\x12\x04..."` (an h2 SETTINGS frame),
+	// deterministically. Pin the ALPN offer to http/1.1 so the edge serves
+	// HTTP/1.1 — matching the clean `curl --http1.1` path.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
+	transport.TLSClientConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+	}
+
+	client := &HTTPClient{
+		baseURL: baseURL,
+		token:   token,
+		httpClient: &http.Client{
+			Timeout:   15 * time.Minute, // Match gRPC client timeout for container creation
+			Transport: transport,
+		},
+	}
+	for _, option := range options {
+		option(client)
+	}
+	return client, nil
+}
+
+// Close closes the HTTP client (no-op for HTTP, kept for interface compatibility)
+func (c *HTTPClient) Close() error {
+	return nil
+}
+
+// doRequest performs an HTTP request with authentication
+// body is the encoded JSON request body, or nil for a bodyless request.
+//
+// It is []byte rather than interface{} deliberately. The old signature
+// marshalled whatever it was handed, so handing it an already-encoded
+// []byte silently base64-encoded the payload into a JSON string and the
+// daemon rejected it with `proto: syntax error (line 1:1): unexpected
+// token "<base64>"` — three client methods shipped broken that way
+// (#887). Taking bytes makes that mistake unrepresentable: callers encode
+// exactly once, at a site where the payload's type is known.
+func (c *HTTPClient) doRequest(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		bodyReader = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	// Advertise the client version so the daemon can log it and, if it
+	// chooses, gate on a minimum-supported client. Both the conventional
+	// User-Agent and the explicit header are set; a server reads whichever
+	// it prefers.
+	req.Header.Set("User-Agent", version.UserAgent())
+	req.Header.Set(version.ClientVersionHeader, version.GetVersion())
+
+	return c.httpClient.Do(req)
+}
+
+// drainClose fully drains then closes an HTTP response body. Draining
+// before Close matters for HTTP/2: a body closed while still unread makes
+// Go send a RST_STREAM (plus a PING) to cancel the stream, which
+// Cloudflare and similar edges treat as abusive client behaviour and
+// answer by tearing down the whole connection (GOAWAY ENHANCE_YOUR_CALM)
+// — see FootprintAI/Containarium#422 and
+// https://blog.cloudflare.com/go-and-enhance-your-calm/. This REST client
+// is pinned to HTTP/1.1 today (where the concern is moot), but draining on
+// every path keeps it correct if HTTP/2 is ever re-enabled, and it's a
+// no-op cost when the caller already read the body to EOF.
+func drainClose(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+}
+
+// parseResponse reads and parses the response body
+func parseResponse[T any](resp *http.Response) (*T, error) {
+	defer drainClose(resp)
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		// Try to parse error response
+		var errResp struct {
+			Error string `json:"error"`
+			Code  int    `json:"code"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var result T
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &result, nil
+}
+
+// Container response types matching the protobuf JSON output
+type containerResponse struct {
+	Name                 string                    `json:"name"`
+	Username             string                    `json:"username"`
+	SshHost              string                    `json:"sshHost"`
+	State                string                    `json:"state"`
+	Resources            *resourceLimits           `json:"resources"`
+	Network              *networkInfo              `json:"network"`
+	CreatedAt            string                    `json:"createdAt"`
+	Labels               map[string]string         `json:"labels"`
+	NetworkTenant        string                    `json:"networkTenant"`
+	NetworkTenantSource  incus.NetworkTenantSource `json:"networkTenantSource"`
+	Image                string                    `json:"image"`
+	PodmanEnabled        bool                      `json:"podmanEnabled"`
+	GpuDevice            string                    `json:"gpuDevice"`
+	GpuDevices           []string                  `json:"gpuDevices"`
+	Isolation            string                    `json:"isolation"`  // protojson enum name, e.g. ISOLATION_TYPE_VM
+	ToolAccess           string                    `json:"toolAccess"` // protojson enum name, e.g. BOX_TOOL_ACCESS_NONE
+	MonitoringEnabled    bool                      `json:"monitoringEnabled"`
+	AutoSleepEnabled     bool                      `json:"autoSleepEnabled"`
+	IdleThresholdMinutes int32                     `json:"idleThresholdMinutes"`
+}
+
+type resourceLimits struct {
+	CPU    string `json:"cpu"`
+	Memory string `json:"memory"`
+	Disk   string `json:"disk"`
+}
+
+type networkInfo struct {
+	IPAddress  string `json:"ipAddress"`
+	MACAddress string `json:"macAddress"`
+	Interface  string `json:"interface"`
+	Bridge     string `json:"bridge"`
+}
+
+type listContainersResponse struct {
+	Containers []containerResponse `json:"containers"`
+}
+
+type createContainerResponse struct {
+	Container *containerResponse `json:"container"`
+	// DryRun echoes a validate-only request (#2925); Container is nil then.
+	DryRun bool `json:"dryRun"`
+}
+
+type getContainerResponse struct {
+	Container *containerResponse `json:"container"`
+}
+
+// containerToIncusInfo converts API response to incus.ContainerInfo
+func containerToIncusInfo(c *containerResponse) incus.ContainerInfo {
+	info := incus.ContainerInfo{
+		Name:     c.Name,
+		Username: c.Username,
+		SSHHost:  c.SshHost,
+		State:    c.State,
+		Labels:   c.Labels,
+		Tenant:   c.NetworkTenant, NetworkTenantSource: c.NetworkTenantSource,
+		InstanceType:         ostype.InstanceTypeFromIsolation(pb.IsolationType(pb.IsolationType_value[c.Isolation])),
+		MonitoringEnabled:    c.MonitoringEnabled,
+		AutoSleepEnabled:     c.AutoSleepEnabled,
+		IdleThresholdMinutes: c.IdleThresholdMinutes,
+		PodmanEnabled:        c.PodmanEnabled,
+	}
+
+	if c.Network != nil {
+		info.IPAddress = c.Network.IPAddress
+	}
+
+	if c.Resources != nil {
+		info.CPU = c.Resources.CPU
+		info.Memory = c.Resources.Memory
+	}
+
+	info.GPU = c.GpuDevice
+	info.GPUs = c.GpuDevices
+	if lvl, ok := pb.BoxToolAccess_value[c.ToolAccess]; ok {
+		if v, ok := toolaccess.ConfigValue(pb.BoxToolAccess(lvl)); ok {
+			info.ToolAccess = v
+		}
+	}
+
+	info.CreatedAt = parseCreatedAt(c.CreatedAt)
+
+	return info
+}
+
+// parseCreatedAt parses the wire `createdAt` field, which is the Container
+// proto's int64 Unix-seconds field (#2146) — protojson renders an int64 as
+// a quoted decimal string (e.g. "1738000000"), not RFC3339. RFC3339 is also
+// accepted so the client keeps working if the wire format ever switches to
+// google.protobuf.Timestamp. Empty or unparseable input leaves the zero
+// time, same as before this fix.
+func parseCreatedAt(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.Unix(sec, 0)
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+
+// ListContainers lists all containers via HTTP
+func (c *HTTPClient) ListContainers() ([]incus.ContainerInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v1/containers", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	result, err := parseResponse[listContainersResponse](resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	var containers []incus.ContainerInfo
+	for _, container := range result.Containers {
+		containers = append(containers, containerToIncusInfo(&container))
+	}
+
+	return containers, nil
+}
+
+// CreateContainer creates a container via HTTP
+// GitSourceOpts carries the optional create-time git provisioning
+// parameters. Zero value (Source == "") means "no git source" and the
+// daemon skips provisioning. Kept as a struct so CreateContainer's
+// already-long signature doesn't grow four more positional strings.
+// EncryptionOpts carries the per-tenant dataset-encryption request
+// (#1198). Bundled into a struct rather than added as two more
+// positional parameters: CreateContainer already takes eighteen, and a
+// bare `encrypted bool` would sit next to `monitoring bool` where a
+// transposed argument compiles cleanly and silently creates the wrong
+// container.
+type EncryptionOpts struct {
+	// Encrypted requests a tenant-scoped ZFS key for this container's
+	// dataset. The daemon rejects it with FAILED_PRECONDITION when no
+	// KeyProvider is configured — it never falls back to plaintext.
+	Encrypted bool
+	// TenantID scopes the key. Empty or "default" on a single-tenant
+	// daemon; any other value is rejected there with INVALID_ARGUMENT.
+	TenantID string
+}
+
+type GitSourceOpts struct {
+	Source        string // clone URL; empty disables git provisioning
+	Ref           string // SHA / branch / tag / refs/pull/N/merge; empty = default branch
+	Credential    string // bearer token for private repos
+	WorkspacePath string // empty defaults to /workspace
+}
+
+func (c *HTTPClient) CreateContainer(username, image, cpu, memory, disk string, sshKeys []string, enablePodman bool, stack string, gpus []string, osType pb.OSType, isolation pb.IsolationType, monitoring bool, pool, backendID string, git GitSourceOpts, ttlSeconds int64, idleStopMinutes int32, disableAutoSleep bool, deleteAfterStoppedSeconds int64, storageClass string, enc EncryptionOpts, memoryRequest, cpuRequest, region string, labels map[string]string, networkTenant ...string) (*incus.ContainerInfo, error) {
+	if len(networkTenant) > 0 && networkTenant[0] != "" {
+		caps, err := c.GetNetworkTenantCapabilities()
+		if err != nil {
+			return nil, fmt.Errorf("native Tenant capability check: %w", err)
+		}
+		if err := requireNativeTenantCapability(caps); err != nil {
+			return nil, err
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	req := createContainerRequest{
+		Username: username,
+		Resources: containerResources{
+			CPU:           cpu,
+			Memory:        memory,
+			Disk:          disk,
+			StorageClass:  storageClass,
+			MemoryRequest: memoryRequest,
+			CPURequest:    cpuRequest,
+		},
+		SSHKeys:      sshKeys,
+		Image:        image,
+		EnablePodman: enablePodman,
+		Stack:        stack,
+		GPUs:         gpus,
+		OSType:       osType,
+		Isolation:    isolation,
+		Monitoring:   monitoring,
+		Pool:         pool,
+		BackendID:    backendID,
+		Encrypted:    enc.Encrypted,
+		TenantID:     enc.TenantID,
+		Region:       region,
+	}
+	if len(networkTenant) > 0 {
+		req.NetworkTenant = networkTenant[0]
+	}
+	if len(labels) > 0 {
+		req.Labels = labels
+	}
+	// The four git fields travel together: all present (even when empty)
+	// when a source is given, all absent otherwise.
+	if git.Source != "" {
+		req.GitSource = &git.Source
+		req.GitRef = &git.Ref
+		req.GitCredential = &git.Credential
+		req.WorkspacePath = &git.WorkspacePath
+	}
+	// Birth TTL (#523), idle-stop (#524), stopped→delete (#525): only
+	// included when set, so an unset value stays absent on the wire
+	// (0 = disabled) rather than forcing a key the daemon would treat the
+	// same but that needlessly differs from a plain create's body.
+	if ttlSeconds > 0 {
+		req.TTLSeconds = ttlSeconds
+	}
+	req.DisableAutoSleep = disableAutoSleep
+	if idleStopMinutes > 0 {
+		req.IdleStopMinutes = idleStopMinutes
+	}
+	if deleteAfterStoppedSeconds > 0 {
+		req.DeleteAfterStoppedSeconds = deleteAfterStoppedSeconds
+	}
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/containers", reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create container: %w", err)
+	}
+
+	result, err := parseResponse[createContainerResponse](resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create container: %w", err)
+	}
+
+	if result.Container == nil {
+		return nil, fmt.Errorf("no container returned in response")
+	}
+
+	info := containerToIncusInfo(result.Container)
+	return &info, nil
+}
+
+// ValidateCreate is GRPCClient.ValidateCreate over the REST API (#2925): it
+// POSTs req with dryRun set and requires the daemon to echo it. The body is the
+// request message itself (protojson, the camelCase names grpc-gateway accepts),
+// not a second hand-written copy of the create fields.
+func (c *HTTPClient) ValidateCreate(req *pb.CreateContainerRequest) error {
+	if req.GetNetworkTenant() != "" {
+		caps, err := c.GetNetworkTenantCapabilities()
+		if err != nil {
+			return fmt.Errorf("native Tenant capability check: %w", err)
+		}
+		if err := requireNativeTenantCapability(caps); err != nil {
+			return err
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	dry, ok := proto.Clone(req).(*pb.CreateContainerRequest)
+	if !ok {
+		return fmt.Errorf("clone create request: unexpected type")
+	}
+	dry.DryRun = true
+	body, err := protojson.Marshal(dry)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/containers", body)
+	if err != nil {
+		return fmt.Errorf("pre-flight check failed: %w", err)
+	}
+	result, err := parseResponse[createContainerResponse](resp)
+	if err != nil {
+		return fmt.Errorf("pre-flight check failed: %w", err)
+	}
+	if !result.DryRun {
+		return errDryRunNotHonoured
+	}
+	return nil
+}
+
+// ToggleAutoSleep writes the per-container auto-sleep opt-in
+// metadata via HTTP. See GRPCClient.ToggleAutoSleep for semantics.
+func (c *HTTPClient) ToggleAutoSleep(username string, enabled bool, idleThresholdMinutes int32) (*pb.ToggleAutoSleepResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/auto-sleep", url.PathEscape(username))
+	body, err := json.Marshal(toggleAutoSleepRequest{
+		Enabled:              enabled,
+		IdleThresholdMinutes: idleThresholdMinutes,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("toggle auto-sleep: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("toggle auto-sleep: status %d", resp.StatusCode)
+	}
+
+	out := &pb.ToggleAutoSleepResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// SetContainerTTL schedules (durationSeconds > 0) or clears (== 0) a
+// container's auto-delete TTL via the REST shim. Used by the containarium-run
+// keep-on-failure path so a kept debug box self-reaps (#264 TTL-404).
+//
+// A 404 (a daemon too old to expose /v1/containers/{name}/ttl) is mapped to
+// gRPC codes.Unimplemented so the `containarium ttl` CLI's isUnimplemented
+// soft-path fires identically across both transports — the box won't auto-
+// delete on an old daemon, but the Action doesn't hard-fail.
+func (c *HTTPClient) SetContainerTTL(username string, durationSeconds int64) (*pb.SetContainerTTLResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/ttl", url.PathEscape(username))
+	body, err := json.Marshal(setContainerTTLRequest{DurationSeconds: durationSeconds})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("set ttl: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, status.Errorf(codes.Unimplemented, "server does not expose SetContainerTTL (HTTP 404)")
+	}
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("set ttl: status %d", resp.StatusCode)
+	}
+
+	out := &pb.SetContainerTTLResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// SetContainerDeletePolicy protects (DELETE_POLICY_PROTECTED) or unprotects
+// (DELETE_POLICY_UNSPECIFIED) a container from the daemon's automated/bulk
+// deletion paths via the REST shim (#284).
+//
+// A 404 (a daemon too old to expose /v1/containers/{name}/delete-policy) is
+// mapped to gRPC codes.Unimplemented so the `containarium protect` CLI's
+// soft-path fires identically across both transports.
+func (c *HTTPClient) SetContainerDeletePolicy(username string, policy pb.DeletePolicy) (*pb.SetContainerDeletePolicyResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/delete-policy", url.PathEscape(username))
+	// Emit the enum by its proto JSON name so grpc-gateway decodes it into the
+	// DeletePolicy enum (it accepts the string form; a bare int would also work
+	// but the name is self-documenting on the wire).
+	body, err := json.Marshal(setContainerDeletePolicyRequest{DeletePolicy: policy.String()})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("set delete policy: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, status.Errorf(codes.Unimplemented, "server does not expose SetContainerDeletePolicy (HTTP 404)")
+	}
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("set delete policy: status %d", resp.StatusCode)
+	}
+
+	out := &pb.SetContainerDeletePolicyResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// SetContainerToolAccess records the tool-access level for platform-started
+// runs on a container via the REST shim (#2944); BOX_TOOL_ACCESS_UNSPECIFIED
+// clears it. A 404 (a daemon too old to expose /v1/containers/{name}/tool-access)
+// is mapped to gRPC codes.Unimplemented so callers see the same soft-path across
+// both transports.
+func (c *HTTPClient) SetContainerToolAccess(username string, level pb.BoxToolAccess) (*pb.SetContainerToolAccessResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/tool-access", url.PathEscape(username))
+	// The enum goes by its proto JSON name so grpc-gateway decodes it into the
+	// BoxToolAccess enum.
+	body, err := json.Marshal(setContainerToolAccessRequest{ToolAccess: level.String()})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("set tool access: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, status.Errorf(codes.Unimplemented, "server does not expose SetContainerToolAccess (HTTP 404)")
+	}
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("set tool access: status %d", resp.StatusCode)
+	}
+
+	out := &pb.SetContainerToolAccessResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// SetContainerAttribution merges labels onto an existing container via the REST
+// shim (cloud #746) — the daemon-side primitive the hosted control plane's
+// adopt flow (cloud #539) uses to stamp attribution on a pre-existing box. A
+// 404 (daemon too old to expose the endpoint) maps to codes.Unimplemented, so a
+// caller can soft-path it the same way as SetContainerDeletePolicy.
+func (c *HTTPClient) SetContainerAttribution(username string, labels map[string]string) (*pb.SetContainerAttributionResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/attribution", url.PathEscape(username))
+	body, err := json.Marshal(setContainerAttributionRequest{Labels: labels})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("set attribution: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, status.Errorf(codes.Unimplemented, "server does not expose SetContainerAttribution (HTTP 404)")
+	}
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("set attribution: status %d", resp.StatusCode)
+	}
+
+	out := &pb.SetContainerAttributionResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// StartContainer starts a stopped container via HTTP. When
+// waitForReady is true the daemon blocks until the container's
+// primary TCP port accepts (or readyTimeoutSeconds elapses).
+func (c *HTTPClient) StartContainer(username string, waitForReady bool, readyTimeoutSeconds int32) (*pb.StartContainerResponse, error) {
+	timeout := 60 * time.Second
+	if waitForReady && readyTimeoutSeconds > 0 {
+		timeout = time.Duration(readyTimeoutSeconds+10) * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/start", url.PathEscape(username))
+	body, err := json.Marshal(startContainerRequest{
+		WaitForReady:        waitForReady,
+		ReadyTimeoutSeconds: readyTimeoutSeconds,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("start container: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("start container: status %d", resp.StatusCode)
+	}
+
+	out := &pb.StartContainerResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// StopContainer stops a running container via HTTP.
+func (c *HTTPClient) StopContainer(username string, force bool) (*pb.StopContainerResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/stop", url.PathEscape(username))
+	body, err := json.Marshal(stopContainerRequest{Force: force})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("stop container: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("stop container: status %d", resp.StatusCode)
+	}
+
+	out := &pb.StopContainerResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// ToggleMonitoring enables / disables OTel app telemetry on an
+// existing container via HTTP. Returns (message, monitoring_enabled, error).
+func (c *HTTPClient) ToggleMonitoring(username string, enabled bool) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/monitoring", url.PathEscape(username))
+	body, err := json.Marshal(toggleMonitoringRequest{Enabled: enabled})
+	if err != nil {
+		return "", false, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return "", false, fmt.Errorf("toggle monitoring: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return "", false, fmt.Errorf("%s", errResp.Error)
+		}
+		return "", false, fmt.Errorf("toggle monitoring: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Message           string `json:"message"`
+		MonitoringEnabled bool   `json:"monitoring_enabled"`
+	}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return "", false, fmt.Errorf("decode response: %w", err)
+	}
+	return result.Message, result.MonitoringEnabled, nil
+}
+
+// SetMetricsExport enables or disables opt-in export of host/container
+// infra metrics to the host cloud's native monitoring (#1069) via HTTP.
+// Enabling with an unresolvable provider credential (e.g. no GCP ADC)
+// or an unsupported provider (AWS, UNSPECIFIED) fails with the
+// server's error message intact — grpc-gateway maps FAILED_PRECONDITION
+// and INVALID_ARGUMENT to HTTP 400 and UNIMPLEMENTED to HTTP 501, but
+// the CLI only needs the message text, which carries the IAM
+// remediation hint for the credential-probe case.
+func (c *HTTPClient) SetMetricsExport(enabled bool, provider pb.CloudMetricsProvider, groups []pb.CloudMetricsGroup) (*pb.SetMetricsExportResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Emit the enums by their proto JSON names so grpc-gateway decodes
+	// them into CloudMetricsProvider / CloudMetricsGroup (#1081).
+	groupNames := make([]string, 0, len(groups))
+	for _, g := range groups {
+		groupNames = append(groupNames, g.String())
+	}
+	body, err := json.Marshal(setMetricsExportRequest{
+		Enabled:  enabled,
+		Provider: provider.String(),
+		Groups:   groupNames,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/system/metrics-export", body)
+	if err != nil {
+		return nil, fmt.Errorf("set metrics export: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotImplemented {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		msg := "server does not support this metrics export provider"
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			msg = errResp.Error
+		}
+		return nil, status.Error(codes.Unimplemented, msg)
+	}
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("set metrics export: status %d", resp.StatusCode)
+	}
+
+	out := &pb.SetMetricsExportResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// GetMetricsExport returns the current cloud-native metrics export
+// configuration and last-known health via HTTP (#1069).
+func (c *HTTPClient) GetMetricsExport() (*pb.GetMetricsExportResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v1/system/metrics-export", nil)
+	if err != nil {
+		return nil, fmt.Errorf("get metrics export: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("%s", errResp.Error)
+		}
+		return nil, fmt.Errorf("get metrics export: status %d", resp.StatusCode)
+	}
+
+	out := &pb.GetMetricsExportResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// RefreshToken exchanges a refresh token for a new
+// (access, refresh) pair. Unauthenticated endpoint —
+// the refresh token in the body IS the credential.
+// Returns (access, refresh, accessExpUnix, refreshExpUnix, error).
+func (c *HTTPClient) RefreshToken(refreshTok string) (string, string, int64, int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// #nosec G117 -- the refresh token IS this request's payload: the
+	// caller trades it for a new access token, so it has to be
+	// marshalled and sent. It travels over the client's HTTPS transport
+	// and is never logged (doRequest logs the path, not the body).
+	body, err := json.Marshal(refreshTokenRequest{RefreshToken: refreshTok})
+	if err != nil {
+		return "", "", 0, 0, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/tokens/refresh", body)
+	if err != nil {
+		return "", "", 0, 0, fmt.Errorf("refresh token: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", "", 0, 0, parseErr(b, resp.StatusCode, "refresh token")
+	}
+	var result struct {
+		AccessToken           string `json:"accessToken"`
+		RefreshToken          string `json:"refreshToken"`
+		AccessTokenExpiresAt  int64  `json:"accessTokenExpiresAt,string"`
+		RefreshTokenExpiresAt int64  `json:"refreshTokenExpiresAt,string"`
+	}
+	if err := json.Unmarshal(b, &result); err != nil {
+		return "", "", 0, 0, fmt.Errorf("decode refresh response: %w", err)
+	}
+	return result.AccessToken, result.RefreshToken, result.AccessTokenExpiresAt, result.RefreshTokenExpiresAt, nil
+}
+
+// Revocation is the CLI-facing shape of one revocation
+// row returned by ListRevokedTokens. Timestamps are
+// RFC3339 strings, matching the wire format.
+type Revocation struct {
+	JTI       string `json:"jti"`
+	ExpiresAt string `json:"expiresAt"`
+	RevokedAt string `json:"revokedAt"`
+	Reason    string `json:"reason"`
+}
+
+// ListRevokedTokens enumerates active revocations.
+// Admin-only on the server side; the daemon checks role +
+// tokens:write scope. `limit` 0 → server default (100);
+// server caps at 1000.
+func (c *HTTPClient) ListRevokedTokens(limit int32, includeExpired bool, jtiPrefix string) ([]Revocation, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	q := url.Values{}
+	if limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", limit))
+	}
+	if includeExpired {
+		q.Set("includeExpired", "true")
+	}
+	if jtiPrefix != "" {
+		q.Set("jtiPrefix", jtiPrefix)
+	}
+	path := "/v1/tokens/revoked"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list revoked tokens: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, parseErr(b, resp.StatusCode, "list revoked tokens")
+	}
+	var result struct {
+		Revocations []Revocation `json:"revocations"`
+	}
+	if err := json.Unmarshal(b, &result); err != nil {
+		return nil, fmt.Errorf("decode revocations: %w", err)
+	}
+	return result.Revocations, nil
+}
+
+// UnscopedTokenReport is the CLI-facing shape of
+// GetUnscopedTokenReport's response (#1679).
+type UnscopedTokenReport struct {
+	// grpc-gateway renders proto int64 as a quoted decimal string (#3250).
+	UnscopedCallCount int64  `json:"unscopedCallCount,string"`
+	Since             string `json:"since"`
+	StrictModeEnabled bool   `json:"strictModeEnabled"`
+}
+
+// GetUnscopedTokenReport reports how many recent calls used a
+// token with no scopes claim — the measurement to check before
+// arming CONTAINARIUM_STRICT_SCOPES. Admin-only on the server
+// side; the daemon checks role or tokens:read scope.
+func (c *HTTPClient) GetUnscopedTokenReport() (UnscopedTokenReport, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v1/tokens/unscoped-report", nil)
+	if err != nil {
+		return UnscopedTokenReport{}, fmt.Errorf("get unscoped token report: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return UnscopedTokenReport{}, parseErr(b, resp.StatusCode, "get unscoped token report")
+	}
+	var result UnscopedTokenReport
+	if err := json.Unmarshal(b, &result); err != nil {
+		return UnscopedTokenReport{}, fmt.Errorf("decode unscoped token report: %w", err)
+	}
+	return result, nil
+}
+
+// RevokeToken adds a JWT's jti to the daemon's revocation
+// list. Phase 1.2 follow-up — admin-only on the server side.
+// `reason` is free-form and recorded for forensics; pass ""
+// to let the daemon default it.
+func (c *HTTPClient) RevokeToken(jti, reason, expiresAt string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	body, err := json.Marshal(revokeTokenRequest{
+		JTI:       jti,
+		Reason:    reason,
+		ExpiresAt: expiresAt,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/tokens/revoke", body)
+	if err != nil {
+		return "", fmt.Errorf("revoke token: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", parseErr(b, resp.StatusCode, "revoke token")
+	}
+	var result struct {
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal(b, &result)
+	return result.Message, nil
+}
+
+// ExchangeDelegatedToken trades this client's own credential for a token
+// that acts FOR `subject` (containarium-cloud#1427). The caller must hold
+// the tokens:delegate scope, and the returned token can never carry more
+// scopes than the caller already had.
+//
+// Returns the token, its real expiry (read from the token's own exp claim
+// by the daemon, so it is safe to cache against), and the scopes actually
+// granted — which may be narrower than those requested.
+func (c *HTTPClient) ExchangeDelegatedToken(subject string, scopes, roles []string, expiresIn time.Duration) (string, time.Time, []string, []string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	body, err := json.Marshal(exchangeDelegatedTokenRequest{
+		Subject:          subject,
+		Scopes:           scopes,
+		Roles:            roles,
+		ExpiresInSeconds: int64(expiresIn / time.Second),
+	})
+	if err != nil {
+		return "", time.Time{}, nil, nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/tokens/delegate", body)
+	if err != nil {
+		return "", time.Time{}, nil, nil, fmt.Errorf("exchange delegated token: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", time.Time{}, nil, nil, parseErr(b, resp.StatusCode, "exchange delegated token")
+	}
+	// protojson renders google.protobuf.Timestamp as an RFC3339 string.
+	var result struct {
+		Token         string   `json:"token"`
+		ExpiresAt     string   `json:"expiresAt"`
+		GrantedScopes []string `json:"grantedScopes"`
+		GrantedRoles  []string `json:"grantedRoles"`
+	}
+	if err := json.Unmarshal(b, &result); err != nil {
+		return "", time.Time{}, nil, nil, fmt.Errorf("decode delegate response: %w", err)
+	}
+	var expiresAt time.Time
+	if result.ExpiresAt != "" {
+		// A malformed timestamp is not fatal: the token itself is usable and
+		// carries its own exp. The caller loses only the ability to cache.
+		expiresAt, _ = time.Parse(time.RFC3339, result.ExpiresAt)
+	}
+	return result.Token, expiresAt, result.GrantedScopes, result.GrantedRoles, nil
+}
+
+// SetSecret creates or updates a tenant secret via HTTP.
+// `delivery` is one of "" (server normalizes to env), "env",
+// or "file" (Phase 4.3 — Phase A lands the field; Phase B
+// switches behavior on it).
+func (c *HTTPClient) SetSecret(username, name, value, delivery string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	body, err := json.Marshal(setSecretRequest{
+		Username: username,
+		Name:     name,
+		Value:    value,
+		Delivery: delivery,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/secrets", body)
+	if err != nil {
+		return "", fmt.Errorf("set secret: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", parseErr(b, resp.StatusCode, "set secret")
+	}
+	var result struct {
+		Message string `json:"message"`
+	}
+	_ = json.Unmarshal(b, &result)
+	return result.Message, nil
+}
+
+// GetSecret reads a single secret's plaintext value via HTTP.
+func (c *HTTPClient) GetSecret(username, name string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	path := fmt.Sprintf("/v1/secrets/%s/%s", url.PathEscape(username), url.PathEscape(name))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return "", fmt.Errorf("get secret: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", parseErr(b, resp.StatusCode, "get secret")
+	}
+	var result struct {
+		Value string `json:"value"`
+	}
+	_ = json.Unmarshal(b, &result)
+	return result.Value, nil
+}
+
+// ListSecrets returns metadata for every secret owned by the tenant.
+// Each entry is the name/version/timestamps tuple — values are only
+// readable via GetSecret per-name.
+//
+// Decoded with protojson into the generated SecretMetadata, matching what
+// GRPCClient.ListSecrets returns, so both transports hand callers the
+// same type. The previous []map[string]interface{} return let a
+// field-name mismatch pass unnoticed: grpc-gateway is configured with
+// UseProtoNames=false, so it emits `updatedAt`, while the CLI read
+// `updated_at` and printed <nil> (#1219).
+func (c *HTTPClient) ListSecrets(username string) ([]*pb.SecretMetadata, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	path := fmt.Sprintf("/v1/secrets/%s", url.PathEscape(username))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list secrets: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, parseErr(b, resp.StatusCode, "list secrets")
+	}
+	var result pb.ListSecretsResponse
+	// Unknown fields are tolerated so a newer daemon adding a field does
+	// not break an older CLI; a malformed body is still an error, which
+	// the old code discarded.
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(b, &result); err != nil {
+		return nil, fmt.Errorf("decode secrets response: %w", err)
+	}
+	return result.GetSecrets(), nil
+}
+
+// DeleteSecret removes a tenant secret via HTTP.
+func (c *HTTPClient) DeleteSecret(username, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	path := fmt.Sprintf("/v1/secrets/%s/%s", url.PathEscape(username), url.PathEscape(name))
+	resp, err := c.doRequest(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return fmt.Errorf("delete secret: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return parseErr(b, resp.StatusCode, "delete secret")
+	}
+	return nil
+}
+
+// RefreshSecrets re-stamps the tenant's secrets into the LXC env.
+func (c *HTTPClient) RefreshSecrets(username string) (string, int32, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	path := fmt.Sprintf("/v1/secrets/%s/refresh", url.PathEscape(username))
+	resp, err := c.doRequest(ctx, http.MethodPost, path, []byte("{}"))
+	if err != nil {
+		return "", 0, fmt.Errorf("refresh secrets: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", 0, parseErr(b, resp.StatusCode, "refresh secrets")
+	}
+	var result struct {
+		Message string `json:"message"`
+		Stamped int32  `json:"stamped"`
+	}
+	_ = json.Unmarshal(b, &result)
+	return result.Message, result.Stamped, nil
+}
+
+// SetTenantKMSKey sets (or, with an empty keyResourceName, clears) a
+// tenant's per-tenant KMS key via HTTP (#1630). Admin role + explicit
+// secrets:write scope required on the token.
+func (c *HTTPClient) SetTenantKMSKey(username, keyResourceName string) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	body, err := json.Marshal(setTenantKMSKeyRequest{KekResourceName: keyResourceName})
+	if err != nil {
+		return "", false, fmt.Errorf("marshal request: %w", err)
+	}
+	path := fmt.Sprintf("/v1/secrets/%s/kms-key", url.PathEscape(username))
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return "", false, fmt.Errorf("set tenant kms key: %w", err)
+	}
+	defer drainClose(resp)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", false, parseErr(b, resp.StatusCode, "set tenant kms key")
+	}
+	var result struct {
+		Message      string `json:"message"`
+		HasTenantKey bool   `json:"hasTenantKey"`
+	}
+	_ = json.Unmarshal(b, &result)
+	return result.Message, result.HasTenantKey, nil
+}
+
+// parseErr is a tiny helper used across the secrets HTTP methods to
+// surface the server's structured error body (`{"error":"..."}`)
+// when present, falling back to the status code otherwise.
+func parseErr(body []byte, status int, op string) error {
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
+		return fmt.Errorf("%s", errResp.Error)
+	}
+	return fmt.Errorf("%s: status %d", op, status)
+}
+
+// ResizeContainer changes a container's CPU / memory / disk via HTTP.
+// Empty string for any field means "no change". Disk can only grow.
+// memoryRequest/cpuRequest are the K8s scheduler-request counterparts to
+// memory/cpu (K8s backend only, ignored on LXC); empty leaves the existing
+// request alone, even when the matching limit changes.
+func (c *HTTPClient) ResizeContainer(username, cpu, memory, disk, memoryRequest, cpuRequest string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/resize", url.PathEscape(username))
+	body, err := json.Marshal(resizeContainerRequest{
+		CPU:           cpu,
+		Memory:        memory,
+		Disk:          disk,
+		MemoryRequest: memoryRequest,
+		CPURequest:    cpuRequest,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPut, path, body)
+	if err != nil {
+		return "", fmt.Errorf("resize container: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return "", fmt.Errorf("%s", errResp.Error)
+		}
+		return "", fmt.Errorf("resize container: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	return result.Message, nil
+}
+
+// DeleteContainer deletes a container via HTTP
+func (c *HTTPClient) DeleteContainer(username string, force bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s", url.PathEscape(username))
+	if force {
+		path += "?force=true"
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return fmt.Errorf("failed to delete container: %w", err)
+	}
+	defer drainClose(resp)
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return fmt.Errorf("%s", errResp.Error)
+		}
+		return fmt.Errorf("failed to delete container: status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// StartEgressProxy asks the control plane (or daemon) to bridge a host-loopback
+// SOCKS (exposed by the caller via ssh -R) into a box's netns (#808). Returns
+// the in-box SOCKS address. HTTP counterpart of GRPCClient.StartEgressProxy.
+func (c *HTTPClient) StartEgressProxy(containerName string, upstreamPort, proxyPort int32) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	body, err := json.Marshal(startEgressProxyRequest{
+		ContainerName: containerName,
+		UpstreamPort:  upstreamPort,
+		ProxyPort:     proxyPort,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/network/egress-proxy", body)
+	if err != nil {
+		return "", fmt.Errorf("failed to start egress proxy: %w", err)
+	}
+	defer drainClose(resp)
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return "", fmt.Errorf("%s", errResp.Error)
+		}
+		return "", fmt.Errorf("failed to start egress proxy: status %d", resp.StatusCode)
+	}
+
+	var out struct {
+		SocksAddress string `json:"socksAddress"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("failed to decode egress proxy response: %w", err)
+	}
+	return out.SocksAddress, nil
+}
+
+// StopEgressProxy tears down the egress-via-client relay for a box. Idempotent
+// (a 404 — already gone — is success).
+func (c *HTTPClient) StopEgressProxy(containerName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	resp, err := c.doRequest(ctx, http.MethodDelete, "/v1/network/egress-proxy/"+url.PathEscape(containerName), nil)
+	if err != nil {
+		return fmt.Errorf("failed to stop egress proxy: %w", err)
+	}
+	defer drainClose(resp)
+
+	if resp.StatusCode >= 400 && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("failed to stop egress proxy: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// GetContainer gets information about a specific container via HTTP
+func (c *HTTPClient) GetContainer(username string) (*incus.ContainerInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s", url.PathEscape(username))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container: %w", err)
+	}
+
+	result, err := parseResponse[getContainerResponse](resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container: %w", err)
+	}
+
+	if result.Container == nil {
+		return nil, fmt.Errorf("no container returned in response")
+	}
+
+	info := containerToIncusInfo(result.Container)
+	return &info, nil
+}
+
+// AddCollaborator adds a collaborator to a container via HTTP.
+func (c *HTTPClient) AddCollaborator(ownerUsername, collaboratorUsername string, sshPublicKeys []string, grantSudo, grantContainerRuntime bool) (*pb.AddCollaboratorResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := &pb.AddCollaboratorRequest{
+		OwnerUsername:         ownerUsername,
+		CollaboratorUsername:  collaboratorUsername,
+		SshPublicKeys:         sshPublicKeys,
+		GrantSudo:             grantSudo,
+		GrantContainerRuntime: grantContainerRuntime,
+	}
+	body, err := protojson.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+
+	path := fmt.Sprintf("/v1/containers/%s/collaborators", url.PathEscape(ownerUsername))
+	resp, err := c.doRequest(ctx, http.MethodPost, path, json.RawMessage(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to add collaborator: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "add collaborator")
+	}
+	out := &pb.AddCollaboratorResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// RemoveCollaborator removes a collaborator from a container via HTTP.
+func (c *HTTPClient) RemoveCollaborator(ownerUsername, collaboratorUsername string) (*pb.RemoveCollaboratorResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/collaborators/%s", url.PathEscape(ownerUsername), url.PathEscape(collaboratorUsername))
+	resp, err := c.doRequest(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to remove collaborator: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "remove collaborator")
+	}
+	out := &pb.RemoveCollaboratorResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// ListCollaborators lists collaborators for a container via HTTP.
+func (c *HTTPClient) ListCollaborators(ownerUsername string) (*pb.ListCollaboratorsResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/collaborators", url.PathEscape(ownerUsername))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list collaborators: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "list collaborators")
+	}
+	out := &pb.ListCollaboratorsResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// ListBoxRuns lists a box's code-run records via HTTP (#2123).
+func (c *HTTPClient) ListBoxRuns(username string) ([]*pb.BoxRun, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.doRequest(ctx, http.MethodGet, runlog.BoxRunsPath(username), nil)
+	if err != nil {
+		return nil, fmt.Errorf("list box runs: %w", err)
+	}
+	defer drainClose(resp)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "list box runs")
+	}
+	out := &pb.ListBoxRunsResponse{}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out.GetRuns(), nil
+}
+
+// GetBoxRunUserStatus is the REST form of GRPCClient.GetBoxRunUserStatus (#3274).
+// A 404 (a daemon too old to expose the route) maps to codes.Unimplemented so
+// callers see the same soft path across both transports.
+func (c *HTTPClient) GetBoxRunUserStatus(username string) (*pb.GetBoxRunUserStatusResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	path := fmt.Sprintf("/v1/containers/%s/run-user/status", url.PathEscape(username))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get box run user status: %w", err)
+	}
+	defer drainClose(resp)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, status.Errorf(codes.Unimplemented, "server does not expose GetBoxRunUserStatus (HTTP 404)")
+	}
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "get box run user status")
+	}
+	out := &pb.GetBoxRunUserStatusResponse{}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// SweepBoxRunCheckouts is the REST form of GRPCClient.SweepBoxRunCheckouts
+// (#3296). A 404 (a daemon too old to expose the route) maps to
+// codes.Unimplemented, as on the gRPC transport.
+func (c *HTTPClient) SweepBoxRunCheckouts(req *pb.SweepBoxRunCheckoutsRequest) (*pb.SweepBoxRunCheckoutsResponse, error) {
+	body, err := protojson.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sweepBoxRunCheckoutsTimeout)
+	defer cancel()
+	path := fmt.Sprintf("/v1/containers/%s/code-run-checkouts:sweep", url.PathEscape(req.GetUsername()))
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("sweep box run checkouts: %w", err)
+	}
+	defer drainClose(resp)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound && !bytes.Contains(bodyBytes, []byte(`"code"`)) {
+		return nil, status.Errorf(codes.Unimplemented, "server does not expose SweepBoxRunCheckouts (HTTP 404)")
+	}
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "sweep box run checkouts")
+	}
+	out := &pb.SweepBoxRunCheckoutsResponse{}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// TailBoxRunLog reads one window of a box run's log via HTTP (#2123).
+func (c *HTTPClient) TailBoxRunLog(req *pb.TailBoxRunLogRequest) (*pb.TailBoxRunLogResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.doRequest(ctx, http.MethodGet, runlog.BoxQuery(req), nil)
+	if err != nil {
+		return nil, fmt.Errorf("tail box run log: %w", err)
+	}
+	defer drainClose(resp)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "tail box run log")
+	}
+	out := &pb.TailBoxRunLogResponse{}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// GetRunApprovalKey returns a box's approval public key via HTTP (#2184).
+func (c *HTTPClient) GetRunApprovalKey(username string) (*pb.GetRunApprovalKeyResponse, error) {
+	out := &pb.GetRunApprovalKeyResponse{}
+	return out, c.doProto(http.MethodGet, runlog.RunApprovalKeyPath(username), nil, out, "get run approval key")
+}
+
+// ListRunInputs lists a box run's open permission requests via HTTP (#2184).
+func (c *HTTPClient) ListRunInputs(req *pb.ListRunInputsRequest) (*pb.ListRunInputsResponse, error) {
+	out := &pb.ListRunInputsResponse{}
+	return out, c.doProto(http.MethodGet, runlog.RunInputsPath(req.GetUsername(), req.GetRunName()), nil, out, "list run inputs")
+}
+
+// AnswerRunInput answers one permission request via HTTP (#2184).
+func (c *HTTPClient) AnswerRunInput(req *pb.AnswerRunInputRequest) (*pb.AnswerRunInputResponse, error) {
+	body, err := protojson.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+	out := &pb.AnswerRunInputResponse{}
+	return out, c.doProto(http.MethodPost, runlog.RunInputAnswerPath(req.GetUsername(), req.GetRunName(), req.GetRequestId()), body, out, "answer run input")
+}
+
+// doProto sends one request and decodes a proto JSON response into out.
+func (c *HTTPClient) doProto(method, path string, body []byte, out proto.Message, what string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.doRequest(ctx, method, path, body)
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	defer drainClose(resp)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return httpError(bodyBytes, resp.StatusCode, what)
+	}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(bodyBytes, out); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
+// DebugContainer returns a diagnostic report for a container's SSH path.
+func (c *HTTPClient) DebugContainer(username string) (*pb.DebugContainerResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/debug", url.PathEscape(username))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to debug container: %w", err)
+	}
+	defer drainClose(resp)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("debug container request failed (%d): %s", resp.StatusCode, string(body))
+	}
+
+	out := &pb.DebugContainerResponse{}
+	if err := protojson.Unmarshal(body, out); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	return out, nil
+}
+
+// GetConsoleLog returns a VM instance's boot-time console ring-buffer log.
+func (c *HTTPClient) GetConsoleLog(username string) (*pb.GetConsoleLogResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/console-log", url.PathEscape(username))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get console log: %w", err)
+	}
+	defer drainClose(resp)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("console log request failed (%d): %s", resp.StatusCode, string(body))
+	}
+
+	out := &pb.GetConsoleLogResponse{}
+	if err := protojson.Unmarshal(body, out); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	return out, nil
+}
+
+// GetSystemInfo gets system information via HTTP
+func (c *HTTPClient) GetSystemInfo() (*incus.ServerInfo, error) {
+	info, err := c.getSystemInfo()
+	if err != nil {
+		return nil, err
+	}
+	return &incus.ServerInfo{
+		Version:              info.IncusVersion,
+		KernelVersion:        info.KernelVersion,
+		TotalMemoryBytes:     info.TotalMemoryBytes,
+		AvailableMemoryBytes: info.AvailableMemoryBytes,
+		CPUBudget: cpuBudgetFromWire(info.TotalCpus, info.CommittedCpuCores,
+			info.CoreCommittedCpuCores, info.CpuAdmissionMode, info.CpuOvercommitFactor),
+		StoragePools: storagePoolsFromWire(info.StoragePools),
+	}, nil
+}
+
+// getSystemInfo shares the generated response decoder with backup status.
+// DiscardUnknown keeps older clients compatible with newer daemons (#3292).
+func (c *HTTPClient) getSystemInfo() (*pb.SystemInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v1/system/info", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get system info: %w", err)
+	}
+
+	defer drainClose(resp)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get system info: failed to read response body: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("failed to get system info: %w", httpError(body, resp.StatusCode, "get system info"))
+	}
+	var result pb.GetSystemInfoResponse
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to get system info: failed to parse response: %w", err)
+	}
+
+	if result.Info == nil {
+		return nil, fmt.Errorf("no system info returned in response")
+	}
+
+	return result.Info, nil
+}
+
+// ManagedBackupKeyConfigured reports whether the daemon has a managed backup
+// key, from SystemInfo.managed_backup_key_configured (#3213).
+func (c *HTTPClient) ManagedBackupKeyConfigured() (bool, error) {
+	info, err := c.getSystemInfo()
+	if err != nil {
+		return false, err
+	}
+	return info.ManagedBackupKeyConfigured, nil
+}
+
+// InstallStack installs a stack or base script on a running container via HTTP
+func (c *HTTPClient) InstallStack(username, stackID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/containers/%s/install-stack", url.PathEscape(username))
+	reqBody, err := json.Marshal(installStackRequest{StackID: stackID})
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPost, path, reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to install stack: %w", err)
+	}
+	defer drainClose(resp)
+
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != "" {
+			return fmt.Errorf("%s", errResp.Error)
+		}
+		return fmt.Errorf("failed to install stack: status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// ListRecipes lists all built-in recipes via HTTP.
+func (c *HTTPClient) ListRecipes() ([]*pb.Recipe, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v1/recipes", nil)
+	if err != nil {
+		return nil, fmt.Errorf("list recipes: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "list recipes")
+	}
+	out := &pb.ListRecipesResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out.Recipes, nil
+}
+
+// GetRecipe fetches a single recipe definition via HTTP.
+func (c *HTTPClient) GetRecipe(id string) (*pb.Recipe, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/recipes/%s", url.PathEscape(id))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get recipe: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "get recipe")
+	}
+	out := &pb.GetRecipeResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out.Recipe, nil
+}
+
+// GetWorkspaceAccess fetches the zero-click bootstrap URL for an
+// agent-workspace box via HTTP.
+func (c *HTTPClient) GetWorkspaceAccess(name string) (*pb.GetWorkspaceAccessResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/recipes/workspace/%s/access", url.PathEscape(name))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get workspace access: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "get workspace access")
+	}
+	out := &pb.GetWorkspaceAccessResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// DeployRecipe provisions a new dedicated container from a recipe via HTTP.
+// guardrailInput is the dataset and attestation for a guardrail-gated recipe
+// (#2368); nil for an ungated one.
+func (c *HTTPClient) DeployRecipe(recipeID, name, gpu, backendID, pool string, params map[string]string, guardrailInput *pb.GuardrailGateInput) (*pb.DeployRecipeResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute) // image + model pulls can take time
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/recipes/%s/deploy", url.PathEscape(recipeID))
+	reqBody := deployRecipeRequest{
+		RecipeID:   recipeID,
+		Name:       name,
+		GPU:        gpu,
+		BackendID:  backendID,
+		Pool:       pool,
+		Parameters: params,
+	}
+	if guardrailInput != nil {
+		raw, err := protojson.Marshal(guardrailInput)
+		if err != nil {
+			return nil, fmt.Errorf("marshal guardrail_input: %w", err)
+		}
+		reqBody.GuardrailInput = raw
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("deploy recipe: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "deploy recipe")
+	}
+	out := &pb.DeployRecipeResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// ListAgentEngines reports, for each agent engine, whether a run naming it
+// would be refused right now (#2223) — via HTTP.
+func (c *HTTPClient) ListAgentEngines() (*pb.ListAgentEnginesResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v1/agent-engines", nil)
+	if err != nil {
+		return nil, fmt.Errorf("list agent engines: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "list agent engines")
+	}
+	out := &pb.ListAgentEnginesResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// ListAgentSkills lists all built-in agent skills via HTTP.
+func (c *HTTPClient) ListAgentSkills() ([]*pb.AgentSkill, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v1/agent-skills", nil)
+	if err != nil {
+		return nil, fmt.Errorf("list agent skills: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "list agent skills")
+	}
+	out := &pb.ListAgentSkillsResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out.Skills, nil
+}
+
+// GetAgentSkill fetches a single agent skill definition via HTTP.
+func (c *HTTPClient) GetAgentSkill(id string) (*pb.AgentSkill, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/agent-skills/%s", url.PathEscape(id))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get agent skill: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "get agent skill")
+	}
+	out := &pb.GetAgentSkillResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out.Skill, nil
+}
+
+// ProvisionSkillBox creates or reuses a skill's deterministic box
+// (agent-<skill_id>) via HTTP, without running it: no token minted, nothing
+// seeded, no model call (#2272).
+func (c *HTTPClient) ProvisionSkillBox(skillID, backendID, pool string) (*pb.ProvisionSkillBoxResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // box deploy can take time
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/agent-skills/%s/provision-box", url.PathEscape(skillID))
+	body, err := json.Marshal(provisionSkillBoxRequest{SkillID: skillID, BackendID: backendID, Pool: pool})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("provision skill box: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "provision skill box")
+	}
+	out := &pb.ProvisionSkillBoxResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// GetSkillBoxCredentialStatus reports, via HTTP, whether a skill's
+// already-provisioned box has a credential its configured coding engine
+// would use — the source NAME only, never a value (#2272, #2030 posture).
+func (c *HTTPClient) GetSkillBoxCredentialStatus(skillID string) (*pb.GetSkillBoxCredentialStatusResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/agent-skills/%s/credential-status", url.PathEscape(skillID))
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get skill box credential status: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "get skill box credential status")
+	}
+	out := &pb.GetSkillBoxCredentialStatusResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// RunAgentSkill provisions a skill's box, mints a scoped token, runs one task,
+// and returns the box via HTTP. gitSource/gitRef/gitCredential (#1859) fetch a
+// repo into the run's workspace before the agent starts; empty gitSource
+// means no fetch. trackerConnection (#2042) binds the run to one of the
+// caller's tracker connections; empty means no binding. engine (#2228) wins
+// over the skill's own manifest engine; AGENT_ENGINE_UNSPECIFIED means "use
+// the manifest", unchanged pre-#2228 behavior.
+func (c *HTTPClient) RunAgentSkill(skillID, backendID, pool, inputJSON, gitSource, gitRef, gitCredential, trackerConnection string, engine pb.AgentEngine) (*pb.RunAgentSkillResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute) // box provisioning can take time
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/agent-skills/%s/run", url.PathEscape(skillID))
+	body, err := json.Marshal(runAgentSkillRequest{
+		SkillID:           skillID,
+		BackendID:         backendID,
+		Pool:              pool,
+		InputJSON:         inputJSON,
+		GitSource:         gitSource,
+		GitRef:            gitRef,
+		GitCredential:     gitCredential,
+		TrackerConnection: trackerConnection,
+		Engine:            engineJSON(engine),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("run agent skill: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "run agent skill")
+	}
+	out := &pb.RunAgentSkillResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// EnqueueAgentTask places a task on the pull queue for a skill (prototype).
+func (c *HTTPClient) EnqueueAgentTask(skillID, inputJSON string) (*pb.EnqueueAgentTaskResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	body, err := json.Marshal(enqueueAgentTaskRequest{
+		SkillID:   skillID,
+		InputJSON: inputJSON,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/agent-tasks", body)
+	if err != nil {
+		return nil, fmt.Errorf("enqueue agent task: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "enqueue agent task")
+	}
+	out := &pb.EnqueueAgentTaskResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// StartAgentWorker launches a poll-mode worker box for a skill (prototype).
+func (c *HTTPClient) StartAgentWorker(skillID, backendID, pool, workerID string) (*pb.StartAgentWorkerResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute) // box provisioning can take time
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/agent-skills/%s/worker", url.PathEscape(skillID))
+	body, err := json.Marshal(startAgentWorkerRequest{
+		SkillID:   skillID,
+		BackendID: backendID,
+		Pool:      pool,
+		WorkerID:  workerID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("start agent worker: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "start agent worker")
+	}
+	out := &pb.StartAgentWorkerResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
+// SendAgentTask delegates a task to a running peer agent over A2A via HTTP.
+func (c *HTTPClient) SendAgentTask(fromSkillID, toPeerID, inputJSON string) (*pb.AgentArtifact, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	path := fmt.Sprintf("/v1/agent-skills/%s/call", url.PathEscape(toPeerID))
+	body, err := json.Marshal(sendAgentTaskRequest{
+		FromSkillID: fromSkillID,
+		ToPeerID:    toPeerID,
+		InputJSON:   inputJSON,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("send agent task: %w", err)
+	}
+	defer drainClose(resp)
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "send agent task")
+	}
+	out := &pb.SendAgentTaskResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out.Artifact, nil
+}
+
+// ListCrews lists all built-in crews via HTTP.
+func (c *HTTPClient) ListCrews() ([]*pb.Crew, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v1/crews", nil)
+	if err != nil {
+		return nil, fmt.Errorf("list crews: %w", err)
+	}
+	defer drainClose(resp)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, httpError(bodyBytes, resp.StatusCode, "list crews")
+	}
+	out := &pb.ListCrewsResponse{}
+	if err := protojson.Unmarshal(bodyBytes, out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out.Crews, nil
+}
+
+// GetCrew fetches a single crew definition via HTTP.
+func (c *HTTPClient) GetCrew(id string) (*pb.Crew, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/v1/crews/%s", url.PathEscape(id)), nil)
+	if err != nil {

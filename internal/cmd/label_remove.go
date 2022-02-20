@@ -18,3 +18,43 @@ Examples:
   # Remove a single label
   containarium label remove alice env
 
+  # Remove multiple labels at once
+  containarium label remove alice env project team`,
+	Aliases: []string{"rm", "delete"},
+	Args:    cobra.MinimumNArgs(2),
+	RunE:    runLabelRemove,
+}
+
+func init() {
+	labelCmd.AddCommand(labelRemoveCmd)
+}
+
+func runLabelRemove(cmd *cobra.Command, args []string) error {
+	username := args[0]
+	keys := args[1:]
+
+	// Remove labels - use remote or local mode
+	if httpMode && serverAddr != "" {
+		return removeLabelsRemoteHTTP(username, keys)
+	} else if serverAddr != "" {
+		return fmt.Errorf("label operations not yet supported via gRPC - use --http mode")
+	}
+
+	return removeLabelsLocal(username, keys)
+}
+
+func removeLabelsRemoteHTTP(username string, keys []string) error {
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	// Get container first to verify it exists
+	info, err := httpClient.GetContainer(username)
+	if err != nil {
+		return fmt.Errorf("container %q not found: %w", username, err)
+	}
+
+	// Find which keys exist
+	removedCount := 0
