@@ -48,3 +48,28 @@ func TestHealthEndpoint_CorePostgresReadiness(t *testing.T) {
 			var got map[string]string
 			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 				t.Fatal(err)
+			}
+			want := map[string]string{"status": string(tc.want), "version": version.GetVersion()}
+			if tc.want == healthStatusDegraded {
+				want["reason"] = "postgres unavailable"
+			}
+			if len(got) != len(want) {
+				t.Errorf("health fields = %v, want only %v", got, want)
+			}
+			for key, value := range want {
+				if got[key] != value {
+					t.Errorf("%s = %q, want %q", key, got[key], value)
+				}
+			}
+		})
+	}
+}
+
+// Exercise the actual gateway mux on the early-bound port. Handing over
+// the listener must not make a failed startup Postgres check look healthy.
+func TestGatewayStart_KeepsPostgresDegradedAfterStartupHandover(t *testing.T) {
+	sl := startStartupListener(t, "initialising daemon")
+	base := "http://" + sl.Addr().String()
+	h := health.NewServer()
+	h.SetServingStatus(policyreadiness.CorePostgresService, healthpb.HealthCheckResponse_NOT_SERVING)
+
