@@ -115,3 +115,120 @@ func queuedThrottle(t *testing.T) (*responderFixture, *ActingSink) {
 }
 
 func queueOne(t *testing.T, fx *responderFixture, sink *ActingSink) responseJob {
+	t.Helper()
+	if _, err := sink.Upsert(context.Background(), &threatdetect.Finding{Rule: ruleMinerSignature,
+		Severity: pb.ThreatSeverity_THREAT_SEVERITY_HIGH, TenantID: "tenant-a", Container: "box-a", Subject: "name:xmrig"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case job := <-fx.r.queue:
+		return job
+	default:
+		t.Fatal("nothing queued")
+		return responseJob{}
+	}
+}
+
+func setCPUCalls(fx *responderFixture) int {
+	fx.act.mu.Lock()
+	defer fx.act.mu.Unlock()
+	n := 0
+	for _, c := range fx.act.calls {
+		if strings.HasPrefix(c, "SetCPULimit:") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestQueuedResponse_DoesNotUndoOperatorRelease (#2638 re-review blocker): a
+// response already queued when the operator releases the action must not
+// re-throttle the box or write APPLIED onto the resolved finding.
+func TestQueuedResponse_DoesNotUndoOperatorRelease(t *testing.T) {
+	ctx := context.Background()
+	fx, sink := queuedThrottle(t)
+	first := queueOne(t, fx, sink)
+	fx.r.runJob(ctx, first) // the throttle is applied
+	if _, err := fx.actions.Open(ctx, "box-a"); err != nil {
+		t.Fatalf("first job did not apply: %v", err)
+	}
+	stale := queueOne(t, fx, sink) // the rule re-fires while throttled
+	if _, _, err := fx.r.Release(ctx, "box-a"); err != nil {
+		t.Fatal(err)
+	}
+	before := setCPUCalls(fx)
+
+	fx.r.runJob(ctx, stale)
+
+	if n := setCPUCalls(fx); n != before {
+		t.Fatalf("worker touched the CPU limit %d time(s) after the release", n-before)
+	}
+	if _, err := fx.actions.Open(ctx, "box-a"); !errors.Is(err, threatdetect.ErrNoOpenAction) {
+		t.Fatalf("an action is open again after the release: %v", err)
+	}
+	f, _ := fx.findings.Get(ctx, stale.f.ID)
+	if f.State != threatdetect.FindingStateResolved || f.Response == nil || f.Response.State != pb.ResponseState_RESPONSE_STATE_RELEASED {
+		t.Fatalf("finding = state %s response %+v, want resolved with RELEASED", f.State, f.Response)
+	}
+	if d := auditDetails(fx.audit, "response-skipped"); len(d) != 1 || !strings.Contains(d[0], "no longer open") {
+		t.Fatalf("response-skipped audit = %v", d)
+	}
+}
+
+// TestQueuedResponse_SkipsFindingResolvedWhileQueued: a finding the sentry
+// (or an operator) resolved while its response waited is left alone.
+func TestQueuedResponse_SkipsFindingResolvedWhileQueued(t *testing.T) {
+	ctx := context.Background()
+	fx, sink := queuedThrottle(t)
+	job := queueOne(t, fx, sink)
+	if _, err := fx.findings.Resolve(ctx, job.f.ID); err != nil {
+		t.Fatal(err)
+	}
+	fx.r.runJob(ctx, job)
+	if setCPUCalls(fx) != 0 {
+		t.Fatal("throttled a box whose finding was resolved while queued")
+	}
+	if f, _ := fx.findings.Get(ctx, job.f.ID); f.Response != nil {
+		t.Fatalf("wrote response %+v onto a resolved finding", f.Response)
+	}
+	if len(auditDetails(fx.audit, "response-skipped")) != 1 {
+		t.Fatal("skip not audited")
+	}
+}
+
+// TestQueuedResponse_SkipsActionReleasedAfterQueueing: the TTL backstop
+// released the box's action after the job was queued, but the finding is
+// still open: the stale job must not re-apply. The release is read from the
+// box's own action row (#2766).
+func TestQueuedResponse_SkipsActionReleasedAfterQueueing(t *testing.T) {
+	ctx := context.Background()
+	fx, sink := queuedThrottle(t)
+	fx.r.runJob(ctx, queueOne(t, fx, sink)) // box-a throttled
+	job := queueOne(t, fx, sink)            // the rule re-fires while throttled
+	if n := fx.r.SweepExpired(ctx, fx.clock.Add(2*time.Hour)); n != 1 {
+		t.Fatalf("SweepExpired released %d, want 1", n)
+	}
+	before := setCPUCalls(fx)
+	fx.r.runJob(ctx, job)
+	if n := setCPUCalls(fx); n != before {
+		t.Fatal("re-applied an action released after the job was queued")
+	}
+	if f, _ := fx.findings.Get(ctx, job.f.ID); f.State != threatdetect.FindingStateOpen {
+		t.Fatalf("finding state = %s, want open (a TTL release does not resolve)", f.State)
+	}
+	if d := auditDetails(fx.audit, "response-skipped"); len(d) != 1 || !strings.Contains(d[0], "released by ttl") {
+		t.Fatalf("response-skipped audit = %v", d)
+	}
+}
+
+// queueSignature queues a miner-signature finding carrying the exec a kill
+// would target (pid), with no worker running.
+func queueSignature(t *testing.T, fx *responderFixture, sink *ActingSink, pid uint32) responseJob {
+	t.Helper()
+	if _, err := sink.Upsert(context.Background(), &threatdetect.Finding{Rule: ruleMinerSignature,
+		Severity: pb.ThreatSeverity_THREAT_SEVERITY_HIGH, TenantID: "tenant-a", Container: "box-a", Subject: "name:xmrig",
+		Evidence: threatdetect.Evidence{Execs: []threatdetect.ExecEvidence{{PID: pid, Comm: "xmrig", Filename: "/tmp/xmrig",
+			Argv: "./xmrig --donate-level 1", Matched: "name:xmrig"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}

@@ -86,33 +86,3 @@ func TestLoadOrCreateOTelBearer_EmptyFileRejected(t *testing.T) {
 
 	_, err := LoadOrCreateOTelBearer()
 	if err == nil {
-		t.Fatal("empty file should be rejected")
-	}
-}
-
-func TestLoadOrCreateOTelBearer_CachedAfterFirstCall(t *testing.T) {
-	// Once loaded, subsequent calls return the cached value
-	// even if the env changes underneath. That's intentional
-	// — the daemon and every container start should see the
-	// same bearer, and rotating the bearer requires a
-	// daemon restart (matches the JWT secret contract).
-	resetBearerCache(t)
-	clearOTelEnv(t)
-	t.Setenv(otelBearerEnvOverride, "first")
-	if v, _ := LoadOrCreateOTelBearer(); v != "first" {
-		t.Fatalf("first load = %q", v)
-	}
-	t.Setenv(otelBearerEnvOverride, "second")
-	if v, _ := LoadOrCreateOTelBearer(); v != "first" {
-		t.Fatalf("second load = %q; should be cached as 'first'", v)
-	}
-}
-
-func TestGenerateAndPersistBearer_ProducesValidSecret(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "bearer")
-	v, err := generateAndPersistBearer(p)
-	if err != nil {
-		t.Fatalf("generate: %v", err)
-	}
-	if len(v) < 40 {
