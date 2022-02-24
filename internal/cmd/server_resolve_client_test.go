@@ -15,20 +15,3 @@ func writeDefaultServer(t *testing.T, defaultServer string) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	path, err := credentials.DefaultPath()
-	if err != nil {
-		t.Fatalf("DefaultPath: %v", err)
-	}
-	cf := credentials.NewCredentialsFile()
-	// Set (not a bare DefaultServer assignment) is required: Save
-	// auto-repairs an unset-in-Servers DefaultServer back to empty, so the
-	// server needs a real (if minimal) entry to survive the write.
-	cf.Set(defaultServer, credentials.ServerCreds{Token: "test-token"})
-	if err := credentials.Save(path, cf); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-}
-
-func TestResolveServerAddr_Client(t *testing.T) {
-	t.Run("non-empty flag/env wins over credentials file", func(t *testing.T) {
-		writeDefaultServer(t, "https://from-file.example.com")
-		if got := resolveServerAddr("https://from-flag.example.com"); got != "https://from-flag.example.com" {
