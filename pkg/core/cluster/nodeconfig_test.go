@@ -50,3 +50,21 @@ func TestNodeContainerConfig(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := nodeContainerConfig(tt.spec, tt.isolation, "poolname")
+
+			if cfg.Name != tt.spec.Name {
+				t.Fatalf("Name = %q, want %q", cfg.Name, tt.spec.Name)
+			}
+			if cfg.InstanceType != tt.wantType {
+				t.Fatalf("InstanceType = %q, want %q", cfg.InstanceType, tt.wantType)
+			}
+			if got := cfg.ExtraConfig["security.nesting"] == "true"; got != tt.wantNesting {
+				t.Fatalf("security.nesting = %v, want %v", got, tt.wantNesting)
+			}
+			if !tt.wantDisk {
+				if cfg.Disk != nil {
+					t.Fatalf("Disk = %+v, want none", cfg.Disk)
+				}
+				return
+			}

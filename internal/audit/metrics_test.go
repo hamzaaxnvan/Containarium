@@ -41,3 +41,47 @@ func TestPersistFailureReport_CountsAndLatchesFirstTimestamp(t *testing.T) {
 	if first.Since.IsZero() {
 		t.Fatal("Since is zero after the first failure, want a timestamp")
 	}
+
+	recordPersistFailure()
+	recordPersistFailure()
+	second := GetPersistFailureReport()
+	if second.Count != 3 {
+		t.Fatalf("Count = %d, want 3", second.Count)
+	}
+	if !second.Since.Equal(first.Since) {
+		t.Fatalf("Since changed from %v to %v — it must latch to the FIRST failure, not the latest", first.Since, second.Since)
+	}
+}
+
+// errAuditLogger always fails Log(), simulating a store outage — the
+// failure mode explicitly named in the report ("failed audit writes are
+// logged and not counted").
+type errAuditLogger struct{}
+
+func (errAuditLogger) Log(_ context.Context, _ *AuditEntry) error {
+	return errors.New("simulated store failure")
+}
+
+func TestGRPCInterceptor_LogErrorRecordsPersistFailure(t *testing.T) {
+	ResetPersistFailuresForTest()
+	t.Cleanup(ResetPersistFailuresForTest)
+
+	g := NewGRPCInterceptor()
+	g.setLogger(errAuditLogger{})
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(auth.MDKeyUsername, "alice"))
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) { return "ok", nil }
+	if _, err := g.Unary()(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/x/Y"}, handler); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if GetPersistFailureReport().Count >= 1 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("persist-failure count never reached 1 after a Log() error; got %d", GetPersistFailureReport().Count)
+}
+
