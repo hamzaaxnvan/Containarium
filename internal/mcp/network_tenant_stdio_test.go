@@ -97,3 +97,36 @@ func TestNativeTenantMCPStdioInitializeCreateAndQuery(t *testing.T) {
 			ID     int             `json:"id"`
 			Result json.RawMessage `json:"result"`
 			Error  json.RawMessage `json:"error"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &reply); err != nil {
+			t.Fatal(err)
+		}
+		if reply.ID != id || len(reply.Error) > 0 {
+			t.Fatalf("MCP %s failed", method)
+		}
+		var outcome struct {
+			IsError bool `json:"isError"`
+		}
+		if err := json.Unmarshal(reply.Result, &outcome); err != nil {
+			t.Fatal(err)
+		}
+		if outcome.IsError {
+			t.Fatalf("tool result error for %s", method)
+		}
+		return reply.Result
+	}
+	result := exchange(1, "initialize", map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "fixture", "version": "1"}})
+	if len(result) == 0 {
+		t.Fatal("initialize missing")
+	}
+	if _, err := in.Write([]byte("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")); err != nil {
+		t.Fatal(err)
+	}
+	tools := exchange(2, "tools/list", map[string]any{})
+	var list struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(tools, &list); err != nil {
+		t.Fatal(err)
