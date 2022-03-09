@@ -28,18 +28,3 @@ func TestIsolation_OrDefault(t *testing.T) {
 	}
 }
 
-func TestMemStore_NodeIsolationRoundTrips(t *testing.T) {
-	ctx := context.Background()
-	s := NewMemStore()
-	for _, tc := range []struct {
-		name string
-		in   Isolation
-		want Isolation
-	}{
-		{"unset", "", IsolationVM},
-		{"vm", IsolationVM, IsolationVM},
-		{"container", IsolationContainer, IsolationContainer},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := s.Create(ctx, &Cluster{
-				ID: tc.name, Owner: "alice", Name: tc.name,

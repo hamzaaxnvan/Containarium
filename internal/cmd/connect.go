@@ -82,3 +82,172 @@ func init() {
 	connectCmd.Flags().StringVar(&connectHost, "host", "", "override the SSH host (default: the box's ssh_host, else its IP)")
 	connectCmd.Flags().IntVar(&connectPort, "port", 22, "SSH port")
 	connectCmd.Flags().StringVar(&connectSession, "session", "", "run inside a named tmux session on the box (stateful; persists across calls). With --exec runs the command there; without --exec attaches your terminal.")
+	connectCmd.Flags().StringVar(&connectKeyWait, "key-wait", "", keyWaitFlagUsage)
+	rootCmd.AddCommand(connectCmd)
+}
+
+// ---- thin REST client (deliberately not ssh.go's sshHTTPClient: that
+// one maps 404→Unimplemented, which would mask "box not found") ---------
+
+type connectAPI struct {
+	hc     *http.Client
+	server string
+	token  string
+}
+
+func newConnectAPI(server string) (*connectAPI, error) {
+	tok := resolveAuthToken(server)
+	if tok == "" {
+		return nil, noTokenError(server)
+	}
+	return &connectAPI{
+		hc:     &http.Client{Timeout: 30 * time.Second},
+		server: server,
+		token:  tok,
+	}, nil
+}
+
+// do sends the request and returns the HTTP status so callers can
+// distinguish 404 (box not found) from other failures. out is decoded on
+// a 2xx response when non-nil.
+func (c *connectAPI) do(ctx context.Context, method, path string, body, out any) (int, error) {
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return 0, fmt.Errorf("marshal request: %w", err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.server+path, rdr)
+	if err != nil {
+		return 0, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if out != nil && len(rb) > 0 {
+			if err := json.Unmarshal(rb, out); err != nil {
+				return resp.StatusCode, fmt.Errorf("decode response: %w", err)
+			}
+		}
+		return resp.StatusCode, nil
+	}
+	return resp.StatusCode, fmt.Errorf("%s %s: status %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(rb)))
+}
+
+func (c *connectAPI) GetContainer(ctx context.Context, box string) (*connectcore.Container, error) {
+	var out connectcore.GetContainerResponse
+	st, err := c.do(ctx, http.MethodGet, "/v1/containers/"+url.PathEscape(box), nil, &out)
+	if st == http.StatusNotFound {
+		return nil, fmt.Errorf("box %q not found (check the name, or `containarium list`)", box)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &out.Container, nil
+}
+
+func (c *connectAPI) AuthorizeKey(ctx context.Context, box, pub string) error {
+	_, err := c.do(ctx, http.MethodPost,
+		"/v1/containers/"+url.PathEscape(box)+"/ssh-keys",
+		connectcore.AuthorizeKeyRequest{SshPublicKey: pub}, nil)
+	return err
+}
+
+// ---- command handler ---------------------------------------------------
+
+// obtainConnectKey returns the public key to authorize and the private
+// key path to authenticate with. With a non-empty keyPath it uses that
+// supplied public key; otherwise it reuses (or generates once) the managed
+// key the `ssh setup` flow already uses, so the user never hand-manages a
+// key. The private path defaults to the public path minus ".pub" unless
+// identity overrides it.
+//
+// Parameterized (not reading connect's own connectKeyPath/connectIdentity
+// package vars) so other commands needing the same "authorize a managed
+// key, connect over SSH" flow — `code install` (#1673) and `code
+// run`/`attach`/`status`/`stop` (#1674) — can call it with their own flag
+// values instead of colliding with connect's.
+func obtainConnectKey(keyPath, identity string) (pub, privPath string, err error) {
+	var pubPath string
+	if keyPath != "" {
+		pub, err = sshkey.ReadPublicKey(keyPath)
+		if err != nil {
+			return "", "", err
+		}
+		pubPath = keyPath
+	} else {
+		pubPath, pub, _, err = sshkey.LocateOrGenerate(sshkey.LocateOpts{})
+		if err != nil {
+			return "", "", fmt.Errorf("locate or generate managed key: %w", err)
+		}
+	}
+	privPath = identity
+	if privPath == "" {
+		privPath = strings.TrimSuffix(pubPath, ".pub")
+	}
+	return pub, privPath, nil
+}
+
+func runConnect(cmd *cobra.Command, args []string) error {
+	box := args[0]
+	if err := validateBoxName(box); err != nil {
+		return err
+	}
+	// Diagnostics go to stderr so --exec keeps stdout clean for command
+	// output (an agent parsing --exec output gets only the command's bytes).
+	diag := cmd.ErrOrStderr()
+
+	server := pickSSHServer(connectServer)
+	api, err := newConnectAPI(server)
+	if err != nil {
+		return err
+	}
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	c, err := api.GetContainer(ctx, box)
+	if err != nil {
+		return err
+	}
+	if !connectcore.IsRunning(c.State) {
+		return fmt.Errorf("box %q is %s, not running — start it first (`containarium wake %s`)",
+			box, connectcore.PrettyState(c.State), box)
+	}
+	target, err := connectcore.BuildTarget(c, connectUser, connectHost, connectPort)
+	if err != nil {
+		return err
+	}
+
+	pub, privPath, err := obtainConnectKey(connectKeyPath, connectIdentity)
+	if err != nil {
+		return err
+	}
+	if err := api.AuthorizeKey(ctx, box, pub); err != nil {
+		return fmt.Errorf("authorize key on %q: %w", box, err)
+	}
+	fp, _ := sshkey.Fingerprint(pub)
+	fmt.Fprintf(diag, "✓ %s → %s@%s (authorized %s)\n", box, target.User, target.Host, fp)
+
+	// This invocation just authorized the key, so a publickey denial is most
+	// likely the sentinel not having learned it yet: armed (#2013).
+	kw, err := newKeyWait(connectKeyWait, true, diag)
+	if err != nil {
+		return err
+	}
+	probe := probeSSHArgs(connectcore.BuildSSHArgs(target, privPath, ""))
+
+	// Tier 2 — stateful tmux session on the box.
+	if connectSession != "" {
+		if err := connectcore.ValidateSessionName(connectSession); err != nil {
