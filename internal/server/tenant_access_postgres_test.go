@@ -31,3 +31,36 @@ func TestTenantAccessPostgresAtomicityPreservationAndConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _, _ = admin.Exec(ctx, "DROP SCHEMA "+quoted+" CASCADE") }()
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	store, err := NewPostgresNetworkPolicyStore(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := richAccessPolicy("testing")
+	if err := store.Set(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateDenyRules(ctx, "testing", func([]*pb.NetworkPolicyDenyRule) ([]*pb.NetworkPolicyDenyRule, error) { return old.DenyRules, nil }); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := store.Get(ctx, "testing")
+	changed, err := store.PatchTenantAccess(ctx, []*pb.TenantAccessChange{{Destination: "allinone", AddSources: []string{"testing"}, ExpectedRevision: "absent"}, {Destination: "testing", AddSources: []string{"allinone"}, ExpectedRevision: PolicyRevision(before)}})
+	if err != nil || len(changed) != 2 {
+		t.Fatalf("atomic two-way mutation: %v", err)
+	}
+	after, _ := store.Get(ctx, "testing")
+	without := proto.Clone(after).(*pb.NetworkPolicy)
+	without.AllowFromTenants = nil
+	if !proto.Equal(without, before) {
+		t.Fatal("Postgres ingress UPDATE lost other policy fields")
+	}
+	_, err = store.PatchTenantAccess(ctx, []*pb.TenantAccessChange{{Destination: "new-empty", AddSources: []string{"testing"}, ExpectedRevision: "absent"}, {Destination: "testing", RemoveSources: []string{"allinone"}, ExpectedRevision: PolicyRevision(before)}})

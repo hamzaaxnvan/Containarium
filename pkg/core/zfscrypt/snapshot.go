@@ -54,3 +54,59 @@ func (m *Manager) Snapshot(ctx context.Context, dataset, name string) (string, e
 	}
 	if err := validateSnapshotName(name); err != nil {
 		return "", err
+	}
+
+	full := dataset + "@" + name
+	_, stderr, err := m.run.Run(ctx, nil, "snapshot", full)
+	if err != nil {
+		return "", fmt.Errorf("create snapshot %s: %w: %s", full, err, strings.TrimSpace(stderr))
+	}
+	return full, nil
+}
+
+// ListSnapshots returns the snapshots of a dataset, newest last.
+//
+// Works with the key unloaded: snapshot names are metadata, not contents.
+func (m *Manager) ListSnapshots(ctx context.Context, dataset string) ([]string, error) {
+	if err := validateDataset(dataset); err != nil {
+		return nil, err
+	}
+	stdout, stderr, err := m.run.Run(ctx, nil,
+		"list", "-H", "-t", "snapshot", "-o", "name", "-s", "creation", "-r", dataset)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots of %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out, nil
+}
+
+// DestroySnapshot removes a snapshot. Like creation, it does not need the
+// key — retention must keep working while custody is down, or a KMS outage
+// would silently become an unbounded-growth incident.
+func (m *Manager) DestroySnapshot(ctx context.Context, snapshot string) error {
+	dataset, _, ok := strings.Cut(snapshot, "@")
+	if !ok {
+		return fmt.Errorf("invalid snapshot reference %q: expected <dataset>@<name>", snapshot)
+	}
+	if err := validateDataset(dataset); err != nil {
+		return err
+	}
+	if _, stderr, err := m.run.Run(ctx, nil, "destroy", snapshot); err != nil {
+		return fmt.Errorf("destroy snapshot %s: %w: %s", snapshot, err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// EnsureInspectable reports whether a snapshot's CONTENTS can be read,
+// returning ErrKeyUnavailableForInspection when they cannot.
+//
+// Called before an inspection so the caller gets a specific, actionable
+// error instead of whatever ZFS says when a read hits an unkeyed dataset —
+// which reads like corruption and sends an operator hunting the wrong
+// problem (#1202 AC2).
