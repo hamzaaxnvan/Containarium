@@ -55,22 +55,3 @@ func (d *Dialer) Client(socketPath string) (pb.SpawnServiceClient, error) {
 
 	conn, err := grpc.NewClient("unix:"+socketPath, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", socketPath, err)
-	}
-	d.conns[socketPath] = conn
-	return pb.NewSpawnServiceClient(conn), nil
-}
-
-// Forget closes and evicts the cached connection for socketPath, if any.
-// Use when a pool member is being destroyed (its socket is going away
-// permanently, not just reconnecting) so the Dialer doesn't keep dialing
-// a path that will never come back — a distinct case from a transient
-// disconnect, which grpc-go's own reconnect logic already absorbs without
-// needing this.
-func (d *Dialer) Forget(socketPath string) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	conn, ok := d.conns[socketPath]
-	if !ok {
-		return nil
