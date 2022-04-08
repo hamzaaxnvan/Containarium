@@ -31,36 +31,3 @@ func (b *cloudInitProbeBackend) ExecWithExitCode(_ string, _ []string) (string, 
 	return "", "", b.probeExitCode, b.probeErr
 }
 
-func (b *cloudInitProbeBackend) Exec(_ string, _ []string) error {
-	return errors.New("stop here: installPackages progressed past the cloud-init wait")
-}
-
-func TestCloudInitPresent(t *testing.T) {
-	tests := []struct {
-		name     string
-		exitCode int
-		err      error
-		want     bool
-	}{
-		{"cloud-init on PATH", 0, nil, true},
-		{"command not found", 1, nil, false},
-		{"exec transport failure", 0, errors.New("boom"), false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			m := NewWithBackend(&cloudInitProbeBackend{probeExitCode: tt.exitCode, probeErr: tt.err})
-			if got := m.cloudInitPresent("box-container"); got != tt.want {
-				t.Errorf("cloudInitPresent() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestInstallPackages_SkipsWaitWhenCloudInitAbsent(t *testing.T) {
-	m := NewWithBackend(&cloudInitProbeBackend{probeExitCode: 1}) // `command -v cloud-init` not found
-	m.cloudInitWait = 2 * time.Second                             // would show up in elapsed if hit
-
-	start := time.Now()
-	_ = m.installPackages("box-container", false, "", nil, "alice", ostype.Debian)
-	elapsed := time.Since(start)
-
