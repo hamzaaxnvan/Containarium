@@ -95,35 +95,3 @@ func parsePatchTenantAccessArgs(args map[string]interface{}) (*pb.PatchTenantAcc
 		}
 		req.Changes = append(req.Changes, ch)
 	}
-	return req, nil
-}
-
-// tenantAccessSources validates the complete list before any backend call.
-func tenantAccessSources(args map[string]interface{}, key string) ([]string, error) {
-	raw, present := args[key]
-	if !present {
-		return nil, nil
-	}
-	list, ok := raw.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("%s must be an array of strings", key)
-	}
-	out := make([]string, 0, len(list))
-	for _, item := range list {
-		source, ok := item.(string)
-		if !ok || strings.TrimSpace(source) == "" {
-			return nil, fmt.Errorf("%s must contain only non-empty strings", key)
-		}
-		out = append(out, source)
-	}
-	return out, nil
-}
-
-func tenantNetworkHandler(operation string) ToolHandler {
-	return func(api API, args map[string]interface{}) (string, error) {
-		client, ok := api.(tenantNetworkAPI)
-		if !ok {
-			return "", fmt.Errorf("backend does not support the Tenant network contract")
-		}
-		var out proto.Message
-		var err error
