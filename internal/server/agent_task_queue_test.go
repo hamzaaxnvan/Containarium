@@ -59,3 +59,64 @@ func TestQueue_EnqueueLeaseComplete(t *testing.T) {
 		t.Fatal("completed task should have a recorded result")
 	}
 	if r.artifactJSON != `{"answer":42}` || r.errMsg != "" || r.skillID != "web-researcher" {
+		t.Errorf("recorded result wrong: %+v", r)
+	}
+}
+
+func TestQueue_LeaseHidesFromOtherWorkers(t *testing.T) {
+	q, _ := newTestQueue()
+	q.enqueue("s", "a")
+
+	if _, ok := q.lease("", time.Minute); !ok {
+		t.Fatal("first lease should succeed")
+	}
+	// A second worker polling immediately sees nothing — the task is leased.
+	if _, ok := q.lease("", time.Minute); ok {
+		t.Fatal("second lease should find nothing (task is held)")
+	}
+}
+
+func TestQueue_RedeliversAfterLeaseExpiry(t *testing.T) {
+	q, advance := newTestQueue()
+	q.enqueue("s", "a")
+
+	first, ok := q.lease("", 30*time.Second)
+	if !ok {
+		t.Fatal("first lease should succeed")
+	}
+	// Still inside the lease window: invisible.
+	advance(20 * time.Second)
+	if _, ok := q.lease("", 30*time.Second); ok {
+		t.Fatal("task should still be hidden inside the lease window")
+	}
+	// Past expiry: redelivered with a NEW token.
+	advance(15 * time.Second)
+	second, ok := q.lease("", 30*time.Second)
+	if !ok {
+		t.Fatal("task should be redelivered after lease expiry")
+	}
+	if second.LeaseToken == first.LeaseToken {
+		t.Error("redelivery must mint a fresh lease token")
+	}
+
+	// The slow original worker now completes with its STALE token — rejected,
+	// because the redelivered lease owns the task.
+	if ok := q.complete(first.ID, first.LeaseToken, "late", ""); ok {
+		t.Error("stale-token completion must be rejected")
+	}
+	// The current lease holder completes successfully.
+	if ok := q.complete(second.ID, second.LeaseToken, "ok", ""); !ok {
+		t.Error("current-token completion must succeed")
+	}
+}
+
+func TestQueue_SkillFilter(t *testing.T) {
+	q, _ := newTestQueue()
+	q.enqueue("alpha", "1")
+	q.enqueue("beta", "2")
+
+	// A worker scoped to "beta" skips the alpha task at the head.
+	leased, ok := q.lease("beta", time.Minute)
+	if !ok || leased.SkillID != "beta" {
+		t.Fatalf("filtered lease should return the beta task, got ok=%v %+v", ok, leased)
+	}
