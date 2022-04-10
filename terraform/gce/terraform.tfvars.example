@@ -10,16 +10,3 @@ admin_ssh_keys = {
   # username = "ssh-ed25519 AAAA... user@example.com"
 }
 
-# Instance configuration
-machine_type        = "e2-standard-2"  # 2 vCPU, 8GB RAM
-use_spot_instance   = true             # Use spot instance (cost-effective)
-use_persistent_disk = true             # Enable persistent disk for data
-
-# Disk sizes (GB)
-boot_disk_size = 100
-data_disk_size = 100
-
-# Security: Restrict SSH access to your IP
-# Get your IP: curl ifconfig.me
-allowed_ssh_sources = ["0.0.0.0/0"]  # WARNING: Replace with your IP for security!
-

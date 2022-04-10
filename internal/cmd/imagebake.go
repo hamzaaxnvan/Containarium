@@ -50,21 +50,3 @@ func init() {
 
 func runImageBake(cmd *cobra.Command, args []string) error {
 	if serverAddr != "" {
-		return fmt.Errorf("image-bake runs on the backend host against local Incus; it is not available in --server mode (SSH to the host and run it there)")
-	}
-
-	osType := pb.OSType_OS_TYPE_UNSPECIFIED
-	if bakeOSType != "" {
-		osType = ostype.OSTypeFromString(bakeOSType)
-		if osType == pb.OSType_OS_TYPE_UNSPECIFIED {
-			return fmt.Errorf("invalid --os-type %q (expected ubuntu, rocky9, or rhel9)", bakeOSType)
-		}
-	}
-
-	mgr, err := container.New()
-	if err != nil {
-		return fmt.Errorf("failed to connect to Incus: %w", err)
-	}
-
-	res, err := mgr.BakeBaseImage(container.BakeOptions{
-		Image:        bakeImage,
