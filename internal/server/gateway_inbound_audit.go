@@ -40,3 +40,24 @@ func (a gatewayInboundAudit) RecordInboundBlock(ctx context.Context, b modelgate
 	d := inboundBlockAuditDetail{
 		Skill: b.SkillID, Provider: b.Provider, Model: b.Model, Reason: b.Reason.String(),
 		Findings: b.Findings, EngineID: b.EngineID, PolicyRevision: b.PolicyRevision,
+	}
+	for _, k := range b.Kinds {
+		d.Kinds = append(d.Kinds, k.String())
+	}
+	payload, err := json.Marshal(d)
+	if err != nil {
+		return fmt.Errorf("marshal inbound block detail: %w", err)
+	}
+	return a.log.Log(ctx, &audit.AuditEntry{
+		Username:     b.Tenant,
+		Action:       modelGatewayInboundBlockAction,
+		ResourceType: "model_gateway",
+		ResourceID:   b.Tenant,
+		Detail:       string(payload),
+	})
+}
+
+// modelGatewayInboundDetectionAction is the audit action of one baseline
+// rule that matched in a model response while no admin policy exists
+// (#2736). Action "log": the response was delivered; action "block" (the
+// baseline's BLOCK mode, #2738): it was blocked, and a
