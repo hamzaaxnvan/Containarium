@@ -85,3 +85,32 @@ func TestReconcileCreate(t *testing.T) {
 	}
 	if !controllerutil.ContainsFinalizer(&got, boxFinalizer) {
 		t.Fatal("finalizer not added on first reconcile")
+	}
+	if len(be.created) != 0 {
+		t.Fatalf("Create called before finalizer was set: %v", be.created)
+	}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if len(be.created) != 1 || be.created[0].Ref.Tenant != "alice" {
+		t.Fatalf("Create not called for alice: %v", be.created)
+	}
+	if be.created[0].Mode != "shell" {
+		t.Errorf("spec.Mode = %q, want shell", be.created[0].Mode)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != containariumv1alpha1.BoxRunning {
+		t.Errorf("phase = %q, want Running", got.Status.Phase)
+	}
+	if got.Status.PodName != "box-alice" {
+		t.Errorf("podName = %q, want box-alice", got.Status.PodName)
+	}
+	if got.Status.Endpoint != "alice@gw.example.com" {
+		t.Errorf("endpoint = %q, want alice@gw.example.com", got.Status.Endpoint)
+	}
+	if meta := got.Status.Conditions; len(meta) != 1 || meta[0].Type != "Ready" || meta[0].Status != metav1.ConditionTrue {
+		t.Errorf("Ready condition not set true: %+v", got.Status.Conditions)
+	}
