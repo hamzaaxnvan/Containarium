@@ -53,3 +53,30 @@ func TestValidateImageRegistry_EmptyAllowlistAcceptsAll(t *testing.T) {
 		if err := validateImageRegistry(in); err != nil {
 			t.Errorf("unset allowlist must accept %q: %v", in, err)
 		}
+	}
+}
+
+func TestValidateImageRegistry_RejectsUnknownRegistry(t *testing.T) {
+	t.Setenv(allowedImageRegistriesEnv, "ubuntu,images")
+	resetImageAllowlist(t)
+
+	if err := validateImageRegistry("docker:registry.attacker.example/evil:latest"); err == nil {
+		t.Fatal("unknown registry must be rejected")
+	}
+	if err := validateImageRegistry("https://attacker.example/img"); err == nil {
+		t.Fatal("URL outside allowlist must be rejected")
+	}
+}
+
+func TestValidateImageRegistry_AcceptsAllowedRegistry(t *testing.T) {
+	t.Setenv(allowedImageRegistriesEnv, "ubuntu,images,incus")
+	resetImageAllowlist(t)
+
+	cases := []string{
+		"ubuntu:22.04",
+		"images:debian/12",
+		"incus:noble",
+		"ubuntu", // bare name → default ubuntu remote
+	}
+	for _, in := range cases {
+		if err := validateImageRegistry(in); err != nil {
