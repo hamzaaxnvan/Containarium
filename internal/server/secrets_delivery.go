@@ -1,0 +1,54 @@
+package server
+
+import (
+	"fmt"
+
+	"github.com/footprintai/containarium/internal/secrets"
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+)
+
+// secrets_delivery.go — conversion between the storage layer's delivery
+// string and the proto SecretDelivery enum.
+//
+// The enum is the contract going forward (CLAUDE.md: "protobuf enums over
+// magic strings"); the legacy `delivery` string stays on the wire so
+// existing REST/MCP clients keep working. The DB column also still stores
+// the string, so these two functions are the only seam that needs to know
+// both representations.
+
+// deliveryToProto maps a storage delivery string onto the enum. An empty
+// string only occurs on a legacy row predating the delivery column
+// (#1604's new default, file, is always written explicitly for anything
+// set since) — those rows were actually stamped as env, so "" maps to ENV
+// rather than UNSPECIFIED, keeping the enum a faithful view of what
+// already happened rather than what a fresh Set would do today.
+func deliveryToProto(s string) pb.SecretDelivery {
+	switch s {
+	case secrets.DeliveryFile:
+		return pb.SecretDelivery_SECRET_DELIVERY_FILE
+	case secrets.DeliveryCompose:
+		return pb.SecretDelivery_SECRET_DELIVERY_COMPOSE
+	case secrets.DeliveryBroker:
+		return pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY
+	case secrets.DeliveryEnv, "":
+		return pb.SecretDelivery_SECRET_DELIVERY_ENV
+	default:
+		// Unknown values are rejected at the API boundary before they
+		// reach storage, so this is unreachable in practice; report
+		// UNSPECIFIED rather than guessing a mode.
+		return pb.SecretDelivery_SECRET_DELIVERY_UNSPECIFIED
+	}
+}
+
+// deliveryFromProto maps the enum onto the storage string. UNSPECIFIED
+// returns "" so the caller can fall back to the legacy field.
+func deliveryFromProto(d pb.SecretDelivery) string {
+	switch d {
+	case pb.SecretDelivery_SECRET_DELIVERY_ENV:
+		return secrets.DeliveryEnv
+	case pb.SecretDelivery_SECRET_DELIVERY_FILE:
+		return secrets.DeliveryFile
+	case pb.SecretDelivery_SECRET_DELIVERY_COMPOSE:
+		return secrets.DeliveryCompose
+	case pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY:
+		return secrets.DeliveryBroker
