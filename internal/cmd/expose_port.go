@@ -33,3 +33,39 @@ Example:
       --server <host:port>`,
 	Args: cobra.ExactArgs(1),
 	RunE: runExposePort,
+}
+
+func init() {
+	rootCmd.AddCommand(exposePortCmd)
+
+	exposePortCmd.Flags().IntVar(&exposePortPort, "container-port", 0,
+		"Port the app listens on inside the container (required)")
+	exposePortCmd.Flags().StringVar(&exposePortDomain, "domain", "",
+		"Public hostname to route from, e.g. blog.example.com (required)")
+	exposePortCmd.Flags().StringVar(&exposePortDescription, "description", "",
+		"Optional human-readable note (shown in 'route list')")
+
+	_ = exposePortCmd.MarkFlagRequired("container-port")
+	_ = exposePortCmd.MarkFlagRequired("domain")
+}
+
+func runExposePort(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required")
+	}
+
+	apiClient, err := newRouteClient()
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer func() { _ = apiClient.Close() }()
+
+	res, err := expose.Run(context.Background(), &exposeAdapter{c: apiClient}, expose.Options{
+		Username:      args[0],
+		ContainerPort: exposePortPort,
+		Domain:        exposePortDomain,
+		Description:   exposePortDescription,
+	})
+	if err != nil {
+		return err
+	}
