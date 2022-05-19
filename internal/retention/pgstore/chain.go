@@ -181,3 +181,95 @@ func (c *ChainSource) CountPrefix(ctx context.Context, cutoffs map[pb.RetentionC
 	p, err := c.plan(ctx, c.pool, cutoffs, heldOrgs)
 	if err != nil {
 		return retention.PrefixCount{}, wrapMissingTable("count audit_logs", err)
+	}
+	end := p.end
+	if end == 0 {
+		end = math.MinInt64 // id < end matches nothing
+	}
+	var olderG, olderS, eligG, eligS int64
+	if err := c.pool.QueryRow(ctx, `
+		SELECT
+		  count(*) FILTER (WHERE NOT (action = ANY($1)) AND timestamp < $3),
+		  count(*) FILTER (WHERE action = ANY($1) AND timestamp < $2),
+		  count(*) FILTER (WHERE NOT (action = ANY($1)) AND id < $4),
+		  count(*) FILTER (WHERE action = ANY($1) AND id < $4)
+		FROM audit_logs`,
+		audit.SessionTranscriptActions, sessCut, gwCut, end).Scan(&olderG, &olderS, &eligG, &eligS); err != nil {
+		return retention.PrefixCount{}, wrapMissingTable("count audit_logs", err)
+	}
+	out := retention.PrefixCount{ByClass: map[pb.RetentionClass]retention.Count{
+		pb.RetentionClass_RETENTION_CLASS_GATEWAY_LOGS:        {Older: olderG, Eligible: eligG},
+		pb.RetentionClass_RETENTION_CLASS_SESSION_TRANSCRIPTS: {Older: olderS, Eligible: eligS},
+	}}
+	out.Note = p.note
+	if p.skipped != "" {
+		out.Note = "not purged: " + p.skipped
+	}
+	if base, purged, err := audit.ReadChainBase(ctx, c.pool); err != nil {
+		return retention.PrefixCount{}, wrapMissingTable("count audit_logs", err)
+	} else if purged {
+		out.Base = basePB(base)
+	}
+	return out, nil
+}
+
+// RemovePrefix removes the prefix in batches of removeChainBatch, each in its
+// own transaction that first takes a SHARE lock on retention_legal_holds, reads
+// the holds under it, and re-plans: SetLegalHold inserts into that table, which
+// the lock excludes, so a hold being placed either committed before the batch
+// looked (and bounds it) or waits until the batch has committed. Each batch
+// writes the new base in the same transaction as its deletes. lock_timeout
+// bounds the wait; a timeout is an error and removes nothing more.
+//
+// The sweeper's snapshot of the held orgs is not used: the holds are read again
+// under the lock.
+func (c *ChainSource) RemovePrefix(ctx context.Context, cutoffs map[pb.RetentionClass]time.Time, _ []string, maxRows int) (retention.PrefixRemoval, error) {
+	out := retention.PrefixRemoval{RemovedByClass: map[pb.RetentionClass]int64{}}
+	if maxRows < 1 {
+		return out, nil
+	}
+	var total int64
+	for total < int64(maxRows) {
+		if err := ctx.Err(); err != nil {
+			return c.withBase(ctx, out), err
+		}
+		batch := int64(removeChainBatch)
+		if left := int64(maxRows) - total; left < batch {
+			batch = left
+		}
+		res, err := c.removeBatch(ctx, cutoffs, batch)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == pgUndefinedTable {
+				// The holds table or the audit tables were never installed
+				// here: no way to prove nothing is held, so nothing goes.
+				out.Skipped = pgErr.Message
+				return c.withBase(ctx, out), nil
+			}
+			return c.withBase(ctx, out), fmt.Errorf("purge audit_logs: %w", err)
+		}
+		if res.skipped != "" {
+			out.Skipped = res.skipped
+			return c.withBase(ctx, out), nil
+		}
+		out.RemovedByClass[pb.RetentionClass_RETENTION_CLASS_GATEWAY_LOGS] += res.gateway
+		out.RemovedByClass[pb.RetentionClass_RETENTION_CLASS_SESSION_TRANSCRIPTS] += res.session
+		total += res.gateway + res.session
+		if res.gateway+res.session < batch {
+			break
+		}
+	}
+	return c.withBase(ctx, out), nil
+}
+
+// withBase attaches the current base to a removal.
+func (c *ChainSource) withBase(ctx context.Context, out retention.PrefixRemoval) retention.PrefixRemoval {
+	if base, purged, err := audit.ReadChainBase(ctx, c.pool); err == nil && purged {
+		out.Base = basePB(base)
+	}
+	return out
+}
+
+type batchResult struct {
+	gateway, session int64
+	skipped          string

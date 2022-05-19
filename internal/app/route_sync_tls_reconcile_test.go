@@ -31,36 +31,3 @@ func httpRoute(domain string) *RouteRecord {
 func TestSyncTLSSubjects_ReconcilesRoutePresentInCaddyButMissingSubject(t *testing.T) {
 	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
 		[]string{"unrelated.example.com"},
-		[]CaddyTLSIssuer{NewACMEIssuer()},
-	))
-	defer srv.Close()
-
-	p := NewProxyManager(srv.URL, "example.com")
-	j := &RouteSyncJob{proxyManager: p}
-
-	routes := []*RouteRecord{httpRoute("app.example.com")}
-	if err := j.syncTLSSubjects(routes); err != nil {
-		t.Fatalf("syncTLSSubjects: %v", err)
-	}
-
-	if !hasSubject(readPolicies(t, fc), "app.example.com") {
-		t.Fatal("sync tick did not reconcile the missing TLS subject — the host serves on :80 " +
-			"and returns `tls: internal error` on :443 indefinitely (#1584)")
-	}
-}
-
-// gRPC routes reach Caddy through AddGRPCRoute, the same ProvisionTLS path,
-// so they are equally exposed to #1584 and must reconcile identically.
-func TestSyncTLSSubjects_CoversGRPCRoutes(t *testing.T) {
-	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
-		[]string{"unrelated.example.com"},
-		[]CaddyTLSIssuer{NewACMEIssuer()},
-	))
-	defer srv.Close()
-
-	p := NewProxyManager(srv.URL, "example.com")
-	j := &RouteSyncJob{proxyManager: p}
-
-	grpc := httpRoute("grpc.example.com")
-	grpc.Protocol = string(RouteProtocolGRPC)
-

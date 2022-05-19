@@ -7,3 +7,6 @@ package_upgrade: false
 packages:
   - openssh-server   # provides sshd, which the harness runs as a throwaway upstream
   - openssh-client   # ssh, ssh-keygen
+  - curl
+  - ca-certificates
+runcmd:
