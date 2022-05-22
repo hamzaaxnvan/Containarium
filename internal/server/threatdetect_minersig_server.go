@@ -22,28 +22,3 @@ import (
 // handlers report Unavailable.
 func (s *ThreatDetectionServer) SetMinerSignatureRule(r *threatdetect.MinerSignatureRule) {
 	s.minerSigRule = r
-}
-
-// ListMinerSignatures returns baseline then operator entries.
-func (s *ThreatDetectionServer) ListMinerSignatures(ctx context.Context, _ *pb.ListMinerSignaturesRequest) (*pb.ListMinerSignaturesResponse, error) {
-	if err := auth.RequireScope(ctx, auth.ScopeSecurityRead); err != nil {
-		return nil, err
-	}
-	if s.minerSigRule == nil {
-		return nil, status.Errorf(codes.Unavailable, "miner-signature rule not available")
-	}
-	entries := s.minerSigRule.ListSignatures()
-	out := make([]*pb.MinerSignature, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, e.ToProto())
-	}
-	return &pb.ListMinerSignaturesResponse{Signatures: out, BaselineVersion: s.minerSigRule.BaselineVersion()}, nil
-}
-
-// AddMinerSignature adds an operator entry, effective immediately.
-func (s *ThreatDetectionServer) AddMinerSignature(ctx context.Context, req *pb.AddMinerSignatureRequest) (*pb.AddMinerSignatureResponse, error) {
-	if err := auth.RequireScope(ctx, auth.ScopeSecurityWrite); err != nil {
-		return nil, err
-	}
-	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
-		return nil, err
