@@ -210,3 +210,109 @@ func validDispatchTransition(from, to pb.TrackerDispatchState) bool {
 		return false
 	}
 }
+
+// InsertDispatch inserts a new QUEUED dispatch row with a fresh id.
+// Returns ErrDispatchActive if the issue already has a queued or running
+// row, ErrNotFound if the connection does not exist.
+func (s *Store) InsertDispatch(ctx context.Context, d Dispatch) (*Dispatch, error) {
+	switch {
+	case d.Username == "":
+		return nil, errors.New("tracker: username is required")
+	case d.Connection == "":
+		return nil, errors.New("tracker: connection is required")
+	case d.IssueNumber <= 0:
+		return nil, errors.New("tracker: issue_number must be positive")
+	case d.Scope == "":
+		return nil, errors.New("tracker: scope is required")
+	case d.SkillID == "":
+		return nil, errors.New("tracker: skill_id is required")
+	}
+
+	out := d
+	out.ID = uuid.NewString()
+	out.State = pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_QUEUED
+	out.FailureReason = ""
+	out.LabelsPending = false
+	out.Failure = pb.TrackerDispatchFailure_TRACKER_DISPATCH_FAILURE_UNSPECIFIED
+	out.StartedAt, out.EndedAt = time.Time{}, time.Time{}
+	var createdAt *time.Time
+	if !d.CreatedAt.IsZero() {
+		createdAt = &d.CreatedAt
+	}
+
+	const q = `
+		INSERT INTO tracker_dispatches (id, username, connection, issue_number, scope, skill_id, run_id, depth, state, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', COALESCE($9::timestamptz, NOW()))
+		RETURNING created_at
+	`
+	if err := s.pool.QueryRow(ctx, q, out.ID, d.Username, d.Connection, d.IssueNumber, d.Scope, d.SkillID, d.RunID, d.Depth, createdAt).
+		Scan(&out.CreatedAt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case pgUniqueViolation:
+				return nil, ErrDispatchActive
+			case pgForeignKeyViolation:
+				return nil, ErrNotFound
+			}
+		}
+		return nil, fmt.Errorf("insert tracker dispatch: %w", err)
+	}
+	return &out, nil
+}
+
+// TransitionDispatch is the compare-and-set state change: it moves the
+// row from `from` to `to` only if it is still in `from`. A lost race (or
+// an unknown id) returns (false, nil) — never a double transition.
+// Entering RUNNING stamps started_at; entering DONE/FAILED stamps
+// ended_at and sets labels_pending (see FailDispatch). reason, when
+// non-empty, is recorded as failure_reason.
+func (s *Store) TransitionDispatch(ctx context.Context, id string, from, to pb.TrackerDispatchState, reason string, at time.Time) (bool, error) {
+	if !validDispatchTransition(from, to) {
+		return false, fmt.Errorf("%w: %v -> %v", ErrInvalidDispatchTransition, from, to)
+	}
+	fromStr, err := dispatchStateToString(from)
+	if err != nil {
+		return false, err
+	}
+	toStr, err := dispatchStateToString(to)
+	if err != nil {
+		return false, err
+	}
+	const q = `
+		UPDATE tracker_dispatches SET
+			state          = $3,
+			started_at     = CASE WHEN $3 = 'running' THEN $4::timestamptz ELSE started_at END,
+			ended_at       = CASE WHEN $3 IN ('done', 'failed') THEN $4::timestamptz ELSE ended_at END,
+			failure_reason = CASE WHEN $5 <> '' THEN $5 ELSE failure_reason END,
+			labels_pending = CASE WHEN $3 IN ('done', 'failed') THEN true ELSE labels_pending END
+		WHERE id = $1 AND state = $2
+	`
+	tag, err := s.pool.Exec(ctx, q, id, fromStr, toStr, at, reason)
+	if err != nil {
+		return false, fmt.Errorf("transition tracker dispatch: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// FailDispatch is the compare-and-set into FAILED with a typed cause
+// (#2026): it moves the row from `from` (QUEUED or RUNNING) to FAILED
+// only if it is still in `from`, stamping ended_at, failure_reason and
+// failure. A lost race returns (false, nil), so of any number of
+// concurrent failers (a timeout sweep, the run's own end, a peer
+// dispatcher) exactly one reports the failure.
+//
+// Entering a terminal state sets labels_pending in the same write
+// (#2047, #2052): the forge does not show the row's state until the
+// projection lands and clears it. So a terminal row is never
+// unprojected yet not pending, and a tick that races the projection —
+// or runs after it failed — sees the flag and does not dispatch the
+// issue again.
+func (s *Store) FailDispatch(ctx context.Context, id string, from pb.TrackerDispatchState, failure pb.TrackerDispatchFailure, reason string, at time.Time) (bool, error) {
+	if !validDispatchTransition(from, pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED) {
+		return false, fmt.Errorf("%w: %v -> FAILED", ErrInvalidDispatchTransition, from)
+	}
+	fromStr, err := dispatchStateToString(from)
+	if err != nil {
+		return false, err
+	}

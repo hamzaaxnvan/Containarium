@@ -152,3 +152,158 @@ func TestDispatchLifecycle_RunningFailedWithComment(t *testing.T) {
 	if !containsString(labels, LabelAgentFailed) || containsString(labels, LabelAgentRunning) || containsString(labels, LabelAgentQueued) {
 		t.Errorf("labels = %v, want %s only among state labels", labels, LabelAgentFailed)
 	}
+	if !containsString(labels, "scope:product") {
+		t.Errorf("labels = %v, the scope label stays on failure so a retry is one label removal", labels)
+	}
+	comments := provider.commentsOn(5)
+	if len(comments) != 1 {
+		t.Fatalf("comments = %q, want exactly one failure comment", comments)
+	}
+	if !strings.Contains(comments[0], row.ID) || !strings.Contains(comments[0], row.RunID) {
+		t.Errorf("comment = %q, want it to name dispatch %s and run %s", comments[0], row.ID, row.RunID)
+	}
+	if strings.Contains(comments[0], "exploded") || strings.Contains(comments[0], "10.0.0.9") || strings.Contains(comments[0], "secret-tenant") {
+		t.Errorf("comment = %q, must not carry the raw run error", comments[0])
+	}
+	if _, _, kind, ok := ParseMarker(comments[0]); !ok || kind != KindComment {
+		t.Errorf("comment = %q, want a platform identity stamp", comments[0])
+	}
+}
+
+// TestDispatchLifecycle_StaleTransitionIsNoop: a hook that loses the
+// compare-and-set (the row was already moved by someone else — e.g. a
+// timeout sweep failed it) changes nothing: not the row, not the
+// labels, no comment.
+func TestDispatchLifecycle_StaleTransitionIsNoop(t *testing.T) {
+	const user = "tracker-lifecycle-stale"
+	d, store, provider, runs, ctx := newLifecycleFixture(t, user, Issue{Number: 9, Labels: []string{"scope:product"}})
+	if res, err := d.Tick(ctx, user, "default"); err != nil || len(res.Started) != 1 {
+		t.Fatalf("Tick = (%+v, %v)", res, err)
+	}
+	row := onlyRow(t, store, ctx, user)
+	if ok, err := store.TransitionDispatch(ctx, row.ID,
+		pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_RUNNING, pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED, "timed out", d.Clock.Now()); err != nil || !ok {
+		t.Fatalf("simulate sweep = (%v, %v)", ok, err)
+	}
+	before := provider.labels(9)
+
+	lc := runs.lifecycle(t, 0)
+	lc.RunEnded(ctx, RunOutcome{}) // late success report
+	lc.RunStarted(ctx)             // late (duplicate) start report
+	lc.RunEnded(ctx, RunOutcome{Err: errors.New("x")})
+
+	row = onlyRow(t, store, ctx, user)
+	if row.State != pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED || row.FailureReason != "timed out" {
+		t.Fatalf("row = %+v, want the sweep's FAILED untouched", row)
+	}
+	if after := provider.labels(9); strings.Join(after, ",") != strings.Join(before, ",") {
+		t.Errorf("labels changed %v -> %v on a lost compare-and-set", before, after)
+	}
+	if c := provider.commentsOn(9); len(c) != 0 {
+		t.Errorf("comments = %q, want none from a lost compare-and-set", c)
+	}
+}
+
+// TestDispatchLifecycle_HookRunsOnCancelledContext: the hook is called
+// from a goroutine whose originating context (the tick RPC) is long
+// gone. A cancelled context must not strand the row RUNNING.
+func TestDispatchLifecycle_HookRunsOnCancelledContext(t *testing.T) {
+	const user = "tracker-lifecycle-cancelled"
+	d, store, provider, runs, ctx := newLifecycleFixture(t, user, Issue{Number: 3, Labels: []string{"scope:product"}})
+	if res, err := d.Tick(ctx, user, "default"); err != nil || len(res.Started) != 1 {
+		t.Fatalf("Tick = (%+v, %v)", res, err)
+	}
+	dead, cancel := context.WithCancel(ctx)
+	cancel()
+	runs.lifecycle(t, 0).RunEnded(dead, RunOutcome{})
+
+	if row := onlyRow(t, store, ctx, user); row.State != pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_DONE {
+		t.Fatalf("row = %+v, want DONE even though the hook's context was cancelled", row)
+	}
+	if !containsString(provider.labels(3), LabelAgentDone) {
+		t.Errorf("labels = %v, want %s", provider.labels(3), LabelAgentDone)
+	}
+
+	// Same for the start report.
+	provider.relabel(3, "scope:product")
+	if res, err := d.Tick(ctx, user, "default"); err != nil || len(res.Started) != 1 {
+		t.Fatalf("Tick 2 = (%+v, %v)", res, err)
+	}
+	runs.lifecycle(t, 1).RunStarted(dead) // already reported once by the starter: a no-op
+	runs.lifecycle(t, 1).RunEnded(dead, RunOutcome{Err: errors.New("boom")})
+	rows, _ := store.ListDispatches(ctx, user, "default", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED)
+	if len(rows) != 1 {
+		t.Fatalf("failed rows = %+v, want the second generation FAILED on a cancelled context", rows)
+	}
+}
+
+// TestDispatchLifecycle_RunEndedBeforeStartReport: a run that ends
+// before anything reported its start (queued -> done is a legal edge)
+// still lands terminal, with the queued label cleared.
+func TestDispatchLifecycle_RunEndedBeforeStartReport(t *testing.T) {
+	const user = "tracker-lifecycle-early-end"
+	provider := newFakeDispatchProvider(Issue{Number: 4, Labels: []string{"scope:product"}})
+	var captured RunLifecycle
+	d, store, ctx := newDispatchFixture(t, user, provider, &fakeRunStarter{})
+	d.Runs = runStarterFunc(func(_ context.Context, req StartRunRequest) error {
+		captured = req.Lifecycle
+		return nil
+	})
+	if res, err := d.Tick(ctx, user, "default"); err != nil || len(res.Started) != 1 {
+		t.Fatalf("Tick = (%+v, %v)", res, err)
+	}
+	if res := onlyRow(t, store, ctx, user); res.State != pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_QUEUED {
+		t.Fatalf("row = %+v, want QUEUED (no start reported)", res)
+	}
+	captured.RunEnded(ctx, RunOutcome{})
+	if row := onlyRow(t, store, ctx, user); row.State != pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_DONE {
+		t.Fatalf("row = %+v, want DONE", row)
+	}
+	labels := provider.labels(4)
+	if !containsString(labels, LabelAgentDone) || containsString(labels, LabelAgentQueued) || containsString(labels, "scope:product") {
+		t.Errorf("labels = %v, want agent:done, no agent:queued, no scope label", labels)
+	}
+}
+
+// TestDispatchLifecycle_LabelFailureMarksPending: the row is
+// authoritative; a forge failure while projecting it leaves
+// labels_pending for the retry (#2026) instead of losing the state.
+func TestDispatchLifecycle_LabelFailureMarksPending(t *testing.T) {
+	const user = "tracker-lifecycle-labelfail"
+	d, store, provider, runs, ctx := newLifecycleFixture(t, user, Issue{Number: 6, Labels: []string{"scope:product"}})
+	if res, err := d.Tick(ctx, user, "default"); err != nil || len(res.Started) != 1 {
+		t.Fatalf("Tick = (%+v, %v)", res, err)
+	}
+	provider.mu.Lock()
+	provider.labelErr = errors.New("forge unreachable")
+	provider.mu.Unlock()
+	runs.lifecycle(t, 0).RunEnded(ctx, RunOutcome{})
+	row := onlyRow(t, store, ctx, user)
+	if row.State != pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_DONE || !row.LabelsPending {
+		t.Fatalf("row = %+v, want DONE with labels_pending", row)
+	}
+}
+
+// TestDispatch_QueuedLabelBeforeStart: agent:queued is on the issue
+// before the run is started (provisioning can take minutes), and a
+// start failure clears it in favour of agent:failed.
+func TestDispatch_QueuedLabelBeforeStart(t *testing.T) {
+	const user = "tracker-dispatch-queued-first"
+	provider := newFakeDispatchProvider(Issue{Number: 2, Labels: []string{"scope:product"}})
+	var seen []string
+	d, _, ctx := newDispatchFixture(t, user, provider, &fakeRunStarter{})
+	d.Runs = runStarterFunc(func(context.Context, StartRunRequest) error {
+		seen = provider.labels(2)
+		return errors.New("no capacity")
+	})
+	if _, err := d.Tick(ctx, user, "default"); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if !containsString(seen, LabelAgentQueued) {
+		t.Errorf("labels during StartRun = %v, want %s already applied", seen, LabelAgentQueued)
+	}
+	labels := provider.labels(2)
+	if !containsString(labels, LabelAgentFailed) || containsString(labels, LabelAgentQueued) {
+		t.Errorf("labels after failed start = %v, want %s and not %s", labels, LabelAgentFailed, LabelAgentQueued)
+	}
+}
