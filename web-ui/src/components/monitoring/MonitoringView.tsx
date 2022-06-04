@@ -28,34 +28,3 @@ export default function MonitoringView({ server }: { server: Server }) {
           // block the monitoring page render — the iframe will surface
           // its own 401, which is no worse than the pre-fix behavior.
           console.warn('Failed to set session cookie; embedded Grafana may 401', e);
-        }
-      }
-      setEnabled(info.enabled);
-      setGrafanaUrl(info.grafanaUrl);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch monitoring info');
-    } finally {
-      setLoading(false);
-    }
-  }, [server]);
-
-  useEffect(() => { fetchInfo(); }, [fetchInfo]);
-
-  if (loading) {
-    return (
-      <div className="flex h-60 items-center justify-center">
-        <Loader2 size={24} className="animate-spin text-[var(--text-secondary)]" />
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="p-6">
-        <div className="flex items-center gap-3 rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-sm text-[var(--c-red)]">
-          <span className="flex-1">{error}</span>
-          <button onClick={fetchInfo} className="rounded p-1 hover:bg-red-500/20 transition-colors">
-            <RefreshCw size={14} />
-          </button>
-        </div>
-      </div>
