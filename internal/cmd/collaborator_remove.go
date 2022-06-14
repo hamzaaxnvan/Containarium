@@ -17,3 +17,22 @@ This will:
 2. Remove the collaborator's jump server account
 3. Remove the collaborator from the database
 
+Examples:
+  # Remove bob as a collaborator from alice's container
+  containarium collaborator remove alice bob
+
+  # Against a remote daemon
+  containarium collaborator remove alice bob --server daemon.example.com:50051`,
+	Args: cobra.ExactArgs(2),
+	RunE: runCollaboratorRemove,
+}
+
+func init() {
+	collaboratorCmd.AddCommand(collaboratorRemoveCmd)
+}
+
+func runCollaboratorRemove(cmd *cobra.Command, args []string) error {
+	ownerUsername := args[0]
+	collaboratorUsername := args[1]
+
+	switch {
