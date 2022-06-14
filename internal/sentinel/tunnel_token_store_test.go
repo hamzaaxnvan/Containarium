@@ -33,39 +33,3 @@ func TestSaveTunnelTokenStore_RoundTrip(t *testing.T) {
 		t.Fatalf("entry count = %d, want %d", len(got), len(want))
 	}
 	for i := range want {
-		if got[i].Token != want[i].Token {
-			t.Errorf("entry %d token = %q, want %q", i, got[i].Token, want[i].Token)
-		}
-	}
-}
-
-func TestApplyTunnelTokenStore_MergesIntoPolicy(t *testing.T) {
-	policy := NewTokenPolicy()
-	entries := []TunnelTokenEntry{
-		{Token: "tok-a", Pools: []Pool{PoolAny}},
-		{Token: "tok-b", Pools: []Pool{"lab"}},
-	}
-	ApplyTunnelTokenStore(entries, policy)
-
-	if err := policy.Validate("tok-a", "anything"); err != nil {
-		t.Errorf("tok-a should validate for any pool: %v", err)
-	}
-	if err := policy.Validate("tok-b", "lab"); err != nil {
-		t.Errorf("tok-b should validate for lab: %v", err)
-	}
-	if err := policy.Validate("tok-b", "prod"); err == nil {
-		t.Error("tok-b should NOT validate for prod")
-	}
-	if err := policy.Validate("unknown", ""); err == nil {
-		t.Error("an unregistered token must still be rejected")
-	}
-}
-
-func TestUpsertTunnelTokenEntry_AppendsNew(t *testing.T) {
-	entries := []TunnelTokenEntry{{Token: "existing", Pools: []Pool{PoolAny}}}
-	got := upsertTunnelTokenEntry(entries, "new-token", []Pool{"lab"})
-	if len(got) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(got))
-	}
-	if got[1].Token != "new-token" {
-		t.Errorf("appended entry token = %q, want new-token", got[1].Token)

@@ -20,3 +20,47 @@ package gatewayprovider
 
 import (
 	"fmt"
+	"sort"
+	"strings"
+
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+)
+
+// enumPrefix is stripped from an enum value's name to get the provider name.
+const enumPrefix = "GATEWAY_PROVIDER_"
+
+// Name returns the gateway registry's provider name for p.
+//
+// GATEWAY_PROVIDER_UNSPECIFIED is an error, not a default: "the caller did not
+// say which provider" must never silently become one.
+func Name(p pb.GatewayProvider) (string, error) {
+	if p == pb.GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED {
+		return "", fmt.Errorf("provider is required (one of: %s)", strings.Join(Names(), ", "))
+	}
+	name, ok := pb.GatewayProvider_name[int32(p)]
+	if !ok {
+		return "", fmt.Errorf("unknown provider (enum value %d)", int32(p))
+	}
+	return strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(name, enumPrefix), "_", "-")), nil
+}
+
+// FromName is Name's inverse, for the CLI's --provider flag.
+func FromName(name string) (pb.GatewayProvider, error) {
+	want := strings.TrimSpace(strings.ToLower(name))
+	if want == "" {
+		return pb.GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED,
+			fmt.Errorf("provider is required (one of: %s)", strings.Join(Names(), ", "))
+	}
+	for value := range pb.GatewayProvider_name {
+		p := pb.GatewayProvider(value)
+		if p == pb.GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED {
+			continue
+		}
+		if got, err := Name(p); err == nil && got == want {
+			return p, nil
+		}
+	}
+	return pb.GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED,
+		fmt.Errorf("unknown provider %q (one of: %s)", name, strings.Join(Names(), ", "))
+}
+
