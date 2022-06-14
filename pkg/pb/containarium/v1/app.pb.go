@@ -689,3 +689,349 @@ func (x *DeployAppResponse) GetMessage() string {
 
 func (x *DeployAppResponse) GetBuildLogUrl() string {
 	if x != nil {
+		return x.BuildLogUrl
+	}
+	return ""
+}
+
+func (x *DeployAppResponse) GetDetectedLanguage() *DetectedLanguage {
+	if x != nil {
+		return x.DetectedLanguage
+	}
+	return nil
+}
+
+// ListAppsRequest lists apps for a user
+type ListAppsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username (empty for all - admin only)
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// Filter by state
+	StateFilter   AppState `protobuf:"varint,2,opt,name=state_filter,json=stateFilter,proto3,enum=containarium.v1.AppState" json:"state_filter,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListAppsRequest) Reset() {
+	*x = ListAppsRequest{}
+	mi := &file_containarium_v1_app_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListAppsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListAppsRequest) ProtoMessage() {}
+
+func (x *ListAppsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListAppsRequest.ProtoReflect.Descriptor instead.
+func (*ListAppsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ListAppsRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *ListAppsRequest) GetStateFilter() AppState {
+	if x != nil {
+		return x.StateFilter
+	}
+	return AppState_APP_STATE_UNSPECIFIED
+}
+
+type ListAppsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// List of apps
+	Apps []*App `protobuf:"bytes,1,rep,name=apps,proto3" json:"apps,omitempty"`
+	// Total count
+	TotalCount    int32 `protobuf:"varint,2,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListAppsResponse) Reset() {
+	*x = ListAppsResponse{}
+	mi := &file_containarium_v1_app_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListAppsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListAppsResponse) ProtoMessage() {}
+
+func (x *ListAppsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListAppsResponse.ProtoReflect.Descriptor instead.
+func (*ListAppsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ListAppsResponse) GetApps() []*App {
+	if x != nil {
+		return x.Apps
+	}
+	return nil
+}
+
+func (x *ListAppsResponse) GetTotalCount() int32 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+// GetAppRequest gets details for a specific app
+type GetAppRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// App name
+	AppName       string `protobuf:"bytes,2,opt,name=app_name,json=appName,proto3" json:"app_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetAppRequest) Reset() {
+	*x = GetAppRequest{}
+	mi := &file_containarium_v1_app_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetAppRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetAppRequest) ProtoMessage() {}
+
+func (x *GetAppRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetAppRequest.ProtoReflect.Descriptor instead.
+func (*GetAppRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GetAppRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *GetAppRequest) GetAppName() string {
+	if x != nil {
+		return x.AppName
+	}
+	return ""
+}
+
+type GetAppResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// App details
+	App           *App `protobuf:"bytes,1,opt,name=app,proto3" json:"app,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetAppResponse) Reset() {
+	*x = GetAppResponse{}
+	mi := &file_containarium_v1_app_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetAppResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetAppResponse) ProtoMessage() {}
+
+func (x *GetAppResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetAppResponse.ProtoReflect.Descriptor instead.
+func (*GetAppResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetAppResponse) GetApp() *App {
+	if x != nil {
+		return x.App
+	}
+	return nil
+}
+
+// StopAppRequest stops a running app
+type StopAppRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// App name
+	AppName       string `protobuf:"bytes,2,opt,name=app_name,json=appName,proto3" json:"app_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StopAppRequest) Reset() {
+	*x = StopAppRequest{}
+	mi := &file_containarium_v1_app_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StopAppRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StopAppRequest) ProtoMessage() {}
+
+func (x *StopAppRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StopAppRequest.ProtoReflect.Descriptor instead.
+func (*StopAppRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *StopAppRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *StopAppRequest) GetAppName() string {
+	if x != nil {
+		return x.AppName
+	}
+	return ""
+}
+
+type StopAppResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Updated app
+	App *App `protobuf:"bytes,1,opt,name=app,proto3" json:"app,omitempty"`
+	// Status message
+	Message       string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StopAppResponse) Reset() {
+	*x = StopAppResponse{}
+	mi := &file_containarium_v1_app_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StopAppResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StopAppResponse) ProtoMessage() {}
+
+func (x *StopAppResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StopAppResponse.ProtoReflect.Descriptor instead.
+func (*StopAppResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *StopAppResponse) GetApp() *App {
+	if x != nil {
+		return x.App
+	}
+	return nil
+}
+
+func (x *StopAppResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// StartAppRequest starts a stopped app
+type StartAppRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// App name
+	AppName       string `protobuf:"bytes,2,opt,name=app_name,json=appName,proto3" json:"app_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartAppRequest) Reset() {
+	*x = StartAppRequest{}
+	mi := &file_containarium_v1_app_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)

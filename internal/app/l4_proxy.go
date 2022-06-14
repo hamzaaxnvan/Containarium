@@ -401,3 +401,137 @@ func (m *L4ProxyManager) RemoveL4Route(sni string) error {
 		}
 	}
 
+	if !found {
+		return nil // not found, already removed (idempotent)
+	}
+
+	return m.putRoutes(newRoutes)
+}
+
+// ListL4Routes returns all configured TLS passthrough routes (excludes the catch-all).
+func (m *L4ProxyManager) ListL4Routes() ([]L4Route, error) {
+	routes, err := m.getRoutes()
+	if err != nil {
+		return nil, err
+	}
+
+	var l4Routes []L4Route
+	for _, route := range routes {
+		// Skip catch-all routes (no match conditions)
+		if len(route.Match) == 0 {
+			continue
+		}
+
+		l4Route := L4Route{}
+
+		// Extract SNI
+		if len(route.Match) > 0 && route.Match[0].TLS != nil && len(route.Match[0].TLS.SNI) > 0 {
+			l4Route.SNI = route.Match[0].TLS.SNI[0]
+		}
+
+		// Extract upstream
+		if len(route.Handle) > 0 && len(route.Handle[0].Upstreams) > 0 && len(route.Handle[0].Upstreams[0].Dial) > 0 {
+			dial := route.Handle[0].Upstreams[0].Dial[0]
+			l4Route.UpstreamIP, l4Route.UpstreamPort = parseDial(dial)
+		}
+
+		if l4Route.SNI != "" {
+			l4Routes = append(l4Routes, l4Route)
+		}
+	}
+
+	return l4Routes, nil
+}
+
+// --- Internal helpers ---
+
+// getRoutes fetches the effective L4 routes from Caddy via the atomic full-
+// config GET. Returns the inner subroute's routes when the server is in
+// wrapped (pattern B) form, the outer routes when flat. Returns nil when L4
+// isn't configured yet.
+func (m *L4ProxyManager) getRoutes() ([]CaddyL4Route, error) {
+	config, err := m.getFullConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get full config: %w", err)
+	}
+	srv := getMapField(getMapField(getMapField(config, "apps"), "layer4"), "servers")
+	server := getMapField(srv, L4ServerName)
+	if server == nil {
+		return nil, nil
+	}
+	outerRoutes, _ := server["routes"].([]interface{})
+	inner := effectiveInnerRoutes(outerRoutes)
+
+	// Round-trip the raw maps into typed routes for the caller.
+	body, err := json.Marshal(inner)
+	if err != nil {
+		return nil, fmt.Errorf("re-marshal effective routes: %w", err)
+	}
+	var routes []CaddyL4Route
+	if err := json.Unmarshal(body, &routes); err != nil {
+		return nil, fmt.Errorf("decode effective routes: %w", err)
+	}
+	return routes, nil
+}
+
+// putRoutes replaces the effective L4 route list atomically via /load. When
+// the server is wrapped (pattern B), the inner subroute's `routes` is
+// replaced; outer wrapping is left intact. When flat, the outer `routes` is
+// replaced. Either way, the rest of the Caddy config is preserved verbatim.
+func (m *L4ProxyManager) putRoutes(routes []CaddyL4Route) error {
+	config, err := m.getFullConfig()
+	if err != nil {
+		return fmt.Errorf("get full config: %w", err)
+	}
+	apps := getMapField(config, "apps")
+	layer4 := getMapField(apps, "layer4")
+	servers := getMapField(layer4, "servers")
+	server := getMapField(servers, L4ServerName)
+	if server == nil {
+		return fmt.Errorf("L4 server %q not active — call ActivateL4 first", L4ServerName)
+	}
+
+	// Round-trip typed routes into raw maps for embedding into the config tree.
+	body, err := json.Marshal(routes)
+	if err != nil {
+		return fmt.Errorf("marshal routes: %w", err)
+	}
+	var newInner []interface{}
+	if err := json.Unmarshal(body, &newInner); err != nil {
+		return fmt.Errorf("decode new routes: %w", err)
+	}
+
+	outerRoutes, _ := server["routes"].([]interface{})
+	if isWrappedRouteList(outerRoutes) {
+		// Replace only the subroute's inner routes; keep the proxy_protocol
+		// handler and the outer wrapper structure untouched.
+		outer, _ := outerRoutes[0].(map[string]interface{})
+		handlers, _ := outer["handle"].([]interface{})
+		sub, _ := handlers[1].(map[string]interface{})
+		sub["routes"] = newInner
+	} else {
+		server["routes"] = newInner
+	}
+
+	return m.loadConfig(config)
+}
+
+// routeMatchesSNI checks if a route matches the given SNI hostname.
+func (m *L4ProxyManager) routeMatchesSNI(route CaddyL4Route, sni string) bool {
+	for _, match := range route.Match {
+		if match.TLS != nil {
+			for _, s := range match.TLS.SNI {
+				if s == sni {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// getFullConfig reads the complete Caddy config as raw JSON.
+func (m *L4ProxyManager) getFullConfig() (map[string]interface{}, error) {
+	url := fmt.Sprintf("%s/config/", m.caddyAdminURL)
+	resp, err := m.httpClient.Get(url)
+	if err != nil {
