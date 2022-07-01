@@ -263,3 +263,92 @@ func ServeSentinelKey() http.HandlerFunc {
 		updated, rotated, err := applySentinelKey("/home", pubKey)
 		if err != nil {
 			log.Printf("[keys] sentinel-key apply failed: %v", err)
+			http.Error(w, `{"error":"failed to apply sentinel key"}`, http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int{
+			"updated": updated,
+			"rotated": rotated,
+		})
+	}
+}
+
+// applySentinelKey rewrites every user's authorized_keys under homeRoot so
+// the current sentinel upstream pubkey is installed exactly once, replacing
+// any prior sentinel-marker block.
+//
+// Returns:
+//
+//   - updated: number of users whose authorized_keys now contains pubKey
+//     (includes both first-install and rotation cases).
+//   - rotated: number of users where a *different* prior sentinel key was
+//     replaced. Useful for observability of rotation events.
+func applySentinelKey(homeRoot, pubKey string) (updated, rotated int, err error) {
+	entries, err := os.ReadDir(homeRoot)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read %s: %w", homeRoot, err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		username := entry.Name()
+		sshDir := filepath.Join(homeRoot, username, ".ssh")
+		if _, statErr := os.Stat(sshDir); os.IsNotExist(statErr) {
+			continue
+		}
+
+		akPath := filepath.Join(sshDir, "authorized_keys")
+		// akPath is built from os.ReadDir output ("entry.Name()" is a
+		// directory base name with no path separators) joined with a
+		// fixed ".ssh/authorized_keys" suffix. Caller cannot inject a
+		// traversal here; akPath always lands inside homeRoot.
+		// Hold the same per-user lock as the daemon's add/remove/set key
+		// paths across read-rewrite-rename, or this rewrite can overwrite
+		// (and so lose or resurrect) keys they just wrote.
+		unlock := container.LockAuthorizedKeys(username)
+		// #nosec G304 -- safe path construction (see above)
+		existing, _ := os.ReadFile(akPath)
+
+		newContent, hadPriorKey, priorKeyDiffers := rewriteSentinelBlock(string(existing), pubKey)
+		if newContent == string(existing) {
+			unlock()
+			// Already in the desired shape; count as updated since the
+			// key IS present.
+			updated++
+			continue
+		}
+
+		writeErr := writeAuthorizedKeys(akPath, sshDir, newContent)
+		unlock()
+		if writeErr != nil {
+			log.Printf("[keys] failed to write %s: %v", akPath, writeErr)
+			continue
+		}
+
+		updated++
+		if hadPriorKey && priorKeyDiffers {
+			rotated++
+			log.Printf("[keys] rotated sentinel key in %s", akPath)
+		} else {
+			log.Printf("[keys] added sentinel key to %s", akPath)
+		}
+	}
+	return updated, rotated, nil
+}
+
+// sshKeyMaterial returns the "<type> <base64>" prefix of an authorized_keys
+// line, ignoring any trailing comment, and true when the line looks like a
+// public key. Two lines name the same key iff their material matches — the
+// comment field is cosmetic and must not defeat dedup.
+//
+// Sentinel upstream keys are written without an options prefix, so the type
+// is the first whitespace field; option-prefixed lines (which a sentinel key
+// never is) return false and are left untouched.
+func sshKeyMaterial(line string) (string, bool) {
+	f := strings.Fields(strings.TrimSpace(line))
+	if len(f) < 2 {
+		return "", false

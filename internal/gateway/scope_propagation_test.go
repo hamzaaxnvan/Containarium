@@ -154,3 +154,82 @@ func TestRunIDClaim_EndToEndPropagation(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	wrapped := mw.HTTPMiddleware(stub)
+
+	req := httptest.NewRequest("POST", "/v1/tracker/connections/alice/default/issues/1/comments", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	runIDVals := capturedMD.Get(auth.MDKeyRunID)
+	if len(runIDVals) != 1 || runIDVals[0] != "run-abc123" {
+		t.Fatalf("run_id metadata = %v; want [run-abc123]", runIDVals)
+	}
+
+	grpcCtx := metadata.NewIncomingContext(context.Background(), capturedMD)
+	got, ok := auth.RunIDFromGRPCContext(grpcCtx)
+	if !ok || got != "run-abc123" {
+		t.Fatalf("RunIDFromGRPCContext = %q, %v; want run-abc123, true", got, ok)
+	}
+}
+
+func TestRunIDClaim_AbsentClaimPropagatesAsAbsent(t *testing.T) {
+	// An operator/human token (no run_id claim) MUST NOT carry a run_id
+	// metadata entry — a tracker write-verb handler must be able to tell
+	// "operator token, may name any connection" from "run token, bound
+	// to one connection" purely from whether this claim is present.
+	tm, _ := auth.NewTokenManager("propagation-test-secret-at-least-32-bytes-ok", "test")
+	mw := auth.NewAuthMiddleware(tm)
+
+	tok, _ := tm.GenerateToken("alice", []string{"admin"}, time.Hour)
+
+	var capturedMD metadata.MD
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMD = annotateContext(r.Context(), r)
+		w.WriteHeader(http.StatusOK)
+	})
+	wrapped := mw.HTTPMiddleware(stub)
+
+	req := httptest.NewRequest("GET", "/v1/tracker/alice", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+
+	if got := capturedMD.Get(auth.MDKeyRunID); len(got) != 0 {
+		t.Fatalf("operator token should NOT propagate run_id metadata; got %v", got)
+	}
+}
+
+// TestTrackerConnClaim_EndToEndPropagation is TestRunIDClaim_EndToEndPropagation's
+// counterpart for the `tracker_conn` claim (#1922): a run bound to a
+// connection via GenerateDelegatedTokenWithRun must have that binding
+// survive the same HTTP-middleware -> annotateContext -> gRPC-metadata hop,
+// since the tracker verb RPCs use it to reject a mismatched connection name.
+func TestTrackerConnClaim_EndToEndPropagation(t *testing.T) {
+	tm, err := auth.NewTokenManager("propagation-test-secret-at-least-32-bytes-ok", "test")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	mw := auth.NewAuthMiddleware(tm)
+
+	tok, _, err := tm.GenerateDelegatedTokenWithRun("alice", []string{"user"}, time.Hour, nil, auth.RunBinding{RunID: "run-abc123", TrackerConn: "default"}, auth.ScopeTrackerWrite)
+	if err != nil {
+		t.Fatalf("GenerateDelegatedTokenWithRun: %v", err)
+	}
+
+	var capturedMD metadata.MD
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMD = annotateContext(r.Context(), r)
+		w.WriteHeader(http.StatusOK)
+	})
+	wrapped := mw.HTTPMiddleware(stub)
+
+	req := httptest.NewRequest("POST", "/v1/tracker/connections/alice/default/issues/1/comments", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
