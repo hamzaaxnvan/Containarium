@@ -32,3 +32,108 @@ func seedChain(t *testing.T, store *Store, ctx context.Context, user string, roo
 
 // TestDispatch_SkipsOverDepth: with the default policy (max_depth 3) an
 // issue at depth 3 is dispatched — and its row and run input carry that
+// depth — while one at depth 4 (filed under an earlier, looser policy) is
+// skipped and counted, with no row, no label write and no run.
+func TestDispatch_SkipsOverDepth(t *testing.T) {
+	const user = "tracker-dispatch-overdepth"
+	provider := newFakeDispatchProvider(
+		Issue{Number: 103, Labels: []string{"scope:product"}}, // depth 3
+		Issue{Number: 104, Labels: []string{"scope:product"}}, // depth 4
+	)
+	runs := &fakeRunStarter{}
+	d, store, ctx := newDispatchFixture(t, user, provider, runs)
+	seedChain(t, store, ctx, user, 100, 4)
+
+	res, err := d.Tick(ctx, user, "default")
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if res.SkippedOverDepth != 1 {
+		t.Errorf("SkippedOverDepth = %d, want 1", res.SkippedOverDepth)
+	}
+	if len(res.Started) != 1 || res.Started[0].IssueNumber != 103 {
+		t.Fatalf("started = %+v, want only #103 (depth 3 == max)", res.Started)
+	}
+	if res.Started[0].Depth != 3 {
+		t.Errorf("started row depth = %d, want 3 (from lineage)", res.Started[0].Depth)
+	}
+	calls := runs.started()
+	if len(calls) != 1 {
+		t.Fatalf("StartRun calls = %d, want 1", len(calls))
+	}
+	var in pb.TrackerDispatchInput
+	if err := protojson.Unmarshal([]byte(calls[0].InputJSON), &in); err != nil {
+		t.Fatalf("decode input: %v", err)
+	}
+	if in.GetDepth() != 3 {
+		t.Errorf("input depth = %d, want 3", in.GetDepth())
+	}
+	if got := provider.labels(104); len(got) != 1 || got[0] != "scope:product" {
+		t.Errorf("over-depth issue labels = %v, want untouched [scope:product]", got)
+	}
+	if c := provider.commentsOn(104); len(c) != 0 {
+		t.Errorf("over-depth issue got comments %v, want none", c)
+	}
+	rows, err := store.ListDispatches(ctx, user, "default", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("ListDispatches: %v", err)
+	}
+	for _, r := range rows {
+		if r.IssueNumber == 104 {
+			t.Errorf("over-depth issue has a dispatch row %+v, want none", r)
+		}
+	}
+}
+
+// TestDispatch_LoweredPolicyStillHolds: the connection's policy is read
+// per tick, so lowering max_depth after a chain was filed stops the
+// deeper issues from dispatching; a human-created issue (no lineage row,
+// depth 0) is always within bounds.
+func TestDispatch_LoweredPolicyStillHolds(t *testing.T) {
+	const user = "tracker-dispatch-lowered"
+	provider := newFakeDispatchProvider(
+		Issue{Number: 200, Labels: []string{"scope:product"}}, // human, depth 0
+		Issue{Number: 201, Labels: []string{"scope:product"}}, // depth 1
+		Issue{Number: 202, Labels: []string{"scope:product"}}, // depth 2
+	)
+	runs := &fakeRunStarter{}
+	d, store, ctx := newDispatchFixture(t, user, provider, runs)
+	seedChain(t, store, ctx, user, 200, 2)
+	lowered := PolicyFromProto(&pb.TrackerPolicy{MaxDepth: 1})
+	d.Policy = &lowered
+
+	res, err := d.Tick(ctx, user, "default")
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	var started []int64
+	for _, r := range res.Started {
+		started = append(started, r.IssueNumber)
+	}
+	if len(started) != 2 || started[0] != 200 || started[1] != 201 {
+		t.Errorf("started = %v, want [200 201]", started)
+	}
+	if res.SkippedOverDepth != 1 {
+		t.Errorf("SkippedOverDepth = %d, want 1 (#202)", res.SkippedOverDepth)
+	}
+}
+
+// TestDispatch_NilPolicyUsesDefaults: a Dispatcher built without a
+// policy enforces the documented default max_depth (3), never
+// "unlimited" — a wiring mistake must fail closed.
+func TestDispatch_NilPolicyUsesDefaults(t *testing.T) {
+	const user = "tracker-dispatch-nilpolicy"
+	provider := newFakeDispatchProvider(Issue{Number: 304, Labels: []string{"scope:product"}}) // depth 4
+	runs := &fakeRunStarter{}
+	d, store, ctx := newDispatchFixture(t, user, provider, runs)
+	seedChain(t, store, ctx, user, 300, 4)
+	d.Policy = nil
+
+	res, err := d.Tick(ctx, user, "default")
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if res.SkippedOverDepth != 1 || len(runs.started()) != 0 {
+		t.Fatalf("result = %+v, runs = %d; want the depth-4 issue skipped under the default max_depth", res, len(runs.started()))
+	}
+}

@@ -32,3 +32,37 @@ const DefaultKind = KindSecret
 // cmd layer switches on this value.
 type Preflight int
 
+const (
+	// PreflightSecretMetadata reads the tenant secret's METADATA (name,
+	// delivery mode) and asserts the delivery mode is one a shell session can
+	// actually see. It never reads the value.
+	PreflightSecretMetadata Preflight = iota
+	// PreflightGatewayDryRun calls MintGatewayToken{dry_run:true}, which
+	// validates box ownership, the provider, and that the resolved key owner
+	// has a key — and issues nothing. It is how install names a
+	// misconfiguration at install time rather than at the first model call.
+	PreflightGatewayDryRun
+)
+
+func (p Preflight) String() string {
+	switch p {
+	case PreflightSecretMetadata:
+		return "secret-metadata"
+	case PreflightGatewayDryRun:
+		return "gateway-dry-run"
+	default:
+		return fmt.Sprintf("Preflight(%d)", int(p))
+	}
+}
+
+// CredentialSource is how one box's runs obtain a model credential.
+type CredentialSource interface {
+	// Kind is this source's identifier, as recorded in code.json.
+	Kind() Kind
+	// Preflight is the install-time check this source demands.
+	Preflight() Preflight
+}
+
+// SecretCredential is the tenant-secret source.
+//
+// Name is the secret the engine's runs expect in their environment
