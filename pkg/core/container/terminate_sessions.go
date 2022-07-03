@@ -16,3 +16,13 @@ import "os/exec"
 // refused without touching the box.
 func (m *Manager) TerminateAccountSessions(containerName, account string) bool {
 	if !isValidUsername(account) {
+		return false
+	}
+	_ = m.incus.Exec(containerName, []string{"loginctl", "terminate-user", account})
+	_, _, code, err := m.incus.ExecWithExitCode(containerName, []string{"pkill", "-KILL", "-u", account})
+	return err == nil && code == 0
+}
+
+// IsValidAccountName reports whether name is an acceptable Linux login for
+// the box and jump accounts: letters, digits, '-' and '_', at most 32
+// characters, not starting with a digit or '-'.
