@@ -34,39 +34,3 @@ func (e *IngestHTTPError) Error() string {
 // IngestSSHSessionRecords appends a batch of sentinel SSH session records to
 // the backend's audit chain over REST.
 func (c *HTTPClient) IngestSSHSessionRecords(ctx context.Context, req *pb.IngestSSHSessionRecordsRequest) (*pb.IngestSSHSessionRecordsResponse, error) {
-	body, err := protojson.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/audit/ssh-sessions/ingest", body)
-	if err != nil {
-		return nil, fmt.Errorf("ingest ssh session records: %w", err)
-	}
-	defer drainClose(resp)
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("ingest ssh session records: read response: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &IngestHTTPError{StatusCode: resp.StatusCode, Body: string(b)}
-	}
-	var out pb.IngestSSHSessionRecordsResponse
-	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(b, &out); err != nil {
-		return nil, fmt.Errorf("ingest ssh session records: decode response: %w", err)
-	}
-	return &out, nil
-}
-
-// IngestSSHSessionRecords is the gRPC transport's counterpart.
-func (c *GRPCClient) IngestSSHSessionRecords(ctx context.Context, req *pb.IngestSSHSessionRecordsRequest) (*pb.IngestSSHSessionRecordsResponse, error) {
-	resp, err := c.auditClient.IngestSSHSessionRecords(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("ingest ssh session records: %w", err)
-	}
-	return resp, nil
-}
-
-// IsIngestRejected reports whether err means the backend refused the batch
-// as invalid or unauthorized (HTTP 400/401/403 or gRPC InvalidArgument /
-// Unauthenticated / PermissionDenied). Those are not retryable: resending
-// the same batch fails the same way.
