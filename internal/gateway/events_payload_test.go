@@ -25,3 +25,31 @@ func marshalToMap(t *testing.T, v any) map[string]json.RawMessage {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
+	return m
+}
+
+func assertKeys(t *testing.T, got map[string]json.RawMessage, want ...string) {
+	t.Helper()
+	for _, k := range want {
+		if _, ok := got[k]; !ok {
+			t.Errorf("payload is missing %q — web-ui's events.ts declares it", k)
+		}
+	}
+	if len(got) != len(want) {
+		keys := make([]string, 0, len(got))
+		for k := range got {
+			keys = append(keys, k)
+		}
+		t.Errorf("payload has %d keys, want %d: got %v, want %v", len(got), len(want), keys, want)
+	}
+}
+
+func TestContainerPayloadShape(t *testing.T) {
+	got := marshalToMap(t, containerToPayload(&pb.Container{
+		Name: "alice-container", Username: "alice",
+		State:     pb.ContainerState_CONTAINER_STATE_RUNNING,
+		Network:   &pb.NetworkInfo{IpAddress: "10.0.3.5"},
+		Resources: &pb.ResourceLimits{Cpu: "2", Memory: "4GB", Disk: "20GB"},
+		Image:     "ubuntu:24.04", PodmanEnabled: true, Stack: "nodejs",
+	}))
+	assertKeys(t, got, "name", "username", "state", "ipAddress", "cpu", "memory", "disk", "image", "podmanEnabled", "stack")
