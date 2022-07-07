@@ -69,3 +69,39 @@ func ListenStartup(addr, reason string) (*StartupListener, error) {
 	}()
 	return sl, nil
 }
+
+// Addr is the bound address.
+func (sl *StartupListener) Addr() net.Addr { return sl.lis.Addr() }
+
+// SetReason updates the reason /health reports while the daemon is starting.
+func (sl *StartupListener) SetReason(reason string) {
+	sl.mu.Lock()
+	sl.reason = reason
+	sl.mu.Unlock()
+}
+
+// Serve installs h as the handler for every request from now on and blocks
+// until the server stops. It returns nil after Close.
+func (sl *StartupListener) Serve(h http.Handler) error {
+	sl.mu.Lock()
+	sl.handler = h
+	sl.mu.Unlock()
+	<-sl.done
+	sl.serveMu.Lock()
+	defer sl.serveMu.Unlock()
+	if errors.Is(sl.err, http.ErrServerClosed) {
+		return nil
+	}
+	return sl.err
+}
+
+// Close stops the server and releases the port before it returns.
+//
+// srv.Close alone is not enough: if the serve goroutine has not registered
+// the listener yet, Close returns while the port is still bound, and a
+// gateway rebinding right after would race it. So close the listener here
+// too and wait for the serve loop to exit.
+func (sl *StartupListener) Close() error {
+	err := sl.srv.Close()
+	_ = sl.lis.Close()
+	<-sl.done

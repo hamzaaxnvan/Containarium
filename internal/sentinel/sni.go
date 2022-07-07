@@ -62,3 +62,67 @@ const maxHelloRecord = 16389
 func peekHelloRecord(conn net.Conn) ([]byte, net.Conn, error) {
 	br := bufio.NewReaderSize(conn, maxHelloRecord)
 	wrapped := &peekConn{Conn: conn, r: br}
+	full, err := peekHelloRecordFrom(br)
+	return full, wrapped, err
+}
+
+// peekHelloRecordFrom peeks the first TLS record from br without consuming
+// it. br must have been created with at least maxHelloRecord of buffer.
+func peekHelloRecordFrom(br *bufio.Reader) ([]byte, error) {
+	// Peek the 5-byte record header to learn record length.
+	hdr, err := br.Peek(5)
+	if err != nil || len(hdr) < 5 {
+		return nil, errNotTLS
+	}
+	if hdr[0] != 0x16 { // TLS handshake content type
+		return nil, errNotTLS
+	}
+	recLen := int(hdr[3])<<8 | int(hdr[4])
+	total := 5 + recLen
+	if total < 5 || total > maxHelloRecord {
+		return nil, errNotTLS
+	}
+
+	full, err := br.Peek(total)
+	if err != nil || len(full) < total {
+		return nil, errNotTLS
+	}
+	return full, nil
+}
+
+// extractSNI parses a TLS ClientHello (record-framed, starting at byte 0)
+// and returns the SNI host_name extension value. It performs strict bounds
+// checks at every step so a malformed handshake returns an error rather than
+// panicking on slice bounds.
+func extractSNI(buf []byte) (string, error) {
+	hello, err := parseHello(buf, false)
+	return hello.SNI, err
+}
+
+// parseClientHello parses the SNI and ALPN extensions of a record-framed
+// ClientHello. A malformed extension yields an error; absent extensions do
+// not.
+func parseClientHello(buf []byte) (clientHello, error) {
+	return parseHello(buf, true)
+}
+
+// parseHello is the shared ClientHello walker. With withALPN false it keeps
+// the original SNI-only contract: it returns as soon as the SNI extension is
+// found (ignoring anything after it) and reports errNoSNI when absent. With
+// withALPN true it visits every extension and a missing SNI is not an error.
+func parseHello(buf []byte, withALPN bool) (clientHello, error) {
+	var hello clientHello
+	// Record header: type(1) + version(2) + length(2)
+	if len(buf) < 5 || buf[0] != 0x16 {
+		return hello, errNotTLS
+	}
+	recLen := int(buf[3])<<8 | int(buf[4])
+	if len(buf) < 5+recLen {
+		return hello, errors.New("record body truncated")
+	}
+	body := buf[5 : 5+recLen]
+
+	// Handshake: type(1) + length(3) + body
+	if len(body) < 4 || body[0] != 0x01 {
+		return hello, errors.New("not a ClientHello")
+	}
