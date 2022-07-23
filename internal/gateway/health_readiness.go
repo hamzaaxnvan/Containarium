@@ -18,3 +18,13 @@ func (gs *GatewayServer) SetReadinessCheck(check policyreadiness.CheckFunc) {
 
 func healthHandlerWithReadiness(check policyreadiness.CheckFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if check == nil {
+			healthHandler(w, r)
+			return
+		}
+		st, err := check(r.Context(), policyreadiness.CorePostgresService)
+		// No entry means Postgres is not configured. A failed startup entry
+		// stays NOT_SERVING until restart, even if policy stores recover.
+		if err == nil && (st == healthpb.HealthCheckResponse_SERVING || st == healthpb.HealthCheckResponse_SERVICE_UNKNOWN) {
+			healthHandler(w, r)
+			return

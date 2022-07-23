@@ -57,3 +57,180 @@ export class ClaudeEngine implements Engine {
     cfg: EngineConfig,
     journal: JournalSink,
   ): Promise<EngineResult> {
+    return this.turn(task, cfg, journal, undefined);
+  }
+
+  // turn runs one query. resume is the SDK session to continue (undefined
+  // starts a new one); the result's followUp resumes this turn's session, so
+  // the model has the run it just did in context (#2513).
+  private async turn(
+    task: string,
+    cfg: EngineConfig,
+    journal: JournalSink,
+    resume: string | undefined,
+  ): Promise<EngineResult> {
+    let sessionId: string | undefined;
+    let source: AuthenticationSource = cfg.authenticationSource ?? "unknown";
+    let externalProvider = false;
+    let text = "";
+    // The text after the last tool call: the final message the skill
+    // contract asks for (#2513), as opposed to narration between tool calls.
+    let finalText = "";
+    let usage: unknown;
+    let result: ClaudeResult | undefined;
+    // tool_use id -> tool name, so a tool_result line can name its tool.
+    const toolNames = new Map<string, string>();
+
+    const specs = mcpServerSpecs(cfg);
+    const options = {
+      model: cfg.model || "claude-opus-4-8",
+      systemPrompt: cfg.systemPrompt,
+      maxTurns: cfg.maxTurns,
+      permissionMode: "dontAsk",
+      allowedTools: claudeAllowedTools(specs),
+      mcpServers: claudeMcpServers(specs),
+      ...(cfg.outputSchema
+        ? { outputFormat: { type: "json_schema", schema: cfg.outputSchema } }
+        : {}),
+      ...(resume ? { resume } : {}),
+    } as Parameters<typeof query>[0]["options"];
+
+    let dispose: (() => void) | undefined;
+    try {
+      const stream = this.queryFn({ prompt: task, options });
+      if ("close" in stream && typeof stream.close === "function") {
+        const close = stream.close;
+        dispose = () => {
+          close.call(stream);
+        };
+      }
+      // SDK account info is nonsecret provenance and is available before model
+      // inference. Do not inspect email/account identifiers or credential values.
+      if ("accountInfo" in stream && typeof stream.accountInfo === "function") {
+        try {
+          const info = (await stream.accountInfo()) as {
+            apiKeySource?: string;
+            apiProvider?: string;
+          };
+          externalProvider = Boolean(
+            info.apiProvider && info.apiProvider !== "firstParty",
+          );
+          source = externalProvider
+            ? "key"
+            : info.apiKeySource === "oauth"
+              ? "oauth"
+              : ["user", "project", "org", "temporary"].includes(
+                    info.apiKeySource ?? "",
+                  )
+                ? "key"
+                : source;
+        } catch (e) {
+          if (
+            typeof e === "object" &&
+            e !== null &&
+            "status" in e &&
+            e.status === 401
+          )
+            throw new CredentialAuthenticationError(source);
+          // Optional metadata lookup failures must not break a valid run.
+          // The authoritative init message may still identify its source.
+        }
+      }
+      for await (const m of stream) {
+        if (typeof m.session_id === "string" && m.session_id) sessionId = m.session_id;
+        if (m.type === "system" && m.subtype === "init") {
+          source = externalProvider
+            ? "key"
+            : m.apiKeySource === "oauth"
+              ? "oauth"
+              : ["user", "project", "org", "temporary"].includes(m.apiKeySource)
+                ? "key"
+                : "unknown";
+        }
+        if (m.type === "assistant") {
+          if (m.error === "authentication_failed")
+            throw new CredentialAuthenticationError(source);
+          for (const block of m.message.content ?? []) {
+            if (block.type === "text" && block.text) {
+              text += block.text;
+              finalText += block.text;
+              journal.append({ kind: "assistant", text: block.text });
+            } else if (block.type === "tool_use") {
+              finalText = "";
+              toolNames.set(block.id, block.name);
+              journal.append({
+                kind: "tool_use",
+                tool: block.name,
+                input: JSON.stringify(block.input ?? {}),
+              });
+            }
+          }
+        } else if (m.type === "user") {
+          const content = m.message.content;
+          if (typeof content === "string") continue;
+          for (const block of content ?? []) {
+            if (block.type !== "tool_result") continue;
+            journal.append({
+              kind: "tool_result",
+              tool: toolNames.get(block.tool_use_id) ?? "unknown",
+              text: toolResultText(block.content),
+            });
+          }
+        } else if (m.type === "result") {
+          if ("api_error_status" in m && m.api_error_status === 401)
+            throw new CredentialAuthenticationError(source);
+          usage = m.usage;
+          result = m;
+          if (m.subtype !== "success") {
+            journal.append({ kind: "error", text: resultErrorText(m) });
+          }
+          break;
+        }
+      }
+    } catch (e) {
+      if (e instanceof CredentialAuthenticationError) throw e;
+      if (
+        typeof e === "object" &&
+        e !== null &&
+        "status" in e &&
+        e.status === 401
+      )
+        throw new CredentialAuthenticationError(source);
+      throw e;
+    } finally {
+      try {
+        dispose?.();
+      } catch {
+        process.stderr.write("agent-runtime: SDK cleanup unavailable\n");
+      }
+    }
+    const ending = describeRunEnding(
+      claudeEnding(result, finalText, !!cfg.outputSchema),
+    );
+    if (ending) journal.append({ kind: "status", text: ending });
+    const authenticated =
+      result?.subtype === "success" && result.is_error === false;
+    if (cfg.outputSchema) {
+      return {
+        outputJson: JSON.stringify(structuredOutput(result)),
+        usage,
+        authenticationSucceeded: authenticated,
+        authenticationSource: source,
+      };
+    }
+    // A schema-bound run never needs one: it returns structured output or
+    // throws above.
+    const resumeFrom = sessionId;
+    return {
+      outputJson: text.trim(),
+      usage,
+      authenticationSucceeded: authenticated,
+      authenticationSource: source,
+      ...(resumeFrom
+        ? { followUp: (next: string, nextJournal: JournalSink) => this.turn(next, cfg, nextJournal, resumeFrom) }
+        : {}),
+    };
+  }
+}
+
+// claudeEnding reads how the turn ended from the result message (#2513): the
