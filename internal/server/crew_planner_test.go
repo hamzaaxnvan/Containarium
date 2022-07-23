@@ -55,3 +55,60 @@ func TestPlanTaskGraph_OnlyRunsPlannerAndValidatesBeforeReturning(t *testing.T) 
 		}
 		if !found {
 			t.Fatal("planner needs the daemon's actual assignee catalog")
+		}
+		return &pb.RunAgentSkillResponse{ArtifactJson: validPlannerGraph, GitCommit: "resolved-sha"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 || resp.Graph.Nodes[0].GetSkillId() != "code-review" || resp.GitCommit != "resolved-sha" {
+		t.Fatalf("unexpected planning result: calls=%d, response=%v", called, resp)
+	}
+	record, ok, err := s.runs.Get(ctx, resp.RunId)
+	if err != nil || !ok || record.State != pb.CrewRunState_CREW_RUN_STATE_COMPLETED || record.ArtifactJson == "" {
+		t.Fatalf("missing completed plan record: %v, %v", record, err)
+	}
+	if strings.Contains(record.String(), "fetch-secret") {
+		t.Fatal("fetch credential must not enter the saved plan")
+	}
+}
+
+func TestPlanTaskGraph_RejectedOutputIsRecordedWithoutExecutingNodes(t *testing.T) {
+	cases := map[string]string{
+		"self assignee":    `{"goal":"review API","nodes":[{"id":"a","goal":"implement","skill_id":"task-planner"}]}`,
+		"malformed":        "not JSON",
+		"unknown field":    `{"goal":"review API","nodez":[]}`,
+		"unknown assignee": `{"goal":"review API","nodes":[{"id":"a","goal":"g","skill_id":"missing"}]}`,
+		"cycle":            `{"goal":"review API","nodes":[{"id":"a","goal":"g","skill_id":"code-review"}],"edges":[{"node_id":"a","depends_on":"a"}]}`,
+		"over cap":         `{"goal":"review API","nodes":[{"id":"a","goal":"g","skill_id":"code-review"}],"limits":{"max_nodes":33}}`,
+		"wrong goal":       `{"goal":"another goal","nodes":[{"id":"a","goal":"g","skill_id":"code-review"}]}`,
+		"empty output":     "",
+	}
+	for name, output := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := NewCrewServer(nil) // no executor: a plan must never need one
+			ctx := ctxAs("admin", true)
+			var runID string
+			calls := 0
+			resp, err := s.planTaskGraph(ctx, &pb.PlanTaskGraphRequest{Goal: "review API", Repo: "https://example.com/repo.git"},
+				func(_ context.Context, task *pb.RunAgentSkillRequest) (*pb.RunAgentSkillResponse, error) {
+					calls++
+					runID = task.RunId
+					if task.SkillId != plannerSkillID {
+						t.Fatal("must not execute an output node")
+					}
+					return &pb.RunAgentSkillResponse{ArtifactJson: output}, nil
+				})
+			if resp != nil || status.Code(err) != codes.FailedPrecondition || calls != 1 || !strings.Contains(err.Error(), runID) {
+				t.Fatalf("invalid plan escaped rejection: response=%v error=%v calls=%d", resp, err, calls)
+			}
+			if name == "self assignee" && (!strings.Contains(err.Error(), `node "a"`) || !strings.Contains(err.Error(), "planner")) {
+				t.Fatalf("self-assignment error must identify the node: %v", err)
+			}
+			record, ok, storeErr := s.runs.Get(ctx, runID)
+			if storeErr != nil || !ok || record.State != pb.CrewRunState_CREW_RUN_STATE_FAILED || record.Error == "" || record.ArtifactJson != "" {
+				t.Fatalf("failure reason must be retained, not a usable artifact: %v %v", record, storeErr)
+			}
+		})
+	}
+}
