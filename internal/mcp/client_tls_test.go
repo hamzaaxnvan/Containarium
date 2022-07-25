@@ -63,3 +63,36 @@ func TestBuildMCPTLSConfig_AllowsHTTPWhenOptedIn(t *testing.T) {
 	t.Setenv(mcpAllowInsecureEnv, "true")
 	cfg, err := buildMCPTLSConfig("http://daemon.example.com:8080")
 	if err != nil {
+		t.Fatalf("opted-in plaintext must be allowed: %v", err)
+	}
+	if cfg != nil {
+		t.Fatal("plaintext path should return nil TLS config")
+	}
+}
+
+func TestBuildMCPTLSConfig_HTTPSWithSystemRoots(t *testing.T) {
+	t.Setenv(mcpAllowInsecureEnv, "")
+	t.Setenv(mcpTrustedCAFileEnv, "")
+	cfg, err := buildMCPTLSConfig("https://daemon.example.com:8080")
+	if err != nil {
+		t.Fatalf("https://+no-CA-pin should be accepted: %v", err)
+	}
+	if cfg != nil {
+		t.Fatal("with no CA pin and no other knobs, returning nil lets http.Transport use system roots")
+	}
+}
+
+func TestBuildMCPTLSConfig_HTTPSWithCAPin(t *testing.T) {
+	tmp := t.TempDir()
+	caPath := filepath.Join(tmp, "ca.crt")
+	if err := os.WriteFile(caPath, genTestCAPEM(t), 0o600); err != nil {
+		t.Fatalf("write CA: %v", err)
+	}
+	t.Setenv(mcpAllowInsecureEnv, "")
+	t.Setenv(mcpTrustedCAFileEnv, caPath)
+
+	cfg, err := buildMCPTLSConfig("https://daemon.example.com:8080")
+	if err != nil {
+		t.Fatalf("CA-pin config should succeed: %v", err)
+	}
+	if cfg == nil || cfg.RootCAs == nil {
