@@ -41,25 +41,3 @@ func TestCheckpointRetainsPendingRiskAndExclusion(t *testing.T) {
 		t.Fatal(err)
 	}
 	if g.Complete(old, SetupSucceeded) {
-		t.Fatal("old-process completion reopened restored state")
-	}
-	denied(t, g, f.key, 1, 1, Cooldown)
-	f.now = start.Add(time.Minute)
-	probe, err := g.Acquire(f.key, 1, 1)
-	if err != nil || !probe.Probe {
-		t.Fatalf("first elapsed charge did not release one safe probe: %v", err)
-	}
-	g.Complete(probe, SetupSucceeded)
-	denied(t, g, f.key, 1, 2, BudgetExhausted)
-	f.now = old.Deadline.Add(time.Minute)
-	if _, err := g.Acquire(f.key, 1, 2); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestRestoreRejectsCorruptStateAtomically refuses risk loss or partial restoration.
-func TestRestoreRejectsCorruptStateAtomically(t *testing.T) {
-	f := newGateFixture(t)
-	f.g.Complete(f.take(t, 1), SetupFailed)
-	rows := f.g.Checkpoint()
-	if len(rows) != 1 || len(rows[0].Risks) != 1 {
