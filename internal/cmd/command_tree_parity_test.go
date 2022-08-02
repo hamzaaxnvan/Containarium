@@ -29,19 +29,3 @@ func TestContainariumdCommandTree_SupersetOfClientGolden(t *testing.T) {
 	b, err := os.ReadFile("testdata/client_command_tree.golden")
 	if err != nil {
 		t.Fatalf("read golden file: %v", err)
-	}
-
-	daemonTree := renderCommandTree(rootCmd)
-	daemonSet := make(map[string]bool, len(daemonTree))
-	for _, p := range daemonTree {
-		daemonSet[p] = true
-	}
-	hasPrefix := func(prefix string) bool {
-		for _, p := range daemonTree {
-			if strings.HasPrefix(p, prefix+" ") {
-				return true
-			}
-		}
-		return false
-	}
-
