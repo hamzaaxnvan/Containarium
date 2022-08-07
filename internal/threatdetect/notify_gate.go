@@ -100,3 +100,54 @@ func killOf(f *Finding) killKey {
 // killNews reports whether f's kill outcome should reach the webhook now,
 // given what was last delivered for it. Skipped kills are keyed on the reason
 // kind, never on text, so a process that exits before every kill is one
+// delivery, not one per pid. The first kill and the first skip of a finding
+// are each immediate exactly once; after that a changed outcome waits for
+// KillRenotifyInterval, so a miner that alternately dies and escapes the
+// signal is one post per interval, not two.
+func killNews(prev gateEntry, f *Finding, now time.Time) bool {
+	cur := killOf(f)
+	if cur == prev.kill {
+		return false
+	}
+	if cur.killed && !prev.kill.killed {
+		return true // the first kill
+	}
+	if cur.skip != pb.KillSkipReason_KILL_SKIP_REASON_UNSPECIFIED && !prev.skipSent {
+		return true // the first skip
+	}
+	changed := cur.killed && (cur.pid != prev.kill.pid || cur.kills != prev.kill.kills) ||
+		cur.skip != pb.KillSkipReason_KILL_SKIP_REASON_UNSPECIFIED && cur.skip != prev.kill.skip
+	return changed && now.Sub(prev.killAt) >= KillRenotifyInterval
+}
+
+// responseOf is the box f's response is about and its state; no response
+// yet is NONE for no box.
+func responseOf(f *Finding) (box string, state pb.ResponseState) {
+	if f.Response == nil {
+		return "", pb.ResponseState_RESPONSE_STATE_NONE
+	}
+	return f.Response.Container, f.Response.State
+}
+
+// boxState is the response state last delivered for box; NONE when none was.
+func (e gateEntry) boxState(box string) pb.ResponseState {
+	if s, ok := e.boxes[box]; ok {
+		return s
+	}
+	return pb.ResponseState_RESPONSE_STATE_NONE
+}
+
+func newDeliveryGate(interval time.Duration) *deliveryGate {
+	if interval <= 0 {
+		interval = DefaultRenotifyInterval
+	}
+	return &deliveryGate{interval: interval, now: time.Now, last: map[int64]gateEntry{}}
+}
+
+// shouldDeliver reports whether f should reach the webhook. It records
+// nothing for a delivery: call delivered once the finding was actually
+// queued, so a dropped delivery does not suppress the next attempt.
+func (g *deliveryGate) shouldDeliver(f *Finding) bool {
+	if f.ID == 0 || f.State == FindingStateResolved {
+		return true // untracked (fail open), or the resolution: always news
+	}
