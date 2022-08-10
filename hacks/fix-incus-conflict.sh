@@ -43,25 +43,3 @@ apt-get autoclean
 
 log_info "Adding Zabbly repository..."
 curl -fsSL https://pkgs.zabbly.com/key.asc | gpg --batch --yes --dearmor -o /usr/share/keyrings/zabbly-incus.gpg
-
-UBUNTU_CODENAME=$(lsb_release -cs)
-echo "deb [signed-by=/usr/share/keyrings/zabbly-incus.gpg] https://pkgs.zabbly.com/incus/stable ${UBUNTU_CODENAME} main" | \
-    tee /etc/apt/sources.list.d/zabbly-incus-stable.list
-
-log_info "Configuring APT to prefer Zabbly Incus packages..."
-cat > /etc/apt/preferences.d/zabbly-incus << 'EOF'
-Package: incus incus-* *incus*
-Pin: origin pkgs.zabbly.com
-Pin-Priority: 1000
-
-Package: incus incus-* *incus*
-Pin: release o=Ubuntu
-Pin-Priority: -1
-EOF
-
-log_info "Updating package lists..."
-apt-get update
-
-log_info "Installing Incus from Zabbly..."
-# Note: incus-tools was replaced by incus-extra in newer versions
-apt-get install -y incus incus-client incus-extra
