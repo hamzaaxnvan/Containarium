@@ -73,3 +73,78 @@ const approvalPromptMax = 500
 type approvalServer struct {
 	run     string
 	dir     string
+	timeout time.Duration
+	pub     ed25519.PublicKey // nil: no usable key was given, nothing can answer
+
+	now          func() time.Time
+	pollInterval time.Duration
+
+	mu sync.Mutex // serializes journal appends
+}
+
+// RunApprovalCLI is `agent-box approval-mcp --run <name> --public-key <hex> [--timeout d] [--dir d]`.
+func RunApprovalCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("approval-mcp", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	run := fs.String("run", "", "run name whose permission requests this serves (required)")
+	timeout := fs.Duration("timeout", coderun.DefaultApprovalTimeout, "how long a request waits before it expires into a deny")
+	dir := fs.String("dir", DefaultLogDir, "run log directory")
+	publicKey := fs.String("public-key", "", "hex Ed25519 public key answers must be signed for")
+	probe := fs.Bool("probe", false, "print a readiness line and exit")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *probe {
+		fmt.Fprintln(stdout, approvalProbeOK)
+		return 0
+	}
+	if err := coderun.ValidApprovalRunName(*run); err != nil {
+		fmt.Fprintf(stderr, "approval-mcp: --run: %v\n", err)
+		return 2
+	}
+	if *timeout <= 0 {
+		fmt.Fprintln(stderr, "approval-mcp: --timeout must be positive")
+		return 2
+	}
+
+	s := &approvalServer{run: *run, dir: *dir, timeout: *timeout, now: time.Now, pollInterval: approvalPollInterval}
+	// The answers directory is this run's own: a previous same-name run's was
+	// rotated aside by process_start.
+	if err := os.MkdirAll(filepath.Join(s.dir, s.run+".answers"), 0o700); err != nil {
+		log.Printf("[approval-mcp] create answers dir: %v", err)
+	}
+	s.setPublicKey(*publicKey)
+
+	mcpServer := server.NewMCPServer(ApprovalServerName, "1", server.WithToolCapabilities(false))
+	mcpServer.AddTool(approvalTool(), s.handleApprove)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := server.NewStdioServer(mcpServer).Listen(ctx, stdin, stdout); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("[approval-mcp] stdio serve error: %v", err)
+		return 1
+	}
+	return 0
+}
+
+func approvalTool() mcp.Tool {
+	return mcp.NewTool(
+		ApprovalToolName,
+		mcp.WithDescription("Permission prompt for a containarium code run. Called by Claude Code, not by the agent."),
+		mcp.WithString("tool_name", mcp.Description("Tool the agent wants to use.")),
+		mcp.WithObject("input", mcp.Description("That tool's input.")),
+		mcp.WithString("tool_use_id", mcp.Description("Claude Code's id for the tool call.")),
+	)
+}
+
+func (s *approvalServer) journalPath() string { return filepath.Join(s.dir, s.run+".input.jsonl") }
+func (s *approvalServer) answerPath(id string) string {
+	return filepath.Join(s.dir, s.run+".answers", id)
+}
+
+// setPublicKey takes the run's public key. A missing or malformed one is
+// journaled, and every request is then denied at once: waiting would only
+// delay a deny nobody can override.
+func (s *approvalServer) setPublicKey(h string) {
+	pub, err := coderun.ParseApprovalPublicKey(h)
+	if err != nil {

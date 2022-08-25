@@ -64,37 +64,3 @@ func TestRevocationStore_RevokedTokenReadsAsRevoked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IsRevoked: %v", err)
 	}
-	if other {
-		t.Error("an unrevoked token read as revoked — every session would be rejected")
-	}
-}
-
-// Revoking twice must not rewrite the first record. The reason and time are
-// audit history: a later call describing the same revocation differently
-// would overwrite why it happened.
-func TestRevocationStore_SecondRevokeDoesNotOverwriteTheFirst(t *testing.T) {
-	ctx := context.Background()
-	s := revocationStore(t)
-	exp := time.Now().Add(time.Hour)
-
-	if err := s.Revoke(ctx, "jti-1", exp, "operator_revoke"); err != nil {
-		t.Fatalf("first revoke: %v", err)
-	}
-	if err := s.Revoke(ctx, "jti-1", exp, "refresh_rotation"); err != nil {
-		t.Fatalf("second revoke: %v", err)
-	}
-
-	rows, err := s.List(ctx, ListRevocationsParams{Limit: 10})
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("revoking the same jti twice produced %d rows, want 1", len(rows))
-	}
-	if rows[0].Reason != "operator_revoke" {
-		t.Errorf("reason = %q, want the first one — a later revoke overwrote the audit record of "+
-			"why the token was revoked", rows[0].Reason)
-	}
-}
-
-// Cleanup must drop only entries whose token has already expired. Removing a
