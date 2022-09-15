@@ -35,22 +35,3 @@ func (c *countingPolicyConfig) Set(_ context.Context, key, value string) error {
 	return nil
 }
 
-func (c *countingPolicyConfig) reads() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.gets
-}
-
-// TestProcessResponder_ReadsPolicyOncePerFinding (#2768 item 5): the kill
-// step and the policy action share one resolution of the effective policy.
-// One Effective is two config reads (backend default, box override).
-func TestProcessResponder_ReadsPolicyOncePerFinding(t *testing.T) {
-	for _, action := range []pb.ProcessAction{pb.ProcessAction_PROCESS_ACTION_ALERT, pb.ProcessAction_PROCESS_ACTION_THROTTLE} {
-		t.Run(action.String(), func(t *testing.T) {
-			fx := newResponderFixture(t, false)
-			cfg := &countingPolicyConfig{kv: map[string]string{}}
-			fx.policies = threatdetect.NewProcessPolicyStore(cfg)
-			fx.r.policies = fx.policies
-			fx.setDefault(t, action, "", 0)
-			fx.setKill(t, "", true)
-			k := &fakeKiller{}

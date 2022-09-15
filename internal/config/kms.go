@@ -15,3 +15,11 @@ const (
 	// KMS backend selector: none | inproc | vault | gcp | aws.
 	EnvKMSBackend = "CONTAINARIUM_KMS_BACKEND"
 
+	// AWS KMS.
+	EnvAWSKMSRegion           = "CONTAINARIUM_AWS_KMS_REGION"
+	EnvAWSKMSKeyID            = "CONTAINARIUM_AWS_KMS_KEY_ID"
+	EnvAWSAccessKeyID         = "CONTAINARIUM_AWS_ACCESS_KEY_ID"
+	EnvAWSKMSEndpoint         = "CONTAINARIUM_AWS_KMS_ENDPOINT"
+	EnvAWSSecretAccessKey     = "CONTAINARIUM_AWS_SECRET_ACCESS_KEY"      // #nosec G101 -- env var name, not a credential value
+	EnvAWSSecretAccessKeyFile = "CONTAINARIUM_AWS_SECRET_ACCESS_KEY_FILE" // #nosec G101 -- env var name, not a credential value
+	EnvAWSSessionToken        = "CONTAINARIUM_AWS_SESSION_TOKEN"          // #nosec G101 -- env var name, not a credential value
