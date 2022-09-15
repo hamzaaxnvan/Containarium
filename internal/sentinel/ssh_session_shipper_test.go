@@ -19,3 +19,14 @@ func TestFileAuditIngestTokens(t *testing.T) {
 		t.Fatalf("no file: ok=%v err=%v", ok, err)
 	}
 
+	if err := SaveAuditIngestTokenStore(path, []AuditIngestTokenEntry{{BackendID: "b1", Token: "t1"}, {BackendID: "b2", Token: "t2"}}); err != nil {
+		t.Fatal(err)
+	}
+	if tok, ok, err := src.TokenFor("b2"); !ok || err != nil || tok != "t2" {
+		t.Fatalf("TokenFor(b2) = %q,%v,%v", tok, ok, err)
+	}
+	if _, ok, _ := src.TokenFor("absent"); ok {
+		t.Fatal("absent backend must report !ok")
+	}
+	bs, _ := src.Backends()
+	sort.Strings(bs)

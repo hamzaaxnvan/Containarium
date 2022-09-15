@@ -82,3 +82,31 @@ export function useApps(server: Server | null, username?: string) {
 
   /**
    * Restart an app
+   */
+  const restartApp = async (appUsername: string, appName: string) => {
+    if (!server) throw new Error('No server selected');
+
+    const client = getClient(server);
+    const app = await client.restartApp(appUsername, appName);
+
+    // Revalidate app list
+    await mutate();
+
+    return app;
+  };
+
+  /**
+   * Delete an app
+   */
+  const deleteApp = async (appUsername: string, appName: string, removeData: boolean = false) => {
+    if (!server) throw new Error('No server selected');
+
+    const client = getClient(server);
+    await client.deleteApp(appUsername, appName, removeData);
+
+    // Revalidate app list
+    await mutate();
+  };
+
+  /**
+   * Get app logs
