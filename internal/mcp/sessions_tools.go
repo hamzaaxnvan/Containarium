@@ -33,3 +33,20 @@ func sessionTools() []Tool {
 }
 
 func handleTerminateUserSessions(api API, args map[string]interface{}) (string, error) {
+	username := getStringArg(args, "username", "")
+	if username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	resp, err := api.TerminateUserSessions(username)
+	if err != nil {
+		return "", fmt.Errorf("failed to terminate sessions: %w", err)
+	}
+	return fmt.Sprintf("✅ Terminated sessions for %s: %d account(s) with live processes ended across %d box(es).",
+		username, resp.GetTerminatedSessions(), resp.GetBoxesTouched()), nil
+}
+
+// newSessionsAPI builds the CLI's typed client from this MCP client's
+// transport, base URL and current token. A variable so the tool test can
+// prove the MCP path goes through the shared client.
+var newSessionsAPI = func(c *Client) (client.SessionsAPI, error) {
+	if c.tlsConfigErr != nil {
