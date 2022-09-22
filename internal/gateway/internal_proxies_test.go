@@ -71,3 +71,40 @@ func buildProxyMux(t *testing.T, gs *GatewayServer) *http.ServeMux {
 }
 
 func TestInternalProxies_RejectUnauthenticated(t *testing.T) {
+	gs, _, _ := newProxyTestGateway(t)
+	mux := buildProxyMux(t, gs)
+
+	for _, path := range []string{"/grafana/", "/alertmanager/", "/guacamole/"} {
+		t.Run(path, func(t *testing.T) {
+			backendPath = ""
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+			if backendPath != "" {
+				t.Fatalf("backend reached without auth: saw path %q", backendPath)
+			}
+		})
+	}
+}
+
+func TestInternalProxies_ForwardWithValidToken(t *testing.T) {
+	gs, _, tok := newProxyTestGateway(t)
+	mux := buildProxyMux(t, gs)
+
+	cases := []struct {
+		in  string
+		out string // path the backend should see (proxies don't strip prefix)
+	}{
+		{"/grafana/dashboards/home", "/grafana/dashboards/home"},
+		{"/alertmanager/api/v2/alerts", "/alertmanager/api/v2/alerts"},
+		{"/guacamole/", "/guacamole/"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			backendPath = ""
+			req := httptest.NewRequest("GET", tc.in, nil)
+			req.Header.Set("Authorization", "Bearer "+tok)
+			rec := httptest.NewRecorder()
