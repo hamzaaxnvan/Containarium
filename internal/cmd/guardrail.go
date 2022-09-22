@@ -111,3 +111,231 @@ var guardrailVerifyCmd = &cobra.Command{
 	Long: `Verify the attestation's signature, recompute the digest of <dir> and
 require it to match, and require the verdict to be PASS. Exit status 0 only
 when all hold. This is what a training job or a CI step runs first.
+
+verify contacts a server only when one is named explicitly, with --server
+or CONTAINARIUM_SERVER; a login's default server does not count. With a
+named server that holds a guardrail policy, the check is server-trusted:
+the attestation's policy hash must equal the server policy's, and its
+signer must be one of the server's trusted signers (--public-key is then
+ignored). The only request is a read of the policy, carrying your
+credentials; no dataset content and no attestation is sent. If the named
+server cannot be reached or answers with an error, verify fails (non-zero
+exit); it never falls back silently. With no named server, or a named
+server that has no policy configured, --public-key is required and the
+result is reported as NOT server-trusted.
+
+Examples:
+  containarium guardrail verify ./export-clean --attestation ./export-clean.attestation.json --server <host>:50051
+  containarium guardrail verify ./export-clean --attestation ./export-clean.attestation.json --public-key ./tenant.pub`,
+	Args: cobra.ExactArgs(1),
+	RunE: runGuardrailVerify,
+}
+
+var guardrailKeygenCmd = &cobra.Command{
+	Use:   "keygen",
+	Short: "Generate an ed25519 attestation signing key pair",
+	Long: `Write <prefix>.key (private, 0600 — keep it on the side that runs
+'guardrail apply') and <prefix>.pub (give it to whoever verifies).
+
+Example:
+  containarium guardrail keygen --out ./tenant`,
+	Args: cobra.NoArgs,
+	RunE: runGuardrailKeygen,
+}
+
+func init() {
+	guardrailCmd.AddCommand(guardrailScanCmd, guardrailApplyCmd, guardrailVerifyCmd, guardrailKeygenCmd)
+	rootCmd.AddCommand(guardrailCmd)
+
+	for _, c := range []*cobra.Command{guardrailScanCmd, guardrailApplyCmd} {
+		c.Flags().StringVar(&guardrailEngineAddr, "engine", "", "GuardrailEngineService gRPC address (host:port). Empty = the in-tree reference rules engine")
+	}
+	// --kind is a scan-only diagnostic. apply derives the kinds from its
+	// policy (#2362): an empty list would mean "whatever the engine has
+	// enabled", and a policy that says REDACT SECRET against an engine that
+	// cannot scan secrets must fail, not attest a PASS that never looked.
+	guardrailScanCmd.Flags().StringSliceVar(&guardrailKinds, "kind", nil, "Kinds to scan for: pii, secret. Empty = every kind the engine supports")
+	guardrailScanCmd.Flags().BoolVar(&guardrailJSON, "json", false, "Print findings as JSON (offsets and types only, never the text)")
+
+	guardrailApplyCmd.Flags().StringVar(&guardrailOut, "out", "", "Directory to write the redacted copy to (required)")
+	_ = guardrailApplyCmd.MarkFlagRequired("out")
+	guardrailApplyCmd.Flags().StringVar(&guardrailPolicyFile, "policy", "", "GuardrailPolicy as JSON. Default: redact every kind, tolerate no residual")
+	guardrailApplyCmd.Flags().StringVar(&guardrailVaultFile, "vault", "", "Where to write token -> original (default <out>.vault.json)")
+	guardrailApplyCmd.Flags().StringVar(&guardrailRedactKey, "redaction-key", "", "32-byte hex key that makes tokens stable across runs; generated at <out>.redaction.key if missing")
+	guardrailApplyCmd.Flags().StringVar(&guardrailSignKey, "sign-key", "", "ed25519 private key file from 'guardrail keygen' to sign the attestation")
+	guardrailApplyCmd.Flags().StringVar(&guardrailAttestFile, "attestation", "", "Where to write the attestation (default <out>.attestation.json)")
+
+	guardrailVerifyCmd.Flags().StringVar(&guardrailAttestFile, "attestation", "", "Attestation JSON written by 'guardrail apply' (required)")
+	guardrailVerifyCmd.Flags().StringVar(&guardrailPublicKey, "public-key", "", "Signer's .pub file (required offline; ignored when a server policy is in force)")
+	guardrailVerifyCmd.Flags().StringVar(&guardrailTrustBundle, "trust-bundle", "", "GuardrailTrustBundle protojson from 'guardrail signer bundle': trusted signers plus revoked keys (offline alternative to --public-key)")
+	guardrailVerifyCmd.Flags().StringSliceVar(&guardrailRequireKinds, "require-kind", nil, "Kinds the attestation must have scanned for (pii, secret); a PASS that never looked for one is refused")
+	_ = guardrailVerifyCmd.MarkFlagRequired("attestation")
+
+	guardrailKeygenCmd.Flags().StringVar(&guardrailKeygenPrefix, "out", "", "Path prefix for <prefix>.key and <prefix>.pub (required)")
+	_ = guardrailKeygenCmd.MarkFlagRequired("out")
+}
+
+// guardrailEngine picks the engine from --engine. The gRPC path is plain
+// text: the engine is a local plug point on the data owner's own host, and
+// a remote engine would mean shipping the raw text somewhere — which is
+// the thing this command exists to avoid.
+func guardrailEngine(cmd *cobra.Command) (guardrail.Engine, func(), error) {
+	if guardrailEngineAddr == "" {
+		fmt.Fprintln(cmd.ErrOrStderr(), "guardrail: using the reference rules engine (regular expressions only — for proving the flow, not for production data)")
+		return guardrail.RulesEngine{}, func() {}, nil
+	}
+	conn, err := grpc.NewClient(guardrailEngineAddr, grpc.WithTransportCredentials(grpcinsecure.NewCredentials()))
+	if err != nil {
+		return nil, nil, fmt.Errorf("engine %s: %w", guardrailEngineAddr, err)
+	}
+	return guardrail.NewGRPCEngine(conn), func() { _ = conn.Close() }, nil
+}
+
+// parseGuardrailKinds turns a --kind / --require-kind value list into kinds.
+func parseGuardrailKinds(flag string, raw []string) ([]pb.GuardrailKind, error) {
+	var out []pb.GuardrailKind
+	for _, k := range raw {
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "pii":
+			out = append(out, pb.GuardrailKind_GUARDRAIL_KIND_PII)
+		case "secret":
+			out = append(out, pb.GuardrailKind_GUARDRAIL_KIND_SECRET)
+		default:
+			return nil, fmt.Errorf("--%s %q: want pii or secret", flag, k)
+		}
+	}
+	return out, nil
+}
+
+func guardrailKindsFromFlag() ([]pb.GuardrailKind, error) {
+	return parseGuardrailKinds("kind", guardrailKinds)
+}
+
+func kindNames(kinds []pb.GuardrailKind) string {
+	names := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		names = append(names, strings.ToLower(strings.TrimPrefix(k.String(), "GUARDRAIL_KIND_")))
+	}
+	return strings.Join(names, ",")
+}
+
+func runGuardrailScan(cmd *cobra.Command, args []string) error {
+	engine, closeEngine, err := guardrailEngine(cmd)
+	if err != nil {
+		return err
+	}
+	defer closeEngine()
+	kinds, err := guardrailKindsFromFlag()
+	if err != nil {
+		return err
+	}
+	units, gaps, err := guardrail.LoadUnits(args[0])
+	if err != nil {
+		return err
+	}
+	resp, err := engine.Scan(cmd.Context(), &pb.GuardrailScanRequest{Units: units, Kinds: kinds})
+	if err != nil {
+		return fmt.Errorf("scan: %w", err)
+	}
+	resp.Gaps = append(resp.Gaps, gaps...)
+	if guardrailJSON {
+		b, err := protojson.MarshalOptions{Multiline: true}.Marshal(resp)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), string(b))
+		return nil
+	}
+	w := cmd.OutOrStdout()
+	fmt.Fprintf(w, "engine: %s %s\n", resp.GetEngineId(), resp.GetEngineVersion())
+	fmt.Fprintf(w, "units: %d scanned, %d gap(s)\n", len(units), len(resp.GetGaps()))
+	printGuardrailCounts(w, resp.GetFindings())
+	return nil
+}
+
+func printGuardrailCounts(w interface{ Write([]byte) (int, error) }, findings []*pb.GuardrailFinding) {
+	counts := map[string]int{}
+	for _, f := range findings {
+		counts[strings.TrimPrefix(f.GetKind().String(), "GUARDRAIL_KIND_")+" "+f.GetType()]++
+	}
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	fmt.Fprintf(w, "findings: %d\n", len(findings))
+	for _, k := range keys {
+		fmt.Fprintf(w, "  %-32s %d\n", k, counts[k])
+	}
+}
+
+func runGuardrailApply(cmd *cobra.Command, args []string) error {
+	in := args[0]
+	out := guardrailOut
+	if guardrailVaultFile == "" {
+		guardrailVaultFile = strings.TrimRight(out, "/") + ".vault.json"
+	}
+	if guardrailAttestFile == "" {
+		guardrailAttestFile = strings.TrimRight(out, "/") + ".attestation.json"
+	}
+	if guardrailRedactKey == "" {
+		guardrailRedactKey = strings.TrimRight(out, "/") + ".redaction.key"
+	}
+
+	// The policy is settled before anything is written, so a refused
+	// --policy leaves nothing behind.
+	policy, server, err := resolveApplyPolicy(cmd)
+	if err != nil {
+		return err
+	}
+	engine, closeEngine, err := guardrailEngine(cmd)
+	if err != nil {
+		return err
+	}
+	defer closeEngine()
+	// Exactly the kinds the policy covers, never empty (#2362): an engine
+	// that cannot scan one of them must fail this run, not pass it.
+	kinds := guardrail.KindsFor(policy)
+	key, err := loadOrCreateRedactionKey(cmd, guardrailRedactKey)
+	if err != nil {
+		return err
+	}
+	var signer func(*pb.GuardrailAttestation) error
+	var signKey ed25519.PrivateKey
+	if guardrailSignKey != "" {
+		priv, err := guardrail.LoadSigningKey(guardrailSignKey)
+		if err != nil {
+			return err
+		}
+		signKey = priv
+		signer = func(att *pb.GuardrailAttestation) error { return guardrail.Sign(att, priv) }
+	}
+	if server.policy != nil {
+		warnIfNotTrustedSigner(cmd, server.policy, signKey)
+	}
+
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	units, loadGaps, err := guardrail.LoadUnits(in)
+	if err != nil {
+		return err
+	}
+	first, err := engine.Scan(ctx, &pb.GuardrailScanRequest{Units: units, Kinds: kinds})
+	if err != nil {
+		return fmt.Errorf("scan for %s: %w — nothing written; the engine must cover every kind the policy names", kindNames(kinds), err)
+	}
+	red, err := guardrail.Redact(units, first.GetFindings(), policy, key)
+	if err != nil {
+		return err
+	}
+	if err := guardrail.WriteUnits(out, red.Wiped); err != nil {
+		return err
+	}
+	if err := writeGuardrailJSON(guardrailVaultFile, red.Vault, 0o600); err != nil {
+		return err
+	}
+
+	wipedUnits := make([]*pb.GuardrailTextUnit, 0, len(red.Wiped))
+	for id, text := range red.Wiped {

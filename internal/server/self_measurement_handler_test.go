@@ -31,3 +31,14 @@ func TestGetSelfMeasurement_LocalUnsignedWhenNoPKI(t *testing.T) {
 	})
 	ctx := auth.ContextWithSystemIdentity(context.Background())
 
+	resp, err := srv.GetSelfMeasurement(ctx, &pb.GetSelfMeasurementRequest{})
+	if err != nil {
+		t.Fatalf("GetSelfMeasurement: %v", err)
+	}
+	m := resp.Measurement
+	if m == nil {
+		t.Fatalf("expected a measurement")
+	}
+	if m.Signed {
+		t.Errorf("expected unsigned measurement without a peer identity key")
+	}

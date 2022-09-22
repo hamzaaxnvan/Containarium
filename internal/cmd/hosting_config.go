@@ -54,3 +54,22 @@ func runHostingConfig(cmd *cobra.Command, args []string) error {
 
 	cfg, err := hosting.LoadConfig()
 	if err != nil {
+		return err
+	}
+
+	fmt.Println("Hosting Configuration")
+	fmt.Println("=====================")
+	fmt.Printf("Config file: %s\n", hosting.ConfigPath())
+	fmt.Println()
+	fmt.Printf("Provider:    %s\n", cfg.Provider)
+	fmt.Printf("Domain:      %s\n", cfg.Domain)
+	fmt.Printf("Email:       %s\n", cfg.Email)
+	fmt.Println()
+	fmt.Println("Credentials:")
+	if showSecrets {
+		fmt.Printf("  API Key:    %s\n", cfg.Credentials.APIKey)
+		fmt.Printf("  API Secret: %s\n", cfg.Credentials.APISecret)
+		if cfg.Credentials.APIToken != "" {
+			fmt.Printf("  API Token:  %s\n", cfg.Credentials.APIToken)
+		}
+	} else {
