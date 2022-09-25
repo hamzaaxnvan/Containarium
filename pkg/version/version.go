@@ -40,3 +40,45 @@ func GetVersion() string {
 	return Version
 }
 
+// ClientVersionHeader is the HTTP header the CLI / MCP client sets to
+// advertise its own version to the daemon, e.g.
+//
+//	X-Containarium-Client-Version: 0.22.4
+//
+// It lets a server log the client version and, if it chooses, refuse or
+// warn on clients too old to speak its contract. Sent alongside a
+// conventional User-Agent (see UserAgent) so a server can read whichever
+// it prefers.
+const ClientVersionHeader = "X-Containarium-Client-Version"
+
+// UserAgent is the product/version token the CLI and MCP client send as
+// their HTTP User-Agent when talking to the daemon, e.g. "containarium/0.22.4".
+func UserAgent() string {
+	return "containarium/" + Version
+}
+
+// GetBuildTime returns the build time
+func GetBuildTime() string {
+	return BuildTime
+}
+
+// GetCommitHash returns the git commit hash
+// Tries GitCommit variable first (set via ldflags), then VCS build info, then "unknown"
+func GetCommitHash() string {
+	// First try the explicit GitCommit variable (set via ldflags)
+	if GitCommit != "" {
+		return GitCommit
+	}
+
+	// Fallback to VCS build info (if available)
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+
+	var revision string
+	var modified bool
+
+	for _, setting := range bi.Settings {
+		switch setting.Key {
+		case "vcs.revision":
