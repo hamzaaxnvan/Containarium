@@ -307,3 +307,158 @@ func TestDispatch_QueuedLabelBeforeStart(t *testing.T) {
 		t.Errorf("labels after failed start = %v, want %s and not %s", labels, LabelAgentFailed, LabelAgentQueued)
 	}
 }
+
+// TestDispatch_InputCarriesTenantAndRepo: the run's input names its own
+// tenant (every broker verb needs it) and the starter is handed the
+// connection's repository so a doc change can be submitted.
+func TestDispatch_InputCarriesTenantAndRepo(t *testing.T) {
+	const user = "tracker-dispatch-input-tenant"
+	d, _, _, runs, ctx := newLifecycleFixture(t, user, Issue{Number: 1, Labels: []string{"scope:product"}})
+	d.RepoURL = "https://forge.example.com/acme/widgets.git"
+	if _, err := d.Tick(ctx, user, "default"); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	call := runs.started()[0]
+	if !strings.Contains(call.InputJSON, `"username":"`+user+`"`) {
+		t.Errorf("input_json = %s, want the tenant username", call.InputJSON)
+	}
+	if call.RepoURL != d.RepoURL {
+		t.Errorf("RepoURL = %q, want %q", call.RepoURL, d.RepoURL)
+	}
+}
+
+// staleListProvider hands dispatcher A an issue list, then — before A
+// gets to act on it — lets a peer finish the issue's whole run.
+type staleListProvider struct {
+	*fakeDispatchProvider
+	afterList func()
+	once      sync.Once
+}
+
+func (s *staleListProvider) ListIssues(ctx context.Context, c Conn, f IssueFilter) ([]Issue, error) {
+	out, err := s.fakeDispatchProvider.ListIssues(ctx, c, f)
+	s.once.Do(s.afterList)
+	return out, err
+}
+
+// TestDispatch_StaleListAfterDoneNoDoubleRun is the probe from the
+// #2022 review: dispatcher A lists the issue; peer B dispatches it and
+// the run completes (row DONE, agent:done, scope label removed); A's
+// insert then succeeds (no ACTIVE row any more). A must re-read the
+// issue and not start a second run.
+func TestDispatch_StaleListAfterDoneNoDoubleRun(t *testing.T) {
+	const user = "tracker-dispatch-stale-list"
+	base := newFakeDispatchProvider(Issue{Number: 77, Labels: []string{"scope:product"}})
+	runs := &lifecycleRunStarter{endWith: &RunOutcome{}}
+	dB, store, ctx := newDispatchFixture(t, user, base, &fakeRunStarter{})
+	dB.Runs = runs
+
+	stale := &staleListProvider{fakeDispatchProvider: base}
+	dA := &Dispatcher{Store: store, Provider: stale, Conn: dB.Conn, Runs: runs, Clock: dB.Clock}
+	stale.afterList = func() {
+		if res, err := dB.Tick(ctx, user, "default"); err != nil || len(res.Started) != 1 {
+			t.Errorf("peer tick = (%+v, %v), want one started", res, err)
+		}
+	}
+
+	res, err := dA.Tick(ctx, user, "default")
+	if err != nil {
+		t.Fatalf("Tick A: %v", err)
+	}
+	if n := len(runs.started()); n != 1 {
+		t.Fatalf("StartRun calls = %d, want exactly 1 (a stale list must not double-run a finished issue)", n)
+	}
+	if len(res.Started) != 0 || res.SkippedActive != 1 {
+		t.Errorf("A's tick = %+v, want nothing started and the issue counted as skipped", res)
+	}
+	rows, err := store.ListDispatches(ctx, user, "default", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("ListDispatches: %v", err)
+	}
+	if len(rows) != 1 || rows[0].State != pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_DONE {
+		t.Fatalf("rows = %+v, want only B's DONE row (A's abandoned insert removed)", rows)
+	}
+	labels := base.labels(77)
+	if !containsString(labels, LabelAgentDone) || containsString(labels, LabelAgentQueued) {
+		t.Errorf("labels = %v, A must not have touched the finished issue", labels)
+	}
+}
+
+// TestDispatch_RecheckReadErrorSkips: if the re-read fails the issue is
+// skipped this tick (the row removed so the next tick can retry), never
+// started blind.
+func TestDispatch_RecheckReadErrorSkips(t *testing.T) {
+	const user = "tracker-dispatch-recheck-err"
+	provider := newFakeDispatchProvider(Issue{Number: 8, Labels: []string{"scope:product"}})
+	provider.getErr = errors.New("forge hiccup")
+	runs := &lifecycleRunStarter{}
+	d, store, ctx := newDispatchFixture(t, user, provider, &fakeRunStarter{})
+	d.Runs = runs
+	if _, err := d.Tick(ctx, user, "default"); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if n := len(runs.started()); n != 0 {
+		t.Fatalf("StartRun calls = %d, want 0 when the re-read fails", n)
+	}
+	rows, _ := store.ListDispatches(ctx, user, "default", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED)
+	if len(rows) != 0 {
+		t.Fatalf("rows = %+v, want the unstarted row removed", rows)
+	}
+	provider.mu.Lock()
+	provider.getErr = nil
+	provider.mu.Unlock()
+	if res, err := d.Tick(ctx, user, "default"); err != nil || len(res.Started) != 1 {
+		t.Fatalf("retry tick = (%+v, %v), want it dispatched", res, err)
+	}
+}
+
+// TestDispatch_RerunAfterCompletionStartsNewGeneration: through the real
+// completion hook, a done issue is left alone until a human re-labels
+// it, and then runs again as a new generation — once.
+func TestDispatch_RerunAfterCompletionStartsNewGeneration(t *testing.T) {
+	const user = "tracker-dispatch-rerun-hook"
+	provider := newFakeDispatchProvider(Issue{Number: 12, Labels: []string{"scope:product"}})
+	runs := &lifecycleRunStarter{endWith: &RunOutcome{}}
+	d, store, ctx := newDispatchFixture(t, user, provider, &fakeRunStarter{})
+	d.Runs = runs
+
+	if res, err := d.Tick(ctx, user, "default"); err != nil || len(res.Started) != 1 {
+		t.Fatalf("Tick 1 = (%+v, %v)", res, err)
+	}
+	if res, err := d.Tick(ctx, user, "default"); err != nil || len(res.Started) != 0 {
+		t.Fatalf("Tick 2 = (%+v, %v), want the done issue left alone", res, err)
+	}
+	// A human removes agent:done and re-adds the scope label.
+	provider.relabel(12, "scope:product")
+	if res, err := d.Tick(ctx, user, "default"); err != nil || len(res.Started) != 1 {
+		t.Fatalf("Tick 3 = (%+v, %v), want a new generation", res, err)
+	}
+	if n := len(runs.started()); n != 2 {
+		t.Fatalf("StartRun calls = %d, want 2", n)
+	}
+	rows, _ := store.ListDispatches(ctx, user, "default", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_DONE)
+	if len(rows) != 2 || rows[0].ID == rows[1].ID {
+		t.Fatalf("done rows = %+v, want two distinct generations", rows)
+	}
+}
+
+// TestStateLabelWriters_OnlyDispatcher: the dispatcher's code path is
+// the only writer of the agent:* state labels. A source scan over the
+// daemon's non-test Go files: any other file naming a state-label
+// constant (or spelling one out) must be deliberately added here.
+func TestStateLabelWriters_OnlyDispatcher(t *testing.T) {
+	allowed := map[string]bool{
+		"internal/tracker/policy.go":             true, // defines them and reserves them from run tokens
+		"internal/tracker/dispatch.go":           true, // the tick: queued, failed-to-start
+		"internal/tracker/dispatch_lifecycle.go": true, // the completion hook: running, done, failed
+		"internal/tracker/dispatch_sweep.go":     true, // the timeout / lease-lost sweep and failure projection (#2026)
+	}
+	pattern := regexp.MustCompile(`LabelAgent(Queued|Running|Done|Failed)|"agent:(queued|running|done|failed)"`)
+	root := filepath.Join("..", "..")
+	var offenders []string
+	for _, dir := range []string{"internal", "cmd", "pkg"} {
+		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, de os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if de.IsDir() {
