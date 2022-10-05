@@ -24,29 +24,3 @@ run "custom_policy" {
   command = plan
   variables {
     ssh_ban_max_failures     = 240
-    ssh_ban_duration_seconds = 45
-    ssh_ban_ignore_cidrs     = ["192.0.2.4/32", "2001:db8::/48"]
-  }
-  assert {
-    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : strcontains(unit, "--max-failures 240") && strcontains(unit, "--ban-duration 45s") && strcontains(unit, "--ignore-ip 192.0.2.4/32") && strcontains(unit, "--ignore-ip 2001:db8::/48")])
-    error_message = "Both listeners must receive exactly the configured policy and exemptions."
-  }
-}
-
-# The text after the last ssh-ban-plugin mention is that plugin's own flags
-# (it is the final plugin in each chain).
-run "audit_records_off_by_default" {
-  command = plan
-  assert {
-    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : !strcontains(element(split("ssh-ban-plugin", unit), length(split("ssh-ban-plugin", unit)) - 1), "--records-file")])
-    error_message = "Without ssh_ban_audit_records the ban plugin must not be given --records-file (an older binary rejects the flag)."
-  }
-}
-
-run "audit_records_on" {
-  command = plan
-  variables { ssh_ban_audit_records = true }
-  assert {
-    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : strcontains(element(split("ssh-ban-plugin", unit), length(split("ssh-ban-plugin", unit)) - 1), "--records-file /var/log/containarium/ssh-sessions.jsonl")])
-    error_message = "With ssh_ban_audit_records both listeners' ban plugins must write to the shared session records file."
-  }

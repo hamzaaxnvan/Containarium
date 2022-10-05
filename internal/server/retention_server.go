@@ -278,3 +278,97 @@ func (s *RetentionServer) SetAuditStore(a auditLogger) {
 	}
 }
 
+// auditUpgradeChanges writes the audit entries of the changes the store's
+// bootstrap made to data an earlier release stored (Q31 on #2727): it ran
+// before any audit store existed, so it recorded them durably instead. A
+// failed write is logged and leaves the rest pending for the next start;
+// it never fails the daemon. An entry can be written twice if the store's
+// commit fails after the write (at least once, never lost).
+func (s *RetentionServer) auditUpgradeChanges() {
+	u, ok := s.store.(retention.UpgradeAuditor)
+	if !ok || s.audit == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	n, err := u.AuditUpgradeEvents(ctx, func(ev retention.UpgradeEvent) error {
+		return s.audit.Log(ctx, &audit.AuditEntry{
+			Username: retention.UpgradeActor, Action: ev.Action,
+			ResourceType: ev.ResourceType, ResourceID: ev.ResourceID, Detail: ev.Detail,
+		})
+	})
+	if n > 0 {
+		log.Printf("Retention: audited %d upgrade change(s) made at startup", n)
+	}
+	if err != nil {
+		log.Printf("Warning: retention: auditing the upgrade changes made at startup failed; they stay pending for the next start: %v", err)
+	}
+}
+
+// retentionStatus maps a store error onto a gRPC status.
+func retentionStatus(op string, err error) error {
+	switch {
+	case errors.Is(err, retention.ErrInvalid):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, retention.ErrHoldExists):
+		return status.Error(codes.AlreadyExists, err.Error())
+	case errors.Is(err, retention.ErrHoldNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, errRetentionStoreUnavailable):
+		return status.Error(codes.Unavailable, err.Error())
+	case errors.Is(err, errRetentionAuditFailed):
+		log.Printf("[retention] %s refused: %v", op, err)
+		return status.Errorf(codes.Internal, "write the audit entry for %s failed; nothing changed", op)
+	default:
+		return status.Errorf(codes.Internal, "%s: %v", op, err)
+	}
+}
+
+// requireRetentionAdmin authorizes an admin caller and returns its name.
+func (s *RetentionServer) requireRetentionAdmin(ctx context.Context) (string, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return "", err
+	}
+	subject, _, _ := auth.SubjectFromGRPCContext(ctx)
+	return subject, nil
+}
+
+// writeAudit logs one change; its error aborts the change.
+func (s *RetentionServer) writeAudit(ctx context.Context, subject, action, resourceType, resourceID string, detail any) error {
+	if s.audit == nil {
+		return nil
+	}
+	payload, err := json.Marshal(detail)
+	if err != nil {
+		return fmt.Errorf("%w: marshal detail: %v", errRetentionAuditFailed, err)
+	}
+	if err := s.audit.Log(ctx, &audit.AuditEntry{
+		Username: subject, Action: action, ResourceType: resourceType, ResourceID: resourceID, Detail: string(payload),
+	}); err != nil {
+		return fmt.Errorf("%w: %s: %v", errRetentionAuditFailed, action, err)
+	}
+	return nil
+}
+
+func (s *RetentionServer) GetRetentionPolicy(ctx context.Context, _ *pb.GetRetentionPolicyRequest) (*pb.GetRetentionPolicyResponse, error) {
+	if _, err := s.requireRetentionAdmin(ctx); err != nil {
+		return nil, err
+	}
+	p, err := s.store.GetPolicy(ctx)
+	if err != nil {
+		return nil, retentionStatus("get retention policy", err)
+	}
+	return &pb.GetRetentionPolicyResponse{Policy: p}, nil
+}
+
+func (s *RetentionServer) SetRetentionPolicy(ctx context.Context, req *pb.SetRetentionPolicyRequest) (*pb.SetRetentionPolicyResponse, error) {
+	subject, err := s.requireRetentionAdmin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	res, err := s.store.SetPolicy(ctx, req.GetWindows(), subject, func(r *retention.PolicySetResult) error {
+		d := retentionPolicyAuditDetail{PreviousRevision: r.Previous.GetRevision(), Revision: r.Current.GetRevision()}
+		for _, w := range req.GetWindows() {
+			d.Windows = append(d.Windows, retentionAuditWindow{Class: w.GetClass().String(), Days: w.GetDays()})
+		}
+		return s.writeAudit(ctx, subject, retentionPolicySetAction, "retention_policy", "cluster", d)
