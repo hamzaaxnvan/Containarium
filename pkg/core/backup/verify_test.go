@@ -246,3 +246,252 @@ func TestVerifyFailedRestoreCapturesEngineError(t *testing.T) {
 	}
 }
 
+// AC #2: a dump whose bytes no longer match the recorded checksum fails
+// verification before it is ever handed to the engine.
+func TestVerifyFailsOnChecksumMismatch(t *testing.T) {
+	ops := newVerifyOps([]byte("PGDMP-fake-archive-bytes"))
+	m, rec := seedBackup(t, ops)
+
+	// Corrupt the stored dump behind the record's back.
+	if err := writeFileForTest(rec.Location, []byte("corrupted")); err != nil {
+		t.Fatalf("corrupt dump: %v", err)
+	}
+	ops.execByContainer = map[string][]string{}
+
+	v, err := m.Verify(VerifyOptions{
+		ID:              rec.ID,
+		TargetContainer: "scratch-container",
+		SourceContainer: "alice-container",
+	})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if v.Result != VerificationFailed {
+		t.Fatalf("result = %q, want failed", v.Result)
+	}
+	if !strings.Contains(v.Error, "integrity") {
+		t.Errorf("error %q does not mention the integrity failure", v.Error)
+	}
+	joined := strings.Join(ops.execByContainer["scratch-container"], "\n")
+	if strings.Contains(joined, "pg_restore") {
+		t.Error("a corrupt dump must not reach pg_restore")
+	}
+}
+
+// AC #2: a dump that loads cleanly but arrives short of the source's own
+// relation count fails verification — the truncated-export case the
+// issue names explicitly, and the one an integrity hash cannot see.
+//
+// Note the counts are *user* relations only. Counting pg_class
+// unfiltered would make this check vacuous: every database carries ~60
+// system catalog relations, so an unfiltered count never reaches zero
+// and never falls short.
+func TestVerifyFailsOnManifestShortfall(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		source     string
+		restored   string
+		wantResult VerificationResult
+	}{
+		{"restored short of source", "25", "0", VerificationFailed},
+		{"restored partially", "25", "24", VerificationFailed},
+		{"restored matches source", "25", "25", VerificationPassed},
+		{"legitimately empty database", "0", "0", VerificationPassed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := newVerifyOps([]byte("PGDMP-fake-archive-bytes"))
+			ops.sourceRelations = tc.source
+			ops.restoredRelations = tc.restored
+			m, rec := seedBackup(t, ops)
+
+			if rec.RelationCount == nil {
+				t.Fatal("Create did not record a relation manifest")
+			}
+
+			v, err := m.Verify(VerifyOptions{
+				ID:              rec.ID,
+				TargetContainer: "scratch-container",
+				SourceContainer: "alice-container",
+			})
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if v.Result != tc.wantResult {
+				t.Errorf("result = %q (error %q), want %q", v.Result, v.Error, tc.wantResult)
+			}
+		})
+	}
+}
+
+// A backup taken before verification existed carries no manifest. It must
+// still verify — recording what was found — rather than failing for the
+// absence of a number nobody captured.
+func TestVerifyWithoutManifestRecordsButDoesNotJudge(t *testing.T) {
+	ops := newVerifyOps([]byte("PGDMP-fake-archive-bytes"))
+	m, rec := seedBackup(t, ops)
+
+	// Simulate a pre-#1159 record: manifest absent.
+	rec.RelationCount = nil
+	if err := m.writeSidecar(rec); err != nil {
+		t.Fatalf("rewrite sidecar: %v", err)
+	}
+	ops.restoredRelations = "3"
+
+	v, err := m.Verify(VerifyOptions{
+		ID:              rec.ID,
+		TargetContainer: "scratch-container",
+		SourceContainer: "alice-container",
+	})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if v.Result != VerificationPassed {
+		t.Errorf("result = %q (error %q), want passed", v.Result, v.Error)
+	}
+	var detail string
+	for _, c := range v.Checks {
+		if c.Name == "relation_count" {
+			detail = c.Detail
+		}
+	}
+	if !strings.Contains(detail, "no manifest") {
+		t.Errorf("evidence should say no manifest was available, got %q", detail)
+	}
+}
+
+// AC #3: the evidence is persisted on the record and survives the call,
+// so an audit window can be answered from ListBackups/GetBackup.
+func TestVerifyEvidenceIsPersistedOnTheRecord(t *testing.T) {
+	ops := newVerifyOps([]byte("PGDMP-fake-archive-bytes"))
+	m, rec := seedBackup(t, ops)
+
+	if got, _ := m.Get(rec.ID); got.LastVerification != nil {
+		t.Fatal("record reports a verification before one has run")
+	}
+
+	v, err := m.Verify(VerifyOptions{
+		ID:              rec.ID,
+		TargetContainer: "scratch-container",
+		SourceContainer: "alice-container",
+		VerifiedBy:      "operator@example.com",
+	})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	// Re-read from disk: the evidence must be in the sidecar, not just
+	// in the returned value.
+	got, err := m.Get(rec.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	lv := got.LastVerification
+	if lv == nil {
+		t.Fatal("LastVerification not persisted to the sidecar")
+	}
+	if lv.Result != VerificationPassed {
+		t.Errorf("persisted result = %q", lv.Result)
+	}
+	if lv.VerifiedBy != "operator@example.com" {
+		t.Errorf("persisted VerifiedBy = %q — the 'who' of the audit record is missing", lv.VerifiedBy)
+	}
+	if lv.VerifiedAt.IsZero() {
+		t.Error("persisted VerifiedAt is zero — the 'when' of the audit record is missing")
+	}
+	if lv.TargetContainer != v.TargetContainer {
+		t.Errorf("persisted target %q != returned %q", lv.TargetContainer, v.TargetContainer)
+	}
+	if len(lv.Checks) == 0 {
+		t.Error("persisted evidence records no individual checks")
+	}
+
+	// And it must be visible through List, which is what the operator
+	// actually runs to answer "when was this last verified".
+	list, err := m.List("alice")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("List: %v len=%d", err, len(list))
+	}
+	if list[0].LastVerification == nil {
+		t.Error("ListBackups does not surface last-verified state")
+	}
+}
+
+// Verification refuses on bad input rather than guessing.
+func TestVerifyValidation(t *testing.T) {
+	ops := newVerifyOps([]byte("PGDMP-fake-archive-bytes"))
+	m, rec := seedBackup(t, ops)
+
+	for _, tc := range []struct {
+		name    string
+		opts    VerifyOptions
+		wantErr string
+	}{
+		{
+			name:    "missing target",
+			opts:    VerifyOptions{ID: rec.ID, SourceContainer: "alice-container"},
+			wantErr: "target container is required",
+		},
+		{
+			name:    "unknown backup",
+			opts:    VerifyOptions{ID: "nope-nope-20260101T000000Z", TargetContainer: "scratch-container"},
+			wantErr: "not found",
+		},
+		{
+			name:    "path-traversal id",
+			opts:    VerifyOptions{ID: "../../etc/passwd", TargetContainer: "scratch-container"},
+			wantErr: "invalid backup id",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := m.Verify(tc.opts); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("err = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// OSS #2295: a restore test must be able to tell the difference between
+// "backup succeeded and is restorable" and "backup succeeded but nobody
+// holds the decryption key" — the failure mode that let a week of real
+// nightly backups go silently unrecoverable (dead age key, never
+// detected because nothing ever attempted a decrypt). Given the right
+// identity, Verify decrypts and runs the exact same restore test as a
+// plaintext dump.
+func TestVerify_Encrypted_WithIdentity_DecryptsAndRestores(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("PGDMP\x00plaintext-archive-bytes")
+	ops := newVerifyOps(payload)
+	m := newTestManager(t, ops)
+
+	rec, err := m.Create(CreateOptions{
+		Username:      "alice",
+		ContainerName: "alice-container",
+		Conn:          PgConn{Database: "app"},
+		Destination:   DestLocal,
+		AgeRecipient:  id.Recipient().String(),
+	})
+	if err != nil {
+		t.Fatalf("seed Create (encrypted): %v", err)
+	}
+	if !rec.Encrypted {
+		t.Fatal("seed record should be encrypted")
+	}
+
+	v, err := m.Verify(VerifyOptions{
+		ID:              rec.ID,
+		TargetContainer: "scratch-container",
+		SourceContainer: "alice-container",
+		AgeIdentity:     id.String(),
+	})
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if v.Result != VerificationPassed {
+		t.Fatalf("result = %q (error %q), want passed; checks=%+v", v.Result, v.Error, v.Checks)
+	}
+
+	var decryptCheck *Check
+	for i := range v.Checks {
