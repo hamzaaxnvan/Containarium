@@ -165,3 +165,86 @@ func TestRunSecurityFindingsList_SharedFindingNamesTheBox(t *testing.T) {
 	}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(canned))
+	}))
+	defer srv.Close()
+	oldServer := serverAddr
+	serverAddr = srv.URL
+	defer func() { serverAddr = oldServer }()
+
+	cmd := testCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	if err := runSecurityFindingsList(cmd, nil); err != nil {
+		t.Fatalf("runSecurityFindingsList: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "response THROTTLE APPLIED on box-b-container\n") || strings.Contains(out, "RELEASED") {
+		t.Errorf("shared finding's response line:\n%s\nwant `response THROTTLE APPLIED on box-b-container` and no RELEASED", out)
+	}
+	resp, raw := findingsListJSON(t, cmd)
+	if r := resp.GetFindings()[0].GetResponse(); r.GetContainer() != "box-b-container" || r.GetState() != pb.ResponseState_RESPONSE_STATE_APPLIED {
+		t.Errorf("--json lost the response's box: %s", raw)
+	}
+}
+
+// TestRunSecurityFindingsList_DecodesIntoGeneratedTypes (#2768 item 5): the
+// list decodes the gateway JSON into pb.ListFindingsResponse. A field or an
+// enum name from a newer daemon does not break an older CLI: the row still
+// prints, the unknown enum as UNSPECIFIED.
+func TestRunSecurityFindingsList_DecodesIntoGeneratedTypes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "unknown field", body: `{"findings": [{"id": "7", "rule": "THREAT_RULE_ID_MINER_SIGNATURE", "state": "FINDING_STATE_OPEN", "futureField": 1}]}`, want: "MINER_SIGNATURE"},
+		{name: "unknown enum name", body: `{"findings": [{"id": "7", "rule": "THREAT_RULE_ID_FROM_THE_FUTURE", "state": "FINDING_STATE_OPEN"}]}`, want: "UNSPECIFIED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			oldServer := serverAddr
+			serverAddr = srv.URL
+			defer func() { serverAddr = oldServer }()
+			cmd := testCmd()
+			var buf bytes.Buffer
+			cmd.SetOut(&buf)
+			if err := runSecurityFindingsList(cmd, nil); err != nil {
+				t.Fatalf("runSecurityFindingsList: %v", err)
+			}
+			if !strings.Contains(buf.String(), tc.want) || !strings.Contains(buf.String(), "OPEN") {
+				t.Errorf("output missing %q:\n%s", tc.want, buf.String())
+			}
+		})
+	}
+}
+
+func TestRunSecurityFindingsList_EncodesFilters(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"findings": []}`))
+	}))
+	defer srv.Close()
+
+	oldServer := serverAddr
+	serverAddr = srv.URL
+	defer func() { serverAddr = oldServer }()
+
+	oldSeverity, oldTenant, oldSince, oldState, oldLimit := findingsSeverity, findingsTenant, findingsSince, findingsState, findingsLimit
+	findingsSeverity = "high"
+	findingsTenant = "bob"
+	findingsSince = "2026-08-01T00:00:00Z"
+	findingsState = "open"
+	findingsLimit = 25
+	defer func() {
+		findingsSeverity, findingsTenant, findingsSince, findingsState, findingsLimit = oldSeverity, oldTenant, oldSince, oldState, oldLimit
+	}()
+
+	cmd := testCmd()
+	cmd.SetOut(&bytes.Buffer{})
