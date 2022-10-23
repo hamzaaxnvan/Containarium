@@ -1,0 +1,180 @@
+package engine
+
+import (
+	"strings"
+
+	"github.com/footprintai/containarium/internal/coderun"
+)
+
+// claudeEngine is Claude Code — the engine `containarium code` has installed
+// since #1673.
+//
+// Everything here is a MOVE of already-shipped behaviour behind the Engine
+// interface, not a reimplementation. In particular RunCommand on a
+// SecretCredential delegates to coderun.BuildClaudeRunCommand, so the command
+// dispatched to every existing box stays byte-identical
+// (TestClaudeSecretRunCommandIsByteIdenticalToTheShippedBuilder pins that).
+//
+// Note what is NOT here: any credential precheck. #2036 removed the
+// CLAUDE_CODE_OAUTH_TOKEN tenant-secret precheck deliberately — Claude Code's
+// terms (https://code.claude.com/docs/en/legal-and-compliance, "Authentication
+// and credential use") forbid a platform collecting, storing, or intermediating
+// a Claude.ai credential. #1727 does not reintroduce it: the install script and
+// verify script below are #2036's, unchanged.
+type claudeEngine struct {
+	opts Options
+}
+
+// ClaudeInstallScript is Anthropic's own native installer, run verbatim. It
+// writes to ~/.local/bin/claude — user-level, no root — which is why `code
+// install` needs no daemon-side privileged exec path.
+const ClaudeInstallScript = "curl -fsSL https://claude.ai/install.sh | bash"
+
+// ClaudeInstallStateFile carries one bit from the install step to the verify
+// step: whether ~/.claude/.credentials.json already existed. A user who signed
+// in through Anthropic's flow legitimately has one, so the assertion that has to
+// hold is "the install did not create it", not "there is none".
+const ClaudeInstallStateFile = "$HOME/.cache/containarium/code-install-state"
+
+// claudeGatewayEnvPath is where a gateway-credentialled Claude box keeps its
+// 0600 token file. Under ~/.claude so it sits with the rest of Claude Code's
+// own state and is removed with it.
+const claudeGatewayEnvPath = "$HOME/.claude/gateway.env"
+
+func (claudeEngine) Name() Name                     { return NameClaude }
+func (e claudeEngine) Credential() CredentialSource { return e.opts.Credential }
+func (claudeEngine) GatewayEnvPath() string         { return claudeGatewayEnvPath }
+
+// InstallScript runs Anthropic's installer unmodified. The only addition is the
+// one bit VerifyScript needs, so "the install created a credentials file" can be
+// told apart from "the user signed in earlier", which is the supported path.
+//
+// Version, when set, is passed to the installer as its argument — the
+// installer's own documented way to pin a version. The command line is
+// otherwise unchanged.
+func (claudeEngine) InstallScript(o InstallOptions) string {
+	installer := ClaudeInstallScript
+	if v := strings.TrimSpace(o.Version); v != "" {
+		installer += " -s " + shellQuoteSingle(v)
+	}
+	return `set -e
+mkdir -p "$(dirname "` + ClaudeInstallStateFile + `")"
+if [ -f "$HOME/.claude/.credentials.json" ]; then
+  echo present > "` + ClaudeInstallStateFile + `"
+else
+  echo absent > "` + ClaudeInstallStateFile + `"
+fi
+` + installer
+}
+
+// VerifyScript is #2036's verification, unchanged: print the installed binary's
+// version, assert the install created no ~/.claude/.credentials.json, and report
+// which credential SOURCE the box has.
+//
+// That last part is deliberately NAMES ONLY — every branch tests for presence
+// and echoes a literal, because expanding any of these would put a live
+// credential into the CLI's output and the user's scrollback.
+func (e claudeEngine) VerifyScript() string {
+	script := `set -e
+"$HOME/.local/bin/claude" --version
+creds="$HOME/.claude/.credentials.json"
+before=absent
+if [ -f "` + ClaudeInstallStateFile + `" ]; then
+  before="$(cat "` + ClaudeInstallStateFile + `")"
+  rm -f "` + ClaudeInstallStateFile + `"
+fi
+if [ "$before" = absent ] && [ -f "$creds" ]; then
+  echo "the install created $creds — containarium never mints or stores a Claude.ai credential" >&2
+  exit 3
+fi
+echo "credential sources present:"
+found=0
+if [ -f "$creds" ]; then
+  echo "  - $creds (signed in through Anthropic's own flow)"
+  found=1
+fi
+settings="$HOME/.claude/settings.json"
+for key in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; do
+  if [ -f "$settings" ] && grep -q "\"$key\"" "$settings"; then
+    echo "  - $key in the env block of $settings"
+    found=1
+  fi
+done
+providers="$(env | sed -n 's/^\(CLAUDE_CODE_USE_[A-Z0-9_]*\)=.*/\1/p')"
+if [ -n "$providers" ]; then
+  for p in $providers; do echo "  - $p (3P inference provider)"; done
+  found=1
+fi`
+	// A gateway-credentialled box has a fourth source, and it is the one the
+	// install just wrote — so report it by name too, for the same reason the
+	// other three are reported: so the operator can see the box is wired
+	// without anything printing a value.
+	if e.opts.Credential != nil && e.opts.Credential.Kind() == KindGateway {
+		script += `
+if [ -f "` + claudeGatewayEnvPath + `" ]; then
+  echo "  - ` + GatewayTokenEnvVar + ` in ` + claudeGatewayEnvPath + ` (containarium model gateway)"
+  found=1
+fi`
+	}
+	script += `
+if [ "$found" = 0 ]; then
+  echo "  (none yet — sign in on the box, or place your own key in $settings)"
+fi`
+	return script
+}
+
+// claudeCredentialStatusScript probes for a Claude Code credential by NAME
+// only (#2272), mirroring VerifyScript's own detection above but condensed to
+// the single canonical answer a caller needs: the one source a run would
+// actually use right now, in the same priority a human reading VerifyScript's
+// multi-line output would pick — an interactive sign-in first (Anthropic's
+// own flow), then a user-placed key, then none. set -e is intentionally
+// absent: every branch exits explicitly, and the loop/grep below must not
+// abort the script on a legitimate "not found".
+//
+// #nosec G101 -- this is a shell script that checks for the PRESENCE of a
+// credentials file and the NAMES of env vars (ANTHROPIC_API_KEY,
+// ANTHROPIC_AUTH_TOKEN, CLAUDE_CODE_USE_*) — it never contains, reads, or
+// echoes a credential value. Same rationale as GatewayTokenEnvVar's
+// annotation in engine.go.
+//
+// Expiry (#2371): when the sign-in file exists, the ONLY thing read out of
+// it is the numeric `expiresAt` timestamp. `grep -o` emits just the
+// `"expiresAt":<digits>` match — never the rest of the line, which in the
+// minified file also holds the token values — and that match is captured
+// into a shell variable, reduced to its digits, and never echoed. Claude
+// Code writes epoch milliseconds; a value of 13+ digits is divided down to
+// seconds, a shorter one is taken as seconds already. No timestamp at all
+// reports "interactive": an unknown expiry is not guessed to be past.
+const claudeCredentialStatusScript = `cred="$HOME/.claude/.credentials.json"
+if [ -f "$cred" ]; then
+  exp=$(grep -o '"expiresAt"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$cred" 2>/dev/null | head -n 1 | grep -o '[0-9][0-9]*$')
+  if [ -n "$exp" ]; then
+    if [ "${#exp}" -ge 13 ]; then
+      exp=$((exp / 1000))
+    fi
+    if [ "$exp" -le "$(date +%s)" ]; then
+      echo expired
+      exit 0
+    fi
+  fi
+  echo interactive
+  exit 0
+fi
+settings="$HOME/.claude/settings.json"
+for key in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN; do
+  if [ -f "$settings" ] && grep -q "\"$key\"" "$settings"; then
+    echo api-key
+    exit 0
+  fi
+done
+if env | grep -q '^CLAUDE_CODE_USE_[A-Z0-9_]*='; then
+  echo api-key
+  exit 0
+fi
+echo none`
+
+// ClaudeStructuredOutputFlag, appended to a Claude run command, makes
+// `claude -p` print ONE JSON result object (type "result", subtype, is_error,
+// result text, session_id, usage, ...) instead of plain text. `json` rather
+// than `stream-json`: stream-json under -p additionally requires --verbose.
