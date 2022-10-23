@@ -31,36 +31,3 @@ func TestClusterIsolation_UnspecifiedResolvesToVM(t *testing.T) {
 		t.Fatalf("CreateCluster: %v", err)
 	}
 	if got := resp.Cluster.NodeIsolation; got != pb.NodeIsolation_NODE_ISOLATION_VM {
-		t.Fatalf("create response isolation = %v, want VM", got)
-	}
-
-	// The store holds the resolved class, not the unset one.
-	rec, err := s.store.Get(ctx, "alice", "demo")
-	if err != nil {
-		t.Fatalf("store Get: %v", err)
-	}
-	if rec.NodeIsolation != cluster.IsolationVM {
-		t.Fatalf("stored isolation = %q, want %q", rec.NodeIsolation, cluster.IsolationVM)
-	}
-
-	// And every read surface says so.
-	got, err := s.GetCluster(ctx, &pb.GetClusterRequest{Name: "demo"})
-	if err != nil {
-		t.Fatalf("GetCluster: %v", err)
-	}
-	if got.Cluster.NodeIsolation != pb.NodeIsolation_NODE_ISOLATION_VM {
-		t.Fatalf("GetCluster isolation = %v, want VM", got.Cluster.NodeIsolation)
-	}
-	st, err := s.GetClusterStatus(ctx, &pb.GetClusterStatusRequest{Name: "demo"})
-	if err != nil {
-		t.Fatalf("GetClusterStatus: %v", err)
-	}
-	if st.Cluster.NodeIsolation != pb.NodeIsolation_NODE_ISOLATION_VM {
-		t.Fatalf("GetClusterStatus isolation = %v, want VM", st.Cluster.NodeIsolation)
-	}
-	list, err := s.ListClusters(ctx, &pb.ListClustersRequest{})
-	if err != nil || len(list.Clusters) != 1 {
-		t.Fatalf("ListClusters = %+v (%v)", list, err)
-	}
-	if list.Clusters[0].NodeIsolation != pb.NodeIsolation_NODE_ISOLATION_VM {
-		t.Fatalf("ListClusters isolation = %v, want VM", list.Clusters[0].NodeIsolation)
