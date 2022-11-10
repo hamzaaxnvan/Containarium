@@ -20,3 +20,10 @@ func TestValidateSSHKeyMode(t *testing.T) {
 		{"neither → required error", false, "", "--ssh-key is required"},
 		{"both → mutually exclusive", true, "/tmp/k.pub", "mutually exclusive"},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSSHKeyMode(tc.noSSHKey, tc.sshKeyPath)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateSSHKeyMode(%v, %q) unexpected error: %v", tc.noSSHKey, tc.sshKeyPath, err)
+				}
