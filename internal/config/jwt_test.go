@@ -12,8 +12,3 @@ func TestLoadJWTEmpty(t *testing.T) {
 }
 
 func TestLoadJWTReadsEnv(t *testing.T) {
-	t.Setenv(EnvJWTSecret, "s3cr3t")
-	t.Setenv(EnvJWTToken, "bearer-xyz")
-	t.Setenv(EnvJWTTokenFile, "/run/jwt.token")
-	t.Setenv(EnvJWTAudience, "containarium-api")
-
