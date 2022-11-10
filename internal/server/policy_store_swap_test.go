@@ -18,3 +18,45 @@ func TestGuardrailPolicyProvider_FollowsDurableInstall(t *testing.T) {
 	s := NewGuardrailPolicyServer(guardrailPolicyStartupStore(true, nil))
 	provider := s.Provider() // captured at startup, as the gate and gateway do
 	if s.Durable() {
+		t.Fatal("Durable() = true on the fail-closed stand-in")
+	}
+	if _, err := provider.Get(context.Background()); err == nil || errors.Is(err, guardrailpolicy.ErrNotConfigured) {
+		t.Fatalf("provider.Get before install = %v, want a fail-closed error", err)
+	}
+
+	if err := s.InstallDurableStore(func() (guardrailpolicy.Store, error) {
+		return nil, errors.New("connection refused")
+	}); err == nil {
+		t.Fatal("InstallDurableStore: want the opener's error")
+	}
+	if s.Durable() {
+		t.Fatal("Durable() = true after a failed install")
+	}
+
+	durable := guardrailpolicy.NewMemoryStore() // stands in for the Postgres store
+	if _, err := durable.Set(context.Background(), gpRequest(0, gpSigner(1)), "admin"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := s.InstallDurableStore(func() (guardrailpolicy.Store, error) { return durable, nil }); err != nil {
+		t.Fatalf("InstallDurableStore: %v", err)
+	}
+	if !s.Durable() {
+		t.Fatal("Durable() = false after install")
+	}
+	got, err := provider.Get(context.Background())
+	if err != nil {
+		t.Fatalf("startup-captured provider.Get after install = %v, want the durable store's policy", err)
+	}
+	if got.GetRevision() != 1 {
+		t.Fatalf("provider.Get revision = %d, want 1 (the durable store's policy)", got.GetRevision())
+	}
+	resp, err := s.GetGuardrailPolicy(gpUserCtx(), &pb.GetGuardrailPolicyRequest{})
+	if err != nil || !resp.GetConfigured() {
+		t.Fatalf("Get after install = %v, %v; want the durable policy", resp, err)
+	}
+}
+
+func TestCodeEgressPolicy_DurableFollowsInstall(t *testing.T) {
+	s := startupServer(t)
+	if s.Durable() {
+		t.Fatal("Durable() = true on the stand-in")
