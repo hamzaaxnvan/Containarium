@@ -16,12 +16,3 @@ import (
 // daemon up.
 func TestAlertSeverityIsValidatedOnEveryWritePath(t *testing.T) {
 	b, err := os.ReadFile("alert_server.go")
-	if err != nil {
-		t.Fatalf("read alert_server.go: %v", err)
-	}
-	src := string(b)
-
-	// Every place the stored severity is assigned from a request.
-	writes := strings.Count(src, "Severity:    severity,") +
-		strings.Count(src, "existing.Severity = req.Severity")
-	if writes == 0 {
