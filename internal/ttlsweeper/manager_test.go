@@ -170,3 +170,89 @@ func TestManager_DeleterError_ContinuesWithOthers(t *testing.T) {
 	del := &fakeDeleter{errs: []error{errors.New("delete boom")}}
 
 	// Capture log output to verify the error is logged.
+	var buf bytes.Buffer
+	prevOut := log.Writer()
+	defer log.SetOutput(prevOut)
+	log.SetOutput(&buf)
+
+	m := NewManager(inc, del, Options{
+		Interval: time.Hour,
+		Clock:    func() time.Time { return now },
+	})
+	m.tick(context.Background())
+
+	calls := del.recorded()
+	if len(calls) != 2 {
+		t.Fatalf("both containers should be attempted, got %d: %+v", len(calls), calls)
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("delete boom")) {
+		t.Errorf("delete error not logged; output:\n%s", buf.String())
+	}
+}
+
+// TestManager_StopIsIdempotent — Stop called twice must not panic
+// and must complete quickly both times. Uses a short interval so the
+// ticker is actively firing during the Stop window.
+func TestManager_StopIsIdempotent(t *testing.T) {
+	now := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	m := NewManager(&fakeIncus{}, &fakeDeleter{}, Options{
+		Interval: 25 * time.Millisecond,
+		Clock:    func() time.Time { return now },
+	})
+	m.Start(context.Background())
+	time.Sleep(75 * time.Millisecond)
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		m.Stop()
+	}()
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Stop() blocked >2s")
+	}
+
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		m.Stop()
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second Stop() blocked >1s; expected no-op")
+	}
+}
+
+// TestManager_ContextCancellationStopsTicker — Start(ctx) with a
+// canceled ctx exits the run loop within a tick interval.
+func TestManager_ContextCancellationStopsTicker(t *testing.T) {
+	before := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	m := NewManager(&fakeIncus{}, &fakeDeleter{}, Options{
+		Interval: 25 * time.Millisecond,
+	})
+	m.Start(ctx)
+	time.Sleep(75 * time.Millisecond) // let several ticks fire
+
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= before+1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > before+1 {
+		t.Errorf("goroutine leak: before=%d after=%d", before, got)
+	}
+	_ = m
+}
+
+// TestManager_StartIsNonBlocking — Start spawns the loop and returns
+// immediately. A blocked Start would hang the daemon's startup.
+func TestManager_StartIsNonBlocking(t *testing.T) {
+	var ticks int64
+	inc := &fakeIncusCounting{count: &ticks}
+	m := NewManager(inc, &fakeDeleter{}, Options{
