@@ -57,3 +57,63 @@ func TestEgressIncomplete_FailedRemovalWithNoRunningBox(t *testing.T) {
 	bob := containerView{Name: "bob-a", Tenant: "bob", TenantID: 2, Ifindex: 21, HasVeth: true, Running: true}
 	policies := map[string]netpolicy.CompiledPolicy{
 		"acme": egressPolicy(t, "acme", "192.0.2.0/24"),
+		"bob":  egressPolicy(t, "bob", "198.51.100.0/24"),
+	}
+	f := &fakeEgressApplier{}
+	egressPass(t, e, []containerView{acme, bob}, policies, f)
+
+	// acme's box is deleted and its policy removed; every acme entry fails to delete.
+	f.failDel = map[netbpf.EgressEntry]bool{}
+	for ee := range e.egressInstalled {
+		if ee.TenantID == acme.TenantID {
+			f.failDel[ee] = true
+		}
+	}
+	if len(f.failDel) == 0 {
+		t.Fatal("setup: pass 1 installed no acme allow-list entries")
+	}
+	delete(policies, "acme")
+	egressPass(t, e, []containerView{bob}, policies, f)
+
+	st := npStatusFor(t, e, true, "acme")
+	if !hasEgressIncomplete(st) {
+		t.Errorf("acme status = %v %v, want %v: its failed removal left destinations allowed", st.GetState(), st.GetUncoveredPaths(), egressIncompletePath)
+	}
+	if st.GetState() != pb.NetworkPolicyAppliedState_NETWORK_POLICY_APPLIED_STATE_NOT_LOADED {
+		t.Errorf("acme state = %v, want NOT_LOADED (no box)", st.GetState())
+	}
+
+	// Another tenant's status is unaffected.
+	if st := npStatusFor(t, e, true, "bob"); hasEgressIncomplete(st) || st.GetState() != pb.NetworkPolicyAppliedState_NETWORK_POLICY_APPLIED_STATE_LOADED {
+		t.Errorf("bob status = %v %v, want LOADED with a complete allow-list", st.GetState(), st.GetUncoveredPaths())
+	}
+
+	// Once the removal lands the record clears.
+	f.failDel = nil
+	egressPass(t, e, []containerView{bob}, policies, f)
+	if st := npStatusFor(t, e, true, "acme"); hasEgressIncomplete(st) {
+		t.Errorf("after the retried removal succeeded acme still reports %v", st.GetUncoveredPaths())
+	}
+	if _, kept := e.egressNames[acme.TenantID]; kept {
+		t.Error("acme's name is still remembered after its last entry was removed (the map must stay bounded)")
+	}
+}
+
+// A tenant with only stopped boxes still has its allow-list written (the plan
+// does not need a running box), so a failed add is real and must be reported.
+func TestEgressIncomplete_FailedAddWithOnlyStoppedBoxes(t *testing.T) {
+	e := egressTestEnforcer()
+	acme := containerView{Name: "acme-a", Tenant: "acme", TenantID: 1, Running: false}
+	bob := containerView{Name: "bob-a", Tenant: "bob", TenantID: 2, Ifindex: 21, HasVeth: true, Running: true}
+	policies := map[string]netpolicy.CompiledPolicy{
+		"acme": egressPolicy(t, "acme", "192.0.2.0/24"),
+		"bob":  egressPolicy(t, "bob", "198.51.100.0/24"),
+	}
+	plan := planReconcile([]containerView{acme, bob}, policies, true)
+	f := &fakeEgressApplier{failAdd: map[netbpf.EgressEntry]bool{}}
+	for _, ee := range plan.egress {
+		if ee.TenantID == acme.TenantID {
+			f.failAdd[ee] = true
+		}
+	}
+	if len(f.failAdd) == 0 {
