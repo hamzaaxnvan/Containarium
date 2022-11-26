@@ -29,3 +29,34 @@ type SystemResources struct {
 	// Aggregate host disk (sum across storage pools), in bytes.
 	DiskUsedBytes  int64
 	DiskTotalBytes int64
+
+	// Number of containers currently on this host (running + stopped).
+	ContainerCount int64
+}
+
+// Sources is the seam over the daemon's existing metric-collection funcs
+// (GetSystemResources for the host snapshot, GetAllMetrics for the
+// per-container map) so the CloudExportCollector is unit-testable with a
+// fake — no incus, no network — while production wires an adapter backed
+// by the real *container.Manager.
+//
+// AllContainerMetrics is defined here for the per-container series that
+// land in #1071; the #1070 host-series collector does not call it yet.
+// It is on the interface now so the fake and the real adapter share one
+// contract across both issues.
+type Sources interface {
+	// SystemResources returns the current host-level snapshot. The
+	// collector logs and skips a tick when this errors — it never
+	// panics or crashes the daemon.
+	SystemResources(ctx context.Context) (*SystemResources, error)
+
+	// AllContainerMetrics returns per-container metrics keyed by
+	// container name. Used by the #1071 container-series collector; not
+	// consulted by the #1070 host-series pipeline.
+	AllContainerMetrics(ctx context.Context) (map[string]*pb.ContainerMetrics, error)
+}
+
+// PeerState is a point-in-time health snapshot of one registered peer
+// (#1084), read via PlatformSources.Peers(). ID is the enrolled host
+// name — the enrollment path already forbids org/tenant identifiers in
+// it — so the tunnel.state series' peer_id label can never carry a

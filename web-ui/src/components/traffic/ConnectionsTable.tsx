@@ -28,18 +28,3 @@ function duration(firstSeen: string, lastSeen: string) {
   return Math.floor((new Date(lastSeen).getTime() - new Date(firstSeen).getTime()) / 1000);
 }
 
-export default function ConnectionsTable({ connections, isLoading }: ConnectionsTableProps) {
-  if (isLoading) {
-    return <p className="py-6 text-center text-xs text-[var(--text-muted)]">Loading connections…</p>;
-  }
-  if (connections.length === 0) {
-    return <p className="py-6 text-center text-xs text-[var(--text-muted)]">No active connections</p>;
-  }
-
-  return (
-    <div className="overflow-x-auto rounded-xl border border-[var(--border-subtle)]">
-      <table className="w-full text-xs">
-        <thead>
-          <tr className="border-b border-[var(--border-subtle)] bg-[var(--surface)]">
-            {['Protocol', 'Destination', 'Port', 'State', 'Sent', 'Received', 'Duration'].map((h, i) => (
-              <th key={h} className={`px-3 py-2.5 font-medium text-[var(--text-secondary)] ${i >= 4 ? 'text-right' : 'text-left'}`}>{h}</th>
