@@ -155,3 +155,161 @@ func TestCodeRunExitErr(t *testing.T) {
 }
 
 func TestLogPathFromListing(t *testing.T) {
+	listing := "Found 1 process(es):\n\n" +
+		"🟢 code  (pid 111, running)\n" +
+		"   Command:    claude -p hi\n" +
+		"   Started at: 2026-09-02T12:00:00Z\n" +
+		"   Log path:   /tmp/agent-box/code.log\n\n"
+
+	got, err := coderun.LogPathFromListing(listing, "code")
+	if err != nil {
+		t.Fatalf("logPathFromListing: %v", err)
+	}
+	if got != "/tmp/agent-box/code.log" {
+		t.Errorf("got %q, want /tmp/agent-box/code.log", got)
+	}
+
+	if _, err := coderun.LogPathFromListing(listing, "nope"); err == nil {
+		t.Error("expected an error for a name not in the listing")
+	}
+}
+
+// --- `code install` (#2030) ------------------------------------------------
+//
+// #2030 removed the CLAUDE_CODE_OAUTH_TOKEN tenant-secret precheck: a platform
+// may not collect, store, or intermediate a Claude.ai credential
+// (https://code.claude.com/docs/en/legal-and-compliance). The install lands a
+// toolchain and nothing else; the user signs in inside the box, or places
+// their own API key. These tests drive runCodeInstall through the sshExec /
+// resolveCodeTargetFn seams, so no box, daemon, or ssh binary is involved.
+
+// installRun is one captured remote exec: the script runCodeInstall asked the
+// box to run.
+type installRun struct {
+	script string
+}
+
+// runInstall drives runCodeInstall against fakes and returns every remote
+// script it ran, plus the command's own stdout.
+func runInstall(t *testing.T, box string, flags map[string]string) ([]installRun, string, error) {
+	t.Helper()
+
+	origSSH, origResolve := sshExec, resolveCodeTargetFn
+	origBootstrap, origRelease, origVersion := codeBootstrapURL, codeRelease, codeClaudeCodeVersion
+	t.Cleanup(func() {
+		sshExec, resolveCodeTargetFn = origSSH, origResolve
+		codeBootstrapURL, codeRelease, codeClaudeCodeVersion = origBootstrap, origRelease, origVersion
+	})
+
+	codeBootstrapURL, codeRelease, codeClaudeCodeVersion = flags["bootstrap-url"], flags["release"], flags["claude-code-version"]
+
+	var runs []installRun
+	resolveCodeTargetFn = func(context.Context, string, io.Writer) (connectcore.Target, string, error) {
+		return connectcore.Target{User: "alice", Host: "box.example.test", Port: 22}, "/dev/null", nil
+	}
+	sshExec = func(_ io.Writer, args []string) (string, error) {
+		script := ""
+		if len(args) > 0 {
+			script = args[len(args)-1]
+		}
+		runs = append(runs, installRun{script: script})
+		return "1.2.3 (Claude Code)\ncredential sources present:\n  (none)", nil
+	}
+
+	cmd := &cobra.Command{}
+	var out, errBuf bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errBuf)
+	cmd.SetContext(context.Background())
+	err := runCodeInstall(cmd, []string{box})
+	return runs, out.String(), err
+}
+
+func allScripts(runs []installRun) string {
+	var sb strings.Builder
+	for _, r := range runs {
+		sb.WriteString(r.script)
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// TestCodeInstall_NoCredentialPrecheck is the headline #2030 AC: "Remove the
+// CLAUDE_CODE_OAUTH_TOKEN tenant-secret precheck. `code install` neither
+// reads, lists, nor names a Claude.ai token." It also pins that --server is no
+// longer required, since the only reason it was is gone.
+func TestCodeInstall_NoCredentialPrecheck(t *testing.T) {
+	origServer := serverAddr
+	serverAddr = "" // used to be a hard error: "--server is required"
+	t.Cleanup(func() { serverAddr = origServer })
+
+	runs, _, err := runInstall(t, "alice", nil)
+	if err != nil {
+		t.Fatalf("install failed with no --server and no credential set: %v", err)
+	}
+	if len(runs) == 0 {
+		t.Fatal("no remote command ran")
+	}
+
+	scripts := allScripts(runs)
+	banned := []string{
+		"CLAUDE_CODE_OAUTH_TOKEN",
+		"setup-token",
+		"secrets set",
+		"/run/secrets/",
+	}
+	for _, b := range banned {
+		if strings.Contains(scripts, b) {
+			t.Errorf("install scripts still reference %q:\n%s", b, scripts)
+		}
+	}
+	// The same promise on the surface the user reads.
+	help := codeInstallCmd.Long + "\n" + codeInstallCmd.Short
+	for _, b := range banned {
+		if strings.Contains(help, b) {
+			t.Errorf("`code install` help still tells users about %q", b)
+		}
+	}
+	// Anthropic's own installer line must be unchanged.
+	if !strings.Contains(scripts, "curl -fsSL https://claude.ai/install.sh | bash") {
+		t.Errorf("Anthropic's installer line is not run verbatim:\n%s", scripts)
+	}
+}
+
+// TestCodeInstall_VerifyScript covers the replaced verification: `claude
+// --version`, an assertion that the install created no ~/.claude/.credentials.json,
+// and a report of which credential SOURCE is present — names only, never a
+// value.
+func TestCodeInstall_VerifyScript(t *testing.T) {
+	script := claudeVerifyScript()
+
+	tests := []struct {
+		name   string
+		want   string
+		absent bool
+	}{
+		{name: "runs the installed binary's version", want: "/.local/bin/claude"},
+		{name: "version, not a prompt", want: "--version"},
+		{name: "no non-interactive prompt any more", want: "claude -p ", absent: true},
+		{name: "asserts no credentials file was created", want: ".credentials.json"},
+		{name: "names the API-key source", want: "ANTHROPIC_API_KEY"},
+		{name: "names the auth-token source", want: "ANTHROPIC_AUTH_TOKEN"},
+		{name: "names the settings.json env block", want: "settings.json"},
+		{name: "names 3P inference providers", want: "CLAUDE_CODE_USE_"},
+		// Presence only. Expanding any of these would put a live credential
+		// into the CLI's own output and the user's scrollback.
+		{name: "never expands the API key", want: `$ANTHROPIC_API_KEY`, absent: true},
+		{name: "never expands the auth token", want: `$ANTHROPIC_AUTH_TOKEN`, absent: true},
+		{name: "never cats the credentials file", want: "cat \"$HOME/.claude/.credentials.json\"", absent: true},
+		{name: "never cats settings.json", want: "cat \"$settings\"", absent: true},
+		// #1673's own rule, still true: bare mode is never used here.
+		{name: "no bare mode", want: "--bare", absent: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := strings.Contains(script, tc.want)
+			if tc.absent && got {
+				t.Errorf("verify script must NOT contain %q:\n%s", tc.want, script)
+			}
+			if !tc.absent && !got {
+				t.Errorf("verify script is missing %q:\n%s", tc.want, script)
