@@ -99,37 +99,3 @@ func TestQueueRPC_StaleCompleteRejected(t *testing.T) {
 	}
 
 	stale, _ := s.CompleteAgentTask(ctx, &pb.CompleteAgentTaskRequest{
-		TaskId: first.TaskId, LeaseToken: first.LeaseToken, ArtifactJson: "late",
-	})
-	if stale.Accepted {
-		t.Error("stale-token completion must be rejected at the RPC layer")
-	}
-}
-
-// TestQueueRPC_RequireRunScope confirms every queue op (and the worker launcher)
-// gates on agents:run — a token without it is denied.
-func TestQueueRPC_RequireRunScope(t *testing.T) {
-	s := newQueueServer()
-	noScope := auth.ContextWithTestSubjectScopes(
-		context.Background(), "nobody", nil, []string{auth.ScopeAgentsRead})
-
-	if _, err := s.EnqueueAgentTask(noScope, &pb.EnqueueAgentTaskRequest{SkillId: "hello-agent"}); status.Code(err) != codes.PermissionDenied {
-		t.Errorf("enqueue without agents:run: got %v, want PermissionDenied", err)
-	}
-	if _, err := s.LeaseAgentTask(noScope, &pb.LeaseAgentTaskRequest{}); status.Code(err) != codes.PermissionDenied {
-		t.Errorf("lease without agents:run: got %v, want PermissionDenied", err)
-	}
-	if _, err := s.CompleteAgentTask(noScope, &pb.CompleteAgentTaskRequest{TaskId: "t", LeaseToken: "x"}); status.Code(err) != codes.PermissionDenied {
-		t.Errorf("complete without agents:run: got %v, want PermissionDenied", err)
-	}
-	if _, err := s.StartAgentWorker(noScope, &pb.StartAgentWorkerRequest{SkillId: "hello-agent"}); status.Code(err) != codes.PermissionDenied {
-		t.Errorf("start-worker without agents:run: got %v, want PermissionDenied", err)
-	}
-}
-
-func TestBuildWorkerPollCommand(t *testing.T) {
-	cmd := buildWorkerPollCommand("tok.tok.tok", "worker-7", "hello-agent", "/etc/containarium/agent/runs/run-1", agentengine.Resolved{}, "")
-
-	for _, want := range []string{
-		"CONTAINARIUM_AGENT_MODE=poll",
-		"ip route", // resolves the daemon host from the default gateway
