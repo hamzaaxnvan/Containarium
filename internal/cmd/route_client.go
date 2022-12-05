@@ -28,3 +28,19 @@ type routeAPI interface {
 }
 
 // newRouteClient returns an HTTP client in --http mode (when a --server is set)
+// and a gRPC client otherwise, mirroring how the other verbs pick their
+// transport. Caller must Close() the result.
+func newRouteClient() (routeAPI, error) {
+	if httpMode && serverAddr != "" {
+		return client.NewHTTPClient(serverAddr, authToken)
+	}
+	return client.NewGRPCClient(serverAddr, certsDir, insecure)
+}
+
+// exposeAdapter implements expose.APIClient over either transport. LookupContainer
+// is a ListContainers + linear scan (the surface has no by-name lookup); this is
+// fine at the typical scale and matches the previous gRPC-only adapter.
+type exposeAdapter struct{ c routeAPI }
+
+func (a *exposeAdapter) LookupContainer(_ context.Context, username string) (string, string, string, error) {
+	containers, err := a.c.ListContainers()
