@@ -134,3 +134,71 @@ func (s *Store) Get(ctx context.Context, id string) (*AlertRule, error) {
 }
 
 // List retrieves all alert rules
+func (s *Store) List(ctx context.Context) ([]*AlertRule, error) {
+	query := `
+		SELECT id, name, expr, duration, severity, description,
+			labels, annotations, enabled, created_at, updated_at
+		FROM alert_rules ORDER BY created_at DESC
+	`
+
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list alert rules: %w", err)
+	}
+	defer rows.Close()
+
+	var rules []*AlertRule
+	for rows.Next() {
+		rule := &AlertRule{}
+		var labelsJSON, annotationsJSON []byte
+		if err := rows.Scan(
+			&rule.ID, &rule.Name, &rule.Expr, &rule.Duration, &rule.Severity,
+			&rule.Description, &labelsJSON, &annotationsJSON,
+			&rule.Enabled, &rule.CreatedAt, &rule.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan alert rule: %w", err)
+		}
+
+		if err := json.Unmarshal(labelsJSON, &rule.Labels); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal labels: %w", err)
+		}
+		if err := json.Unmarshal(annotationsJSON, &rule.Annotations); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal annotations: %w", err)
+		}
+
+		rules = append(rules, rule)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating alert rules: %w", err)
+	}
+
+	return rules, nil
+}
+
+// ListEnabled retrieves only enabled alert rules
+func (s *Store) ListEnabled(ctx context.Context) ([]*AlertRule, error) {
+	query := `
+		SELECT id, name, expr, duration, severity, description,
+			labels, annotations, enabled, created_at, updated_at
+		FROM alert_rules WHERE enabled = true ORDER BY created_at DESC
+	`
+
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list enabled alert rules: %w", err)
+	}
+	defer rows.Close()
+
+	var rules []*AlertRule
+	for rows.Next() {
+		rule := &AlertRule{}
+		var labelsJSON, annotationsJSON []byte
+		if err := rows.Scan(
+			&rule.ID, &rule.Name, &rule.Expr, &rule.Duration, &rule.Severity,
+			&rule.Description, &labelsJSON, &annotationsJSON,
+			&rule.Enabled, &rule.CreatedAt, &rule.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan alert rule: %w", err)
+		}
+
