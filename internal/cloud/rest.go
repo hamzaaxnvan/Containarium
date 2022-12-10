@@ -81,3 +81,86 @@ type retiredClient struct {
 	// closed, so the first close can find the connection still busy.
 	idleSwept bool
 }
+
+// maxTransportAge bounds how long one transport, and so one pooled
+// connection, serves new requests (#3113). Go's http.Transport has no
+// maximum connection age, and CloseIdleConnections cannot close an HTTP/2
+// connection that always has a stream in flight, so a continuously busy
+// connection could stay pinned to a moved origin. After this age the next
+// request goes to a fresh transport (a new dial); the old one finishes its
+// in-flight requests undisturbed and is then closed. A connection therefore
+// lives at most maxTransportAge plus the duration of its longest request;
+// the client's 30s Timeout bounds that, so the real worst case is ~15m30s.
+// Swapping, rather than closing the connection from a dialer wrapper, never
+// aborts an in-flight request.
+const maxTransportAge = 15 * time.Minute
+
+// recycleAfter5xx is how many consecutive 5xx responses make the client drop
+// its pooled connections so the next request redials (#3077). A heartbeat
+// every ~30s keeps one pooled HTTP/2 connection in use, so it is never
+// idle-timed-out; if the control plane's origin moves behind the same
+// hostname, that connection can stay pinned to the old origin at the edge and
+// answer 502 until something closes it.
+//
+// Limit: CloseIdleConnections does not close an HTTP/2 connection that still
+// has an in-flight stream. The close runs at the start of the next request, so
+// with the usual 30s heartbeat the connection is idle between beats and is
+// closed; a connection kept continuously busy by overlapping requests would
+// survive until it goes idle. maxTransportAge closes that gap by bounding the
+// lifetime of every connection regardless of traffic.
+const recycleAfter5xx = 3
+
+// noteResponse updates the consecutive-5xx counter for one completed HTTP
+// exchange and flags a recycle when the threshold is hit; the next request
+// closes the idle connections (see recycleIfPending).
+// Only a 5xx response counts as a failure: 4xx (e.g. a 401 from a bad bearer)
+// is the server answering correctly and says nothing about the connection, so
+// it neither counts nor resets. Any other status is a success and resets.
+// Transport-level errors (dial failure, timeout, reset) are deliberately not
+// counted either: the next request already redials after those, so there is
+// nothing pinned to recycle.
+func (r *restActuation) noteResponse(status int) {
+	r.mu.Lock()
+	switch {
+	case status >= 500:
+		r.consecutive5xx++
+	case status >= 400:
+		// Neither a connection symptom nor proof of health: leave as is.
+	default:
+		r.consecutive5xx = 0
+	}
+	if r.consecutive5xx >= recycleAfter5xx {
+		r.consecutive5xx = 0
+		r.recyclePending = true
+	}
+	r.mu.Unlock()
+}
+
+// recycleIfPending closes the pooled connections when noteResponse flagged a
+// recycle. It runs at the start of the next request rather than at the end of
+// the failing one: an HTTP/2 stream is released asynchronously after the body
+// is read, so closing immediately can find the connection still "in use" and
+// do nothing. By the next request (a heartbeat tick later) it is idle.
+func (r *restActuation) recycleIfPending() {
+	r.mu.Lock()
+	pending := r.recyclePending
+	r.recyclePending = false
+	r.mu.Unlock()
+	if pending {
+		log.Printf("[cloud] %d consecutive 5xx from the control plane; closing pooled connections so this request redials", recycleAfter5xx)
+		r.mu.Lock()
+		hc := r.hc
+		r.mu.Unlock()
+		hc.CloseIdleConnections()
+	}
+}
+
+// acquire returns the client for one request, first swapping in a fresh
+// transport if the current one has outlived maxTransportAge and sweeping
+// drained retired clients. The returned release must be called once the
+// response body has been read and closed.
+func (r *restActuation) acquire() (*http.Client, func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.now()
+	// A transport that is not an *http.Transport cannot be cloned, so the swap
