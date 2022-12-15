@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// Guardrails: the contract between Containarium and a detection engine, and
+// the attestation a dataset carries once it has been through one
+// (docs/architecture/guardrail.md).
+//
+// Containarium does not detect anything itself. It drives an ENGINE — any
+// process that implements GuardrailEngineService — over a set of text units,
+// rewrites what the engine flagged, re-scans the result as the gate, and
+// signs a GuardrailAttestation that a consumer (a training sandbox, a CI
+// job) verifies before it touches the data. The in-tree reference engine is
+// a handful of regular expressions that exist so the flow is runnable and
+// testable end to end; a production engine plugs in behind the same RPC.
+
+// GuardrailKind is the family a finding belongs to. Enum, not a string: a
+// policy is keyed by it and a consumer decides by it.
+enum GuardrailKind {
+  GUARDRAIL_KIND_UNSPECIFIED = 0;
+  // Personal data: names, contact details, government identifiers,
+  // financial identifiers, addresses, amounts in a personal context.
+  GUARDRAIL_KIND_PII = 1;
+  // Non-personal sensitive material: credentials, private keys, connection
+  // strings, internal topology. Distinct from PII because the right action
+  // differs (a secret is never tokenized into a persisted vault).
+  GUARDRAIL_KIND_SECRET = 2;
+  // Inbound (model output on its way into a box): code shapes that are
+  // dangerous to run, e.g. download-and-execute, destructive shell,
+  // credential exfiltration (docs/architecture/guardrail-inbound-and-server-policy.md).
+  GUARDRAIL_KIND_UNSAFE_CODE = 3;
+  // Inbound: instruction-override signatures embedded in returned content.
+  GUARDRAIL_KIND_PROMPT_INJECTION = 4;
+}
+
+// CodeModelTrafficScanning says whether a `code run`'s model responses are
+// scanned by the inbound guardrail. Computed once at run start from the
+// credential source and the current server policy, so "no alert" is never
+// mistaken for "clean" (docs/architecture/guardrail-inbound-and-server-policy.md).
+enum CodeModelTrafficScanning {
+  CODE_MODEL_TRAFFIC_SCANNING_UNSPECIFIED = 0; // could not be determined
+  // Gateway credential and the server policy has an inbound BLOCK rule.
+  CODE_MODEL_TRAFFIC_SCANNING_SCANNED = 1;
+  // Gateway credential, but no inbound BLOCK rule is in force.
+  CODE_MODEL_TRAFFIC_SCANNING_UNSCANNED_NO_POLICY = 2;
+  // The tenant's own key: traffic does not cross the gateway.
+  CODE_MODEL_TRAFFIC_SCANNING_UNSCANNED_TENANT_KEY = 3;
+  // Gateway credential and no admin policy was ever set: responses get the
+  // built-in baseline scan (#2736). Whether it only logs or also blocks is
+  // set by the baseline mode (#2738; see `guardrail status`).
+  CODE_MODEL_TRAFFIC_SCANNING_BASELINE = 4;
+}
+
+// GuardrailAction is what the policy does with a finding of a given kind.
+enum GuardrailAction {
+  GUARDRAIL_ACTION_UNSPECIFIED = 0;
+  // Leave the span as-is; count it.
+  GUARDRAIL_ACTION_ALLOW = 1;
+  // Replace the span with a stable placeholder token.
+  GUARDRAIL_ACTION_REDACT = 2;
+  // Any finding of this kind fails the gate for the whole subject.
+  GUARDRAIL_ACTION_BLOCK = 3;
+}
+
+// GuardrailVerdict is the gate's answer for one subject.
+enum GuardrailVerdict {
+  GUARDRAIL_VERDICT_UNSPECIFIED = 0;
+  // Residual findings within policy and no coverage gaps.
+  GUARDRAIL_VERDICT_PASS = 1;
+  GUARDRAIL_VERDICT_FAIL = 2;
+}
+
+// GuardrailTextUnit is one piece of text handed to an engine. Offsets in
+// the findings it produces are Unicode CODE POINT offsets into `text` —
+// not bytes, not UTF-16 units — so every engine, whatever its runtime's
+// string model, reports in one coordinate system and an adapter converts.
+message GuardrailTextUnit {
+  // Caller-chosen key, echoed back on every finding for this unit. Opaque
+  // to the engine; unique within one request.
+  string unit_id = 1;
+  string text = 2;
+}
+
+// GuardrailFinding is one flagged span.
+message GuardrailFinding {
+  string unit_id = 1;
+  // [start, end) in code points of GuardrailTextUnit.text.
+  int32 start = 2;
+  int32 end = 3;
+  GuardrailKind kind = 4;
+  // The engine's own type name within the kind (e.g. "EMAIL", "IBAN",
+  // "API_KEY"). Free text by design: Containarium never branches on it,
+  // only reports it; the kind is what policy keys on.
+  string type = 5;
+  // 0..1. Engines that do not score report 1.
+  double confidence = 6;
