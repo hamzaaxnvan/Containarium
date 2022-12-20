@@ -78,3 +78,43 @@ func (s *MemCodingToolEgressPolicyStore) Get(_ context.Context, tenant string) (
 func (s *MemCodingToolEgressPolicyStore) Delete(_ context.Context, tenant string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	p, ok := s.m[tenant]
+	if !ok {
+		return 0, nil
+	}
+	delete(s.m, tenant)
+	return p.GetRevision(), nil
+}
+
+func cloneCodeEgressPolicy(p *pb.CodingToolEgressPolicy) *pb.CodingToolEgressPolicy {
+	out := &pb.CodingToolEgressPolicy{
+		Tenant:        p.GetTenant(),
+		Mode:          p.GetMode(),
+		EgressCidrs:   append([]string(nil), p.GetEgressCidrs()...),
+		EgressDomains: append([]string(nil), p.GetEgressDomains()...),
+		Revision:      p.GetRevision(),
+		UpdatedBy:     p.GetUpdatedBy(),
+	}
+	if t := p.GetUpdatedAt(); t != nil {
+		out.UpdatedAt = timestamppb.New(t.AsTime())
+	}
+	return out
+}
+
+// --- postgres -------------------------------------------------------
+
+// PostgresCodingToolEgressPolicyStore keeps policies in their own table, with
+// revisions from a sequence so they stay monotonic across deletes and
+// restarts.
+type PostgresCodingToolEgressPolicyStore struct {
+	pool *pgxpool.Pool
+}
+
+func NewPostgresCodingToolEgressPolicyStore(ctx context.Context, pool *pgxpool.Pool) (*PostgresCodingToolEgressPolicyStore, error) {
+	const schema = `
+		CREATE SEQUENCE IF NOT EXISTS coding_tool_egress_policy_revision_seq;
+		CREATE TABLE IF NOT EXISTS coding_tool_egress_policies (
+			tenant TEXT PRIMARY KEY,
+			mode INTEGER NOT NULL DEFAULT 0,
+			egress_cidrs TEXT[] NOT NULL DEFAULT '{}',
+			egress_domains TEXT[] NOT NULL DEFAULT '{}',
