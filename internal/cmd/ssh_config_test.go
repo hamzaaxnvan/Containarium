@@ -51,3 +51,56 @@ func TestSSHConfigOptions_RemoteSingleVM(t *testing.T) {
 				host = "2001:db8::1"
 			}
 			want := "Host alice-container\n" +
+				"    HostName 10.0.3.100\n" +
+				"    Port 22\n" +
+				"    User alice\n" +
+				"    ProxyJump alice-container-jump\n" +
+				"    IdentityFile ~/.ssh/containarium_ed25519\n" +
+				"    IdentitiesOnly yes\n\n" +
+				"Host alice-container-jump\n" +
+				"    HostName " + host + "\n" +
+				"    Port 22\n" +
+				"    User alice\n" +
+				"    IdentityFile ~/.ssh/containarium_ed25519\n" +
+				"    IdentitiesOnly yes\n\n"
+			if !strings.Contains(g.Content, want) || g.Count != 1 {
+				t.Fatalf("missing single-VM ProxyJump config (Count=%d):\n%s", g.Count, g.Content)
+			}
+		})
+	}
+}
+
+func TestSSHConfigSync_RemoteSingleVM(t *testing.T) {
+	resetSSHConfigGlobals(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/containers" {
+			t.Errorf("path = %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"containers":[{"name":"alice-container","username":"alice","state":"CONTAINER_STATE_RUNNING","sshHost":"","network":{"ipAddress":"10.0.3.100"}}]}`))
+	}))
+	defer srv.Close()
+	serverAddr, httpMode = srv.URL, true
+	sshConfigJumpHost = "vm.example.com:2222"
+	sshConfigOutPath = filepath.Join(t.TempDir(), "ssh_config")
+	if err := runSSHConfigSync(sshConfigSyncCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(sshConfigOutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Host alice-container\n", "ProxyJump alice-container-jump\n", "Host alice-container-jump\n", "HostName vm.example.com\n", "Port 2222\n"} {
+		if !strings.Contains(string(content), want) {
+			t.Errorf("synced config missing %q:\n%s", want, content)
+		}
+	}
+	t.Run("OpenSSH resolves both hops", func(t *testing.T) {
+		if _, err := exec.LookPath("ssh"); err != nil {
+			t.Skip("OpenSSH is not installed")
+		}
+		for _, tc := range []struct {
+			name, host, port, proxy string
+		}{

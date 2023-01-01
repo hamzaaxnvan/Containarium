@@ -88,3 +88,48 @@ func (b *BridgeClient) Authorize(ctx context.Context, backend string, in *pb.Aut
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= 0 {
+		return nil, context.DeadlineExceeded
+	}
+	// Put the backend in the path prefix; HTTPAuthorizer appends AuthorizePath.
+	a := &HTTPAuthorizer{Client: b.client, BackendURL: func(string) (string, error) { return "http://sentinel/backend/" + url.PathEscape(backend), nil }, Sign: func(r *http.Request) {
+		if deadline, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(deadline); remaining > 0 {
+				r.Header.Set("X-SSH-Authz-Timeout", remaining.String())
+			}
+		}
+	}}
+	return a.Authorize(ctx, backend, in)
+}
+
+// BridgeHandler is local infrastructure plumbing, never a TCP gateway route.
+// The backend is checked against the current login route before forwarding.
+func BridgeHandler(resolver BackendResolver, authorizer Authorizer) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /route", func(w http.ResponseWriter, r *http.Request) {
+		backend, known, err := resolver.ResolveBackend(r.Context(), r.URL.Query().Get("login"))
+		if err != nil {
+			http.Error(w, "routing unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(route{Backend: backend, Known: known})
+	})
+	// A resolver without a readiness signal is always authoritative.
+	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
+		ready := true
+		if rr, ok := resolver.(RoutingReadiness); ok {
+			ready = rr.RoutingReady(r.Context())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(readiness{Ready: ready})
+	})
+	mux.HandleFunc("POST /backend/{backend}"+AuthorizePath, func(w http.ResponseWriter, r *http.Request) {
+		timeout := DefaultTimeout
+		if header := r.Header.Get("X-SSH-Authz-Timeout"); header != "" {
+			var err error
+			timeout, err = time.ParseDuration(header)
+			if err != nil || timeout <= 0 {
+				http.Error(w, "invalid timeout", http.StatusBadRequest)
+				return
+			}
