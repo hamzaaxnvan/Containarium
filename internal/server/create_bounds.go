@@ -45,26 +45,3 @@ const (
 	// for an unknown one. Catalog IDs are short identifiers.
 	MaxStackIDLength = 64
 
-	// MaxLabels caps the labels map cardinality.
-	MaxLabels = 64
-
-	// MaxLabelKeyLen / MaxLabelValueLen — labels show up in Incus
-	// config, which has its own length limits. 256 chars per
-	// component is comfortably within those.
-	MaxLabelKeyLen   = 256
-	MaxLabelValueLen = 256
-)
-
-// validateStackID rejects an unknown stack ID with InvalidArgument, naming the
-// valid IDs (#2860). Empty means no stack and is valid.
-func validateStackID(id string) error {
-	if err := stacks.GetDefault().CheckStackID(id); err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
-	}
-	return nil
-}
-
-// validateCreateContainerBounds enforces the size caps above on
-// req. Returns nil if every field is within bounds; otherwise a
-// gRPC InvalidArgument status that names the offending field +
-// limit so the caller can fix.

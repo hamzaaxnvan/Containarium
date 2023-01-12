@@ -3,6 +3,3 @@
 3:I[37457,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"default"]
 4:I[97367,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"OutletBoundary"]
 5:"$Sreact.suspense"
-7:I[97367,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"ViewportBoundary"]
-9:I[97367,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"MetadataBoundary"]
-b:I[68027,["/webui/_next/static/chunks/2f236954d6a65e12.js"],"default"]
