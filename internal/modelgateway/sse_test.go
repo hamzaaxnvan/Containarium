@@ -181,3 +181,64 @@ func TestSSE_FilterOn_FullChunkShape(t *testing.T) {
 	}
 	for _, want := range []string{`"object":"chat.completion.chunk"`, `"id":"chatcmpl-xyz"`, `"model":"gemini-flash-latest"`} {
 		if !strings.Contains(out, want) {
+			t.Fatalf("emitted chunk missing %s; out=%q", want, out)
+		}
+	}
+	if u.OutputTokens != 6 {
+		t.Fatalf("usage out = %d, want 6", u.OutputTokens)
+	}
+}
+
+// standardizeToolCalls must inject a position index (LangChain clients merge
+// streamed tool-call deltas by index) and drop Gemini's non-standard
+// extra_content — without this LibreChat aborts the turn ("terminated").
+func TestStandardizeToolCalls(t *testing.T) {
+	in := `{"choices":[{"delta":{"tool_calls":[{"extra_content":{"google":{"thought_signature":"x"}},"function":{"name":"list_containers","arguments":"{}"},"id":"abc","type":"function"}]}}]}`
+	out := standardizeToolCalls(in)
+	if !strings.Contains(out, `"index":0`) {
+		t.Fatalf("index not injected: %s", out)
+	}
+	if strings.Contains(out, "extra_content") || strings.Contains(out, "thought_signature") {
+		t.Fatalf("extra_content not stripped: %s", out)
+	}
+	if !strings.Contains(out, `"name":"list_containers"`) {
+		t.Fatalf("tool call dropped: %s", out)
+	}
+	plain := `{"choices":[{"delta":{"content":"hi"}}]}`
+	if standardizeToolCalls(plain) != plain {
+		t.Fatalf("plain content chunk must be unchanged")
+	}
+}
+
+// The gateway must STOP at finish_reason and emit its own [DONE] promptly rather
+// than waiting for the provider to close the stream — Gemini doesn't reliably
+// close a tool stream and an agent client abandons round-1 the instant it has
+// the tool_call, which otherwise deadlocks the response ("terminated").
+func TestSSE_StopsAtFinish(t *testing.T) {
+	// A TOOL turn: tool_call, then finish, then the provider KEEPS sending
+	// (mimics Gemini not closing the tool stream). The gateway must stop at finish
+	// and emit [DONE]; the trailing content must never leak. Content turns are
+	// covered by the other tests (they drain fully and preserve trailing usage).
+	sse := `data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"list_containers","arguments":"{}"},"id":"a","type":"function"}]},"index":0}]}` + "\n\n" +
+		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}` + "\n\n" +
+		chunk("LEAKED-AFTER-FINISH", "") +
+		"data: [DONE]\n\n"
+	out, u := runFilter(t, sse, "") // filter off → passthrough path
+	if !strings.Contains(out, "list_containers") {
+		t.Fatalf("tool call missing: %q", out)
+	}
+	if strings.Contains(out, "LEAKED-AFTER-FINISH") {
+		t.Fatalf("content after finish was emitted: %q", out)
+	}
+	if !strings.Contains(out, "[DONE]") {
+		t.Fatalf("missing [DONE] terminator")
+	}
+	if u.OutputTokens != 4 {
+		t.Fatalf("usage out=%d want 4 (from the finish chunk)", u.OutputTokens)
+	}
+}
+
+func TestNormalizeNonStreamToolFinish(t *testing.T) {
+	// finish_reason "stop" WITH message.tool_calls → rewritten.
+	withTool := map[string]any{}
+	_ = json.Unmarshal([]byte(`{"choices":[{"finish_reason":"stop","message":{"tool_calls":[{"id":"x"}]}}]}`), &withTool)

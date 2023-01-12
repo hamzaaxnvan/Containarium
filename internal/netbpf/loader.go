@@ -1,0 +1,312 @@
+package netbpf
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
+)
+
+// Map / program / section names — must match SEC(".maps") names and the
+// program section in experimental/ebpf-phaseA/netpolicy.bpf.c.
+const (
+	progNetpolicy       = "netpolicy_ingress"
+	progNetpolicyEgress = "netpolicy_egress"
+	mapVethPolicy       = "veth_policy"
+	mapEgressCIDR       = "egress_cidr"
+	mapIPTenant         = "ip_tenant"
+	mapStats            = "stats"
+	mapEvents           = "events"
+	mapFlows            = "flows"
+	mapDenyCIDR         = "deny_cidr"
+	mapSignatures       = "signatures"
+	mapSigConfig        = "sig_config"
+	mapInboundFlows     = "inbound_flows"
+	mapTrustedIif       = "trusted_iif"
+	statSeen            = uint32(0)
+	statWouldDeny       = uint32(1)
+	statInboundReseed   = uint32(2) // #2618: TCP inbound entry re-created mid-stream (eviction/expiry healed)
+	statsEntryCount     = 3
+)
+
+// Loader owns a loaded netpolicy BPF collection and the per-veth TCX links it
+// has attached. It is the Phase A productionization of cmd/ebpf-phase0: instead
+// of a counter it loads the real policy program, populates the policy maps, and
+// attaches the program to each managed container's host veth in TC_INGRESS.
+//
+// Linux-only at runtime: cilium/ebpf compiles on every platform (so the daemon
+// builds on a dev mac), but Load/Attach return errors on non-Linux kernels.
+type Loader struct {
+	coll        *ebpf.Collection
+	links       map[int]link.Link // ifindex -> TCX ingress link
+	egressLinks map[int]link.Link // ifindex -> TCX egress link (#631 reply accounting)
+	egressMode  bool              // the object's program reads policy_cfg.egress_mode (#2987)
+	// inboundReplies: the object validates a box's source against
+	// policy_cfg.box_ip and recognises replies to inbound flows (#2618).
+	inboundReplies bool
+}
+
+// Resolve loads the netpolicy BPF object from the operator-supplied source. The
+// value comes from CONTAINARIUM_NETWORK_POLICY_BPF_OBJECT and is interpreted as:
+//
+//   - "embedded" / "1" / "true" / "yes" / "on" → the object compiled into this
+//     binary at build time (release binaries bundle it; see `make build-bpf`).
+//   - anything else → a filesystem path to a netpolicy.bpf.o.
+//
+// This lets release builds enable the feature with a single env flag while a
+// custom/locally-built object can still be pointed at by path.
+func Resolve(value string) (*Loader, error) {
+	switch {
+	case IsEmbeddedValue(value):
+		obj := EmbeddedObject()
+		if len(obj) == 0 {
+			return nil, fmt.Errorf("netbpf: no embedded BPF object in this build " +
+				"(release binaries bundle it; for a custom build run `make build-bpf` then " +
+				"build with -tags embed_bpf, or set CONTAINARIUM_NETWORK_POLICY_BPF_OBJECT to a netpolicy.bpf.o path)")
+		}
+		return LoadFromBytes(obj)
+	default:
+		return Load(value)
+	}
+}
+
+// IsEmbeddedValue reports whether a CONTAINARIUM_NETWORK_POLICY_BPF_OBJECT value
+// selects the object compiled into the binary rather than a file path. Resolve
+// and the integrity self-measurement (#3079) share it so they agree on which
+// object is loaded.
+func IsEmbeddedValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "embedded", "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// Load reads the compiled BPF object at objPath and loads the collection. Build
+// the object with:
+//
+//	clang -O2 -g -target bpfel -I/usr/include/$(uname -m)-linux-gnu \
+//	    -c experimental/ebpf-phaseA/netpolicy.bpf.c -o netpolicy.bpf.o
+func Load(objPath string) (*Loader, error) {
+	if _, err := os.Stat(objPath); err != nil {
+		return nil, fmt.Errorf("netbpf: BPF object %q: %w", objPath, err)
+	}
+	spec, err := ebpf.LoadCollectionSpec(objPath)
+	if err != nil {
+		return nil, fmt.Errorf("netbpf: load spec: %w", err)
+	}
+	return newLoaderFromSpec(spec)
+}
+
+// LoadFromBytes loads the collection from an in-memory BPF object — used for the
+// object embedded into the binary (Resolve "embedded"). Same verification as
+// Load.
+func LoadFromBytes(obj []byte) (*Loader, error) {
+	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(obj))
+	if err != nil {
+		return nil, fmt.Errorf("netbpf: load spec from embedded object: %w", err)
+	}
+	return newLoaderFromSpec(spec)
+}
+
+// newLoaderFromSpec instantiates the collection from a parsed spec and verifies
+// the expected program + maps are present. Shared by Load and LoadFromBytes.
+func newLoaderFromSpec(spec *ebpf.CollectionSpec) (*Loader, error) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return nil, fmt.Errorf("netbpf: RemoveMemlock: %w", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return nil, fmt.Errorf("netbpf: load collection: %w", err)
+	}
+	for _, name := range []string{mapVethPolicy, mapEgressCIDR, mapIPTenant, mapStats, mapEvents} {
+		if coll.Maps[name] == nil {
+			coll.Close()
+			return nil, fmt.Errorf("netbpf: BPF object missing map %q (rebuild netpolicy.bpf.o?)", name)
+		}
+	}
+	if coll.Programs[progNetpolicy] == nil {
+		coll.Close()
+		return nil, fmt.Errorf("netbpf: BPF object missing program %q", progNetpolicy)
+	}
+	// progNetpolicyEgress is OPTIONAL: an object built before #631 lacks it, and
+	// the loader still works (reply-byte accounting just stays off). AttachVethEgress
+	// no-ops when it's absent.
+	return &Loader{
+		coll:           coll,
+		links:          make(map[int]link.Link),
+		egressLinks:    make(map[int]link.Link),
+		egressMode:     specSupportsEgressMode(spec),
+		inboundReplies: specSupportsInboundReplies(spec),
+	}, nil
+}
+
+// vethPolicyEgressModeField is the `struct policy_cfg` member an object must
+// declare for its program to read the egress-mode byte (#2974).
+const vethPolicyEgressModeField = "egress_mode"
+
+// vethPolicyBoxIPField and vethPolicyFlagsField are the `struct policy_cfg`
+// members an object declares when its program validates the box's source
+// address, marks frames and tracks inbound flows (#2618); appended after
+// egress_mode, in this order.
+const (
+	vethPolicyBoxIPField = "box_ip"
+	vethPolicyFlagsField = "flags"
+)
+
+// specVethPolicyHasMember reports whether the object's `struct policy_cfg`
+// declares the named member, i.e. whether its program was built to read it
+// (#2987). A member that was padding or absent in an older source is simply
+// ignored by that object's program, which loads fine. Detected from the
+// object's own BTF (clang -g, which `make build-bpf` and every BTF-defined map
+// require): no BTF, no map, or a non-struct value proves nothing, so it is
+// reported as unsupported.
+func specVethPolicyHasMember(spec *ebpf.CollectionSpec, name string) bool {
+	ms := spec.Maps[mapVethPolicy]
+	if ms == nil || ms.Value == nil {
+		return false
+	}
+	st, ok := btf.UnderlyingType(ms.Value).(*btf.Struct)
+	if !ok {
+		return false
+	}
+	for _, m := range st.Members {
+		if m.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// specSupportsEgressMode reports whether the object's program reads the
+// egress_mode byte of `struct policy_cfg` (#2987); see specVethPolicyHasMember.
+func specSupportsEgressMode(spec *ebpf.CollectionSpec) bool {
+	return specVethPolicyHasMember(spec, vethPolicyEgressModeField)
+}
+
+// specSupportsInboundReplies reports whether the object validates the box's
+// source, marks frames and tracks inbound flows (#2618): its policy_cfg declares
+// box_ip and flags AND it carries the inbound_flows and trusted_iif maps.
+// Anything less proves nothing.
+func specSupportsInboundReplies(spec *ebpf.CollectionSpec) bool {
+	return specVethPolicyHasMember(spec, vethPolicyBoxIPField) &&
+		specVethPolicyHasMember(spec, vethPolicyFlagsField) &&
+		spec.Maps[mapInboundFlows] != nil &&
+		spec.Maps[mapTrustedIif] != nil
+}
+
+// SupportsEgressMode reports whether the loaded object applies the egress_mode
+// byte to the egress allow-list (#2987). When false, the program applies `mode`
+// to every check, whatever egress_mode the daemon writes.
+func (l *Loader) SupportsEgressMode() bool { return l.egressMode }
+
+// SupportsInboundReplies reports whether the loaded object validates a box's
+// source address against policy_cfg.box_ip and lets the box answer flows that
+// peers open toward it (#2618). When false (an object built before it), the
+// program judges every packet the box sends as a new outbound flow, so a box
+// with an enforce policy cannot answer inbound connections, and BoxIP is
+// written to no effect.
+func (l *Loader) SupportsInboundReplies() bool { return l.inboundReplies }
+
+// hasEgressProgram reports whether the loaded object carries the reply-accounting
+// egress program (#631).
+func (l *Loader) hasEgressProgram() bool { return l.coll.Programs[progNetpolicyEgress] != nil }
+
+// AttachVeth attaches the policy program to a container's host veth in
+// TC_INGRESS via TCX (kernel ≥ 6.6). Idempotent per ifindex.
+func (l *Loader) AttachVeth(ifindex int) error {
+	if _, ok := l.links[ifindex]; ok {
+		return nil
+	}
+	lnk, err := link.AttachTCX(link.TCXOptions{
+		Interface: ifindex,
+		Program:   l.coll.Programs[progNetpolicy],
+		Attach:    ebpf.AttachTCXIngress,
+	})
+	if err != nil {
+		return fmt.Errorf("netbpf: attach TCX ingress on ifindex %d: %w", ifindex, err)
+	}
+	l.links[ifindex] = lnk
+	return nil
+}
+
+// AttachVethEgress attaches the reply-accounting program to a container's host
+// veth in TC_EGRESS via TCX (#631), so the container's receive-direction bytes
+// are tallied. Idempotent per ifindex. No-ops when the loaded object predates
+// #631 (no egress program) — reply bytes then stay 0 rather than failing.
+func (l *Loader) AttachVethEgress(ifindex int) error {
+	if !l.hasEgressProgram() {
+		return nil
+	}
+	if _, ok := l.egressLinks[ifindex]; ok {
+		return nil
+	}
+	lnk, err := link.AttachTCX(link.TCXOptions{
+		Interface: ifindex,
+		Program:   l.coll.Programs[progNetpolicyEgress],
+		Attach:    ebpf.AttachTCXEgress,
+	})
+	if err != nil {
+		return fmt.Errorf("netbpf: attach TCX egress on ifindex %d: %w", ifindex, err)
+	}
+	l.egressLinks[ifindex] = lnk
+	return nil
+}
+
+// DetachVeth removes both programs from a veth (e.g. on container stop/delete).
+func (l *Loader) DetachVeth(ifindex int) error {
+	var errs []error
+	if lnk, ok := l.links[ifindex]; ok {
+		delete(l.links, ifindex)
+		if err := lnk.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if lnk, ok := l.egressLinks[ifindex]; ok {
+		delete(l.egressLinks, ifindex)
+		if err := lnk.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// SetVethPolicy writes the per-veth policy config into the veth_policy map,
+// keyed by the veth's host ifindex.
+func (l *Loader) SetVethPolicy(ifindex int, cfg PolicyConfig) error {
+	key := uint32(ifindex) // #nosec G115 -- ifindex is a small positive int
+	m := l.coll.Maps[mapVethPolicy]
+	// The value must be exactly the map's size: an object built before #2618
+	// has an 8-byte policy_cfg (no box_ip) and still loads.
+	val := fitVethPolicyValue(vethPolicyValue(cfg), int(m.ValueSize()))
+	if err := m.Update(&key, val, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("netbpf: update veth_policy[%d]: %w", ifindex, err)
+	}
+	return nil
+}
+
+// AddEgress installs one egress allow-list LPM entry.
+func (l *Loader) AddEgress(e EgressEntry) error {
+	key := egressKeyBytes(e)
+	one := uint8(1)
+	if err := l.coll.Maps[mapEgressCIDR].Update(key[:], &one, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("netbpf: update egress_cidr: %w", err)
+	}
+	return nil
+}
+
+// DeleteEgress removes an egress allow-list LPM entry. Used by the reconcile
+// loop to converge the map when a CIDR is removed from a policy — a stale allow
+// entry is a security hole once a tenant is in enforce mode. A missing key is
+// not an error (the desired state is already reached).
+func (l *Loader) DeleteEgress(e EgressEntry) error {
+	key := egressKeyBytes(e)
+	if err := l.coll.Maps[mapEgressCIDR].Delete(key[:]); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
