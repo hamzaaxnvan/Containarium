@@ -50,3 +50,29 @@ func newUserspaceForwarder(emitProxyV2 bool) *userspaceForwarder {
 // accepted connection dials backend:port (the same port — this is a
 // dumb port-for-port forwarder, not a port-remapping proxy), and if
 // emitProxy is true, prepends a PROXY v2 frame before the first byte
+// of payload. Repeat calls to start() append to the listener set; the
+// caller is responsible for calling stop() in between if reconfiguring.
+//
+// Returns an error if any port fails to bind — but it does NOT roll
+// back successfully-bound listeners on partial failure. The caller
+// should treat partial-success as an error and stop() everything.
+func (f *userspaceForwarder) start(backendIP string, ports []int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for _, port := range ports {
+		listenAddr := fmt.Sprintf(":%d", port)
+		ln, err := net.Listen("tcp", listenAddr)
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", listenAddr, err)
+		}
+		target := fmt.Sprintf("%s:%d", backendIP, port)
+		f.listeners = append(f.listeners, ln)
+		go f.serve(ln, target)
+		log.Printf("[sentinel] userspace forwarder listening on %s -> %s (proxy_v2=%v)",
+			listenAddr, target, f.emitProxy)
+	}
+	return nil
+}
+
+// stop closes every listener owned by this forwarder. In-flight

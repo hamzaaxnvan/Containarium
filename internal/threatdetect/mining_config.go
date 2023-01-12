@@ -47,3 +47,52 @@ type MiningThresholds struct {
 func DefaultMiningThresholds() MiningThresholds {
 	return MiningThresholds{
 		MinCores:           DefaultMiningMinCores,
+		MinFractionOfLimit: DefaultMiningMinFractionOfLimit,
+		Window:             DefaultMiningWindow,
+		FlowMinAge:         DefaultMiningFlowMinAge,
+		StratumPorts:       slices.Clone(DefaultMiningStratumPorts),
+	}
+}
+
+// MiningThresholdsFromProto resolves a stored message: every zero or empty
+// field falls back to its default, so a partial message tunes only what it
+// sets. nil yields the defaults.
+func MiningThresholdsFromProto(m *pb.MiningBehaviorThresholds) MiningThresholds {
+	t := DefaultMiningThresholds()
+	if v := m.GetMinCores(); v > 0 {
+		t.MinCores = v
+	}
+	if v := m.GetMinFractionOfLimit(); v > 0 {
+		t.MinFractionOfLimit = v
+	}
+	if d := m.GetWindow().AsDuration(); m.GetWindow() != nil && d > 0 {
+		t.Window = d
+	}
+	if d := m.GetFlowMinAge().AsDuration(); m.GetFlowMinAge() != nil && d > 0 {
+		t.FlowMinAge = d
+	}
+	if ports := m.GetStratumPorts(); len(ports) > 0 {
+		t.StratumPorts = slices.Clone(ports)
+	}
+	return t
+}
+
+// Bar is the mean-cores level a box must reach: min(MinCores,
+// MinFractionOfLimit x limitCores), or MinCores alone when the box has no
+// CPU limit (limitCores <= 0).
+func (t MiningThresholds) Bar(limitCores float64) float64 {
+	if limitCores <= 0 {
+		return t.MinCores
+	}
+	return min(t.MinCores, t.MinFractionOfLimit*limitCores)
+}
+
+func (t MiningThresholds) isStratumPort(port uint16) bool {
+	return slices.Contains(t.StratumPorts, uint32(port))
+}
+
+// ConfigKV is the slice of app.DaemonConfigStore the thresholds config uses.
+type ConfigKV interface {
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key, value string) error
+}
