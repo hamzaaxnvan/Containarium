@@ -91,3 +91,49 @@ func TestPprofRequiresAdminSecret(t *testing.T) {
 // TestPprofHeapIsReadableByGoToolPprof is the acceptance criterion for #1352:
 // not "bytes came back" but "the bytes are a profile go tool pprof can open,
 // with the sample type you need to find a leak".
+func TestPprofHeapIsReadableByGoToolPprof(t *testing.T) {
+	srv := newPprofTestServer(t)
+
+	code, body := getPprof(t, srv, "/debug/pprof/heap", testPprofAdminSecret)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+
+	// A pprof profile on the wire is gzipped protobuf; go tool pprof rejects
+	// anything else. Decompressing here proves the framing without taking a
+	// dependency on github.com/google/pprof (which drags a readline terminal
+	// library into the module graph for a parse we can do structurally).
+	raw := gunzipOrFail(t, body)
+
+	// Sample-type names live in the profile's string table as plain UTF-8, so
+	// they are assertable on the decompressed bytes. inuse_space is what
+	// answers "what is holding 480 MB right now" — the actual question in
+	// #1349, and the one sample type this endpoint exists to deliver.
+	for _, want := range []string{"inuse_space", "inuse_objects", "space", "bytes"} {
+		if !bytes.Contains(raw, []byte(want)) {
+			t.Errorf("heap profile string table has no %q — not a usable heap profile", want)
+		}
+	}
+	if len(raw) < 128 {
+		t.Fatalf("heap profile is %d bytes decompressed — too small to contain samples", len(raw))
+	}
+}
+
+// gunzipOrFail decompresses a pprof response body, failing the test with the
+// leading bytes when it is not a valid gzip stream.
+func gunzipOrFail(t *testing.T, body []byte) []byte {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("response is not gzipped protobuf, so go tool pprof cannot read it: %v (first 32 bytes: %q)",
+			err, truncBytes(body, 32))
+	}
+	defer func() { _ = zr.Close() }()
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("truncated/corrupt gzip stream: %v", err)
+	}
+	return raw
+}
+
+func TestPprofGoroutineProfileAndDebugTextMode(t *testing.T) {
