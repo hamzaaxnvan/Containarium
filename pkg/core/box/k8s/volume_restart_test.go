@@ -36,3 +36,41 @@ func volumeRestartClient(t *testing.T, sb *sandboxv1beta1.Sandbox) *sandboxfake.
 func TestVolumeRestartWaitsForCurrentSuspension(t *testing.T) {
 	sb := volumeRestartSandbox()
 	b, _, _ := testBackend()
+	sc := volumeRestartClient(t, sb)
+	b.sandboxes = sc
+	observations := 0
+	resumed := false
+	sc.PrependReactor("get", "sandboxes", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		current, err := sc.Tracker().Get(sandboxv1beta1.SchemeGroupVersion.WithResource("sandboxes"), sb.Namespace, sb.Name)
+		if err != nil {
+			return true, nil, err
+		}
+		got := current.(*sandboxv1beta1.Sandbox).DeepCopy()
+		if got.Spec.OperatingMode != sandboxv1beta1.SandboxOperatingModeSuspended {
+			t.Error("polled before requesting suspension")
+		}
+		observations++
+		condition := metav1.Condition{Type: string(sandboxv1beta1.SandboxConditionSuspended), Status: metav1.ConditionTrue, ObservedGeneration: got.Generation}
+		switch observations {
+		case 1:
+			condition.ObservedGeneration-- // A stale True must not resume the box.
+		case 2:
+			condition.Status = metav1.ConditionFalse // Pod is still terminating.
+		}
+		got.Status.Conditions = []metav1.Condition{condition}
+		return true, got, nil
+	})
+	sc.PrependReactor("patch", "sandboxes", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		var patch struct {
+			Spec struct {
+				OperatingMode sandboxv1beta1.SandboxOperatingMode `json:"operatingMode"`
+			} `json:"spec"`
+		}
+		if err := json.Unmarshal(action.(clienttesting.PatchAction).GetPatch(), &patch); err != nil {
+			t.Fatal(err)
+		}
+		if patch.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning {
+			resumed = true
+			if observations < 3 {
+				t.Error("resumed before the current suspension was observed")
+			}
