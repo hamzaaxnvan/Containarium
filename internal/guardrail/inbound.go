@@ -47,3 +47,52 @@ var inboundReasonNames = map[InboundReason]string{
 	InboundReasonEngineError:       "engine_error",
 	InboundReasonOverLimit:         "over_limit",
 	InboundReasonPolicyUnavailable: "policy_unavailable",
+}
+
+// String is the stable name used in logs, counters and audit details.
+func (r InboundReason) String() string {
+	if s, ok := inboundReasonNames[r]; ok {
+		return s
+	}
+	return "unknown"
+}
+
+// InboundDecision is the typed block decision for one model response.
+//
+// It carries counts and kinds only. No field can hold the flagged span or
+// any response text (TestInboundDecision_NoTextBearingField enforces this
+// by reflection); EngineID is the engine's own identifier.
+type InboundDecision struct {
+	Blocked  bool
+	Kinds    []pb.GuardrailKind // kinds with at least one finding, sorted
+	Findings int
+	Gaps     int
+	EngineID string
+	Reason   InboundReason
+}
+
+// DecideInbound turns one engine Scan result into a decision under policy.
+//
+// Every failure mode blocks: an engine error (including FAILED_PRECONDITION
+// for an unsupported kind, and a nil response), a coverage gap, or a
+// finding of a kind whose rule is BLOCK. Findings of a kind without a BLOCK
+// rule are counted but do not block. When several apply, the reason is the
+// first of EngineError, Finding, CoverageGap; the counts record the rest.
+func DecideInbound(resp *pb.GuardrailScanResponse, scanErr error, policy *pb.GuardrailPolicy) InboundDecision {
+	if scanErr != nil || resp == nil {
+		return InboundBlocked(InboundReasonEngineError)
+	}
+	blocking := map[pb.GuardrailKind]bool{}
+	for _, r := range policy.GetRules() {
+		if r.GetAction() == pb.GuardrailAction_GUARDRAIL_ACTION_BLOCK {
+			blocking[r.GetKind()] = true
+		}
+	}
+	d := InboundDecision{
+		EngineID: resp.GetEngineId(),
+		Findings: len(resp.GetFindings()),
+		Gaps:     len(resp.GetGaps()),
+	}
+	perKind := map[pb.GuardrailKind]int64{}
+	hit := false
+	for _, f := range resp.GetFindings() {
