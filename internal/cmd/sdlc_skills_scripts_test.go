@@ -159,3 +159,165 @@ func publish(t *testing.T, files map[string]string) string {
 	repo, sha := fixtureRepo(t, files)
 	lock := writeLock(t, repo, sha, "")
 	out := t.TempDir()
+	if o, ok := run(t, "", buildEnv(repo, lock), "bash", buildSDLCSkillsScript, "--update-lock", out); !ok {
+		t.Fatalf("build failed: %s", o)
+	}
+	return out
+}
+
+func install(t *testing.T, base, skillsDir string, extra ...string) (string, bool) {
+	t.Helper()
+	return run(t, "", append([]string{"ARTIFACT_BASE_URL=file://" + base, "SKILLS_DIR=" + skillsDir, "RELEASE=v9.9.9"}, extra...),
+		"bash", installSDLCSkillsScript)
+}
+
+func exists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+func TestInstallSDLCSkills_InstallsAndLeavesTheUsersOwnSkillsAlone(t *testing.T) {
+	needTools(t)
+	base := publish(t, defaultSkills)
+	dir := filepath.Join(t.TempDir(), "skills")
+	write(t, filepath.Join(dir, "my-own-skill", "SKILL.md"), "mine\n")
+
+	if o, ok := install(t, base, dir); !ok {
+		t.Fatalf("install failed: %s", o)
+	}
+	for _, p := range []string{"architect-design/SKILL.md", "qa-unit-test/SKILL.md", "_shared/tracker.md", ".sdlc-skills-manifest", ".sdlc-skills-version", "my-own-skill/SKILL.md"} {
+		if !exists(filepath.Join(dir, p)) {
+			t.Errorf("%s missing after install", p)
+		}
+	}
+	v, _ := os.ReadFile(filepath.Join(dir, ".sdlc-skills-version")) //nolint:gosec // test temp dir
+	if !strings.Contains(string(v), "release=v9.9.9") {
+		t.Errorf("version record = %q, want the release recorded", v)
+	}
+}
+
+func TestInstallSDLCSkills_UpdateRemovesOnlyWhatItOwned(t *testing.T) {
+	needTools(t)
+	dir := filepath.Join(t.TempDir(), "skills")
+	write(t, filepath.Join(dir, "my-own-skill", "SKILL.md"), "mine\n")
+
+	if o, ok := install(t, publish(t, defaultSkills), dir); !ok {
+		t.Fatalf("first install: %s", o)
+	}
+	// Second release drops qa/unit-test.
+	next := map[string]string{"architect/design.md": "# design v2\n", "_shared/tracker.md": "# shared\n"}
+	if o, ok := install(t, publish(t, next), dir); !ok {
+		t.Fatalf("second install: %s", o)
+	}
+	if exists(filepath.Join(dir, "qa-unit-test")) {
+		t.Error("a skill removed from the pinned set was left behind")
+	}
+	if !exists(filepath.Join(dir, "my-own-skill", "SKILL.md")) {
+		t.Error("the user's own skill was removed by an update")
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "architect-design", "SKILL.md")) //nolint:gosec // test temp dir
+	if !strings.Contains(string(b), "v2") {
+		t.Errorf("architect-design not updated: %q", b)
+	}
+}
+
+func TestInstallSDLCSkills_HashMismatchInstallsNothing(t *testing.T) {
+	needTools(t)
+	base := publish(t, defaultSkills)
+	write(t, filepath.Join(base, "sdlc-skills.tar.gz.sha256"), strings.Repeat("0", 64)+"  sdlc-skills.tar.gz\n")
+	dir := filepath.Join(t.TempDir(), "skills")
+
+	out, ok := install(t, base, dir)
+	if ok {
+		t.Fatalf("install succeeded on a hash mismatch:\n%s", out)
+	}
+	if !strings.Contains(out, "sha256 mismatch") {
+		t.Errorf("output %q does not say why", out)
+	}
+	if exists(filepath.Join(dir, "architect-design")) {
+		t.Error("skills were installed despite the mismatch")
+	}
+}
+
+// A hostile archive (path traversal) with a MATCHING hash is still refused.
+func TestInstallSDLCSkills_RejectsPathTraversal(t *testing.T) {
+	needTools(t)
+	base := t.TempDir()
+	evil := filepath.Join(base, "sdlc-skills.tar.gz")
+	// A valid skill alongside the traversal entry: without the installer's own
+	// path check, a lenient tar would strip the "../" and the install would
+	// succeed, so this must fail on the guard's message, not on tar's behaviour.
+	py := "import tarfile,io,sys\nt=tarfile.open(sys.argv[1],'w:gz')\nfor n in ('good-skill/SKILL.md','../escaped.txt'):\n i=tarfile.TarInfo(n);d=b'x';i.size=len(d);t.addfile(i,io.BytesIO(d))\nt.close()\n"
+	if o, ok := run(t, "", nil, "python3", "-I", "-c", py, evil); !ok {
+		t.Fatalf("craft archive: %s", o)
+	}
+	sum, ok := run(t, "", nil, "bash", "-c", "(sha256sum '"+evil+"' 2>/dev/null || shasum -a 256 '"+evil+"') | cut -d' ' -f1")
+	if !ok {
+		t.Fatalf("sha256: %s", sum)
+	}
+	write(t, evil+".sha256", strings.TrimSpace(sum)+"  sdlc-skills.tar.gz\n")
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "skills")
+
+	out, ok := install(t, base, dir)
+	if ok {
+		t.Fatalf("install accepted a traversal archive:\n%s", out)
+	}
+	if !strings.Contains(out, "unsafe path in archive") {
+		t.Errorf("rejected, but not by the installer's path check: %q", out)
+	}
+	if exists(filepath.Join(parent, "escaped.txt")) {
+		t.Error("a file escaped the skills directory")
+	}
+	if exists(filepath.Join(dir, "good-skill")) {
+		t.Error("part of a rejected archive was installed")
+	}
+}
+
+func TestInstallSDLCSkills_OverlayWins(t *testing.T) {
+	needTools(t)
+	base := publish(t, defaultSkills)
+	dir := filepath.Join(t.TempDir(), "skills")
+	overlay := t.TempDir()
+	write(t, filepath.Join(overlay, "architect-design", "SKILL.md"), "# team override\n")
+
+	if o, ok := install(t, base, dir, "SDLC_SKILLS_OVERLAY_DIR="+overlay); !ok {
+		t.Fatalf("install: %s", o)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "architect-design", "SKILL.md")) //nolint:gosec // test temp dir
+	if string(b) != "# team override\n" {
+		t.Errorf("architect-design = %q, want the overlay's copy", b)
+	}
+	if !exists(filepath.Join(dir, "qa-unit-test", "SKILL.md")) {
+		t.Error("public skills not overridden by the overlay were lost")
+	}
+}
+
+// --- skill sets (#3048) -----------------------------------------------------
+
+var setSkills = map[string]string{
+	"architect/design.md": "# design\n",
+	"engineer/build.md":   "# build\n",
+	"qa/unit-test.md":     "# unit\n",
+	"qa/e2e.md":           "# e2e\n",
+	"_shared/tracker.md":  "# shared tracker\n",
+}
+
+const setLines = "set.sdlc=architect,engineer\nset.qa=qa\n"
+
+// publishSets builds a bundle whose lock defines the sets sdlc (architect,
+// engineer) and qa (qa), and returns the asset base and the built lock.
+func publishSets(t *testing.T, files map[string]string, sets string) (base, lock string) {
+	t.Helper()
+	repo, sha := fixtureRepo(t, files)
+	lock = filepath.Join(t.TempDir(), "sdlc-skills.lock")
+	write(t, lock, sets+"[sdlc]\nrepo=example/skills\nref="+sha+"\nsha256=\n")
+	base = t.TempDir()
+	if o, ok := run(t, "", buildEnv(repo, lock), "bash", buildSDLCSkillsScript, "--update-lock", base); !ok {
+		t.Fatalf("build failed: %s", o)
+	}
+	return base, lock
+}
+
+func multiSourceLock(t *testing.T, firstRef, secondRef string) string {
+	t.Helper()
+	lock := filepath.Join(t.TempDir(), "sdlc-skills.lock")
+	write(t, lock, "set.sdlc=architect\nset.qa=qa\n"+
+		"[sdlc]\nrepo=example/sdlc\nref="+firstRef+"\nsha256=\n"+
