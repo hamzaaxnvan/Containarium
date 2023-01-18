@@ -75,3 +75,80 @@ func (c CompiledPolicy) EffectiveEgressMode() pb.NetworkPolicyMode {
 // CIDR is matched first; Port/Proto (0 = any) further scope the block to a
 // single service. A host IP is carried as a /32.
 type DenyRule struct {
+	CIDR      netip.Prefix
+	Port      uint16    // 0 = any port
+	Proto     uint8     // IP protocol number (0 = any; 6 = tcp, 17 = udp)
+	Note      string    // operator note, typically a CVE id
+	ExpiresAt time.Time // zero = no expiry
+}
+
+// Expired reports whether the rule's expiry has passed relative to now. A
+// zero ExpiresAt never expires.
+func (d DenyRule) Expired(now time.Time) bool {
+	return !d.ExpiresAt.IsZero() && now.After(d.ExpiresAt)
+}
+
+// Validate reports whether a NetworkPolicy is well-formed without compiling it.
+// Compile performs the same checks, so callers that only need the compiled
+// result can skip Validate.
+func Validate(p *pb.NetworkPolicy) error {
+	_, err := Compile(p)
+	return err
+}
+
+// Compile validates and normalizes a NetworkPolicy.
+func Compile(p *pb.NetworkPolicy) (CompiledPolicy, error) {
+	if p == nil {
+		return CompiledPolicy{}, fmt.Errorf("network policy is nil")
+	}
+	tenant := strings.TrimSpace(p.GetTenant())
+	if tenant == "" {
+		return CompiledPolicy{}, fmt.Errorf("network policy: tenant is required")
+	}
+
+	cidrs, err := compileCIDRs(p.GetEgressCidrs())
+	if err != nil {
+		return CompiledPolicy{}, err
+	}
+	domains, err := compileDomains(p.GetEgressDomains())
+	if err != nil {
+		return CompiledPolicy{}, err
+	}
+	deny, err := compileDenyRules(p.GetDenyRules())
+	if err != nil {
+		return CompiledPolicy{}, err
+	}
+	allowFrom, err := compileAllowFromTenants(tenant, p.GetAllowFromTenants())
+	if err != nil {
+		return CompiledPolicy{}, err
+	}
+
+	// Unspecified defaults to log-only in Phase A; reject unknown enum values.
+	mode := p.GetMode()
+	switch mode {
+	case pb.NetworkPolicyMode_NETWORK_POLICY_MODE_UNSPECIFIED:
+		mode = pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY
+	case pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY,
+		pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE:
+		// ok
+	default:
+		return CompiledPolicy{}, fmt.Errorf("network policy: unknown mode %d", int32(mode))
+	}
+
+	// egress_mode: UNSPECIFIED is kept (it means "follow mode"); unknown values
+	// are rejected like an unknown mode.
+	switch p.GetEgressMode() {
+	case pb.NetworkPolicyMode_NETWORK_POLICY_MODE_UNSPECIFIED,
+		pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY,
+		pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE:
+	default:
+		return CompiledPolicy{}, fmt.Errorf("network policy: unknown egress mode %d", int32(p.GetEgressMode()))
+	}
+
+	switch p.GetEgressPreset() {
+	case pb.EgressPreset_EGRESS_PRESET_UNSPECIFIED, pb.EgressPreset_EGRESS_PRESET_ALLOW_LIST_ONLY:
+	default:
+		return CompiledPolicy{}, fmt.Errorf("network policy: unknown egress preset %d", int32(p.GetEgressPreset()))
+	}
+
+	return CompiledPolicy{
