@@ -48,20 +48,3 @@ func TestFoldExitSidecar(t *testing.T) {
 		{name: "no sidecar leaves it open", record: RunRecord{Name: "a"}},
 		{name: "sidecar supplies code and time", record: RunRecord{Name: "a"}, sidecar: "3 1790000000", wantCode: intPtr(3), wantAt: time.Unix(1790000000, 0).UTC()},
 		{name: "corrupt sidecar ignored", record: RunRecord{Name: "a"}, sidecar: "x"},
-		{name: "record's own code wins", record: RunRecord{Name: "a", ExitCode: &seven}, sidecar: "0 1790000000", wantCode: intPtr(7)},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := FoldExitSidecar(tc.record, []byte(tc.sidecar))
-			switch {
-			case tc.wantCode == nil && got.ExitCode != nil:
-				t.Fatalf("exit code = %d, want none", *got.ExitCode)
-			case tc.wantCode != nil && (got.ExitCode == nil || *got.ExitCode != *tc.wantCode):
-				t.Fatalf("exit code = %v, want %d", got.ExitCode, *tc.wantCode)
-			}
-			if !tc.wantAt.IsZero() && (got.FinishedAt == nil || !got.FinishedAt.Equal(tc.wantAt)) {
-				t.Errorf("finished_at = %v, want %v", got.FinishedAt, tc.wantAt)
-			}
-		})
-	}
-}

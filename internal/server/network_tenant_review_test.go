@@ -15,3 +15,37 @@ func TestTenantReviewLegacyCreateIgnoresUnavailableTenantDependencies(t *testing
 	req := &pb.CreateContainerRequest{Username: "workload", DryRun: true}
 	out, err := s.CreateContainer(nativeUser(), req)
 	if err != nil || !out.GetDryRun() || calls != 0 || req.NetworkTenant != "" {
+		t.Fatalf("out=%v err=%v readinessCalls=%d requestTenant=%q", out, err, calls, req.NetworkTenant)
+	}
+}
+func TestTenantReviewAccountNamespaceMustNotJoinSharedDomain(t *testing.T) {
+	req := &pb.CreateContainerRequest{Username: "team-a"}
+	if err := authorizeNetworkTenantCreate(nativeUser(), req, true, true); err != nil {
+		t.Fatal(err)
+	}
+	actual := incus.ResolveTenant(req.NetworkTenant, "", "team-a-container")
+	shared := incus.ResolveTenant("team-a", "", "admin-box-container")
+	if actual == shared {
+		t.Fatalf("account %q and admin shared tenant resolve to same Guard domain %q", req.NetworkTenant, actual)
+	}
+}
+func TestTenantReviewLocalPlacementMustRemainSupported(t *testing.T) {
+	s := &ContainerServer{peerPool: NewPeerPool("local-fixture", "", nil, "local-pool")}
+	for _, req := range []*pb.CreateContainerRequest{{Username: "workload", BackendId: "local-fixture"}, {Username: "workload", BackendId: "local-fixture", Pool: "local-pool"}} {
+		if req.Pool != "" {
+			if err := s.resolvePoolPlacement(req); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if s.createTargetsPeer(req) {
+			t.Fatal("fixture unexpectedly targets peer")
+		}
+		if err := authorizeNetworkTenantCreate(nativeUser(), req, true, true); err != nil {
+			t.Errorf("resolved local placement refused: %v", err)
+		}
+	}
+}
+func TestTenantReviewGuardCapabilityIndependentOfOtherBox(t *testing.T) {
+	g := &pb.GuardStatus{Mode: pb.GuardMode_GUARD_MODE_ENFORCE, FirewallDriver: "nftables", LastPass: time.Now().UTC().Format(time.RFC3339), Entries: []*pb.GuardEntry{{Attached: false}}}
+	if !nativeTenantGuardCapable(g, time.Now()) {
+		t.Fatal("supported fresh Guard capability rejected solely for another unattached box")
