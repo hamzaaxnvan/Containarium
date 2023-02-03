@@ -24,3 +24,29 @@ func TestMigrate_RefusedWithoutKMS(t *testing.T) {
 	if !errors.Is(err, ErrMigrateNoKMS) {
 		t.Fatalf("got %v want ErrMigrateNoKMS", err)
 	}
+}
+
+// TestMigrate_SingleRowRoundtripVerify mirrors the inner
+// loop of migrateOne (decrypt legacy → encrypt envelope
+// → verify) without touching SQL.
+func TestMigrate_SingleRowRoundtripVerify(t *testing.T) {
+	cipher := newCipher(t)
+	kms := newKMS(t)
+	s := &Store{cipher: cipher, kms: kms}
+
+	// Build a legacy-shaped row.
+	const username, name = "alice", "FOO"
+	plaintext := []byte("the-actual-secret")
+	legacyNonce, legacyCT, err := cipher.Encrypt(username, name, plaintext)
+	if err != nil {
+		t.Fatalf("legacy encrypt: %v", err)
+	}
+
+	// Decrypt under master key (the migrator's first step).
+	got, err := s.cipher.Decrypt(username, name, legacyNonce, legacyCT)
+	if err != nil {
+		t.Fatalf("legacy decrypt: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatal("legacy roundtrip broken")
+	}
