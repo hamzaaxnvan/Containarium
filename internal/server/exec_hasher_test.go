@@ -45,3 +45,50 @@ func TestExecHasher_PinsPIDBeforeHashing(t *testing.T) {
 	const pid = 4242
 	tests := []struct {
 		name      string
+		start     threatdetect.ProcStartTicks // the exec event's
+		noStat    bool
+		wantSum   bool
+		wantMoved uint64
+	}{
+		{name: "stamped in the tick it started", start: fakeStart(pid), wantSum: true},
+		{name: "stamped later than it started", start: fakeStart(pid) + 9, wantSum: true},
+		{name: "within the one-tick slack", start: fakeStart(pid) - 1, wantSum: true},
+		{name: "pid now held by a process started after the stamp", start: fakeStart(pid) - 2, wantMoved: 1},
+		{name: "pid now held by a much newer process", start: fakeStart(pid) - 900, wantMoved: 1},
+		{name: "no stamp cannot be pinned", start: 0, wantMoved: 1},
+		{name: "stat gone", start: fakeStart(pid), noStat: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			hasherProc(t, root, pid, "miner", fakeStart(pid))
+			if tt.noStat {
+				if err := os.Remove(filepath.Join(root, strconv.Itoa(pid), "stat")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h, got := newTestHasher(root)
+			h.process(threatdetect.ExecEvent{PID: pid, StartTime: tt.start, Container: "box-a"})
+			if tt.wantSum {
+				if len(*got) != 1 || (*got)[0].SHA256 != sha256Hex("miner") || (*got)[0].Container != "box-a" {
+					t.Fatalf("redelivered %+v, want one event with the binary's hash", *got)
+				}
+			} else if len(*got) != 0 {
+				t.Fatalf("redelivered %+v for a process that is not the exec's", *got)
+			}
+			if m := h.pidMoved.Load(); m != tt.wantMoved {
+				t.Fatalf("pidMoved = %d, want %d", m, tt.wantMoved)
+			}
+		})
+	}
+}
+
+// TestExecHasher_ComparesStartTimeAfterOpen: the order is what makes the pin
+// hold. If the pid is reused just before exe is opened, the opened file is
+// the newcomer's binary; only a start-time read AFTER the open sees the
+// newcomer and drops the event.
+func TestExecHasher_ComparesStartTimeAfterOpen(t *testing.T) {
+	const pid = 4242
+	root := t.TempDir()
+	hasherProc(t, root, pid, "miner", fakeStart(pid))
+	h, got := newTestHasher(root)

@@ -25,3 +25,57 @@ func sentinelHint(verb string, username string, err error) error {
 	return fmt.Errorf("%s failed: %w", verb, err)
 }
 
+// handlePush is the agent-native version of `containarium push <user>`.
+// Same Go function (transfer.Push) backs both surfaces; this just adapts
+// the MCP args dict into a typed PushOptions struct.
+func handlePush(client API, args map[string]interface{}) (string, error) {
+	username := getStringArg(args, "username", "")
+	if username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+
+	res, err := transfer.Push(transfer.PushOptions{
+		Options: transfer.Options{
+			Username:     username,
+			SentinelHost: pickSentinel(client, args),
+			KeyPath:      getStringArg(args, "key_path", ""),
+			LocalPath:    getStringArg(args, "local_path", ""),
+			RemotePath:   getStringArg(args, "remote_path", ""),
+			Verbose:      false,
+		},
+		Branch:     getStringArg(args, "branch", ""),
+		IncludeWIP: getBoolArg(args, "include_wip", false),
+		DeployCmd:  getStringArg(args, "deploy_cmd", ""),
+		RemoteName: getStringArg(args, "remote_name", ""),
+	})
+	if err != nil {
+		return "", sentinelHint("push", username, err)
+	}
+
+	var out string
+	if res.PreviousHead == "" {
+		out = fmt.Sprintf("pushed branch %s to %s (first push, head=%s)",
+			res.Branch, res.RemoteURL, shortShaMCP(res.NewHead))
+	} else {
+		out = fmt.Sprintf("pushed branch %s: %s..%s -> %s",
+			res.Branch, shortShaMCP(res.PreviousHead), shortShaMCP(res.NewHead), res.RemoteURL)
+	}
+	if res.DeployCmd != "" {
+		out += fmt.Sprintf("\ndeploy hook configured: %s", res.DeployCmd)
+	}
+	if res.WIPCommitMade {
+		out += "\nWIP commit was shipped and the local repo was rewound to its pre-WIP state."
+	}
+	return out, nil
+}
+
+// handleSync is the agent-native version of `containarium sync <user>`.
+func handleSync(client API, args map[string]interface{}) (string, error) {
+	username := getStringArg(args, "username", "")
+	if username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+
+	excludes := append([]string{}, transfer.DefaultSyncExcludes...)
+	if extra, ok := args["exclude"].([]interface{}); ok {
+		for _, e := range extra {
