@@ -293,3 +293,298 @@ type CollectorOptions struct {
 	// tests). Required.
 	Exporter sdkmetric.Exporter
 	// Resource is the OTel resource the series are exported under: the
+	// provider's identity attributes (e.g. the instance id and zone from the
+	// GCP detector). Which monitored resource Cloud Monitoring records for
+	// them is the provider's own mapping, not this field's (for GCP OTLP
+	// since v0.100.0 it is prometheus_target, not gce_instance). Optional;
+	// nil falls back to the SDK default resource.
+	Resource *resource.Resource
+	// Labels is the fixed backend_id/hostname/region identity.
+	Labels Labels
+	// IntervalSeconds is the requested export cadence. Clamped up to
+	// MinIntervalSeconds; <= 0 uses MinIntervalSeconds.
+	IntervalSeconds int32
+	// Groups selects which independently-enableable series groups this
+	// collector registers (#1081). Normalized at construction: an empty
+	// selection resolves to [HOST], so a collector built from a v0.60.0
+	// config exports exactly the #1070 host series.
+	Groups []pb.CloudMetricsGroup
+	// Now is the clock the backup-health series (#2294) reads to turn a
+	// tenant's last-success timestamp into an age. Test seam; nil
+	// defaults to time.Now in production.
+	Now func() time.Time
+}
+
+// healthState is the collector's live export health, surfaced through
+// GetMetricsExport. Guarded by its own mutex because it is written from
+// the PeriodicReader's background goroutine and read from RPC handlers.
+type healthState struct {
+	mu             sync.Mutex
+	lastSuccessAt  time.Time
+	lastError      string
+	exportFailures int64
+}
+
+func (h *healthState) recordSuccess(now time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.lastSuccessAt = now
+	h.lastError = ""
+}
+
+func (h *healthState) recordFailure(err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.exportFailures++
+	h.lastError = err.Error()
+}
+
+func (h *healthState) snapshot() (lastSuccessAt time.Time, lastError string, failures int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastSuccessAt, h.lastError, h.exportFailures
+}
+
+// healthExporter decorates the real exporter to record per-batch
+// success/failure into the shared healthState. It never changes the
+// exporter's own error behavior — the OTel SDK still logs and drops on
+// its own terms; this only observes the outcome so GetMetricsExport can
+// report real numbers.
+type healthExporter struct {
+	sdkmetric.Exporter
+	health *healthState
+	now    func() time.Time
+}
+
+func (h *healthExporter) Export(ctx context.Context, rm *metricdata.ResourceMetrics) error {
+	err := h.Exporter.Export(ctx, rm)
+	if err != nil {
+		h.health.recordFailure(err)
+	} else {
+		h.health.recordSuccess(h.now())
+	}
+	return err
+}
+
+// CloudExportCollector owns a dedicated OTel MeterProvider + a
+// PeriodicReader wired to one provider exporter, and registers exactly
+// the allowlisted host-series instruments as async gauges pulling from
+// Sources. It is deliberately a second, separate pipeline from the
+// daemon's internal Collector: the exported instrument set is the billed
+// cost surface, and keeping it isolated makes that surface explicit and
+// reviewable in one file.
+type CloudExportCollector struct {
+	sources         Sources
+	platformSources PlatformSources
+	exporter        sdkmetric.Exporter
+	resource        *resource.Resource
+	labels          Labels
+	interval        time.Duration
+	groups          []pb.CloudMetricsGroup
+	health          *healthState
+	now             func() time.Time
+
+	mu      sync.Mutex
+	mp      *sdkmetric.MeterProvider
+	started bool
+}
+
+// NewCollector builds an unstarted CloudExportCollector. Call Start to
+// begin periodic export and Stop to tear it down; both are idempotent.
+func NewCollector(opts CollectorOptions) *CloudExportCollector {
+	interval := time.Duration(opts.IntervalSeconds) * time.Second
+	if floor := MinIntervalSeconds * time.Second; interval < floor {
+		interval = floor
+	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	return &CloudExportCollector{
+		sources:         opts.Sources,
+		platformSources: opts.PlatformSources,
+		exporter:        opts.Exporter,
+		resource:        opts.Resource,
+		labels:          opts.Labels,
+		interval:        interval,
+		groups:          NormalizeGroups(opts.Groups),
+		health:          &healthState{},
+		now:             now,
+	}
+}
+
+// Start begins periodic export. Idempotent: a second call while running
+// is a no-op. The MeterProvider it stands up is entirely separate from
+// the daemon's internal metrics pipeline.
+func (c *CloudExportCollector) Start(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started {
+		return nil
+	}
+
+	reader := sdkmetric.NewPeriodicReader(
+		&healthExporter{Exporter: c.exporter, health: c.health, now: time.Now},
+		sdkmetric.WithInterval(c.interval),
+	)
+	mp, err := c.buildMeterProvider(reader)
+	if err != nil {
+		_ = reader.Shutdown(ctx)
+		return err
+	}
+	c.mp = mp
+	c.started = true
+	return nil
+}
+
+// Stop tears down the MeterProvider (final flush + reader shutdown) and
+// halts emission. Idempotent: a call while already stopped is a no-op.
+func (c *CloudExportCollector) Stop(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.started {
+		return nil
+	}
+	mp := c.mp
+	c.mp = nil
+	c.started = false
+	if mp == nil {
+		return nil
+	}
+	return mp.Shutdown(ctx)
+}
+
+// ForceFlush triggers an immediate collection + export outside the
+// periodic cadence. Used by tests to observe a tick without waiting a
+// full interval; a no-op when the collector is stopped.
+func (c *CloudExportCollector) ForceFlush(ctx context.Context) error {
+	c.mu.Lock()
+	mp := c.mp
+	c.mu.Unlock()
+	if mp == nil {
+		return nil
+	}
+	return mp.ForceFlush(ctx)
+}
+
+// Health reports the live export health for GetMetricsExport.
+func (c *CloudExportCollector) Health() (lastSuccessAt time.Time, lastError string, exportFailures int64) {
+	return c.health.snapshot()
+}
+
+// buildMeterProvider stands up the MeterProvider on the given reader and
+// registers the allowlisted instruments with a single multi-instrument
+// callback. Factored out (unexported) so unit tests can drive it with a
+// ManualReader and assert the exact series/label set the callback emits.
+func (c *CloudExportCollector) buildMeterProvider(reader sdkmetric.Reader) (*sdkmetric.MeterProvider, error) {
+	mpOpts := []sdkmetric.Option{sdkmetric.WithReader(reader)}
+	if c.resource != nil {
+		mpOpts = append(mpOpts, sdkmetric.WithResource(c.resource))
+	}
+	mp := sdkmetric.NewMeterProvider(mpOpts...)
+	for _, g := range c.groups {
+		if err := registerGroupInstruments(mp, g, c.sources, c.platformSources, c.labels, c.now); err != nil {
+			return nil, err
+		}
+	}
+	if err := registerHeartbeatInstrument(mp, c.labels); err != nil {
+		return nil, err
+	}
+	return mp, nil
+}
+
+// registerGroupInstruments registers exactly the instruments belonging
+// to one metric group (#1081). This is the single dispatch point new
+// groups plug into: host registers the #1070 allowlist; container
+// registers the #1071 per-container series; platform registers the
+// #1082/#1083/#1084 API-health, provisioning-outcome, and connectivity
+// series when a PlatformSources is wired, and nothing otherwise. Groups
+// are normalized before they reach here, so UNSPECIFIED never arrives;
+// an unknown value is a programming error.
+//
+// Note the heartbeat is deliberately NOT a group: it is registered
+// unconditionally by buildMeterProvider alongside (and independent of)
+// whatever groups are enabled, because the dead-man signal must never be
+// gated by group selection or a Sources error (see
+// registerHeartbeatInstrument).
+func registerGroupInstruments(mp *sdkmetric.MeterProvider, group pb.CloudMetricsGroup, sources Sources, platformSources PlatformSources, labels Labels, now func() time.Time) error {
+	switch group {
+	case pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST:
+		return registerHostInstruments(mp, sources, labels)
+	case pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_CONTAINER:
+		return registerContainerInstruments(mp, sources, labels)
+	case pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_PLATFORM:
+		if platformSources == nil {
+			// Not wired (e.g. an older daemon build, or a test that
+			// doesn't need it) — deliberate zero-series opt-in, same as
+			// the pre-#1082 "reserved" behavior, never an error.
+			return nil
+		}
+		return registerPlatformInstruments(mp, platformSources, labels, now)
+	default:
+		return fmt.Errorf("cloudexport: unregisterable metric group %v", group)
+	}
+}
+
+// registerPlatformInstruments creates the platform group's API-health
+// (#1082), provisioning-outcome (#1083), connectivity (#1084), and
+// backup-health (#2294) instruments and wires one callback per concern,
+// each pulling a single snapshot per tick. API-health and provisioning
+// are counters: OTel async-counter semantics expect the current
+// cumulative total on every observation (platformstats.Stats already
+// accumulates for the daemon's lifetime), which is exactly what those
+// snapshots report. Connectivity and backup-health are gauges: both are
+// current state (peer health; seconds since last success), not an
+// accumulating count.
+func registerPlatformInstruments(mp *sdkmetric.MeterProvider, sources PlatformSources, labels Labels, now func() time.Time) error {
+	meter := mp.Meter(meterName)
+
+	requests, err := meter.Int64ObservableCounter(MetricPlatformAPIRequests,
+		metric.WithDescription("Cumulative count of completed API requests (gRPC + REST-via-gateway), by coarse outcome class."))
+	if err != nil {
+		return err
+	}
+	apiErrors, err := meter.Int64ObservableCounter(MetricPlatformAPIErrors,
+		metric.WithDescription("Cumulative count of completed API requests that resulted in a client or server error, by coarse outcome class."))
+	if err != nil {
+		return err
+	}
+
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			snap := sources.APIStats()
+			for class, n := range snap.RequestsByClass {
+				o.ObserveInt64(requests, n, metric.WithAttributeSet(labels.platformAttributeSet(class)))
+			}
+			for class, n := range snap.ErrorsByClass {
+				o.ObserveInt64(apiErrors, n, metric.WithAttributeSet(labels.platformAttributeSet(class)))
+			}
+			return nil
+		},
+		requests, apiErrors,
+	)
+	if err != nil {
+		return err
+	}
+
+	attempts, err := meter.Int64ObservableCounter(MetricPlatformProvisionAttempts,
+		metric.WithDescription("Cumulative count of container provisioning attempts (create/delete), by operation."))
+	if err != nil {
+		return err
+	}
+	failures, err := meter.Int64ObservableCounter(MetricPlatformProvisionFailures,
+		metric.WithDescription("Cumulative count of container provisioning attempts that failed, by operation."))
+	if err != nil {
+		return err
+	}
+	durationSum, err := meter.Float64ObservableCounter(MetricPlatformProvisionDurationSecondsSum,
+		metric.WithUnit("s"), metric.WithDescription("Cumulative wall-clock time spent on provisioning attempts, by operation — divide by attempts for mean latency."))
+	if err != nil {
+		return err
+	}
+
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			snap := sources.ProvisionStats()
+			for op, n := range snap.Attempts {
+				o.ObserveInt64(attempts, n, metric.WithAttributeSet(labels.provisionAttributeSet(op)))
