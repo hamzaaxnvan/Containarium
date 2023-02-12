@@ -21,15 +21,3 @@ func ModelTrafficScanning(cred Kind, effective pb.GuardrailEffectivePolicy) pb.C
 		case pb.GuardrailEffectivePolicy_GUARDRAIL_EFFECTIVE_POLICY_ADMIN:
 			return pb.CodeModelTrafficScanning_CODE_MODEL_TRAFFIC_SCANNING_SCANNED
 		case pb.GuardrailEffectivePolicy_GUARDRAIL_EFFECTIVE_POLICY_BASELINE:
-			return pb.CodeModelTrafficScanning_CODE_MODEL_TRAFFIC_SCANNING_BASELINE
-		case pb.GuardrailEffectivePolicy_GUARDRAIL_EFFECTIVE_POLICY_NONE:
-			return pb.CodeModelTrafficScanning_CODE_MODEL_TRAFFIC_SCANNING_UNSCANNED_NO_POLICY
-		}
-	}
-	return pb.CodeModelTrafficScanning_CODE_MODEL_TRAFFIC_SCANNING_UNSPECIFIED
-}
-
-// ScanningLine renders the one-line status `code run` prints, shared by the
-// CLI and the MCP tool so the two cannot drift.
-func ScanningLine(s pb.CodeModelTrafficScanning) string {
-	switch s {

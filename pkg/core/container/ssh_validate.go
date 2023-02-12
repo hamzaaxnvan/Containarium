@@ -21,3 +21,14 @@ import (
 func ValidateSSHPublicKey(key string) error {
 	key = strings.TrimSpace(key)
 	if key == "" {
+		return fmt.Errorf("key is empty")
+	}
+
+	// Reject any embedded CR/LF. An authorized_keys file is line-
+	// based, and a key with a `\n` in the middle would silently
+	// inject a second "line" the sshd parser interprets as
+	// additional authorized credentials. Done before placeholder
+	// matching so the more specific error wins.
+	if strings.ContainsAny(key, "\r\n") {
+		return fmt.Errorf("key contains embedded newline (CR or LF)")
+	}
