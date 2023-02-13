@@ -68,3 +68,73 @@ func TestReportStatusOnce_Posture(t *testing.T) {
 		})
 	}
 }
+
+// Build the pre-#2328 schema by removing only field 13 from the current
+// descriptor. This exercises the real protobuf/gateway decoders without
+// registering a conflicting generated copy of the old Go types.
+func legacyStatusDescriptor(t *testing.T) protoreflect.MessageDescriptor {
+	t.Helper()
+	fd := protodesc.ToFileDescriptorProto(cloudv1.File_containarium_cloud_v1_actuation_service_proto)
+	for _, m := range fd.MessageType {
+		if m.GetName() != "ReportHostStatusRequest" {
+			continue
+		}
+		fields := m.Field[:0]
+		for _, f := range m.Field {
+			if f.GetNumber() != 13 {
+				fields = append(fields, f)
+			}
+		}
+		m.Field = fields
+	}
+	f, err := protodesc.NewFile(fd, protoregistry.GlobalFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := f.Messages().ByName("ReportHostStatusRequest")
+	if md.Fields().Len() != 12 || md.Fields().ByName("posture") != nil {
+		t.Fatal("legacy schema must contain only the original 12 fields")
+	}
+	return md
+}
+
+func TestReportHostStatus_BackwardCompatibility(t *testing.T) {
+	md := legacyStatusDescriptor(t)
+	req := &cloudv1.ReportHostStatusRequest{
+		AgentVersion: "test", CpuCores: 8, SelfCheckOk: true,
+		Checks: []*cloudv1.HostCapabilityCheck{{Name: "posture: auditd running", Ok: false, Detail: "not running"}},
+		Posture: &cloudv1.HostSecurityPosture{
+			Checks:     []*cloudv1.HostCapabilityCheck{{Name: "auditd running", Ok: false, Detail: "not running"}},
+			MeasuredAt: timestamppb.New(time.Date(2026, 1, 2, 3, 4, 5, 123, time.UTC)),
+		},
+	}
+	assertLegacy := func(t *testing.T, got *dynamicpb.Message) {
+		t.Helper()
+		if got.Get(md.Fields().ByName("agent_version")).String() != "test" ||
+			got.Get(md.Fields().ByName("cpu_cores")).Int() != 8 ||
+			!got.Get(md.Fields().ByName("self_check_ok")).Bool() {
+			t.Fatalf("legacy fields lost: %v", got)
+		}
+		checks := got.Get(md.Fields().ByName("checks")).List()
+		if checks.Len() != 1 {
+			t.Fatalf("legacy checks = %v", checks)
+		}
+		check := checks.Get(0).Message()
+		if check.Get(check.Descriptor().Fields().ByName("name")).String() != "posture: auditd running" ||
+			check.Get(check.Descriptor().Fields().ByName("ok")).Bool() ||
+			check.Get(check.Descriptor().Fields().ByName("detail")).String() != "not running" {
+			t.Fatalf("legacy check changed: %v", check)
+		}
+	}
+	t.Run("new sender to old protobuf receiver", func(t *testing.T) {
+		wire, err := proto.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := dynamicpb.NewMessage(md)
+		if err := (proto.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(wire, old); err != nil {
+			t.Fatal(err)
+		}
+		assertLegacy(t, old)
+	})
+	t.Run("new REST sender to old default gateway", func(t *testing.T) {
