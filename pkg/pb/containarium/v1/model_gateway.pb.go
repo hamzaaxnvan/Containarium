@@ -189,3 +189,576 @@ func (x *SetTenantProviderKeyResponse) String() string {
 }
 
 func (*SetTenantProviderKeyResponse) ProtoMessage() {}
+
+func (x *SetTenantProviderKeyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetTenantProviderKeyResponse.ProtoReflect.Descriptor instead.
+func (*SetTenantProviderKeyResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *SetTenantProviderKeyResponse) GetKeyOwner() string {
+	if x != nil {
+		return x.KeyOwner
+	}
+	return ""
+}
+
+func (x *SetTenantProviderKeyResponse) GetProvider() GatewayProvider {
+	if x != nil {
+		return x.Provider
+	}
+	return GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED
+}
+
+func (x *SetTenantProviderKeyResponse) GetFingerprint() string {
+	if x != nil {
+		return x.Fingerprint
+	}
+	return ""
+}
+
+func (x *SetTenantProviderKeyResponse) GetSetAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.SetAt
+	}
+	return nil
+}
+
+type DeleteTenantProviderKeyRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	KeyOwner      string                 `protobuf:"bytes,1,opt,name=key_owner,json=keyOwner,proto3" json:"key_owner,omitempty"`
+	Provider      GatewayProvider        `protobuf:"varint,2,opt,name=provider,proto3,enum=containarium.v1.GatewayProvider" json:"provider,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteTenantProviderKeyRequest) Reset() {
+	*x = DeleteTenantProviderKeyRequest{}
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteTenantProviderKeyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteTenantProviderKeyRequest) ProtoMessage() {}
+
+func (x *DeleteTenantProviderKeyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteTenantProviderKeyRequest.ProtoReflect.Descriptor instead.
+func (*DeleteTenantProviderKeyRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *DeleteTenantProviderKeyRequest) GetKeyOwner() string {
+	if x != nil {
+		return x.KeyOwner
+	}
+	return ""
+}
+
+func (x *DeleteTenantProviderKeyRequest) GetProvider() GatewayProvider {
+	if x != nil {
+		return x.Provider
+	}
+	return GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED
+}
+
+type DeleteTenantProviderKeyResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// tokens_revoked reports whether the owner's live gateway tokens were also
+	// killed. False means the daemon holds no revocable owner-revocation store,
+	// so tokens minted before the delete stay valid until they expire — worth
+	// surfacing rather than implying a clean revocation.
+	TokensRevoked bool `protobuf:"varint,1,opt,name=tokens_revoked,json=tokensRevoked,proto3" json:"tokens_revoked,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteTenantProviderKeyResponse) Reset() {
+	*x = DeleteTenantProviderKeyResponse{}
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteTenantProviderKeyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteTenantProviderKeyResponse) ProtoMessage() {}
+
+func (x *DeleteTenantProviderKeyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteTenantProviderKeyResponse.ProtoReflect.Descriptor instead.
+func (*DeleteTenantProviderKeyResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *DeleteTenantProviderKeyResponse) GetTokensRevoked() bool {
+	if x != nil {
+		return x.TokensRevoked
+	}
+	return false
+}
+
+type GetTenantProviderKeyStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	KeyOwner      string                 `protobuf:"bytes,1,opt,name=key_owner,json=keyOwner,proto3" json:"key_owner,omitempty"`
+	Provider      GatewayProvider        `protobuf:"varint,2,opt,name=provider,proto3,enum=containarium.v1.GatewayProvider" json:"provider,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetTenantProviderKeyStatusRequest) Reset() {
+	*x = GetTenantProviderKeyStatusRequest{}
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTenantProviderKeyStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTenantProviderKeyStatusRequest) ProtoMessage() {}
+
+func (x *GetTenantProviderKeyStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTenantProviderKeyStatusRequest.ProtoReflect.Descriptor instead.
+func (*GetTenantProviderKeyStatusRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *GetTenantProviderKeyStatusRequest) GetKeyOwner() string {
+	if x != nil {
+		return x.KeyOwner
+	}
+	return ""
+}
+
+func (x *GetTenantProviderKeyStatusRequest) GetProvider() GatewayProvider {
+	if x != nil {
+		return x.Provider
+	}
+	return GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED
+}
+
+type GetTenantProviderKeyStatusResponse struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	KeyOwner string                 `protobuf:"bytes,1,opt,name=key_owner,json=keyOwner,proto3" json:"key_owner,omitempty"`
+	Provider GatewayProvider        `protobuf:"varint,2,opt,name=provider,proto3,enum=containarium.v1.GatewayProvider" json:"provider,omitempty"`
+	// set reports whether a key is registered for this (key_owner, provider).
+	Set bool `protobuf:"varint,3,opt,name=set,proto3" json:"set,omitempty"`
+	// fingerprint is the first 16 hex characters of the key's SHA-256, empty
+	// when unset. The ONLY key-derived value this API ever returns.
+	Fingerprint   string                 `protobuf:"bytes,4,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"`
+	SetAt         *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=set_at,json=setAt,proto3" json:"set_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetTenantProviderKeyStatusResponse) Reset() {
+	*x = GetTenantProviderKeyStatusResponse{}
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTenantProviderKeyStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTenantProviderKeyStatusResponse) ProtoMessage() {}
+
+func (x *GetTenantProviderKeyStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTenantProviderKeyStatusResponse.ProtoReflect.Descriptor instead.
+func (*GetTenantProviderKeyStatusResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *GetTenantProviderKeyStatusResponse) GetKeyOwner() string {
+	if x != nil {
+		return x.KeyOwner
+	}
+	return ""
+}
+
+func (x *GetTenantProviderKeyStatusResponse) GetProvider() GatewayProvider {
+	if x != nil {
+		return x.Provider
+	}
+	return GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED
+}
+
+func (x *GetTenantProviderKeyStatusResponse) GetSet() bool {
+	if x != nil {
+		return x.Set
+	}
+	return false
+}
+
+func (x *GetTenantProviderKeyStatusResponse) GetFingerprint() string {
+	if x != nil {
+		return x.Fingerprint
+	}
+	return ""
+}
+
+func (x *GetTenantProviderKeyStatusResponse) GetSetAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.SetAt
+	}
+	return nil
+}
+
+type MintGatewayTokenRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// box names the box the token is for — a box/container name, NOT a key_owner
+	// value. The server resolves key_owner from this box's cloud-org attribution
+	// when it is stamped, else from the box's owning username, and refuses
+	// outright when the caller does not own the box.
+	Box      string          `protobuf:"bytes,1,opt,name=box,proto3" json:"box,omitempty"`
+	Provider GatewayProvider `protobuf:"varint,2,opt,name=provider,proto3,enum=containarium.v1.GatewayProvider" json:"provider,omitempty"`
+	// run_id optionally binds the token to one run, so the run's exit can revoke
+	// exactly the token it was given.
+	RunId string `protobuf:"bytes,3,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	// allowed_models is an optional ceiling: the gateway refuses any model not
+	// in this list. Empty means the gateway's own configured ceiling applies.
+	AllowedModels []string `protobuf:"bytes,4,rep,name=allowed_models,json=allowedModels,proto3" json:"allowed_models,omitempty"`
+	// ttl is the requested lifetime. Empty takes the default; anything above the
+	// server's cap is silently capped TO the cap rather than rejected, and
+	// expires_at in the response is the truth.
+	Ttl *durationpb.Duration `protobuf:"bytes,5,opt,name=ttl,proto3" json:"ttl,omitempty"`
+	// dry_run validates everything a real mint validates — box ownership, the
+	// provider, the resolved key owner's key — and issues NO token. It is how
+	// `code install` names a misconfiguration at install time instead of at the
+	// first model call.
+	DryRun        bool `protobuf:"varint,6,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MintGatewayTokenRequest) Reset() {
+	*x = MintGatewayTokenRequest{}
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MintGatewayTokenRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MintGatewayTokenRequest) ProtoMessage() {}
+
+func (x *MintGatewayTokenRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MintGatewayTokenRequest.ProtoReflect.Descriptor instead.
+func (*MintGatewayTokenRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *MintGatewayTokenRequest) GetBox() string {
+	if x != nil {
+		return x.Box
+	}
+	return ""
+}
+
+func (x *MintGatewayTokenRequest) GetProvider() GatewayProvider {
+	if x != nil {
+		return x.Provider
+	}
+	return GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED
+}
+
+func (x *MintGatewayTokenRequest) GetRunId() string {
+	if x != nil {
+		return x.RunId
+	}
+	return ""
+}
+
+func (x *MintGatewayTokenRequest) GetAllowedModels() []string {
+	if x != nil {
+		return x.AllowedModels
+	}
+	return nil
+}
+
+func (x *MintGatewayTokenRequest) GetTtl() *durationpb.Duration {
+	if x != nil {
+		return x.Ttl
+	}
+	return nil
+}
+
+func (x *MintGatewayTokenRequest) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+type MintGatewayTokenResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// token is the signed gateway token. ALWAYS EMPTY when dry_run was set.
+	Token string `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
+	// base_url is what the box points its SDK at: the gateway's per-provider
+	// base, http://<daemon-host>:<http-port>/v1/model/<provider>.
+	BaseUrl string `protobuf:"bytes,2,opt,name=base_url,json=baseUrl,proto3" json:"base_url,omitempty"`
+	// key_owner is the owner the server resolved, so the caller can see whose
+	// key this token will spend without decoding the JWT.
+	KeyOwner  string                 `protobuf:"bytes,3,opt,name=key_owner,json=keyOwner,proto3" json:"key_owner,omitempty"`
+	ExpiresAt *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	// token_id is the minted jti, so the caller can revoke exactly this token
+	// (`containarium token revoke --jti <id>`) without re-parsing it. Empty on
+	// dry_run.
+	TokenId       string `protobuf:"bytes,5,opt,name=token_id,json=tokenId,proto3" json:"token_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MintGatewayTokenResponse) Reset() {
+	*x = MintGatewayTokenResponse{}
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MintGatewayTokenResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MintGatewayTokenResponse) ProtoMessage() {}
+
+func (x *MintGatewayTokenResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MintGatewayTokenResponse.ProtoReflect.Descriptor instead.
+func (*MintGatewayTokenResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *MintGatewayTokenResponse) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
+func (x *MintGatewayTokenResponse) GetBaseUrl() string {
+	if x != nil {
+		return x.BaseUrl
+	}
+	return ""
+}
+
+func (x *MintGatewayTokenResponse) GetKeyOwner() string {
+	if x != nil {
+		return x.KeyOwner
+	}
+	return ""
+}
+
+func (x *MintGatewayTokenResponse) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
+}
+
+func (x *MintGatewayTokenResponse) GetTokenId() string {
+	if x != nil {
+		return x.TokenId
+	}
+	return ""
+}
+
+type ListGatewayModelsRequest struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Provider GatewayProvider        `protobuf:"varint,1,opt,name=provider,proto3,enum=containarium.v1.GatewayProvider" json:"provider,omitempty"`
+	// box optionally scopes the lookup to one box's key owner, resolved exactly
+	// as MintGatewayToken resolves it (and with the same ownership check). Empty
+	// resolves to the calling subject's own owner id.
+	Box           string `protobuf:"bytes,2,opt,name=box,proto3" json:"box,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListGatewayModelsRequest) Reset() {
+	*x = ListGatewayModelsRequest{}
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListGatewayModelsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListGatewayModelsRequest) ProtoMessage() {}
+
+func (x *ListGatewayModelsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListGatewayModelsRequest.ProtoReflect.Descriptor instead.
+func (*ListGatewayModelsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *ListGatewayModelsRequest) GetProvider() GatewayProvider {
+	if x != nil {
+		return x.Provider
+	}
+	return GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED
+}
+
+func (x *ListGatewayModelsRequest) GetBox() string {
+	if x != nil {
+		return x.Box
+	}
+	return ""
+}
+
+type GatewayModel struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GatewayModel) Reset() {
+	*x = GatewayModel{}
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GatewayModel) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GatewayModel) ProtoMessage() {}
+
+func (x *GatewayModel) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GatewayModel.ProtoReflect.Descriptor instead.
+func (*GatewayModel) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GatewayModel) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type ListGatewayModelsResponse struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Models []*GatewayModel        `protobuf:"bytes,1,rep,name=models,proto3" json:"models,omitempty"`
+	// key_owner is the owner whose key was spent listing them.
+	KeyOwner      string `protobuf:"bytes,2,opt,name=key_owner,json=keyOwner,proto3" json:"key_owner,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListGatewayModelsResponse) Reset() {
+	*x = ListGatewayModelsResponse{}
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
