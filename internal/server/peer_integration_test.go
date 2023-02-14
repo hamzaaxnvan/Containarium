@@ -244,3 +244,250 @@ func TestIntegration_MultiBackendListContainers(t *testing.T) {
 	// Verify backend_id tagging
 	backendCounts := make(map[string]int)
 	for _, c := range containers {
+		backendCounts[c.BackendID]++
+	}
+	if backendCounts["gcp-spot"] != 2 {
+		t.Errorf("expected 2 containers from gcp-spot, got %d", backendCounts["gcp-spot"])
+	}
+	if backendCounts["tunnel-gpu"] != 1 {
+		t.Errorf("expected 1 container from tunnel-gpu, got %d", backendCounts["tunnel-gpu"])
+	}
+}
+
+// TestIntegration_PeerForwardResize verifies that resize operations
+// are forwarded to the correct peer when the container is not local.
+func TestIntegration_PeerForwardResize(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	// Find charlie's peer
+	peer, _ := pool.FindContainerPeer("charlie", "")
+	if peer == nil {
+		t.Fatal("expected to find charlie on tunnel-gpu")
+	}
+	if peer.ID != "tunnel-gpu" {
+		t.Errorf("expected peer ID 'tunnel-gpu', got %q", peer.ID)
+	}
+
+	// Forward resize
+	body := []byte(`{"cpu":"8","memory":"16GB","disk":"100GB"}`)
+	respBody, statusCode, err := peer.ForwardRequest("PUT", "/v1/containers/charlie/resize", "", body)
+	if err != nil {
+		t.Fatalf("resize forward failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected 200, got %d: %s", statusCode, respBody)
+	}
+
+	// Verify request reached the peer
+	lastReq := gpu.lastRequest()
+	if lastReq.Method != "PUT" || lastReq.Path != "/v1/containers/charlie/resize" {
+		t.Errorf("unexpected request: %s %s", lastReq.Method, lastReq.Path)
+	}
+}
+
+// TestIntegration_ResizeContainerForwardsRequestFields verifies that
+// ContainerServer.ResizeContainer's peer-forward path (the container isn't
+// local, so the request is forwarded over HTTP) carries CpuRequest and
+// MemoryRequest along with cpu/memory/disk. The forward body used to be
+// built from a map literal naming only cpu/memory/disk, silently dropping
+// the two request fields on any resize routed through a peer (#1572,
+// caught in review on PR #1577).
+func TestIntegration_ResizeContainerForwardsRequestFields(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	// The container is not local: GetContainer errors, so
+	// container.Manager.Resize returns "not found" and ResizeContainer
+	// falls through to the peer-forward path above.
+	mock := incustest.NewMockBackend()
+	mock.GetContainerFunc = func(name string) (*incus.ContainerInfo, error) {
+		return nil, fmt.Errorf("not found")
+	}
+	s := &ContainerServer{
+		manager:  container.NewWithBackend(mock),
+		peerPool: pool,
+	}
+
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"charlie", []string{"user"}, []string{auth.ScopeContainersWrite})
+
+	_, err := s.ResizeContainer(ctx, &pb.ResizeContainerRequest{
+		Username:      "charlie",
+		Cpu:           "4",
+		CpuRequest:    "500m",
+		MemoryRequest: "1Gi",
+	})
+	if err != nil {
+		t.Fatalf("ResizeContainer: %v", err)
+	}
+
+	lastReq := gpu.lastRequest()
+	if lastReq.Method != "PUT" || lastReq.Path != "/v1/containers/charlie/resize" {
+		t.Fatalf("unexpected request: %s %s", lastReq.Method, lastReq.Path)
+	}
+	var forwarded map[string]string
+	if err := json.Unmarshal([]byte(lastReq.Body), &forwarded); err != nil {
+		t.Fatalf("forwarded body not valid JSON: %v (%s)", err, lastReq.Body)
+	}
+	if forwarded["cpuRequest"] != "500m" {
+		t.Errorf("forwarded cpuRequest = %q, want %q (raw body: %s)", forwarded["cpuRequest"], "500m", lastReq.Body)
+	}
+	if forwarded["memoryRequest"] != "1Gi" {
+		t.Errorf("forwarded memoryRequest = %q, want %q (raw body: %s)", forwarded["memoryRequest"], "1Gi", lastReq.Body)
+	}
+}
+
+// TestIntegration_ResizeAdmissionNotEvaluatedForPeerForwardedContainer proves
+// the #1579 requirement that a peer-forwarded resize is never evaluated
+// against the LOCAL host's capacity. The local gate here is configured to
+// reject absolutely everything (factor effectively 0 capacity headroom) —
+// if the admission check ran unconditionally before the local/peer dispatch
+// decision (rather than only once the container is confirmed local), this
+// resize would be wrongly rejected with ResourceExhausted before ever
+// reaching the peer. It must instead sail through to the peer unblocked.
+func TestIntegration_ResizeAdmissionNotEvaluatedForPeerForwardedContainer(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	// charlie's box is not local: GetContainer errors so ResizeContainer
+	// falls through to the peer-forward path.
+	mock := incustest.NewMockBackend()
+	mock.GetContainerFunc = func(name string) (*incus.ContainerInfo, error) {
+		return nil, fmt.Errorf("not found")
+	}
+	s := &ContainerServer{
+		manager:  container.NewWithBackend(mock),
+		peerPool: pool,
+	}
+	// A maximally strict local gate: 0 physical cores of headroom would
+	// reject any nonzero CPU request outright if evaluated against THIS
+	// host. hostCoresFn reports a nonzero host (so the gate doesn't fail
+	// open on "capacity unknown") with zero factor-adjusted ceiling.
+	s.hostCoresFn = func() (float64, error) { return 8, nil }
+	s.SetCPUOvercommitPolicy(0.0001, true) // effectively zero headroom, strictly enforced
+
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"charlie", []string{"user"}, []string{auth.ScopeContainersWrite})
+
+	_, err := s.ResizeContainer(ctx, &pb.ResizeContainerRequest{Username: "charlie", Cpu: "8"})
+	if err != nil {
+		t.Fatalf("peer-forwarded resize must not be evaluated against local capacity, got %v", err)
+	}
+	if status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("resize was rejected by the LOCAL admission gate despite the container living on a peer")
+	}
+
+	lastReq := gpu.lastRequest()
+	if lastReq.Method != "PUT" || lastReq.Path != "/v1/containers/charlie/resize" {
+		t.Fatalf("resize never reached the peer: %s %s", lastReq.Method, lastReq.Path)
+	}
+}
+
+// TestIntegration_PeerForwardDelete verifies delete operations forward correctly.
+func TestIntegration_PeerForwardDelete(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	peer, _ := pool.FindContainerPeer("charlie", "")
+	if peer == nil {
+		t.Fatal("expected to find charlie")
+	}
+
+	_, statusCode, err := peer.ForwardRequest("DELETE", "/v1/containers/charlie", "", nil)
+	if err != nil {
+		t.Fatalf("delete forward failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected 200, got %d", statusCode)
+	}
+
+	// Verify container was removed from fake backend
+	gpu.mu.RLock()
+	if len(gpu.containers) != 0 {
+		t.Errorf("expected 0 containers after delete, got %d", len(gpu.containers))
+	}
+	gpu.mu.RUnlock()
+}
+
+// TestIntegration_PeerForwardCollaborators verifies collaborator operations forward correctly.
+func TestIntegration_PeerForwardCollaborators(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	peer, _ := pool.FindContainerPeer("charlie", "")
+	if peer == nil {
+		t.Fatal("expected to find charlie")
+	}
+
+	// Add collaborator
+	body := []byte(`{"collaborator_username":"dave","ssh_public_key":"ssh-ed25519 AAAA_dave"}`)
+	_, statusCode, err := peer.ForwardRequest("POST", "/v1/containers/charlie/collaborators", "", body)
+	if err != nil {
+		t.Fatalf("add collaborator failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected 200, got %d", statusCode)
+	}
+
+	// List collaborators
+	_, statusCode, err = peer.ForwardRequest("GET", "/v1/containers/charlie/collaborators", "", nil)
+	if err != nil {

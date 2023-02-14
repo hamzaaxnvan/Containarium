@@ -19,3 +19,14 @@ import (
 // `incus` binary is either absent or the container doesn't exist) — this
 // exercises the real code path end to end rather than mocking it.
 func TestEnsureDaemonRunning_FailsFastWhenNotInstalled(t *testing.T) {
+	s := NewScanner()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := s.EnsureDaemonRunning(ctx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error when ZAP is not installed, got nil")

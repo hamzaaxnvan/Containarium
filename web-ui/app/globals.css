@@ -43,3 +43,25 @@ html.light {
   --text-muted:    #71717a;
   --accent:        #2563eb;
   --accent-hover:  #1d4ed8;
+  --success:       #059669;
+  --error:         #dc2626;
+  --warning:       #d97706;
+  --info:          #4f46e5;
+
+  --c-emerald: #059669;
+  --c-red:     #dc2626;
+  --c-blue:    #2563eb;
+  --c-amber:   #d97706;
+  --c-violet:  #7c3aed;
+  --c-orange:  #ea580c;
+}
+
+@theme inline {
+  --color-background:    var(--background);
+  --color-surface:       var(--surface);
+  --color-surface-2:     var(--surface-2);
+  --color-border:        var(--border);
+  --color-border-subtle: var(--border-subtle);
+  --color-foreground:    var(--text);
+  --color-text-secondary:var(--text-secondary);
+  --color-text-muted:    var(--text-muted);
