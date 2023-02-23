@@ -42,3 +42,26 @@ func TestRedact_ScrubsJWTWithBearerPrefix(t *testing.T) {
 }
 
 func TestRedact_ScrubsPasswordVariants(t *testing.T) {
+	cases := []string{
+		"password=hunter2",
+		"PASSWORD=hunter2",
+		"password = hunter2",
+		"password: hunter2",
+		"passwd=hunter2",
+		"pass=hunter2",
+		"secret=abcdef",
+		"api_key=foo",
+		"api-key=foo",
+		"access_token=foo",
+	}
+	for _, in := range cases {
+		t.Run(in, func(t *testing.T) {
+			got := Redact(in)
+			if strings.Contains(got, "hunter2") || strings.Contains(got, "abcdef") || strings.Contains(got, "foo") {
+				t.Fatalf("secret leaked through redaction: %q", got)
+			}
+		})
+	}
+}
+
+func TestRedact_ScrubsAWSAccessKey(t *testing.T) {
