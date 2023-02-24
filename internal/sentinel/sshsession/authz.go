@@ -37,3 +37,23 @@ const (
 	DenyUserInactive        DenyReason = "USER_INACTIVE"
 	DenyNoAccess            DenyReason = "NO_ACCESS"
 	DenyKeyExpired          DenyReason = "KEY_EXPIRED"
+	DenyApprovalPending     DenyReason = "APPROVAL_PENDING"
+	DenyApprovalDenied      DenyReason = "APPROVAL_DENIED"
+	DenyUpstreamUnavailable DenyReason = "UPSTREAM_UNAVAILABLE"
+)
+
+func DecisionFromProto(v pb.SSHAuthzDecision) AuthzDecision {
+	if v == pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_UNSPECIFIED {
+		return ""
+	}
+	return AuthzDecision(strings.TrimPrefix(v.String(), "SSH_AUTHZ_DECISION_"))
+}
+
+func ReasonFromProto(v pb.SSHDenyReason) DenyReason {
+	if v == pb.SSHDenyReason_SSH_DENY_REASON_UNSPECIFIED {
+		return ""
+	}
+	return DenyReason(strings.TrimPrefix(v.String(), "SSH_DENY_REASON_"))
+}
+
+func DecisionToProto(v AuthzDecision) pb.SSHAuthzDecision {
