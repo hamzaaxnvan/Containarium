@@ -12,8 +12,3 @@ metadata:
     app.kubernetes.io/name: containarium-bench-sentinel
     app.kubernetes.io/instance: containarium-bench
     benchmark: agent-sandbox-density
-spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: containarium-bench-sentinel
-    app.kubernetes.io/instance: containarium-bench
