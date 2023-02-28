@@ -41,3 +41,47 @@ type AuthorizeKeyRequest struct {
 }
 
 // Target is a resolved SSH destination.
+type Target struct {
+	User string
+	Host string
+	Port int
+}
+
+// IsRunning reports whether a box can accept connections. protojson emits
+// the enum identifier ("CONTAINER_STATE_RUNNING"); we also accept the
+// friendly "Running" defensively.
+func IsRunning(state string) bool {
+	return state == "CONTAINER_STATE_RUNNING" || strings.EqualFold(state, "running")
+}
+
+// IsTransientState reports whether a box is in a short-lived bring-up state
+// (still being created/provisioned) that will reach RUNNING on its own. A
+// caller that just created a box and immediately wants to connect should
+// wait these out rather than failing — waiting succeeds, whereas "start it
+// first" is wrong (you can't start a box that's already coming up). protojson
+// emits the enum identifier; the friendly form is accepted defensively.
+func IsTransientState(state string) bool {
+	switch {
+	case state == "CONTAINER_STATE_CREATING", strings.EqualFold(state, "creating"):
+		return true
+	case state == "CONTAINER_STATE_PROVISIONING", strings.EqualFold(state, "provisioning"):
+		return true
+	}
+	return false
+}
+
+// PrettyState trims the proto enum prefix for human-facing messages.
+func PrettyState(state string) string {
+	s := strings.TrimPrefix(state, "CONTAINER_STATE_")
+	if s == "" {
+		return "unknown"
+	}
+	return strings.ToLower(s)
+}
+
+// BuildTarget derives user@host:port, preferring overrides, then the
+// daemon-owned ssh_host (FootprintAI/Containarium#452), then the container
+// IP. Returns an actionable error when neither a host nor an IP is known
+// yet (box still being placed).
+func BuildTarget(c *Container, userOverride, hostOverride string, port int) (Target, error) {
+	user := userOverride
