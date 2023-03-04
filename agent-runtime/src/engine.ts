@@ -1,0 +1,42 @@
+// Engine is the pluggable in-box agent loop. The Claude Agent SDK, the OpenAI
+// Codex SDK, and the Google Gen AI SDK (Gemini) are each wrapped behind this
+// interface so the agent-runtime is harness-agnostic: a skill picks its engine,
+// the rest of the runtime (seed loading, artifact writing, the A2A server in 4b)
+// stays identical.
+import type { JournalSink } from "./journal.js";
+import type { PlatformMcpConfig } from "./seed.js";
+
+export interface EngineConfig {
+  // Model id. Engine-specific: Claude → claude-opus-4-8; Codex → an OpenAI
+  // model. Empty means "use the engine's own default".
+  model: string;
+  // Trusted launch provenance for failures before SDK init; never a key.
+  authenticationSource?: "oauth" | "key";
+  // The skill's persona, from system_prompt.txt.
+  systemPrompt: string;
+  // The in-box agent-box MCP server (the engine's tool surface): the command
+  // to spawn over stdio and its args.
+  agentBoxCommand: string;
+  agentBoxArgs: string[];
+  // Hard cap on agentic turns (tool-use round trips).
+  maxTurns: number;
+  // The platform MCP to mount beside agent-box, from the seed (D4). Absent or
+  // null means agent-box alone — the behavior before the tracker broker.
+  platformMcp?: PlatformMcpConfig | null;
+  // The skill's agent_card.output_schema_json, parsed (#2002): the JSON Schema
+  // the artifact must satisfy. An engine hands it to its provider's native
+  // structured-output mechanism so the shape is enforced by the SDK, not
+  // requested in prose; an engine whose provider has no usable mechanism says
+  // so in the journal. Absent or null means free-form output, as before. A
+  // JSON Schema is a genuinely open document, hence the one untyped record.
+  outputSchema?: Record<string, unknown> | null;
+}
+
+export interface EngineResult {
+  // Explicit success evidence for credential recovery; a partial/error result
+  // returned by an SDK is not a successful authenticated run (#2790).
+  authenticationSucceeded?: boolean;
+  authenticationSource?: "oauth" | "key" | "unknown";
+  // The agent's final output text/JSON.
+  outputJson: string;
+  // Engine-shaped usage/cost, if available.
