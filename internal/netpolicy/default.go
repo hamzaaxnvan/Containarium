@@ -23,3 +23,29 @@ var defaultEgressDomains = []string{
 	"github.com", "api.github.com", "codeload.github.com", "gitlab.com", "bitbucket.org",
 	// language registries
 	"registry.npmjs.org", "pypi.org", "files.pythonhosted.org",
+	"proxy.golang.org", "sum.golang.org", "index.crates.io", "static.crates.io",
+	// OS package mirrors for the supported base images
+	"deb.debian.org", "security.debian.org", "archive.ubuntu.com", "security.ubuntu.com",
+}
+
+// DefaultEgressDomains returns a copy of the built-in default allow-list
+// domains, sorted.
+func DefaultEgressDomains() []string {
+	out := slices.Clone(defaultEgressDomains)
+	slices.Sort(out)
+	return out
+}
+
+// DefaultEgressExtras are the operator-supplied additions to the default
+// allow-list: typically the model gateway and the control plane.
+type DefaultEgressExtras struct {
+	Domains []string
+	CIDRs   []string
+}
+
+// DefaultPolicy is the policy a tenant with no stored policy runs under. It is
+// observe-only by construction (LOG_ONLY for both modes): arming enforce is a
+// per-tenant decision made by storing a policy, never something the default
+// does. A bad extra is an error rather than a silent drop, so a typo cannot
+// quietly narrow the list.
+func DefaultPolicy(tenant string, extras DefaultEgressExtras) (CompiledPolicy, error) {
