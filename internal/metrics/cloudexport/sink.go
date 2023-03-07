@@ -15,39 +15,3 @@ import (
 
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
-	"google.golang.org/grpc"
-)
-
-// SinkConfig carries the parameters a Sink needs to build its OTel metric
-// exporter. Provider-specific fields (GCP project ID, AWS region, ...)
-// land here as #1070/#1071 wire the collector.
-type SinkConfig struct {
-	// ProjectID is the GCP project the exported series should land in,
-	// sent as the x-goog-user-project header on every OTLP export call.
-	// Empty omits the header, leaving project attribution to whatever
-	// quota project ADC itself resolves (e.g. the GCE metadata server's
-	// project on-VM).
-	ProjectID string
-
-	// GRPCConn, when set, is used as the OTLP exporter's gRPC transport
-	// instead of dialing the real Google Cloud OTLP endpoint with TLS +
-	// ADC credentials. Empty in production; tests dial an insecure
-	// in-process fake OTLP collector so the real exporter code path runs
-	// end-to-end without calling GCP.
-	GRPCConn *grpc.ClientConn
-}
-
-// Sink abstracts one cloud provider's metrics backend. GCP is the only
-// implementation in the MVP (gcpSink, gcp.go); AWS is a reserved
-// CloudMetricsProvider enum value with no Sink registered — the server
-// layer returns Unimplemented for it before ever reaching this
-// interface.
-type Sink interface {
-	// NewExporter builds the OTel SDK metric exporter that pushes to
-	// this provider. Not implemented by any Sink as of #1069 — the
-	// CloudExportCollector that would call it lands with #1070/#1071.
-	NewExporter(ctx context.Context, cfg SinkConfig) (sdkmetric.Exporter, error)
-
-	// Probe verifies the host can authenticate to this provider's
-	// monitoring API right now, without emitting anything. Returns nil
-	// when export can proceed; otherwise an error carrying an

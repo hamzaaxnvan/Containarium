@@ -61,3 +61,66 @@ func cpuBox(name, state, ip, cpu string) incus.ContainerInfo {
 // queried, and one container's Incus error skips only that container and is
 // counted.
 func TestStandaloneCPUSampler(t *testing.T) {
+	t0 := time.Unix(1_760_140_800, 0)
+	series := map[string][]int64{ // cumulative counter per tick
+		"a": {100, 160, 220, 5, 20},
+		"b": {0, 30, 60, 90, 120},
+	}
+	cases := []struct {
+		name       string
+		containers []incus.ContainerInfo
+		failing    map[string]bool
+		wantNames  []string // containers expected in emitted samples
+		wantErrors uint64
+		wantCalls  map[string]int
+	}{
+		{
+			name:       "all running sampled, deltas match collector path",
+			containers: []incus.ContainerInfo{cpuBox("a", "Running", "10.0.0.5", "250m"), cpuBox("b", "Running", "10.0.0.6", "2")},
+			wantNames:  []string{"a", "b"},
+			wantCalls:  map[string]int{"a": 5, "b": 5},
+		},
+		{
+			name:       "stopped container never queried",
+			containers: []incus.ContainerInfo{cpuBox("a", "Running", "10.0.0.5", "250m"), cpuBox("b", "Stopped", "", "2")},
+			wantNames:  []string{"a"},
+			wantCalls:  map[string]int{"a": 5},
+		},
+		{
+			name:       "incus error on one container skips it, others sampled, error counted",
+			containers: []incus.ContainerInfo{cpuBox("a", "Running", "10.0.0.5", "250m"), cpuBox("b", "Running", "10.0.0.6", "2")},
+			failing:    map[string]bool{"b": true},
+			wantNames:  []string{"a"},
+			wantErrors: 5,
+			wantCalls:  map[string]int{"a": 5, "b": 5},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &fakeCPUSource{containers: tc.containers, usage: map[string]int64{}, failing: tc.failing}
+			var standalone [][]threatdetect.CPUSample
+			s := NewStandaloneCPUSampler(src, func(smp []threatdetect.CPUSample) { standalone = append(standalone, smp) })
+
+			// Reference: the collector path, fed the same readings the
+			// collector would build for the containers the standalone
+			// sampler could read.
+			var reference [][]threatdetect.CPUSample
+			ref := NewCPUSampler(func(smp []threatdetect.CPUSample) { reference = append(reference, smp) })
+
+			for i := range series["a"] {
+				at := t0.Add(time.Duration(i) * StandaloneCPUSampleInterval)
+				var readings []metrics.ContainerCPUReading
+				for _, ct := range tc.containers {
+					src.usage[ct.Name] = series[ct.Name][i]
+					if ct.State == "Running" && !tc.failing[ct.Name] {
+						readings = append(readings, metrics.ContainerCPUReading{Name: ct.Name, IPAddress: ct.IPAddress, CPULimit: ct.CPU, CPUUsageSeconds: series[ct.Name][i]})
+					}
+				}
+				s.Tick(at)
+				ref.Observe(at, readings)
+			}
+
+			if !reflect.DeepEqual(standalone, reference) {
+				t.Fatalf("standalone samples differ from collector path:\n got  %+v\n want %+v", standalone, reference)
+			}
+			if len(standalone) == 0 {
