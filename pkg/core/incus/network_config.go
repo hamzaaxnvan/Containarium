@@ -19,3 +19,10 @@ func (c *Client) SetNetworkConfigValue(network, key, value string) error {
 	n, etag, err := c.server.GetNetwork(network)
 	if err != nil {
 		return fmt.Errorf("failed to get network %s: %w", network, err)
+	}
+	put := n.Writable()
+	if put.Config == nil {
+		put.Config = map[string]string{}
+	}
+	if value == "" {
+		delete(put.Config, key)

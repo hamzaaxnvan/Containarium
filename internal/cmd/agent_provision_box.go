@@ -33,21 +33,3 @@ Typical flow:
 	RunE: runAgentProvisionBox,
 }
 
-func init() {
-	agentCmd.AddCommand(agentProvisionBoxCmd)
-	agentProvisionBoxCmd.Flags().StringVar(&agentProvisionBoxBackendID, "backend-id", "",
-		"Target backend ID (must be the local backend in v1)")
-	agentProvisionBoxCmd.Flags().StringVar(&agentProvisionBoxPool, "pool", "",
-		"Target pool (not supported in v1)")
-}
-
-func runAgentProvisionBox(cmd *cobra.Command, args []string) error {
-	skillID := args[0]
-
-	c, err := newAgentClient()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = c.Close() }()
-
-	fmt.Printf("Provisioning box for skill %q (no credential needed, no model call)...\n", skillID)
