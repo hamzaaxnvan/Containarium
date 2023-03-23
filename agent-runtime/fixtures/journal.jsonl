@@ -1,0 +1,4 @@
+{"seq":1,"t":"2026-09-28T10:00:00.000Z","kind":"status","text":"run started"}
+{"seq":2,"t":"2026-09-28T10:00:01.000Z","kind":"assistant","text":"I will list the repository first."}
+{"seq":3,"t":"2026-09-28T10:00:02.000Z","kind":"tool_use","tool":"mcp__agent-box__shell","input":"{\"command\":\"ls\"}"}
+{"seq":4,"t":"2026-09-28T10:00:03.000Z","kind":"tool_result","tool":"mcp__agent-box__shell","text":"README.md\nsrc\n"}

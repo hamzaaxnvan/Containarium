@@ -1,0 +1,350 @@
+package incus
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/lxc/incus/v7/shared/api"
+)
+
+// ACLRule represents a single firewall rule
+type ACLRule struct {
+	Action          string // "allow", "drop", "reject"
+	Source          string // CIDR, "@internal", "@external", or empty
+	Destination     string // CIDR, "@internal", "@external", or empty
+	DestinationPort string // "80", "80,443", "1000-2000", or empty
+	Protocol        string // "tcp", "udp", "icmp", or empty
+	Description     string
+}
+
+// ACLConfig holds configuration for creating a network ACL
+type ACLConfig struct {
+	Name         string
+	Description  string
+	IngressRules []ACLRule
+	EgressRules  []ACLRule
+}
+
+// ACLPreset represents predefined firewall configurations
+type ACLPreset string
+
+const (
+	// ACLPresetFullIsolation blocks inter-container traffic, allows only proxy ingress
+	ACLPresetFullIsolation ACLPreset = "full-isolation"
+
+	// ACLPresetHTTPOnly allows HTTP/HTTPS ingress from any source
+	ACLPresetHTTPOnly ACLPreset = "http-only"
+
+	// ACLPresetPermissive allows all traffic
+	ACLPresetPermissive ACLPreset = "permissive"
+)
+
+// GetPresetACL returns ACL rules for a given preset
+func GetPresetACL(preset ACLPreset, proxyIP string, containerNetwork string) ACLConfig {
+	switch preset {
+	case ACLPresetFullIsolation:
+		return ACLConfig{
+			Name:        string(preset),
+			Description: "Full isolation: only allow HTTP from proxy, block inter-container traffic",
+			IngressRules: []ACLRule{
+				{
+					Action:          "allow",
+					Source:          proxyIP,
+					DestinationPort: "80,443,3000,8080",
+					Protocol:        "tcp",
+					Description:     "Allow HTTP/HTTPS from reverse proxy",
+				},
+				{
+					Action:      "drop",
+					Source:      containerNetwork, // e.g., "10.100.0.0/24"
+					Description: "Block all inter-container traffic",
+				},
+				{
+					Action:      "drop",
+					Source:      "@external",
+					Description: "Block all other external traffic",
+				},
+			},
+			EgressRules: []ACLRule{
+				{
+					Action:          "allow",
+					DestinationPort: "53",
+					Protocol:        "udp",
+					Description:     "Allow DNS",
+				},
+				{
+					Action:          "allow",
+					DestinationPort: "443",
+					Protocol:        "tcp",
+					Description:     "Allow HTTPS outbound for APIs",
+				},
+				{
+					Action:      "drop",
+					Destination: containerNetwork,
+					Description: "Block egress to other containers",
+				},
+				{
+					Action:      "allow",
+					Description: "Allow other outbound traffic",
+				},
+			},
+		}
+
+	case ACLPresetHTTPOnly:
+		return ACLConfig{
+			Name:        string(preset),
+			Description: "HTTP only: allow HTTP/HTTPS inbound, standard egress",
+			IngressRules: []ACLRule{
+				{
+					Action:          "allow",
+					DestinationPort: "80,443",
+					Protocol:        "tcp",
+					Description:     "Allow HTTP/HTTPS",
+				},
+				{
+					Action:      "drop",
+					Description: "Block all other inbound",
+				},
+			},
+			EgressRules: []ACLRule{
+				{
+					Action:      "allow",
+					Description: "Allow all outbound",
+				},
+			},
+		}
+
+	case ACLPresetPermissive:
+		return ACLConfig{
+			Name:        string(preset),
+			Description: "Permissive: allow all traffic (development only)",
+			IngressRules: []ACLRule{
+				{
+					Action:      "allow",
+					Description: "Allow all inbound",
+				},
+			},
+			EgressRules: []ACLRule{
+				{
+					Action:      "allow",
+					Description: "Allow all outbound",
+				},
+			},
+		}
+
+	default:
+		// Default to full isolation
+		return GetPresetACL(ACLPresetFullIsolation, proxyIP, containerNetwork)
+	}
+}
+
+// convertRuleToAPI converts our ACLRule to Incus API format
+func convertRuleToAPI(rule ACLRule) api.NetworkACLRule {
+	return api.NetworkACLRule{
+		Action:          rule.Action,
+		Source:          rule.Source,
+		Destination:     rule.Destination,
+		DestinationPort: rule.DestinationPort,
+		Protocol:        rule.Protocol,
+		Description:     rule.Description,
+		State:           "enabled",
+	}
+}
+
+// CreateNetworkACL creates a new network ACL
+func (c *Client) CreateNetworkACL(config ACLConfig) error {
+	// Convert rules to API format
+	var ingressRules []api.NetworkACLRule
+	for _, rule := range config.IngressRules {
+		ingressRules = append(ingressRules, convertRuleToAPI(rule))
+	}
+
+	var egressRules []api.NetworkACLRule
+	for _, rule := range config.EgressRules {
+		egressRules = append(egressRules, convertRuleToAPI(rule))
+	}
+
+	acl := api.NetworkACLsPost{
+		NetworkACLPost: api.NetworkACLPost{
+			Name: config.Name,
+		},
+		NetworkACLPut: api.NetworkACLPut{
+			Description: config.Description,
+			Ingress:     ingressRules,
+			Egress:      egressRules,
+		},
+	}
+
+	if err := c.server.CreateNetworkACL(acl); err != nil {
+		return fmt.Errorf("failed to create network ACL %s: %w", config.Name, err)
+	}
+
+	return nil
+}
+
+// GetNetworkACL gets a network ACL by name
+func (c *Client) GetNetworkACL(name string) (*api.NetworkACL, error) {
+	acl, _, err := c.server.GetNetworkACL(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get network ACL %s: %w", name, err)
+	}
+	return acl, nil
+}
+
+// UpdateNetworkACL updates an existing network ACL
+func (c *Client) UpdateNetworkACL(name string, config ACLConfig) error {
+	// Get current ACL to preserve ETag
+	_, etag, err := c.server.GetNetworkACL(name)
+	if err != nil {
+		return fmt.Errorf("failed to get network ACL %s: %w", name, err)
+	}
+
+	// Convert rules to API format
+	var ingressRules []api.NetworkACLRule
+	for _, rule := range config.IngressRules {
+		ingressRules = append(ingressRules, convertRuleToAPI(rule))
+	}
+
+	var egressRules []api.NetworkACLRule
+	for _, rule := range config.EgressRules {
+		egressRules = append(egressRules, convertRuleToAPI(rule))
+	}
+
+	aclPut := api.NetworkACLPut{
+		Description: config.Description,
+		Ingress:     ingressRules,
+		Egress:      egressRules,
+	}
+
+	if err := c.server.UpdateNetworkACL(name, aclPut, etag); err != nil {
+		return fmt.Errorf("failed to update network ACL %s: %w", name, err)
+	}
+
+	return nil
+}
+
+// DeleteNetworkACL deletes a network ACL
+func (c *Client) DeleteNetworkACL(name string) error {
+	if err := c.server.DeleteNetworkACL(name); err != nil {
+		return fmt.Errorf("failed to delete network ACL %s: %w", name, err)
+	}
+	return nil
+}
+
+// ListNetworkACLs lists all network ACLs
+func (c *Client) ListNetworkACLs() ([]api.NetworkACL, error) {
+	acls, err := c.server.GetNetworkACLs()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list network ACLs: %w", err)
+	}
+	return acls, nil
+}
+
+// AttachACLToContainer attaches a network ACL to a container's network
+// device. It works on the NIC every tenant box actually has — one inherited
+// from the default profile — by shadowing it with an instance-local copy
+// first (EnsureNICDevice), appends to an existing security.acls list rather
+// than overwriting it, and issues no write when the ACL is already attached
+// (#2348).
+func (c *Client) AttachACLToContainer(containerName, aclName, deviceName string) error {
+	if aclName == "" {
+		return fmt.Errorf("attach acl to %s/%s: acl name is required", containerName, deviceName)
+	}
+	return c.editNICACLs(containerName, deviceName, "attach acl "+aclName+" to "+deviceName, func(have []string) []string {
+		for _, name := range have {
+			if name == aclName {
+				return have // already attached; stay silent
+			}
+		}
+		return append(have, aclName)
+	})
+}
+
+// SetOwnedACL makes aclName the only attached ACL whose name starts with
+// ownedPrefix, leaving every other attached ACL alone. It is how a guard that
+// owns a naming family (the tenant guard owns containarium-tenant-*) moves a
+// box to a new ACL without leaving the old one attached: appending alone
+// would stack a previous tenant's allow table on top of the new one. Same
+// profile-NIC shadowing and no-write-when-converged behaviour as
+// AttachACLToContainer.
+func (c *Client) SetOwnedACL(containerName, aclName, deviceName, ownedPrefix string) error {
+	if aclName == "" {
+		return fmt.Errorf("set owned acl on %s/%s: acl name is required", containerName, deviceName)
+	}
+	if ownedPrefix == "" {
+		return fmt.Errorf("set owned acl on %s/%s: owned prefix is required (empty would own every ACL)", containerName, deviceName)
+	}
+	return c.editNICACLs(containerName, deviceName, "set owned acl "+aclName+" on "+deviceName, func(have []string) []string {
+		out := make([]string, 0, len(have)+1)
+		for _, name := range have {
+			if !strings.HasPrefix(name, ownedPrefix) {
+				out = append(out, name)
+			}
+		}
+		return append(out, aclName)
+	})
+}
+
+// editNICACLs applies edit to a NIC's security.acls list. A profile-inherited
+// NIC is shadowed by an instance-local copy carrying the profile's settings in
+// the same write; nothing is written when the resulting list equals the
+// current one.
+func (c *Client) editNICACLs(containerName, deviceName, what string, edit func(have []string) []string) error {
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container %s: %w", containerName, err)
+	}
+	device, local := inst.Devices[deviceName]
+	if !local {
+		expanded, ok := inst.ExpandedDevices[deviceName]
+		if !ok {
+			return fmt.Errorf("device %s not found in container %s", deviceName, containerName)
+		}
+		device = make(map[string]string, len(expanded)+1)
+		for k, v := range expanded {
+			device[k] = v
+		}
+		device["type"] = "nic"
+		device["name"] = deviceName
+	}
+	have := splitACLList(device["security.acls"])
+	want := strings.Join(edit(append([]string(nil), have...)), ",")
+	if local && want == strings.Join(have, ",") {
+		return nil
+	}
+	device["security.acls"] = want
+	if inst.Devices == nil {
+		inst.Devices = map[string]map[string]string{}
+	}
+	inst.Devices[deviceName] = device
+	if err := c.updateInstanceDevices(containerName, inst, etag, what); err != nil {
+		return fmt.Errorf("failed to update ACLs on container: %w", err)
+	}
+	return nil
+}
+
+// splitACLList parses Incus's comma-separated security.acls value.
+func splitACLList(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// DetachACLFromContainer removes a network ACL from a container's network device
+func (c *Client) DetachACLFromContainer(containerName, deviceName string) error {
+	// Get current container configuration
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container %s: %w", containerName, err)
+	}
+
+	// Find the network device
+	device, exists := inst.Devices[deviceName]
+	if !exists {
+		return fmt.Errorf("device %s not found in container %s", deviceName, containerName)
+	}
+
