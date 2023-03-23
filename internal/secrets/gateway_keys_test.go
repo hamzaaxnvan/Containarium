@@ -85,3 +85,46 @@ func TestGatewayKeyLocation(t *testing.T) {
 		})
 	}
 
+	if IsGatewayKeyNamespace("alice") {
+		t.Error("a plain tenant username was mistaken for the reserved namespace")
+	}
+}
+
+// TestReservedNamespaceRefusedOnTenantAPI — the tenant-facing surface refuses
+// the reserved namespace outright, so no RPC that forwards a caller-supplied
+// username can read, list, overwrite, or delete a per-owner gateway key. The
+// zero-value Store has no pool: reaching Postgres would panic, so returning an
+// error proves the guard runs before any DB work.
+func TestReservedNamespaceRefusedOnTenantAPI(t *testing.T) {
+	s := &Store{}
+	ctx := context.Background()
+	const reserved = "__gateway/org:acme"
+
+	if _, err := s.Set(ctx, reserved, "ACMEAI", "k", DeliveryBroker); !errors.Is(err, ErrReservedNamespace) {
+		t.Errorf("Set on the reserved namespace = %v, want ErrReservedNamespace", err)
+	}
+	if _, _, err := s.Get(ctx, reserved, "ACMEAI"); !errors.Is(err, ErrReservedNamespace) {
+		t.Errorf("Get on the reserved namespace = %v, want ErrReservedNamespace", err)
+	}
+	if _, err := s.List(ctx, reserved); !errors.Is(err, ErrReservedNamespace) {
+		t.Errorf("List on the reserved namespace = %v, want ErrReservedNamespace", err)
+	}
+	if err := s.Delete(ctx, reserved, "ACMEAI"); !errors.Is(err, ErrReservedNamespace) {
+		t.Errorf("Delete on the reserved namespace = %v, want ErrReservedNamespace", err)
+	}
+	if _, err := s.LoadAllForUserWithDelivery(ctx, reserved); !errors.Is(err, ErrReservedNamespace) {
+		t.Errorf("LoadAllForUserWithDelivery on the reserved namespace = %v, want ErrReservedNamespace", err)
+	}
+	if _, err := s.BrokerCredential(ctx, reserved, "ACMEAI"); !errors.Is(err, ErrReservedNamespace) {
+		t.Errorf("BrokerCredential on the reserved namespace = %v, want ErrReservedNamespace", err)
+	}
+}
+
+// TestGatewayProviderKey_Roundtrip is the store-integration half: a per-owner
+// key set, read back, rotated and deleted, while the owning tenant's own
+// secret listing and delivery load never see it.
+//
+// Gated on CONTAINARIUM_TEST_DSN, like TestSecretsStore_Roundtrip — the
+// store-integration lane sets it.
+func TestGatewayProviderKey_Roundtrip(t *testing.T) {
+	dsn := os.Getenv("CONTAINARIUM_TEST_DSN")
