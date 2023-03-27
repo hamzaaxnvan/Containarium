@@ -164,3 +164,86 @@ func (r *restActuation) acquire() (*http.Client, func()) {
 	defer r.mu.Unlock()
 	now := r.now()
 	// A transport that is not an *http.Transport cannot be cloned, so the swap
+	// is skipped for it; newRESTActuation always installs an *http.Transport.
+	if tr, ok := r.hc.Transport.(*http.Transport); ok && now.Sub(r.transportBorn) >= maxTransportAge {
+		r.retired = append(r.retired, &retiredClient{hc: r.hc})
+		r.hc = &http.Client{Timeout: r.hc.Timeout, Transport: tr.Clone()}
+		r.transportBorn = now
+		log.Printf("[cloud] control-plane transport older than %s; using a fresh connection", maxTransportAge)
+	}
+	kept := r.retired[:0]
+	for _, rc := range r.retired {
+		if r.inflight[rc.hc] > 0 {
+			rc.idleSwept = false
+			kept = append(kept, rc)
+			continue
+		}
+		rc.hc.CloseIdleConnections()
+		if !rc.idleSwept {
+			rc.idleSwept = true
+			kept = append(kept, rc)
+		}
+	}
+	for i := len(kept); i < len(r.retired); i++ {
+		r.retired[i] = nil
+	}
+	r.retired = kept
+	hc := r.hc
+	if r.inflight == nil {
+		r.inflight = make(map[*http.Client]int)
+	}
+	r.inflight[hc]++
+	return hc, func() {
+		r.mu.Lock()
+		if r.inflight[hc]--; r.inflight[hc] <= 0 {
+			delete(r.inflight, hc)
+		}
+		r.mu.Unlock()
+	}
+}
+
+func newRESTActuation(controlPlane, bearer string) *restActuation {
+	return &restActuation{
+		base:   strings.TrimRight(strings.TrimSpace(controlPlane), "/"),
+		bearer: bearer,
+		// Own transport (a clone of the default, so proxy/HTTP2 behaviour is
+		// unchanged) so CloseIdleConnections affects only this client.
+		hc:            &http.Client{Timeout: 30 * time.Second, Transport: newTransport()},
+		now:           time.Now,
+		transportBorn: time.Now(),
+	}
+}
+
+func newTransport() *http.Transport {
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		return dt.Clone()
+	}
+	return &http.Transport{Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: true}
+}
+
+func (r *restActuation) Heartbeat(ctx context.Context, req *cloudv1.HeartbeatRequest, _ ...grpc.CallOption) (*cloudv1.HeartbeatResponse, error) {
+	var resp cloudv1.HeartbeatResponse
+	if err := r.post(ctx, "/v1/actuation/heartbeat", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (r *restActuation) ReportHostStatus(ctx context.Context, req *cloudv1.ReportHostStatusRequest, _ ...grpc.CallOption) (*cloudv1.ReportHostStatusResponse, error) {
+	var resp cloudv1.ReportHostStatusResponse
+	if err := r.post(ctx, "/v1/actuation/status", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetSSHTrustBundle fetches the CA trust bundle over the RPC's grpc-gateway
+// GET mapping (/v1/actuation/ssh-trust-bundle), carrying known_version as a
+// query parameter the way grpc-gateway maps a GET request's fields by
+// default.
+func (r *restActuation) GetSSHTrustBundle(ctx context.Context, req *cloudv1.GetSSHTrustBundleRequest, _ ...grpc.CallOption) (*cloudv1.GetSSHTrustBundleResponse, error) {
+	path := "/v1/actuation/ssh-trust-bundle"
+	if kv := req.GetKnownVersion(); kv != "" {
+		path += "?known_version=" + url.QueryEscape(kv)
+	}
+	var resp cloudv1.GetSSHTrustBundleResponse
