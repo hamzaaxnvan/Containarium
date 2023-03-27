@@ -1083,3 +1083,545 @@ func (m *Manager) healthCheckAll(ctx context.Context) {
 			log.Printf("[sentinel] failed to switch to maintenance: %v", err)
 		}
 		// First recovery attempt immediately; maybeRetryRecovery then
+		// re-attempts on the backoff schedule while we stay in maintenance.
+		for _, b := range backends {
+			if b.Type == BackendGCP && b.Provider != nil {
+				m.diagnoseAndRecover(ctx, b)
+			}
+		}
+	}
+
+	// Return to the preferred backend once it has recovered and stayed healthy
+	// (#2476); failoverPrimary only ever moves traffic AWAY from it.
+	if anyHealthy {
+		m.maybeFailback()
+	}
+}
+
+// probeBackend is one health probe of a backend, through the test seam if set.
+func (m *Manager) probeBackend(ip string) bool {
+	if m.checkHealthFn != nil {
+		return m.checkHealthFn(ip)
+	}
+	return CheckHealth(ip, m.config.HealthPort, 5*time.Second)
+}
+
+// defaultFailbackChecks is 4 consecutive healthy checks: with the default 15 s
+// interval that is about a minute of stability, a hold-down long enough that a
+// flapping primary does not make traffic oscillate between backends.
+const defaultFailbackChecks = 4
+
+// failbackChecks is the effective threshold: negative = disabled (returns -1),
+// 0 = the default, and never below HealthyThreshold (a backend cannot be failed
+// back to before it is even counted healthy).
+func (m *Manager) failbackChecks() int {
+	n := m.config.FailbackChecks
+	if n < 0 {
+		return -1
+	}
+	if n == 0 {
+		n = defaultFailbackChecks
+	}
+	if n < m.config.HealthyThreshold {
+		n = m.config.HealthyThreshold
+	}
+	return n
+}
+
+// maybeFailback switches the primary back to a healthy backend with a better
+// (lower) Priority than the current one, once it has been healthy for
+// failbackChecks consecutive checks. Backends of equal priority never displace
+// each other. Called only from the health-check goroutine, which is also the
+// only writer of Backend.healthyCount.
+func (m *Manager) maybeFailback() {
+	need := m.failbackChecks()
+	if need < 0 || m.currentState() != StateProxy {
+		return
+	}
+	m.mu.RLock()
+	cur := m.primary
+	m.mu.RUnlock()
+	if cur == nil {
+		return
+	}
+	best := m.backends.SelectPrimary()
+	if best == nil || best == cur || best.Priority >= cur.Priority || best.healthyCount < need {
+		return
+	}
+	checks := best.healthyCount
+	if err := m.doSwitchToProxy(best); err != nil {
+		// The primary is unchanged; try again on the next check. Not logged as
+		// a failback: nothing moved, and a consumer counting "failback:" lines
+		// must not count a refused switch.
+		log.Printf("[sentinel] switch back to %s (%s) refused, staying on %s: %v", best.ID, best.IP, cur.ID, err)
+		return
+	}
+	log.Printf("[sentinel] failback: %s → %s (%s), healthy for %d consecutive checks", cur.ID, best.ID, best.IP, checks)
+	m.recordFailback()
+}
+
+// doSwitchToProxy calls the injected seam when one is set, else the real
+// switchToProxy. Keeps failoverPrimary's control flow exercisable in tests.
+func (m *Manager) doSwitchToProxy(b *Backend) error {
+	if m.switchToProxyFn != nil {
+		return m.switchToProxyFn(b)
+	}
+	return m.switchToProxy(b)
+}
+
+// failoverPrimary switches HTTP forwarding to the next healthy backend.
+func (m *Manager) failoverPrimary(ctx context.Context, failed *Backend) {
+	next := m.backends.SelectPrimary()
+	if next != nil && next != failed {
+		log.Printf("[sentinel] failover: %s → %s (%s)", failed.ID, next.ID, next.IP)
+		if err := m.doSwitchToProxy(next); err != nil {
+			log.Printf("[sentinel] failover failed: %v", err)
+		} else {
+			// Counted only on a switch that actually took effect. A failed
+			// switch is already logged and leaves the primary unchanged, so
+			// counting it would report a failover that never happened.
+			m.recordFailover()
+		}
+	} else {
+		log.Printf("[sentinel] no healthy backend for failover, switching to maintenance")
+		m.outageStart = time.Now()
+		if err := m.switchToMaintenance(); err != nil {
+			log.Printf("[sentinel] failed to switch to maintenance: %v", err)
+		}
+		// Try to recover the failed backend
+		if failed.Provider != nil {
+			m.diagnoseAndRecover(ctx, failed)
+		}
+	}
+}
+
+func (m *Manager) currentState() State {
+	return m.state.Load().(State)
+}
+
+func (m *Manager) switchToProxy(backend *Backend) error {
+	// Stop maintenance HTTP servers
+	if m.stopMaintenance != nil {
+		m.stopMaintenance()
+		m.stopMaintenance = nil
+	}
+
+	m.mu.Lock()
+	m.primary = backend
+	m.mu.Unlock()
+
+	// Immediate cert sync from the primary backend
+	if err := m.certStore.Sync(backend.ID, backend.IP, m.config.HealthPort); err != nil {
+		log.Printf("[sentinel] cert sync on proxy switch failed: %v", err)
+	} else {
+		log.Printf("[sentinel] cert sync on proxy switch: %d certs", m.certStore.SyncedCount())
+	}
+
+	// Immediate key sync from ALL healthy backends + apply
+	for _, b := range m.backends.Healthy() {
+		if err := m.keyStore.Sync(b.ID, b.IP, m.config.HealthPort); err != nil {
+			log.Printf("[sentinel] key sync for %s on proxy switch failed: %v", b.ID, err)
+		}
+		if err := m.keyStore.PushSentinelKey(b.IP, m.config.HealthPort); err != nil {
+			log.Printf("[sentinel] push sentinel key for %s failed: %v", b.ID, err)
+		}
+	}
+	if err := m.keyStore.Apply(); err != nil {
+		log.Printf("[sentinel] key apply on proxy switch failed: %v", err)
+	} else {
+		// Apply() rewrote config.yaml; sshpiperd's yaml plugin re-reads it per
+		// connection, so no restart is needed (and a restart would drop every
+		// live session — issue #301).
+		log.Printf("[sentinel] key sync on proxy switch: %d users", m.keyStore.SyncedCount())
+	}
+
+	// Handle port 443 via ConnMux if available (tunnel/hybrid mode)
+	forwardedPorts := m.config.ForwardedPorts
+	if m.httpsDispatch != nil {
+		forwardedPorts = excludePort(forwardedPorts, m.config.HTTPSPort)
+		m.startHTTPSProxy(backend)
+	}
+
+	// Simple-proxy mode with --proxy-protocol: route :80/:443 through a
+	// userspace TCP forwarder that prepends a PROXY v2 header. Kernel
+	// iptables DNAT can't inject the frame, so without this path the
+	// downstream Caddy never sees the real client IP. Only applies in
+	// non-ConnMux mode — ConnMux already emits PROXY v2 via the SNI
+	// router for its own :443 traffic.
+	if m.config.ProxyProtocol && m.httpsDispatch == nil {
+		userspacePorts := []int{m.config.HTTPPort, m.config.HTTPSPort}
+		forwardedPorts = excludePort(forwardedPorts, m.config.HTTPPort)
+		forwardedPorts = excludePort(forwardedPorts, m.config.HTTPSPort)
+
+		fwd := newUserspaceForwarder(true)
+		if err := fwd.start(backend.IP, userspacePorts); err != nil {
+			fwd.stop()
+			return fmt.Errorf("userspace forwarder: %w", err)
+		}
+		m.userspaceFwd = fwd
+		log.Printf("[sentinel] userspace forwarder active for ports %v → %s (PROXY v2 enabled)",
+			userspacePorts, backend.IP)
+	}
+
+	// Enable iptables forwarding for any remaining ports (everything
+	// except the ones owned by ConnMux or the userspace forwarder).
+	if err := enableForwarding(backend.IP, forwardedPorts); err != nil {
+		return err
+	}
+
+	m.state.Store(StateProxy)
+	log.Printf("[sentinel] mode: PROXY → primary=%s (%s), total backends=%d",
+		backend.ID, backend.IP, m.backends.Count())
+	return nil
+}
+
+func (m *Manager) switchToMaintenance() error {
+	if err := disableForwarding(); err != nil {
+		log.Printf("[sentinel] warning: failed to disable forwarding: %v", err)
+	}
+
+	// Tear down the userspace forwarder if it was running. Safe to call
+	// even when it wasn't started — stop() on an empty listener list is
+	// a no-op.
+	if m.userspaceFwd != nil {
+		m.userspaceFwd.stop()
+		m.userspaceFwd = nil
+	}
+
+	m.mu.Lock()
+	m.primary = nil
+	m.mu.Unlock()
+
+	// If ConnMux is active, switch HTTPS dispatch to maintenance mode
+	if m.httpsDispatch != nil {
+		m.setHTTPSMaintenanceHandler()
+	}
+
+	if m.stopMaintenance == nil {
+		if m.httpsDispatch != nil {
+			// ConnMux mode: only start HTTP maintenance on port 80
+			stop, err := startMaintenanceHTTPOnly(m.config.HTTPPort, m)
+			if err != nil {
+				return err
+			}
+			m.stopMaintenance = stop
+		} else {
+			stop, err := startMaintenanceServers(m.config.HTTPPort, m.config.HTTPSPort, m.certStore, m)
+			if err != nil {
+				return err
+			}
+			m.stopMaintenance = stop
+		}
+	}
+
+	m.state.Store(StateMaintenance)
+	log.Printf("[sentinel] mode: MAINTENANCE → serving maintenance page")
+	return nil
+}
+
+// startHTTPSProxy sets the dispatch handler to proxy HTTPS to the primary backend.
+// HTTPS is forwarded as raw TCP (TLS passthrough) so the backend (Caddy) handles
+// TLS termination with real Let's Encrypt certificates.
+//
+// Routing precedence per connection:
+//  1. If the TLS ClientHello carries an SNI hostname registered in
+//     m.primaries, forward to that primary's IP:Port.
+//  2. Otherwise (no SNI, unknown hostname, or non-TLS), forward to the
+//     backend as before — preserves single-pool / unpooled behavior.
+//
+// How step 2 reaches the backend depends on its type. A tunnel backend's
+// IP is a loopback alias (127.0.0.N) on THIS host, and in ConnMux mode nothing
+// listens on alias:443 except the mux itself (it listens on the wildcard), so
+// a TCP dial to it connects straight back to the sentinel: the connection is
+// routed again, falls back again, and one client connection fans out into an
+// unbounded chain that exhausts memory in a fraction of a second (a 384M
+// cgroup cap is reached in well under a second). A tunnel backend is therefore
+// reached through its tunnel, exactly like a tunnel-promoted primary. Only a
+// backend that is genuinely remote (GCP, in-VPC) is TCP-dialled.
+func (m *Manager) startHTTPSProxy(backend *Backend) {
+	target := net.JoinHostPort(backend.IP, fmt.Sprintf("%d", m.config.HTTPSPort))
+	fb := m.tcpFallbackDial(target)
+	desc := "fallback " + target
+	if backend.Type == BackendTunnel && m.tunnelRegistry != nil {
+		spotID := strings.TrimPrefix(backend.ID, "tunnel-")
+		port := m.config.HTTPSPort
+		fb = func() (net.Conn, error) { return m.tunnelRegistry.DialTunnel(spotID, port) }
+		desc = fmt.Sprintf("fallback via tunnel %s:%d", spotID, port)
+	}
+	m.httpsDispatch.SetHandler(m.buildSNIRoutingHandlerDial(fb))
+	log.Printf("[sentinel] HTTPS proxy started → %s (SNI routing via primary registry)", desc)
+}
+
+// fallbackDial opens the passthrough connection for traffic that matches no
+// registered primary.
+type fallbackDial func() (net.Conn, error)
+
+// errSelfDial is returned for a fallback target that is the sentinel's own
+// HTTPS listener; dialling it would loop (see startHTTPSProxy).
+var errSelfDial = errors.New("fallback target is this sentinel's own HTTPS listener")
+
+// logSelfDialRefused logs a refusal at most once every 30 s; kind says which
+// route tried to dial the sentinel's own listener ("fallback", "primary route").
+func (m *Manager) logSelfDialRefused(kind string) {
+	now := time.Now().UnixNano()
+	last := m.selfDialLogNanos.Load()
+	if now-last < int64(30*time.Second) || !m.selfDialLogNanos.CompareAndSwap(last, now) {
+		return
+	}
+	log.Printf("[sentinel] refusing to dial this sentinel's own HTTPS listener (loopback:%d) for the %s; "+
+		"the connection takes the next route, or is dropped if none is routable", m.config.HTTPSPort, kind)
+}
+
+// tcpFallbackDial returns a fallbackDial that TCP-dials target through
+// dialTCP, so it can never connect back to the sentinel's own mux.
+func (m *Manager) tcpFallbackDial(target string) fallbackDial {
+	return func() (net.Conn, error) { return m.dialTCP(target) }
+}
+
+// dialTCP dials target, refusing any connection that lands on the sentinel's
+// own HTTPS listener (loopback on the HTTPS port: 127.0.0.0/8 is local and the
+// mux listens on the wildcard, so such a connection is always the mux itself,
+// never a backend). Two checks, because a target need not be an IP literal:
+// a literal is refused before dialling, and anything else (a hostname that
+// resolves to loopback) is caught on the connected socket's remote address.
+func (m *Manager) dialTCP(target string) (net.Conn, error) {
+	if m.isOwnHTTPSListener(target) {
+		return nil, errSelfDial
+	}
+	conn, err := sentinelDialer.Dial("tcp", target)
+	if err != nil {
+		return nil, err
+	}
+	if ra, ok := conn.RemoteAddr().(*net.TCPAddr); ok && m.config.HTTPSPort != 0 &&
+		ra.Port == m.config.HTTPSPort && ra.IP.IsLoopback() {
+		_ = conn.Close()
+		return nil, errSelfDial
+	}
+	return conn, nil
+}
+
+// isOwnHTTPSListener reports whether target is a loopback IP literal on the
+// sentinel's HTTPS port. netip is used so an IPv6 literal with a zone
+// ("fe80::1%lo") is parsed, not skipped.
+func (m *Manager) isOwnHTTPSListener(target string) bool {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil || m.config.HTTPSPort == 0 {
+		return false
+	}
+	if p, err := strconv.Atoi(port); err != nil || p != m.config.HTTPSPort {
+		return false
+	}
+	addr, err := netip.ParseAddr(host)
+	return err == nil && addr.Unmap().IsLoopback()
+}
+
+// selfCheckSNI is the ServerName the self-check probe presents. It is
+// deliberately unroutable (`.invalid` is reserved by RFC 2606) so the probe
+// exercises the SNI peek and routing decision without ever being forwarded
+// to a real backend — the pipeline reacts, no tenant connection is opened.
+const selfCheckSNI = "sentinel-self-check.invalid"
+
+// selfCheckProxyPath dials the sentinel's own HTTPS listener and verifies
+// the ConnMux → dispatch → routing pipeline actually reacts within timeout.
+// It does not care WHAT the pipeline decides (complete a handshake, refuse
+// with a TLS alert, fail the SNI lookup and close) — only that something
+// happens. A handshake that hits its deadline with no reaction at all is the
+// wedge this exists to catch: the listener is alive (TCP accepts succeed) but
+// nothing downstream is servicing connections.
+//
+// The probe sends a complete TLS ClientHello, not a fragment (#1598). It
+// previously wrote a single record-layer byte (0x16) and waited to read one
+// back — but a TLS server handed one byte of a record header does exactly
+// what it should: it waits for the rest of the ClientHello. It neither
+// responds nor closes, so the probe timed out against a perfectly healthy
+// pipeline and the sentinel killed itself every ~2 minutes. Letting
+// crypto/tls compose the ClientHello gives the pipeline something it can
+// actually act on, so "no reaction" once again means what it claims to.
+//
+// The two failure kinds are kept distinct:
+//   - a TCP dial failure means our own listener is gone — reported as-is
+//   - a handshake timeout means accepted-but-not-serviced — the wedge
+//
+// Any other handshake outcome, including a certificate or protocol error, is
+// proof of life and reports healthy.
+func (m *Manager) selfCheckProxyPath(timeout time.Duration) error {
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(m.config.HTTPSPort))
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return fmt.Errorf("dial self %s: %w", addr, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	// InsecureSkipVerify is correct here and not a weakening: this is a
+	// liveness probe against our own loopback listener that sends no data
+	// and reads no response body. Verifying the peer would make the probe
+	// fail on exactly the certificate problems it is not measuring — and
+	// during an incident the served cert may legitimately be a fallback.
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         selfCheckSNI,
+		InsecureSkipVerify: true, // #nosec G402 -- liveness probe, see above
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return fmt.Errorf("proxy path unresponsive after %s: %w", timeout, err)
+		}
+		// Alert, EOF, reset, unknown-SNI refusal: the pipeline serviced the
+		// connection within the deadline, which is all this probe asserts.
+	}
+	return nil
+}
+
+// selfCheckOnce runs one self-check iteration given the current
+// consecutive-failure count, returning the updated count and whether the
+// threshold was reached (and exitFn invoked) this call. Split out from
+// runSelfCheckLoop so tests can drive it synchronously without a real
+// ticker, goroutine, or listener.
+func (m *Manager) selfCheckOnce(failures int) (newFailures int, triggered bool) {
+	if m.currentState() != StateProxy {
+		return 0, false
+	}
+
+	check := m.selfCheckFn
+	if check == nil {
+		check = func() error { return m.selfCheckProxyPath(20 * time.Second) }
+	}
+
+	if err := check(); err != nil {
+		failures++
+		log.Printf("[sentinel] self-check failed (%d/%d consecutive): %v",
+			failures, m.config.SelfCheckFailureThreshold, err)
+		if failures >= m.config.SelfCheckFailureThreshold {
+			log.Printf("[sentinel] self-check failed %d times in a row while the backend reports healthy — the proxy pipeline is wedged; restarting process (systemd Restart=always recreates it)", failures)
+			m.exitFn()
+			return failures, true
+		}
+		return failures, false
+	}
+	return 0, false
+}
+
+// runSelfCheckLoop periodically probes the sentinel's OWN externally-facing
+// proxy path end-to-end (selfCheckProxyPath), independent of and in
+// addition to healthCheckAll's backend-only health check. See
+// Config.SelfCheckFailureThreshold for why this exists. No-op when the
+// self-check is disabled (threshold <= 0) or the sentinel isn't running
+// ConnMux/hybrid mode (httpsDispatch == nil), since that's the pipeline
+// being probed.
+func (m *Manager) runSelfCheckLoop(ctx context.Context) {
+	if m.config.SelfCheckFailureThreshold <= 0 || m.httpsDispatch == nil {
+		return
+	}
+	interval := m.config.CheckInterval
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		var triggered bool
+		failures, triggered = m.selfCheckOnce(failures)
+		if triggered {
+			return
+		}
+	}
+}
+
+// buildSNIRoutingHandler returns a connection handler that peeks SNI from
+// each incoming TLS ClientHello and forwards the connection to the primary
+// registered for that hostname, falling back to fallbackTarget on miss.
+//
+// Routing precedence:
+//  1. Exact Hostname/Alias match (LookupByHostname).
+//  2. BaseDomain suffix match (LookupByBaseDomainSuffix) — routes ad-hoc
+//     container subdomains like "blog.containarium.dev" to whichever
+//     primary registered BaseDomain="containarium.dev". See
+//     docs/PER-POOL-BASE-DOMAIN.md.
+//  3. No primary match → TCP-dial fallbackTarget (legacy single-backend
+//     behavior).
+//
+// Inside each match path, the dial target depends on whether the primary
+// is tunnel-promoted: BackendID set → yamux stream via the tunnel
+// registry (avoids a sentinel-side TCP listener that would collide with
+// ConnMux on :443); BackendID empty → TCP dial to Primary.IP:Port.
+func (m *Manager) buildSNIRoutingHandler(fallbackTarget string) func(net.Conn) {
+	return m.buildSNIRoutingHandlerDial(m.tcpFallbackDial(fallbackTarget))
+}
+
+// buildSNIRoutingHandlerDial is buildSNIRoutingHandler with the fallback
+// connection supplied by fallback (a TCP dial, or a tunnel stream).
+func (m *Manager) buildSNIRoutingHandlerDial(fallback fallbackDial) func(net.Conn) {
+	return func(conn net.Conn) {
+		defer func() { _ = conn.Close() }()
+
+		// Bound the SNI peek so a stalled client can't hold the connection.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		sni, peekedConn, peekErr := peekSNI(conn)
+		_ = conn.SetReadDeadline(time.Time{})
+
+		// The watchdog measures our mux/dispatch/router, independently of
+		// backend health (#1139). An unmatched SNI normally uses the fallback,
+		// so .invalid alone did not keep this probe local: a blackholed backend
+		// made a healthy sentinel exit. Closing here proves the entire local
+		// path serviced the ClientHello, before any tenant route or dial.
+		if peekErr == nil && sni == selfCheckSNI {
+			return
+		}
+
+		var (
+			dst net.Conn
+			err error
+		)
+		if peekErr == nil && sni != "" {
+			// BYOC public ingress (#733): a cloud-pushed subdomain binding
+			// for a box on a tunnel host. Unlike the primary path (raw TLS
+			// passthrough to a host that terminates), the BYOC host has no
+			// cert — so the sentinel terminates TLS here with the wildcard
+			// it already holds and plaintext-forwards to the box over the
+			// tunnel. serveBYOCIngress takes over the connection entirely.
+			if m.byocRoutes != nil {
+				if route, ok := m.byocRoutes.Lookup(sni); ok {
+					m.serveBYOCIngress(peekedConn, route)
+					return
+				}
+			}
+			p := m.primaries.LookupByHostname(sni)
+			if p == nil {
+				p = m.primaries.LookupByBaseDomainSuffix(sni)
+			}
+			if p != nil {
+				if p.BackendID != "" && m.tunnelRegistry != nil {
+					// Tunnel-promoted primary: yamux directly.
+					spotID := strings.TrimPrefix(p.BackendID, "tunnel-")
+					dst, err = m.tunnelRegistry.DialTunnel(spotID, p.Port)
+				} else {
+					// In-VPC primary: TCP dial.
+					target := net.JoinHostPort(p.IP, fmt.Sprintf("%d", p.Port))
+					dst, err = m.dialTCP(target)
+					if errors.Is(err, errSelfDial) {
+						m.logSelfDialRefused("primary route")
+						dst = nil // never dial our own mux; fall through to the fallback
+					}
+				}
+			}
+		}
+		if dst == nil {
+			// No primary match (or yamux/TCP failed): fall back.
+			dst, err = fallback()
+			if errors.Is(err, errSelfDial) {
+				m.logSelfDialRefused("fallback")
+			}
+		}
+		if err != nil || dst == nil {
+			return
+		}

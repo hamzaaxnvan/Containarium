@@ -137,3 +137,50 @@ func TestCreateUser_UsesTheBackendsTimedExecWhenAvailable(t *testing.T) {
 		t.Fatal("ExecWithTimeout was never called")
 	}
 	if gotTimeout != createUserTimeout {
+		t.Errorf("timeout = %s, want createUserTimeout (%s)", gotTimeout, createUserTimeout)
+	}
+}
+
+// TestCreateUser_WedgedExecReturnsAnErrorInsteadOfHanging: mutation-shaped
+// proof that a backend reporting a timeout actually surfaces as createUser
+// returning an error — not silently swallowed, not blocking forever.
+func TestCreateUser_WedgedExecReturnsAnErrorInsteadOfHanging(t *testing.T) {
+	mock := incustest.NewMockBackend()
+	mock.ExecWithTimeoutFunc = func(_ string, _ []string, timeout time.Duration) error {
+		return errWedgedForTest
+	}
+	m := NewWithBackend(mock)
+
+	done := make(chan error, 1)
+	go func() { done <- m.createUser("c", "alice", ostype.Debian) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("want an error when the backend reports a wedged exec, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("createUser did not return — it hung despite the backend reporting an error")
+	}
+}
+
+// A hostile username must reach the script only inside single quotes —
+// the quoted rendition appears, the raw breakout never does.
+func TestCreateUser_HostileUsernameIsQuoted(t *testing.T) {
+	const evil = "eve'; touch /pwned; '"
+	mock, rec := newSeedBackend()
+	m := NewWithBackend(mock)
+
+	if err := m.createUser("c", evil, ostype.Debian); err != nil {
+		t.Fatalf("createUser: %v", err)
+	}
+	script := rec.execs[0][2]
+	if !strings.Contains(script, shellQuote(evil)) {
+		t.Errorf("script does not contain the quoted username:\n%s", script)
+	}
+	if strings.Contains(script, "'"+evil+"'") {
+		t.Errorf("script contains a naively-quoted breakout:\n%s", script)
+	}
+}
+
+func TestAddSSHKeys_StagesOnceThenPlacesOnce(t *testing.T) {
