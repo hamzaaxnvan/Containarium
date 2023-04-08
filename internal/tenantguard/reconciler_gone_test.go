@@ -63,3 +63,36 @@ func TestReconcile_InstanceRemovedMidPassIsSkippedNotFailed(t *testing.T) {
 		}
 		if e.Attached {
 			attached++
+		}
+	}
+	if attached != 3 {
+		t.Errorf("attached = %d, want the 3 boxes that remain", attached)
+	}
+}
+
+// A dataset error for an instance that is STILL listed once the re-checks run
+// out is a real fault and is reported, never hidden as a race.
+func TestReconcile_DatasetErrorOnAnInstanceThatStaysIsStillAnError(t *testing.T) {
+	fastGoneChecks(t)
+	f := twoTenantHost()
+	f.ensureErrs = map[string]error{"bob-container": errDatasetGone}
+
+	r := NewReconciler(f, enforceCfg())
+	err := r.ReconcileOnce(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "dataset does not exist") {
+		t.Fatalf("err = %v, want the dataset error reported", err)
+	}
+	var found bool
+	for _, e := range r.Status().Entries {
+		if e.Container == "bob-container" {
+			found = true
+			if e.Attached || e.LastError == "" {
+				t.Errorf("entry should carry the error: %+v", e)
+			}
+		}
+	}
+	if !found {
+		t.Error("the failing box is missing from the status")
+	}
+}
+

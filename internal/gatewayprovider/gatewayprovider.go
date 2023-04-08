@@ -42,25 +42,3 @@ func Name(p pb.GatewayProvider) (string, error) {
 		return "", fmt.Errorf("unknown provider (enum value %d)", int32(p))
 	}
 	return strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(name, enumPrefix), "_", "-")), nil
-}
-
-// FromName is Name's inverse, for the CLI's --provider flag.
-func FromName(name string) (pb.GatewayProvider, error) {
-	want := strings.TrimSpace(strings.ToLower(name))
-	if want == "" {
-		return pb.GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED,
-			fmt.Errorf("provider is required (one of: %s)", strings.Join(Names(), ", "))
-	}
-	for value := range pb.GatewayProvider_name {
-		p := pb.GatewayProvider(value)
-		if p == pb.GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED {
-			continue
-		}
-		if got, err := Name(p); err == nil && got == want {
-			return p, nil
-		}
-	}
-	return pb.GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED,
-		fmt.Errorf("unknown provider %q (one of: %s)", name, strings.Join(Names(), ", "))
-}
-
