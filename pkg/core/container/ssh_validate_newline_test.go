@@ -31,3 +31,20 @@ func TestValidateSSHPublicKey_RejectsEmbeddedCR(t *testing.T) {
 	err := ValidateSSHPublicKey(key)
 	if err == nil {
 		t.Fatal("embedded CR must be rejected")
+	}
+}
+
+func TestValidateSSHPublicKey_RejectsEmbeddedCRLF(t *testing.T) {
+	key := "ssh-ed25519 AAAA\r\nfoo user@host"
+	err := ValidateSSHPublicKey(key)
+	if err == nil {
+		t.Fatal("embedded CRLF must be rejected")
+	}
+}
+
+func TestValidateSSHPublicKey_AcceptsRealKey(t *testing.T) {
+	// Real ed25519 public key (throwaway, never used as auth).
+	// The TrimSpace in the validator means leading/trailing
+	// whitespace is fine; embedded newlines aren't.
+	key := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK8gYz2sUYIvKVoB1aZmJC1hY4yYR8nM8GxTk8nL7sWP user@test"
+	if err := ValidateSSHPublicKey(key); err != nil {
