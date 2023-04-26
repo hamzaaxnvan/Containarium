@@ -153,3 +153,158 @@ export default function Home() {
   const [firewallEditorOpen, setFirewallEditorOpen] = useState(false);
   const [selectedContainer, setSelectedContainer] = useState<string | null>(null);
   const { acl, isLoading: aclLoading, updateACL } = useContainerACL(activeServer, selectedContainer || '');
+
+  const [collaboratorContainer, setCollaboratorContainer] = useState<string | null>(null);
+  const { collaborators, isLoading: collaboratorsLoading, addCollaborator, removeCollaborator } = useCollaborators(activeServer, collaboratorContainer);
+
+  const metricsMap = useMemo(() => {
+    const map: Record<string, ContainerMetricsWithRate> = {};
+    for (const m of metrics) map[m.name] = m;
+    return map;
+  }, [metrics]);
+
+  const containerNames = useMemo(() => containers.map(c => c.name), [containers]);
+  const { badgesMap: securityBadgesMap } = useContainerSecurityBadges(activeServer, containerNames);
+  const isAdmin = useMemo(() => isAdminToken(activeServer?.token || ''), [activeServer?.token]);
+
+  const [serverDialogOpen, setServerDialogOpen] = useState(false);
+  const [editingServer, setEditingServer] = useState<Server | null>(null);
+  const [createContainerOpen, setCreateContainerOpen] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState<{ open: boolean; containerName: string }>({ open: false, containerName: '' });
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalUsername, setTerminalUsername] = useState('');
+  const [labelEditorOpen, setLabelEditorOpen] = useState(false);
+  const [labelEditorContainer, setLabelEditorContainer] = useState<{ username: string; labels: Record<string, string> } | null>(null);
+  const [resizeDialogOpen, setResizeDialogOpen] = useState(false);
+  const [resizeTarget, setResizeTarget] = useState<{ username: string; cpu: string; memory: string; disk: string } | null>(null);
+  const [autoSleepTarget, setAutoSleepTarget] = useState<{ username: string; enabled: boolean; threshold: number } | null>(null);
+  const [securityDialogContainer, setSecurityDialogContainer] = useState<{ name: string; username: string } | null>(null);
+
+  const handleEditServer = (serverId: string) => {
+    const server = servers.find(s => s.id === serverId);
+    if (server) { setEditingServer(server); setServerDialogOpen(true); }
+  };
+
+  const handleConfirmDelete = async () => {
+    await deleteContainer(deleteConfirm.containerName, true);
+  };
+
+  const handleCloseTerminal = () => { setTerminalOpen(false); setTerminalUsername(''); };
+
+  const handleEditLabels = (username: string, labels: Record<string, string>) => {
+    setLabelEditorContainer({ username, labels });
+    setLabelEditorOpen(true);
+  };
+
+  const handleOpenResize = (username: string, currentResources: { cpu: string; memory: string; disk: string }) => {
+    setResizeTarget({ username, ...currentResources });
+    setResizeDialogOpen(true);
+  };
+
+  const handleResize = async (resources: { cpu?: string; memory?: string; disk?: string }) => {
+    if (!resizeTarget) return;
+    await resizeContainer(resizeTarget.username, resources);
+  };
+
+  const handleOpenAutoSleep = (username: string, current: { enabled: boolean; threshold: number }) => {
+    setAutoSleepTarget({ username, ...current });
+  };
+
+  const handleAutoSleepSave = async (enabled: boolean, idleThresholdMinutes: number) => {
+    if (!autoSleepTarget) return;
+    await toggleAutoSleep(autoSleepTarget.username, enabled, idleThresholdMinutes);
+  };
+
+  const handleEditContainerFirewall = (username: string) => {
+    setSelectedContainer(username);
+    setFirewallEditorOpen(true);
+  };
+
+  const handleRefreshNetwork = () => {
+    refreshRoutes();
+    refreshTopology();
+    refreshDNS();
+  };
+
+  if (serversLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-[var(--background)]">
+        <Loader2 size={24} className="animate-spin text-[var(--text-secondary)]" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-screen flex-col overflow-hidden bg-[var(--background)]">
+      <AppBar onAddServer={() => setServerDialogOpen(true)} />
+
+      <ServerTabs
+        servers={servers}
+        activeServerId={activeServerId}
+        onServerChange={setActiveServerId}
+        onRemoveServer={removeServer}
+        onEditServer={handleEditServer}
+      />
+
+      {servers.length === 0 ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2">
+          <p className="text-sm font-medium text-[var(--text)]">No servers added</p>
+          <p className="text-xs text-[var(--text-secondary)]">Click &ldquo;Add Server&rdquo; to connect to a Containarium server</p>
+        </div>
+      ) : activeServer ? (
+        <>
+          {/* View tab bar */}
+          <div className="flex items-end gap-0 overflow-x-auto border-b border-[var(--border-subtle)] bg-[var(--surface)] px-4 shrink-0">
+            {TABS.map(({ label, icon: Icon }, i) => {
+              if (i === 5 && !isAdmin) return null;
+              return (
+                <button
+                  key={label}
+                  onClick={() => setViewTab(i)}
+                  className={[
+                    'flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium transition-colors border-b-2 -mb-px',
+                    viewTab === i
+                      ? 'border-[var(--accent)] text-[var(--accent)]'
+                      : 'border-transparent text-[var(--text-secondary)] hover:text-[var(--text)]',
+                  ].join(' ')}
+                >
+                  <Icon size={13} />
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Tab content */}
+          <div className="flex-1 overflow-auto">
+            {viewTab === 0 && (
+              <ContainerTopology
+                containers={containers}
+                coreServices={coreServices}
+                metricsMap={metricsMap}
+                securityBadgesMap={securityBadgesMap}
+                systemInfo={systemInfo}
+                isLoading={containersLoading}
+                error={containersError as Error | null}
+                onCreateContainer={() => setCreateContainerOpen(true)}
+                onDeleteContainer={(u) => setDeleteConfirm({ open: true, containerName: u })}
+                onStartContainer={startContainer}
+                onStopContainer={stopContainer}
+                onTerminalContainer={(u) => { setTerminalUsername(u); setTerminalOpen(true); }}
+                onEditFirewall={handleEditContainerFirewall}
+                onEditLabels={handleEditLabels}
+                onResize={handleOpenResize}
+                onManageCollaborators={(u) => setCollaboratorContainer(u)}
+                onToggleAutoSleep={handleOpenAutoSleep}
+                onRefresh={refreshContainers}
+                backends={backends}
+                onSelectBackend={getSystemInfoForBackend}
+                onSecurityClick={(name) => {
+                  const c = containers.find(x => x.name === name);
+                  if (c) setSecurityDialogContainer({ name, username: c.username || name });
+                }}
+              />
+            )}
+            {viewTab === 1 && (
+              <AppsView
+                apps={apps}
