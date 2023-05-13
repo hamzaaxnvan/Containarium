@@ -44,3 +44,49 @@ func TestStampBirthTTL_StampsExpiry(t *testing.T) {
 	if c.kind != "set" || c.name != "alice-container" || c.key != incus.TTLExpiresAtKey {
 		t.Errorf("call = %+v, want set alice-container/%s", c, incus.TTLExpiresAtKey)
 	}
+	stamped, err := time.Parse(time.RFC3339, c.value)
+	if err != nil {
+		t.Fatalf("stamped value %q not RFC3339: %v", c.value, err)
+	}
+	lo := before.Add(30 * time.Minute).Add(-2 * time.Second)
+	hi := after.Add(30 * time.Minute).Add(2 * time.Second)
+	if stamped.Before(lo) || stamped.After(hi) {
+		t.Errorf("stamped expiry %s outside [%s, %s]", stamped, lo, hi)
+	}
+}
+
+// TestStampBirthTTL_FailureDeletesBox — if the TTL can't be stamped, the box
+// is deleted and an Internal error is returned: a box that asked to be
+// ephemeral but would leak forever is worse than no box (default-dead, #522).
+func TestStampBirthTTL_FailureDeletesBox(t *testing.T) {
+	s, _, mock := newTTLTestServer(t, map[string]*incus.ContainerInfo{
+		"alice-container": {Name: "alice-container", State: "Running"},
+	})
+	mock.SetConfigFunc = func(string, string, string) error {
+		return errors.New("incus config write failed")
+	}
+	deletedName := ""
+	mock.DeleteContainerFunc = func(name string) error { deletedName = name; return nil }
+
+	err := s.stampBirthTTL(context.Background(), "alice-container", "alice", 1800)
+	if err == nil {
+		t.Fatal("expected an error when the TTL stamp fails")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.Internal {
+		t.Errorf("error = %v, want Internal status", err)
+	}
+	if deletedName != "alice-container" {
+		t.Errorf("box not deleted on stamp failure: deletedName=%q want alice-container", deletedName)
+	}
+}
+
+// TestStampBirthAutoSleep_EnablesWithThreshold — #524: a create-time idle-stop
+// enables auto-sleep at birth by writing the same two Incus keys ToggleAutoSleep
+// uses, so the box is born with its idle→stop timer (no separate toggle call).
+func TestStampBirthAutoSleep_EnablesWithThreshold(t *testing.T) {
+	s, calls, _ := newTTLTestServer(t, map[string]*incus.ContainerInfo{
+		"alice-container": {Name: "alice-container", State: "Running"},
+	})
+	s.stampBirthAutoSleep("alice-container", 20)
+
+	if len(*calls) != 2 {
