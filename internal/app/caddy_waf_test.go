@@ -32,3 +32,37 @@ func TestDefaultWAFDirectives(t *testing.T) {
 	}
 	// Both load the CRS.
 	for _, d := range []string{on, off} {
+		if !strings.Contains(d, "@owasp_crs") || !strings.Contains(d, "@coraza.conf-recommended") {
+			t.Errorf("directives should include the CRS + coraza baseline: %q", d)
+		}
+	}
+}
+
+func TestPrependWAF(t *testing.T) {
+	rp := CaddyReverseProxyHandler{Handler: "reverse_proxy"}
+	base := []CaddyHandler{rp}
+
+	// Disabled → unchanged slice (byte-identical routes when WAF is off).
+	if got := PrependWAF(base, false, "x"); len(got) != 1 || got[0].HandlerName() != "reverse_proxy" {
+		t.Fatalf("disabled PrependWAF changed the chain: %+v", got)
+	}
+
+	// Enabled → WAF first, then reverse_proxy (inspect before forward).
+	got := PrependWAF(base, true, "SecRuleEngine On")
+	if len(got) != 2 || got[0].HandlerName() != "waf" || got[1].HandlerName() != "reverse_proxy" {
+		t.Fatalf("enabled PrependWAF order wrong: %+v", got)
+	}
+	if w, ok := got[0].(CaddyWAFHandler); !ok || w.Directives != "SecRuleEngine On" {
+		t.Fatalf("WAF handler not carrying directives: %+v", got[0])
+	}
+}
+
+// TestAddRoute_WAFDisabledByteIdentical guards that with WAF off, a programmed
+// route's JSON is exactly what it was before this change — i.e. the []CaddyHandler
+// switch is invisible to live ingress.
+func TestAddRoute_WAFDisabledByteIdentical(t *testing.T) {
+	handler := CaddyReverseProxyHandler{
+		Handler:   "reverse_proxy",
+		Upstreams: []CaddyUpstreamTyped{{Dial: "10.0.0.5:8080"}},
+	}
+	// WAF off → single reverse_proxy handler.
