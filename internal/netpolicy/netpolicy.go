@@ -152,3 +152,80 @@ func Compile(p *pb.NetworkPolicy) (CompiledPolicy, error) {
 	}
 
 	return CompiledPolicy{
+		Tenant:           tenant,
+		AllowIntraTenant: p.GetAllowIntraTenant(),
+		EgressCIDRs:      cidrs,
+		EgressDomains:    domains,
+		AllowMetadata:    p.GetAllowMetadata(),
+		Mode:             mode,
+		LogOnly:          mode != pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE,
+		DenyRules:        deny,
+		AllowFromTenants: allowFrom,
+		EgressPreset:     p.GetEgressPreset(),
+		EgressMode:       p.GetEgressMode(),
+	}, nil
+}
+
+// ImplicitEgress returns the destinations the policy allows without the
+// operator listing them: for ALLOW_LIST_ONLY, the box's DNS resolver, which is
+// the bridge gateway. Name resolution is itself egress, so an enforced
+// allow-list that omits it blackholes the box (the runbook's standing
+// warning); the preset makes that mistake impossible. The gateway is the
+// daemon's to know, so it is passed in; an invalid address yields nothing and
+// the caller logs it. Callers fold the result into the egress set; it is not
+// stored on the policy, so `get` shows what the operator wrote.
+func ImplicitEgress(p CompiledPolicy, gateway netip.Addr) []netip.Prefix {
+	if p.EgressPreset != pb.EgressPreset_EGRESS_PRESET_ALLOW_LIST_ONLY || !gateway.IsValid() || !gateway.Is4() {
+		return nil
+	}
+	return []netip.Prefix{netip.PrefixFrom(gateway, 32)}
+}
+
+// compileAllowFromTenants trims, drops empties, dedups and sorts the list,
+// and refuses the tenant's own name — same-tenant traffic is
+// allow_intra_tenant's switch, and a self entry would read as if it did
+// something.
+func compileAllowFromTenants(tenant string, in []string) ([]string, error) {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range in {
+		t := strings.TrimSpace(raw)
+		if t == "" || seen[t] {
+			continue
+		}
+		if t == tenant {
+			return nil, fmt.Errorf("network policy: allow_from_tenants must not list the tenant itself (%q); use allow_intra_tenant for same-tenant traffic", t)
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// ToProto renders a CompiledPolicy back into a NetworkPolicy message — the
+// normalized form to persist and echo to callers (masked/deduped/sorted CIDRs,
+// normalized domains, resolved mode).
+func (c CompiledPolicy) ToProto() *pb.NetworkPolicy {
+	cidrs := make([]string, len(c.EgressCIDRs))
+	for i, p := range c.EgressCIDRs {
+		cidrs[i] = p.String()
+	}
+	var deny []*pb.NetworkPolicyDenyRule
+	if len(c.DenyRules) > 0 {
+		deny = make([]*pb.NetworkPolicyDenyRule, len(c.DenyRules))
+		for i, d := range c.DenyRules {
+			var exp string
+			if !d.ExpiresAt.IsZero() {
+				exp = d.ExpiresAt.UTC().Format(time.RFC3339)
+			}
+			deny[i] = &pb.NetworkPolicyDenyRule{
+				Cidr:      d.CIDR.String(),
+				Port:      uint32(d.Port),
+				Proto:     protoName(d.Proto),
+				Note:      d.Note,
+				ExpiresAt: exp,
+			}
+		}
+	}
+	return &pb.NetworkPolicy{
