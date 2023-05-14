@@ -203,3 +203,209 @@ EOF
         log_success "Incus initialized"
     else
         log_info "Incus already initialized"
+    fi
+}
+
+configure_zfs() {
+    log_info "Configuring ZFS..."
+
+    # Some kernel flavors (for example the Debian cloud kernel) ship without
+    # the ZFS module. Skip ZFS setup there instead of failing the install.
+    if ! lsmod | grep -q zfs; then
+        log_info "Loading ZFS kernel module..."
+        if ! modprobe zfs 2>/dev/null; then
+            log_warn "ZFS kernel module not available for $(uname -r); skipping ZFS setup"
+            return 0
+        fi
+    fi
+
+    # Ensure ZFS loads on boot
+    if ! grep -q "^zfs$" /etc/modules-load.d/zfs.conf 2>/dev/null; then
+        echo "zfs" > /etc/modules-load.d/zfs.conf
+        log_success "ZFS module configured to load on boot"
+    fi
+
+    log_success "ZFS configured"
+}
+
+configure_kernel_modules() {
+    log_info "Configuring kernel modules for Docker support..."
+
+    # Required modules for Docker in containers
+    MODULES=("overlay" "br_netfilter" "nf_nat")
+
+    for module in "${MODULES[@]}"; do
+        if ! lsmod | grep -q "^$module"; then
+            log_info "Loading kernel module: $module"
+            modprobe "$module"
+        fi
+
+        if ! grep -q "^$module$" /etc/modules-load.d/containarium.conf 2>/dev/null; then
+            echo "$module" >> /etc/modules-load.d/containarium.conf
+        fi
+    done
+
+    log_success "Kernel modules configured"
+}
+
+install_containarium_binary() {
+    log_info "Installing Containarium binary..."
+
+    # Determine architecture
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64)
+            ARCH="amd64"
+            ;;
+        aarch64)
+            ARCH="arm64"
+            ;;
+        *)
+            log_error "Unsupported architecture: $ARCH"
+            exit 1
+            ;;
+    esac
+
+    # Download binary
+    if [ "$CONTAINARIUM_VERSION" == "latest" ]; then
+        DOWNLOAD_URL="https://github.com/footprintai/containarium/releases/latest/download/containariumd-linux-${ARCH}"
+    else
+        DOWNLOAD_URL="https://github.com/footprintai/containarium/releases/download/${CONTAINARIUM_VERSION}/containariumd-linux-${ARCH}"
+    fi
+
+    log_info "Downloading from: $DOWNLOAD_URL"
+
+    if ! curl -fsSL "$DOWNLOAD_URL" -o /tmp/containariumd; then
+        log_error "Failed to download Containarium binary"
+        log_info "Please check if the release exists: https://github.com/footprintai/containarium/releases"
+        exit 1
+    fi
+
+    # Install binary. #1781 (design doc, Rollout Phase 1): installs as
+    # containariumd; the pre-#1780 name keeps working as a compat symlink for
+    # any runbook/cron this inventory missed.
+    install -m 755 /tmp/containariumd "$INSTALL_DIR/containariumd"
+    ln -sf "$INSTALL_DIR/containariumd" "$INSTALL_DIR/containarium"
+    rm /tmp/containariumd
+
+    # Verify installation
+    INSTALLED_VERSION=$("$INSTALL_DIR/containariumd" version)
+    log_success "Containarium installed: $INSTALLED_VERSION"
+}
+
+generate_tls_certificates() {
+    log_info "Generating TLS certificates for mTLS..."
+
+    # Check if certificates already exist
+    if [ -f "$CONFIG_DIR/certs/server.crt" ]; then
+        log_info "TLS certificates already exist"
+        return 0
+    fi
+
+    # Generate certificates
+    "$INSTALL_DIR/containariumd" cert generate --output "$CONFIG_DIR/certs"
+
+    log_success "TLS certificates generated: $CONFIG_DIR/certs"
+}
+
+setup_jwt_secret() {
+    log_info "Setting up JWT secret for REST API..."
+
+    # Create config directory
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+
+    # Generate JWT secret if it doesn't exist
+    if [ ! -f "$CONFIG_DIR/jwt.secret" ]; then
+        openssl rand -base64 32 > "$CONFIG_DIR/jwt.secret"
+        chmod 600 "$CONFIG_DIR/jwt.secret"
+        log_success "JWT secret generated: $CONFIG_DIR/jwt.secret"
+    else
+        log_info "JWT secret already exists: $CONFIG_DIR/jwt.secret"
+    fi
+}
+
+create_systemd_service() {
+    log_info "Creating systemd service via 'containariumd service install'..."
+
+    # The binary manages its own service file, JWT secret generation,
+    # systemd reload, enable, and start — all in one command.
+    /usr/local/bin/containariumd service install
+
+    log_success "Systemd service created"
+}
+
+setup_firewall() {
+    log_info "Configuring firewall..."
+
+    # Check if ufw is installed
+    if command -v ufw &> /dev/null; then
+        # Allow SSH
+        ufw allow 22/tcp comment 'SSH' || true
+
+        # Allow gRPC
+        # The daemon serves an external gRPC listener only with --mtls; without
+        # it 50051 has nothing behind it, so leave the port closed (#3063).
+        if [ "${ENABLE_MTLS:-0}" = "1" ]; then
+            ufw allow 50051/tcp comment 'Containarium gRPC (mTLS)' || true
+        fi
+
+        # Allow REST API
+        ufw allow 8080/tcp comment 'Containarium REST API' || true
+
+        # Enable firewall if not already enabled
+        if ! ufw status | grep -q "Status: active"; then
+            log_warn "UFW is installed but not active. Enable with: sudo ufw enable"
+        else
+            log_success "Firewall rules configured"
+        fi
+    else
+        log_warn "UFW not installed. Consider installing for security: apt install ufw"
+    fi
+}
+
+generate_initial_token() {
+    log_info "Generating initial admin token..."
+
+    if [ -f "$CONFIG_DIR/jwt.secret" ]; then
+        TOKEN=$("$INSTALL_DIR/containariumd" token generate \
+            --username admin \
+            --roles admin \
+            --expiry 720h \
+            --secret-file "$CONFIG_DIR/jwt.secret" 2>/dev/null | grep "^eyJ" || echo "")
+
+        if [ -n "$TOKEN" ]; then
+            echo "$TOKEN" > "$CONFIG_DIR/admin.token"
+            chmod 600 "$CONFIG_DIR/admin.token"
+            log_success "Admin token saved to: $CONFIG_DIR/admin.token"
+        fi
+    fi
+}
+
+print_completion_message() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo -e "${GREEN}  ✅ Containarium Installation Complete!${NC}"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+    echo "📦 Installed Components:"
+    echo "   • Containarium $(containarium version)"
+    echo "   • Incus $(incus --version)"
+    echo "   • ZFS kernel module"
+    echo ""
+    echo "🔧 Configuration:"
+    echo "   • Config directory: $CONFIG_DIR"
+    echo "   • JWT secret: $CONFIG_DIR/jwt.secret"
+    if [ -f "$CONFIG_DIR/admin.token" ]; then
+        echo "   • Admin token: $CONFIG_DIR/admin.token"
+    fi
+    echo "   • Systemd service: /etc/systemd/system/containarium.service"
+    echo ""
+    echo "🚀 Next Steps:"
+    echo ""
+    echo "   1. Start the daemon:"
+    echo "      sudo systemctl start containarium"
+    echo ""
+    echo "   2. Enable auto-start on boot:"
+    echo "      sudo systemctl enable containarium"
+    echo ""
