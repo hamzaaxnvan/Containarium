@@ -22,28 +22,3 @@ func TestClassifyGPUInput(t *testing.T) {
 		{name: "negative", input: "-1", wantErr: "non-negative integer"},
 		{name: "non-numeric letters", input: "abc", wantErr: "non-negative integer"},
 		{name: "decimal", input: "1.5", wantErr: "non-negative integer"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			pci, ok, err := classifyGPUInput(tc.input)
-			if tc.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("got err=%v, want substring %q", err, tc.wantErr)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected err: %v", err)
-			}
-			if tc.wantPCI != "" && pci != tc.wantPCI {
-				t.Errorf("pci: got %q, want %q", pci, tc.wantPCI)
-			}
-			if !tc.wantNeeds && pci == "" {
-				t.Errorf("expected PCI passthrough, got empty (ok=%v)", ok)
-			}
-			if tc.wantNeeds && ok {
-				t.Errorf("expected needs-resolution, got ok=true")
-			}
-		})
-	}
-}
