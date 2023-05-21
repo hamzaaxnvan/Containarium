@@ -154,3 +154,160 @@ function UnifiedRouteTable({ proxyRoutes, passthroughRoutes, onDeleteProxyRoute,
               </td>
             </tr>
           )}
+          {tlsPassthroughRoutes.map(route => (
+            <tr key={`tls-${route.fullDomain || route.subdomain}`}
+              className={`border-b border-[var(--border-subtle)] transition-colors hover:bg-[var(--surface)] last:border-0 ${!route.active ? 'opacity-60' : ''}`}>
+              <td className={TD}>
+                <span title="TLS Passthrough: Raw TLS forwarded via SNI" className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[10px] text-[var(--c-violet)] flex items-center gap-1 w-fit">
+                  <Lock size={10} /> TLS Pass
+                </span>
+              </td>
+              <td className={`${TD} font-mono pl-6 ${!route.active ? 'line-through' : ''}`}>{route.fullDomain || route.subdomain}:443</td>
+              <td className={TD + ' font-mono'}>{route.containerIp ? `${route.containerIp}:${route.port}` : 'N/A'}</td>
+              <td className={TD}><span className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-[10px] text-[var(--c-violet)]">TLS Passthrough</span></td>
+              <td className={TD}>{route.appName || '-'}</td>
+              <td className={TD}><Toggle checked={route.active} onChange={v => onToggleProxyRoute?.(route.fullDomain, v)} disabled={!onToggleProxyRoute} /></td>
+              <td className="px-3 py-2">
+                {onDeleteProxyRoute && (
+                  <button onClick={() => onDeleteProxyRoute(route.fullDomain)} title="Delete route"
+                    className="rounded p-1 text-[var(--text-muted)] transition-colors hover:bg-red-500/10 hover:text-[var(--c-red)]"><Trash2 size={12} /></button>
+                )}
+              </td>
+            </tr>
+          ))}
+
+          {/* Passthrough TCP/UDP section */}
+          {passthroughRoutes.length > 0 && (
+            <tr className="border-b border-[var(--border-subtle)] bg-[var(--surface-2)]">
+              <td colSpan={7} className="px-3 py-2">
+                <div className="flex items-center gap-1.5">
+                  <Network size={13} className="text-[var(--c-amber)]" />
+                  <span className="font-medium text-[var(--text)]">Passthrough (TCP/UDP)</span>
+                  <span className="rounded-full border border-[var(--border-subtle)] bg-[var(--surface)] px-1.5 py-0.5 text-[10px] text-[var(--text-muted)]">{passthroughRoutes.length}</span>
+                </div>
+              </td>
+            </tr>
+          )}
+          {passthroughRoutes.map(route => (
+            <tr key={`passthrough-${route.externalPort}-${route.protocol}`}
+              className={`border-b border-[var(--border-subtle)] transition-colors hover:bg-[var(--surface)] last:border-0 ${!route.active ? 'opacity-60' : ''}`}>
+              <td className={TD}>
+                <span title="Passthrough: Direct TCP/UDP forwarding" className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] text-[var(--c-amber)] flex items-center gap-1 w-fit">
+                  <Network size={10} /> Pass
+                </span>
+              </td>
+              <td className={`${TD} font-mono ${!route.active ? 'line-through' : ''}`}>:{route.externalPort}</td>
+              <td className={TD + ' font-mono'}>{route.targetIp}:{route.targetPort}</td>
+              <td className={TD}><span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] text-[var(--c-amber)]">{getRouteProtocolName(route.protocol)}</span></td>
+              <td className={TD}>{route.containerName || '-'}</td>
+              <td className={TD}><Toggle checked={route.active} onChange={v => onTogglePassthroughRoute?.(route.externalPort, route.protocol, v)} disabled={!onTogglePassthroughRoute} /></td>
+              <td className="px-3 py-2">
+                {onDeletePassthroughRoute && (
+                  <button onClick={() => onDeletePassthroughRoute(route.externalPort, route.protocol)} title="Delete route"
+                    className="rounded p-1 text-[var(--text-muted)] transition-colors hover:bg-red-500/10 hover:text-[var(--c-red)]"><Trash2 size={12} /></button>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export default function NetworkTopologyView({
+  topology, routes, passthroughRoutes = [], dnsRecords = [], baseDomain = '', isLoading, error,
+  includeStopped, onIncludeStoppedChange, onAddRoute, onDeleteRoute, onToggleRoute,
+  onAddPassthroughRoute, onDeletePassthroughRoute, onTogglePassthroughRoute, onRefresh,
+}: NetworkTopologyViewProps) {
+  const [addRouteDialog, setAddRouteDialog] = useState(false);
+  const [newRoute, setNewRoute] = useState({ domain: '', targetIp: '', targetPort: '', protocol: 'ROUTE_PROTOCOL_HTTP' as RouteProtocol, externalPort: '' });
+  const [deleteRouteDialog, setDeleteRouteDialog] = useState<{ open: boolean; domain: string }>({ open: false, domain: '' });
+  const [deletePassthroughDialog, setDeletePassthroughDialog] = useState<{ open: boolean; externalPort: number; protocol: RouteProtocol }>({ open: false, externalPort: 0, protocol: 'ROUTE_PROTOCOL_TCP' });
+
+  const domainSuggestions = useMemo(() => {
+    const suggestions = dnsRecords.map(r => ({ subdomain: r.name, fullDomain: r.data }));
+    for (const domain of routes.map(r => r.fullDomain).filter(Boolean)) {
+      if (!suggestions.find(s => s.fullDomain === domain)) {
+        suggestions.push({ subdomain: domain.replace('.' + baseDomain, ''), fullDomain: domain });
+      }
+    }
+    return suggestions;
+  }, [dnsRecords, routes, baseDomain]);
+
+  const containerOptions = topology.nodes
+    .filter(n => n.type === 'container' && n.ipAddress && n.state === 'running')
+    .map(n => ({ name: n.name, ip: n.ipAddress || '' }));
+
+  const handleAddRoute = async () => {
+    if (onAddRoute && newRoute.domain && newRoute.targetIp && newRoute.targetPort) {
+      await onAddRoute(newRoute.domain, newRoute.targetIp, parseInt(newRoute.targetPort, 10), newRoute.protocol);
+      setAddRouteDialog(false);
+      setNewRoute({ domain: '', targetIp: '', targetPort: '', protocol: 'ROUTE_PROTOCOL_HTTP', externalPort: '' });
+    }
+  };
+
+  const handleConfirmDeleteRoute = async () => {
+    if (onDeleteRoute) { await onDeleteRoute(deleteRouteDialog.domain); setDeleteRouteDialog({ open: false, domain: '' }); }
+  };
+
+  const handleConfirmDeletePassthrough = async () => {
+    if (onDeletePassthroughRoute) {
+      await onDeletePassthroughRoute(deletePassthroughDialog.externalPort, deletePassthroughDialog.protocol);
+      setDeletePassthroughDialog({ open: false, externalPort: 0, protocol: 'ROUTE_PROTOCOL_TCP' });
+    }
+  };
+
+  const inputCls = 'w-full rounded-md border border-[var(--border-subtle)] bg-[var(--surface-2)] px-3 py-1.5 text-xs text-[var(--text)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none';
+  const selectCls = 'w-full appearance-none rounded-md border border-[var(--border-subtle)] bg-[var(--surface-2)] px-3 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none';
+
+  if (isLoading && topology.nodes.length === 0) {
+    return <div className="flex min-h-[300px] items-center justify-center"><div className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--border)] border-t-[var(--accent)]" /></div>;
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center gap-2 py-16 text-center">
+        <p className="text-sm font-medium text-[var(--c-red)]">Failed to load network topology</p>
+        <p className="text-xs text-[var(--text-muted)]">{error.message}</p>
+        <button onClick={onRefresh} className="mt-2 rounded-md border border-[var(--border-subtle)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:bg-[var(--surface-2)]">Retry</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6">
+      {/* Header */}
+      <div className="mb-6 flex items-center gap-3">
+        <h1 className="mr-auto text-base font-semibold text-[var(--text)]">Network Topology</h1>
+        <label className="flex cursor-pointer items-center gap-2 text-xs text-[var(--text-secondary)]">
+          <input type="checkbox" checked={includeStopped} onChange={e => onIncludeStoppedChange(e.target.checked)} className="accent-[var(--accent)]" />
+          Include stopped
+        </label>
+        <button onClick={onRefresh} disabled={isLoading}
+          className="flex items-center gap-1.5 rounded-md border border-[var(--border-subtle)] bg-[var(--surface)] px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--surface-2)] disabled:opacity-50">
+          <RefreshCw size={12} className={isLoading ? 'animate-spin' : ''} /> Refresh
+        </button>
+      </div>
+
+      {/* Route Table */}
+      <div className="mb-3 flex items-center justify-between">
+        <h2 className="text-sm font-medium text-[var(--text)]">Routes <span className="ml-1 text-xs font-normal text-[var(--text-muted)]">({routes.length + passthroughRoutes.length})</span></h2>
+        {(onAddRoute || onAddPassthroughRoute) && (
+          <button onClick={() => setAddRouteDialog(true)}
+            className="flex items-center gap-1.5 rounded-md border border-[var(--border-subtle)] bg-[var(--surface)] px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--surface-2)]">
+            <Plus size={12} /> Add Route
+          </button>
+        )}
+      </div>
+
+      <div className="rounded-xl border border-[var(--border-subtle)]">
+        <UnifiedRouteTable
+          proxyRoutes={routes}
+          passthroughRoutes={passthroughRoutes}
+          onDeleteProxyRoute={onDeleteRoute ? d => setDeleteRouteDialog({ open: true, domain: d }) : undefined}
+          onToggleProxyRoute={onToggleRoute}
+          onDeletePassthroughRoute={onDeletePassthroughRoute ? (p, proto) => setDeletePassthroughDialog({ open: true, externalPort: p, protocol: proto || 'ROUTE_PROTOCOL_TCP' }) : undefined}
+          onTogglePassthroughRoute={onTogglePassthroughRoute}
+        />
+      </div>
