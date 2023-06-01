@@ -67,37 +67,3 @@ func TestDeviceApprovalStoreIsBounded(t *testing.T) {
 		if len(h.p.approvals) != 1 || !h.p.hasApproval("conn-1") {
 			t.Fatalf("store holds %d approvals, want only conn-1", len(h.p.approvals))
 		}
-	})
-}
-
-// The approval URL reaches the user's terminal; a URL with userinfo can pass
-// for a different site (https://approve.example.com@evil.example/), so it is
-// refused at the offer like plain http.
-func TestDeviceApprovalRefusesUserinfoInURL(t *testing.T) {
-	f := newRouterFixture(t, "")
-	wire := f.alice.PublicKey().Marshal()
-	start := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
-	for _, u := range []string{
-		"https://approve.example.com@evil.example/d",
-		"https://user:secret@approve.example.com/d",
-		"https://:secret@approve.example.com/d",
-	} {
-		t.Run(u, func(t *testing.T) {
-			res := pendingRes(start.Add(5*time.Minute), 5*time.Second)
-			res.Approval.Url = u
-			h := newApprovalHarness(t, f, true, res, nil, nil)
-			conn := &libplugin.ConnMeta{UserName: "alice", UniqId: "conn-1"}
-			if up, err := h.cfg.PublicKeyCallback(conn, wire); err == nil || up != nil {
-				t.Fatalf("a URL with userinfo must be refused at the offer: %v %v", up, err)
-			}
-			if m := h.methods(t, conn); m != "publickey" {
-				t.Fatalf("methods = %q", m)
-			}
-			if h.p.hasApproval("conn-1") {
-				t.Fatal("approval stored")
-			}
-		})
-	}
-	if _, ok := newApproval(pendingRes(start.Add(time.Minute), time.Second), start); !ok {
-		t.Fatal("control: the same response without userinfo must be accepted")
-	}

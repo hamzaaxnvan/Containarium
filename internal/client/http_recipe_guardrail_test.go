@@ -17,3 +17,22 @@ import (
 // the same message, and an ungated deploy sends none.
 func TestHTTPDeployRecipe_SendsGuardrailInput(t *testing.T) {
 	var bodies []*pb.DeployRecipeRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		req := &pb.DeployRecipeRequest{}
+		if err := protojson.Unmarshal(b, req); err != nil {
+			t.Errorf("body %s is not a DeployRecipeRequest: %v", b, err)
+		}
+		bodies = append(bodies, req)
+		_, _ = w.Write([]byte(`{"message":"ok"}`))
+	}))
+	defer srv.Close()
+	c, err := NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &pb.GuardrailGateInput{
+		StagingRef: "ds1",
+		Attestation: &pb.GuardrailAttestation{
+			SubjectSha256: "abc", PolicyHash: "def", KeyId: "k", Signature: []byte{1, 2, 3},
+			Verdict:      pb.GuardrailVerdict_GUARDRAIL_VERDICT_PASS,
