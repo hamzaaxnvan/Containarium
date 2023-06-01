@@ -33,15 +33,3 @@ type anonReminderPayload struct {
 	BoxName   string `json:"box_name"`
 	ClaimURL  string `json:"claim_url"`
 	ExpiresAt string `json:"expires_at"`
-}
-
-// Send implements anonbox.ReminderSender.
-func (w *anonReminderWebhook) Send(ctx context.Context, r anonbox.Reminder) error {
-	body, err := json.Marshal(anonReminderPayload{Email: r.Email, BoxName: r.BoxName, ClaimURL: r.ClaimURL, ExpiresAt: r.ExpiresAt.UTC().Format(time.RFC3339)})
-	if err != nil {
-		return fmt.Errorf("encode reminder: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build reminder request: %w", err)
-	}
