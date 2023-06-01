@@ -13,3 +13,34 @@ const testClaimToken = "v1.anon-1a2b3c4d-container.ff00.1790870400.0123456789abc
 func TestRenderClaim(t *testing.T) {
 	tests := []struct {
 		name    string
+		content string
+		json    bool
+		want    []string
+		wantErr bool
+	}{
+		{"url", "https://cloud.example.test/claim?token=" + testClaimToken, false,
+			[]string{"open this link", "https://cloud.example.test/claim?token=" + testClaimToken, "expires with the box at 2026-10-01T16:00:00Z"}, false},
+		{"bare token", testClaimToken, false,
+			[]string{"no claim URL configured", testClaimToken, "containarium anon claim", "2026-10-01T16:00:00Z"}, false},
+		{"url json", "https://cloud.example.test/claim?token=" + testClaimToken, true,
+			[]string{`"url": "https://cloud.example.test/claim?token=` + testClaimToken + `"`, `"token": "` + testClaimToken + `"`, `"expires_at": "2026-10-01T16:00:00Z"`}, false},
+		{"empty", "   ", false, nil, true},
+		{"not a token", "https://x/claim?token=hello", false, nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := renderClaim(tt.content, tt.json)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			for _, w := range tt.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("output missing %q:\n%s", w, out)
+				}
+			}
+			if tt.json && err == nil {
+				var info claimInfo
+				if json.Unmarshal([]byte(out), &info) != nil || info.Token != testClaimToken {
+					t.Errorf("not valid JSON with the token: %s", out)
+				}
+			}

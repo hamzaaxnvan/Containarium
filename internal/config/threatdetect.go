@@ -29,3 +29,19 @@ const EnvThreatDenyBurstCountLogOnly = "CONTAINARIUM_THREAT_DENY_BURST_COUNT_LOG
 const EnvThreatWebhookRenotifyMinutes = "CONTAINARIUM_THREAT_WEBHOOK_RENOTIFY_MINUTES"
 
 // ThreatDetect is the typed view of the CONTAINARIUM_THREAT_* namespace.
+type ThreatDetect struct {
+	// SentryEnabled arms the background detection engine. Requires the eBPF
+	// network-policy object loaded (CONTAINARIUM_NETWORK_POLICY_BPF_OBJECT)
+	// but NOT enforce mode — detection runs in observation mode.
+	// (EnvThreatSentry)
+	SentryEnabled bool
+	// DenyBurstN and DenyBurstWindow are the deny-burst rule's threshold and
+	// sliding window. Zero/unset falls back to the rule's own defaults (see
+	// threatdetect.DefaultDenyBurstN/Window) — this struct only carries an
+	// override when the operator actually set one.
+	DenyBurstN      int
+	DenyBurstWindow time.Duration
+	// DenyBurstCountLogOnly counts observation-only would-deny events too
+	// (EnvThreatDenyBurstCountLogOnly). Default false: enforced drops only.
+	DenyBurstCountLogOnly bool
+	// WebhookRenotify is the re-delivery interval for a finding that stays
