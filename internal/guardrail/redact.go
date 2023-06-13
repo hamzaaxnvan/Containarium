@@ -40,3 +40,89 @@ type RedactResult struct {
 	// Findings on the original, per kind, before any action.
 	Found map[pb.GuardrailKind]int64
 	// Findings whose kind the policy marks BLOCK. Any non-zero count fails
+	// the gate regardless of what the re-scan says.
+	Blocked map[pb.GuardrailKind]int64
+}
+
+type span struct {
+	start, end int
+	kind       pb.GuardrailKind
+	typ        string
+	conf       float64
+}
+
+// Redact applies policy to the engine's findings over units and returns
+// the wiped text, the vault and the counts the gate and the attestation
+// need. Offsets are code points, so each unit is sliced as []rune.
+func Redact(units []*pb.GuardrailTextUnit, findings []*pb.GuardrailFinding, policy *pb.GuardrailPolicy, key []byte) (*RedactResult, error) {
+	if len(key) == 0 {
+		return nil, fmt.Errorf("guardrail: redaction key is empty")
+	}
+	actions := actionsByKind(policy)
+	byUnit := map[string][]span{}
+	res := &RedactResult{
+		Wiped:   map[string]string{},
+		Vault:   Vault{},
+		Found:   map[pb.GuardrailKind]int64{},
+		Blocked: map[pb.GuardrailKind]int64{},
+	}
+	for _, f := range findings {
+		res.Found[f.GetKind()]++
+		switch actions[f.GetKind()] {
+		case pb.GuardrailAction_GUARDRAIL_ACTION_BLOCK:
+			res.Blocked[f.GetKind()]++
+		case pb.GuardrailAction_GUARDRAIL_ACTION_REDACT:
+			byUnit[f.GetUnitId()] = append(byUnit[f.GetUnitId()], span{
+				int(f.GetStart()), int(f.GetEnd()), f.GetKind(), f.GetType(), f.GetConfidence()})
+		}
+	}
+	for _, u := range units {
+		runes := []rune(u.GetText())
+		spans := mergeSpans(byUnit[u.GetUnitId()])
+		for _, s := range spans {
+			if s.start < 0 || s.end > len(runes) || s.start >= s.end {
+				return nil, fmt.Errorf("guardrail: finding [%d,%d) out of range for unit %q (len %d code points)", s.start, s.end, u.GetUnitId(), len(runes))
+			}
+		}
+		// Back to front so earlier offsets stay valid.
+		out := runes
+		for i := len(spans) - 1; i >= 0; i-- {
+			s := spans[i]
+			value := string(runes[s.start:s.end])
+			tok := Token(key, s.kind, s.typ, value)
+			if s.kind != pb.GuardrailKind_GUARDRAIL_KIND_SECRET {
+				res.Vault[tok] = VaultEntry{Kind: s.kind, Type: s.typ, Value: value}
+			}
+			repl := []rune(tok)
+			next := make([]rune, 0, len(out)-(s.end-s.start)+len(repl))
+			next = append(next, out[:s.start]...)
+			next = append(next, repl...)
+			next = append(next, out[s.end:]...)
+			out = next
+		}
+		res.Wiped[u.GetUnitId()] = string(out)
+	}
+	return res, nil
+}
+
+// Token is the placeholder for one (kind, type, value) under key.
+func Token(key []byte, kind pb.GuardrailKind, typ, value string) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(kind.String()))
+	mac.Write([]byte{0x1f})
+	mac.Write([]byte(typ))
+	mac.Write([]byte{0x1f})
+	mac.Write([]byte(value))
+	sum := mac.Sum(nil)
+	return fmt.Sprintf("[[%s:%s]]", typ, hex.EncodeToString(sum[:6]))
+}
+
+// mergeSpans collapses overlapping or touching spans into one; the
+// surviving type is the higher-confidence member's.
+func mergeSpans(in []span) []span {
+	if len(in) == 0 {
+		return nil
+	}
+	sort.Slice(in, func(i, j int) bool {
+		if in[i].start != in[j].start {
+			return in[i].start < in[j].start

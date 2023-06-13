@@ -203,3 +203,106 @@ message GuardrailAttestation {
   // must be distinguishable from one that did (#2362). Sorted ascending.
   repeated GuardrailKind kinds_scanned = 12;
 }
+
+// --- Server-side guardrail policy (#2368) ---------------------------------
+// docs/architecture/guardrail-inbound-and-server-policy.md, "Policy service".
+// The platform admin owns one cluster-wide policy; a gated deploy and the
+// model gateway read it. Not configured is an explicit state, distinct from
+// "the store could not be read".
+
+// GuardrailTrustedSigner is a signing key an admin registered. A verifier
+// trusts these keys, never a key a deploy request carries.
+message GuardrailTrustedSigner {
+  // SHA-256 of public_key, hex (matches GuardrailAttestation.key_id). Set
+  // rejects a signer whose key_id is not the hash of its key.
+  string key_id = 1;
+  // Ed25519 public key, 32 bytes.
+  bytes public_key = 2;
+  // Reviewer-readable name. No personal data.
+  string label = 3;
+}
+
+// GuardrailRevokedKey is a signing key an admin revoked (#2729;
+// docs/architecture/guardrail-inbound-and-server-policy.md, "Signer rotation
+// and revocation"). Every attestation the key signed fails verification,
+// whatever its attested_at: the signer sets that timestamp, so whoever stole
+// the key could backdate it. Revocation is permanent: a Set that drops or
+// changes a stored entry is refused.
+message GuardrailRevokedKey {
+  // SHA-256 of the revoked Ed25519 public key, hex (as GuardrailTrustedSigner.key_id).
+  string key_id = 1;
+  // Server-assigned by the Set that adds the entry; a value in the request is
+  // ignored.
+  google.protobuf.Timestamp revoked_at = 2;
+  // Required. Reviewer-readable, no personal data. Named by every refused verify.
+  string reason = 3;
+}
+
+// GuardrailTrustBundle is the trust a verifier needs without a server: the
+// trusted signers and the revoked keys. `guardrail verify --trust-bundle`
+// reads it as protojson. A key in `revoked` is refused even if it is also
+// listed in `signers`.
+message GuardrailTrustBundle {
+  repeated GuardrailTrustedSigner signers = 1;
+  repeated GuardrailRevokedKey revoked = 2;
+}
+
+// ServerGuardrailPolicy is the stored policy plus the server's bookkeeping.
+message ServerGuardrailPolicy {
+  // The rules. GuardrailAttestation.policy_hash covers THIS message only, so
+  // rotating a trusted signer does not invalidate existing attestations.
+  GuardrailPolicy policy = 1;
+  repeated GuardrailTrustedSigner trusted_signers = 2;
+  // Server-assigned, monotonic: every successful Set increments it by one.
+  int64 revision = 3;
+  google.protobuf.Timestamp updated_at = 4;
+  // Authenticated subject that made the last Set.
+  string updated_by = 5;
+  // Revoked signing keys (#2729). Outside `policy`, so revoking a key leaves
+  // policy_hash unchanged. Never shrinks.
+  repeated GuardrailRevokedKey revoked_signers = 6;
+}
+
+message GetGuardrailPolicyRequest {}
+
+message GetGuardrailPolicyResponse {
+  // False when no policy was ever set. `policy` is then empty and consumers
+  // behave as before the server policy existed (ungated deploys unaffected,
+  // inbound scan off). A read error is an RPC error, never configured=false.
+  bool configured = 1;
+  ServerGuardrailPolicy policy = 2;
+  // SHA-256 of policy.policy (the same hash an attestation records). Empty
+  // when not configured.
+  string policy_hash = 3;
+}
+
+message SetGuardrailPolicyRequest {
+  // Required. An empty rule list is a valid policy (it clears every rule).
+  GuardrailPolicy policy = 1;
+  repeated GuardrailTrustedSigner trusted_signers = 2;
+  // Must keep every stored revoked key (same key_id and reason), or the Set
+  // is FAILED_PRECONDITION. No trusted signer may be revoked.
+  repeated GuardrailRevokedKey revoked_signers = 3;
+  // When set, the Set applies only if the stored revision equals it (0 = not
+  // configured); otherwise ABORTED and nothing changes. A read-edit-write
+  // sets it so a concurrent Set cannot be overwritten silently.
+  optional int64 expected_revision = 4;
+}
+
+message SetGuardrailPolicyResponse {
+  // The stored policy, with its new revision.
+  ServerGuardrailPolicy policy = 1;
+  string policy_hash = 2;
+}
+
+// GuardrailEffectivePolicy is what actually scans model responses on this
+// daemon, derived from the stored server policy (#2737, slice B of #2575).
+enum GuardrailEffectivePolicy {
+  GUARDRAIL_EFFECTIVE_POLICY_UNSPECIFIED = 0;
+  // A policy is configured but has no inbound BLOCK rule (it is empty or
+  // has outbound rules only): model responses are not scanned.
+  GUARDRAIL_EFFECTIVE_POLICY_NONE = 1;
+  // No policy was ever set: responses are scanned against the built-in
+  // baseline rules (private keys, cloud keys), log-only (#2736).
+  GUARDRAIL_EFFECTIVE_POLICY_BASELINE = 2;
+  // The admin policy has at least one inbound BLOCK rule: it decides what
