@@ -76,3 +76,82 @@ func TestBuildMessage_ControlCharactersEscaped(t *testing.T) {
 			t.Errorf("push contains raw control/format char %q: %q", bad, m.Body)
 		}
 	}
+	if strings.Contains(commandLine(m.Body), "\n") || !strings.Contains(m.Body, `echo ok\nApproved`) {
+		t.Errorf("newline in the command not escaped: %q", m.Body)
+	}
+	// Box and run come from the journal path / record, but escape them too.
+	r := req("r1", "Bash", "Bash: ls")
+	r.Run = "run\nfake"
+	if m := BuildMessage([]Request{r}, false, t0); strings.Contains(m.Title, "\n") {
+		t.Errorf("title contains a raw newline: %q", m.Title)
+	}
+}
+
+func TestBuildMessage_CountsBurst(t *testing.T) {
+	m := BuildMessage([]Request{req("r1", "Bash", "Bash: a"), req("r2", "Bash", "Bash: b"), req("r3", "Read", "Read: /x")}, false, t0)
+	if !strings.Contains(m.Title, "3 requests") {
+		t.Errorf("title %q lacks the count", m.Title)
+	}
+}
+
+// commandLine returns the body's command line (the line after "command: ").
+func commandLine(body string) string {
+	for _, l := range strings.Split(body, "\n") {
+		if c, ok := strings.CutPrefix(l, "command: "); ok {
+			return c
+		}
+	}
+	return ""
+}
+
+func TestCoalescer_OneRequestOnePushImmediately(t *testing.T) {
+	c := NewCoalescer(30 * time.Second)
+	pushes := c.Step("alice", map[string][]Request{"fix-bug": {req("r1", "Bash", "Bash: ls")}}, t0)
+	if len(pushes) != 1 || len(pushes[0].Requests) != 1 {
+		t.Fatalf("pushes = %+v, want one push with one request", pushes)
+	}
+	// Seen again on the next poll: no second push.
+	if p := c.Step("alice", map[string][]Request{"fix-bug": {req("r1", "Bash", "Bash: ls")}}, t0.Add(5*time.Second)); len(p) != 0 {
+		t.Fatalf("re-observed request pushed again: %+v", p)
+	}
+}
+
+func TestCoalescer_BurstAtMostOnePushPer30sNoneDropped(t *testing.T) {
+	c := NewCoalescer(30 * time.Second)
+	var open []Request
+	total, pushes := 0, 0
+	for i := 0; i < 5; i++ {
+		open = append(open, req("r"+string(rune('1'+i)), "Bash", "Bash: step"))
+		now := t0.Add(time.Duration(i*2) * time.Second)
+		for _, p := range c.Step("alice", map[string][]Request{"fix-bug": open}, now) {
+			pushes++
+			total += len(p.Requests)
+		}
+	}
+	if pushes != 1 || total != 1 {
+		t.Fatalf("within the window: %d pushes covering %d requests, want 1 push of 1", pushes, total)
+	}
+	// Window still open at +29 s: nothing.
+	if p := c.Step("alice", map[string][]Request{"fix-bug": open}, t0.Add(29*time.Second)); len(p) != 0 {
+		t.Fatalf("pushed before the window closed: %+v", p)
+	}
+	p := c.Step("alice", map[string][]Request{"fix-bug": open}, t0.Add(30*time.Second))
+	if len(p) != 1 {
+		t.Fatalf("window close: %d pushes, want 1", len(p))
+	}
+	total += len(p[0].Requests)
+	if total != 5 {
+		t.Fatalf("requests covered by pushes = %d, want 5", total)
+	}
+}
+
+func TestCoalescer_RunsAreIndependent(t *testing.T) {
+	c := NewCoalescer(30 * time.Second)
+	p := c.Step("alice", map[string][]Request{
+		"a": {req("r1", "Bash", "Bash: x")},
+		"b": {req("r1", "Bash", "Bash: y")},
+	}, t0)
+	if len(p) != 2 {
+		t.Fatalf("two runs: %d pushes, want 2", len(p))
+	}
+}
