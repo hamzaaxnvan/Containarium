@@ -62,3 +62,24 @@ func TestRunTunnelRefusesWithoutPin(t *testing.T) {
 	t.Setenv(sentinelPinEnv, "")
 	t.Setenv("CONTAINARIUM_TUNNEL_TOKEN", "")
 	saved := []string{tunnelSentinelAddr, tunnelToken, tunnelSpotID, tunnelSentinelPin}
+	t.Cleanup(func() {
+		tunnelSentinelAddr, tunnelToken, tunnelSpotID, tunnelSentinelPin = saved[0], saved[1], saved[2], saved[3]
+	})
+	tunnelSentinelAddr = "127.0.0.1:1"
+	tunnelToken = "tok"
+	tunnelSpotID = "spot"
+	tunnelSentinelPin = ""
+
+	err := runTunnel(tunnelCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "--sentinel-pin") {
+		t.Fatalf("runTunnel without a pin: err = %v, want a --sentinel-pin error", err)
+	}
+}
+
+// TestRunHypervisorAgentRefusesWithoutPin: hypervisor-agent also requires
+// the sentinel pin, and checks it before opening its console listener.
+func TestRunHypervisorAgentRefusesWithoutPin(t *testing.T) {
+	t.Setenv(sentinelPinEnv, "")
+	saved := []string{hvSentinelAddr, hvTunnelToken, hvSpotID, hvVBoxDir, hvConsoleToken, hvSentinelPin}
+	t.Cleanup(func() {
+		hvSentinelAddr, hvTunnelToken, hvSpotID, hvVBoxDir, hvConsoleToken, hvSentinelPin = saved[0], saved[1], saved[2], saved[3], saved[4], saved[5]
