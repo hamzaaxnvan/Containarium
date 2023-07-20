@@ -27,3 +27,33 @@ func resultSweeper(t *testing.T, p *fakePrefix, events *[]string, results *[]Pur
 
 func TestPrefixResult_APurgeWritesTheResultAfterTheRemovalWithBothBases(t *testing.T) {
 	var events []string
+	var results []PurgeResult
+	p := eligibleChain()
+	sw := resultSweeper(t, p, &events, &results, nil)
+
+	if _, err := sw.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if strings.Join(events, ",") != "audit,remove,result" {
+		t.Fatalf("events = %v, want the result entry after the removal", events)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+	r := results[0]
+	if r.Store != "audit_logs" || r.PreviousBaseID != 10 || r.BaseID != 510 || r.RowsRemoved != 10 {
+		t.Errorf("result = %+v, want audit_logs previous base 10, new base 510, 10 rows", r)
+	}
+	if r.ByClass[gwClass] != 7 || r.ByClass[sessClass] != 3 {
+		t.Errorf("by class = %v, want gateway 7 and session 3", r.ByClass)
+	}
+}
+
+func TestPrefixResult_NoPriorPurgeHasPreviousBaseZero(t *testing.T) {
+	var events []string
+	var results []PurgeResult
+	p := eligibleChain()
+	p.count.Base = nil
+	sw := resultSweeper(t, p, &events, &results, nil)
+
+	if _, err := sw.Sweep(context.Background()); err != nil {
