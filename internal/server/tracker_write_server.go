@@ -95,3 +95,100 @@ func (s *ContainerServer) writerConnFor(ctx context.Context, trackerConn *tracke
 func (s *ContainerServer) identityFromContext(ctx context.Context) tracker.Identity {
 	runID, hasRun := auth.RunIDFromGRPCContext(ctx)
 	if !hasRun || runID == "" {
+		username, _, _ := auth.SubjectFromGRPCContext(ctx)
+		return tracker.Identity{RunID: username, SkillID: "operator"}
+	}
+	var info runlease.Info
+	if s.runRegistry != nil {
+		info, _ = s.runRegistry.Get(runID)
+	}
+	return tracker.Identity{RunID: runID, SkillID: info.SkillID, Model: info.Model}
+}
+
+// CommentOnTrackerIssue posts a stamped, sanitized comment on an issue
+// or change request.
+func (s *ContainerServer) CommentOnTrackerIssue(ctx context.Context, req *pb.CommentOnTrackerIssueRequest) (*pb.CommentOnTrackerIssueResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrackerWrite); err != nil {
+		return nil, err
+	}
+	if s.trackerStore == nil {
+		return nil, status.Error(codes.Unavailable, "tracker store not configured on this daemon")
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTrackerTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+	if req.Body == "" {
+		return nil, status.Error(codes.InvalidArgument, "body is required")
+	}
+
+	provider, conn, err := s.resolveWriterConn(ctx, req.Username, req.Connection)
+	if err != nil {
+		return nil, err
+	}
+
+	id := s.identityFromContext(ctx)
+	body := tracker.Sanitize(req.Body) + "\n\n" + tracker.Stamp(id, tracker.KindComment)
+	comment, err := provider.Comment(ctx, conn, req.Number, body)
+	if err != nil {
+		return nil, mapProviderError(err)
+	}
+
+	s.auditTrackerWrite(ctx, "tracker.comment", req.Username, req.Connection, req.Number, trackerCommentAuditDetail{
+		Connection: req.Connection,
+		Number:     req.Number,
+		RunID:      id.RunID,
+		SkillID:    id.SkillID,
+	})
+	return &pb.CommentOnTrackerIssueResponse{Comment: toProtoComment(comment)}, nil
+}
+
+// runResolver returns the tracker.RunResolver ClaimTrackerIssue uses to
+// decide whether a foreign claim's run is still going. A daemon with no
+// run registry wired (tests constructing ContainerServer directly)
+// falls back to a resolver that reports every run as not-live, which
+// degrades ClaimTrackerIssue to freshness-only — safe, just less
+// precise than with the registry.
+func (s *ContainerServer) runResolver() tracker.RunResolver {
+	if s.runRegistry != nil {
+		return s.runRegistry
+	}
+	return noRunsLiveResolver{}
+}
+
+type noRunsLiveResolver struct{}
+
+func (noRunsLiveResolver) Live(string) bool { return false }
+
+// ClaimTrackerIssue attempts to claim an issue for the calling run.
+func (s *ContainerServer) ClaimTrackerIssue(ctx context.Context, req *pb.ClaimTrackerIssueRequest) (*pb.ClaimTrackerIssueResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrackerWrite); err != nil {
+		return nil, err
+	}
+	if s.trackerStore == nil {
+		return nil, status.Error(codes.Unavailable, "tracker store not configured on this daemon")
+	}
+	if s.claimLocks == nil {
+		return nil, status.Error(codes.Unavailable, "claim locks not configured on this daemon")
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTrackerTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	provider, conn, err := s.resolveWriterConn(ctx, req.Username, req.Connection)
+	if err != nil {
+		return nil, err
+	}
+
+	staleAfter := tracker.DefaultStaleAfter
+	if req.StaleAfterSeconds > 0 {
+		staleAfter = time.Duration(req.StaleAfterSeconds) * time.Second
+	}
+
+	// Serialize claims on this (username, connection, number) within
+	// this daemon process — the cross-daemon race is handled by
