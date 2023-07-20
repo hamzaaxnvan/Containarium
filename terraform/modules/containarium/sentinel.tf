@@ -1,0 +1,164 @@
+# =============================================================================
+# Containarium Terraform Module — Sentinel VM
+# =============================================================================
+# Sentinel VM for HA spot instance recovery.
+# Uses the same static IP as jump_server_ip (sentinel owns it, spot VM uses internal).
+# All resources are conditional on enable_sentinel + use_spot_instance.
+
+locals {
+  use_sentinel = var.enable_sentinel && var.use_spot_instance
+}
+
+# -----------------------------------------------------------------------------
+# Sentinel VM — tiny always-on instance that owns the public static IP
+# Runs in the SAME region/zone as spot VM (matching production setup).
+# -----------------------------------------------------------------------------
+
+resource "google_compute_instance" "sentinel" {
+  count = local.use_sentinel ? 1 : 0
+
+  name         = "${var.instance_name}-sentinel"
+  machine_type = var.sentinel_machine_type
+  zone         = var.zone
+  project      = var.project_id
+
+  tags = concat(["containarium-sentinel"], var.instance_tags)
+
+  # Always-on: standard provisioning, live-migrate on maintenance
+  scheduling {
+    preemptible         = false
+    automatic_restart   = true
+    on_host_maintenance = "MIGRATE"
+    provisioning_model  = "STANDARD"
+  }
+
+  boot_disk {
+    auto_delete       = true
+    kms_key_self_link = var.kms_key_self_link == "" ? null : var.kms_key_self_link
+    initialize_params {
+      image = var.os_image
+      size  = var.sentinel_boot_disk_size
+      type  = "pd-standard"
+    }
+  }
+
+  network_interface {
+    network    = local.network
+    subnetwork = local.subnetwork
+
+    access_config {
+      # Sentinel owns the public static IP
+      nat_ip = google_compute_address.jump_server_ip.address
+    }
+  }
+
+  metadata = {
+    ssh-keys = join("\n", [
+      for user, key in var.admin_ssh_keys :
+      "${user}:${key}"
+    ])
+    # Its own metadata key (not inlined in startup-script) so the periodic
+    # reconcile timer in startup-sentinel.sh can fetch the CURRENT desired
+    # unit content live from the metadata server without a reboot — GCE
+    # metadata updates apply immediately on `terraform apply`, but the
+    # startup-script itself only runs once at boot. Before this, a tuning
+    # change here (e.g. failtoban's --max-failures/--ban-duration) silently
+    # never reached already-running sentinels (issue #933) — some sentinels
+    # kept running months-stale, far more aggressive settings indefinitely.
+    sshpiper-service-unit = local.sshpiper_service_unit
+    ssh-upstream-policy   = local.ssh_upstream_policy_json
+    # The anonymous-box door's unit, same live-metadata reconcile as above
+    # (#2198). Present only when the door is configured; the startup script
+    # treats an absent key as "disable and remove the unit".
+    sshpiper-anon-service-unit = local.sshpiper_anon_service_unit
+    startup-script = templatefile("${path.module}/scripts/startup-sentinel.sh", {
+      admin_users             = keys(var.admin_ssh_keys)
+      containarium_version    = var.containarium_version
+      containarium_binary_url = var.containarium_binary_url
+      spot_vm_name            = local.spot_vm_name
+      zone                    = var.zone
+      project_id              = var.project_id
+      enable_proxy_protocol   = var.enable_proxy_protocol
+      sentinel_auth_secret    = var.sentinel_auth_secret
+      sentinel_admin_secret   = var.sentinel_admin_secret
+      enable_peer_mtls        = var.enable_peer_mtls
+
+      # Local SSH session sink retention (#2415); its own alignment group.
+      ssh_session_log_retention_days = var.ssh_session_log_retention_days
+    })
+  }
+
+  service_account {
+    email  = var.service_account_email
+    scopes = ["cloud-platform"]
+  }
+
+  labels = merge(
+    var.labels,
+    {
+      component = "containarium"
+      role      = "sentinel"
+    }
+  )
+
+  allow_stopping_for_update = true
+
+  lifecycle {
+    # Cross-variable validation belongs in a precondition to preserve the
+    # module's Terraform >=1.2 floor (input validation cross-references need 1.9).
+    precondition {
+      condition     = var.ssh_upstream_risk_per_attempt <= var.ssh_upstream_failure_budget
+      error_message = "Per-attempt SSH risk must fit within the shared failure budget."
+    }
+    ignore_changes = [
+      metadata["ssh-keys"],
+    ]
+
+    # Phase 0.5 peer mTLS rides on the sentinel↔daemon HMAC channel, so it
+    # is inert without a shared secret. Fail at plan time rather than let
+    # the deployment come up and silently 401 every keysync/certsync (the
+    # lockout described in issue #341). 32 bytes matches the daemon's
+    # auth.SentinelMinSecretLen.
+    precondition {
+      condition     = !var.enable_peer_mtls || length(var.sentinel_auth_secret) >= 32
+      error_message = "enable_peer_mtls = true requires sentinel_auth_secret to be a 32+ byte shared secret (currently ${length(var.sentinel_auth_secret)} bytes). An empty/short secret silently 401s every sentinel↔daemon sync — see issue #341."
+    }
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Sentinel Firewall Rules
+# -----------------------------------------------------------------------------
+
+# Allow SSH/HTTP/HTTPS from internet to sentinel
+resource "google_compute_firewall" "sentinel_ingress" {
+  count = local.use_sentinel ? 1 : 0
+
+  name    = "${var.instance_name}-sentinel-ingress"
+  network = local.network
+  project = var.project_id
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22", "80", "443"]
+  }
+
+  source_ranges = var.allowed_ssh_sources
+  target_tags   = ["containarium-sentinel"]
+
+  description = "Allow SSH (sshpiper on :22) / HTTP / HTTPS to Containarium sentinel"
+}
+
+# Allow sentinel to forward user traffic to the spot backend.
+# Carries SSH (sshpiper → backend per-user shell), HTTP, and HTTPS.
+# These are user-facing protocols proxied through the sentinel.
+resource "google_compute_firewall" "sentinel_to_spot" {
+  count = local.use_sentinel ? 1 : 0
+
+  name    = "${var.instance_name}-sentinel-to-spot"
+  network = local.network
+  project = var.project_id
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22", "80", "443"]

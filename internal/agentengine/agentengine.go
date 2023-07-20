@@ -89,3 +89,94 @@ func Provider(e pb.AgentEngine) (name string, ok bool) {
 	case pb.AgentEngine_AGENT_ENGINE_GEMINI:
 		return "gemini", true
 	default:
+		return "", false
+	}
+}
+
+// ForProvider inverts Provider. UNSPECIFIED for a provider no engine speaks
+// (e.g. an operator-registered OpenAI-compatible upstream with its own
+// provider name) — see docs/architecture/agent-router.md "What changes at
+// 10x" for engines whose provider is not fixed.
+func ForProvider(provider string) pb.AgentEngine {
+	for _, e := range All() {
+		if p, _ := Provider(e); p == provider {
+			return e
+		}
+	}
+	return pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED
+}
+
+// KeyResolver reports whether a usable provider key exists for one key
+// owner, without ever handing the key's value back to this package — Resolve
+// only ever inspects the boolean. Any type satisfying modelgateway.KeyResolver
+// (KeyFor(ctx, keyOwner, provider) (string, bool)) already implements this.
+type KeyResolver interface {
+	KeyFor(ctx context.Context, keyOwner, provider string) (string, bool)
+}
+
+// Gateway is the daemon's model-gateway state, as Resolve needs to see it. A
+// nil *Gateway means direct mode (the daemon serves no gateway): boxes run
+// with whatever credential their own environment supplies, and Resolve never
+// refuses a run in that mode.
+type Gateway struct {
+	// DefaultProvider is what AGENT_ENGINE_UNSPECIFIED resolves to — today's
+	// gatewayPrimaryProvider(keys): the first of anthropic/openai/gemini the
+	// daemon holds a global key for. Empty if the daemon holds no global key
+	// at all (gateway still "enabled" via an operator-registered upstream).
+	DefaultProvider string
+	// GlobalProviders is the set of providers the daemon holds a key for in
+	// its own environment (not per key-owner). A provider in this set is
+	// ready for every caller, with no per-owner lookup needed.
+	GlobalProviders map[string]bool
+	// Keys resolves a per-owner key when GlobalProviders doesn't already
+	// cover the provider. Nil when the daemon has no per-owner store (no
+	// Postgres) — then only GlobalProviders can make a provider ready.
+	Keys KeyResolver
+	// NoGlobalFallback mirrors modelgateway.Config.DisableGlobalKeyFallback:
+	// for a run with a key owner, GlobalProviders no longer makes a provider
+	// ready and no longer picks the default — only the owner's own key does.
+	// Without it a run is admitted on a daemon-global key that the gateway will
+	// then refuse to spend, and fails inside the box instead of up front.
+	NoGlobalFallback bool
+}
+
+// defaultProviderOrder is the order an unspecified engine is matched to a
+// provider when the choice is per owner (NoGlobalFallback); the same order the
+// daemon uses to pick its global default.
+var defaultProviderOrder = []string{"anthropic", "openai", "gemini"}
+
+// globalCovers reports whether the daemon-global key makes provider ready for
+// this caller.
+func (g *Gateway) globalCovers(provider, keyOwner string) bool {
+	if g.NoGlobalFallback && keyOwner != "" {
+		return false
+	}
+	return g.GlobalProviders[provider]
+}
+
+func (g *Gateway) ownerHasKey(ctx context.Context, keyOwner, provider string) bool {
+	if g.Keys == nil {
+		return false
+	}
+	_, ok := g.Keys.KeyFor(ctx, keyOwner, provider)
+	return ok
+}
+
+// Resolved is the engine and provider one run actually uses.
+type Resolved struct {
+	// Engine is never a value Parse would reject; it IS AGENT_ENGINE_UNSPECIFIED
+	// exactly when no CONTAINARIUM_AGENT_ENGINE should be exported for this run
+	// (direct mode with no engine named).
+	Engine pb.AgentEngine
+	// Provider is the gateway provider the run's token is bound to; "" in
+	// direct mode, where there is no gateway to bind a token to.
+	Provider string
+	// Default is true when `want` was UNSPECIFIED and this result came from
+	// the gateway's default provider (or, in direct mode, from there being no
+	// engine named at all) rather than the manifest naming one explicitly.
+	// Callers use this to decide whether to export CONTAINARIUM_AGENT_MODEL:
+	// only when Default is false (Q1, docs/product/agent-router.md).
+	Default bool
+}
+
+// NotReadyError is returned when a named engine's provider has no resolvable
