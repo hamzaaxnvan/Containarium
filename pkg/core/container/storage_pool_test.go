@@ -91,3 +91,49 @@ func TestCreate_ExplicitStoragePoolOverridesTheConfiguredOne(t *testing.T) {
 	_, _ = m.Create(CreateOptions{
 		Username:    "alice",
 		Image:       "ubuntu:24.04",
+		Disk:        "20GB",
+		StoragePool: "containarium-tenant-alice",
+	})
+
+	if created.Disk == nil {
+		t.Fatal("no root disk device configured")
+	}
+	if created.Disk.Pool != "containarium-tenant-alice" {
+		t.Errorf("root disk pool = %q, want %q — the container landed on the daemon-wide pool "+
+			"instead of the tenant's, which for an encrypted create means it is outside that "+
+			"tenant's encryptionroot and unencrypted", created.Disk.Pool, "containarium-tenant-alice")
+	}
+}
+
+// The trap this issue exists to close.
+//
+// A root disk device was only ever emitted when a disk size was requested;
+// with no size the container inherits the DEFAULT PROFILE's root disk — the
+// daemon-wide pool. So an encrypted create that simply did not ask for a disk
+// size would land outside its tenant's encryptionroot, unencrypted, and report
+// success. Nothing about the request would look wrong.
+func TestCreate_ExplicitStoragePoolEmitsARootDiskWithoutADiskSize(t *testing.T) {
+	var created incus.ContainerConfig
+	mock := &incustest.MockBackend{
+		CreateContainerFunc: func(cfg incus.ContainerConfig) error { created = cfg; return nil },
+	}
+	m := NewWithBackend(mock)
+
+	_, _ = m.Create(CreateOptions{
+		Username:    "alice",
+		Image:       "ubuntu:24.04",
+		StoragePool: "containarium-tenant-alice",
+		// No Disk on purpose.
+	})
+
+	if created.Disk == nil {
+		t.Fatal("a create naming a storage pool but no disk size emitted no root disk device — " +
+			"the container inherits the default profile's pool, silently ignoring the pool it " +
+			"was told to use")
+	}
+	if created.Disk.Pool != "containarium-tenant-alice" {
+		t.Errorf("root disk pool = %q, want %q", created.Disk.Pool, "containarium-tenant-alice")
+	}
+	if created.Disk.Size != "" {
+		t.Errorf("root disk size = %q, want empty — the caller asked for no size and one was "+
+			"invented", created.Disk.Size)

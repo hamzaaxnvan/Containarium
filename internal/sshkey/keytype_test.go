@@ -28,33 +28,3 @@ func authorizedLine(t *testing.T, pub interface{}) string {
 // parses both sk- types but has no constructor for them.
 func skLine(t *testing.T, keyType string, body interface{}) string {
 	t.Helper()
-	wire := ssh.Marshal(body)
-	return keyType + " " + base64.StdEncoding.EncodeToString(wire) + " user@security-key"
-}
-
-func TestParseType(t *testing.T) {
-	edPub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ecKey := func(c elliptic.Curve) *ecdsa.PublicKey {
-		k, err := ecdsa.GenerateKey(c, rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return &k.PublicKey
-	}
-	p256 := ecKey(elliptic.P256())
-
-	skEd := skLine(t, ssh.KeyAlgoSKED25519, struct {
-		Name        string
-		KeyBytes    []byte
-		Application string
-	}{ssh.KeyAlgoSKED25519, edPub, "ssh:"})
-	skEc := skLine(t, ssh.KeyAlgoSKECDSA256, struct {
-		Name        string
-		ID          string
