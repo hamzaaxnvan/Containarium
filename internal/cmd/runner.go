@@ -174,3 +174,179 @@ func runRunnerProvision(_ *cobra.Command, args []string) error {
 	// Reuse the operator's existing SSH public key when creating
 	// the boxes so the same private key auths the install step.
 	opts.SSHKey = sshKey
+
+	fmt.Printf("Provisioning %d runner(s) for %s …\n", opts.Count, opts.Repo)
+	res, err := runner.Provision(context.Background(), deps, opts)
+	if err != nil {
+		return err
+	}
+
+	printRunnerTable(res.Runners)
+	if res.PartialFailure {
+		// Non-zero exit so CI / shell wrappers can detect partial
+		// failure without parsing the table.
+		return fmt.Errorf("one or more runners failed to provision (see table above)")
+	}
+	return nil
+}
+
+func runRunnerList(_ *cobra.Command, args []string) error {
+	repo := args[0]
+	deps, _, err := buildRunnerDeps("", "") // list doesn't ssh
+	if err != nil {
+		return err
+	}
+	res, err := runner.List(context.Background(), deps, runner.Options{
+		Repo:       repo,
+		PAT:        runnerPAT,
+		NamePrefix: runnerNamePrefix,
+	})
+	if err != nil {
+		return err
+	}
+	switch runnerListFormat {
+	case "table":
+		printRunnerTable(res.Runners)
+	case "json":
+		return printRunnerJSON(res.Runners)
+	default:
+		return fmt.Errorf("unknown format %q (use: table, json)", runnerListFormat)
+	}
+	return nil
+}
+
+func runRunnerRemove(_ *cobra.Command, args []string) error {
+	repo := args[0]
+	name := args[1]
+	deps, _, err := buildRunnerDeps("", "") // remove doesn't need to ssh (drain handled server-side by --ephemeral)
+	if err != nil {
+		return err
+	}
+	st, err := runner.Remove(context.Background(), deps, runner.Options{
+		Repo: repo,
+		PAT:  runnerPAT,
+	}, name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ %s: %s\n", st.Name, st.State)
+	if st.LastError != "" {
+		fmt.Printf("  note: %s\n", st.LastError)
+	}
+	return nil
+}
+
+// buildRunnerDeps wires the production BoxManager / SSH installer /
+// GitHub client. Returns the deps PLUS the public SSH key text
+// that will be used to create new boxes (so the caller can pass it
+// to runner.Options.SSHKey). Empty sentinel/sshUser means "skip
+// the SSH installer" — caller is using list/remove which don't ssh.
+func buildRunnerDeps(sentinel, sshUser string) (runner.Deps, string, error) {
+	if serverAddr == "" {
+		return runner.Deps{}, "", fmt.Errorf("--server is required (runner provision is a daemon-side operation; local-only Incus mode would need a different SSH path)")
+	}
+
+	// Pick the daemon API — same gRPC vs HTTP toggle used by
+	// create / list / delete elsewhere in the CLI.
+	api, creator, err := buildDaemonAPI()
+	if err != nil {
+		return runner.Deps{}, "", err
+	}
+	boxes := runner.NewDaemonBoxManager(api, creator)
+
+	deps := runner.Deps{
+		Boxes:  boxes,
+		GitHub: runner.NewGitHubClient(nil),
+	}
+
+	var sshPubKey string
+	if sentinel != "" {
+		// Read the operator's existing SSH public key (default
+		// ~/.ssh/id_rsa.pub) and use it for both directions:
+		// the box authorizes that key, and the install step
+		// signs with the matching private key.
+		pubPath, privPath, err := resolveOperatorSSHKey(runnerSSHKeyPath)
+		if err != nil {
+			return runner.Deps{}, "", err
+		}
+		// gosec G304: pubPath comes from a CLI flag the operator
+		// passed themselves. The CLI runs as the operator's UID;
+		// any file it can open, the operator can already `cat`.
+		// Constraining the path would just block legitimate
+		// custom-key-location use cases without any real security
+		// benefit. (Contrast with internal/mcp/runner_tools.go,
+		// where the path IS constrained because the caller may
+		// be a different identity than the daemon.)
+		pubBytes, err := os.ReadFile(pubPath) // #nosec G304 -- operator-supplied path; CLI runs as operator's UID
+		if err != nil {
+			return runner.Deps{}, "", fmt.Errorf("read public key %s: %w", pubPath, err)
+		}
+		sshPubKey = string(pubBytes)
+
+		installer, err := runner.NewSSHInstaller(runner.SSHInstallerConfig{
+			Endpoint: runner.SSHEndpointFunc(func(_ context.Context, boxName string) (string, string, error) {
+				user := sshUser
+				if user == "" {
+					// sshpiper routes ssh user "<boxname>"
+					// to the right backend box; this is the
+					// idiomatic Containarium SSH path.
+					user = boxName
+				}
+				host, port, err := net.SplitHostPort(sentinel)
+				if err != nil {
+					// No port → default 22.
+					host = sentinel
+					port = "22"
+				}
+				return user, net.JoinHostPort(host, port), nil
+			}),
+			PrivateKeyPath: privPath,
+		})
+		if err != nil {
+			return runner.Deps{}, "", err
+		}
+		deps.SSH = installer
+	}
+	return deps, sshPubKey, nil
+}
+
+// resolveOperatorSSHKey picks the SSH key pair to use. If the
+// caller passed --ssh-key it points at the *public* half (matching
+// the convention used by `containarium create --ssh-key`); we
+// derive the private path by trimming a trailing .pub. Empty
+// falls back to ~/.ssh/id_rsa.pub.
+func resolveOperatorSSHKey(pubPathFlag string) (pubPath, privPath string, err error) {
+	pubPath = pubPathFlag
+	if pubPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", "", fmt.Errorf("home dir: %w", err)
+		}
+		pubPath = home + "/.ssh/id_rsa.pub"
+	}
+	if strings.HasPrefix(pubPath, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", "", fmt.Errorf("home dir: %w", err)
+		}
+		pubPath = home + pubPath[1:]
+	}
+	privPath = strings.TrimSuffix(pubPath, ".pub")
+	if privPath == pubPath {
+		// User didn't give us a .pub path. Be conservative:
+		// treat the supplied path as both public and private —
+		// they'll get a useful "parse private key" error if
+		// it was actually a public key.
+		privPath = pubPath
+	}
+	if _, err := os.Stat(pubPath); err != nil {
+		return "", "", fmt.Errorf("ssh public key %s not found (pass --ssh-key or create ~/.ssh/id_rsa.pub): %w", pubPath, err)
+	}
+	return pubPath, privPath, nil
+}
+
+// daemonAPIWrapper adapts an HTTPClient or GRPCClient to the
+// runner.DaemonAPI interface. Done as a thin wrapper struct
+// (rather than declaring the methods directly on the client
+// types, which would be the wrong place for runner-specific
+// glue) so the runner package stays decoupled.
