@@ -46,3 +46,27 @@ func TestPickLowestRTT(t *testing.T) {
 		{Cand: sentinelCandidate{Region: "eu", Addr: "b"}, RTT: 10 * time.Millisecond},
 		{Cand: sentinelCandidate{Region: "ap", Addr: "c"}, Err: errors.New("timeout")},
 	}
+	got, err := pickLowestRTT(rows)
+	if err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+	if got.Region != "eu" {
+		t.Errorf("want eu (lowest RTT), got %+v", got)
+	}
+}
+
+func TestPickLowestRTT_AllFailed(t *testing.T) {
+	rows := []rttRow{
+		{Cand: sentinelCandidate{Addr: "a"}, Err: errors.New("x")},
+		{Cand: sentinelCandidate{Addr: "b"}, Err: errors.New("y")},
+	}
+	if _, err := pickLowestRTT(rows); err == nil {
+		t.Error("all-failed must error, not silently pick none")
+	}
+}
+
+func TestResolveSentinel_SingleSkipsProbe(t *testing.T) {
+	probed := false
+	probe := func([]sentinelCandidate) []rttRow { probed = true; return nil }
+	c := []sentinelCandidate{{Region: "us", Addr: "only:443"}}
+	got, rows, err := resolveSentinel(c, "auto", probe)
