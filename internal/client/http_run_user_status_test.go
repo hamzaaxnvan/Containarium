@@ -22,3 +22,15 @@ func TestHTTPGetBoxRunUserStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := c.GetBoxRunUserStatus("alice")
+	if err != nil {
+		t.Fatalf("GetBoxRunUserStatus: %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v1/containers/alice/run-user/status" {
+		t.Errorf("request = %s %s", gotMethod, gotPath)
+	}
+	if got.GetRunUser() != "ctn-run" || !got.GetToolAccessRecorded() || !got.GetRunUserExists() ||
+		got.GetState() != pb.CodeCredentialSource_CODE_CREDENTIAL_SOURCE_EXPIRED {
+		t.Errorf("decoded = %v", got)
+	}
+}
+
