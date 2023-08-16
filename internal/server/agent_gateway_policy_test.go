@@ -28,3 +28,33 @@ func TestGatewayPolicyFromEnv_WindowAloneIsNotAPolicy(t *testing.T) {
 func TestGatewayPolicyFromEnv_QuotaParsed(t *testing.T) {
 	t.Setenv(appconfig.EnvGatewayQuotaWindow, "10m")
 	t.Setenv(appconfig.EnvGatewayQuotaCalls, "500")
+	t.Setenv(appconfig.EnvGatewayQuotaTokens, "1000000")
+	t.Setenv(appconfig.EnvGatewayQuotaOutputTokens, "250000")
+
+	got := gatewayPolicyFromEnv()
+	if got == nil {
+		t.Fatal("configured quota produced no policy")
+	}
+	if got.Quota.Window != 10*time.Minute {
+		t.Errorf("window = %v, want 10m", got.Quota.Window)
+	}
+	if got.Quota.MaxCalls != 500 || got.Quota.MaxTotalTokens != 1_000_000 || got.Quota.MaxOutputTokens != 250_000 {
+		t.Errorf("quota = %+v", got.Quota)
+	}
+	if got.Anomaly.Enabled {
+		t.Error("anomaly detection enabled without being asked for")
+	}
+	if got.RevokeAt != 0 {
+		t.Errorf("RevokeAt = %v, want 0 (auto-revocation off unless configured)", got.RevokeAt)
+	}
+}
+
+func TestGatewayPolicyFromEnv_AnomalyAloneIsEnough(t *testing.T) {
+	t.Setenv(appconfig.EnvGatewayAnomalyEnabled, "1")
+	got := gatewayPolicyFromEnv()
+	if got == nil {
+		t.Fatal("anomaly=1 produced no policy")
+	}
+	if !got.Anomaly.Enabled {
+		t.Error("anomaly not enabled")
+	}

@@ -28,34 +28,3 @@ ALLOW=${DOC_NAMES_ALLOW:-$HERE/doc-names.allow}
 scan() {
   local f
   while IFS= read -r -d '' f; do
-    awk -v allow="$ALLOW" -v file="$f" '
-      BEGIN {
-        while ((getline l < allow) > 0) {
-          sub(/[ \t]+#.*$/, "", l)
-          n = split(l, p, /[ \t]+/)
-          if (p[1] == "ip") okip[p[2]] = 1
-          else if (p[1] == "name") okname[p[2]] = 1
-          else if (p[1] == "pending") pend[p[2] SUBSEP p[3]] = 1
-        }
-        rel = file; sub(/^\.\//, "", rel)
-      }
-      /^[ \t]*(```|~~~)/ { fence = !fence; next }
-      {
-        line = $0; rest = line
-        while (match(rest, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/)) {
-          s = RSTART; len = RLENGTH; ip = substr(rest, s, len)
-          pre = (s > 1) ? substr(rest, s - 1, 1) : ""
-          post = substr(rest, s + len, 1)
-          after = substr(rest, s + len)
-          rest = substr(rest, s + len)
-          if (pre ~ /[0-9.]/ || post ~ /[0-9]/) continue
-          split(ip, o, ".")
-          if (o[1] > 255 || o[2] > 255 || o[3] > 255 || o[4] > 255) continue
-          a = o[1] + 0; b = o[2] + 0; c = o[3] + 0
-          cidr = (post == "/")
-          if (a == 100 && b >= 64 && b <= 127) { print "tailscale " rel ":" FNR ": " ip; continue }
-          priv = (a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168))
-          if (priv) {
-            if (!fence && !cidr && rel != "CHANGELOG.md" && !(a == 10 && b == 0 && c == 3)) print "private-ip " rel ":" FNR ": " ip
-            continue
-          }
