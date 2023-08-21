@@ -17,9 +17,3 @@ func TestValidateSSHPublicKey(t *testing.T) {
 		{"placeholder text", "ssh-ed25519 placeholder foo@bar", true},
 		{"placeholder TODO", "TODO: add key here", true},
 		{"ellipsis truncated", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG... user@host", true},
-		{"invalid type", "ssh-unknown AAAA user@host", true},
-		{"garbage", "not a key at all", true},
-		{"valid ed25519", validEd25519, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {

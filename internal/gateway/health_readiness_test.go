@@ -73,3 +73,28 @@ func TestGatewayStart_KeepsPostgresDegradedAfterStartupHandover(t *testing.T) {
 	h := health.NewServer()
 	h.SetServingStatus(policyreadiness.CorePostgresService, healthpb.HealthCheckResponse_NOT_SERVING)
 
+	tm, err := auth.NewTokenManager("test-secret-for-postgres-health-0123456789", "containarium")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := NewGatewayServer("127.0.0.1:1", 1, auth.NewAuthMiddleware(tm), t.TempDir(), "", "")
+	gs.SetStartupListener(sl)
+	gs.SetReadinessCheck(policyreadiness.ServerCheck(h))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- gs.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = sl.Close()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Errorf("gateway shutdown: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("gateway did not stop")
+		}
+	})
+
+	deadline := time.Now().Add(3 * time.Second)
