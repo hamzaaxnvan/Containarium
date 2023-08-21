@@ -1,2 +1,5 @@
 name: bad-template-injection
 on:
+  pull_request:
+permissions:
+  contents: read

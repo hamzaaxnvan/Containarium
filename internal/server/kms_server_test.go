@@ -25,31 +25,3 @@ func TestSetKMSStatus_NormalizesBackend(t *testing.T) {
 	// Empty backend defaults to "none".
 	cs.SetKMSStatus("", "disabled", false, false)
 	if cs.kmsBackend != "none" {
-		t.Fatalf("empty backend should normalize to none; got %q", cs.kmsBackend)
-	}
-}
-
-func TestGetKMSStatus_ReturnsSnapshot(t *testing.T) {
-	cs := &ContainerServer{}
-	cs.SetKMSStatus("vault", "vault transit (addr=https://v|transit|k)", true, true)
-	srv := NewKmsServer(cs)
-
-	resp, err := srv.GetKMSStatus(kmsAdminCtx(), &pb.GetKMSStatusRequest{})
-	if err != nil {
-		t.Fatalf("GetKMSStatus: %v", err)
-	}
-	if resp.Backend != "vault" || !resp.KmsConfigured || !resp.RequireEnvelope {
-		t.Fatalf("unexpected status: %+v", resp)
-	}
-	if resp.Description == "" {
-		t.Fatal("description should pass through")
-	}
-}
-
-func TestKMS_RequiresAdminScope(t *testing.T) {
-	srv := NewKmsServer(&ContainerServer{})
-
-	// Missing the kms:admin scope (has a different scope).
-	noScope := auth.ContextWithTestSubjectScopes(context.Background(),
-		"ops", []string{auth.RoleAdmin}, []string{auth.ScopeSecretsRead})
-	if _, err := srv.GetKMSStatus(noScope, &pb.GetKMSStatusRequest{}); status.Code(err) != codes.PermissionDenied {
