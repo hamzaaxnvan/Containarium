@@ -61,3 +61,129 @@ func ACLName(role incus.Role) string {
 // sourceKind says who a listener rule admits. Every rule's source is one of
 // these — there is deliberately no "anyone" kind.
 type sourceKind uint8
+
+const (
+	fromHost         sourceKind = iota // the host gateway /32
+	fromBridge                         // the whole tenant bridge — only for tenant-facing ports
+	fromControlPlane                   // each control-plane container /32
+	fromCore                           // one named core role's /32
+)
+
+type source struct {
+	kind sourceKind
+	role incus.Role // set when kind == fromCore
+}
+
+// listener is one row of the table: a tcp port group on a role and the
+// sources allowed to reach it.
+type listener struct {
+	ports string
+	from  []source
+}
+
+// table is the allow-list. Sources are always the host gateway, a specific
+// core/control-plane container, or — for exactly the ports tenants are meant
+// to use — the bridge CIDR. Everything not listed is dropped by the NIC's
+// default ingress action. Keep this in step with the table in the design
+// doc; TestCompute_RoleTable pins it.
+var table = map[incus.Role][]listener{
+	incus.RolePostgres: {
+		// daemon connection pool; Grafana's datastore. The live pg_stat_activity
+		// client set observed during the incident that motivated the guard.
+		{ports: "5432", from: []source{{kind: fromHost}, {kind: fromCore, role: incus.RoleVictoriaMetrics}}},
+	},
+	incus.RoleVictoriaMetrics: {
+		// VictoriaMetrics + alertmanager: daemon and control plane write/query.
+		{ports: "8428,8880,9093,9094", from: []source{{kind: fromHost}, {kind: fromControlPlane}}},
+		// Grafana is fronted by Caddy; never reachable from tenants directly.
+		{ports: "3000", from: []source{{kind: fromHost}, {kind: fromCore, role: incus.RoleCaddy}}},
+	},
+	incus.RoleOTelCollector: {
+		// Tenants with monitoring=true push OTLP by design.
+		{ports: "4317,4318", from: []source{{kind: fromBridge}}},
+		// health + self-metrics
+		{ports: "13133,8888", from: []source{{kind: fromHost}}},
+	},
+	incus.RoleCaddy: {
+		// The base domain resolves in-bridge; tenants and agent boxes reach the
+		// platform API through Caddy.
+		{ports: "80,443", from: []source{{kind: fromBridge}}},
+		// Admin API: the daemon drives it over the bridge from the host.
+		{ports: "2019", from: []source{{kind: fromHost}}},
+	},
+	// No listeners: everything dropped.
+	incus.RoleSecurity: {},
+	incus.RoleGuacamole: {
+		{ports: "8080", from: []source{{kind: fromHost}, {kind: fromCore, role: incus.RoleCaddy}}},
+	},
+}
+
+// Compute renders the table for one host. It validates every address
+// against the bridge first — a rule with a wrong subnet would be a silent
+// allow for the wrong thing — and produces rules in a fixed order so an
+// unchanged host yields byte-identical ACLs (a reconciler diffs on them).
+func Compute(in Inputs) (Policy, error) {
+	if err := validate(in); err != nil {
+		return Policy{}, err
+	}
+	bridge := in.BridgeCIDR.Masked()
+
+	pol := Policy{ACLs: make(map[incus.Role]incus.ACLConfig, len(in.Core))}
+	for role := range in.Core {
+		if role == incus.RoleControlPlane {
+			// Platform infrastructure that tenants legitimately call and that
+			// must reach every box (#780): a source, never a subject.
+			continue
+		}
+		rows, known := table[role]
+		if !known {
+			pol.UnknownRoles = append(pol.UnknownRoles, role)
+		}
+
+		acl := incus.ACLConfig{
+			Name:        ACLName(role),
+			Description: fmt.Sprintf("containarium core-infra guard for %s — managed by containariumd, do not edit", role),
+		}
+		for _, l := range rows {
+			for _, src := range l.from {
+				for _, cidr := range resolve(src, in, bridge) {
+					acl.IngressRules = append(acl.IngressRules, incus.ACLRule{
+						Action:          "allow",
+						Source:          cidr,
+						Protocol:        "tcp",
+						DestinationPort: l.ports,
+						Description:     fmt.Sprintf("%s: %s from %s", role, l.ports, describe(src)),
+					})
+				}
+			}
+		}
+		sort.SliceStable(acl.IngressRules, func(i, j int) bool {
+			a, b := acl.IngressRules[i], acl.IngressRules[j]
+			if a.DestinationPort != b.DestinationPort {
+				return a.DestinationPort < b.DestinationPort
+			}
+			return a.Source < b.Source
+		})
+		pol.ACLs[role] = acl
+	}
+	sort.Slice(pol.UnknownRoles, func(i, j int) bool { return pol.UnknownRoles[i] < pol.UnknownRoles[j] })
+	return pol, nil
+}
+
+// resolve turns a table source into concrete CIDR strings. A peer that is
+// not present on the host resolves to nothing — the rule is omitted, not
+// rendered with a placeholder.
+func resolve(src source, in Inputs, bridge netip.Prefix) []string {
+	switch src.kind {
+	case fromHost:
+		return []string{host32(in.HostGateway)}
+	case fromBridge:
+		return []string{bridge.String()}
+	case fromControlPlane:
+		out := make([]string, 0, len(in.ControlPlane))
+		for _, a := range in.ControlPlane {
+			out = append(out, host32(a))
+		}
+		return out
+	case fromCore:
+		if a, ok := in.Core[src.role]; ok {
