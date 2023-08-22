@@ -19,24 +19,3 @@ func TestAppServer_DeployApp_RejectsMissingScope(t *testing.T) {
 	srv := &AppServer{}
 	ctx := tenantWithScopes("alice", auth.ScopeContainersRead) // read-only
 	_, err := srv.DeployApp(ctx, &pb.DeployAppRequest{
-		Username:      "alice",
-		AppName:       "myapp",
-		SourceTarball: []byte("not-empty"),
-	})
-	if status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("got %v want PermissionDenied", err)
-	}
-}
-
-func TestAppServer_ListApps_RejectsMissingScope(t *testing.T) {
-	srv := &AppServer{}
-	ctx := tenantWithScopes("alice", auth.ScopeContainersWrite) // write-only
-	_, err := srv.ListApps(ctx, &pb.ListAppsRequest{})
-	if status.Code(err) != codes.PermissionDenied {
-		t.Fatalf("got %v want PermissionDenied", err)
-	}
-}
-
-func TestAppServer_GetApp_RejectsMissingScope(t *testing.T) {
-	srv := &AppServer{}
-	ctx := tenantWithScopes("alice", auth.ScopeContainersWrite)

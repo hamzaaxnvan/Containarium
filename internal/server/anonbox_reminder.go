@@ -9,27 +9,3 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/footprintai/containarium/internal/anonbox"
-)
-
-// anonReminderWebhook delivers the opt-in expiry reminder (#2206) as one
-// POST to the control plane, which owns outbound email (it already sends
-// signup mail). The daemon has no SMTP path — alerting is webhook-only —
-// and this keeps it that way: no provider, no credentials on the anon host.
-//
-// Body: {"email","box_name","claim_url","expires_at"}; any 2xx is
-// delivered. One attempt; the warner records it and never retries.
-type anonReminderWebhook struct {
-	url    string
-	client *http.Client
-}
-
-func newAnonReminderWebhook(url string) *anonReminderWebhook {
-	return &anonReminderWebhook{url: url, client: &http.Client{Timeout: 10 * time.Second}}
-}
-
-type anonReminderPayload struct {
-	Email     string `json:"email"`
-	BoxName   string `json:"box_name"`
-	ClaimURL  string `json:"claim_url"`
-	ExpiresAt string `json:"expires_at"`
