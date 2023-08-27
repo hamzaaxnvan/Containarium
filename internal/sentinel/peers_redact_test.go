@@ -50,3 +50,21 @@ func TestPeersHandler_UnsignedPoolQueryIgnored(t *testing.T) {
 	_, all := peersCall(t, m, "", "")
 	for _, q := range []string{"?pool=prod", "?pool=ghost", "?pool="} {
 		raw, got := peersCall(t, m, q, "")
+		if len(got) != len(all) {
+			t.Errorf("%s: filter honoured for unsigned caller (%d vs %d)", q, len(got), len(all))
+		}
+		if strings.Contains(raw, "pool") {
+			t.Errorf("%s: leaks pool: %s", q, raw)
+		}
+	}
+}
+
+func TestPeersHandler_WrongSecretTreatedAsUnsigned(t *testing.T) {
+	m := newManagerForPeersTest(peersTestSecret)
+	raw, peers := peersCall(t, m, "?pool=prod", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+	if len(peers) != 2 || strings.Contains(raw, "pool") {
+		t.Fatalf("bad signature must be redacted: %s", raw)
+	}
+}
+
+func TestPeersHandler_UnconfiguredSecretNeverTrustsSignature(t *testing.T) {
