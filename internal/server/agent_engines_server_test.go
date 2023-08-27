@@ -80,3 +80,44 @@ func TestListAgentEngines_TenantSeesOwnOwner(t *testing.T) {
 		t.Fatalf("ListAgentEngines: %v", err)
 	}
 	if resp.GetKeyOwner() != "user:alice" {
+		t.Errorf("key_owner = %q, want user:alice", resp.GetKeyOwner())
+	}
+	codex := statusFor(resp.GetEngines(), pb.AgentEngine_AGENT_ENGINE_CODEX)
+	if codex.GetReadiness() != pb.AgentEngineReadiness_AGENT_ENGINE_READINESS_READY {
+		t.Errorf("codex readiness = %v, want READY (alice has her own openai key)", codex.GetReadiness())
+	}
+	// gemini also has no global key, so Statuses checks its owner key too —
+	// only openai's lookup matters here; just confirm it happened as alice.
+	found := false
+	for _, call := range resolver.calls {
+		if call == "user:alice|openai" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("resolver calls = %v, want user:alice|openai among them", resolver.calls)
+	}
+	if got := codex.GetSkillIds(); len(got) != 1 || got[0] != "codex-skill" {
+		t.Errorf("codex skill_ids = %v, want [codex-skill]", got)
+	}
+}
+
+// TestListAgentEngines_AdminSeesGlobalView pins the other half: "an admin
+// with no owner scope sees the global view" — keyOwner is empty, so
+// readiness reflects ONLY the global provider set, and a per-owner key that
+// exists for some other user never leaks into the admin's rows.
+func TestListAgentEngines_AdminSeesGlobalView(t *testing.T) {
+	resolver := &fakeOwnerKeyResolverForEngines{has: map[string]bool{"user:alice|openai": true}}
+	s := &AgentSkillServer{
+		catalog: enginesFixtureCatalog(t),
+		gateway: &gatewayProvisioning{engines: agentengine.Gateway{
+			DefaultProvider: "anthropic",
+			GlobalProviders: map[string]bool{"anthropic": true},
+			Keys:            resolver,
+		}},
+	}
+	resp, err := s.ListAgentEngines(ctxAs("ops", true), &pb.ListAgentEnginesRequest{})
+	if err != nil {
+		t.Fatalf("ListAgentEngines: %v", err)
+	}
+	if resp.GetKeyOwner() != "" {

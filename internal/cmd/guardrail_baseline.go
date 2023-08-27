@@ -44,3 +44,26 @@ var guardrailBaselineSetCmd = &cobra.Command{
 	Long: `Switch what the baseline does with a match. The baseline scans model
 responses only while no admin guardrail policy has been set.
 
+  log    default: the response streams to the client unchanged and is
+         scanned at its end; a match is audited and logged
+  block  the response is held to its end, scanned, and blocked on a match
+         (HTTP 502, audited); a 2xx response over the hold limit, with a
+         content encoding, or neither JSON nor an event stream is blocked
+         too, for every tenant, as under an admin BLOCK rule
+
+The mode is stored apart from the policy, so setting it never turns the
+baseline off. Admin role required; every change increments the setting's
+revision. On a daemon with an audit store the change writes an audit entry,
+and it is refused if that entry cannot be written. A daemon with no audit
+store (no Postgres, REST disabled, or an audit store that failed to start)
+keeps no audit entry. Check it with 'containarium guardrail status'.
+
+Examples:
+  containarium guardrail baseline set --mode block --server <host>:50051
+  containarium guardrail baseline set --mode log --server <host>:50051`,
+	Args: cobra.NoArgs,
+	RunE: runGuardrailBaselineSet,
+}
+
+func init() {
+	guardrailBaselineCmd.AddCommand(guardrailBaselineSetCmd)
