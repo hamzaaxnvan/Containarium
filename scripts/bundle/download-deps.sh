@@ -139,3 +139,144 @@ case "$OS" in
   *)
     log_error "Unsupported OS: $OS (expected linux)"
     exit 1
+    ;;
+esac
+
+mkdir -p "$STAGING_DIR/toolchains" "$STAGING_DIR/bin" "$STAGING_DIR/apt"
+
+# fetch <url> <output-path>
+# Skip if the output already exists and is non-empty (idempotent re-runs).
+fetch() {
+  local url="$1" out="$2"
+  if [ -s "$out" ]; then
+    log_info "skip (cached): $(basename "$out")"
+    return 0
+  fi
+  log_info "fetch: $url"
+  # -L follow redirects; -f fail on HTTP error; --retry 3 buffers flaky
+  # network without masking persistent failure.
+  if ! curl -fL --retry 3 --retry-delay 2 -o "$out.partial" "$url"; then
+    log_error "fetch failed: $url"
+    rm -f "$out.partial"
+    return 1
+  fi
+  mv "$out.partial" "$out"
+  log_success "fetched: $(basename "$out")"
+}
+
+# ---- Go ----
+download_go() {
+  local file="go${GO_VERSION}.${OS}-${ARCH}.tar.gz"
+  fetch "https://go.dev/dl/${file}" "$STAGING_DIR/toolchains/${file}"
+}
+
+# ---- Node ----
+download_node() {
+  # Node tarballs for linux use .tar.xz; for darwin .tar.gz. We only
+  # ship linux today so xz is fine.
+  local file="node-v${NODE_VERSION}-${OS}-${NODE_ARCH}.tar.xz"
+  fetch "https://nodejs.org/dist/v${NODE_VERSION}/${file}" \
+        "$STAGING_DIR/toolchains/${file}"
+}
+
+# ---- pnpm ----
+download_pnpm() {
+  # pnpm publishes raw binaries (no tarball wrapper) named like
+  # pnpm-linux-x64 / pnpm-linux-arm64 via GitHub releases.
+  local file="pnpm-${OS}-${NODE_ARCH}"
+  fetch "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/${file}" \
+        "$STAGING_DIR/toolchains/pnpm-${PNPM_VERSION}-${OS}-${NODE_ARCH}"
+}
+
+# ---- buf ----
+download_buf() {
+  # Share CI's pin and checksum validation, including on cached-file reruns.
+  "$(dirname "$0")/../install-buf.sh" \
+    "$STAGING_DIR/toolchains/buf-${BUF_VERSION}-${OS}-${ARCH}" "$BUF_OS" "$BUF_ARCH"
+}
+
+# ---- golangci-lint ----
+download_golangci_lint() {
+  local file="golangci-lint-${GOLANGCI_LINT_VERSION}-${OS}-${ARCH}.tar.gz"
+  fetch "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_LINT_VERSION}/${file}" \
+        "$STAGING_DIR/toolchains/${file}"
+}
+
+# ---- actions-runner ----
+download_actions_runner() {
+  local file="actions-runner-${OS}-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
+  fetch "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${file}" \
+        "$STAGING_DIR/bin/${file}"
+}
+
+# ---- apt packages ----
+# Downloads the .debs install.sh would pull on a connected host, plus their
+# whole Depends/Pre-Depends closure, into $STAGING_DIR/apt/.
+#
+# Fails loudly (#3061). It used to filter apt's `E:` lines and discard the
+# exit status, so a release bundle shipped an empty apt/ from a green step.
+# The causes are handled on purpose here:
+#
+#   - The closure came from `apt-rdepends`, which lists virtual names
+#     (debconf-2.0, logind, default-dbus-system-bus, ...) and removed
+#     alternatives (mime-support) but never follows a virtual name to the
+#     package that provides it. One such name made the single
+#     `apt-get download` call fail and fetch nothing, and skipping them would
+#     still have left out dbus, libpam-systemd and friends. apt's own
+#     resolver now picks the set: `apt-get install -s` against an empty dpkg
+#     status lists every package a fresh host would need, providers of
+#     virtual names included, and exactly those name=version pairs are
+#     downloaded. Recommends are not followed (--no-install-recommends).
+#   - incus, incus-client and incus-extra come from the Zabbly stable repo,
+#     as on a connected install (hacks/install.sh); Ubuntu has no
+#     incus-extra. Add the repo first with scripts/bundle/add-zabbly-repo.sh.
+#     A requested package apt cannot locate fails the resolver step.
+#   - check_apt_closure then proves the result independently of apt: a .deb
+#     for every requested package, and every Depends/Pre-Depends group of
+#     every downloaded .deb met inside the bundle.
+#
+# Run it on the Ubuntu release the bundle targets (24.04), after
+# `apt-get update`: the .debs are only valid for that release.
+download_apt_packages() {
+  local tool missing_tool=0
+  for tool in apt-get dpkg-deb; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      log_error "$tool not found; the apt step needs it"
+      missing_tool=1
+    fi
+  done
+  if [ "$missing_tool" = 1 ]; then
+    log_error "Run the apt step on an Ubuntu builder of the target release, or run"
+    log_error "with DEPS_ONLY=toolchains and put the .debs into $STAGING_DIR/apt/ yourself."
+    return 1
+  fi
+
+  local apt_dir="$STAGING_DIR/apt" work sim
+  local pkgs=() fetch=()
+  read -r -a pkgs <<<"$APT_PACKAGES"
+  if [ "${#pkgs[@]}" -eq 0 ]; then
+    log_error "APT_PACKAGES is empty"
+    return 1
+  fi
+
+  work="$(mktemp -d)"
+  # shellcheck disable=SC2064  # expand now: $work is local
+  trap "rm -rf '$work'; trap - RETURN" RETURN
+  : >"$work/status"   # empty dpkg status: resolve as for a host with nothing installed
+
+  log_info "Resolving the install set of: ${pkgs[*]}"
+  if ! sim="$(apt-get install -s --no-install-recommends "${APT_NET_OPTS[@]}" \
+                -o Dir::State::status="$work/status" -o Debug::NoLocking=1 \
+                "${pkgs[@]}")"; then
+    log_error "apt could not resolve the package set (see the apt error above)."
+    log_error "Is every repo configured? incus* need scripts/bundle/add-zabbly-repo.sh."
+    return 1
+  fi
+  # `Inst <name> (<version> <origin> [<arch>])`
+  mapfile -t fetch < <(awk '$1 == "Inst" { v = $3; sub(/^\(/, "", v); print $2 "=" v }' <<<"$sim")
+  if [ "${#fetch[@]}" -eq 0 ]; then
+    log_error "apt resolved an empty install set"
+    return 1
+  fi
+
+  # Batched (#3118): the log shows which batch is in flight, so a stall is
