@@ -91,3 +91,96 @@ func SignSentinelRequest(req *http.Request, secret []byte) {
 
 // VerifySentinelRequest returns nil if `req` carries a valid
 // sentinel-HMAC signature for `secret`. The error is intentionally
+// generic — callers should map it to a 401 without echoing the
+// reason, the same way JWT validation does.
+func VerifySentinelRequest(req *http.Request, secret []byte, now time.Time) error {
+	tsStr := req.Header.Get(SentinelHeaderTimestamp)
+	sig := req.Header.Get(SentinelHeaderSignature)
+	if tsStr == "" || sig == "" {
+		return errSentinelAuth
+	}
+	ts, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return errSentinelAuth
+	}
+	if delta := now.Unix() - ts; delta > int64(SentinelMaxClockSkew/time.Second) || -delta > int64(SentinelMaxClockSkew/time.Second) {
+		return errSentinelAuth
+	}
+	want := computeSentinelSignature(secret, req.Method, req.URL.Path, tsStr)
+	// hex string compare via hmac.Equal for constant-time. Decoding
+	// to bytes first would let a length mismatch leak via early
+	// return; string-form Equal is fixed-width over the hex output.
+	if !hmac.Equal([]byte(want), []byte(sig)) {
+		return errSentinelAuth
+	}
+	return nil
+}
+
+// SentinelHMACMiddleware wraps `next` such that incoming requests
+// must carry a valid sentinel HMAC signature. If `secret` is nil or
+// shorter than SentinelMinSecretLen, the middleware refuses ALL
+// requests with 401 — fail-closed by default, no silent
+// passthrough. Operators must configure
+// CONTAINARIUM_SENTINEL_AUTH_SECRET to enable the wrapped endpoints.
+//
+// When unconfigured AND requests are actually arriving, a WARNING
+// is logged at most once per sentinelMisconfigLogInterval so the
+// daemon's journal shows the misconfiguration in real time during
+// an incident — the startup line alone is easy to miss (#341).
+func SentinelHMACMiddleware(secret []byte, next http.Handler) http.Handler {
+	configured := len(secret) >= SentinelMinSecretLen
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !configured {
+			logDaemonSentinelMisconfigOncePerInterval(r)
+			http.Error(w, `{"error":"sentinel auth not configured","code":401}`, http.StatusUnauthorized)
+			return
+		}
+		if err := VerifySentinelRequest(r, secret, time.Now()); err != nil {
+			http.Error(w, `{"error":"sentinel auth failed","code":401}`, http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+const sentinelMisconfigLogInterval = 60 * time.Second
+
+// lastDaemonMisconfigLogNs tracks the most recent per-request
+// WARNING so the daemon doesn't spam the log every keysync cycle.
+var lastDaemonMisconfigLogNs atomic.Int64
+
+func logDaemonSentinelMisconfigOncePerInterval(r *http.Request) {
+	now := time.Now().UnixNano()
+	last := lastDaemonMisconfigLogNs.Load()
+	if last != 0 && now-last < int64(sentinelMisconfigLogInterval) {
+		return
+	}
+	if !lastDaemonMisconfigLogNs.CompareAndSwap(last, now) {
+		return
+	}
+	log.Printf("[sentinel-hmac] WARNING: sentinel-auth secret unconfigured but request received for %s %s — set CONTAINARIUM_SENTINEL_AUTH_SECRET on the daemon host; until then every sentinel keysync/certsync cycle is failing", r.Method, r.URL.Path)
+}
+
+func computeSentinelSignature(secret []byte, method, path, ts string) string {
+	mac := hmac.New(sha256.New, secret)
+	// "\n" separator is unambiguous because HTTP methods and URL
+	// paths can't contain raw newlines.
+	mac.Write([]byte(method))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(path))
+	mac.Write([]byte{'\n'})
+	mac.Write([]byte(ts))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// SignSentinelResponse stamps the timestamp + signature headers on
+// `w` for an HTTP response body of `body`. Call BEFORE writing the
+// body so headers go out first. The signature commits to (body, ts)
+// — a tampered body or replayed signature fails verification.
+//
+// When the secret is unconfigured (nil or shorter than the
+// minimum), the headers are NOT written and the body is sent
+// unsigned. The verifier on the daemon side will fail-closed and
+// log it, so misconfiguration surfaces loudly rather than silently
+// shipping unauthenticated peer lists.
+func SignSentinelResponse(w http.ResponseWriter, secret, body []byte) {
