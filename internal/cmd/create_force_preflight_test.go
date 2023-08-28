@@ -65,3 +65,36 @@ func (d *fakeForceDaemon) sequence() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return strings.Join(d.calls, ",")
+}
+
+func forceCreateAgainst(t *testing.T, d *fakeForceDaemon) error {
+	t.Helper()
+	savedForce, savedNoKey, savedStack, savedAddr, savedHTTP, savedToken, savedVerbose :=
+		forceRecreate, noSSHKey, stackID, serverAddr, httpMode, authToken, verbose
+	defer func() {
+		forceRecreate, noSSHKey, stackID, serverAddr, httpMode, authToken, verbose =
+			savedForce, savedNoKey, savedStack, savedAddr, savedHTTP, savedToken, savedVerbose
+	}()
+	forceRecreate, noSSHKey, stackID, serverAddr, httpMode, authToken, verbose = true, true, "typo", d.srv.URL, true, "tok", false
+	return runCreate(nil, []string{"alice"})
+}
+
+// #2925: against a daemon, `create --force` must not delete the existing box
+// for a request the daemon would reject. The daemon's own pre-flight decides.
+func TestRunCreate_ForceDoesNotDeleteWhenTheDaemonRejectsThePreflight(t *testing.T) {
+	d := newFakeForceDaemon(t)
+	d.rejectDryRun = true
+
+	err := forceCreateAgainst(t, d)
+	if err == nil || !strings.Contains(err.Error(), `unknown stack "typo"`) {
+		t.Fatalf("runCreate = %v, want the daemon's rejection surfaced", err)
+	}
+	if got := d.sequence(); got != "GET,DRYRUN" {
+		t.Fatalf("daemon saw %q, want GET,DRYRUN: the box must still exist and nothing else may run", got)
+	}
+}
+
+func TestRunCreate_ForceDeletesAndCreatesOnlyAfterTheDaemonAcceptsThePreflight(t *testing.T) {
+	d := newFakeForceDaemon(t)
+
+	if err := forceCreateAgainst(t, d); err != nil {

@@ -16,3 +16,21 @@ func TestNewStore_PingIsBoundedOnBlackholePostgres(t *testing.T) {
 	}
 	defer func() { _ = lis.Close() }()
 	go func() {
+		var held []net.Conn // owned by this goroutine; closed when the listener closes
+		for {
+			c, err := lis.Accept()
+			if err != nil {
+				for _, h := range held {
+					_ = h.Close()
+				}
+				return
+			}
+			held = append(held, c) // never answer the startup message
+		}
+	}()
+	dsn := "postgres://u:p@" + lis.Addr().String() + "/db?sslmode=disable"
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewStore(context.Background(), dsn)
+		done <- err
