@@ -28,3 +28,34 @@ import (
 //     sentinel-issued CA from Phase 0.5 (the /sentinel/ca
 //     response) or a corporate root. Unset → fall back to the
 //     system trust store, which is correct for publicly-trusted
+//     hostnames and wrong for self-signed certs.
+
+const (
+	mcpAllowInsecureEnv = "CONTAINARIUM_MCP_ALLOW_INSECURE"
+	mcpTrustedCAFileEnv = "CONTAINARIUM_MCP_TRUSTED_CA_FILE"
+)
+
+// buildMCPTLSConfig constructs a *tls.Config for the MCP client's
+// http.Transport based on the env knobs above. Returns:
+//   - nil, nil      — caller can use the http.Transport zero
+//     value (system roots, default TLS). Happens
+//     for an https:// URL with no CA pin and
+//     no insecure-allow toggle.
+//   - cfg, nil      — pinned CA (cfg.RootCAs populated).
+//   - nil, error    — scheme is http:// and ALLOW_INSECURE isn't
+//     set, OR the CA file is unreadable / not
+//     PEM.
+func buildMCPTLSConfig(baseURL string) (*tls.Config, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid baseURL %q: %w", baseURL, err)
+	}
+
+	if u.Scheme == "http" {
+		if !mcpInsecureAllowed() {
+			return nil, fmt.Errorf("MCP client refuses http:// baseURL %q (audit C-HIGH-1); set %s=true to opt into plaintext for dev/test",
+				baseURL, mcpAllowInsecureEnv)
+		}
+		// Caller explicitly allowed plaintext; no TLS config
+		// needed, returning nil falls back to the http.Transport
+		// zero value (no TLS attempted).
