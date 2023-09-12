@@ -34,3 +34,21 @@ func TestNetworkPolicyStatus_PolicySource(t *testing.T) {
 				t.Errorf("policy_source = %v, want %v", st.GetPolicySource(), tc.want)
 			}
 		})
+	}
+}
+
+// With nothing loaded the source is unknown, never guessed.
+func TestNetworkPolicyStatus_PolicySourceUnknownWhenNotLoaded(t *testing.T) {
+	st := npStatusFor(t, nil, false, "acme")
+	if st.GetPolicySource() != pb.NetworkPolicySource_NETWORK_POLICY_SOURCE_UNSPECIFIED {
+		t.Errorf("policy_source = %v, want UNSPECIFIED", st.GetPolicySource())
+	}
+}
+
+// The default policy is marked as such; a compiled stored policy is not.
+func TestDefaultPolicy_IsMarkedDefault(t *testing.T) {
+	def, err := netpolicy.DefaultPolicy("acme", netpolicy.DefaultEgressExtras{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !def.IsHostDefault {
