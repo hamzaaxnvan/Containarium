@@ -35,3 +35,40 @@ func hostHasSwap() bool {
 	for _, line := range strings.Split(string(data), "\n") {
 		rest, ok := strings.CutPrefix(line, "SwapTotal:")
 		if !ok {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			return false
+		}
+		kb, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil {
+			return false
+		}
+		return kb > 0
+	}
+	return false
+}
+
+var (
+	sentinelSvcSpotVM     string
+	sentinelSvcZone       string
+	sentinelSvcProject    string
+	sentinelSvcMemoryHigh string
+	sentinelSvcMemoryMax  string
+)
+
+var sentinelServiceCmd = &cobra.Command{
+	Use:   "service",
+	Short: "Manage the Containarium sentinel systemd service",
+}
+
+var sentinelServiceInstallCmd = &cobra.Command{
+	Use:   "install",
+	Short: "Install the sentinel systemd service file and enable it",
+	Long: `Install the Containarium sentinel systemd service to /etc/systemd/system/.
+
+The sentinel service monitors a backend spot VM and forwards traffic via iptables DNAT.
+When the backend is unavailable, it serves a maintenance page.
+
+Requires root privileges.`,
