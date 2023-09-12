@@ -79,3 +79,85 @@ func TestCAHandler_503WhenUnconfigured(t *testing.T) {
 		t.Fatalf("want 503, got %d", rec.Code)
 	}
 }
+
+func TestCAHandler_RejectsUnsignedRequest(t *testing.T) {
+	m := newManagerForPKITest(t, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/sentinel/ca", nil) // no SignSentinelRequest
+	rec := httptest.NewRecorder()
+	handler := auth.SentinelHMACMiddleware([]byte(phase05Secret), m.CAHandler())
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unsigned request must be rejected; got %d", rec.Code)
+	}
+}
+
+func TestPeerCertHandler_IssuesVerifiableCert(t *testing.T) {
+	m := newManagerForPKITest(t, true)
+
+	body, _ := json.Marshal(PeerCertRequest{PeerID: "tunnel-node-a-gpu"})
+	req := httptest.NewRequest(http.MethodPost, "/sentinel/peer-cert", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	auth.SignSentinelRequest(req, []byte(phase05Secret))
+	rec := httptest.NewRecorder()
+	handler := auth.SentinelHMACMiddleware([]byte(phase05Secret), m.PeerCertHandler())
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	var resp PeerCertResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.CertPEM == "" || resp.KeyPEM == "" || resp.CAPEM == "" {
+		t.Fatalf("missing fields: %+v", resp)
+	}
+
+	// The issued leaf must verify against the bundled CA.
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM([]byte(resp.CAPEM)) {
+		t.Fatal("CA bundle not parseable")
+	}
+	tlsCert, err := tls.X509KeyPair([]byte(resp.CertPEM), []byte(resp.KeyPEM))
+	if err != nil {
+		t.Fatalf("X509KeyPair: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
+	if err != nil {
+		t.Fatalf("ParseCertificate: %v", err)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, DNSName: "tunnel-node-a-gpu"}); err != nil {
+		t.Fatalf("issued cert does not verify: %v", err)
+	}
+}
+
+func TestPeerCertHandler_RejectsMissingPeerID(t *testing.T) {
+	m := newManagerForPKITest(t, true)
+
+	body := []byte(`{}`)
+	req := httptest.NewRequest(http.MethodPost, "/sentinel/peer-cert", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	auth.SignSentinelRequest(req, []byte(phase05Secret))
+	rec := httptest.NewRecorder()
+	handler := auth.SentinelHMACMiddleware([]byte(phase05Secret), m.PeerCertHandler())
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d", rec.Code)
+	}
+}
+
+func TestSentinelTLSEndToEnd_ServesAndVerifies(t *testing.T) {
+	// End-to-end smoke: spin up a real HTTPS test server using a
+	// sentinel-issued cert, then connect with an http.Client pinned
+	// to the matching CA. This is the same path the daemon's
+	// peer-to-peer client uses.
+	m := newManagerForPKITest(t, true)
+	certPEM, keyPEM := m.SentinelServerCertPEM()
+	if certPEM == nil {
+		t.Fatal("sentinel server cert was not minted")
+	}
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
