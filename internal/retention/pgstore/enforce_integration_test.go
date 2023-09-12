@@ -128,3 +128,133 @@ func TestEnforce_AHeldOrgsRecordsSurviveAndGoOnTheNextSweepAfterRelease(t *testi
 	if _, err := store.ReleaseHold(ctx, "org-a", "admin", nil); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := sw.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep after release: %v", err)
+	}
+	wantRows(t, pool, 1, "after the release the expired records go on the next enforced sweep")
+}
+
+func TestEnforce_ACrewRunUsesTheLongerOfItsTwoWindows(t *testing.T) {
+	ctx := context.Background()
+	pool := sourcesPool(t)
+	store, err := pgstore.New(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetPolicy(ctx, []*pb.RetentionWindow{
+		{Class: pb.RetentionClass_RETENTION_CLASS_PROMPTS, Days: 30},
+		{Class: pb.RetentionClass_RETENTION_CLASS_RESPONSES, Days: 90},
+	}, "admin", nil); err != nil {
+		t.Fatal(err)
+	}
+	for id, age := range map[string]int{"c-20d": 20, "c-60d": 60, "c-100d": 100} {
+		if _, err := pool.Exec(ctx, `INSERT INTO crew_runs (id, run, created_at) VALUES ($1, '{}'::jsonb, $2)`,
+			id, time.Now().AddDate(0, 0, -age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setMode(t, ctx, store, pb.RetentionMode_RETENTION_MODE_ENFORCE)
+	sw := retention.NewSweeper(store, pgstore.NewSources(pool), nil)
+	sw.SetAuditor((&auditCounter{}).audit)
+	if _, err := sw.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	rows, err := pool.Query(ctx, `SELECT id FROM crew_runs ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var left []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		left = append(left, id)
+	}
+	if len(left) != 2 || left[0] != "c-20d" || left[1] != "c-60d" {
+		t.Errorf("crew_runs left = %v, want [c-20d c-60d]: only the row past the longer 90-day window goes", left)
+	}
+}
+
+func removers(pool *pgxpool.Pool, table string) retention.Remover {
+	for _, s := range pgstore.NewSources(pool) {
+		if s.Store() == table {
+			return s.(retention.Remover)
+		}
+	}
+	return nil
+}
+
+func TestRemove_IsBoundedByMaxRows(t *testing.T) {
+	ctx := context.Background()
+	pool := sourcesPool(t)
+	seed(t, pool)
+	if _, err := pgstore.New(ctx, pool); err != nil { // creates the holds table Remove checks
+		t.Fatal(err)
+	}
+	cutoff := time.Now().AddDate(0, 0, -sourceWindowDays)
+	rm := removers(pool, "agent_tasks")
+	res, err := rm.Remove(ctx, cutoff, nil, 1)
+	if err != nil || res.Removed != 1 {
+		t.Fatalf("Remove(maxRows=1) = (%+v, %v), want 1 removed of the 2 eligible", res, err)
+	}
+	res, err = rm.Remove(ctx, cutoff, nil, 100)
+	if err != nil || res.Removed != 1 {
+		t.Fatalf("Remove(maxRows=100) = (%+v, %v), want the 1 remaining eligible row", res, err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_tasks`).Scan(&left); err != nil || left != 1 {
+		t.Errorf("agent_tasks has %d rows left (err %v), want only the newer one", left, err)
+	}
+}
+
+// A hold placed after the sweeper read the holds must still stop the
+// deletion: the hold check is part of the DELETE statement.
+func TestRemove_ReChecksHoldsInTheSameStatement(t *testing.T) {
+	ctx := context.Background()
+	pool := sourcesPool(t)
+	seed(t, pool)
+	store, err := pgstore.New(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetHold(ctx, "org-a", "case 1", "admin", nil); err != nil {
+		t.Fatal(err)
+	}
+	cutoff := time.Now().AddDate(0, 0, -sourceWindowDays)
+	// The caller believes there are no holds (it read them before the hold was placed).
+	for _, tbl := range []string{"agent_tasks", "agent_task_results", "crew_runs", "traffic_connections", "traffic_aggregates"} {
+		if res, err := removers(pool, tbl).Remove(ctx, cutoff, nil, 100); err != nil || res.Removed != 0 {
+			t.Errorf("Remove on %s = (%+v, %v), want nothing removed while a hold exists", tbl, res, err)
+		}
+	}
+	wantRows(t, pool, 3, "a hold placed mid-sweep keeps every record")
+}
+
+// Without the holds table nothing can prove that no hold exists, so nothing is removed.
+func TestRemove_WithoutTheHoldsTableRemovesNothing(t *testing.T) {
+	ctx := context.Background()
+	pool := sourcesPool(t)
+	seed(t, pool)
+	res, err := removers(pool, "agent_tasks").Remove(ctx, time.Now().AddDate(0, 0, -sourceWindowDays), nil, 100)
+	if err != nil || res.Removed != 0 || !strings.Contains(res.Skipped, "retention_legal_holds") {
+		t.Errorf("Remove with no holds table = (%+v, %v), want nothing removed and a Skipped reason naming the holds table", res, err)
+	}
+	wantRows(t, pool, 3, "no holds table, no removal")
+}
+
+// SetLegalHold inserts the hold in a transaction that stays open while its
+// audit entry is written. A delete batch that started meanwhile must not
+// read "no hold yet" and delete: Remove takes a SHARE lock on the holds table,
+// so it waits for the hold's transaction and then sees the committed hold.
+func TestRemove_WaitsForAHoldThatIsBeingPlaced(t *testing.T) {
+	ctx := context.Background()
+	pool := sourcesPool(t)
+	seed(t, pool)
+	if _, err := pgstore.New(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
