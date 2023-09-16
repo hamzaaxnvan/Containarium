@@ -118,3 +118,123 @@ func TestSetTrackerConnection_CrossTenantDenied(t *testing.T) {
 	s := &ContainerServer{secretsStore: mustTestSecretsStore(t), trackerStore: mustTestTrackerStore(t)}
 	ctx := kmsKeyTestCtx("tracker-rpc-cross-tenant-alice", "member", "tracker:admin")
 	_, err := s.SetTrackerConnection(ctx, &pb.SetTrackerConnectionRequest{
+		Username: "tracker-rpc-cross-tenant-bob", Name: "default",
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied (alice acting on bob's tenant without admin role)", status.Code(err))
+	}
+}
+
+func TestSetTrackerConnection_RejectsMissingSecret(t *testing.T) {
+	secretsStore := mustTestSecretsStore(t)
+	trackerStore := mustTestTrackerStore(t)
+	s := &ContainerServer{secretsStore: secretsStore, trackerStore: trackerStore}
+	const user = "tracker-rpc-missing-secret"
+
+	ctx := kmsKeyTestCtx(user, "member", "tracker:admin")
+	_, err := s.SetTrackerConnection(ctx, &pb.SetTrackerConnectionRequest{
+		Username:         user,
+		Name:             "default",
+		Provider:         pb.TrackerProvider_TRACKER_PROVIDER_GITHUB,
+		Project:          "acme/widgets",
+		CredentialSecret: "DOES_NOT_EXIST",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument (credential_secret doesn't exist)", status.Code(err))
+	}
+}
+
+func TestSetTrackerConnection_RejectsNonBrokerSecret(t *testing.T) {
+	secretsStore := mustTestSecretsStore(t)
+	trackerStore := mustTestTrackerStore(t)
+	s := &ContainerServer{secretsStore: secretsStore, trackerStore: trackerStore}
+	const user = "tracker-rpc-non-broker-secret"
+
+	secretCtx := kmsKeyTestCtx(user, "member", "secrets:write")
+	if _, err := s.SetSecret(secretCtx, &pb.SetSecretRequest{
+		Username: user, Name: "GH_TOKEN", Value: "ghp_x",
+		DeliveryMode: pb.SecretDelivery_SECRET_DELIVERY_ENV,
+	}); err != nil {
+		t.Fatalf("SetSecret (env mode): %v", err)
+	}
+
+	ctx := kmsKeyTestCtx(user, "member", "tracker:admin")
+	_, err := s.SetTrackerConnection(ctx, &pb.SetTrackerConnectionRequest{
+		Username:         user,
+		Name:             "default",
+		Provider:         pb.TrackerProvider_TRACKER_PROVIDER_GITHUB,
+		Project:          "acme/widgets",
+		CredentialSecret: "GH_TOKEN",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument (credential_secret is env-mode, not broker-only)", status.Code(err))
+	}
+}
+
+// TestSetTrackerConnection_AcceptsNamesThatLookLikeRouteVerbs pins the
+// outcome of nesting the data-plane REST routes under the connection
+// (/v1/tracker/connections/{username}/{connection}/<verb>, #2035): a verb
+// word never occupies a wildcard position any more, so no connection name or
+// username is reserved. These names were rejected before; they must reach the
+// store now. Reachability over REST is proven against the real grpc-gateway
+// mux in internal/gateway/tracker_route_ambiguity_test.go.
+func TestSetTrackerConnection_AcceptsNamesThatLookLikeRouteVerbs(t *testing.T) {
+	cases := []struct{ user, name string }{
+		{"tracker-rpc-verbnames", "issues"},
+		{"tracker-rpc-verbnames", "changes"},
+		{"tracker-rpc-verbnames", "routes"},
+		{"tracker-rpc-verbnames", "dispatch"},
+		{"tracker-rpc-verbnames", "dispatches"},
+		{"tracker-rpc-verbnames", "status"},
+		{"tracker-rpc-verbnames", "connections"},
+		{"tracker-rpc-verbnames", "default"},
+		{"connections", "default"}, // a username equal to the path's literal segment
+	}
+	secretsStore := mustTestSecretsStore(t)
+	trackerStore := mustTestTrackerStore(t)
+	s := &ContainerServer{secretsStore: secretsStore, trackerStore: trackerStore}
+
+	seeded := map[string]bool{}
+	for _, tc := range cases {
+		if !seeded[tc.user] {
+			secretCtx := kmsKeyTestCtx(tc.user, "member", "secrets:write")
+			if _, err := s.SetSecret(secretCtx, &pb.SetSecretRequest{
+				Username: tc.user, Name: "GH_TOKEN", Value: "ghp_x",
+				DeliveryMode: pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY,
+			}); err != nil {
+				t.Fatalf("SetSecret (broker-only) for %q: %v", tc.user, err)
+			}
+			seeded[tc.user] = true
+		}
+		t.Run(tc.user+"/"+tc.name, func(t *testing.T) {
+			ctx := kmsKeyTestCtx(tc.user, "member", "tracker:admin")
+			if _, err := s.SetTrackerConnection(ctx, &pb.SetTrackerConnectionRequest{
+				Username:         tc.user,
+				Name:             tc.name,
+				Provider:         pb.TrackerProvider_TRACKER_PROVIDER_GITHUB,
+				Project:          "acme/widgets",
+				CredentialSecret: "GH_TOKEN",
+			}); err != nil {
+				t.Fatalf("SetTrackerConnection(user=%q, name=%q): %v", tc.user, tc.name, err)
+			}
+		})
+	}
+}
+
+// TestTrackerConnection_CRUDRoundTrip is the happy path end to end
+// through the RPC layer: a broker-only secret, then Set / Get / List /
+// Delete on the connection that references it.
+func TestTrackerConnection_CRUDRoundTrip(t *testing.T) {
+	secretsStore := mustTestSecretsStore(t)
+	trackerStore := mustTestTrackerStore(t)
+	s := &ContainerServer{secretsStore: secretsStore, trackerStore: trackerStore}
+	const user = "tracker-rpc-crud"
+
+	secretCtx := kmsKeyTestCtx(user, "member", "secrets:write")
+	if _, err := s.SetSecret(secretCtx, &pb.SetSecretRequest{
+		Username: user, Name: "GH_TOKEN", Value: "ghp_x",
+		DeliveryMode: pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY,
+	}); err != nil {
+		t.Fatalf("SetSecret (broker-only): %v", err)
+	}
+
