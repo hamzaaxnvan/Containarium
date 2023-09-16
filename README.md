@@ -540,3 +540,274 @@ agent-driven, not developer-driven, no IDE assumption, SSH-as-the-API:
 ### vs. application container platforms (Docker, Kubernetes)
 
 LXC is a **system** container, not an application container. Each
+container has `systemd`, a real init, real users, real package managers,
+real `sudo`. You can run Docker *inside* a Containarium container; the
+reverse isn't really a thing.
+
+If your agent is going to `apt install` half a Linux distro, edit
+config files in `/etc`, run a database, and reboot — LXC is the right
+shape. If your agent runs a single Python process, Docker or Modal is
+fine.
+
+It isn't either/or: Containarium can run a box *as a pod* in a
+Kubernetes cluster you already operate — same SSH-native agent contract,
+no kube-apiserver token in the agent's hands. Switch with
+`--runtime=k8s`. See the **Kubernetes backend** section below.
+
+---
+
+## What's in the box
+
+Beyond the agent-native primitives, Containarium ships:
+
+### Multi-OS
+
+- **Ubuntu 24.04 LTS** (default)
+- **Rocky Linux 9** (dev/test)
+- **RHEL 9** (production)
+- **Windows Server VMs** via QEMU/KVM with RDP — see
+  [docs/WINDOWS-VM-SETUP.md](docs/WINDOWS-VM-SETUP.md)
+
+### GPU passthrough
+
+For ML/AI agent workflows. Works with NVIDIA RTX 3090, RTX 4090, and
+similar. PCI-level passthrough so the container sees the GPU directly.
+Tested on bare-metal GPU nodes connected to the sentinel via tunnel.
+
+### Multi-backend
+
+A single sentinel can front:
+
+- **GCP spot VMs**: cost-effective cloud backends with auto-recovery
+  on preemption.
+- **Bare-metal GPU nodes**: any Linux box you can SSH to; reaches the
+  sentinel via outbound tunnel.
+- **Windows VMs**: live alongside Linux backends.
+
+All containers from all backends appear in a single unified API.
+
+### Kubernetes backend (experimental)
+
+Beyond the LXC/Incus backend, Containarium can run a box as a **pod in a
+Kubernetes cluster you already operate** — reached over SSH exactly like
+an LXC box, so an agent can't tell which substrate it landed on. The
+daemon reconciles a per-tenant namespace + StatefulSet + headless Service
++ default-deny NetworkPolicy, and programs the sshpiper gateway (the
+`Pipe` CRD) so `ssh <tenant>@<gateway>` routes to the right pod.
+What the NetworkPolicy does and does not guarantee is in
+[`docs/security/CLAIMS.md`](docs/security/CLAIMS.md).
+<!-- claim-row: Kubernetes boxes get a default-deny NetworkPolicy. -->
+
+The pitch isn't "another way to run pods" — it's giving an agent a
+hardened, SSH-native foothold in your cluster **without handing it a
+kube-apiserver token**: the box runs with `automountServiceAccountToken:
+false` and satisfies the `restricted` Pod Security profile. Compare this
+to `kubectl exec`-based runtimes where the agent necessarily holds cluster
+credentials.
+
+**Runtime selection** (no recompile needed):
+
+```bash
+# LXC/Incus (default)
+containariumd daemon
+
+# Kubernetes — uses in-cluster config or KUBECONFIG
+CONTAINARIUM_RUNTIME=k8s containariumd daemon
+# or
+containariumd daemon --runtime=k8s
+```
+
+Both backends share the same CLI, MCP tools, JWT auth, and REST/gRPC API.
+GPU passthrough is supported on K8s via `nvidia.com/gpu` resource limits.
+Local bring-up takes under 5 minutes with `kind` — see
+[docs/KIND-QUICKSTART.md](docs/KIND-QUICKSTART.md).
+
+Design, topology, and BYO-cluster integration:
+[docs/K8S-AGENT-BOX-RUNTIME-DESIGN.md](docs/K8S-AGENT-BOX-RUNTIME-DESIGN.md).
+
+### Web UI
+
+A basic dashboard at `/webui/` for users who'd rather not type CLI:
+container list, lifecycle controls, metrics, browser-based terminal.
+Polished UI is intentionally a cloud-product concern — the OSS web UI
+is functional, not opinionated.
+
+### Persistent storage (ZFS)
+
+Containers survive VM restarts and spot termination. ZFS handles
+compression, snapshots (daily by default, 30-day retention), and
+checksums.
+
+### Sentinel HA
+
+The sentinel itself is e2-micro (free tier). It:
+
+- Detects spot preemption in ~10s, serves a maintenance page.
+- Restarts spot VMs automatically (~85s total recovery).
+- Holds the static IP, so DNS doesn't change as backends rotate.
+
+### Monitoring & observability
+
+VictoriaMetrics + Grafana auto-provisioned. Per-container CPU,
+memory, disk, network. Alerting via webhooks. SSH audit logs per
+user (LXC backend; the Kubernetes backend records control-plane API
+audit but not in-box SSH sessions — see #1189).
+<!-- claim-row: SSH session audit logs per user. -->
+
+### Security primitives
+
+- **Unprivileged LXC containers**: container root ≠ host root.
+- **Per-user proxy accounts**: `/usr/sbin/nologin` on the sentinel,
+  users can only proxy through to their container.
+- **fail2ban per-user**: an attack on Alice's account doesn't ban
+  Bob.
+- **Trivy** image/dependency scanning across backends. **ClamAV** malware scanning is a tenant-run capability (the scan runs inside a box, started by its owner, and the verdict is self-reported); it is being rebuilt in #2631 and is not a platform-wide control today.
+- **AppArmor profiles** per container.
+- **AGENTBOX_ROOT sandbox** to constrain agent-box file ops at runtime.
+
+**Zero-trust controls** (see [`docs/security/OPERATOR-SECURITY-RUNBOOK.md`](docs/security/OPERATOR-SECURITY-RUNBOOK.md); several are opt-in, see [`docs/security/CLAIMS.md`](docs/security/CLAIMS.md) for what is on by default):
+
+- **JWT with `iss` / `aud` / `jti` / `tt` / `scopes`**: 32-byte minimum
+  secret enforced at startup; refresh tokens are single-use; jti-based
+  revocation; per-tool MCP scopes propagate to server-side gates.
+- **Admin RBAC + per-container ownership** on the API surface; cluster
+  ops admin-only, container ops owner-only.
+- **KMS envelope encryption for tenant secrets** (Vault Transit or GCP
+  Cloud KMS), with a migration tool and master-key retirement gate.
+- **tmpfs `--delivery=file`** for secrets that shouldn't be visible in
+  `/proc/<pid>/environ`.
+- **Audit log with SHA-256 hash chain** + `containariumd audit verify`
+  (on the host): tamper-evident against an application- or database-level
+  attacker. An attacker who can write the database can rewrite the chain
+  consistently; the chain root can be anchored to a file outside the database
+  (`internal/audit/anchor.go`), which a database credential does not reach, but
+  a host-root attacker could still edit both.
+- **Image-registry allowlist + pre-pull simplestreams digest
+  verification + post-pull `volatile.base_image` defense-in-depth**
+  for supply-chain hardening.
+- **`SECURITY.md`** with a 90-day coordinated-disclosure window;
+  `gosec` / `govulncheck` / `trivy` running in CI.
+
+---
+
+## CLI reference (essentials)
+
+### Container lifecycle
+
+```bash
+# Create (Ubuntu 24.04, default)
+containarium create alice --ssh-key ~/.ssh/id_ed25519.pub
+
+# Create with options
+containarium create ml-dev \
+  --ssh-key ~/.ssh/id_ed25519.pub \
+  --gpu 0 \
+  --stack gpu \
+  --memory 16GB \
+  --cpu 4
+
+# Lifecycle
+containarium list
+containarium info
+containarium wake alice     # start a stopped box
+containarium sleep alice    # stop it
+containarium delete alice
+```
+
+### Networking
+
+```bash
+# Expose a container port on a public hostname
+containarium expose-port alice \
+  --container-port 8080 \
+  --domain blog.example.com
+
+# Lower-level route management
+containarium route add api.example.com --target 10.0.3.42:3000
+containarium route list
+containarium route delete api.example.com
+
+# Raw TCP/UDP passthrough via local iptables (on the host, so it's a
+# containariumd verb)
+containariumd passthrough add --port 50051 \
+  --target-ip 10.0.3.150 --target-port 50051
+
+# Raw TCP/UDP passthrough via the daemon API (works against a remote box)
+containarium passthrough-route add --port 9443 \
+  --target-ip 10.0.3.150 --target-port 50051 --server <host:port>
+containarium passthrough-route list --server <host:port>
+containarium passthrough-route remove --port 9443 --server <host:port>
+```
+
+### SSH config
+
+```bash
+# Print to stdout (preview)
+containarium ssh-config show
+
+# Write to ~/.containarium/ssh_config (one-line `Include` to wire in)
+containarium ssh-config sync
+containarium ssh-config sync --sentinel sentinel.example.com  # via sentinel
+containarium ssh-config sync --identity ~/.ssh/containarium_ed25519
+
+# From a client machine, against a remote server (the bare form above
+# only reaches a local Incus socket)
+containarium ssh-config sync --http --server <host:port>
+```
+
+### Authentication
+
+```bash
+# Issue an access + refresh pair (CLI-only; never exposed via API).
+# Access tokens are short-lived (default 15 min) and authenticate the
+# API. Refresh tokens are long-lived and single-use — exchange via
+# POST /v1/tokens/refresh for a new pair.
+containarium token generate \
+  --username admin \
+  --roles admin \
+  --secret-file /etc/containarium/jwt.secret
+
+# Use the access token
+curl -H "Authorization: Bearer <access-token>" http://localhost:8080/v1/containers
+
+# Exchange the refresh token for a new pair (same as POST /v1/tokens/refresh;
+# the refresh token is the credential, so no --token)
+containarium token refresh --refresh-token "$REFRESH" --server <host:port>
+
+# Inspect a token's claims (jti, scopes, expiry, validation)
+containarium token inspect <token> --secret-file /etc/containarium/jwt.secret
+
+# Revoke a leaked token by jti (idempotent; reads from `audit query`
+# or `token inspect`)
+containarium token revoke <jti> --reason "leak_2026_05_22"
+containarium token list-revoked
+
+# Mint a least-privilege token for an agent with only the scopes it
+# needs — server-side gates enforce this even if the agent ignores
+# the filter.
+containarium token generate \
+  --username alice-agent \
+  --scopes containers:read,containers:write \
+  --secret-file /etc/containarium/jwt.secret
+```
+
+See [`docs/security/OPERATOR-SECURITY-RUNBOOK.md`](docs/security/OPERATOR-SECURITY-RUNBOOK.md)
+for the full token lifecycle, leak-response playbook, and the agent
+least-privilege scope catalog.
+<!-- claim-exempt: points to the runbook, asserts no property of the product -->
+
+---
+
+## Deployment
+
+### Two binaries: `containarium` vs `containariumd`
+
+Same convention as `docker`/`dockerd` or `incus`/`incusd`: `containarium`
+is the CLI you run from your laptop (`create`, `list`, `ssh-config`,
+`expose-port`, …); `containariumd` is what runs *on the host* — the
+daemon, the sentinel, and every on-host admin verb (`daemon`,
+`sentinel`, `service install`, `sync-accounts`, `pool join`, `node`,
+`hosting`, `recover`, `doctor`). Install `containarium` wherever you
+want to drive the platform from (your laptop, a jump box); install
+`containariumd` on every host that runs the daemon or sentinel itself.
+A compat symlink (`/usr/local/bin/containarium -> containariumd`) keeps
