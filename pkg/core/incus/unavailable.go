@@ -25,31 +25,3 @@ type UnavailableBackend struct{}
 
 // NewUnavailableBackend returns an UnavailableBackend.
 func NewUnavailableBackend() *UnavailableBackend { return &UnavailableBackend{} }
-
-// Compile-time assertion.
-var _ Backend = (*UnavailableBackend)(nil)
-
-// StoragePool returns the default name rather than an error: it has no
-// signature to fail through, and a caller on a host with no incus never
-// reaches a create path where the value is used.
-func (*UnavailableBackend) StoragePool() string { return DefaultStoragePool }
-
-func (*UnavailableBackend) CreateContainer(ContainerConfig) error       { return ErrUnavailable }
-func (*UnavailableBackend) StartContainer(string) error                 { return ErrUnavailable }
-func (*UnavailableBackend) StopContainer(string, bool) error            { return ErrUnavailable }
-func (*UnavailableBackend) DeleteContainer(string) error                { return ErrUnavailable }
-func (*UnavailableBackend) GetContainer(string) (*ContainerInfo, error) { return nil, ErrUnavailable }
-func (*UnavailableBackend) ListContainers() ([]ContainerInfo, error)    { return nil, ErrUnavailable }
-func (*UnavailableBackend) WaitForNetwork(string, time.Duration) (string, error) {
-	return "", ErrUnavailable
-}
-func (*UnavailableBackend) Exec(string, []string) error                { return ErrUnavailable }
-func (*UnavailableBackend) EnsureToolchainVolume(string, string) error { return ErrUnavailable }
-func (*UnavailableBackend) ExecWithOutput(string, []string) (string, string, error) {
-	return "", "", ErrUnavailable
-}
-func (*UnavailableBackend) ExecWithExitCode(string, []string) (string, string, int, error) {
-	return "", "", 0, ErrUnavailable
-}
-func (*UnavailableBackend) WriteFile(string, string, []byte, string) error { return ErrUnavailable }
-func (*UnavailableBackend) ReadFile(string, string) ([]byte, error)        { return nil, ErrUnavailable }
