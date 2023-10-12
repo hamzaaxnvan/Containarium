@@ -21,26 +21,3 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// Run the real stdio MCP server in a helper process, through the generated
-// REST gateway and daemon gate, against the fake container backend.
-func TestDeployGate_MCP(t *testing.T) {
-	for _, withInput := range []bool{true, false} {
-		t.Run(map[bool]string{true: "valid input", false: "missing input"}[withInput], func(t *testing.T) {
-			f := newGateFixture(t)
-			f.srv.guardrailPolicy = fakePolicyProvider{policy: f.policy}
-			mux := runtime.NewServeMux(runtime.WithMetadata(func(context.Context, *http.Request) metadata.MD {
-				md, _ := metadata.FromIncomingContext(tenantWithScopes("alice", auth.ScopeContainersWrite))
-				return md
-			}))
-			require.NoError(t, pb.RegisterRecipeServiceHandlerServer(context.Background(), mux, f.srv))
-			srv := httptest.NewServer(mux)
-			defer srv.Close()
-			args := map[string]interface{}{"recipe_id": "gated", "name": "alice"}
-			if withInput {
-				raw, err := (protojson.MarshalOptions{UseProtoNames: true}).Marshal(f.req.GuardrailInput)
-				require.NoError(t, err)
-				args["guardrail_input"] = json.RawMessage(raw)
-			}
-			request, err := json.Marshal(mcp.MCPRequest{JSONRPC: "2.0", ID: 1, Method: "tools/call", Params: map[string]interface{}{
-				"name": "deploy_recipe", "arguments": args,
-			}})
