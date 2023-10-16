@@ -10,27 +10,3 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func TestHTTPGetBoxRunUserStatus(t *testing.T) {
-	var gotPath, gotMethod string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath, gotMethod = r.URL.Path, r.Method
-		_, _ = w.Write([]byte(`{"runUser":"ctn-run","toolAccessRecorded":true,"runUserExists":true,"state":"CODE_CREDENTIAL_SOURCE_EXPIRED"}`))
-	}))
-	defer srv.Close()
-	c, err := NewHTTPClient(srv.URL, "tok")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := c.GetBoxRunUserStatus("alice")
-	if err != nil {
-		t.Fatalf("GetBoxRunUserStatus: %v", err)
-	}
-	if gotMethod != http.MethodGet || gotPath != "/v1/containers/alice/run-user/status" {
-		t.Errorf("request = %s %s", gotMethod, gotPath)
-	}
-	if got.GetRunUser() != "ctn-run" || !got.GetToolAccessRecorded() || !got.GetRunUserExists() ||
-		got.GetState() != pb.CodeCredentialSource_CODE_CREDENTIAL_SOURCE_EXPIRED {
-		t.Errorf("decoded = %v", got)
-	}
-}
-

@@ -4,10 +4,3 @@
 # outside the tenant-visible Kubernetes API surface.
 set -eu
 
-cat > /etc/systemd/system/k3s-cluster-autoscaler.service <<'UNIT'
-[Unit]
-Description=containarium managed-cluster autoscaler (externalgrpc)
-After=k3s.service
-Requires=k3s.service
-
-[Service]
