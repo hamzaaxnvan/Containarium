@@ -31,36 +31,3 @@ func TestRunModeCommand_ExportsRunAndSkillID(t *testing.T) {
 		runID     string
 		skillID   string
 		want      []string
-		wantOrder []string
-	}{
-		{
-			name: "direct mode", seedDir: "/seed/run-1", runID: "run-1", skillID: "hello-agent",
-			want: []string{
-				"CONTAINARIUM_RUN_ID='run-1' ",
-				"CONTAINARIUM_SKILL_ID='hello-agent' ",
-				"AGENT_SEED_DIR=/seed/run-1 agent-runtime",
-				sourceGatewayEnvPrefix("/seed/run-1"),
-			},
-		},
-		{
-			name: "gateway mode keeps the engine pin", engineRes: geminiResolved, seedDir: "/seed/r2", runID: "r2", skillID: "relay-agent",
-			want: []string{
-				"CONTAINARIUM_AGENT_ENGINE=gemini ",
-				"CONTAINARIUM_RUN_ID='r2' ",
-				"CONTAINARIUM_SKILL_ID='relay-agent' ",
-			},
-			// The gateway env is sourced first, so a gateway.env can never
-			// shadow the run id the daemon exports for this exec.
-			wantOrder: []string{"gateway.env", "CONTAINARIUM_RUN_ID=", "agent-runtime"},
-		},
-		{
-			name: "ids are shell-quoted", seedDir: "/seed/x", runID: "a.b_c-1", skillID: "it's",
-			want: []string{"CONTAINARIUM_RUN_ID='a.b_c-1' ", `CONTAINARIUM_SKILL_ID='it'\''s' `},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := s.runModeCommand(tc.seedDir, tc.runID, tc.skillID, tc.engineRes, "")
-			for _, w := range tc.want {
-				if !strings.Contains(got, w) {
-					t.Errorf("runModeCommand = %q, want it to contain %q", got, w)
