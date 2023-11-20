@@ -23,29 +23,3 @@ type Info struct {
 	// it already learns Model.
 	Engine pb.AgentEngine
 	// Box is the container name the run's box lives in — the same
-	// value provisionSkillBox already returns and Lease.Box already
-	// carries, duplicated here because SubmitTrackerChange resolves a
-	// run by id alone (from the JWT's run_id claim) and has no other
-	// path to the box name.
-	Box string
-	// GitCommit and Workspace mirror provisionSkillBox's own return
-	// values for a run with a git_source. Both are empty for a run
-	// with none — SubmitTrackerChange must treat that as
-	// FAILED_PRECONDITION ("no base commit to bundle against"), never
-	// guess a workspace or fetch nothing and call it success.
-	GitCommit string
-	Workspace string
-	// GitRef is the run's ORIGINAL requested ref (branch/tag/SHA/
-	// "refs/pull/N/merge"), not the resolved GitCommit — carried
-	// separately because SubmitTrackerChange needs a branch NAME to
-	// open a change request against (OpenChangeRequest.BaseBranch),
-	// which a resolved commit alone cannot supply. Empty means the run
-	// fetched the remote's default branch (FetchGitSource's own "empty
-	// ref" convention) rather than naming one explicitly.
-	GitRef string
-}
-
-// Registry is an in-memory, in-process record of currently-live runs.
-// Populated when a run starts and removed when its lease ends — see
-// Register/Unregister. Deliberately NOT durable and NOT shared across
-// daemon instances; see Live's doc comment for what that means for a
