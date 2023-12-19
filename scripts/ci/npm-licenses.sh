@@ -34,39 +34,3 @@ ALLOWED="Apache-2.0 MIT BSD-2-Clause BSD-3-Clause ISC Unlicense MPL-2.0 0BSD"
 #                  build tools; not part of the output.
 #   agent-runtime: @anthropic-ai/claude-agent-sdk*  Anthropic's own SDK under
 #                  its commercial terms (not an open-source licence). We do not
-#                  redistribute it: it is installed from npm in the customer's
-#                  box, where its terms apply to them.
-WEB_EXCEPT="@img/sharp-libvips-,caniuse-lite"
-RT_EXCEPT="@anthropic-ai/claude-agent-sdk"
-
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-
-# scan <project dir> <label>: install production deps in a scratch copy (never
-# the working tree) and write $work/<label>.json.
-scan() {
-  local dir="$1" label="$2"
-  mkdir -p "$work/$label"
-  cp "$dir/package.json" "$dir/package-lock.json" "$work/$label/"
-  (cd "$work/$label" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null 2>&1) \
-    || { echo "::error::npm ci failed for $dir" >&2; exit 1; }
-  (cd "$work/$label" && npx --yes "$CHECKER" --production --excludePrivatePackages --json) \
-    > "$work/$label.json"
-}
-
-# analyse <label> <exceptions> <mode>  (python: one place for the expression logic)
-analyse() {
-  python3 - "$work/$1.json" "$2" "$ALLOWED" "$3" "${4:-}" <<'PY'
-import json, re, sys, os
-path, excepts, allowed, mode, out = sys.argv[1:6]
-allowed = set(allowed.split()); excepts = [e for e in excepts.split(",") if e]
-data = json.load(open(path))
-
-def ok(expr):
-    expr = expr.strip()
-    # SPDX: AND needs every side allowed, OR needs one. Parentheses dropped;
-    # the packages in practice use flat expressions.
-    expr = expr.replace("(", " ").replace(")", " ")
-    for alt in re.split(r"\s+OR\s+", expr):
-        if all(t.strip().rstrip("*") in allowed for t in re.split(r"\s+AND\s+", alt.strip())):
-            return True
