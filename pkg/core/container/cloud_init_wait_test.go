@@ -14,20 +14,3 @@ import (
 // images:ubuntu/24.04 — this daemon's default create base — which doesn't
 // ship cloud-init at all. Pure waste on every stackless create. These tests
 // cover cloudInitPresent directly, and installPackages' use of it.
-
-// cloudInitProbeBackend fakes exactly the two calls installPackages makes
-// before this fix's guard point: the cloud-init presence probe
-// (ExecWithExitCode) and, immediately after, a package-repo update (Exec) —
-// deliberately failing that second call so installPackages returns right
-// after the sleep-or-skip decision, without needing to fake the rest of a
-// full package install.
-type cloudInitProbeBackend struct {
-	incus.Backend
-	probeExitCode int
-	probeErr      error
-}
-
-func (b *cloudInitProbeBackend) ExecWithExitCode(_ string, _ []string) (string, string, int, error) {
-	return "", "", b.probeExitCode, b.probeErr
-}
-
