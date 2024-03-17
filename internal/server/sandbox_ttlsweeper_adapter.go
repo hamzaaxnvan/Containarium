@@ -20,25 +20,3 @@ import (
 // Decide's stopped->delete and protected-box rules never fire: a sandbox
 // is never stopped-and-kept (DeleteSandbox always destroys outright, see
 // its doc comment) and delete-protection is a persistent-tenant-box
-// concept that doesn't apply to a short-lived ephemeral one.
-type ttlsweeperSandboxAdapter struct {
-	backend incus.Backend
-}
-
-// ListContainers returns one ContainerView per sandbox the backend
-// currently knows about, with TTLExpiresAt populated from the same
-// user.containarium.ttl_expires_at key SpawnSandbox/claimFromPool stamp
-// (see sandbox_server.go).
-func (a *ttlsweeperSandboxAdapter) ListContainers() ([]ttlsweeper.ContainerView, error) {
-	raw, err := a.backend.ListContainers()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ttlsweeper.ContainerView, 0, len(raw))
-	for i := range raw {
-		c := raw[i]
-		if c.Labels[sandboxKindLabelSuffix] != SandboxKindLabelValue {
-			continue
-		}
-		v := ttlsweeper.ContainerView{Name: c.Name}
-		if !c.TTLExpiresAt.IsZero() {
