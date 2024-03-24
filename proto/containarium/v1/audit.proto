@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+import "containarium/v1/ssh_authz.proto";
+import "containarium/v1/ssh_ban.proto";
+
+// AuditService — the proto-defined surface of the tamper-evident audit
+// store (internal/audit). Today it carries one write RPC (#2415): the
+// sentinel ships the SSH session records its sshpiperd plugin appends
+// locally (internal/sentinel/sshsession) into THIS backend's audit chain,
+// so the platform's front-door logins get the same hash chain and
+// external anchoring (#1706) as in-box sessions and API calls.
+//
+// Reads stay on the legacy /v1/audit/logs gateway route for now.
+service AuditService {
+  // IngestSSHSessionRecords appends a batch of sentinel SSH session records
+  // to this backend's audit chain.
+  //
+  // Idempotent per (session_id, phase): a record already ingested is
+  // reported as DUPLICATE and writes nothing, so a shipper that crashed
+  // after a successful call and replays the batch cannot fork or pad the
+  // chain. Storage is all-or-nothing for the batch — on any storage error
+  // no row is committed, so the caller's only rule is "advance the
+  // checkpoint only after OK". Validation runs before any write; an
+  // invalid record rejects the whole batch with InvalidArgument naming its
+  // index.
+  //
+  // Requires the audit:ingest scope, explicitly (a token with no scopes
+  // claim is denied even in non-strict mode).
+  rpc IngestSSHSessionRecords(IngestSSHSessionRecordsRequest) returns (IngestSSHSessionRecordsResponse) {
+    option (google.api.http) = {
+      post: "/v1/audit/ssh-sessions/ingest"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Ingest sentinel SSH session records";
+      description: "Append sentinel SSH session open/close records to this backend's tamper-evident audit chain. Idempotent per (session_id, phase); all-or-nothing per batch. Requires the audit:ingest scope.";
+      tags: "Audit";
+    };
+  }
+}
+
+// SSHSessionPhase mirrors internal/sentinel/sshsession.SessionPhase.
+enum SSHSessionPhase {
+  SSH_SESSION_PHASE_UNSPECIFIED = 0;
+  SSH_SESSION_PHASE_OPEN = 1;
+  SSH_SESSION_PHASE_CLOSE = 2;
+  // The sentinel's ssh-authz plugin refused the connection (#2516); no
+  // CLOSE follows. To be stored as action ssh_session_denied (#2519); until
+  // then ingest rejects it as an invalid phase.
+  SSH_SESSION_PHASE_DENIED = 3;
+  // Failed authentications from one source IP within one ban window (#2419),
+  // written by the sentinel's ssh-ban-plugin when the window ends. No session
+  // existed, so there is no routed backend, login or credential: the record
+  // ships to the sentinel's default backend. failure_count carries the total.
+  // With an empty client_ip it is the overflow record instead: see
+  // suppressed_count.
+  SSH_SESSION_PHASE_AUTH_FAILED = 4;
+  // A source IP crossed the failure budget and is banned (#2419); one record
+  // per ban. failure_count is the failures that tripped it, banned_until when
+  // the ban lapses.
+  SSH_SESSION_PHASE_BANNED = 5;
+}
+
+// SSHAuthMethod mirrors internal/sentinel/sshsession.AuthMethod.
+enum SSHAuthMethod {
+  SSH_AUTH_METHOD_UNSPECIFIED = 0;
+  SSH_AUTH_METHOD_CERTIFICATE = 1;
+  SSH_AUTH_METHOD_PUBLICKEY = 2;
+  // The offered key could not be parsed; credential fields are empty.
+  SSH_AUTH_METHOD_UNKNOWN = 3;
+}
+
+// SSHCloseReason mirrors internal/sentinel/sshsession.CloseReason. Set only
+// on a CLOSE record.
+enum SSHCloseReason {
+  SSH_CLOSE_REASON_UNSPECIFIED = 0;
