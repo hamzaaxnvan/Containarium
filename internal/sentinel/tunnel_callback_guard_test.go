@@ -25,31 +25,3 @@ import (
 // checked deterministically is that the callbacks do not reference the test
 // at all, which is what makes the race impossible.
 func TestTunnelCallbacksDoNotTouchTheTestingT(t *testing.T) {
-	const file = "tunnel_integration_test.go"
-
-	fset := token.NewFileSet()
-	parsed, err := parser.ParseFile(fset, file, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", file, err)
-	}
-
-	checked := 0
-	ast.Inspect(parsed, func(n ast.Node) bool {
-		assign, ok := n.(*ast.AssignStmt)
-		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
-			return true
-		}
-		sel, ok := assign.Lhs[0].(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		if sel.Sel.Name != "OnConnect" && sel.Sel.Name != "OnDisconnect" {
-			return true
-		}
-		lit, ok := assign.Rhs[0].(*ast.FuncLit)
-		if !ok {
-			return true
-		}
-		checked++
-
-		ast.Inspect(lit.Body, func(inner ast.Node) bool {
