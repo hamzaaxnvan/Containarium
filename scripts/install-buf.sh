@@ -11,16 +11,3 @@ case "$platform" in
   Darwin-arm64) checksum="$BUF_SHA256_DARWIN_ARM64" ;;
   *) echo "Unsupported buf platform: $platform" >&2; exit 1 ;;
 esac
-digest() {
-  local output
-  if command -v sha256sum >/dev/null; then
-    output="$(sha256sum "$1")"
-  else
-    output="$(shasum -a 256 "$1")"
-  fi
-  echo "${output%% *}"
-}
-if [[ -f "$destination" ]] && [[ "$(digest "$destination")" == "$checksum" ]]; then
-  chmod +x "$destination"
-  echo "Using verified buf $BUF_VERSION at $destination"
-  exit 0
