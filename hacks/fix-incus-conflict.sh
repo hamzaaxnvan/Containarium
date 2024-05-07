@@ -20,26 +20,3 @@ log_success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-if [ "$EUID" -ne 0 ]; then
-    log_error "This script must be run as root"
-    exit 1
-fi
-
-echo "═══════════════════════════════════════════════════════════════"
-echo "  Fixing Incus Package Conflict"
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
-
-log_info "Removing Ubuntu's default Incus packages..."
-apt-get remove -y incus incus-tools incus-client incus-base 2>/dev/null || true
-
-log_info "Cleaning up package database..."
-apt-get autoremove -y
-apt-get autoclean
-
-log_info "Adding Zabbly repository..."
-curl -fsSL https://pkgs.zabbly.com/key.asc | gpg --batch --yes --dearmor -o /usr/share/keyrings/zabbly-incus.gpg
