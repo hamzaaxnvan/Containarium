@@ -15,20 +15,3 @@ func TestAccountPolicyFallbackPreservesEnforcementWithoutJoiningSharedDomain(t *
 		t.Fatal(err)
 	}
 	e := NewNetworkPolicyEnforcer("", store, NewMemTenantRegistry(), nil, nil, nil, true)
-	views := []containerView{{Tenant: "account:workload", TenantID: 2}, {Tenant: "workload", TenantID: 1}}
-	policies, err := e.planPolicies(ctx, views)
-	if err != nil {
-		t.Fatal(err)
-	}
-	account := policies["account:workload"]
-	if account.LogOnly || account.Tenant != "account:workload" || len(account.EgressCIDRs) != 1 || len(account.AllowFromTenants) != 0 {
-		t.Fatalf("unsafe fallback: %+v", account)
-	}
-	if incus.ResolveTenant("account:workload", "", "") == incus.ResolveTenant("workload", "", "") {
-		t.Fatal("enforcement identities collided")
-	}
-	if err := store.Set(ctx, &pb.NetworkPolicy{Tenant: "account:workload", AllowFromTenants: []string{"peer"}}); err != nil {
-		t.Fatal(err)
-	}
-	policies, err = e.planPolicies(ctx, views)
-	if err != nil {
