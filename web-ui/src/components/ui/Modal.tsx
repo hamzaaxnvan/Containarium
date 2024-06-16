@@ -32,37 +32,3 @@ export function Modal({ open, onClose, title, children, footer, size = 'md' }: M
             </Dialog.Close>
           </div>
 
-          {/* Body */}
-          <div className="px-5 py-4">{children}</div>
-
-          {/* Footer */}
-          {footer && (
-            <div className="flex items-center justify-end gap-2 border-t border-[var(--border-subtle)] px-5 py-4">
-              {footer}
-            </div>
-          )}
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
-  );
-}
-
-export function ModalBtn({
-  onClick, disabled, variant = 'ghost', children, type = 'button',
-}: {
-  onClick?: () => void;
-  disabled?: boolean;
-  variant?: 'ghost' | 'primary' | 'danger';
-  children: React.ReactNode;
-  type?: 'button' | 'submit';
-}) {
-  const cls = {
-    ghost: 'border border-[var(--border)] bg-transparent text-[var(--text-secondary)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]',
-    primary: 'bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)]',
-    danger: 'bg-red-600 text-white hover:bg-red-700',
-  }[variant];
-  return (
-    <button
-      type={type}
-      onClick={onClick}
-      disabled={disabled}
