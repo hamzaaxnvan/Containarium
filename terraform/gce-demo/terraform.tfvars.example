@@ -12,31 +12,3 @@ project_id = "your-gcp-project-id"
 admin_ssh_keys = {
   admin = "ssh-ed25519 AAAAC3Nz... admin@example.com"
 }
-
-// REQUIRED: random JWT signing secret. Generate with:
-//   openssl rand -hex 32
-// Keep this secret — anyone who has it can mint admin tokens.
-jwt_secret = "REPLACE_ME_WITH_OPENSSL_RAND_HEX_32"
-
-// REQUIRED on v0.22.x: shared HMAC secret the sentinel uses to
-// authenticate keysync/certsync to the backend daemon. An empty value
-// makes every sentinel↔daemon sync 401 — SSH key sync never wires up
-// and the create→ssh→install demo flow silently breaks. Generate a
-// separate value from jwt_secret:
-//   openssl rand -hex 32
-sentinel_auth_secret = "REPLACE_ME_WITH_OPENSSL_RAND_HEX_32"
-
-// Optional: lock down SSH to your egress IP for the recording window.
-// "0.0.0.0/0" is fine for a quick test; tighter is better.
-allowed_ssh_sources = ["0.0.0.0/0"]
-
-// Optional: GCP region/zone. Defaults to us-central1 / us-central1-a.
-// Pick whatever's closest to where you'll record.
-// region = "us-central1"
-// zone   = "us-central1-a"
-
-// Optional but recommended: provision DNS via Cloud DNS so demo URLs
-// resolve out of the box. Leave blank to set DNS manually.
-//
-// dns_managed_zone_name is the *Terraform name* of the Cloud DNS zone
-// resource — if you created it via `gcloud dns managed-zones create
