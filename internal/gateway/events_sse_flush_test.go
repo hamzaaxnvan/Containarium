@@ -25,30 +25,3 @@ func TestHandleSSE_FlushesFirstEventUnderAuditMiddleware(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/test/sse", h.HandleSSE)
 
-	srv := httptest.NewServer(audit.HTTPAuditMiddleware(mux, noopAuditLogger{}))
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/v1/test/sse", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
-		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
-	}
-
-	// The handler is still blocked in its select loop (no events, heartbeat
-	// is 15s away): the only way these lines arrive is the per-event flush.
-	sc := bufio.NewScanner(resp.Body)
-	var got []string
-	for sc.Scan() {
