@@ -25,30 +25,3 @@ import (
 func deliveryToProto(s string) pb.SecretDelivery {
 	switch s {
 	case secrets.DeliveryFile:
-		return pb.SecretDelivery_SECRET_DELIVERY_FILE
-	case secrets.DeliveryCompose:
-		return pb.SecretDelivery_SECRET_DELIVERY_COMPOSE
-	case secrets.DeliveryBroker:
-		return pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY
-	case secrets.DeliveryEnv, "":
-		return pb.SecretDelivery_SECRET_DELIVERY_ENV
-	default:
-		// Unknown values are rejected at the API boundary before they
-		// reach storage, so this is unreachable in practice; report
-		// UNSPECIFIED rather than guessing a mode.
-		return pb.SecretDelivery_SECRET_DELIVERY_UNSPECIFIED
-	}
-}
-
-// deliveryFromProto maps the enum onto the storage string. UNSPECIFIED
-// returns "" so the caller can fall back to the legacy field.
-func deliveryFromProto(d pb.SecretDelivery) string {
-	switch d {
-	case pb.SecretDelivery_SECRET_DELIVERY_ENV:
-		return secrets.DeliveryEnv
-	case pb.SecretDelivery_SECRET_DELIVERY_FILE:
-		return secrets.DeliveryFile
-	case pb.SecretDelivery_SECRET_DELIVERY_COMPOSE:
-		return secrets.DeliveryCompose
-	case pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY:
-		return secrets.DeliveryBroker
