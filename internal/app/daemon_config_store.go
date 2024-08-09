@@ -29,34 +29,3 @@ func (s *DaemonConfigStore) initSchema(ctx context.Context) error {
 	schema := `
 		CREATE TABLE IF NOT EXISTS daemon_config (
 			key        TEXT PRIMARY KEY,
-			value      TEXT NOT NULL,
-			updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-		);
-	`
-	_, err := s.pool.Exec(ctx, schema)
-	return err
-}
-
-// ErrDaemonConfigNotFound reports that no value is stored under a key.
-//
-// A sentinel because absence is a normal answer here and has to be
-// distinguishable from a database failure: the daemon reads this store while
-// bootstrapping, and "nothing configured yet" means fall back to defaults
-// while "the database is unreachable" means do not.
-//
-// It wraps pgx.ErrNoRows rather than replacing it, so callers already
-// matching on that keep working.
-var ErrDaemonConfigNotFound = errors.New("no daemon config stored under that key")
-
-// Get retrieves a single config value by key.
-//
-// A missing key is an ERROR wrapping ErrDaemonConfigNotFound, not an empty
-// string — the doc used to claim otherwise, and it was wrong (#1300). The
-// distinction matters: a stored empty value is a real setting ("switched
-// off"), and collapsing it together with absence and with a failed query
-// would have the daemon boot on defaults believing they were configured.
-func (s *DaemonConfigStore) Get(ctx context.Context, key string) (string, error) {
-	var value string
-	err := s.pool.QueryRow(ctx,
-		"SELECT value FROM daemon_config WHERE key = $1", key,
-	).Scan(&value)
