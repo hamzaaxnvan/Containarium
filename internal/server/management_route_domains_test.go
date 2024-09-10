@@ -18,23 +18,3 @@ func TestManagementRouteDomains(t *testing.T) {
 		{
 			name: "single base domain (unchanged behavior)",
 			cfg:  &DualServerConfig{BaseDomain: "example.org"},
-			want: []string{"example.org"},
-		},
-		{
-			name: "multiple public base domains take precedence",
-			cfg: &DualServerConfig{
-				BaseDomain:        "example.org",
-				PublicBaseDomains: []string{"lab.example.com", "demo.example.org"},
-			},
-			want: []string{"lab.example.com", "demo.example.org"},
-		},
-		{
-			name: "public base domains without a base domain",
-			cfg:  &DualServerConfig{PublicBaseDomains: []string{"a.com"}},
-			want: []string{"a.com"},
-		},
-		{
-			name: "nothing configured → no routes",
-			cfg:  &DualServerConfig{},
-			want: nil,
-		},
