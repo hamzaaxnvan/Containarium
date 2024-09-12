@@ -25,30 +25,3 @@ type baselineRequest struct {
 	sub inboundSubject
 }
 
-// watch wraps the final response body. It runs as the last step of
-// ModifyResponse, so it sees exactly the bytes the client is sent.
-func (br *baselineRequest) watch(resp *http.Response) {
-	if resp.Body == nil || resp.Body == http.NoBody {
-		return
-	}
-	// Encoded bytes are opaque to the rules; count, never block.
-	if resp.Header.Get("Content-Encoding") != "" {
-		br.in.baselineUnscanned.Add(1)
-		return
-	}
-	resp.Body = &baselineTee{
-		src: resp.Body, br: br, limit: br.in.limit,
-		streaming: strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream"),
-	}
-}
-
-// baselineTee passes reads through unchanged and keeps a bounded copy whose
-// capacity never exceeds the limit. Past the limit the copy is dropped (the
-// response still flows) and the response is counted as unscanned.
-type baselineTee struct {
-	src       io.ReadCloser
-	br        *baselineRequest
-	limit     int
-	streaming bool
-	buf       []byte
-	over      bool
