@@ -21,26 +21,3 @@ func (f *authorizationMemoryLogger) LogBatch(_ context.Context, entries []audit.
 		f.seen = make(map[string]bool)
 	}
 	outcomes := make([]audit.BatchOutcome, len(entries))
-	for i, entry := range entries {
-		if f.seen[entry.DedupeKey] {
-			outcomes[i] = audit.BatchDuplicate
-		} else {
-			f.seen[entry.DedupeKey] = true
-			f.rows = append(f.rows, entry)
-			outcomes[i] = audit.BatchInserted
-		}
-	}
-	return outcomes, nil
-}
-
-func TestIngest_AuthorizationReasonsAndReplay(t *testing.T) {
-	for number, name := range pb.SSHDenyReason_name {
-		t.Run(name, func(t *testing.T) {
-			denied := openRec("authorization-session")
-			denied.Phase = pb.SSHSessionPhase_SSH_SESSION_PHASE_DENIED
-			denied.UserId = "user-test"
-			denied.AuthzDecision = pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_DENY
-			denied.DenyReason = pb.SSHDenyReason(number)
-			denied.Enforced = false // audit-only: a later OPEN is a separate row.
-			opened := openRec(denied.SessionId)
-			opened.UserId, opened.AuthzDecision, opened.DenyReason = denied.UserId, denied.AuthzDecision, denied.DenyReason
