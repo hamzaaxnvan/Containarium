@@ -11,17 +11,3 @@ PartOf=containarium-sentinel.service
 # service must be able to retry until the config is valid.
 StartLimitIntervalSec=0
 
-[Service]
-ExecStart=/usr/local/bin/sshpiperd \
-  -i /etc/sshpiper/host_key \
-  -p 22 \
-  --drop-hostkeys-message \
-  --login-grace-time 90s \
-  /usr/local/bin/containarium sentinel ssh-authz-plugin \
-  --ssh-authz-grace 5m \
-  --ssh-authz-timeout 3s \
-%{ if ssh_authz_enforce ~}
-  --ssh-authz-enforce \
-  --records-file /var/log/containarium/ssh-sessions.jsonl \
-%{ endif ~}
-  -- \

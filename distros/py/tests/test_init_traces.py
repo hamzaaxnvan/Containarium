@@ -15,21 +15,3 @@ from containarium_telemetry._init import (
     _reset_for_tests,
 )
 
-
-@pytest.fixture(autouse=True)
-def _reset():
-    _reset_for_tests()
-    yield
-    _reset_for_tests()
-
-
-def _cfg(protocol):
-    return DistroConfig(
-        endpoint="http://127.0.0.1:4318",
-        service_name=None,
-        resource_attributes=None,
-        headers=None,
-        protocol=protocol,
-        container_id=None,
-        backend_id=None,
-        tenant_id=None,
