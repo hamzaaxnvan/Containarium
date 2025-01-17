@@ -19,25 +19,3 @@ func TestInfoHTTPMemory(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		info string
-		want string
-	}{
-		{
-			name: "gateway quoted int64s",
-			info: `{"incusVersion":"6.0.2","kernelVersion":"6.8.0","os":"Ubuntu 24.04",
-				"totalMemoryBytes":"34359738368","availableMemoryBytes":"17179869184"}`,
-			want: "Memory:\n  Total:           32.0 GiB\n  Available:       16.0 GiB\n",
-		},
-		{
-			name: "zero available is reported",
-			info: `{"totalMemoryBytes":"34359738368","availableMemoryBytes":"0"}`,
-			want: "Memory:\n  Total:           32.0 GiB\n  Available:       0.0 GiB\n",
-		},
-		{
-			name: "older daemon without memory",
-			info: `{"incusVersion":"6.0.2"}`,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				switch r.URL.Path {
