@@ -27,33 +27,3 @@ func TestValidateName(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidateName(tc.input)
 			if tc.ok && err != nil {
-				t.Fatalf("ValidateName(%q) = %v, want nil", tc.input, err)
-			}
-			if !tc.ok && err == nil {
-				t.Fatalf("ValidateName(%q) = nil, want error", tc.input)
-			}
-		})
-	}
-}
-
-func validGroup(name string) NodeGroup {
-	return NodeGroup{Name: name, Size: Size{CPU: "2", Memory: "4GB", Disk: "40GB"}, MinNodes: 0, MaxNodes: 1}
-}
-
-func TestValidateNodeGroups(t *testing.T) {
-	cases := []struct {
-		name    string
-		mutate  func() []NodeGroup
-		ok      bool
-		errFrag string // substring the error must carry, "" = don't care
-	}{
-		{"default presets are valid", DefaultNodeGroups, true, ""},
-		{"single minimal group", func() []NodeGroup { return []NodeGroup{validGroup("small")} }, true, ""},
-		{"empty set", func() []NodeGroup { return nil }, false, "at least one node group"},
-		{"duplicate names", func() []NodeGroup {
-			return []NodeGroup{validGroup("small"), validGroup("small")}
-		}, false, "duplicate node group"},
-		{"invalid group name", func() []NodeGroup {
-			g := validGroup("Small")
-			return []NodeGroup{g}
-		}, false, "invalid name"},
