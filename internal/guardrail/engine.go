@@ -11,16 +11,3 @@ package guardrail
 import (
 	"context"
 
-	"google.golang.org/grpc"
-
-	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
-)
-
-// Engine is anything that can scan text units: the gRPC client over a
-// process implementing GuardrailEngineService, or the reference rules
-// engine. Offsets in the findings are Unicode code points into the unit's
-// text (proto/containarium/v1/guardrail.proto).
-type Engine interface {
-	Scan(ctx context.Context, req *pb.GuardrailScanRequest) (*pb.GuardrailScanResponse, error)
-}
-
