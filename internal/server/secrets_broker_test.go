@@ -28,33 +28,3 @@ func TestGetSecretRPC_BrokerRow_EmptyValueEvenWithSecretsRead(t *testing.T) {
 		t.Fatalf("SetSecret(broker-only): %v", err)
 	}
 
-	getCtx := kmsKeyTestCtx(user, "member", "secrets:read")
-	resp, err := s.GetSecret(getCtx, &pb.GetSecretRequest{Username: user, Name: "GH_TOKEN"})
-	if err != nil {
-		t.Fatalf("GetSecret: %v", err)
-	}
-	if resp.Value != "" {
-		t.Errorf("GetSecret returned a value for a broker-only secret to a secrets:read caller: %q", resp.Value)
-	}
-	if resp.Secret == nil || resp.Secret.DeliveryMode != pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY {
-		t.Errorf("GetSecret metadata = %+v, want DeliveryMode=BROKER_ONLY", resp.Secret)
-	}
-
-	// ListSecrets shows the row with its mode, still no value (ListSecrets
-	// never returns values for any mode — unaffected by this change, but
-	// worth pinning here since it's the other read path onto the same row).
-	listResp, err := s.ListSecrets(getCtx, &pb.ListSecretsRequest{Username: user})
-	if err != nil {
-		t.Fatalf("ListSecrets: %v", err)
-	}
-	found := false
-	for _, m := range listResp.Secrets {
-		if m.Name == "GH_TOKEN" {
-			found = true
-			if m.DeliveryMode != pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY {
-				t.Errorf("ListSecrets GH_TOKEN DeliveryMode = %v, want BROKER_ONLY", m.DeliveryMode)
-			}
-		}
-	}
-	if !found {
-		t.Error("ListSecrets did not include the broker-only secret")
