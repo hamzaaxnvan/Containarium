@@ -1,0 +1,155 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/encoding/protojson"
+
+	v1 "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+)
+
+var (
+	// ErrNotFound is returned when an app is not found
+	ErrNotFound = errors.New("app not found")
+
+	// ErrAlreadyExists is returned when trying to create an app that already exists
+	ErrAlreadyExists = errors.New("app already exists")
+)
+
+// Store handles persistent storage of applications using PostgreSQL
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+// NewStore creates a new app store connected to PostgreSQL
+// connectionString format: postgres://user:password@host:port/database?sslmode=disable
+func NewStore(ctx context.Context, connectionString string) (*Store, error) {
+	pool, err := pgxpool.New(ctx, connectionString)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Test the connection under a bounded deadline: pgx's dial has no timeout
+	// of its own, so an unresponsive Postgres would block daemon startup
+	// before it serves (#2824).
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	store := &Store{pool: pool}
+
+	// Initialize schema
+	if err := store.initSchema(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("failed to initialize schema: %w", err)
+	}
+
+	return store, nil
+}
+
+// Close closes the database connection pool
+func (s *Store) Close() {
+	if s.pool != nil {
+		s.pool.Close()
+	}
+}
+
+// Pool returns the underlying connection pool for sharing with other stores
+func (s *Store) Pool() *pgxpool.Pool {
+	return s.pool
+}
+
+// initSchema creates the database schema if it doesn't exist
+func (s *Store) initSchema(ctx context.Context) error {
+	schema := `
+		CREATE TABLE IF NOT EXISTS apps (
+			id UUID PRIMARY KEY,
+			data JSONB NOT NULL,
+			username TEXT NOT NULL,
+			name TEXT NOT NULL,
+			state TEXT NOT NULL,
+			subdomain TEXT UNIQUE NOT NULL,
+			port INTEGER NOT NULL,
+			container_name TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			deployed_at TIMESTAMP,
+			UNIQUE(username, name)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_apps_username ON apps(username);
+		CREATE INDEX IF NOT EXISTS idx_apps_state ON apps(state);
+		CREATE INDEX IF NOT EXISTS idx_apps_subdomain ON apps(subdomain);
+		CREATE INDEX IF NOT EXISTS idx_apps_username_name ON apps(username, name);
+	`
+
+	_, err := s.pool.Exec(ctx, schema)
+	return err
+}
+
+// Save saves an app to the database (insert or update)
+func (s *Store) Save(ctx context.Context, app *v1.App) error {
+	// Serialize protobuf to JSON
+	jsonData, err := protojson.Marshal(app)
+	if err != nil {
+		return fmt.Errorf("failed to marshal app: %w", err)
+	}
+
+	// Upsert query
+	query := `
+		INSERT INTO apps (id, data, username, name, state, subdomain, port, container_name, created_at, updated_at, deployed_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		ON CONFLICT (id) DO UPDATE SET
+			data = EXCLUDED.data,
+			state = EXCLUDED.state,
+			port = EXCLUDED.port,
+			updated_at = EXCLUDED.updated_at,
+			deployed_at = EXCLUDED.deployed_at
+	`
+
+	createdAt := app.CreatedAt.AsTime()
+	updatedAt := app.UpdatedAt.AsTime()
+	var deployedAt *time.Time
+	if app.DeployedAt != nil {
+		t := app.DeployedAt.AsTime()
+		deployedAt = &t
+	}
+
+	_, err = s.pool.Exec(ctx, query,
+		app.Id,
+		jsonData,
+		app.Username,
+		app.Name,
+		app.State.String(),
+		app.Subdomain,
+		app.Port,
+		app.ContainerName,
+		createdAt,
+		updatedAt,
+		deployedAt,
+	)
+
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			if pgErr.Code == "23505" { // unique_violation
+				return ErrAlreadyExists
+			}
+		}
+		return fmt.Errorf("failed to save app: %w", err)
+	}
+
+	return nil
+}
+
+// GetByID retrieves an app by its ID
+func (s *Store) GetByID(ctx context.Context, id string) (*v1.App, error) {
