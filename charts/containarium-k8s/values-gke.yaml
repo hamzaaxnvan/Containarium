@@ -1,0 +1,6 @@
+# Values preset for GKE (managed Kubernetes on Google Cloud).
+#
+# Runs the whole agent-box stack on managed nodes, fronted by a Google Cloud
+# L4 LoadBalancer — no sentinel, no bare-metal. The cluster's own control
+# plane, node autoscaling, and disk provisioning are the shared infra;
+# Containarium is the access + lifecycle layer on top.
