@@ -1,0 +1,11 @@
+#!/bin/sh
+# containarium managed-cluster control-plane bootstrap (#1414).
+# The k3s binary is pre-pushed; this script only wires and starts it.
+set -eu
+
+chmod 0755 /usr/local/bin/k3s
+
+cat > /etc/systemd/system/k3s.service <<'UNIT'
+[Unit]
+Description=containarium managed k3s server
+After=network-online.target
