@@ -17,22 +17,3 @@
 #   4. It's a box: tear it down, zero blast radius.
 #
 # -----------------------------------------------------------------------------
-# PREREQUISITES (operator, one-time — do this BEFORE recording):
-#
-#   * A reachable Containarium daemon ($SERVER below). Self-host:
-#       curl -fsSL https://containarium.dev/install.sh | sh   # (or build OSS)
-#
-#   * Turn on the gateway by giving the DAEMON one provider key in its env,
-#     then (re)start it. The key turns the model-gateway on automatically:
-#       # /etc/containarium/daemon.env
-#       GEMINI_API_KEY=...            # or ANTHROPIC_API_KEY / OPENAI_API_KEY
-#     The daemon logs on boot:
-#       "Model-gateway enabled (providers=[gemini ...]) — provider keys never leave the host"
-#
-#   The `code-review` skill below ships in OSS, so no extra pack is needed.
-#   (Opinionated/domain skills — PM, compliance — load from a pack via
-#    CONTAINARIUM_SKILLS_DIR; `hello-agent` is the zero-config smoke test.)
-#
-SERVER="${SERVER:-https://YOUR-DAEMON:8080}"
-SKILL="${SKILL:-code-review}"
-INPUT="${INPUT:-{\"brief\":\"Review this Go handler for bugs and security issues: func GetUser(w http.ResponseWriter, r *http.Request) { id := r.URL.Query().Get(\\\"id\\\"); row := db.QueryRow(\\\"SELECT name FROM users WHERE id = \\\" + id); ... }\"}}"
