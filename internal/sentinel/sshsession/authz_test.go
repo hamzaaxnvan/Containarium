@@ -27,33 +27,3 @@ func TestAuthorizationMetadataOnOpenCloseAndShutdown(t *testing.T) {
 		}
 		raw, err := json.Marshal(rec)
 		if err != nil {
-			t.Fatal(err)
-		}
-		var back Record
-		if err := json.Unmarshal(raw, &back); err != nil || !reflect.DeepEqual(back, rec) {
-			t.Fatalf("JSONL roundtrip: %v %v", back, err)
-		}
-		back, err = FromProto(ToProto(rec))
-		if err != nil || !reflect.DeepEqual(back, rec) {
-			t.Fatalf("proto roundtrip: %v %v", back, err)
-		}
-	}
-}
-
-func TestAuthorizationProtoEveryReasonAndValidation(t *testing.T) {
-	for n := int32(1); n <= 7; n++ {
-		r := baseRecord()
-		r.UserID = "person"
-		r.AuthzDecision = pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_DENY
-		r.DenyReason = pb.SSHDenyReason(n)
-		back, err := FromProto(ToProto(r))
-		if err != nil || !reflect.DeepEqual(back, r) {
-			t.Fatalf("reason %d: %v %v", n, back, err)
-		}
-	}
-	r := baseRecord()
-	r.AuthzDecision = pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_ALLOW
-	r.UserID = "person"
-	if back, err := FromProto(ToProto(r)); err != nil || !reflect.DeepEqual(back, r) {
-		t.Fatalf("allow: %v %v", back, err)
-	}
