@@ -28,34 +28,3 @@ var (
 // docs/architecture/guardrail-inbound-and-server-policy.md): it accepts the
 // bytes under dir only when all of these hold:
 //
-//   - server is a configured policy;
-//   - the attestation's key_id is not revoked (#2729): whatever its
-//     attested_at says, since the signer sets that time;
-//   - the policy has at least one trusted signer;
-//   - the attestation's key_id names one of server.trusted_signers, and the
-//     signature verifies against THAT signer's key (never a key the caller
-//     supplies: a caller-supplied key would let anyone sign their own input);
-//   - policy_hash equals the hash of server.policy (the inner rules only);
-//   - the verdict is PASS;
-//   - kinds_scanned covers every kind the server policy scans for, plus
-//     require;
-//   - the digest recomputed over dir equals the attested subject_sha256.
-//
-// It returns the trusted signer that matched. Both `guardrail verify` and the
-// DeployRecipe gate call it, so the two cannot disagree on what "verified"
-// means.
-func VerifyAttestation(att *pb.GuardrailAttestation, server *pb.ServerGuardrailPolicy, dir string, require []pb.GuardrailKind) (*pb.GuardrailTrustedSigner, error) {
-	signer, err := VerifyClaims(att, server, require)
-	if err != nil {
-		return nil, err
-	}
-	got, err := guardrail.SubjectDigest(dir)
-	if err != nil {
-		return nil, err
-	}
-	if got != att.GetSubjectSha256() {
-		return nil, fmt.Errorf("%w (got %s, attested %s): the bytes changed after attestation", ErrDigestMismatch, shortHex(got), shortHex(att.GetSubjectSha256()))
-	}
-	return signer, nil
-}
-
