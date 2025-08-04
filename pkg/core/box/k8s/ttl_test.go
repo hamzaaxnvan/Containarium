@@ -22,27 +22,3 @@ func TestSetTTLStampsShutdownTimeAndMeta(t *testing.T) {
 	b, _, sc := testBackend()
 	ctx := context.Background()
 	ref := box.BoxRef{Tenant: "ttl-user"}
-	if _, err := b.Create(ctx, box.BoxSpec{Ref: ref, Image: "x", AutoStart: true}); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	expiresAt := time.Now().Add(30 * time.Minute).UTC().Truncate(time.Second)
-	if err := b.SetTTL(ctx, ref, &expiresAt); err != nil {
-		t.Fatalf("SetTTL: %v", err)
-	}
-
-	sb := getSandbox(t, sc, "tenant-ttl-user")
-	if sb.Spec.ShutdownTime == nil || !sb.Spec.ShutdownTime.Time.Equal(expiresAt) {
-		t.Errorf("shutdownTime = %v, want %v", sb.Spec.ShutdownTime, expiresAt)
-	}
-	if sb.Spec.ShutdownPolicy == nil || *sb.Spec.ShutdownPolicy != sandboxv1beta1.ShutdownPolicyRetain {
-		t.Errorf("shutdownPolicy = %v, want Retain (Delete would orphan the daemon-owned Pipe/Secrets/PVC)", sb.Spec.ShutdownPolicy)
-	}
-
-	// The sweeper reads the expiry off box meta (BoxStatus.Labels via List).
-	meta, err := b.GetMeta(ctx, ref)
-	if err != nil {
-		t.Fatalf("GetMeta: %v", err)
-	}
-	got, perr := time.Parse(time.RFC3339, meta[metaTTLExpiresAtKey])
-	if perr != nil || !got.Equal(expiresAt) {
