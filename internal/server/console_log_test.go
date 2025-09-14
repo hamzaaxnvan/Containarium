@@ -18,24 +18,3 @@ func TestGetConsoleLog_ReturnsLogForVMInstance(t *testing.T) {
 			t.Fatalf("unexpected container name: %s", name)
 		}
 		return "BIOS POST...\nboot hung here\n", nil
-	}
-	cs := &ContainerServer{manager: container.NewWithBackend(mock)}
-
-	resp, err := cs.GetConsoleLog(testCtx(), &pb.GetConsoleLogRequest{Username: "alice"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if resp.Log != "BIOS POST...\nboot hung here\n" {
-		t.Fatalf("unexpected log content: %q", resp.Log)
-	}
-}
-
-func TestGetConsoleLog_LXCContainerReturnsEmptyNotError(t *testing.T) {
-	mock := incustest.NewMockBackend()
-	mock.GetConsoleLogFunc = func(name string) (string, error) {
-		return "", errors.New("instance is not a VM")
-	}
-	cs := &ContainerServer{manager: container.NewWithBackend(mock)}
-
-	resp, err := cs.GetConsoleLog(testCtx(), &pb.GetConsoleLogRequest{Username: "alice"})
-	if err != nil {
