@@ -1,0 +1,160 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+import "containarium/v1/container.proto";
+import "containarium/v1/network.proto";
+import "containarium/v1/guardrail.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// RecipeResources holds default resource limits for a recipe's container.
+message RecipeResources {
+  // CPU limit (number of cores, e.g. "8")
+  string cpu = 1;
+
+  // Memory limit (e.g. "16GB")
+  string memory = 2;
+
+  // Disk limit (e.g. "200GB")
+  string disk = 3;
+}
+
+// RecipePort maps a container port to a public subdomain, or to a raw
+// TCP/UDP passthrough port for a wire protocol no HTTP client speaks
+// (e.g. Postgres wire, Redis, Kafka). See #1462.
+message RecipePort {
+  // Port the app listens on inside the container (e.g. 11434)
+  int32 container_port = 1;
+
+  // Subdomain to expose it under (e.g. "ollama"); combined with the
+  // deployment name and the daemon's base domain to form the public host.
+  // Ignored when protocol is TCP or UDP.
+  string subdomain = 2;
+
+  // How to expose this port. ROUTE_PROTOCOL_UNSPECIFIED and
+  // ROUTE_PROTOCOL_HTTP/GRPC route through Caddy under `subdomain` (the
+  // original, and still default, behavior). ROUTE_PROTOCOL_TCP/UDP register
+  // a direct passthrough route instead.
+  RouteProtocol protocol = 3;
+
+  // Host-side port for a TCP/UDP passthrough. Defaults to container_port
+  // when zero. Ignored for HTTP/GRPC. Passthrough binds a host-wide port,
+  // so a deploy whose external_port is already claimed by a different
+  // container fails loudly rather than silently stealing it.
+  int32 external_port = 4;
+}
+
+// RecipeVolume is a named persistent volume mounted into the app container.
+message RecipeVolume {
+  // Volume name (e.g. "ollama-models")
+  string name = 1;
+
+  // Mount path inside the app container (e.g. "/root/.ollama")
+  string path = 2;
+}
+
+// RecipeParam describes a deploy-time input the recipe accepts. Mirrors
+// stacks.StackParameter. Values are exported to post_start commands as
+// CONTAINARIUM_PARAM_<NAME> environment variables.
+message RecipeParam {
+  // Parameter key (e.g. "model"). Env var seen by post_start is
+  // CONTAINARIUM_PARAM_<upper(name)>.
+  string name = 1;
+
+  // Human-readable label for UIs.
+  string label = 2;
+
+  // Optional helper text.
+  string description = 3;
+
+  // "string", "password", "number", or "boolean". Controls UI rendering;
+  // the value is always carried as a string.
+  string type = 4;
+
+  // Fallback value if the deployer leaves it blank.
+  string default = 5;
+
+  // Marks the parameter as mandatory.
+  bool required = 6;
+}
+
+// Recipe is a declarative definition of a GPU/app workload that Containarium
+// can provision as a new dedicated container. The container is an LXC system
+// container; the recipe's image runs inside it via Podman (post_start),
+// mirroring how the kubeflow stack runs k3s inside an LXC.
+message Recipe {
+  // Stable recipe identifier (e.g. "ollama").
+  string id = 1;
+
+  // Display name (e.g. "Ollama").
+  string name = 2;
+
+  // Short description.
+  string description = 3;
+
+  // OCI image run via `podman run` inside the LXC (e.g. "ollama/ollama").
+  string image = 4;
+
+  // When true, the deploy must specify a GPU (--gpu) and/or a GPU-capable
+  // backend (--backend-id/--pool); the daemon rejects the deploy otherwise.
+  bool requires_gpu = 5;
+
+  // Default resource limits for the container.
+  RecipeResources resources = 6;
+
+  // Ports to expose publicly after the app is running.
+  repeated RecipePort ports = 7;
+
+  // Persistent volumes to create and mount.
+  repeated RecipeVolume volumes = 8;
+
+  // Static environment variables passed to the app.
+  map<string, string> env = 9;
+
+  // Deploy-time parameters (with defaults), surfaced to UIs and exported to
+  // post_start as CONTAINARIUM_PARAM_<NAME>.
+  repeated RecipeParam parameters = 10;
+
+  // Shell commands run inside the container after it is up (e.g. the
+  // `podman run ...` that starts the app, plus model warm-up). Same trust
+  // level as a stack's post_install: these ship in-tree and are reviewed.
+  repeated string post_start = 11;
+
+  // When non-empty, the daemon brokers this recipe's model calls through the
+  // managed model-gateway for the named provider (e.g. "gemini-openai"): it
+  // mints a scoped, revocable gateway token and exports
+  // CONTAINARIUM_MODEL_GATEWAY_URL + CONTAINARIUM_GATEWAY_TOKEN into post_start,
+  // so the box uses the platform key (metered, never leaked) instead of one the
+  // user supplies. Inert when the daemon holds no key for the provider — the
+  // box then comes up unconfigured (self-hosted default).
+  string model_gateway_provider = 12;
+
+  // When set, every deploy of this recipe is gated on a guardrail
+  // attestation (#2368): DeployRecipe verifies the dataset the request
+  // stages against the server guardrail policy and its trusted signers
+  // BEFORE the container is created, copies exactly the verified bytes to
+  // dataset_path, and only then runs post_start. The recipe decides whether
+  // a gate applies; a caller cannot opt out by leaving guardrail_input out.
+  GuardrailGate guardrail_gate = 13;
+}
+
+// GuardrailGate is a recipe's guardrail precondition
+// (docs/architecture/guardrail-inbound-and-server-policy.md, "The gate").
+message GuardrailGate {
+  // Absolute path in the new box where the verified bytes are placed before
+  // post_start.
+  string dataset_path = 1;
+
+  // Kinds the attestation must have covered, in addition to the server
+  // policy's own.
+  repeated GuardrailKind require_kinds = 2;
+}
+
+// GuardrailGateInput is the dataset a gated deploy checks.
+message GuardrailGateInput {
+  // A directory under the daemon's guardrail staging root (the daemon flag
+  // --guardrail-staging-root), as a clean relative path. Nothing on the
+  // platform stages a dataset there yet: an operator or an out-of-band copy
