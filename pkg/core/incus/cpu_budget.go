@@ -24,30 +24,3 @@ const (
 func (m CPUAdmissionMode) String() string {
 	switch m {
 	case CPUAdmissionDisabled:
-		return "disabled"
-	case CPUAdmissionAdvisory:
-		return "advisory"
-	case CPUAdmissionEnforcing:
-		return "enforcing"
-	default:
-		return "unknown"
-	}
-}
-
-// CPUBudget is one host's CPU commitment split the way the admission gate
-// reasons about it (#2284): what tenants have been promised, what the
-// platform's own core-role containers have been promised, and what the
-// host physically has — plus the gate's posture, so a reader can tell
-// whether being over the ceiling is actually being acted on.
-//
-// All sums are incus.CommittedCores over limits.cpu, so an unbounded
-// container counts 0 — see CommittedCores for why that is conservative.
-type CPUBudget struct {
-	// PhysicalCPUs is the host's logical CPU count (SMT threads included,
-	// the unit limits.cpu uses). 0 means unknown — every derived number
-	// then reads 0 rather than dividing by it.
-	PhysicalCPUs float64
-	// TenantCommittedCores is SystemInfo.committed_cpu_cores: every
-	// non-core-role container's committed CPU.
-	TenantCommittedCores float64
-	// CoreCommittedCores is every core-role container's committed CPU —
