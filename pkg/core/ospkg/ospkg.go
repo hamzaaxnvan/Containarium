@@ -9,25 +9,3 @@ type PackageManager interface {
 	// UpdateCmd returns the command to update package repo metadata.
 	UpdateCmd() []string
 
-	// InstallCmd returns the command to install the given packages.
-	InstallCmd(pkgs []string) []string
-
-	// CreateUserCmd returns the command to create a user with a home directory.
-	CreateUserCmd(username, gecos string) []string
-
-	// SudoGroup returns the group name that grants sudo privileges.
-	SudoGroup() string
-
-	// SSHServiceName returns the systemd service name for SSH.
-	SSHServiceName() string
-
-	// BasePackages returns the base packages to install in every container.
-	BasePackages() []string
-	// MoshInstallScript returns a best-effort bash script that installs mosh
-	// when the distro's base repos don't carry it (empty when BasePackages
-	// already includes it). A failure must not fail provisioning (#2121).
-	MoshInstallScript() string
-
-	// PodmanAvailableInBaseRepos returns true if podman is in the distro's base repos.
-	PodmanAvailableInBaseRepos() bool
-
