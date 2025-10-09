@@ -32,37 +32,3 @@ func counterValues(t *testing.T, reader *sdkmetric.ManualReader) (map[string]int
 	t.Helper()
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatal(err)
-	}
-	sums := map[string]int64{}
-	histCounts := map[string]uint64{}
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			switch d := m.Data.(type) {
-			case metricdata.Sum[int64]:
-				for _, p := range d.DataPoints {
-					sums[m.Name] += p.Value
-				}
-			case metricdata.Histogram[float64]:
-				for _, p := range d.DataPoints {
-					histCounts[m.Name] += p.Count
-				}
-			}
-		}
-	}
-	return sums, histCounts
-}
-
-func drain(sub *events.Subscriber) []*pb.Event {
-	var out []*pb.Event
-	for {
-		select {
-		case e := <-sub.Events:
-			out = append(out, e)
-		default:
-			return out
-		}
-	}
-}
-
-// Every step increments exactly its own counter once and publishes
