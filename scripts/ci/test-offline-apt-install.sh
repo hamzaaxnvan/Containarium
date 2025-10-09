@@ -14,19 +14,3 @@ mkdir -p "$tmp/bin" "$tmp/state/lists/partial" "$tmp/cache/archives/partial" "$t
 : >"$tmp/etc/sources.list"
 for cmd in incus zfs jq curl; do ln -s /bin/true "$tmp/bin/$cmd"; done
 cat >"$tmp/bin/dpkg" <<'EOF'
-#!/bin/bash
-for arg; do
-  case "$arg" in
-    --print-architecture) echo amd64 ;;
-    *.deb)
-      [[ "$arg" = /* ]] && [ -f "$arg" ] || exit 42
-      printf '%s\n' "${arg##*/}" >>"$TEST_UNPACKED"
-      ;;
-  esac
-done
-exit 0
-EOF
-chmod +x "$tmp/bin/dpkg"
-cat >"$tmp/apt.conf" <<EOF
-Dir::Etc "$tmp/etc";
-Dir::State "$tmp/state";
