@@ -23,28 +23,3 @@ var hostHardenCmd = &cobra.Command{
 	Short:  "Narrow host-hardening mutations, applied by cloud enroll / pool join and the reboot unit they install",
 	Hidden: true,
 }
-
-var hostHardenBlockMetadataCmd = &cobra.Command{
-	Use:   "block-metadata <bridge>",
-	Short: "Idempotently drop FORWARDED traffic from <bridge>'s subnet to the cloud metadata endpoint",
-	Long: `Inserts (if not already present) an iptables FORWARD rule dropping traffic
-from <bridge>'s configured subnet to 169.254.169.254 — the cloud metadata
-endpoint every major provider serves at that link-local address. Scoped to
-FORWARDED (container-bridge) traffic only; the host's own OUTPUT-originated
-requests are untouched, so cloud-provider tooling running on the host itself
-keeps working. See internal/hostharden and #1103.
-
---persist also installs and enables the systemd unit that re-applies the
-rule on every boot — what ` + "`cloud enroll`" + ` / ` + "`pool join`" + ` do — so one command
-restores both halves the host posture check looks for (#2298). The unit
-itself runs this command WITHOUT --persist.`,
-	Args: cobra.ExactArgs(1),
-	RunE: runHostHardenBlockMetadata,
-}
-
-var hostHardenPersist bool
-
-func init() {
-	rootCmd.AddCommand(hostHardenCmd)
-	hostHardenCmd.AddCommand(hostHardenBlockMetadataCmd)
-	hostHardenBlockMetadataCmd.Flags().BoolVar(&hostHardenPersist, "persist", false,
