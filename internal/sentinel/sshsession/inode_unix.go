@@ -2,8 +2,3 @@
 
 package sshsession
 
-import (
-	"os"
-	"syscall"
-)
-
