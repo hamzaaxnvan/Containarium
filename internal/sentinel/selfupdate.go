@@ -1,0 +1,119 @@
+package sentinel
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/footprintai/containarium/internal/releases"
+)
+
+const (
+	githubReleaseBaseURL = "https://github.com/FootprintAI/Containarium/releases/download"
+	// releaseBinaryName names the daemon artifact fetched from a GitHub
+	// release. #1779 (design doc, Rollout Phase 1): containarium-* becomes
+	// the client build in Phase 2, so from release N on, the self-update
+	// chain must ask for containariumd-* instead. containarium-* keeps
+	// shipping the same server build in parallel (#1782) so a host still
+	// asking for the old name during the rollout window gets a working
+	// daemon too — but the sentinel's own fetch always asks for the new one.
+	releaseBinaryName = "containariumd-linux-amd64"
+)
+
+type fetchReleaseRequest struct {
+	Tag string `json:"tag"`
+}
+
+// fetchReleaseHandler returns an HTTP handler for POST /sentinel/fetch-release.
+// It downloads the named release from GitHub, verifies SHA256SUMS.txt,
+// smoke-tests the binary, atomically swaps it, and restarts the sentinel service.
+func fetchReleaseHandler(binaryPath string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req fetchReleaseRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
+			return
+		}
+		tag := strings.TrimSpace(req.Tag)
+		if tag == "" {
+			http.Error(w, `{"error":"tag is required (e.g. \"v0.48.0\" or \"latest\")"}`, http.StatusBadRequest)
+			return
+		}
+
+		ctx := r.Context()
+
+		// Resolve "latest" → concrete tag via GitHub API.
+		if tag == "latest" {
+			rel, _, err := releases.NewClient().Latest(ctx)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":"resolve latest tag: %v"}`, err), http.StatusBadGateway)
+				return
+			}
+			tag = rel.TagName
+		}
+
+		// Normalise: ensure the "v" prefix that GitHub release URLs require.
+		if !strings.HasPrefix(tag, "v") {
+			tag = "v" + tag
+		}
+
+		log.Printf("[sentinel-selfupdate] operator requested upgrade to %s", tag)
+
+		if err := fetchAndInstallRelease(ctx, tag, binaryPath); err != nil {
+			log.Printf("[sentinel-selfupdate] upgrade to %s failed: %v", tag, err)
+			http.Error(w, fmt.Sprintf(`{"error":"%v"}`, err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"message": "binary swapped — containarium-sentinel restarting momentarily",
+			"tag":     tag,
+		})
+
+		// Give the response a moment to flush before the restart kills us.
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			log.Printf("[sentinel-selfupdate] restarting containarium-sentinel…")
+			if err := exec.Command("systemctl", "restart", "containarium-sentinel").Run(); err != nil { // #nosec G204
+				// Fallback: if systemctl fails (e.g. not running under systemd),
+				// hard-exit so the service manager (if any) restarts the process.
+				log.Printf("[sentinel-selfupdate] systemctl restart failed (%v); exiting for service-manager restart", err)
+				os.Exit(0)
+			}
+		}()
+	})
+}
+
+// fetchAndInstallRelease downloads the containarium-linux-amd64 binary for
+// the given tag from GitHub Releases, verifies it against SHA256SUMS.txt,
+// smoke-tests it with `version`, and atomically swaps the sentinel binary.
+// Callers restart the sentinel service after this returns nil.
+func fetchAndInstallRelease(ctx context.Context, tag, binaryPath string) error {
+	base := githubReleaseBaseURL + "/" + tag
+	binURL := base + "/" + releaseBinaryName
+	sumsURL := base + "/SHA256SUMS.txt"
+
+	// 1. Fetch expected hash from SHA256SUMS.txt.
+	expectedHash, err := fetchExpectedHash(ctx, sumsURL, releaseBinaryName)
+	if err != nil {
+		return fmt.Errorf("fetch SHA256SUMS.txt for %s: %w", tag, err)
+	}
+
+	// 2. Download the binary to a temp path.
+	tmpPath := binaryPath + ".new"
+	if err := downloadReleaseBinary(ctx, binURL, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("download %s binary: %w", tag, err)
