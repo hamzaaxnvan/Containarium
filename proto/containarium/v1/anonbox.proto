@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+// AnonymousBoxService is the daemon side of the `ssh new.<cloud-domain>`
+// door (docs/architecture/ssh-new-anonymous-box.md): a Linux VM per SSH
+// key fingerprint, no account required, claimable into a tenant by
+// signing up, destroyed at TTL otherwise. The sentinel's door plugin calls
+// EnsureAnonymousBox; the cloud control plane (or an admin) calls
+// ClaimAnonymousBox; everything else is operator surface.
+service AnonymousBoxService {
+  // EnsureAnonymousBox resolves or creates the VM for a key. Reconnecting
+  // with the same key returns the same box (reused=true); a key whose
+  // previous box expired gets a fresh one (previous_expired=true).
+  // Requires role admin or scope anon:door.
+  rpc EnsureAnonymousBox(EnsureAnonymousBoxRequest) returns (EnsureAnonymousBoxResponse) {
+    option (google.api.http) = {
+      post: "/v1/anon/boxes:ensure"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Ensure anonymous box";
+      description: "Resolve or create the anonymous VM for an SSH public key. Sentinel door / admin only.";
+      tags: "AnonymousBox";
+    };
+  }
+
+  // ClaimAnonymousBox binds a box to a tenant via its single-use claim
+  // token (#2199). Requires role admin or scope anon:admin.
+  rpc ClaimAnonymousBox(ClaimAnonymousBoxRequest) returns (ClaimAnonymousBoxResponse) {
+    option (google.api.http) = {
+      post: "/v1/anon/boxes:claim"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Claim anonymous box";
+      description: "Bind an anonymous box to a tenant using its claim token. Admin / control plane only.";
+      tags: "AnonymousBox";
+    };
+  }
+
+  // GetAnonymousDoorConfig returns the door's state and the fixed limits.
+  // Requires role admin or scope anon:admin.
+  rpc GetAnonymousDoorConfig(GetAnonymousDoorConfigRequest) returns (AnonymousDoorConfig) {
+    option (google.api.http) = {
+      get: "/v1/anon/door"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get anonymous door config";
+      description: "Kill switch, bans and the fixed per-box limits of the anonymous tier. Admin only.";
