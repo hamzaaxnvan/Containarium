@@ -34,39 +34,3 @@ const DefaultStdioDrainGrace = 30 * time.Second
 // that read a request answers it before it exits.
 //
 // It tracks request ids seen on the read side and removes them when a
-// response with the same id is written. Notifications (no id) and the
-// server's own notifications are ignored.
-type DrainingStdio struct {
-	r     io.Reader
-	w     io.Writer
-	grace time.Duration
-
-	mu      sync.Mutex
-	cond    *sync.Cond
-	pending map[string]struct{}
-	rbuf    []byte // partial line carried between Reads
-	wbuf    []byte // partial line carried between Writes
-	eof     bool   // underlying reader returned EOF; drain started
-}
-
-// NewDrainingStdio wraps r and w. grace <= 0 means DefaultStdioDrainGrace.
-func NewDrainingStdio(r io.Reader, w io.Writer, grace time.Duration) *DrainingStdio {
-	if grace <= 0 {
-		grace = DefaultStdioDrainGrace
-	}
-	d := &DrainingStdio{r: r, w: w, grace: grace, pending: map[string]struct{}{}}
-	d.cond = sync.NewCond(&d.mu)
-	return d
-}
-
-// Pending reports how many requests have been read but not yet answered.
-func (d *DrainingStdio) Pending() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.pending)
-}
-
-// Read passes bytes through from the wrapped reader, recording request ids.
-// On the wrapped reader's EOF it blocks until no request is pending or the
-// grace period elapses, then reports EOF.
-func (d *DrainingStdio) Read(p []byte) (int, error) {
