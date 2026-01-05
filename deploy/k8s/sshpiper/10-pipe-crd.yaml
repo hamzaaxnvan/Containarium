@@ -1,0 +1,13 @@
+# The sshpiper "Pipe" CRD (sshpiper.com/v1beta1). The daemon programs one Pipe
+# per box; sshpiper watches them and routes incoming SSH by username.
+#
+# This ships an OPEN schema (x-kubernetes-preserve-unknown-fields) so it accepts
+# the plugin's full spec without us tracking every field. Operators who want
+# strict validation can apply sshpiper's upstream CRD instead — the
+# group/version/kind are identical, so the daemon and sshpiper work with either.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: pipes.sshpiper.com
+spec:
+  group: sshpiper.com
