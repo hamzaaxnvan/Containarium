@@ -1,0 +1,6 @@
+[Unit]
+Description=helloworld python app
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/helloworld/work/app.py
