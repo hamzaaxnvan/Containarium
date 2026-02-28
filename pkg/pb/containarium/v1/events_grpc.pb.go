@@ -30,36 +30,3 @@ const (
 type EventServiceClient interface {
 	// SubscribeEvents opens a streaming connection for real-time events
 	SubscribeEvents(ctx context.Context, in *SubscribeEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error)
-}
-
-type eventServiceClient struct {
-	cc grpc.ClientConnInterface
-}
-
-func NewEventServiceClient(cc grpc.ClientConnInterface) EventServiceClient {
-	return &eventServiceClient{cc}
-}
-
-func (c *eventServiceClient) SubscribeEvents(ctx context.Context, in *SubscribeEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &EventService_ServiceDesc.Streams[0], EventService_SubscribeEvents_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[SubscribeEventsRequest, Event]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type EventService_SubscribeEventsClient = grpc.ServerStreamingClient[Event]
-
-// EventServiceServer is the server API for EventService service.
-// All implementations must embed UnimplementedEventServiceServer
-// for forward compatibility.
-//

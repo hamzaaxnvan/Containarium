@@ -21,26 +21,3 @@ func TestSignChallenge_CloudProofContract(t *testing.T) {
 			var err error
 			if keyType == ssh.KeyAlgoRSA {
 				privateKey, err = rsa.GenerateKey(rand.Reader, 2048)
-			} else {
-				_, privateKey, err = ed25519.GenerateKey(rand.Reader)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			signer, err := ssh.NewSignerFromKey(privateKey)
-			if err != nil {
-				t.Fatal(err)
-			}
-			block, err := ssh.MarshalPrivateKey(privateKey, "proof-test")
-			if err != nil {
-				t.Fatal(err)
-			}
-			path := filepath.Join(t.TempDir(), "key")
-			if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			nonce := []byte{0, 255, 42, 17, 128, 1, 9, 10}
-			proof, err := SignChallenge(path, nonce)
-			if err != nil {
-				t.Fatal(err)
-			}
