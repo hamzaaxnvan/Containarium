@@ -1,0 +1,16 @@
+[Unit]
+Description=Containarium weekly base-image re-bake
+Documentation=https://github.com/footprintai/Containarium/issues/1037
+# Needs the network (distro mirrors) and local Incus; runs alongside the
+# daemon but doesn't require it — image-bake talks straight to Incus.
+After=network-online.target incus.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Optional overrides (image / podman / os-type flags), e.g.:
+#   REBAKE_FLAGS=--image images:ubuntu/24.04 --podman=true
+# Absent file or empty var = bake the defaults, which match what stackless
+# creates request. To bake several variants, add drop-in ExecStart lines.
+EnvironmentFile=-/etc/containarium/rebake.env
