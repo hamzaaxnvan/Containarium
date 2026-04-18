@@ -33,38 +33,3 @@ provider "google" {
 
 // Derive the GitHub release URL when an explicit override isn't given.
 // The startup script otherwise has no source for the binary on a fresh
-// install (no file provisioner, no sentinel binary server set up yet).
-//
-// #1784 (design doc, Rollout Phase 2): the host installs the containariumd-*
-// server artifact; containarium-* is the client build from Phase 2 on. The
-// startup script installs it at /usr/local/bin/containariumd (#1781).
-locals {
-  containarium_binary_url = var.containarium_binary_url != "" ? var.containarium_binary_url : (
-    "https://github.com/footprintai/Containarium/releases/download/v${var.containarium_version}/containariumd-linux-amd64"
-  )
-}
-
-module "containarium" {
-  source = "../modules/containarium"
-
-  // Identity
-  project_id    = var.project_id
-  region        = var.region
-  zone          = var.zone
-  instance_name = var.instance_name
-
-  // Sizing — small but real
-  machine_type   = var.machine_type
-  boot_disk_size = 30
-
-  // Spot + persistent disk: containers survive preemption. Demo
-  // viewers see real recovery if they hold the cluster for a few days.
-  use_spot_instance     = true
-  use_persistent_disk   = true
-  data_disk_size        = 100
-  data_disk_type        = "pd-balanced"
-  enable_disk_snapshots = false // optional; turn on if you keep the cluster around
-
-  // Sentinel — required for the agent-native demo (Caddy + sshpiper
-  // hostname routing live here).
-  enable_sentinel         = true
