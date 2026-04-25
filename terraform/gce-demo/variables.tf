@@ -18,24 +18,3 @@ variable "zone" {
 }
 
 variable "instance_name" {
-  description = "Name prefix for the demo instances. The spot VM is <name>, the sentinel is <name>-sentinel."
-  type        = string
-  default     = "containarium-demo"
-}
-
-variable "machine_type" {
-  description = "GCE machine type for the spot backend VM. e2-standard-2 (2 vCPU, 8 GB) is enough for the demo container plus Incus overhead. Note: the upstream module's regex rejects shared-core types (e2-medium / e2-small / e2-micro)."
-  type        = string
-  default     = "e2-standard-2"
-}
-
-// Versioning ----------------------------------------------------------
-
-variable "containarium_version" {
-  description = "Containarium version to install on the demo VM. Should match a tagged release at https://github.com/footprintai/Containarium/releases. Note: --proxy-protocol on the sentinel requires v0.16.7+ — older versions silently no-op'd the flag in simple-proxy mode."
-  type        = string
-  default     = "0.16.7"
-}
-
-variable "base_domain" {
-  description = "Public hostname the demo daemon serves at. Containers exposed via `expose_port` get subdomains of this (e.g. blog.<base_domain>). The cluster must have wildcard DNS for *.<base_domain> pointing at the sentinel's IP — Cloudflare-managed for the production demo deployment. Empty disables app-hosting."
