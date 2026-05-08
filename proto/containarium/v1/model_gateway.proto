@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// ModelGatewayService is the control surface for the daemon's model gateway
+// (internal/modelgateway): who owns which upstream provider key, and the
+// short-lived scoped tokens a box presents instead of one.
+//
+// The gateway's DATA plane is not here — it stays the HTTP proxy at
+// /v1/model/<provider> that a box calls with its gateway token. This service
+// is the admin + mint surface around it:
+//
+//   - Set/Delete/GetStatus for one key owner's real upstream key. Admin-only
+//     (gateway:admin); the key goes in, and only a fingerprint ever comes back
+//     out. The keys live in the daemon's encrypted secrets store under a
+//     reserved namespace no tenant can list and no delivery mode ships into a
+//     box (internal/secrets.GatewayKeyLocation).
+//   - MintGatewayToken, which issues a scoped, revocable, short-lived token
+//     for a box the CALLER OWNS (gateway:mint). The token's key_owner claim —
+//     the box's cloud-org attribution when stamped, else its owning username —
+//     is what makes the call spend that owner's upstream key rather than the
+//     daemon operator's.
+//   - ListGatewayModels, the upstream model list read through the gateway, so
+//     a caller can see what it may ask for without ever holding a real key.
+//
+// Design: docs/architecture/workspace-own-inference-key.md (cloud repo),
+// component 2 / contract C1.
+service ModelGatewayService {
+  // SetTenantProviderKey upserts the REAL upstream key one key owner pays
+  // with for one provider. Admin-only: the caller is the control plane (or an
+  // operator), never a tenant. The key is write-only over this API — nothing
+  // reads it back out, including this service.
+  rpc SetTenantProviderKey(SetTenantProviderKeyRequest) returns (SetTenantProviderKeyResponse) {
+    option (google.api.http) = {
+      put: "/v1/model-gateway/keys/{key_owner}/{provider}"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Set a key owner's provider key";
+      description: "Stores (or rotates) the real upstream API key one key owner spends for one provider. Requires the gateway:admin scope. The response carries a fingerprint, never the key.";
