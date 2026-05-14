@@ -1,0 +1,4 @@
+{
+  "route": {
+    "subdomain": "blog",
+    "fullDomain": "blog.example.com",
