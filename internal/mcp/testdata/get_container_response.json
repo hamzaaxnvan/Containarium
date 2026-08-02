@@ -1,0 +1,9 @@
+{
+  "container": {
+    "name": "alice-container",
+    "username": "alice",
+    "state": "CONTAINER_STATE_RUNNING",
+    "resources": {"cpu": "4", "memory": "8GB", "disk": "50GB", "gpu": ""},
+    "sshKeys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop"],
+    "network": {"ipAddress": "10.0.0.10", "macAddress": "00:16:3e:aa:bb:cc", "interface": "eth0", "bridge": "incusbr0"},
+    "createdAt": "1771122760",
