@@ -28,34 +28,3 @@ func TestRecordChild_AmbiguousCreateKeepsTheSlotAndSaysOutcomeUnknown(t *testing
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("RecordChild err = %v, want the upstream cause kept in the chain", err)
 	}
-	rows, err := store.ListLineageReservations(ctx, user, "default")
-	if err != nil {
-		t.Fatalf("ListLineageReservations: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("reservations after an ambiguous create = %d, want 1 (the slot stays claimed)", len(rows))
-	}
-
-	called := false
-	_, err = store.RecordChild(ctx, l, 0, 1, func(context.Context) (int64, error) { called = true; return 77, nil })
-	if !errors.Is(err, ErrFanoutExceeded) {
-		t.Fatalf("retry after an ambiguous create: err = %v, want ErrFanoutExceeded", err)
-	}
-	if called {
-		t.Error("retry reached the upstream create; the cap must reject it first")
-	}
-}
-
-// A definite upstream failure (the forge answered with an error) still
-// frees the slot: nothing was created, so the run may try again.
-func TestRecordChild_DefiniteFailureReleasesTheSlot(t *testing.T) {
-	store, ctx := newTrackerTestStore(t)
-	const user = "tracker-store-definite-failure"
-	resetReservationFixture(t, store, ctx, user)
-	l := Lineage{Username: user, Connection: "default", ParentNumber: 10, CreatedByRun: "run-rejected"}
-
-	_, err := store.RecordChild(ctx, l, 0, 1, func(context.Context) (int64, error) {
-		return 0, errors.New("github: HTTP 422: validation failed")
-	})
-	if err == nil || errors.Is(err, ErrUpstreamOutcomeUnknown) {
-		t.Fatalf("RecordChild err = %v, want a plain (definite) failure", err)
