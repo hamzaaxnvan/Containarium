@@ -1,0 +1,94 @@
+name: helm-lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'charts/**'
+  # No `branches:` filter — a base filter leaves stacked PRs with no checks
+  # at all, which looks the same as checks not having started (#1215). The
+  # `paths` filter stays: scoping by what changed is intentional, scoping by
+  # base branch was not.
+  pull_request:
+    paths:
+      - 'charts/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  helm-lint:
+    name: helm lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.16.2
+
+      - name: Lint containarium-k8s
+        run: helm lint charts/containarium-k8s
+
+      - name: Template render (smoke test)
+        # gateway.upstreamKeySecret must be set or the chart's own #1496 guard
+        # (daemon-deployment.yaml) intentionally refuses to render at all —
+        # unrelated to what this smoke test checks (template syntax/rendering
+        # errors in general), so satisfy it with a placeholder value.
+        run: |
+          helm template containarium charts/containarium-k8s \
+            --set gateway.upstreamKeySecret=smoke-test-placeholder \
+            > /dev/null
+
+      - name: Template render — gateway disabled (#1526)
+        # values.yaml documents clearing gateway.namespace as how to disable
+        # gateway routing entirely, but namespace.yaml had no
+        # gateway.enabled guard (unlike every other gateway-only resource in
+        # this chart), so it rendered a Namespace with an empty name —
+        # `resource name may not be empty` on install, only failing at
+        # install/dry-run time since `helm template` alone doesn't validate
+        # object names. --show-only asserts the template renders nothing at
+        # all for this file (matching every sibling gateway resource) rather
+        # than just checking the overall command doesn't error, which
+        # wouldn't have caught the empty-name manifest.
+        run: |
+          if helm template containarium charts/containarium-k8s \
+            --set gateway.enabled=false --set gateway.namespace="" \
+            --show-only templates/namespace.yaml > /dev/null 2>&1; then
+            echo "::error::namespace.yaml still rendered something with gateway.enabled=false — expected it to render nothing, the same as every other gateway-only resource"
+            exit 1
+          fi
+          helm template containarium charts/containarium-k8s \
+            --set gateway.enabled=false --set gateway.namespace="" \
+            > /dev/null
+
+      - name: Packaged chart pins its own release image (#2574)
+        # The release workflow stamps `version` / `appVersion` with
+        # `helm package`. Prove the stamped chart renders exactly that
+        # release's daemon image (and not the in-repo `latest` placeholder),
+        # using the same flags release.yml uses.
+        run: |
+          helm package charts/containarium-k8s \
+            --version 9.8.7 --app-version v9.8.7 --destination "$RUNNER_TEMP"
+          rendered="$(helm template containarium "$RUNNER_TEMP/containarium-k8s-9.8.7.tgz" \
+            --set gateway.upstreamKeySecret=smoke-test-placeholder)"
+          if ! grep -q 'image: ghcr.io/hamzaaxnvan/containarium:v9.8.7$' <<<"$rendered"; then
+            echo "::error::stamped chart does not render the daemon image ghcr.io/hamzaaxnvan/containarium:v9.8.7"
+            grep -n 'image:' <<<"$rendered" || true
+            exit 1
+          fi
+          if ! grep -q 'image: ghcr.io/hamzaaxnvan/containarium-sshpiper:v9.8.7$' <<<"$rendered"; then
+            echo "::error::stamped chart does not pin the sshpiper gateway image to v9.8.7 (#2703)"
+            grep -n 'image:' <<<"$rendered" || true
+            exit 1
+          fi
+          if grep -q 'containarium:latest' <<<"$rendered"; then
+            echo "::error::stamped chart still references the :latest daemon image"
+            exit 1
+          fi
