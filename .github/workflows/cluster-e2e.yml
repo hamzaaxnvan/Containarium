@@ -1,0 +1,678 @@
+name: Managed clusters KVM e2e
+
+# The definition-of-done lane for the managed-Kubernetes-clusters MVP
+# (#1418): the six-step tenant journey from the design's "End-to-end"
+# section, run with real everything — Incus VMs, k3s, cluster-autoscaler,
+# VPA — by scripts/cluster-e2e.sh + test/e2e/cluster/.
+#
+# It is also the home of the repo's OTHER real-daemon smoke lane: the
+# agent-skill run-lease e2e (#1819, scripts/agent-skill-lease-e2e.sh),
+# which measures the execution-scoped-authorization PRD's headline metric
+# — a run's gateway token is 401 within 5 s of the run returning — against
+# a real daemon, real Postgres, and a real Incus skill box. It lives here
+# because this is where "real daemon + real Postgres, on the nightly and
+# release-blocking cadence" already is; it needs no KVM and no
+# Kubernetes, so it runs on a GitHub-hosted runner it provisions itself
+# and never touches the self-hosted host's Incus. The same script (same
+# job, same cadence) now also proves the coding-skill-on-a-repo shape
+# (#1861): a run that fetched a repo leaves the checkout gone with the run
+# and never wrote the fetch credential to disk.
+#
+# WHAT GATES THE LEASE PATH PER-PR, precisely — because "wired into CI"
+# reads as more than it is. This lane is NOT a per-PR check: like the
+# cluster journey beside it, it runs nightly and on release tags. The
+# per-PR gate on the run-lease code itself is the unit suites that
+# shipped with it (#1817, #1823-#1826: internal/runlease,
+# internal/server/agent_server_test.go, internal/modelgateway,
+# internal/audit) under `Unit + default e2e`, which IS a required check
+# on main. This lane is the backstop for what those cannot reach: the
+# real wall-clock bound, against a real gateway and a real Postgres. The
+# `pull_request` paths below also list the lease path's Go directories,
+# so a change there runs the cheap `build-unit` job and gets the
+# script's syntax and lint checked — `build-unit` is not itself a
+# required check, so treat that as advisory rather than a gate.
+#
+# AND, since Containarium-cloud#1773 (AC2), the home of the repo's THIRD
+# real-daemon lane: the engineer-crew e2e (scripts/engineer-crew-e2e.sh),
+# which runs `engineer-crew` against the same pinned public fixture with a
+# REAL model and asserts the artifact names a file that really exists in that
+# fixture and carries a non-empty pr_title. It is here for the same reason the
+# lease lane is — real daemon + real Postgres + a self-provisioned Incus
+# container host, nightly and release-blocking cadence — with one difference
+# that has no precedent anywhere else in this repo: IT SPENDS REAL PROVIDER
+# MONEY. Everything else in CI, the lease lane included, runs on a placeholder
+# key by construction. So it is split in two: `engineer-crew-skip-gate` runs on
+# every pull request and proves the lane SKIPS cleanly with no credential, and
+# `engineer-crew-live` does the spending and runs only when a provider-key
+# secret exists. No such secret exists as of that split landing; see those
+# jobs' own comment block.
+#
+# AND, since #2225 (agent-router PRD Story 4), a FOURTH real-daemon lane in the
+# same shape: the two-engine-crew e2e (scripts/two-engine-crew-e2e.sh), which
+# runs a two-member crew whose members name two DIFFERENT engines against one
+# daemon holding both provider keys, and asserts each member's gateway token
+# names its own provider plus `containarium agent engines` reports the right
+# readiness/reason for all three engines. Same split as engineer-crew:
+# `two-engine-crew-skip-gate` on every PR, `two-engine-crew-live` only when
+# BOTH an ANTHROPIC_API_KEY and an OPENAI_API_KEY secret exist. As of this
+# landing only the former exists on this repository (for engineer-crew-live
+# above) — the OPENAI_API_KEY secret does not, so two-engine-crew-live has
+# never run; see that job's own comment block.
+#
+# Cadence per the design's CI-gates section: NIGHTLY + RELEASE-BLOCKING
+# (tag push), not per-PR — a full run provisions VMs for over an hour.
+# Pull requests touching the lane get only the cheap job: compile the
+# gated package and run its untagged unit tests, so the lane's own logic
+# cannot rot unnoticed between nightlies.
+#
+# Runner contract (the provisioning half of #1418): a SELF-HOSTED runner
+# labeled `incus` + `kvm`, with Incus and its unix socket, /dev/kvm,
+# a Go toolchain, passwordless sudo, docker or podman (throwaway
+# Postgres), and egress to github.com + registry.k8s.io. Details in the
+# header of scripts/cluster-e2e.sh.
+#
+# Prove-the-lane-can-fail (#1418 guardrail): dispatch with
+# sabotage=join-token. The script corrupts worker join tokens so no node
+# can register; the JOB goes green only if the SUITE goes red. Run it
+# once when the runner first comes up, and after any change to the
+# lane's assertions — a green lane that has never failed proves nothing.
+
+on:
+  schedule:
+    # Nightly, off-peak for the self-hosted host.
+    - cron: '30 2 * * *'
+  push:
+    tags:
+      - 'v*'   # release-blocking: docs/RELEASE-PROCESS.md gates publishing on this run
+  workflow_dispatch:
+    inputs:
+      sabotage:
+        description: 'Deliberate breakage; each option proves one lane can fail'
+        type: choice
+        # join-token:  no cluster node can register, so the journey never
+        #   reaches READY — proves the cluster lane can fail (#1418).
+        # no-revoke:   the run_exit revocation rows are deleted right after the
+        #   run returns, which is the state a missing revoke call produces —
+        #   proves the run-lease lane can fail on the REVOCATION (#1819).
+        # slow-revoke: the revocation happens, but the first poll is delayed
+        #   past the budget — proves the run-lease lane can fail on the
+        #   5s BOUND, which it once could not (the budget was only the poll
+        #   loop's continuation condition, never a gate on the measurement).
+        # skip-workspace-removal: after the #1861 git-source run returns and
+        #   is cleaned up normally, the harness recreates the workspace
+        #   directory to simulate a skipped removal — proves the lane can
+        #   fail on "the fetched checkout must not outlive its run".
+        # fixture-path-mismatch / blank-pr-title: the engineer-crew lane's two
+        #   sabotages (Containarium-cloud#1773 AC2). Each replaces exactly one
+        #   value the harness asserts on AFTER a real model run — the
+        #   independently-computed fixture file list, or pr_title — so each
+        #   proves one of AC2's two gates discriminates while every other
+        #   assertion stays green. Sabotaging the MODEL is not an option: a
+        #   model cannot be reliably instructed to answer wrongly, and a
+        #   guardrail has to be deterministic. Each costs one real model run,
+        #   which is why they are dispatch-only like everything else here.
+        # swap-expected-providers: the two-engine-crew lane's own sabotage
+        #   (#2225). Swaps which provider the harness expects from which crew
+        #   member right before the comparison, so the per-member engine
+        #   check must go RED even though the real tokens are unchanged and
+        #   correct. Needs the same two-key secret pair as the live job.
+        options: ['none', 'join-token', 'no-revoke', 'slow-revoke', 'skip-workspace-removal', 'fixture-path-mismatch', 'blank-pr-title', 'swap-expected-providers']
+        default: 'none'
+      short_scale_down:
+        description: 'Use the tag-run autoscaler scale-down timers (5m/1m) instead of stock, to rehearse the release gate'
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'test/e2e/cluster/**'
+      - 'scripts/cluster-e2e.sh'
+      - 'scripts/agent-skill-lease-e2e.sh'
+      - 'scripts/engineer-crew-e2e.sh'
+      - 'scripts/two-engine-crew-e2e.sh'
+      - '.github/workflows/cluster-e2e.yml'
+      # The lease path's own code. This does not make the 45-minute lane run
+      # on a PR — see the header — it runs `build-unit`, so a change to the
+      # credential lifecycle at least gets this lane's script checked.
+      - 'internal/runlease/**'
+      - 'internal/modelgateway/**'
+      - 'internal/server/agent_server.go'
+      - 'internal/server/agent_gateway.go'
+      # The engineer-crew / two-engine-crew lanes' own code and content. Same
+      # reasoning: a change to RunCrew's provisioning, to #2222/#2223's engine
+      # resolution, or to the crew/skill prompts whose OUTPUT SHAPE either
+      # lane asserts on, gets both scripts' syntax + lint checked and their
+      # skip gates exercised on the PR that makes it.
+      - 'internal/server/crew_server.go'
+      - 'internal/agentengine/**'
+      - 'pkg/core/crews/crews.yaml'
+      - 'pkg/core/skills/skills.yaml'
+
+permissions:
+  contents: read
+
+# One run at a time regardless of ref: every run owns the runner's Incus
+# (VM capacity, the fixed CA-provider port, the sweep of e2etenant VMs).
+#
+# The run-lease jobs below are the exception the group costs nothing for:
+# they run on ephemeral GitHub-hosted runners with their own Incus, so
+# they own nothing here — and because they share the cluster lane's
+# triggers exactly (nightly, release tags, dispatch), serializing them
+# alongside it never queues a pull request behind an hour-long nightly.
+concurrency:
+  group: cluster-e2e-kvm
+  cancel-in-progress: false
+
+jobs:
+  build-unit:
+    name: compile lane + helper unit tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/setup-go-cached
+        with:
+          go-version: '1.26.10'
+          cache-name: shared
+      - name: Compile the gated e2e package
+        run: go vet -tags 'incus cluster_e2e' ./test/e2e/cluster/
+      - name: Helper unit tests (pure, no Incus)
+        # This is the only invocation list carrying this package's unit
+        # tests — no repo-wide `go test ./...` lane exists to catch it.
+        run: go test -race -count=1 -v ./test/e2e/cluster/
+      - name: Lane script syntax
+        # All three lanes' scripts. The expensive jobs below run nightly, so a
+        # syntax error introduced in a PR would otherwise sit undetected
+        # until the next nightly — by which point it is someone else's
+        # 2:30am red run.
+        run: |
+          bash -n scripts/cluster-e2e.sh
+          bash -n scripts/agent-skill-lease-e2e.sh
+          bash -n scripts/engineer-crew-e2e.sh
+          bash -n scripts/two-engine-crew-e2e.sh
+
+      - name: Lane script lint
+        # shellcheck is preinstalled on ubuntu-latest — no apt-get, which
+        # kept ~30s off every PR that touches the lane.
+        #
+        # Not scripts/cluster-e2e.sh: it predates this step and carries
+        # findings of its own (the same deliberate SC2024 the lease script
+        # disables inline, among others). Cleaning those is a separate change;
+        # gating the NEW scripts is what stops new ones.
+        run: |
+          shellcheck scripts/agent-skill-lease-e2e.sh
+          shellcheck scripts/engineer-crew-e2e.sh
+          shellcheck scripts/two-engine-crew-e2e.sh
+
+  kvm-e2e:
+    name: six-step journey (real VMs)
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.sabotage == 'none')
+    runs-on: [self-hosted, incus, kvm]
+    timeout-minutes: 150
+    env:
+      # Repository variables tune budgets for slower nested-KVM hosts. Defaults
+      # include margin for the observed control-plane and worker startup time.
+      CONTAINARIUM_E2E_GO_TIMEOUT: ${{ vars.CONTAINARIUM_E2E_GO_TIMEOUT || '130m' }}
+      CONTAINARIUM_E2E_READY_TIMEOUT: ${{ vars.CONTAINARIUM_E2E_READY_TIMEOUT || '25m' }}
+      CONTAINARIUM_E2E_SCALEUP_TIMEOUT: ${{ vars.CONTAINARIUM_E2E_SCALEUP_TIMEOUT || '12m' }}
+      CONTAINARIUM_E2E_VPA_TIMEOUT: ${{ vars.CONTAINARIUM_E2E_VPA_TIMEOUT || '15m' }}
+      CONTAINARIUM_E2E_SCALEDOWN_TIMEOUT: ${{ vars.CONTAINARIUM_E2E_SCALEDOWN_TIMEOUT || '30m' }}
+      CONTAINARIUM_E2E_DELETE_TIMEOUT: ${{ vars.CONTAINARIUM_E2E_DELETE_TIMEOUT || '10m' }}
+      # Autoscaler scale-down timers, TAG RUNS ONLY (the release gate). The
+      # stock timers (10m delay-after-add + 10m unneeded) made step 5 about
+      # 12 of the lane's ~22 minutes of pure waiting (v0.110.0: step 5 ran
+      # 22:56:47 -> 23:08:30). 5m after the last scale-up (~2m into step 5
+      # on that run) keeps the autoscaler from consolidating nodes while the
+      # earlier steps still need them; 1m unneeded then removes the surplus
+      # promptly. Nightly runs, and dispatch runs without short_scale_down,
+      # leave both unset, so the stock cadence is still exercised every night.
+      CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_DELAY_AFTER_ADD: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.short_scale_down) && (vars.CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_DELAY_AFTER_ADD || '5m') || '' }}
+      CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_UNNEEDED_TIME: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.short_scale_down) && (vars.CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_UNNEEDED_TIME || '1m') || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run the lane
+        # No pipes around the go test inside — its exit status is the
+        # script's, and the script's is the job's.
+        run: bash scripts/cluster-e2e.sh
+
+  prove-lane-can-fail:
+    name: sabotage run (suite must go red)
+    if: github.event_name == 'workflow_dispatch' && inputs.sabotage == 'join-token'
+    runs-on: [self-hosted, incus, kvm]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Corrupt join tokens and expect the suite to fail
+        # Inversion is explicit and lives only in this dispatch-only
+        # job: green here means the lane DETECTED the sabotage.
+        env:
+          CONTAINARIUM_E2E_SABOTAGE: join-token
+          # Sabotaged workers can never register; don't wait the full
+          # production bound to learn what we broke on purpose.
+          CONTAINARIUM_E2E_READY_TIMEOUT: 12m
+        run: |
+          if bash scripts/cluster-e2e.sh; then
+            echo "::error::lane stayed GREEN under join-token sabotage — it cannot fail, so its green proves nothing"
+            exit 1
+          fi
+          echo "lane went red under sabotage: it can fail, and its green is evidence."
+
+  agent-skill-lease:
+    name: agent-skill run lease (token 401 within 5s of run exit)
+    # Same cadence as the cluster lane above — nightly and release-blocking —
+    # so the PRD's headline metric is re-measured on the schedule a release
+    # is gated on, not just once in the PR that added the script (#1819).
+    #
+    # #1861's git-source proof extends the SAME script and runs on this SAME
+    # cadence, not per-PR: it is a real Incus box + real fetch from a real
+    # public repo, same cost shape as the run-lease proof beside it. A PR
+    # touching the lease/git-source path gets `build-unit`'s syntax+lint
+    # check (see that job and the `pull_request.paths` list above); the full
+    # proof — this job — runs nightly and release-blocking, same as #1819's.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.sabotage == 'none')
+    # A skill box is an Incus SYSTEM CONTAINER, so this lane needs no KVM and
+    # provisions its own host — the cluster-container-e2e.yml precedent. It
+    # therefore does not compete with kvm-e2e above for the self-hosted host,
+    # which is why the two run in parallel rather than in sequence.
+    runs-on: ubuntu-latest
+    # Budget: ~8m Incus provisioning, ~3m build, ~1m postgres pull, then the
+    # warm-up run's first box provision (the agent-runtime recipe installs
+    # Node inside the box) dominates at ~5-10m. The two measured runs are
+    # ~30s each; #1861's git-source run adds one shallow clone of a small,
+    # ancient public repo, seconds not minutes. 45 leaves room for a cold
+    # runner without letting a wedged daemon hold the queue.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: ./.github/actions/setup-go-cached
+        with:
+          go-version-file: go.mod
+          cache-name: shared
+
+      - name: Provision Incus (the incus-create.yml precedent, minus KVM)
+        run: bash scripts/ci-incus-container-host.sh
+
+      - name: Run the run-lease lane
+        # No pipe: the script's exit status is the job's. Each assertion
+        # prints what it observed, so a green run is evidence rather than
+        # an absence of output.
+        run: bash scripts/agent-skill-lease-e2e.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          sudo incus list || true
+          sudo incus info || true
+          free -m || true
+          df -h /mnt / || true
+
+  prove-lease-lane-can-fail:
+    name: sabotage run (run-lease lane must go red)
+    # All three lease sabotages land here. no-revoke and slow-revoke prove
+    # assertion 2's two separate claims (dead, and dead within the bound) can
+    # each fail on demand; skip-workspace-removal proves #1861's assertion 7
+    # (a fetched checkout must not outlive its run) can too.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.sabotage == 'no-revoke' || inputs.sabotage == 'slow-revoke' || inputs.sabotage == 'skip-workspace-removal')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: ./.github/actions/setup-go-cached
+        with:
+          go-version-file: go.mod
+          cache-name: shared
+
+      - name: Provision Incus (the incus-create.yml precedent, minus KVM)
+        run: bash scripts/ci-incus-container-host.sh
+
+      - name: Break the lease property and expect the lane to fail
+        # Inversion is explicit and lives only in this dispatch-only job:
+        # green here means the lane DETECTED the broken property. A lane
+        # that has never failed proves nothing.
+        env:
+          CONTAINARIUM_E2E_SABOTAGE: ${{ inputs.sabotage }}
+        run: |
+          if bash scripts/agent-skill-lease-e2e.sh; then
+            echo "::error::lane stayed GREEN under sabotage=${CONTAINARIUM_E2E_SABOTAGE} — it cannot fail that way, so its green proves nothing"
+            exit 1
+          fi
+          echo "lane went red under sabotage=${CONTAINARIUM_E2E_SABOTAGE}: it can fail, and its green is evidence."
+
+  # ======================================================================
+  # engineer-crew (Containarium-cloud#1773 AC2) — the repo's ONLY lane that
+  # spends real model money.
+  #
+  # Two jobs on purpose, because AC4 of that issue says "both tests run on
+  # every PR in their repo" and a lane that bills cannot honestly run on every
+  # PR:
+  #
+  #   engineer-crew-skip-gate  — runs on EVERY pull request. Executes the real
+  #     script with no model credential and requires it to SKIP (exit 0, prints
+  #     SKIP, never prints PASS). That is what "runs on every PR" buys here:
+  #     the script's own gate is exercised for real on every change, not merely
+  #     asserted in a comment, so the lane cannot rot into one that fails —
+  #     or, worse, silently passes — when no key is configured.
+  #
+  #   engineer-crew-live       — nightly + release-blocking + dispatch, and
+  #     only actually runs when a provider-key secret exists. This is the half
+  #     that proves AC2.
+  #
+  # AS OF THIS LANDING NO SUCH SECRET EXISTS on this repository, so
+  # engineer-crew-live has never run and reports a ::notice:: saying so rather
+  # than going green on nothing. Creating it is a human decision about spend
+  # (see the script's header for the three ceilings that bound the cost);
+  # nothing else is missing.
+  # ======================================================================
+  engineer-crew-skip-gate:
+    name: engineer-crew e2e skips cleanly with no model credential
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run the lane with no model credential and require a SKIP
+        # The empty values are deliberate rather than redundant: they defend
+        # against a runner (or a future workflow-level env) that happens to
+        # carry a provider key, which would turn this cheap per-PR job into an
+        # unexpected hour-long spend.
+        env:
+          ANTHROPIC_API_KEY: ''
+          OPENAI_API_KEY: ''
+          GEMINI_API_KEY: ''
+        run: |
+          set -euo pipefail
+          # No pipe around the script: `out="$( ... )"` under set -e means a
+          # non-zero exit fails the step, which is the first thing being
+          # asserted — an unconfigured lane must SKIP, not fail.
+          out="$(bash scripts/engineer-crew-e2e.sh)"
+          printf '%s\n' "$out"
+          if ! printf '%s\n' "$out" | grep -q '^SKIP:'; then
+            echo "::error::the lane exited 0 with no model credential but never printed SKIP — a silent success is indistinguishable from a real pass"
+            exit 1
+          fi
+          if printf '%s\n' "$out" | grep -q '^PASS'; then
+            echo "::error::the lane printed PASS without a model credential — it cannot have proved anything about engineer-crew"
+            exit 1
+          fi
+          echo "skip gate holds: no credential -> SKIP, exit 0, no PASS claimed."
+
+  engineer-crew-live:
+    name: engineer-crew against the pinned fixture (REAL model)
+    # Same cadence as the two lanes above — nightly and release-blocking — so
+    # the phase's definition-of-done evidence is re-measured on the schedule a
+    # release is gated on, not just once in the PR that added the script.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.sabotage == 'none')
+    runs-on: ubuntu-latest
+    # Budget: ~8m Incus provisioning, ~3m build, ~1m postgres pull, then TWO
+    # first-time member-box provisions (the agent-runtime recipe installs Node
+    # and pulls the release bundle in each) at ~10m apiece, then two real model
+    # conversations. 90 leaves room for a cold runner without letting a wedged
+    # daemon hold the queue.
+    timeout-minutes: 90
+    env:
+      # Read into `env` at job level, not referenced inline in `if:`, because
+      # that is the supported way to branch on whether a secret exists: an
+      # absent secret interpolates to the empty string, and `env.X != ''` is
+      # then a legal step-level condition. Both keys are offered so a
+      # deployment can pay for the cheap engine instead of the default one —
+      # the script picks between them in the daemon's own precedence.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - name: Report that no model credential is configured
+        if: env.ANTHROPIC_API_KEY == '' && env.GEMINI_API_KEY == ''
+        run: |
+          echo "::notice title=engineer-crew live lane not run::No ANTHROPIC_API_KEY or GEMINI_API_KEY secret is set on this repository, so Containarium-cloud#1773 AC2 has not been measured. The scaffolding is green (see engineer-crew-skip-gate on every PR); what is missing is a human decision to fund the spend. Add one of those Actions secrets and this job runs the real lane on the next nightly."
+
+      # fetch-depth 0: the script defaults its agent-runtime RELEASE to the
+      # newest reachable v-tag, and actions/checkout's default shallow fetch
+      # brings none — the lane would fail pre-flight on "no release tag".
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.ANTHROPIC_API_KEY != '' || env.GEMINI_API_KEY != ''
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-go-cached
+        if: env.ANTHROPIC_API_KEY != '' || env.GEMINI_API_KEY != ''
+        with:
+          go-version-file: go.mod
+          cache-name: shared
+
+      - name: Provision Incus (the incus-create.yml precedent, minus KVM)
+        if: env.ANTHROPIC_API_KEY != '' || env.GEMINI_API_KEY != ''
+        run: bash scripts/ci-incus-container-host.sh
+
+      - name: Run the engineer-crew lane
+        if: env.ANTHROPIC_API_KEY != '' || env.GEMINI_API_KEY != ''
+        # No pipe: the script's exit status is the job's. Each assertion prints
+        # what it observed, so a green run is evidence rather than an absence
+        # of output.
+        run: bash scripts/engineer-crew-e2e.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          sudo incus list || true
+          free -m || true
+          df -h /mnt / || true
+
+  prove-engineer-crew-lane-can-fail:
+    name: sabotage run (engineer-crew lane must go red)
+    # fixture-path-mismatch proves AC2's "files touch a path that exists in the
+    # fixture" gate discriminates; blank-pr-title proves the "pr_title is
+    # non-empty" gate is a gate. Each costs one real model run, so this is
+    # dispatch-only and needs the same secret the live job does.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.sabotage == 'fixture-path-mismatch' || inputs.sabotage == 'blank-pr-title')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - name: Refuse to claim a guardrail without a credential
+        if: env.ANTHROPIC_API_KEY == '' && env.GEMINI_API_KEY == ''
+        # A sabotage job that "went red" because the lane SKIPPED would be the
+        # worst possible outcome here: it would look like proof the lane can
+        # fail when in fact nothing ran. Fail explicitly instead.
+        run: |
+          echo "::error::no model credential secret is set, so this sabotage would only prove the skip gate works, not that the lane can fail. Add ANTHROPIC_API_KEY or GEMINI_API_KEY before dispatching a sabotage."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-go-cached
+        with:
+          go-version-file: go.mod
+          cache-name: shared
+
+      - name: Provision Incus (the incus-create.yml precedent, minus KVM)
+        run: bash scripts/ci-incus-container-host.sh
+
+      - name: Break one AC2 gate and expect the lane to fail
+        # Inversion is explicit and lives only in this dispatch-only job:
+        # green here means the lane DETECTED the broken property. A lane that
+        # has never failed proves nothing.
+        env:
+          CONTAINARIUM_E2E_SABOTAGE: ${{ inputs.sabotage }}
+        run: |
+          if bash scripts/engineer-crew-e2e.sh; then
+            echo "::error::lane stayed GREEN under sabotage=${CONTAINARIUM_E2E_SABOTAGE} — it cannot fail that way, so its green proves nothing"
+            exit 1
+          fi
+          echo "lane went red under sabotage=${CONTAINARIUM_E2E_SABOTAGE}: it can fail, and its green is evidence."
+
+  # ======================================================================
+  # two-engine-crew (#2225, agent-router PRD Story 4) — proves several
+  # agent engines run on ONE daemon at once. Same shape as engineer-crew
+  # above (it also spends real provider money), split the same way:
+  #
+  #   two-engine-crew-skip-gate — runs on EVERY pull request. Executes the
+  #     real script with no credential and requires it to SKIP.
+  #
+  #   two-engine-crew-live      — nightly + release-blocking + dispatch, and
+  #     only runs when BOTH an ANTHROPIC_API_KEY and an OPENAI_API_KEY secret
+  #     exist (this lane needs two different providers configured at once,
+  #     unlike engineer-crew-live's any-one-of).
+  #
+  # AS OF THIS LANDING NO OPENAI_API_KEY SECRET EXISTS on this repository
+  # (only ANTHROPIC_API_KEY / GEMINI_API_KEY do, for engineer-crew-live), so
+  # two-engine-crew-live has never run and reports a ::notice:: saying so.
+  # Creating it is the same human decision about spend as engineer-crew-live's;
+  # nothing else is missing.
+  # ======================================================================
+  two-engine-crew-skip-gate:
+    name: two-engine-crew e2e skips cleanly with one or no model credential
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run the lane with no model credential and require a SKIP
+        # Deliberately empty, same reasoning as engineer-crew-skip-gate: a
+        # runner whose environment happens to carry a provider key must not
+        # turn this cheap per-PR job into an unexpected hour-long spend.
+        env:
+          ANTHROPIC_API_KEY: ''
+          OPENAI_API_KEY: ''
+          GEMINI_API_KEY: ''
+        run: |
+          set -euo pipefail
+          out="$(bash scripts/two-engine-crew-e2e.sh)"
+          printf '%s\n' "$out"
+          if ! printf '%s\n' "$out" | grep -q '^SKIP:'; then
+            echo "::error::the lane exited 0 with no model credential but never printed SKIP — a silent success is indistinguishable from a real pass"
+            exit 1
+          fi
+          if printf '%s\n' "$out" | grep -q '^PASS'; then
+            echo "::error::the lane printed PASS without both model credentials — it cannot have proved anything about engine routing"
+            exit 1
+          fi
+          echo "skip gate holds: no credential -> SKIP, exit 0, no PASS claimed."
+
+      - name: Run the lane with only ONE of the two credentials and require a SKIP
+        # The whole point of this lane is BOTH providers at once — one key
+        # must still SKIP, not silently run a one-engine proof that
+        # engineer-crew-skip-gate already covers.
+        env:
+          ANTHROPIC_API_KEY: 'not-a-real-key-e2e-placeholder'
+          OPENAI_API_KEY: ''
+          GEMINI_API_KEY: ''
+        run: |
+          set -euo pipefail
+          out="$(bash scripts/two-engine-crew-e2e.sh)"
+          printf '%s\n' "$out"
+          if ! printf '%s\n' "$out" | grep -q '^SKIP:'; then
+            echo "::error::the lane did not SKIP with only one of the two required credentials set"
+            exit 1
+          fi
+          echo "one-key gate holds: ANTHROPIC_API_KEY alone -> SKIP."
+
+  two-engine-crew-live:
+    name: two-engine-crew across claude + codex (REAL models)
+    # Same cadence as engineer-crew-live — nightly and release-blocking.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.sabotage == 'none')
+    runs-on: ubuntu-latest
+    # Budget: ~8m Incus provisioning, ~3m build, ~1m postgres pull, then TWO
+    # first-time member-box provisions at ~10m apiece, then two small real
+    # model conversations capped at a low turn count. 60 leaves room for a
+    # cold runner without letting a wedged daemon hold the queue.
+    timeout-minutes: 60
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Report that both model credentials are not configured
+        if: env.ANTHROPIC_API_KEY == '' || env.OPENAI_API_KEY == ''
+        run: |
+          echo "::notice title=two-engine-crew live lane not run::This lane needs BOTH an ANTHROPIC_API_KEY and an OPENAI_API_KEY secret on this repository, and at least one is missing, so #2225's Story 4 has not been measured. The scaffolding is green (see two-engine-crew-skip-gate on every PR); what is missing is a human decision to fund the spend (and add the OPENAI_API_KEY secret, which does not exist here yet). Add both and this job runs the real lane on the next nightly."
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.ANTHROPIC_API_KEY != '' && env.OPENAI_API_KEY != ''
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-go-cached
+        if: env.ANTHROPIC_API_KEY != '' && env.OPENAI_API_KEY != ''
+        with:
+          go-version-file: go.mod
+          cache-name: shared
+
+      - name: Provision Incus (the incus-create.yml precedent, minus KVM)
+        if: env.ANTHROPIC_API_KEY != '' && env.OPENAI_API_KEY != ''
+        run: bash scripts/ci-incus-container-host.sh
+
+      - name: Run the two-engine-crew lane
+        if: env.ANTHROPIC_API_KEY != '' && env.OPENAI_API_KEY != ''
+        run: bash scripts/two-engine-crew-e2e.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          sudo incus list || true
+          free -m || true
+          df -h /mnt / || true
+
+  prove-two-engine-crew-lane-can-fail:
+    name: sabotage run (two-engine-crew lane must go red)
+    # swap-expected-providers proves the per-member engine check (assertion 2)
+    # discriminates. Costs one real run, so dispatch-only, and needs the same
+    # two-key secret pair as the live job.
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.sabotage == 'swap-expected-providers'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Refuse to claim a guardrail without both credentials
+        if: env.ANTHROPIC_API_KEY == '' || env.OPENAI_API_KEY == ''
+        # A sabotage job that "went red" because the lane SKIPPED would be the
+        # worst possible outcome here: it would look like proof the lane can
+        # fail when in fact nothing ran.
+        run: |
+          echo "::error::both ANTHROPIC_API_KEY and OPENAI_API_KEY secrets are required to dispatch this sabotage — without them this would only prove the skip gate works, not that the lane can fail."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-go-cached
+        with:
+          go-version-file: go.mod
+          cache-name: shared
+
+      - name: Provision Incus (the incus-create.yml precedent, minus KVM)
+        run: bash scripts/ci-incus-container-host.sh
+
+      - name: Break the per-member engine check and expect the lane to fail
+        env:
+          CONTAINARIUM_E2E_SABOTAGE: ${{ inputs.sabotage }}
+        run: |
+          if bash scripts/two-engine-crew-e2e.sh; then
+            echo "::error::lane stayed GREEN under sabotage=${CONTAINARIUM_E2E_SABOTAGE} — it cannot fail that way, so its green proves nothing"
+            exit 1
+          fi
+          echo "lane went red under sabotage=${CONTAINARIUM_E2E_SABOTAGE}: it can fail, and its green is evidence."
