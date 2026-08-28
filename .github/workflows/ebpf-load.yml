@@ -1,0 +1,208 @@
+name: eBPF load path
+
+# Proves the compiled netpolicy eBPF object (internal/netbpf/netpolicy.bpf.o)
+# actually loads into a real kernel, actually attaches its TC hooks via
+# AttachTCX, and its attached program actually evaluates real traffic — not
+# just that it compiles. See docs/EBPF-CI-LOADING-LANE-DESIGN.md (#1663,
+# split from #1660, umbrella #1645) for the full design.
+#
+# Since #2637 the same lane also proves the SECOND object,
+# internal/netbpf/execwatch.bpf.o (exec telemetry): it loads under this
+# kernel's verifier with CO-RE against the runner's BTF, attaches to the
+# sched/sched_process_exec tracepoint, emits exactly one event for an exec
+# inside a watched cgroup and none for a host exec, counts (not crashes on)
+# a 10k-exec burst, and logs the measured per-exec overhead
+# (execwatch_load_test.go).
+#
+# release.yml already proves the OTHER half (`make build-bpf` succeeds in
+# CI); this lane exists because nothing anywhere proved the load/attach
+# half, and a verifier-rejected instruction or a broken AttachTCX call would
+# ship invisibly today.
+#
+# Deliberately NOT built on incus-create.yml's Incus/ZFS setup: AttachVeth
+# takes any real interface's ifindex, so this lane needs neither — a
+# throwaway veth pair + netns created directly on the bare runner is
+# sufficient. Coupling this to an unrelated Incus/ZFS dependency would make
+# every netbpf-only change wait on an image pull for no benefit, the same
+# reasoning incus-create.yml's own header gives for staying separate from
+# zfs-encryption.yml. That's also why this lane is fast (minutes, not
+# incus-create.yml's 45-minute budget).
+#
+# Runs as root (sudo) inside the ephemeral, secret-less runner VM this job
+# gets on a `pull_request` trigger (not `pull_request_target` — a fork's PR
+# never sees repo secrets or a write-capable GITHUB_TOKEN regardless of
+# what runs as root inside the VM). The kernel's own eBPF verifier is the
+# actual safety boundary for what a loaded program can do, not this
+# workflow's permission scoping — see the design doc's Security section.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'internal/netbpf/**'
+      - 'experimental/ebpf-phaseA/**'
+      - 'internal/server/exec_watcher.go'
+      - 'internal/server/exec_stamp*.go'
+      - 'internal/server/process_kill*.go'
+      - '.github/workflows/ebpf-load.yml'
+  # No `branches:` filter — a base filter leaves stacked PRs with no checks
+  # at all, which looks the same as checks not having started (#1215, same
+  # reasoning incus-create.yml documents).
+  pull_request:
+    paths:
+      - 'internal/netbpf/**'
+      - 'experimental/ebpf-phaseA/**'
+      - 'internal/server/exec_watcher.go'
+      - 'internal/server/exec_stamp*.go'
+      - 'internal/server/process_kill*.go'
+      - '.github/workflows/ebpf-load.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ebpf-load:
+    name: Load + attach the real eBPF objects (network policy, exec telemetry)
+    runs-on: ubuntu-latest
+    # No image pull, no Incus — this is a compile + a few `ip` commands + a
+    # Go test. The exec-telemetry overhead measurement (#2637) runs a paced
+    # exec load for 60 s with and without the program attached, so the test
+    # step itself takes a few minutes; headroom on top for a cold apt cache.
+    timeout-minutes: 25
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-cached
+        with:
+          go-version-file: go.mod
+          cache-name: shared
+
+      # release.yml's already-proven recipe (see its "Compile eBPF
+      # network-policy object" step) — copied verbatim rather than shared
+      # via a composite action, since it's three lines and this is the only
+      # other place that needs it.
+      - name: Install eBPF toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev linux-libc-dev
+          # bpftool for vmlinux.h (#2637): a pinned static release from
+          # github.com/libbpf/bpftool, checksum-verified. Not Ubuntu's
+          # linux-tools: on the Azure runner kernels the only thing those
+          # packages leave on disk is the linux-tools-common wrapper, which
+          # cannot run (proved by runs 39210535656 / 39212425801). Dumping
+          # /sys/kernel/btf/vmlinux does not need a kernel-matched binary.
+          BPFTOOL_VERSION=v7.6.0
+          BPFTOOL_SHA256=51ffd3dd4f46fdc46736433a971e828dc70835c6b18ad20cabffd10abcf00358
+          curl -sSfL -o /tmp/bpftool.tar.gz "https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-amd64.tar.gz"
+          echo "${BPFTOOL_SHA256}  /tmp/bpftool.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/bpftool.tar.gz -C /usr/local/bin bpftool
+          sudo chmod 0755 /usr/local/bin/bpftool
+          BPFTOOL=/usr/local/bin/bpftool
+          echo "bpftool: $BPFTOOL ($("$BPFTOOL" version | head -n1))"
+          echo "BPFTOOL=$BPFTOOL" >> "$GITHUB_ENV"
+
+      - name: Compile both eBPF objects
+        run: |
+          set -euo pipefail
+          make build-bpf BPFTOOL="$BPFTOOL"
+          test -s internal/netbpf/netpolicy.bpf.o || {
+            echo "::error::make build-bpf reported success but netpolicy.bpf.o is missing or empty"
+            exit 1
+          }
+          test -s internal/netbpf/execwatch.bpf.o || {
+            echo "::error::make build-bpf reported success but execwatch.bpf.o is missing or empty"
+            exit 1
+          }
+          test -s internal/netbpf/vmlinux.h || {
+            echo "::error::make build-bpf did not generate vmlinux.h"
+            exit 1
+          }
+
+      # A netpolicy object from before #2974, whose policy_cfg's last byte was
+      # padding (#2987): the loader must detect that it ignores egress_mode.
+      # Built from the netpolicy.bpf.c at #2974's parent commit, fetched by
+      # sha (the checkout is shallow), with the same flags as `make build-bpf`.
+      - name: Compile the pre-egress_mode network-policy object
+        run: |
+          set -euo pipefail
+          OLD_SHA=85b5919fdfda6314a841b88a8861666042404848
+          git fetch --no-tags --depth=1 origin "$OLD_SHA"
+          OLD_SRC="$RUNNER_TEMP/netpolicy-pre-egress-mode.bpf.c"
+          OLD_OBJ="$RUNNER_TEMP/netpolicy-pre-egress-mode.bpf.o"
+          git show "$OLD_SHA:experimental/ebpf-phaseA/netpolicy.bpf.c" > "$OLD_SRC"
+          if grep -q egress_mode "$OLD_SRC"; then
+            echo "::error::the pinned pre-#2974 source already declares egress_mode"
+            exit 1
+          fi
+          clang -O2 -g -target bpfel -I/usr/include/"$(uname -m)"-linux-gnu -c "$OLD_SRC" -o "$OLD_OBJ"
+          test -s "$OLD_OBJ"
+          echo "NETBPF_PRE_EGRESS_MODE_OBJECT=$OLD_OBJ" >> "$GITHUB_ENV"
+
+      # sudo -E env "PATH=$PATH" is incus-create.yml's own fix for #1614:
+      # plain `sudo go test` drops $PATH (no `go` binary found) and, if it
+      # DOES find go some other way, leaves $HOME pointing at the invoking
+      # user's dir while running as root — writing root-owned build-cache
+      # entries a later same-user step then can't read. Matching that exact
+      # invocation here avoids rediscovering the same failure mode.
+      #
+      # -v so a failure's own test log (not just the exit code) is visible
+      # in the CI log directly; -count=1 disables Go's test cache, which
+      # would be actively wrong here (a cached PASS from a previous kernel
+      # state proves nothing about this run's kernel).
+      - name: Load, attach, and evaluate real traffic against the object
+        working-directory: internal/netbpf
+        run: |
+          set -euo pipefail
+          sudo -E env "PATH=$PATH" go test -tags=ebpf_load -v -count=1 -timeout 12m . | tee ebpf-load-test.log
+
+      # A skip here means the build tag or the environment silently didn't
+      # engage — a lane whose entire purpose is proving real-kernel behavior
+      # must fail loud on that, not report green (same #1234 reasoning
+      # incus-create.yml's own "Assert nothing was skipped" step documents).
+      - name: Assert nothing was skipped
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f internal/netbpf/ebpf-load-test.log || {
+            echo "::error::no test log — the load/attach test step never produced output"
+            exit 1
+          }
+          if grep -q -- "--- SKIP" internal/netbpf/ebpf-load-test.log; then
+            echo "::error::an ebpf_load test SKIPPED on a runner where it should have run for real"
+            grep -- "--- SKIP" internal/netbpf/ebpf-load-test.log
+            exit 1
+          fi
+          echo "No skips — the load/attach/evaluate path actually ran."
+
+      # Per-exec capture cost on the exec ring consumer (#2765 follow-up):
+      # the boot-clock stamp the watcher takes on every exec against the
+      # /proc/<pid>/stat read it replaced, which now runs once per kill.
+      # A smoke, not a gate: it fails only if the benchmark cannot run, and
+      # the numbers land in the log for the verification doc.
+      - name: Benchmark the per-exec capture cost
+        run: |
+          set -euo pipefail
+          go test -run '^$' -bench 'BenchmarkExecCapture|BenchmarkExecWatcherOnExecEvent' \
+            -benchtime 200000x -count 3 ./internal/server/ | tee exec-capture-bench.log
+          grep -q '^BenchmarkExecCapture/bootclock' exec-capture-bench.log
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          echo "--- kernel version ---"
+          uname -a
+          echo "--- ip link (detail) ---"
+          sudo ip -d link show || true
+          echo "--- ip netns list ---"
+          sudo ip netns list || true
+          echo "--- dmesg tail ---"
+          sudo dmesg | tail -80 || true
+          echo "--- bpftool prog list (if available) ---"
+          sudo bpftool prog list 2>/dev/null || echo "bpftool not installed"
