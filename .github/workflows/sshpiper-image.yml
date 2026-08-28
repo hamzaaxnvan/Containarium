@@ -1,0 +1,73 @@
+name: sshpiper image
+
+# Build-checks the containarium-sshpiper gateway image (images/sshpiper/) —
+# pinned upstream sshpiperd release + our entrypoint. Build only (no push);
+# publishing to ghcr.io/hamzaaxnvan/containarium-sshpiper happens on release
+# tags via sidecars.yml.
+on:
+  pull_request:
+    paths:
+      - 'images/sshpiper/**'
+      - '.github/workflows/sshpiper-image.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'images/sshpiper/**'
+      - '.github/workflows/sshpiper-image.yml'
+  schedule:
+    # Path filters above mean the Trivy scan only reruns when this image's own
+    # source changes — a CVE disclosed later against an unchanged base image or
+    # OS package would otherwise go undetected indefinitely. Same slot as
+    # agent-box-image.yml / security.yml's scans (Monday 06:00 UTC).
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      security-events: write   # Trivy SARIF upload
+    name: build image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Build sshpiper image
+        run: docker build -f images/sshpiper/Dockerfile -t containarium-sshpiper:ci images/sshpiper
+      - name: Smoke-check the image
+        # sshpiperd + the kubernetes plugin must be present, the entrypoint
+        # executable, and the runtime user non-root.
+        run: |
+          docker run --rm --entrypoint /bin/sh containarium-sshpiper:ci -c '
+            set -e
+            test -x /sshpiperd/sshpiperd
+            test -x /sshpiperd/plugins/kubernetes
+            test -x /sshpiperd/entrypoint.sh
+            id -u | grep -qx 1000
+          '
+
+      # Mirrors agent-box-image.yml's Trivy job — see its comments for why
+      # each flag is set (ignore-unfixed: real fixes only;
+      # limit-severities-for-sarif: without it trivy-action ignores the
+      # severity filter entirely for SARIF output).
+      - name: Run Trivy vulnerability scanner (image)
+        uses: aquasecurity/trivy-action@8f28faec26515256b6d22074d1d2a8986f4cbd87 # master
+        with:
+          image-ref: 'containarium-sshpiper:ci'
+          format: 'sarif'
+          output: 'trivy-sshpiper-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          limit-severities-for-sarif: 'true'
+          ignore-unfixed: 'true'
+          exit-code: '1'
+
+      - name: Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
+        if: always()
+        with:
+          sarif_file: trivy-sshpiper-results.sarif
