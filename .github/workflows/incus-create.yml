@@ -1,0 +1,546 @@
+name: Incus create path
+
+# Stands up the environment #1199 has been blocked on (#1332).
+#
+# #1199 — wiring the per-tenant encryption PreCreate hook into the create
+# path — was reported blocked for a sprint on "there is nowhere to run the
+# daemon's Incus-backed Create()". Nobody had tried constructing that
+# somewhere. This lane is that attempt: a plain ubuntu-latest runner with a
+# real ZFS pool and a real Incus, driving the daemon's own create path.
+#
+# It follows the precedent of zfs-encryption.yml, which cleared the same
+# shape of blocker for #1200 in a day. It is a SEPARATE workflow rather than
+# more steps on that one because the two have different costs and different
+# triggers: the ZFS lane is a pool plus `go test` and gates every encryption
+# change, while this one installs Incus and pulls a distro image, and gates
+# the create path. Merging them would make every encryption change wait on an
+# image pull.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pkg/core/box/lxc/**'
+      - 'pkg/core/container/**'
+      - 'pkg/core/incus/**'
+      # #3146: both provisioning defaults and startup can change timezones.
+      - 'pkg/core/stacks/stacks.yaml'
+      - 'internal/cmd/daemon.go'
+      - 'internal/testsupport/incusenv/**'
+      # The encrypted-create path this lane now covers (#1199).
+      - 'pkg/core/zfscrypt/**'
+      - 'pkg/core/zfskey/**'
+      # The server wiring that decides whether a container is encrypted at
+      # all (#1341). Without this the wiring lands untested by the lane that
+      # exists to test it.
+      - 'internal/server/**'
+      - 'internal/cmd/backup_verify.go'
+      - 'proto/containarium/v1/backup.proto'
+      # Whole-box backup (#2801) streams through the Incus export/import
+      # seam; the backup package is where that stream is staged and sent.
+      - 'pkg/core/backup/**'
+      - 'scripts/backup-scoped-token-e2e.sh'
+      # Caddy port-forward hairpin (#2732): real netns + iptables, no Incus.
+      - 'pkg/core/network/**'
+      - '.github/workflows/incus-create.yml'
+  # No `branches:` filter — a base filter leaves stacked PRs with no checks
+  # at all, which looks the same as checks not having started (#1215).
+  pull_request:
+    paths:
+      - 'pkg/core/box/lxc/**'
+      - 'pkg/core/container/**'
+      - 'pkg/core/incus/**'
+      # #3146: both provisioning defaults and startup can change timezones.
+      - 'pkg/core/stacks/stacks.yaml'
+      - 'internal/cmd/daemon.go'
+      - 'internal/testsupport/incusenv/**'
+      # The encrypted-create path this lane now covers (#1199).
+      - 'pkg/core/zfscrypt/**'
+      - 'pkg/core/zfskey/**'
+      # The server wiring that decides whether a container is encrypted at
+      # all (#1341). Without this the wiring lands untested by the lane that
+      # exists to test it.
+      - 'internal/server/**'
+      - 'internal/cmd/backup_verify.go'
+      - 'proto/containarium/v1/backup.proto'
+      # Whole-box backup (#2801) streams through the Incus export/import
+      # seam; the backup package is where that stream is staged and sent.
+      - 'pkg/core/backup/**'
+      - 'scripts/backup-scoped-token-e2e.sh'
+      # Caddy port-forward hairpin (#2732): real netns + iptables, no Incus.
+      - 'pkg/core/network/**'
+      - '.github/workflows/incus-create.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  incus-create:
+    name: Daemon Create() against real Incus on ZFS
+    runs-on: ubuntu-latest
+    # Generous: the create path pulls a distro image and then runs a real
+    # in-container package install, which is the work it does in production.
+    timeout-minutes: 45
+    env:
+      # Turns "no usable Incus here" from a skip into a failure — AC3. The
+      # switch itself is unit-tested in internal/testsupport/incusenv, so a
+      # lane that stopped exercising Incus cannot report green by not running.
+      CONTAINARIUM_REQUIRE_INCUS: '1'
+      # Every Go test creates from the copy pulled once above, rather than
+      # re-fetching from the public mirror on each create (#1375).
+      CONTAINARIUM_LANE_IMAGE: lane-box
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # #1614's actual root cause turned out NOT to be disk pressure — a
+      # live run of this exact step showed 86G free before, 102G after,
+      # nowhere near tight (the real cause, fixed at the "Create an
+      # encrypted container" step below, was a root-owned Go build cache).
+      # Kept anyway as ordinary hygiene: ubuntu-latest ships ~20-30G of
+      # preinstalled toolchains this lane never touches, freeing them
+      # before anything disk-heavy starts costs nothing and gives every
+      # later step more headroom.
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          echo "--- before ---"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+          echo "--- after ---"; df -h /
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-cached
+        with:
+          go-version-file: go.mod
+          cache-name: shared
+
+      - name: Install ZFS
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zfsutils-linux
+          # The module ships in linux-modules-extra on Ubuntu; usually already
+          # present on the runner image, so only fetch it if needed.
+          if ! sudo modprobe zfs 2>/dev/null; then
+            echo "zfs module not loadable yet; installing linux-modules-extra-$(uname -r)"
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe zfs
+          fi
+          zfs version
+          test -e /dev/zfs || { echo "::error::/dev/zfs absent — the module cannot be driven"; exit 1; }
+
+      # The pool is named incus-local with a `containers` dataset because that
+      # is what the daemon's OWN storage detection probes for
+      # (detectZFSContainersDataset / SelectStorageDriver). Creating the pool
+      # under any other name would make the daemon fall back to the `dir`
+      # driver, and a dir-backed lane cannot exercise per-container datasets
+      # at all — which is the thing #1199 needs.
+      - name: Create the ZFS pool the daemon detects
+        run: |
+          set -euo pipefail
+          # /mnt is the runner's large scratch disk; the image is sparse.
+          sudo truncate -s 20G /mnt/incus-zfs.img
+          sudo zpool create -f -m /mnt/incus-local incus-local /mnt/incus-zfs.img
+          sudo zfs create incus-local/containers
+          sudo zpool list
+          sudo zfs list
+
+      - name: Install Incus
+        run: |
+          set -euo pipefail
+          # dnsmasq-base is explicit because --no-install-recommends drops it,
+          # and Incus needs it to bring up incusbr0's DHCP/DNS. Without it the
+          # daemon's own EnsureNetwork fails with "Failed to check dnsmasq
+          # version: executable file not found", which is a runner-provisioning
+          # gap wearing the costume of a daemon bug.
+          sudo apt-get install -y --no-install-recommends incus dnsmasq-base
+          # Socket-activated: this both proves the client works and brings the
+          # daemon up, so the socket the test connects to exists.
+          sudo incus version
+
+      # Two runner-specific facts that would otherwise show up as a mystifying
+      # failure several minutes into the create:
+      #
+      # 1. Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor,
+      #    which is what an unprivileged Incus container needs.
+      # 2. Docker is installed and running on GitHub runners, and it sets the
+      #    iptables FORWARD policy to DROP. That silently kills incusbr0's
+      #    NAT, so the container boots with no route out and the create fails
+      #    minutes later inside `apt-get update` rather than here.
+      - name: Make the runner able to host containers
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo iptables -P FORWARD ACCEPT
+          # Incus needs a subuid/subgid range for root to map an unprivileged
+          # container into. The package normally provides it; assert rather
+          # than assume, since a missing range fails at instance start.
+          grep -q '^root:' /etc/subuid || echo 'root:1000000:1000000000' | sudo tee -a /etc/subuid
+          grep -q '^root:' /etc/subgid || echo 'root:1000000:1000000000' | sudo tee -a /etc/subgid
+
+      # Pull the box image ONCE, with retries, into the runner's local store.
+      #
+      # Every test used to fetch images:ubuntu/24.04 from
+      # images.linuxcontainers.org at run time — five or more fetches per run
+      # against a third-party mirror. When it hiccuped, every PR touching this
+      # lane failed at once with "The requested image couldn't be found",
+      # which reads as a code failure: two unrelated PRs were investigated for
+      # it in one afternoon (#1375).
+      #
+      # One fetch, retried, and a failure here names the mirror at the step
+      # that talks to it rather than surfacing inside a product test.
+      - name: Pre-pull the box image
+        run: |
+          set -euo pipefail
+          pulled=""
+          for attempt in 1 2 3 4 5; do
+            if sudo incus image copy images:ubuntu/24.04 local: --alias lane-box >/dev/null 2>&1; then
+              pulled=yes; break
+            fi
+            echo "image pull attempt $attempt failed; retrying in 15s"
+            sleep 15
+          done
+          if [ -z "$pulled" ]; then
+            echo "::error::could not pull images:ubuntu/24.04 from images.linuxcontainers.org after 5 attempts — the mirror is unavailable, not the code under test"
+            exit 1
+          fi
+          sudo incus image list
+
+      # Assert the environment before trusting any result from it. The Go
+      # helper does the same check and fails on it (CONTAINARIUM_REQUIRE_INCUS
+      # above); this step exists so an unusable runner is named at the step
+      # that set it up, which is what #1332's timebox asks for if the answer
+      # turns out to be "Incus cannot run here".
+      - name: Verify Incus is actually usable (fail, don't skip)
+        run: |
+          set -euo pipefail
+          test -S /var/lib/incus/unix.socket || {
+            echo "::error::no Incus socket at /var/lib/incus/unix.socket — the daemon did not come up"
+            sudo systemctl status incus.service --no-pager || true
+            sudo journalctl -u incus.service --no-pager -n 100 || true
+            exit 1
+          }
+          sudo incus info | head -30
+          # Asserted here rather than discovered inside EnsureNetwork, where it
+          # surfaces as a daemon error rather than a missing package.
+          command -v dnsmasq >/dev/null || {
+            echo "::error::dnsmasq is absent — Incus cannot bring up incusbr0"
+            exit 1
+          }
+          sudo zfs list incus-local/containers >/dev/null || {
+            echo "::error::incus-local/containers is absent — the daemon would select the dir driver"
+            exit 1
+          }
+          echo "Incus and ZFS are usable; the lane will not skip."
+
+      # NOT `incus launch`. The test drives box.BoxBackend.Create →
+      # container.Manager.Create → the daemon's Incus client, because the
+      # claim being made is that OUR create path runs here — that is the API
+      # #1199 has to call.
+      #
+      # Storage pool, network and default profile are set up by the test
+      # through the daemon's own InitializeInfrastructure, not by
+      # `incus admin init`, so the lane exercises the daemon's selection
+      # instead of a preseed we wrote to make it pass.
+      #
+      # The package list is explicit rather than ./... — this lane owns the
+      # packages whose behaviour only a real Incus can settle, and a wildcard
+      # would drag in every unit test for no benefit. Add a package here when
+      # it grows an incus-tagged test, or the test silently never runs and the
+      # lane goes green without it (#1338 shipped that way for one commit).
+      - name: Create a container through the daemon's own Create()
+        run: |
+          set -euo pipefail
+          sudo -E env "PATH=$PATH" go test -tags=incus -v -count=1 -timeout 40m \
+            ./pkg/core/box/lxc/ ./pkg/core/incus/ ./internal/server/ ./pkg/core/network/ \
+            -run 'TestIntegrationIncus|TestIntegrationHairpin' | tee incus-test.log
+
+      # #1368 — the daemon BINARY, with its flags.
+      #
+      # Everything above drives Go packages. That is why #1342
+      # (--zfs-keys-dir) had to be labelled needs-verification and shipped in
+      # v0.66.0 unverified: flag -> KeyProvider -> encrypted create only
+      # assembles on a running daemon, and nothing in CI assembled one.
+      #
+      # Reached over the REST surface with a JWT rather than gRPC+mTLS: the
+      # CLI looks for a client certificate bundle against a gRPC address even
+      # when the daemon has mTLS off, and generating a CA here would test the
+      # certificate tooling rather than the encrypted-create path.
+      #
+      # Asserted against the HOST's ZFS state, never the daemon's report of
+      # itself — a daemon claiming success is the thing under test.
+      - name: Create an encrypted container through the daemon and its flags
+        env:
+          JWT_SECRET: lane-only-secret-not-a-credential
+        run: |
+          set -euo pipefail
+          # #1614, root-caused: this build used to run as the plain runner
+          # user, right after the PRIOR step's `sudo -E env "PATH=$PATH" go
+          # test` — which runs AS ROOT but with $HOME still pointing at
+          # /home/runner (that's what -E preserves), so it writes fresh
+          # build-cache entries into /home/runner/.cache/go-build OWNED BY
+          # ROOT. This build then couldn't read its own cache: "open
+          # .../go-build/...: permission denied" was the actual error,
+          # buried under a wall of "package X is not in std" — Go's import
+          # resolution reports an unreadable cache entry that way, which is
+          # what made three prior runs look like random toolchain
+          # corruption instead of a deterministic ownership mismatch.
+          # Matching the prior step's privilege level (sudo -E, same
+          # preserved $PATH/$HOME) makes both go invocations share the
+          # cache under the SAME effective owner.
+          # #1773: cmd/containarium is client-only now; the full daemon is
+          # cmd/containariumd, untagged, unchanged.
+          sudo -E env "PATH=$PATH" go build -o /tmp/containarium ./cmd/containariumd
+          sudo mkdir -p /etc/containarium/keys
+
+          # --standalone skips the core LXCs (Postgres, Caddy). With no
+          # Postgres reachable the daemon waits ~2 minutes and proceeds with
+          # those services disabled; none are on the encrypted-create path.
+          sudo /tmp/containarium daemon --standalone --rest \
+            --jwt-secret "$JWT_SECRET" \
+            --zfs-keys-dir=/etc/containarium/keys \
+            > /tmp/daemon.log 2>&1 &
+
+          TOKEN=$(/tmp/containarium token generate --username admin --roles admin \
+                    --expiry 24h --secret "$JWT_SECRET" | tr -d " \t" | grep -E "^ey" | head -1)
+          test -n "$TOKEN" || { echo "::error::could not mint a token"; exit 1; }
+          export CONTAINARIUM_TOKEN="$TOKEN"
+          # CONTAINARIUM_HTTP is what actually selects the REST surface. An
+          # http:// address alone does not: the CLI dispatches on this flag,
+          # so without it every call goes down the gRPC path and asks for a
+          # client certificate bundle that does not exist here.
+          export CONTAINARIUM_HTTP=true
+          SERVER="http://localhost:8080"
+
+          # Readiness: the daemon answers a real RPC. Both the daemon's log
+          # and the CLIENT's error are printed on failure — the first attempt
+          # at this printed only the daemon's, which said it was serving,
+          # turning "the client cannot authenticate" into "the daemon is
+          # broken". Those lead to opposite investigations.
+          ready=""
+          for _ in $(seq 1 60); do
+            if /tmp/containarium --server "$SERVER" list >/tmp/probe.log 2>&1; then
+              ready=yes; break
+            fi
+            sleep 5
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::the daemon never answered the CLI"
+            echo "--- last CLI probe ---"; cat /tmp/probe.log || true
+            echo "--- daemon log tail ---"; tail -40 /tmp/daemon.log
+            exit 1
+          fi
+          grep -E "\[encryption\]" /tmp/daemon.log || true
+
+          TENANT="lane$$"
+          /tmp/containarium --server "$SERVER" create "$TENANT" \
+            --no-ssh-key --podman=false --disk 5GB --encrypted --image lane-box
+
+          # The claim, checked on the host: the instance sits under the
+          # TENANT's encryptionroot, not the pool default.
+          DS=$(sudo zfs list -H -o name -r | grep "/containers/${TENANT}-container$" | head -1)
+          test -n "$DS" || { echo "::error::no dataset for ${TENANT}-container"; sudo zfs list -r; exit 1; }
+          ROOT=$(sudo zfs get -H -o value encryptionroot "$DS")
+          echo "instance $DS has encryptionroot $ROOT"
+          case "$ROOT" in
+            */tenants/"$TENANT") ;;
+            *) echo "::error::encryptionroot is $ROOT — the container is not under its tenant's key"; exit 1 ;;
+          esac
+
+          # #3146: provisioning sets the default, but restarting the daemon
+          # must preserve a timezone the tenant subsequently selects.
+          INSTANCE="${TENANT}-container"
+          timezone=$(sudo incus exec "$INSTANCE" -- timedatectl show --property=Timezone --value)
+          test "$timezone" = "Asia/Taipei" || {
+            echo "::error::new container timezone is $timezone, expected Asia/Taipei"; exit 1; }
+          sudo incus exec "$INSTANCE" -- timedatectl set-timezone Europe/Paris
+
+          sudo pkill -TERM -f '^/tmp/containarium daemon'
+          for _ in $(seq 1 30); do
+            if ! pgrep -f '^/tmp/containarium daemon' >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if pgrep -f '^/tmp/containarium daemon' >/dev/null; then
+            echo "::error::daemon did not exit before the timezone restart check"
+            exit 1
+          fi
+          sudo /tmp/containarium daemon --standalone --rest \
+            --jwt-secret "$JWT_SECRET" \
+            --zfs-keys-dir=/etc/containarium/keys \
+            > /tmp/daemon-timezone-restart.log 2>&1 &
+
+          ready=""
+          for _ in $(seq 1 60); do
+            if /tmp/containarium --server "$SERVER" list >/tmp/timezone-probe.log 2>&1; then
+              ready=yes; break
+            fi
+            sleep 5
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::restarted daemon never answered the CLI"
+            cat /tmp/timezone-probe.log
+            tail -40 /tmp/daemon-timezone-restart.log
+            exit 1
+          fi
+          # The old replay runs in a goroutine: watch beyond readiness so
+          # a late overwrite also fails instead of passing a single probe.
+          for _ in $(seq 1 10); do
+            timezone=$(sudo incus exec "$INSTANCE" -- timedatectl show --property=Timezone --value)
+            if [ "$timezone" != "Europe/Paris" ]; then
+              echo "::error::daemon restart changed the tenant timezone to $timezone"
+              tail -40 /tmp/daemon-timezone-restart.log
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "timezone preserved across daemon restart: $timezone"
+
+          # And a stopped container is ciphertext: the key unloads.
+          #
+          # `sleep` is the container-level stop; `stop` is `app stop`, for an
+          # app inside a box. Getting that wrong left the container running
+          # and the assertion below correctly reported the key as still
+          # loaded — a real-looking encryption failure caused by the wrong
+          # verb.
+          /tmp/containarium --server "$SERVER" sleep "$TENANT"
+          sleep 10
+          STATUS=$(sudo zfs get -H -o value keystatus "$ROOT")
+          echo "keystatus after stop: $STATUS"
+          test "$STATUS" = "unavailable" || {
+            echo "::error::the tenant key is still $STATUS after its last container stopped — a stopped container is NOT ciphertext at rest"; exit 1; }
+
+          /tmp/containarium --server "$SERVER" delete "$TENANT" --force || true
+          sudo pkill -f "containarium daemon" || true
+          sleep 3
+
+      # The closed default is the promise every OSS daemon ships with, so it
+      # gets an assertion rather than trust: without the flag, the same create
+      # must be refused, and refused for the documented reason.
+      - name: Without --zfs-keys-dir the same create is refused
+        env:
+          JWT_SECRET: lane-only-secret-not-a-credential
+        run: |
+          set -euo pipefail
+          sudo /tmp/containarium daemon --standalone --rest \
+            --jwt-secret "$JWT_SECRET" > /tmp/daemon-nokeys.log 2>&1 &
+
+          TOKEN=$(/tmp/containarium token generate --username admin --roles admin \
+                    --expiry 24h --secret "$JWT_SECRET" | tr -d " \t" | grep -E "^ey" | head -1)
+          export CONTAINARIUM_TOKEN="$TOKEN"
+          # CONTAINARIUM_HTTP is what actually selects the REST surface. An
+          # http:// address alone does not: the CLI dispatches on this flag,
+          # so without it every call goes down the gRPC path and asks for a
+          # client certificate bundle that does not exist here.
+          export CONTAINARIUM_HTTP=true
+          SERVER="http://localhost:8080"
+
+          ready=""
+          for _ in $(seq 1 60); do
+            if /tmp/containarium --server "$SERVER" list >/tmp/probe2.log 2>&1; then
+              ready=yes; break
+            fi
+            sleep 5
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::the daemon never answered the CLI"
+            echo "--- last CLI probe ---"; cat /tmp/probe2.log || true
+            tail -40 /tmp/daemon-nokeys.log; exit 1
+          fi
+
+          if /tmp/containarium --server "$SERVER" create "nokeys$$" \
+               --no-ssh-key --podman=false --disk 5GB --encrypted --image lane-box > /tmp/refusal.log 2>&1; then
+            echo "::error::an encrypted create SUCCEEDED on a daemon with no key custody — the closed default regressed"
+            exit 1
+          fi
+          grep -qi "keyprovider" /tmp/refusal.log || {
+            echo "::error::refused, but not for the documented reason:"; cat /tmp/refusal.log; exit 1; }
+          echo "closed default holds: $(head -3 /tmp/refusal.log)"
+          sudo pkill -f "containarium daemon" || true
+
+      - name: Backup verifier scope allows verify and refuses legacy write against the real daemon
+        env:
+          JWT_SECRET: backup-verifier-lane-only-secret-not-a-credential
+        run: |
+          set -euo pipefail
+          ADMIN_TOKEN=$(/tmp/containarium token generate --username admin --roles admin \
+            --expiry 24h --secret "$JWT_SECRET" --raw)
+          backup_dir=$(mktemp -d)
+          # pkill in the preceding step sends a signal; wait for shutdown
+          # before another daemon can bind the same ports.
+          for _ in $(seq 1 30); do
+            if ! pgrep -f '^/tmp/containarium daemon' >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if pgrep -f '^/tmp/containarium daemon' >/dev/null; then
+            echo "::error::previous daemon did not exit within 30 seconds"
+            exit 1
+          fi
+          sudo env CONTAINARIUM_BACKUP_DIR="$backup_dir" \
+            CONTAINARIUM_BACKUP_VERIFY_IMAGE=lane-box \
+            /tmp/containarium daemon --standalone --rest --jwt-secret "$JWT_SECRET" \
+            > /tmp/backup-scoped-daemon.log 2>&1 &
+          daemon_pid=$!
+          cleanup() {
+            sudo kill "$daemon_pid" || true
+            sudo rm -rf "$backup_dir"
+          }
+          trap cleanup EXIT
+          ready=""
+          for _ in $(seq 1 60); do
+            if curl --fail -sS -H "Authorization: Bearer $ADMIN_TOKEN" \
+              http://localhost:8080/v1/backups >/dev/null 2>&1; then
+              ready=yes; break
+            fi
+            sleep 5
+          done
+          if [ -z "$ready" ]; then
+            cat /tmp/backup-scoped-daemon.log
+            exit 1
+          fi
+          sudo env "PATH=$PATH" JWT_SECRET="$JWT_SECRET" ADMIN_TOKEN="$ADMIN_TOKEN" \
+            CI="${CI:-}" \
+            CONTAINARIUM_LANE_IMAGE=lane-box \
+            bash scripts/backup-scoped-token-e2e.sh || {
+              cat /tmp/backup-scoped-daemon.log; exit 1;
+            }
+
+      # A skip here means the environment check above passed and the test
+      # decided otherwise — a contradiction worth failing on rather than
+      # quietly reporting green (#1234).
+      - name: Assert nothing was skipped
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f incus-test.log || { echo "::error::no test log — the test step never produced output"; exit 1; }
+          if grep -q -- "--- SKIP" incus-test.log; then
+            echo "::error::An Incus integration test SKIPPED on a runner where Incus is available."
+            grep -- "--- SKIP" incus-test.log
+            exit 1
+          fi
+          echo "No skips — the create path actually ran."
+
+      # #1332 is timeboxed with a defined failure mode: if Incus cannot run in
+      # a GitHub-hosted runner, the issue closes with the SPECIFIC failure
+      # recorded. Collect it here so that outcome arrives as evidence rather
+      # than as "it went red".
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          sudo incus list --format compact || true
+          # The instance name embeds the test binary's PID, so ask Incus which
+          # instances exist rather than trying to reconstruct it.
+          for i in $(sudo incus list --format csv -c n || true); do
+            echo "--- incus info --show-log $i ---"
+            sudo incus info --show-log "$i" || true
+          done
+          sudo journalctl -u incus.service --no-pager -n 200 || true
+          sudo zfs list -r -t all || true
+          sudo dmesg | tail -50 || true
