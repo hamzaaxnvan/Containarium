@@ -1,0 +1,208 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: [main]
+  # No `branches:` filter — a base filter leaves stacked PRs with no checks
+  # at all, which looks the same as checks not having started (#1215). That
+  # matters most here: gosec, govulncheck and Trivy are the checks least
+  # likely to be missed by eye when they are silently absent.
+  pull_request:
+  schedule:
+    # Run weekly on Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  # Release-PR fast path (.github/actions/release-only-diff): on a diff that
+  # only cuts a release on top of a main commit that already passed this
+  # workflow, the heavy jobs below skip. Any doubt runs them.
+  changes:
+    name: Release-only diff?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      release-only: ${{ steps.diff.outputs.release-only }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+
+      - name: Decide
+        id: diff
+        uses: ./.github/actions/release-only-diff
+
+  gosec:
+    name: SAST (gosec)
+    # Never skipped, unlike the other fast-path jobs: the required `gosec`
+    # check is created by the SARIF upload below, so a skipped job would leave
+    # it missing and block the merge. On a release-only diff the job uploads
+    # the base commit's stored analysis instead of rescanning: the code is
+    # identical, so it is the same result, in seconds rather than ~5 minutes.
+    # !cancelled() keeps it running when the detector job fails.
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # SARIF upload
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+
+      - name: Reuse the base commit's gosec analysis (release-only diff)
+        id: reuse
+        if: needs.changes.outputs.release-only == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Falls through to a real scan on any failure (reused=false).
+        run: |
+          set -uo pipefail
+          base="$(git rev-parse HEAD^1)"
+          id="$(gh api "repos/${GITHUB_REPOSITORY}/code-scanning/analyses?ref=refs/heads/main&per_page=100" \
+            --jq "[.[] | select(.commit_sha == \"${base}\" and .category == \".github/workflows/security.yml:gosec\")][0].id // empty")"
+          if [ -n "$id" ] && gh api -H "Accept: application/sarif+json" \
+               "repos/${GITHUB_REPOSITORY}/code-scanning/analyses/${id}" >gosec-results.sarif \
+             && jq -e '.runs | length > 0' gosec-results.sarif >/dev/null; then
+            echo "reused analysis ${id} of base ${base}"
+            echo "reused=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::warning::no reusable gosec analysis for base ${base}; scanning instead"
+            rm -f gosec-results.sarif
+            echo "reused=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Run gosec
+        if: steps.reuse.outputs.reused != 'true'
+        uses: securego/gosec@14ef84f6feccf40be7f5092fd2db119bf3f5f836 # master
+        with:
+          # -exclude-generated: generated protobuf/grpc-gateway stubs
+          # (pkg/pb/**) are never hand-edited (CLAUDE.md) and carry ~130
+          # pre-existing gosec findings (G103 unsafe.Slice in reflection
+          # code, G101 false-positive "hardcoded credential" hits on any
+          # *Token*_FullMethodName constant) that are permanently
+          # unactionable there. Without this flag, a PR that merely adds a
+          # new RPC can shift const-block gofmt alignment enough for
+          # GitHub's code-scanning diff view to treat pre-existing lines as
+          # "new to this PR" and fail the gosec required check on
+          # unrelated, unfixable findings — as happened on PR #1691.
+          args: '-no-fail -exclude-generated -fmt sarif -out gosec-results.sarif ./...'
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
+        if: always()
+        with:
+          sarif_file: gosec-results.sarif
+
+  govulncheck:
+    name: Vulnerability Check (govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-cached
+        with:
+          go-version: '1.26.10'
+          cache-name: shared
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+
+      - name: Run govulncheck
+        run: |
+          # govulncheck's exit codes are documented: 0 = no vulnerabilities,
+          # 3 = vulnerabilities found, anything else = the scan did not
+          # complete. `|| true` swallowed all three alike — and since every
+          # check below is a grep over the report, a scan that never ran left
+          # an empty file, matched nothing, and printed "govulncheck passed".
+          #
+          # That is a gate which is green precisely when the scanner is
+          # broken. Exit code 3 is still tolerated, because unfixable upstream
+          # findings are the normal state here; a tool that failed to run is
+          # not, and is now told apart from a tool that ran and found things.
+          set -o pipefail
+          rc=0
+          govulncheck -show verbose ./... 2>&1 | tee govulncheck-output.txt || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+            echo "::error::govulncheck did not complete (exit $rc). A scan that did not run is not a clean scan."
+            exit 1
+          fi
+          if [ ! -s govulncheck-output.txt ]; then
+            echo "::error::govulncheck produced no output. An empty report is not a clean report."
+            exit 1
+          fi
+
+          # Fail only on vulnerabilities that have a fix we have not applied.
+          # One condition, not two: the previous first check ("there are
+          # findings and NONE is N/A") is a strict subset of this one ("at
+          # least one finding is not N/A"), so it never fired on its own and
+          # only made the authoritative rule harder to identify.
+          if grep "Fixed in:" govulncheck-output.txt | grep -qv "N/A"; then
+            echo "::error::govulncheck found vulnerabilities with available fixes"
+            exit 1
+          fi
+          echo "govulncheck passed (the scan ran; any remaining vulns have no upstream fix)"
+
+  makefile-var-safety:
+    name: Makefile variable injection (#1732)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run test-makefile-var-safety.sh
+        run: ./scripts/test-makefile-var-safety.sh
+
+  sentinel-hostkey-persistence:
+    name: Sentinel admin sshd host key persistence (#1596)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run test-sentinel-hostkey-persistence.sh
+        run: ./scripts/test-sentinel-hostkey-persistence.sh
+
+  deploy-binary-rollback:
+    name: deploy-binary.sh keeps .old and rolls back (#3060)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run test-deploy-binary-rollback.sh
+        run: ./scripts/test-deploy-binary-rollback.sh
+
+  trivy:
+    name: Dependency Scan (Trivy)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # SARIF upload
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@8f28faec26515256b6d22074d1d2a8986f4cbd87 # master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy SARIF results
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif

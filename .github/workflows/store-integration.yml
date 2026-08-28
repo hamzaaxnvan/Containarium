@@ -1,0 +1,178 @@
+name: Store integration (Postgres)
+
+# The Postgres store implementations had no executable test coverage (#1300):
+# every green test exercised the in-memory impl, which is the half that cannot
+# fail for the reasons the Postgres half exists. The two dedicated store tests
+# in the tree skip unconditionally and defer to "integration tests run
+# separately" — which ran nowhere.
+#
+# This is that lane. It stands up a real Postgres, runs the shared behavioural
+# suite against both implementations, and covers the properties only a database
+# can show: row-locked lease claims, sequence-backed lease tokens surviving a
+# reconnect, and a stranded-run sweep that has to update both the state column
+# and the state inside the marshalled proto.
+
+on:
+  pull_request:
+    # No `branches:` filter — a PR targeting anything but main would otherwise
+    # run none of this and show no checks at all, which reads exactly like
+    # checks that have not started (#1215).
+    paths:
+      - 'internal/testsupport/postgres/**'
+      - 'internal/server/**'
+      - 'internal/cluster/**'
+      - 'internal/audit/**'
+      - 'internal/auth/**'
+      - 'internal/secrets/**'
+      - 'internal/app/**'
+      - 'internal/alert/**'
+      - 'pkg/core/network/**'
+      - 'internal/autosleep/**'
+      - 'internal/pentest/**'
+      - 'internal/security/**'
+      - 'internal/traffic/**'
+      - 'internal/zap/**'
+      - 'internal/threatdetect/**'
+      - 'internal/tracker/**'
+      - 'internal/guardrailpolicy/**'
+      - 'internal/retention/**'
+      - 'internal/proofpack/**'
+      - 'internal/cmd/**'
+      - 'internal/sentinel/**'
+      - 'internal/client/**'
+      - 'internal/sshauthz/**'
+      - 'proto/containarium/v1/audit.proto'
+      - '.github/workflows/store-integration.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'internal/testsupport/postgres/**'
+      - 'internal/server/**'
+      - 'internal/cluster/**'
+      - 'internal/audit/**'
+      - 'internal/auth/**'
+      - 'internal/secrets/**'
+      - 'internal/app/**'
+      - 'internal/alert/**'
+      - 'pkg/core/network/**'
+      - 'internal/autosleep/**'
+      - 'internal/pentest/**'
+      - 'internal/security/**'
+      - 'internal/traffic/**'
+      - 'internal/zap/**'
+      - 'internal/threatdetect/**'
+      - 'internal/tracker/**'
+      - 'internal/guardrailpolicy/**'
+      - 'internal/retention/**'
+      - 'internal/proofpack/**'
+      - 'internal/cmd/**'
+      - 'internal/sentinel/**'
+      - 'internal/client/**'
+      - 'internal/sshauthz/**'
+      - 'proto/containarium/v1/audit.proto'
+      - '.github/workflows/store-integration.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  postgres:
+    name: stores against a real Postgres
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: containarium
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: containarium
+        ports:
+          - 5432:5432
+        # Without this the job races the database's startup and fails on
+        # connect rather than on anything it is testing.
+        options: >-
+          --health-cmd "pg_isready -U containarium"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-cached
+        with:
+          go-version: '1.26.10'
+          cache-name: shared
+
+      - name: Run the store integration suite
+        env:
+          CONTAINARIUM_TEST_DSN: postgres://containarium:test@127.0.0.1:5432/containarium?sslmode=disable&application_name=containarium-test
+        run: |
+          # pipefail, or `go test | tee` reports tee's exit status and a red
+          # suite passes the step. This lane ran without it, and PIPESTATUS
+          # was only consulted after the SECOND invocation — so a failure in
+          # the group below was silently discarded. Found while adding
+          # pkg/core/network (#1300); see the PR for the reproduction.
+          set -o pipefail
+
+          go test -tags=integration -count=1 -timeout 10m -v \
+            ./internal/server/ ./internal/cluster/ ./internal/auth/ \
+            ./internal/alert/ ./internal/collaborator/ ./internal/sshauthz/ ./internal/guardrailpolicy/... ./internal/retention/... 2>&1 | tee integration.log
+
+          # Each package process uses its own schema, including independent
+          # concurrent runs of the same package (#2749).
+          go test -tags=integration -count=1 -timeout 5m -v \
+            ./internal/testsupport/postgres/ ./internal/audit/ ./internal/threatdetect/ ./internal/proofpack/ 2>&1 | tee -a integration.log
+
+          # The sentinel SSH session shipper's end-to-end test (#2415) drives the
+          # real shipper -> REST gateway -> gRPC AuditService -> hash chain ->
+          # `containarium audit verify` path. -run keeps this
+          # invocation to the tests that need the database (the rest of
+          # internal/cmd is covered by the ordinary unit lane).
+          go test -tags=integration -count=1 -timeout 5m -v ./internal/cmd/ \
+            -run 'TestE2E_(SSHSessionShip|Tampering|GRPCAndREST|IngestRequires|OrphanClose)' 2>&1 | tee -a integration.log
+
+          # internal/secrets and internal/app carry their Postgres tests
+          # without a build tag, gated on the DSN. Run them here too — they
+          # skipped unconditionally until now, deferring to "integration tests
+          # run separately", which meant nowhere.
+          go test -count=1 -timeout 5m -v \
+            ./internal/secrets/ ./internal/app/ ./pkg/core/network/ \
+            ./internal/autosleep/ ./internal/pentest/ ./internal/security/ ./internal/traffic/ ./internal/zap/ \
+            ./internal/tracker/ 2>&1 | tee -a integration.log
+
+          # A skipped test here is indistinguishable from a passing one, and
+          # this lane exists because that ambiguity hid the gap for so long.
+          # The suite fails rather than skips when the DSN is missing, so a
+          # SKIP means something else went quiet — treat it as a failure.
+          #
+          # Intentional opt-in tests are the only exemption: they skip by design
+          # unless an env var is set (they need a fixture this lane does not
+          # provide). List one by its EXACT test name, space-separated, with the
+          # reason. Matching is on the whole name, so a subtest
+          # (TestName/sub) or a similarly named test is NOT exempt, and every
+          # other `--- SKIP` still fails the job.
+          #   TestCredentialDockerEndToEnd - needs an isolated Docker fixture
+          #     (CONTAINARIUM_CREDENTIAL_DOCKER_E2E=1), see #2847.
+          OPT_IN_SKIPS="TestCredentialDockerEndToEnd"
+          unexpected_skips=$(awk -v allow="$OPT_IN_SKIPS" '
+            BEGIN { n = split(allow, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1 }
+            $1 == "---" && $2 == "SKIP:" && !($3 in ok) { print }
+          ' integration.log)
+          if [ -n "$unexpected_skips" ]; then
+            echo "::error::A store integration test skipped while the database was up."
+            echo "$unexpected_skips"
+            exit 1
+          fi
+
+          # And a run that matched nothing would also be green. Require that
+          # the suite actually executed.
+          for want in TestLogBatch_ReplayIsNoOp TestLogBatch_FailureCommitsNothing TestDedupeKey_MigrationOnExistingRows TestE2E_SSHSessionShipVerifyAndRerun TestE2E_TamperingWithAShippedRowIsDetected TestE2E_GRPCAndRESTProduceIdenticalRows TestE2E_IngestRequiresTheExplicitScope TestE2E_OrphanCloseThenLateGenuineClose TestAgentTaskQueue_ConcurrentLeasesAreDistinct TestAuditChain_ConcurrentAppendersDoNotFork TestQuery_ByRunID_ReturnsBothLeaseRows TestBootstrap_CreatesRunIDIndex TestSecretsStore_Roundtrip TestGet_BrokerRow_ReturnsErrBrokerOnly TestBrokerCredential_ReturnsValue_OnlyForBrokerRows TestSet_BrokerToDeliveringMode_Rejected TestLoadAllForUserWithDelivery_ExcludesBrokerRows TestRewrapTenant_IncludesBrokerRows TestGetSecretRPC_BrokerRow_EmptyValueEvenWithSecretsRead TestSetSecretRPC_BrokerToDeliveringMode_Rejected TestStoreOperations TestRevocationStore_RevokedTokenReadsAsRevoked TestOwnerRevocationStore_CutoffContract TestOwnerRevocationStore_CutoffSurvivesRestart TestOwnerRevocationStore_LookupErrorIsReported TestDeleteTenantProviderKey_PostgresBacked_RevokesAndSurvivesRestart TestCollaboratorStore_ListingIsScopedToTheSubject TestRouteStore_SaveIsAnUpsertByDomain TestAlertStore_RuleRoundTrips TestCredentialStateStore_RoundTripsAndUpserts TestCredentialWatcher_PostgresRestartDoesNotRefire TestPassthroughStore_PortAndProtocolAreDistinctRoutes TestDaemonConfigStore_SetAllRollsBackAPartialBatch TestIntegrationIdle_OpenConnectionReportsActivityAsOfNow TestPentestStore_ConcurrentClaimsGetDistinctJobs TestSecurityStore_FailedJobRetriesThenGivesUp TestTrafficStore_SavedConnectionIsQueryableWithItsCounters TestTrafficStore_AggregatesGroupedByDestIPAreReadable TestZapStore_MarkResolvedClosesOnlyWhatThisScanDidNotSee TestZapStore_RiskCountsAreCaseInsensitive TestClusterStore_ContractHoldsForBothImpls TestFindingStore_InsertRidesTheAuditChain TestFindingStore_InsertEmitsSecurityFindingEvent TestFindingStore_PersistsAcrossRestart TestFindingStore_AuditFailureLeavesNoOrphanFinding TestFindingStores_KillFactsAgreeOnEveryWriteSequence TestTrackerStore_CRUDRoundTrip TestGet_OtherTenantsConnection_NotFound TestTrackerStore_UnknownProviderString_RejectedByCheckConstraint TestSet_UnspecifiedProvider_Rejected TestSetCredentialExpiry TestSetTrackerConnection_DescribeCredentialBestEffort_PopulatesExpiry TestSetTrackerConnection_DescribeCredentialFailure_StillSucceeds TestSetTrackerConnection_AuditsCreateUpdateAndDelete TestGetTrackerStatus_Success TestGetTrackerStatus_CredentialInvalid TestGetTrackerStatus_Unreachable TestGetTrackerIssue_NoSuchConnection TestGetTrackerIssue_Success TestGetTrackerIssue_NotFoundOnTracker TestListTrackerIssues_PassesFilterThrough TestGetTrackerChange_Success TestGetTrackerIssue_UpstreamUnreachable TestCommentOnTrackerIssue_RejectsEmptyBody TestCommentOnTrackerIssue_StampsSanitizesAndAudits TestCommentOnTrackerIssue_OperatorIdentity_NoRunID TestClaimTrackerIssue_NoClaimLocksConfigured TestClaimTrackerIssue_HappyPath TestClaimTrackerIssue_AlreadyClaimedByForeignRun TestSetTrackerIssueLabels_RejectsEmptyRequest TestSetTrackerIssueLabels_HappyPath TestResolveConnection_RunTokenUsesClaim_RejectsMismatch TestResolveConnection_OperatorTokenMayName TestSubmitTrackerChange_RejectsMissingIssue TestSubmitTrackerChange_RejectsMissingTitle TestSubmitTrackerChange_CrossTenantDenied TestSubmitTrackerChange_RequiresRunScopedToken TestSubmitTrackerChange_NoRunRegistryConfigured TestSubmitTrackerChange_RunNotFound TestSubmitTrackerChange_RunHasNoGitSource TestSubmitTrackerChange_NoContainerManagerConfigured TestSubmitTrackerChange_HostGitMissingOrTooOld TestSubmitTrackerChange_BundleTooLarge TestSubmitTrackerChange_PushFails TestSubmitTrackerChange_OpenChangeFails TestSubmitTrackerChange_HappyPath TestSubmitTrackerChange_EmptyGitRefResolvesProviderDefaultBranch TestSubmitTrackerChange_DefaultBranchResolutionFails TestGetTrackerStatus_ReportsHostGitEvenWhenConnectionUnhealthy TestGuardrailPolicyPGStore_Contract TestGuardrailPolicyPGStore_RevisionSurvivesRestart TestGuardrailPolicyPGStore_ConcurrentSetsGetDistinctRevisions TestGuardrailPolicyPGStore_ReadErrorIsNotNotConfigured TestGuardrailPolicyPGStore_CorruptStoredPolicyIsAnError TestGuardrailPolicyPGStore_MissingRowIsAnError TestGuardrailPolicyPGStore_BaselineModeSurvivesRestart TestGuardrailPolicyPGStore_ConcurrentBaselineModeSetsGetDistinctRevisions TestCodingToolEgressPolicyStore_PostgresContract TestCodingToolEgressPolicyStore_PostgresSurvivesRestart; do
+            if ! grep -q -- "--- PASS: $want" integration.log; then
+              echo "::error::$want did not run — renamed, retagged, or filtered out."
+              exit 1
+            fi
+          done
