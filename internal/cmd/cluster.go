@@ -324,3 +324,167 @@ func runClusterList(cmd *cobra.Command, args []string) error {
 	}
 	defer func() { _ = c.Close() }()
 	resp, err := c.ListClusters(clusterOwner)
+	if err != nil {
+		return err
+	}
+	if len(resp.Clusters) == 0 {
+		fmt.Println("No clusters.")
+		return nil
+	}
+	return writeClusterList(os.Stdout, resp.Clusters)
+}
+
+// writeClusterList renders the `cluster list` table. ISOLATION is a
+// first-class column, not a detail behind `cluster get`: an auditor
+// scanning the fleet needs the weak-boundary clusters to stand out in
+// the list itself.
+func writeClusterList(out io.Writer, clusters []*pb.Cluster) error {
+	w := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tOWNER\tSTATE\tISOLATION\tGROUPS\tAPI ENDPOINT")
+	for _, cl := range clusters {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
+			cl.Name, cl.Owner, clusterStateString(cl.State), nodeIsolationString(cl.NodeIsolation),
+			len(cl.NodeGroups), cl.ApiEndpoint)
+	}
+	return w.Flush()
+}
+
+func runClusterGet(cmd *cobra.Command, args []string) error {
+	c, err := newClusterClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	resp, err := c.GetCluster(args[0], clusterOwner)
+	if err != nil {
+		return err
+	}
+	printCluster(resp.Cluster)
+	return nil
+}
+
+func runClusterDelete(cmd *cobra.Command, args []string) error {
+	c, err := newClusterClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	resp, err := c.DeleteCluster(args[0], clusterOwner)
+	if err != nil {
+		return err
+	}
+	fmt.Println(resp.Message)
+	return nil
+}
+
+func runClusterKubeconfig(cmd *cobra.Command, args []string) error {
+	c, err := newClusterClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	resp, err := c.GetClusterKubeconfig(args[0], clusterOwner)
+	if err != nil {
+		return err
+	}
+	// Bare kubeconfig on stdout so `> demo.kubeconfig` and
+	// `KUBECONFIG=<(...)` both work; the notice goes to stderr.
+	fmt.Print(resp.Kubeconfig)
+	fmt.Fprintln(os.Stderr, "kubeconfig fetched; treat it as a credential")
+	return nil
+}
+
+func runClusterNodePool(cmd *cobra.Command, args []string) error {
+	if len(clusterGroups) == 0 {
+		return fmt.Errorf("at least one --group is required (the set you pass replaces the current set)")
+	}
+	groups := make([]*pb.NodeGroup, 0, len(clusterGroups))
+	for _, spec := range clusterGroups {
+		g, err := parseNodeGroup(spec)
+		if err != nil {
+			return err
+		}
+		groups = append(groups, g)
+	}
+	c, err := newClusterClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	resp, err := c.UpdateClusterNodePool(&pb.UpdateClusterNodePoolRequest{
+		Name: args[0], Owner: clusterOwner, NodeGroups: groups,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Println(resp.Message)
+	printCluster(resp.Cluster)
+	return nil
+}
+
+func clusterNodeStateString(s pb.ClusterNodeState) string {
+	switch s {
+	case pb.ClusterNodeState_CLUSTER_NODE_STATE_PROVISIONING:
+		return "provisioning"
+	case pb.ClusterNodeState_CLUSTER_NODE_STATE_READY:
+		return "ready"
+	case pb.ClusterNodeState_CLUSTER_NODE_STATE_DRAINING:
+		return "draining"
+	default:
+		return "unknown"
+	}
+}
+
+func scaleEventKindString(k pb.ScaleEventKind) string {
+	switch k {
+	case pb.ScaleEventKind_SCALE_EVENT_KIND_SCALE_UP:
+		return "scale-up"
+	case pb.ScaleEventKind_SCALE_EVENT_KIND_SCALE_DOWN:
+		return "scale-down"
+	case pb.ScaleEventKind_SCALE_EVENT_KIND_REFUSED:
+		return "REFUSED"
+	case pb.ScaleEventKind_SCALE_EVENT_KIND_NODE_REPLACED:
+		return "node-replaced"
+	default:
+		return "unknown"
+	}
+}
+
+func runClusterStatus(cmd *cobra.Command, args []string) error {
+	c, err := newClusterClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	st, err := c.GetClusterStatus(args[0], clusterOwner, clusterEventsLimit)
+	if err != nil {
+		return err
+	}
+	printCluster(st.Cluster)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "\nGROUP\tSIZE\tNODES\tBOUNDS")
+	for _, g := range st.Groups {
+		fmt.Fprintf(w, "%s\tcpu=%s mem=%s disk=%s\t%d\t%d..%d\n",
+			g.Group.Name, g.Group.Size.Cpu, g.Group.Size.Memory, g.Group.Size.Disk,
+			g.CurrentNodes, g.Group.MinNodes, g.Group.MaxNodes)
+	}
+	if len(st.Nodes) > 0 {
+		fmt.Fprintln(w, "\nNODE\tROLE\tGROUP\tSTATE")
+		for _, n := range st.Nodes {
+			role := "worker"
+			if n.Role == pb.ClusterNodeRole_CLUSTER_NODE_ROLE_CONTROL_PLANE {
+				role = "control-plane"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", n.VmName, role, n.NodeGroup, clusterNodeStateString(n.State))
+		}
+	}
+	if len(st.Events) > 0 {
+		fmt.Fprintln(w, "\nWHEN\tEVENT\tGROUP\tREASON")
+		for _, e := range st.Events {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
+				e.At.AsTime().Format("2006-01-02 15:04:05"), scaleEventKindString(e.Kind), e.NodeGroup, e.Reason)
+		}
+	}
+	return w.Flush()
+}
