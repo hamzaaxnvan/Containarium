@@ -79,3 +79,84 @@ func HTTPAuditMiddleware(next http.Handler, store auditLogger) http.Handler {
 			for _, prefix := range skipGETPaths {
 				if strings.HasPrefix(r.URL.Path, prefix) {
 					next.ServeHTTP(w, r)
+					return
+				}
+			}
+		}
+
+		start := time.Now()
+
+		// Phase 4.6: every audited request gets a correlation ID.
+		// Honor an inbound X-Request-ID (sanitized) or mint a
+		// fresh one. Echo in the response header so clients can
+		// correlate their view with the audit row. Attach to
+		// context for any downstream handler that wants to
+		// propagate it (peer RPCs, error responses, log lines).
+		reqID := extractOrGenerateRequestID(r)
+		w.Header().Set(RequestIDHeader, reqID)
+		r = r.WithContext(ContextWithRequestID(r.Context(), reqID))
+
+		// httpx.StatusWriter captures the status and, through Unwrap,
+		// keeps the real writer's Flusher reachable for server-streaming
+		// responses (#2773).
+		rw := httpx.NewStatusWriter(w)
+
+		next.ServeHTTP(rw, r)
+
+		duration := time.Since(start)
+
+		// Extract username from context (set by auth middleware)
+		username, _ := auth.UsernameFromContext(r.Context())
+
+		// Extract source IP
+		sourceIP := extractSourceIP(r)
+
+		// Use method-specific action for better filtering and UI color-coding
+		action := "api_" + strings.ToLower(r.Method) // api_get, api_post, api_put, api_delete
+
+		// Detail carries `request_id=<id> duration=<d>`. The
+		// request ID is intentionally first so a grep on
+		// audit_logs.detail surfaces it whether the duration is
+		// present or not. Sanitized through SanitizeDetail
+		// (Phase 4.4) — defensive even though the inputs are
+		// already trusted.
+		detail := SanitizeDetail(fmt.Sprintf("request_id=%s duration=%s", reqID, duration))
+
+		entry := &AuditEntry{
+			Timestamp:    start,
+			Username:     username,
+			Action:       action,
+			ResourceType: "api",
+			ResourceID:   fmt.Sprintf("%s %s", r.Method, r.URL.Path),
+			Detail:       detail,
+			SourceIP:     sourceIP,
+			StatusCode:   rw.StatusCode,
+		}
+
+		// Non-blocking send
+		select {
+		case entryCh <- entry:
+		default:
+			// Channel full, drop entry to avoid blocking the request
+			recordPersistFailure()
+		}
+	})
+}
+
+// extractSourceIP extracts the client IP from the request, preferring
+// X-Forwarded-For (set by load balancers/proxies) over RemoteAddr.
+func extractSourceIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Take the first IP (original client)
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
