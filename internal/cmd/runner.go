@@ -350,3 +350,179 @@ func resolveOperatorSSHKey(pubPathFlag string) (pubPath, privPath string, err er
 // (rather than declaring the methods directly on the client
 // types, which would be the wrong place for runner-specific
 // glue) so the runner package stays decoupled.
+type daemonAPIWrapper struct {
+	list   func() ([]incus.ContainerInfo, error)
+	get    func(string) (*incus.ContainerInfo, error)
+	delete func(string, bool) error
+}
+
+func (w *daemonAPIWrapper) ListContainers() ([]incus.ContainerInfo, error) { return w.list() }
+func (w *daemonAPIWrapper) GetContainer(u string) (*incus.ContainerInfo, error) {
+	return w.get(u)
+}
+func (w *daemonAPIWrapper) DeleteContainer(u string, force bool) error {
+	return w.delete(u, force)
+}
+
+// buildDaemonAPI returns a runner.DaemonAPI + DaemonCreator
+// backed by either the HTTP or gRPC client, mirroring the
+// transport toggle elsewhere in the CLI. The creator closure
+// captures all the box-shape defaults (small CPU/memory, runner-
+// flavored image) so the runner package doesn't have to know
+// about them.
+func buildDaemonAPI() (runner.DaemonAPI, runner.DaemonCreator, error) {
+	if httpMode && serverAddr != "" {
+		httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return nil, nil, fmt.Errorf("http client: %w", err)
+		}
+		api := &daemonAPIWrapper{
+			list:   httpClient.ListContainers,
+			get:    httpClient.GetContainer,
+			delete: httpClient.DeleteContainer,
+		}
+		creator := func(_ context.Context, name, sshKey string) (string, string, error) {
+			info, err := httpClient.CreateContainer(
+				name,
+				"images:ubuntu/24.04",
+				"4",
+				"4GB",
+				"50GB",
+				splitNonEmpty(sshKey),
+				true, // podman
+				"",   // stack
+				nil,  // gpus
+				ostype.OSTypeFromString("ubuntu"),
+				0,                       // isolation: daemon default (container)
+				false,                   // monitoring
+				runnerPool,              // pool: steer placement like `create --pool` (#1216)
+				runnerBackendID,         // backend-id: ditto (#1216)
+				client.GitSourceOpts{},  // no git-source for runner boxes
+				0,                       // ttl: runner sets its own lifecycle; birth-TTL wiring is #526
+				0,                       // idle-stop: runner boxes are long-lived; not auto-slept
+				false,                   // disable-auto-sleep: unchanged runner behavior
+				0,                       // delete-after-stopped: not applicable to runner boxes
+				"",                      // storage-class: runner boxes use cluster default
+				client.EncryptionOpts{}, // encryption: runner boxes carry no tenant data (#1198)
+				"",                      // memory-request: runner boxes use request==limit (#1557)
+				"",                      // cpu-request: ditto
+				"",                      // region: runner boxes don't steer by region (#1606)
+				nil,                     // labels: runner boxes carry no user labels (#2358)
+			)
+			if err != nil {
+				return "", "", err
+			}
+			return info.Name, info.Username, nil
+		}
+		return api, creator, nil
+	}
+
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return nil, nil, fmt.Errorf("grpc client: %w", err)
+	}
+	api := &daemonAPIWrapper{
+		list:   grpcClient.ListContainers,
+		get:    grpcClient.GetContainer,
+		delete: grpcClient.DeleteContainer,
+	}
+	creator := func(_ context.Context, name, sshKey string) (string, string, error) {
+		info, err := grpcClient.CreateContainer(
+			name,
+			"images:ubuntu/24.04",
+			"4",
+			"4GB",
+			"50GB",
+			splitNonEmpty(sshKey),
+			true,
+			"",  // stack
+			nil, // gpus
+			ostype.OSTypeFromString("ubuntu"),
+			0,                       // isolation: daemon default (container)
+			false,                   // monitoring
+			runnerPool,              // pool: steer placement like `create --pool` (#1216)
+			runnerBackendID,         // backend-id: ditto (#1216)
+			client.GitSourceOpts{},  // no git-source for runner boxes
+			0,                       // ttl: runner sets its own lifecycle; birth-TTL wiring is #526
+			0,                       // idle-stop: runner boxes are long-lived; not auto-slept
+			false,                   // disable-auto-sleep: unchanged runner behavior
+			0,                       // delete-after-stopped: not applicable to runner boxes
+			"",                      // storage-class: runner boxes use cluster default
+			client.EncryptionOpts{}, // encryption: runner boxes carry no tenant data (#1198)
+			"",                      // memory-request: runner boxes use request==limit (#1557)
+			"",                      // cpu-request: ditto
+			"",                      // region: runner boxes don't steer by region (#1606)
+			nil,                     // labels: runner boxes carry no user labels (#2358)
+		)
+		if err != nil {
+			return "", "", err
+		}
+		return info.Name, info.Username, nil
+	}
+	return api, creator, nil
+}
+
+// splitNonEmpty returns a single-element []string{s} when s is
+// non-empty, else nil. The daemon's CreateContainer signature
+// wants []string for ssh keys, but the runner orchestrator
+// passes the public key as one string.
+func splitNonEmpty(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	return []string{s}
+}
+
+// printRunnerTable renders a compact summary table to stdout.
+// Same field set the MCP tool returns as JSON, so the human and
+// agent views stay in sync.
+func printRunnerTable(runners []runner.RunnerStatus) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tSTATE\tREGISTERED\tNOTE")
+	for _, r := range runners {
+		registered := "no"
+		if r.Registered {
+			registered = "yes"
+		}
+		note := r.LastError
+		if note == "" {
+			note = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Name, r.State, registered, note)
+	}
+	_ = w.Flush()
+}
+
+// printRunnerJSON emits the result as JSON for scripting.
+func printRunnerJSON(runners []runner.RunnerStatus) error {
+	// Lightweight inline encoder — avoids pulling in the
+	// existing list.go JSON helper which expects []interface{}.
+	type row struct {
+		Name       string `json:"name"`
+		BoxID      string `json:"box_id"`
+		State      string `json:"state"`
+		Registered bool   `json:"registered"`
+		LastError  string `json:"last_error,omitempty"`
+	}
+	out := make([]row, 0, len(runners))
+	for _, r := range runners {
+		out = append(out, row{
+			Name:       r.Name,
+			BoxID:      r.BoxID,
+			State:      r.State,
+			Registered: r.Registered,
+			LastError:  r.LastError,
+		})
+	}
+	return writeJSON(os.Stdout, out)
+}
+
+// writeJSON renders v as indented JSON to w with a trailing
+// newline. Tiny inline helper rather than pulling in
+// internal/list.go's helper, which expects []interface{}.
+func writeJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
