@@ -49,3 +49,29 @@ Y
   cat >"$d/branch.yml" <<'Y'
 jobs:
   a:
+    steps:
+      - uses: aquasecurity/trivy-action@master
+Y
+  cat >"$d/pass.yml" <<'Y'
+jobs:
+  a:
+    uses: ./.github/workflows/x.yml
+    steps:
+      # uses: actions/checkout@v4 (comment is ignored)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: "docker://alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+Y
+  mkdir "$d/t" "$d/b" "$d/p"; mv "$d/tag.yml" "$d/t/"; mv "$d/branch.yml" "$d/b/"; mv "$d/pass.yml" "$d/p/"
+  for c in t b; do
+    if check "$d/$c" >/dev/null; then echo "self-test FAIL: tag/branch pin accepted ($c)"; return 1; fi
+  done
+  check "$d/p" >/dev/null || { echo "self-test FAIL: SHA-pinned fixture rejected"; check "$d/p"; return 1; }
+  echo "self-test ok: tag and branch pins rejected, SHA/local/digest pins accepted"
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then self_test; exit; fi
+[[ $# -gt 0 ]] || set -- .github
+if check "$@"; then echo "all uses: references are SHA-pinned"; else
+  echo "Pin each action to a full commit SHA with the ref as a trailing comment: uses: owner/repo@<40-hex> # v1.2.3" >&2
+  exit 1
+fi
