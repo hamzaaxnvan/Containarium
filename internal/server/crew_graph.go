@@ -110,3 +110,115 @@ func (s *CrewServer) runCrewGraph(ctx context.Context, req *pb.RunCrewRequest, c
 		wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		return s.runs.Put(wctx, run)
+	}
+	if err := persist(); err != nil {
+		return nil, status.Errorf(codes.Internal, "record graph run: %v", err)
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type event struct {
+		id, output string
+		err        error
+	}
+	events := make(chan event, len(nodes))
+	active, finished := 0, 0
+	var saveErr error
+	for finished < len(nodes) {
+		for _, r := range run.NodeResults {
+			if r.State != pb.TaskNodeState_TASK_NODE_STATE_PENDING {
+				continue
+			}
+			if workerCtx.Err() != nil {
+				r.State, r.Error = pb.TaskNodeState_TASK_NODE_STATE_CANCELLED, workerCtx.Err().Error()
+				r.FinishedAt = timestamppb.Now()
+				finished++
+				continue
+			}
+			ready := true
+			var inputs []graphDependency
+			for _, id := range deps[r.NodeId] {
+				d := results[id]
+				switch d.State {
+				case pb.TaskNodeState_TASK_NODE_STATE_FAILED, pb.TaskNodeState_TASK_NODE_STATE_BLOCKED, pb.TaskNodeState_TASK_NODE_STATE_CANCELLED:
+					r.State, r.Error = pb.TaskNodeState_TASK_NODE_STATE_BLOCKED, "blocked by dependency "+id
+					r.FinishedAt = timestamppb.Now()
+				case pb.TaskNodeState_TASK_NODE_STATE_SUCCEEDED:
+					inputs = append(inputs, graphDependency{NodeID: id, OutputJSON: d.OutputJson})
+				default:
+					ready = false
+				}
+			}
+			if r.State == pb.TaskNodeState_TASK_NODE_STATE_BLOCKED {
+				finished++
+				continue
+			}
+			if !ready || active == limit {
+				continue
+			}
+			// This payload contains only strings/slices, so marshaling cannot fail.
+			input, err := json.Marshal(graphNodeInput{Goal: nodes[r.NodeId].Goal, InputJSON: nodes[r.NodeId].InputJson, Dependencies: inputs})
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "encode node input: %v", err)
+			}
+			r.State, r.StartedAt = pb.TaskNodeState_TASK_NODE_STATE_RUNNING, timestamppb.Now()
+			active++
+			go func(id, childID, input string) {
+				e := event{id: id}
+				defer func() {
+					if recover() != nil {
+						e.err = fmt.Errorf("node executor panicked")
+					}
+					events <- e
+				}()
+				// Recheck after dependencies finish: a profile may have been
+				// refreshed since preflight. Never let pool fallback place a
+				// locally validated node on an unvalidated peer.
+				backend, err := s.validateLocalNodeResources(nodes[id], req)
+				if err != nil {
+					e.err = err
+					return
+				}
+				nodeReq := req
+				if backend != "" {
+					nodeReq = proto.Clone(req).(*pb.RunCrewRequest)
+					nodeReq.BackendId, nodeReq.Pool = backend, ""
+				}
+				e.output, e.err = execute(workerCtx, nodes[id], childID, input, nodeReq)
+			}(r.NodeId, r.RunId, string(input))
+		}
+		if err := persist(); err != nil && saveErr == nil {
+			saveErr = err
+			cancel() // stop new dispatch, then drain workers so leases still end
+		}
+		if active == 0 {
+			continue
+		}
+		e := <-events
+		r := results[e.id]
+		r.FinishedAt = timestamppb.Now()
+		if e.err != nil {
+			r.State, r.Error = pb.TaskNodeState_TASK_NODE_STATE_FAILED, e.err.Error()
+		} else {
+			r.State, r.OutputJson = pb.TaskNodeState_TASK_NODE_STATE_SUCCEEDED, e.output
+		}
+		active--
+		finished++
+	}
+	run.State = pb.CrewRunState_CREW_RUN_STATE_COMPLETED
+	for _, r := range run.NodeResults {
+		if r.State != pb.TaskNodeState_TASK_NODE_STATE_SUCCEEDED {
+			run.State = pb.CrewRunState_CREW_RUN_STATE_FAILED
+			run.Error = "one or more task nodes did not succeed; see node_results"
+		}
+	}
+	if ctx.Err() != nil {
+		run.State = pb.CrewRunState_CREW_RUN_STATE_CANCELLED
+	}
+	if err := persist(); err != nil {
+		return nil, status.Errorf(codes.Internal, "record graph result: %v", err)
+	}
+	if saveErr != nil {
+		return nil, status.Errorf(codes.Internal, "record graph progress: %v", saveErr)
+	}
+	return &pb.RunCrewResponse{Run: run}, nil
+}

@@ -86,3 +86,26 @@ func ParseCodeConfig(blob []byte) (*CodeConfig, error) {
 			CodeConfigPath, cfg.Engine)
 	}
 	return &cfg, nil
+}
+
+// CredentialSource rebuilds the live source this record describes, so `code run`
+// can construct the same Engine `code install` did.
+func (c CodeConfig) CredentialSource() (CredentialSource, error) {
+	switch c.Credential {
+	case KindGateway:
+		return GatewayCredential{Provider: c.Provider}, nil
+	case KindSecret:
+		return SecretCredential{Name: c.SecretName}, nil
+	default:
+		return nil, fmt.Errorf("unknown credential source %q in %s", c.Credential, CodeConfigPath)
+	}
+}
+
+// EngineFor rebuilds the Engine this record describes.
+func (c CodeConfig) EngineFor() (Engine, error) {
+	src, err := c.CredentialSource()
+	if err != nil {
+		return nil, err
+	}
+	return For(c.Engine, Options{Credential: src, Model: c.Model})
+}

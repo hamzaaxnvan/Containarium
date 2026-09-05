@@ -49,3 +49,54 @@ type ContainerView struct {
 // whether ttl_expires_at has elapsed. Protects against minor clock
 // skew between the daemon host and whatever set the TTL (the GHA
 // runner, a developer's laptop, etc.). 30s is generous compared to
+// typical NTP skew (sub-second) and comfortably less than 1% of the
+// smallest realistic TTL window — see the package doc for the
+// reasoning. Exported as a package constant rather than a tunable so
+// the same value shows up in tests and operator-facing docs.
+const graceMargin = 30 * time.Second
+
+// Decide returns the names of containers that should be deleted now
+// (accounting for graceMargin). Pure function — no IO, no clock, no
+// locks. Safe to call from a goroutine; safe to call repeatedly with
+// the same inputs (idempotent, deterministic).
+//
+// A container is deleted if EITHER timer has elapsed:
+//
+//   - Absolute TTL (#523): TTLExpiresAt set and at/before now-graceMargin.
+//     Fires regardless of running/stopped — the box's hard death date.
+//   - Stopped→delete (#525): the box is Stopped, has a StoppedAt, opted into
+//     a DeleteAfterStopped window, and StoppedAt+window is at/before
+//     now-graceMargin. This is the disk-reclaim half of the two-phase
+//     lifecycle: idle→stop (#524, autosleep) frees CPU/RAM, then a box left
+//     stopped past its window is deleted to free disk. Waking the box clears
+//     StoppedAt (→ nil here), which resets this timer.
+//
+// Unset/missing fields skip the corresponding rule, so a box with neither a
+// TTL nor a stopped→delete window is never reaped. A name matching both rules
+// is returned once (the two rules share the append-and-continue). A box marked
+// Protected (#284) is skipped entirely, regardless of either timer.
+func Decide(containers []ContainerView, now time.Time) []string {
+	cutoff := now.Add(-graceMargin)
+	var expired []string
+	for _, c := range containers {
+		// Protected boxes (#284) are never auto-reaped — skip before any timer
+		// check so a stray TTL on a protected box can't delete it.
+		if c.Protected {
+			continue
+		}
+		// Absolute TTL.
+		if c.TTLExpiresAt != nil && !c.TTLExpiresAt.After(cutoff) {
+			expired = append(expired, c.Name)
+			continue
+		}
+		// Stopped→delete: only for a stopped box that opted in.
+		if c.Stopped && c.StoppedAt != nil && c.DeleteAfterStopped != nil {
+			deadline := c.StoppedAt.Add(*c.DeleteAfterStopped)
+			if !deadline.After(cutoff) {
+				expired = append(expired, c.Name)
+				continue
+			}
+		}
+	}
+	return expired
+}
