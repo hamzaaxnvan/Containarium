@@ -106,3 +106,58 @@ func GenerateVPAWebhookSecret() ([]byte, error) {
 		return nil, err
 	}
 
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	srvPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srvDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: srvKeyDER})
+
+	b64 := base64.StdEncoding.EncodeToString
+	secret := fmt.Sprintf(`# Generated per cluster by containarium (#1416). The admission
+# webhook's serving certs — never shared across clusters.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vpa-tls-certs
+  namespace: kube-system
+type: Opaque
+data:
+  caCert.pem: %s
+  serverCert.pem: %s
+  serverKey.pem: %s
+`, b64(caPEM), b64(srvPEM), b64(keyPEM))
+	return []byte(secret), nil
+}
+
+func vpaSerial() *big.Int {
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		panic(err) // rand.Reader failing is unrecoverable
+	}
+	return serial
+}
+
+// DeployVPA installs the pinned VPA bundle onto a provisioned control
+// plane via the k3s auto-apply dir. Idempotent by presence check: the
+// per-cluster webhook Secret is generated exactly once — re-pushing it
+// every pass would rotate the webhook's certs under the running
+// admission controller.
+func (m *Manager) DeployVPA(tenant, clusterName string) error {
+	cp := CPName(tenant, clusterName)
+	if _, err := m.host.Read(cp, VPACertsPath); err == nil {
+		return nil // already deployed
+	}
+	manifests, err := VPAManifests()
+	if err != nil {
+		return err
+	}
+	secret, err := GenerateVPAWebhookSecret()
+	if err != nil {
+		return fmt.Errorf("generate VPA webhook certs: %w", err)
+	}
+	if err := m.pushFile(cp, VPACertsPath, secret, "0600"); err != nil {
+		return fmt.Errorf("push VPA certs manifest: %w", err)
+	}
+	if err := m.pushFile(cp, VPAManifestPath, manifests, "0644"); err != nil {
+		return fmt.Errorf("push VPA manifests: %w", err)
+	}
+	return nil
+}
