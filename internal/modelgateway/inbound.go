@@ -384,3 +384,261 @@ func (in *inbound) status() InboundStatus {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	st.Ready = in.provider == nil || in.loaded
+	m := modeOf(in.policy, in.baselineMode)
+	st.Scanning, st.PolicyRevision = m.scan, m.revision
+	st.BaselineMode = strings.ToLower(strings.TrimPrefix(in.baselineMode.String(), "GUARDRAIL_BASELINE_MODE_"))
+	st.AuditDropped, st.AuditFailed = in.auditDropped, in.auditFailed
+	st.UpstreamErrors = in.upstreamErrors.Load()
+	st.HoldSeconds, st.HoldBytes = in.holdSeconds.snapshot(), in.holdBytes.snapshot()
+	st.PolicyReads = in.policyReads.Load()
+	if in.auditQ != nil {
+		st.AuditQueued = len(in.auditQ)
+	}
+	for r, n := range in.blocked {
+		st.Blocked[r.String()] = n
+	}
+	for k, n := range in.blockedByKind {
+		st.BlockedByKind[kindName(k)] = n
+	}
+	for id, n := range in.baselineHits {
+		st.BaselineDetections[string(id)] = n
+	}
+	st.BaselineUnscanned = in.baselineUnscanned.Load()
+	return st
+}
+
+// inboundSubject is who a block is attributed to.
+type inboundSubject struct {
+	tenant, skill, provider, model string
+}
+
+// block records one block: log line, counters, and a queued audit entry. It
+// returns the typed error the response is replaced with. The audit write
+// happens off the request path and failing is logged and counted, never a
+// reason to let the response through or to delay it.
+func (in *inbound) block(sub inboundSubject, dec guardrail.InboundDecision, revision int64) *inboundBlockError {
+	in.logger.Printf("model-gateway: INBOUND-BLOCK tenant=%s skill=%s provider=%s model=%s reason=%s kinds=%v findings=%d gaps=%d engine=%q revision=%d",
+		sub.tenant, sub.skill, sub.provider, sub.model, dec.Reason, kindNames(dec.Kinds), dec.Findings, dec.Gaps, dec.EngineID, revision)
+	in.mu.Lock()
+	in.blocked[dec.Reason]++
+	for _, k := range dec.Kinds {
+		in.blockedByKind[k]++
+	}
+	in.mu.Unlock()
+	in.enqueueAudit(auditJob{b: &InboundBlock{
+		Tenant: sub.tenant, SkillID: sub.skill, Provider: sub.provider, Model: sub.model,
+		Reason: dec.Reason, Kinds: dec.Kinds, Findings: dec.Findings, EngineID: dec.EngineID, PolicyRevision: revision,
+	}})
+	return &inboundBlockError{dec: dec}
+}
+
+// auditJob is one queued audit entry (a block or a baseline detection), or
+// (done != nil) a flush marker.
+type auditJob struct {
+	b    *InboundBlock
+	d    *InboundDetection
+	done chan struct{}
+}
+
+// enqueueAudit hands an audit entry to the worker without ever
+// waiting: the request path must not depend on the audit store, whose outage
+// is also the likeliest reason for the policy-unavailable refusals this runs
+// for. A full queue drops the entry and counts it.
+func (in *inbound) enqueueAudit(job auditJob) {
+	if in.audit == nil {
+		return
+	}
+	in.startAuditWorker()
+	select {
+	case in.auditQ <- job:
+	default:
+		in.mu.Lock()
+		in.auditDropped++
+		n := in.auditDropped
+		in.mu.Unlock()
+		// First drop and every thousandth: an outage must not also flood the log.
+		if n%1000 == 1 {
+			in.logger.Printf("model-gateway: inbound audit queue full; entry dropped (%d dropped so far); a blocked response stays blocked", n)
+		}
+	}
+}
+
+func (in *inbound) startAuditWorker() {
+	in.auditOnce.Do(func() { go in.auditWorker() })
+}
+
+// auditWorker delivers queued entries one at a time, each under its own
+// short timeout. It runs for the life of the process.
+func (in *inbound) auditWorker() {
+	for job := range in.auditQ {
+		if job.done != nil {
+			close(job.done)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), in.auditTimeout)
+		var err error
+		if job.d != nil {
+			err = in.audit.RecordInboundDetection(ctx, *job.d)
+		} else {
+			err = in.audit.RecordInboundBlock(ctx, *job.b)
+		}
+		cancel()
+		if err != nil {
+			in.mu.Lock()
+			in.auditFailed++
+			in.mu.Unlock()
+			in.logger.Printf("model-gateway: inbound audit write failed (a blocked response stays blocked): %v", err)
+		}
+	}
+}
+
+// flushAudit waits until every entry queued before the call has been handed
+// to the sink (delivered, failed or timed out), or ctx ends. For a clean
+// daemon shutdown and for tests; the request path never calls it.
+func (in *inbound) flushAudit(ctx context.Context) error {
+	if in.audit == nil {
+		return nil
+	}
+	in.startAuditWorker()
+	done := make(chan struct{})
+	select {
+	case in.auditQ <- auditJob{done: done}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// inboundBlockError is returned from ModifyResponse so the proxy's
+// ErrorHandler writes the typed body instead of the model output.
+type inboundBlockError struct{ dec guardrail.InboundDecision }
+
+func (e *inboundBlockError) Error() string {
+	return "guardrail inbound block: " + e.dec.Reason.String()
+}
+
+func writeInboundBlock(w http.ResponseWriter, status int, dec guardrail.InboundDecision) {
+	body := InboundBlockBody{Error: InboundBlockError{
+		Type: InboundBlockType, Reason: dec.Reason.String(), Kinds: kindNames(dec.Kinds),
+		Message: fmt.Sprintf("model response blocked by the inbound guardrail (%s); no model output was delivered", dec.Reason),
+	}}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func kindName(k pb.GuardrailKind) string { return strings.TrimPrefix(k.String(), "GUARDRAIL_KIND_") }
+
+func kindNames(ks []pb.GuardrailKind) []string {
+	if len(ks) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ks))
+	for _, k := range ks {
+		out = append(out, kindName(k))
+	}
+	return out
+}
+
+// inboundRequest is one scanned request: the mode it resolved and who to
+// attribute a block to.
+type inboundRequest struct {
+	in   *inbound
+	mode inboundMode
+	sub  inboundSubject
+	// onBlocked meters a response the scan blocked, from the bytes already
+	// held (#2452). Nil skips metering. It is not called when the hold hit
+	// its limit: the body is truncated, so any usage in it would be invented.
+	onBlocked func(held []byte, streaming bool)
+	// passedThrough is set when enforce let the response through unscanned
+	// (an upstream error). Under the baseline's BLOCK mode the gateway then
+	// tees it like LOG mode, so BLOCK never records less than LOG (#2738).
+	passedThrough bool
+}
+
+// enforce is the ModifyResponse pre-stage in scanned mode. It holds the
+// whole response (JSON or event stream) to its end, scans it once, and on a
+// clean result restores the held bytes unchanged for the existing path to
+// meter and normalise as today. Any other outcome returns the block error.
+// Because the hold completes before ModifyResponse returns, the proxy has
+// committed nothing to the client, so a block is a real error status and a
+// stream is never half-opened.
+func (ir *inboundRequest) enforce(resp *http.Response) error {
+	fail := func(dec guardrail.InboundDecision) error {
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(nil))
+		return ir.in.block(ir.sub, dec, ir.mode.revision)
+	}
+	ct := resp.Header.Get("Content-Type")
+	streaming := strings.Contains(ct, "text/event-stream")
+	recognised := streaming || strings.Contains(ct, "application/json")
+	// A non-2xx response in a shape we do not scan is an upstream or
+	// intermediary error (rate limit, proxy page), not model output: pass it
+	// through with its status and headers. A 2xx of that shape stays blocked.
+	if !recognised && (resp.StatusCode < 200 || resp.StatusCode > 299) {
+		ir.in.upstreamErrors.Add(1)
+		ir.passedThrough = true
+		return nil
+	}
+	// An unscannable body cannot pass a gate that claims to scan. The
+	// transport already decodes gzip the upstream chose on its own; a
+	// Content-Encoding still present means the bytes are opaque to us.
+	if resp.Header.Get("Content-Encoding") != "" {
+		return fail(guardrail.InboundBlocked(guardrail.InboundReasonCoverageGap))
+	}
+	if !recognised {
+		return fail(guardrail.InboundBlocked(guardrail.InboundReasonCoverageGap))
+	}
+	holdStart := time.Now()
+	held, err := io.ReadAll(io.LimitReader(resp.Body, int64(ir.in.limit)+1))
+	ir.in.holdSeconds.observe(time.Since(holdStart).Seconds())
+	ir.in.holdBytes.observe(float64(len(held)))
+	if err != nil {
+		return fail(guardrail.InboundBlocked(guardrail.InboundReasonEngineError))
+	}
+	if len(held) > ir.in.limit {
+		// The buffer is dropped with this frame; none of it is released.
+		return fail(guardrail.InboundBlocked(guardrail.InboundReasonOverLimit))
+	}
+	var units []*pb.GuardrailTextUnit
+	if streaming {
+		units = inboundUnitsSSE(held)
+	} else {
+		units = inboundUnitsJSON(held)
+	}
+	if dec := ir.scan(resp.Request.Context(), units); dec.Blocked {
+		if ir.onBlocked != nil {
+			ir.onBlocked(held, streaming)
+		}
+		return fail(dec)
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(held))
+	return nil
+}
+
+// scan runs the engine over the units under the resolved policy. A unit
+// that is not valid UTF-8 is a coverage gap, as in guardrail.LoadUnits: a
+// lenient decode would hand the engine quietly corrupted text.
+func (ir *inboundRequest) scan(ctx context.Context, units []*pb.GuardrailTextUnit) guardrail.InboundDecision {
+	if ir.in.engine == nil && !ir.mode.baselineBlock {
+		return guardrail.InboundBlocked(guardrail.InboundReasonEngineError)
+	}
+	for _, u := range units {
+		if !utf8.ValidString(u.GetText()) {
+			return guardrail.InboundBlocked(guardrail.InboundReasonCoverageGap)
+		}
+	}
+	if ir.mode.baselineBlock {
+		return ir.scanBaseline(units)
+	}
+	ctx, cancel := context.WithTimeout(ctx, ir.in.timeout)
+	defer cancel()
+	resp, err := ir.in.engine.Scan(ctx, &pb.GuardrailScanRequest{Units: units, Kinds: ir.mode.kinds})
+	return guardrail.DecideInbound(resp, err, ir.mode.policy)
+}
