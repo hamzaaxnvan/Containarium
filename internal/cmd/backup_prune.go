@@ -39,3 +39,44 @@ Examples:
 
 func init() {
 	backupCmd.AddCommand(backupPruneCmd)
+	f := backupPruneCmd.Flags()
+	f.StringVar(&backupPruneDatabase, "database", "", "prune only this database (or hook label); omit to prune every database this tenant has backups for")
+	f.Int32Var(&backupPruneKeep, "keep", 0, "number of newest backups to keep per database (required, must be >= 1)")
+	_ = backupPruneCmd.MarkFlagRequired("keep")
+}
+
+func runBackupPrune(cmd *cobra.Command, args []string) error {
+	username := args[0]
+	if backupPruneKeep < 1 {
+		return fmt.Errorf("--keep must be at least 1 (got %d); use 'backup delete <id>' to remove a specific backup", backupPruneKeep)
+	}
+
+	c, err := newBackupClientFn()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	if backupPruneDatabase == "" {
+		fmt.Printf("Pruning %s, keeping the newest %d per database...\n", username, backupPruneKeep)
+	} else {
+		fmt.Printf("Pruning %s database %q, keeping the newest %d...\n", username, backupPruneDatabase, backupPruneKeep)
+	}
+	resp, err := c.PruneBackups(&pb.PruneBackupsRequest{
+		Username: username,
+		Database: backupPruneDatabase,
+		Keep:     backupPruneKeep,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\n✓ %s\n", resp.Message)
+	for _, id := range resp.DeletedIds {
+		fmt.Printf("  - deleted %s\n", id)
+	}
+	for _, f := range resp.Failures {
+		fmt.Printf("  ✗ %s\n", f)
+	}
+	return nil
+}
