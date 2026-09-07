@@ -25,3 +25,58 @@ import (
 func deliveryToProto(s string) pb.SecretDelivery {
 	switch s {
 	case secrets.DeliveryFile:
+		return pb.SecretDelivery_SECRET_DELIVERY_FILE
+	case secrets.DeliveryCompose:
+		return pb.SecretDelivery_SECRET_DELIVERY_COMPOSE
+	case secrets.DeliveryBroker:
+		return pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY
+	case secrets.DeliveryEnv, "":
+		return pb.SecretDelivery_SECRET_DELIVERY_ENV
+	default:
+		// Unknown values are rejected at the API boundary before they
+		// reach storage, so this is unreachable in practice; report
+		// UNSPECIFIED rather than guessing a mode.
+		return pb.SecretDelivery_SECRET_DELIVERY_UNSPECIFIED
+	}
+}
+
+// deliveryFromProto maps the enum onto the storage string. UNSPECIFIED
+// returns "" so the caller can fall back to the legacy field.
+func deliveryFromProto(d pb.SecretDelivery) string {
+	switch d {
+	case pb.SecretDelivery_SECRET_DELIVERY_ENV:
+		return secrets.DeliveryEnv
+	case pb.SecretDelivery_SECRET_DELIVERY_FILE:
+		return secrets.DeliveryFile
+	case pb.SecretDelivery_SECRET_DELIVERY_COMPOSE:
+		return secrets.DeliveryCompose
+	case pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY:
+		return secrets.DeliveryBroker
+	default:
+		return ""
+	}
+}
+
+// resolveDelivery picks the delivery mode from a SetSecretRequest that may
+// carry the typed field, the legacy string, or both.
+//
+// When both are set they must agree. Silently preferring one would make a
+// client that sent contradictory values believe the other took effect —
+// the same class of silent divergence as a backend accepting a call it
+// cannot honor. Fail loudly instead.
+func resolveDelivery(mode pb.SecretDelivery, legacy string) (string, error) {
+	typed := deliveryFromProto(mode)
+	switch {
+	case typed == "" && legacy == "":
+		// Neither set: the store normalizes "" to env.
+		return "", nil
+	case typed == "":
+		return legacy, nil
+	case legacy == "":
+		return typed, nil
+	case typed == legacy:
+		return typed, nil
+	default:
+		return "", fmt.Errorf("delivery_mode (%s) and delivery (%q) disagree; set one or make them match", mode, legacy)
+	}
+}

@@ -61,3 +61,46 @@ func (a gatewayInboundAudit) RecordInboundBlock(ctx context.Context, b modelgate
 // rule that matched in a model response while no admin policy exists
 // (#2736). Action "log": the response was delivered; action "block" (the
 // baseline's BLOCK mode, #2738): it was blocked, and a
+// model_gateway.inbound_block entry records the block itself.
+const modelGatewayInboundDetectionAction = "model_gateway.inbound_detection"
+
+// inboundDetectionAuditDetail is the Detail of a
+// model_gateway.inbound_detection entry: attribution, which policy flagged it,
+// the rule id, kind and action, and the match count. Never the matched text.
+type inboundDetectionAuditDetail struct {
+	Skill    string `json:"skill,omitempty"`
+	Provider string `json:"provider"`
+	Model    string `json:"model,omitempty"`
+	Policy   string `json:"policy"`
+	RuleID   string `json:"rule_id"`
+	Kind     string `json:"kind"`
+	Action   string `json:"action"`
+	Matches  int    `json:"matches"`
+}
+
+func (a gatewayInboundAudit) RecordInboundDetection(ctx context.Context, d modelgateway.InboundDetection) error {
+	payload, err := json.Marshal(inboundDetectionAuditDetail{
+		Skill: d.SkillID, Provider: d.Provider, Model: d.Model, Policy: "baseline",
+		RuleID: string(d.RuleID), Kind: d.Kind.String(), Action: d.Action.String(), Matches: d.Matches,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal inbound detection detail: %w", err)
+	}
+	return a.log.Log(ctx, &audit.AuditEntry{
+		Username:     d.Tenant,
+		Action:       modelGatewayInboundDetectionAction,
+		ResourceType: "model_gateway",
+		ResourceID:   d.Tenant,
+		Detail:       string(payload),
+	})
+}
+
+// newGatewayInboundAudit returns the sink for a daemon audit store, or nil
+// when there is none: the gateway then logs blocks only. The explicit nil
+// check keeps a nil *audit.Store from becoming a non-nil interface.
+func newGatewayInboundAudit(store *audit.Store) modelgateway.InboundAuditSink {
+	if store == nil {
+		return nil
+	}
+	return gatewayInboundAudit{log: store}
+}
