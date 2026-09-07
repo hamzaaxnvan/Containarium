@@ -64,3 +64,267 @@ func ContainerdDeriveTemplateSedArgs() []string {
 	}
 	return args
 }
+
+// Reserved is the slice of a node's observed capacity that does NOT
+// belong to the node — the gap between what /proc reports (the outer
+// host) and the size the daemon actually asked for.
+type Reserved struct {
+	CPU         int
+	MemoryBytes int64
+}
+
+// Zero reports whether there is nothing to reserve, i.e. the node
+// observes exactly its own size and the stock kubelet is already right.
+func (r Reserved) Zero() bool { return r.CPU == 0 && r.MemoryBytes == 0 }
+
+// ReservedResources computes what kubelet must reserve so that
+// allocatable equals the requested size, given what the node observes.
+//
+// Allocatable = capacity − reserved, and the scheduler and
+// cluster-autoscaler's fit simulation both read allocatable — so this
+// is what stops a node claiming four times its CPU from being packed
+// with pods it cannot run, and from suppressing the scale-up that
+// should have happened.
+//
+// Observed capacity SMALLER than the requested size is an error, never
+// a negative reservation: it means the node cannot host what was asked
+// for, and inventing headroom would hide that.
+func ReservedResources(observedCPU int, observedMemBytes int64, spec NodeSpec) (Reserved, error) {
+	wantCPU, err := strconv.Atoi(spec.CPU)
+	if err != nil {
+		return Reserved{}, fmt.Errorf("node cpu %q: %w", spec.CPU, err)
+	}
+	wantMem, err := ParseSizeBytes(spec.Memory)
+	if err != nil {
+		return Reserved{}, fmt.Errorf("node memory %q: %w", spec.Memory, err)
+	}
+	if observedCPU < wantCPU || observedMemBytes < wantMem {
+		return Reserved{}, fmt.Errorf(
+			"node observes %d cpu / %d bytes but was sized %d cpu / %d bytes: "+
+				"the host cannot honour this size, so no reservation makes allocatable truthful",
+			observedCPU, observedMemBytes, wantCPU, wantMem)
+	}
+	return Reserved{
+		CPU:         observedCPU - wantCPU,
+		MemoryBytes: observedMemBytes - wantMem,
+	}, nil
+}
+
+// NodeReservation decides the reservation from what a BOOTED node
+// reports about itself (#1466). It is the post-boot counterpart of
+// ReservedResources, and it differs in exactly one way that matters.
+//
+// ReservedResources treats observed-smaller-than-requested as an
+// error, which is right for the create-time sizing question it serves
+// (CheckNodeCapacity): a host that cannot fit the node should refuse.
+// It is wrong here, because an honest node ALWAYS reports slightly
+// less than its configured size — the kernel's MemTotal excludes
+// firmware-reserved and unavailable memory, so a node limited to 4GB
+// (4_000_000_000) reports about 3_999_993_856. Treating that as a
+// failure would refuse every correctly-behaving container node, which
+// is the #1456 mistake with the sign flipped.
+//
+// So the rule is a one-way comparison: reserve only the excess a node
+// claims over its own size, per dimension, and nothing when it claims
+// no excess. A node under its size is a node telling the truth; a node
+// over it is the nested-host lie this exists to correct.
+func NodeReservation(observedCPU int, observedMemBytes int64, spec NodeSpec) (Reserved, error) {
+	wantCPU, err := strconv.Atoi(spec.CPU)
+	if err != nil {
+		return Reserved{}, fmt.Errorf("node cpu %q: %w", spec.CPU, err)
+	}
+	wantMem, err := ParseSizeBytes(spec.Memory)
+	if err != nil {
+		return Reserved{}, fmt.Errorf("node memory %q: %w", spec.Memory, err)
+	}
+	var r Reserved
+	if observedCPU > wantCPU {
+		r.CPU = observedCPU - wantCPU
+	}
+	if observedMemBytes > wantMem {
+		r.MemoryBytes = observedMemBytes - wantMem
+	}
+	return r, nil
+}
+
+// KubeletReservedArgs renders a reservation as k3s --kubelet-arg
+// flags. A zero reservation renders nothing: a node whose observed
+// capacity already equals its size needs no correction, and passing
+// system-reserved=cpu=0 would only add noise to the unit file.
+func KubeletReservedArgs(r Reserved) []string {
+	if r.Zero() {
+		return nil
+	}
+	return []string{
+		fmt.Sprintf("--kubelet-arg=system-reserved=cpu=%d,memory=%d", r.CPU, r.MemoryBytes),
+		// Without this kubelet accounts the reservation but does not
+		// enforce it, so allocatable moves while the cgroup does not.
+		"--kubelet-arg=enforce-node-allocatable=pods",
+	}
+}
+
+// sizeBytesRE matches the house size format the node-group validator
+// accepts ("16GB"), decimal units.
+var sizeBytesRE = regexp.MustCompile(`^([1-9][0-9]*)(MB|GB|TB)$`)
+
+// ParseSizeBytes parses the house size format ("16GB") into bytes.
+//
+// Lives here rather than in internal/server because pkg/core/cluster is
+// what the node sizing math needs it for, and the dependency only runs
+// that way; internal/server's own copy predates this and can adopt it.
+func ParseSizeBytes(s string) (int64, error) {
+	m := sizeBytesRE.FindStringSubmatch(s)
+	if m == nil {
+		return 0, fmt.Errorf("invalid size %q (want e.g. 16GB)", s)
+	}
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	switch m[2] {
+	case "MB":
+		return n * 1_000_000, nil
+	case "GB":
+		return n * 1_000_000_000, nil
+	default: // TB
+		return n * 1_000_000_000_000, nil
+	}
+}
+
+// ProcCPUInfoPath and ProcMemInfoPath are the two files cadvisor
+// derives node capacity from. Named constants because they are read
+// from two vantage points — the daemon host's filesystem (create-time
+// sizing) and a booted node's own /proc over Exec (#1466) — and the
+// second is the only one that can tell a misreporting node from an
+// honest one.
+const (
+	ProcCPUInfoPath = "/proc/cpuinfo"
+	ProcMemInfoPath = "/proc/meminfo"
+)
+
+// ParseProcCapacity reconstructs the capacity cadvisor would report
+// from the contents of /proc/cpuinfo and /proc/meminfo.
+//
+// Pure, so it can be applied to whichever /proc is relevant: the
+// daemon host's (HostCapacity) or a booted node's own, read back over
+// Exec. A shape it cannot read is an error, never a zero capacity —
+// zero would compute a reservation that silently starves the node.
+func ParseProcCapacity(cpuinfo, meminfo string) (cpu int, memBytes int64, err error) {
+	for _, line := range strings.Split(cpuinfo, "\n") {
+		if strings.HasPrefix(line, "processor") {
+			cpu++
+		}
+	}
+	if cpu == 0 {
+		return 0, 0, fmt.Errorf("no processor lines in %s", ProcCPUInfoPath)
+	}
+
+	for _, line := range strings.Split(meminfo, "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			break
+		}
+		kb, convErr := strconv.ParseInt(fields[1], 10, 64)
+		if convErr != nil {
+			return 0, 0, fmt.Errorf("MemTotal %q: %w", fields[1], convErr)
+		}
+		return cpu, kb * 1024, nil
+	}
+	return 0, 0, fmt.Errorf("no MemTotal in %s", ProcMemInfoPath)
+}
+
+// HostCapacity reads the DAEMON HOST's /proc.
+//
+// This is the create-time sizing question — "can this host host a node
+// of the size asked for" — and nothing else. It is deliberately NOT
+// the reservation trigger: the daemon host's capacity is not the
+// node's, and inferring one from the other is what #1456 removed. What
+// a node observes is established from the node itself (#1466).
+//
+// sysRoot is the filesystem root ("/" in production, a fixture in
+// tests). A /proc it cannot read is an error, never a zero capacity.
+func HostCapacity(sysRoot string) (cpu int, memBytes int64, err error) {
+	cpuinfo, err := os.ReadFile(filepath.Join(sysRoot, "proc/cpuinfo"))
+	if err != nil {
+		return 0, 0, fmt.Errorf("read cpuinfo: %w", err)
+	}
+	meminfo, err := os.ReadFile(filepath.Join(sysRoot, "proc/meminfo"))
+	if err != nil {
+		return 0, 0, fmt.Errorf("read meminfo: %w", err)
+	}
+	return ParseProcCapacity(string(cpuinfo), string(meminfo))
+}
+
+// CheckNodeCapacity is the create-time half of the capability probe:
+// a host may satisfy every kernel precondition and still be unable to
+// host the node that was asked for.
+//
+// It refuses when the capacity a node would observe is smaller than
+// the size requested, because then no reservation makes allocatable
+// truthful — and a node that lies about its size is worse than no
+// node, since the scheduler and the autoscaler's fit simulation both
+// believe it.
+func CheckNodeCapacity(observedCPU int, observedMemBytes int64, spec NodeSpec) error {
+	if _, err := ReservedResources(observedCPU, observedMemBytes, spec); err != nil {
+		return fmt.Errorf("%w: %v", ErrContainerNodesUnsupported, err)
+	}
+	return nil
+}
+
+// DeriveContainerdTemplate turns a *generated* containerd config into
+// the template a container-class node should use: the same content
+// with the unprivileged-port/ICMP toggles flipped off.
+//
+// This is the Go-side counterpart of the sed the control-plane
+// bootstrap runs, and it exists because a **worker cannot derive its
+// own** (#1448): k3s agent writes config.toml only after it has
+// retrieved configuration from the server, so a worker that waits for
+// that file blocks on something downstream of the startup it is
+// blocking. The daemon instead derives from the control plane's
+// already-generated config — same pinned k3s version, same base shape
+// — and pushes the result before the agent first starts.
+//
+// A config that does not contain a toggle is an ERROR, not a
+// pass-through: silently shipping a template that leaves the toggles
+// enabled would restore the failure #1444 fixed, with nothing to say
+// so. #1444's loudness is the property being preserved here.
+func DeriveContainerdTemplate(generated []byte) ([]byte, error) {
+	out := string(generated)
+	for _, key := range containerdUnprivilegedToggles {
+		enabled := key + " = true"
+		disabled := key + " = false"
+		switch {
+		case strings.Contains(out, enabled):
+			out = strings.ReplaceAll(out, enabled, disabled)
+		case strings.Contains(out, disabled):
+			// Already off — nothing to flip, still correct.
+		default:
+			return nil, fmt.Errorf(
+				"generated containerd config contains no %q setting to disable; "+
+					"the config shape changed and a container node would run with pod sandboxes broken", key)
+		}
+	}
+	return []byte(out), nil
+}
+
+// ContainerKubeletArgs are the kubelet flags every container-class node
+// needs, with any additional args (e.g. a reservation) appended.
+//
+// kubelet's ContainerManager writes kernel sysctls at startup —
+// /proc/sys/kernel/panic_on_oops, /proc/sys/vm/overcommit_memory,
+// /proc/sys/kernel/panic — which an unprivileged container may not
+// touch. It fails with "Failed to start ContainerManager" and names the
+// remedy itself: the KubeletInUserNamespace feature gate makes it skip
+// those writes (#1452).
+//
+// This applies to BOTH roles: k3s server runs an embedded kubelet, so a
+// control plane fails identically to a worker without it — which is why
+// the control plane could report `ready` (its files exist) while its
+// supervisor never finished starting and no agent could ever join.
+func ContainerKubeletArgs(extra []string) []string {
+	args := []string{"--kubelet-arg=feature-gates=KubeletInUserNamespace=true"}
+	return append(args, extra...)
+}
