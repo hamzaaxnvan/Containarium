@@ -2,3 +2,13 @@
   "route": {
     "subdomain": "blog",
     "fullDomain": "blog.example.com",
+    "containerIp": "10.0.0.10",
+    "port": 8080,
+    "active": true,
+    "appId": "",
+    "appName": "",
+    "username": "alice",
+    "protocol": "ROUTE_PROTOCOL_HTTP"
+  },
+  "message": "route added"
+}
