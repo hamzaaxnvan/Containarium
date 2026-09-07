@@ -268,3 +268,138 @@ mining-behavior thresholds are backend-wide and cannot be combined with
 					pol.ThrottleAllowance, set = allowance, true
 				}
 				if flags.Changed("ttl") {
+					d, err := parsePositiveDuration("ttl", ttl)
+					if err != nil {
+						return err
+					}
+					pol.Ttl, set = d, true
+				}
+				if flags.Changed("kill-process") {
+					pol.KillProcess, set = proto.Bool(killProcess), true
+				}
+				miningFlags := false
+				for _, n := range []string{"min-cores", "min-fraction-of-limit", "window", "flow-min-age", "stratum-ports"} {
+					miningFlags = miningFlags || flags.Changed(n)
+				}
+				if flags.Changed("rule") && rule != "mining-behavior" {
+					return fmt.Errorf("invalid --rule %q: only mining-behavior has tunable thresholds", rule)
+				}
+				if miningFlags && rule != "mining-behavior" {
+					return fmt.Errorf("threshold flags require --rule mining-behavior")
+				}
+				if rule == "mining-behavior" {
+					if !miningFlags {
+						return fmt.Errorf("at least one threshold flag is required with --rule mining-behavior")
+					}
+					if container != "" {
+						return fmt.Errorf("mining-behavior thresholds are backend-wide; omit --container")
+					}
+					m := &pb.MiningBehaviorThresholds{MinCores: minCores, MinFractionOfLimit: minFraction}
+					var err error
+					if flags.Changed("window") {
+						if m.Window, err = parsePositiveDuration("window", window); err != nil {
+							return err
+						}
+					}
+					if flags.Changed("flow-min-age") {
+						if m.FlowMinAge, err = parsePositiveDuration("flow-min-age", flowMinAge); err != nil {
+							return err
+						}
+					}
+					if flags.Changed("stratum-ports") {
+						if m.StratumPorts, err = parseStratumPorts(ports); err != nil {
+							return err
+						}
+					}
+					pol.MiningBehavior, set = m, true
+				}
+				if !set {
+					return fmt.Errorf("nothing to set: give --action, --throttle-allowance, --ttl, --kill-process, --clear-override or --rule mining-behavior with thresholds")
+				}
+				req.Policy = pol
+			}
+			var out pb.SetProcessPolicyResponse
+			u := strings.TrimSuffix(serverAddr, "/") + processPolicyPath
+			if err := policyRoundTrip(http.MethodPut, u, req, &out); err != nil {
+				return err
+			}
+			w := cmd.OutOrStdout()
+			if clearOverride {
+				fmt.Fprintf(w, "Cleared override on %s.\n", container)
+			} else {
+				fmt.Fprintln(w, "Process policy updated.")
+			}
+			fmt.Fprintln(w, "Effective:")
+			writePolicyBlock(w, out.GetEffective())
+			return nil
+		},
+	}
+	f := c.Flags()
+	f.StringVar(&action, "action", "", "What a HIGH mining finding does: "+processActionAllowed)
+	f.StringVar(&allowance, "throttle-allowance", "", `limits.cpu.allowance applied by throttle, e.g. "10%" or "10ms/100ms"`)
+	f.StringVar(&ttl, "ttl", "", "How long an unreleased action stays before the TTL backstop releases it (e.g. 24h)")
+	f.BoolVar(&killProcess, "kill-process", false, "Also SIGKILL the matched process on a miner-signature finding (--kill-process=false turns it off)")
+	f.StringVar(&container, "container", "", "Write this container's override instead of the backend default")
+	f.BoolVar(&clearOverride, "clear-override", false, "Remove the container's override (requires --container)")
+	f.StringVar(&rule, "rule", "", "Tune a rule's thresholds: mining-behavior")
+	f.Float64Var(&minCores, "min-cores", 0, "mining-behavior: absolute CPU bar in cores (default 1.5)")
+	f.Float64Var(&minFraction, "min-fraction-of-limit", 0, "mining-behavior: fraction of the box's CPU limit that also trips the bar (default 0.75)")
+	f.StringVar(&window, "window", "", "mining-behavior: window the CPU mean is taken over (default 5m)")
+	f.StringVar(&flowMinAge, "flow-min-age", "", "mining-behavior: minimum age of a qualifying flow (default 3m)")
+	f.StringVar(&ports, "stratum-ports", "", "mining-behavior: comma-separated stratum destination ports")
+	return c
+}
+
+func newProcessPolicyReleaseCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "release <container>",
+		Short: "Undo the open throttle/freeze on a container and resolve its finding (admin)",
+		Long: `Restores the container's recorded CPU limit (throttle) or unfreezes it
+(freeze), marks the action released by the operator and resolves the finding.
+A miner-signature finding shared with another box of the tenant that still
+has an action open or a response queued is kept open instead, and resolved
+when the last box is released; the output says which.
+Fails with 404 when no action is open on the container.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if serverAddr == "" {
+				return errServerRequired()
+			}
+			var out pb.ReleaseProcessActionResponse
+			u := strings.TrimSuffix(serverAddr, "/") + processPolicyPath + "/release"
+			if err := policyRoundTrip(http.MethodPost, u, &pb.ReleaseProcessActionRequest{Container: args[0]}, &out); err != nil {
+				return err
+			}
+			// The box's own release record (#2820); a daemon before it
+			// sends none, and its finding's response is the release.
+			act := out.GetReleased().GetAction()
+			if out.GetReleased() == nil {
+				act = out.GetFinding().GetResponse().GetAction()
+			}
+			what := "action undone"
+			switch act {
+			case pb.ProcessAction_PROCESS_ACTION_THROTTLE:
+				what = "CPU limit restored"
+			case pb.ProcessAction_PROCESS_ACTION_FREEZE:
+				what = "container unfrozen"
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Released %s on %s: %s. %s\n", actionLabel(act), args[0], what, releasedFindingNote(&out))
+			return nil
+		},
+	}
+}
+
+// releasedFindingNote says what the release did to the finding: resolved,
+// or kept open because another box of the tenant still holds the shared
+// finding (an action open or a response queued; #2766).
+func releasedFindingNote(out *pb.ReleaseProcessActionResponse) string {
+	if out.GetFindingKeptOpen() {
+		return fmt.Sprintf("Finding #%d kept open: another box still has a response.", out.GetFinding().GetId())
+	}
+	return fmt.Sprintf("Finding #%d resolved.", out.GetFinding().GetId())
+}
+
+func init() {
+	securityProcessPolicyCmd.AddCommand(newProcessPolicyGetCmd(), newProcessPolicySetCmd(), newProcessPolicyReleaseCmd())
+	securityCmd.AddCommand(securityProcessPolicyCmd)
+}
