@@ -34,3 +34,16 @@ var _ box.TTLCapable = (*Backend)(nil)
 //     full cascade fires exactly as it does for an LXC box.
 func (b *Backend) SetTTL(ctx context.Context, ref box.BoxRef, expiresAt *time.Time) error {
 	var patch []byte
+	if expiresAt == nil {
+		// Merge-patch nulls delete the map key / clear the scalar.
+		patch = fmt.Appendf(nil, `{"metadata":{"annotations":{%q:null}},"spec":{"shutdownTime":null}}`,
+			metaAnnotationPrefix+metaTTLExpiresAtKey)
+	} else {
+		ts := expiresAt.UTC().Format(time.RFC3339)
+		patch = fmt.Appendf(nil, `{"metadata":{"annotations":{%q:%q}},"spec":{"shutdownTime":%q,"shutdownPolicy":"Retain"}}`,
+			metaAnnotationPrefix+metaTTLExpiresAtKey, ts, ts)
+	}
+	_, err := b.sandboxes.AgentsV1beta1().Sandboxes(b.namespaceFor(ref.Tenant)).
+		Patch(ctx, sandboxName, types.MergePatchType, patch, metav1.PatchOptions{})
+	return err
+}
