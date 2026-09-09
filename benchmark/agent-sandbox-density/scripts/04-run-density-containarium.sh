@@ -65,3 +65,71 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 [[ -n "$VM_NAME" ]] || die "usage: $0 --name <vm-name>"
+
+load_config
+require_vars SANDBOX_CPU_LIMIT SANDBOX_MEM_LIMIT SANDBOX_CPU_REQUEST SANDBOX_MEM_REQUEST FAILURE_STREAK_TO_STOP CREATE_TIMEOUT_SECONDS BENCH_SSH_KEY_FILE
+resolve_remote "$VM_NAME"
+
+log "sandbox profile on the Containarium side: cpu=${SANDBOX_CPU_REQUEST}/${SANDBOX_CPU_LIMIT} memory=${SANDBOX_MEM_REQUEST}/${SANDBOX_MEM_LIMIT} (request/limit, k8s-native quantities)"
+
+RESULTS_DIR="${BENCH_ROOT}/results"
+mkdir -p "$RESULTS_DIR"
+RESULTS_FILE="${RESULTS_DIR}/containarium-$(date -u +%Y%m%dT%H%M%SZ).md"
+
+RESOLVED_TAG=$(ssh_or_local "cat /tmp/containarium-resolved-tag 2>/dev/null" || true)
+[[ -n "$RESOLVED_TAG" ]] || die "couldn't read /tmp/containarium-resolved-tag — did 03-provision-containarium.sh run first?"
+AGENT_BOX_IMAGE="ghcr.io/footprintai/containarium-agent-box:${RESOLVED_TAG}"
+log "using agent-box image ${AGENT_BOX_IMAGE}"
+
+log "resolving the daemon's ClusterIP and minting an admin token (containarium list is broken on this backend — see header — so no port-forward/list dependency here)"
+CTN_CLUSTERIP=$(ssh_or_local "kubectl get svc containarium-containarium-k8s-daemon -o jsonpath='{.spec.clusterIP}'")
+[[ -n "$CTN_CLUSTERIP" ]] || die "couldn't resolve the daemon's ClusterIP — check 'kubectl get svc' on the guest"
+CTN_SERVER="http://${CTN_CLUSTERIP}:8080"
+
+JWT_SECRET=$(ssh_or_local "kubectl get secret containarium-containarium-k8s-daemon -o jsonpath='{.data.jwt-secret}' | base64 -d")
+[[ -n "$JWT_SECRET" ]] || die "failed to read the daemon's jwt-secret — check helm install succeeded (03-provision-containarium.sh)"
+CTN_TOKEN=$(ssh_or_local "containarium token generate --username bench-admin --roles admin --expiry 6h --secret '${JWT_SECRET}' --raw")
+[[ -n "$CTN_TOKEN" ]] || die "failed to mint a token"
+
+create_box() {
+	local name="$1"
+	ssh_or_local "containarium create ${name} --no-ssh-key --cpu ${SANDBOX_CPU_LIMIT} --memory ${SANDBOX_MEM_LIMIT} --cpu-request ${SANDBOX_CPU_REQUEST} --memory-request ${SANDBOX_MEM_REQUEST} --image ${AGENT_BOX_IMAGE} --server ${CTN_SERVER} --http --token ${CTN_TOKEN}" >/dev/null 2>&1
+}
+
+box_ready() {
+	local name="$1"
+	local phase ready
+	phase=$(ssh_or_local "kubectl get pod -n tenant-${name} box -o jsonpath='{.status.phase}' 2>/dev/null" || true)
+	ready=$(ssh_or_local "kubectl get pod -n tenant-${name} box -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null" || true)
+	[[ "$phase" == "Running" && "$ready" == "true" ]]
+}
+
+cleanup_box() {
+	local name="$1"
+	ssh_or_local "containarium delete ${name} --force --server ${CTN_SERVER} --http --token ${CTN_TOKEN}" >/dev/null 2>&1 || true
+}
+
+resource_snapshot "before" "$RESULTS_FILE"
+{
+	echo "profile: cpu ${SANDBOX_CPU_LIMIT}, mem ${SANDBOX_MEM_LIMIT} (k8s-native, request==limit)"
+	echo "image: ${AGENT_BOX_IMAGE}"
+	echo "runtimeClass: see 03-provision-containarium.sh GVISOR_RUNTIME_CLASS"
+	echo
+} >>"$RESULTS_FILE"
+
+run_density_loop "sbdens" create_box box_ready cleanup_box "$RESULTS_FILE"
+
+resource_snapshot "after (${DENSITY_RESULT_COUNT} ready)" "$RESULTS_FILE"
+{
+	echo "kubectl top nodes (if metrics-server installed):"
+	echo '```'
+	ssh_or_local "kubectl top nodes 2>&1" || true
+	echo '```'
+	echo "pods by RuntimeClass (sanity check that boxes really landed on gVisor):"
+	echo '```'
+	ssh_or_local "kubectl get pods -A -o custom-columns=NAME:.metadata.name,RUNTIMECLASS:.spec.runtimeClassName 2>&1" || true
+	echo '```'
+} >>"$RESULTS_FILE"
+
+log "Containarium (gVisor) experiment group result: ${DENSITY_RESULT_COUNT} boxes reached RUNNING"
+log "full log: ${RESULTS_FILE}"
