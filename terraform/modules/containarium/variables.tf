@@ -199,3 +199,405 @@ variable "instance_tags" {
 # -----------------------------------------------------------------------------
 
 variable "admin_ssh_keys" {
+  description = "Map of admin users to their SSH public keys"
+  type        = map(string)
+  default     = {}
+}
+
+variable "allowed_ssh_sources" {
+  description = <<-EOT
+    CIDR blocks allowed to reach user-facing services on the
+    sentinel: sshpiper on :22 (the per-tenant SSH proxy), plus
+    HTTP :80 and HTTPS :443. Defaults to 0.0.0.0/0 because the
+    whole point of these services is to accept user traffic
+    from anywhere; sshpiper has fail2ban in front, and 80/443
+    front Caddy which handles its own TLS termination.
+
+    For operator-only ports (jump-server SSH :22, gRPC :50051,
+    sentinel management SSH :2222) use `allowed_management_sources`
+    instead — that defaults to VPC-only so operator surfaces
+    aren't world-reachable by accident. Audit C-HIGH-3.
+  EOT
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "allowed_management_sources" {
+  description = <<-EOT
+    CIDR blocks allowed to reach operator-only surfaces: jump-
+    server SSH :22, gRPC :50051, and sentinel management SSH
+    :2222. Defaults to RFC-1918 (10/8, 172.16/12, 192.168/16) so
+    operators reach them via VPN / IAP / bastion rather than via
+    open internet. Set to a narrower CIDR if your operator
+    network is more specific, or to ["0.0.0.0/0"] only when you
+    have a documented reason and other compensating controls.
+
+    Tracks audit finding C-HIGH-3.
+  EOT
+  type        = list(string)
+  default     = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+}
+
+variable "fail2ban_whitelist_cidr" {
+  description = "CIDR to whitelist in fail2ban (e.g., 10.128.0.0/9 for GCE default, 10.0.0.0/8 for VPC)"
+  type        = string
+  default     = "10.0.0.0/8"
+}
+
+variable "ssh_authz_keys_command" {
+  description = "Install sshd AuthorizedKeysCommand on the jump host so direct SSH logins (not through the sentinel) are checked against the daemon's SSH authorization, and start the daemon with --ssh-authz-keys-command (#2527). Off by default."
+  type        = bool
+  default     = false
+}
+
+variable "ssh_authz_keys_enforce" {
+  description = "With ssh_authz_keys_command: when the daemon cannot be asked, the AuthorizedKeysCommand exits 1 (enforce) instead of 0 (audit-only)."
+  type        = bool
+  default     = false
+}
+
+variable "jwt_secret" {
+  description = "JWT secret for REST API authentication. If empty, auto-generated at boot."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+# -----------------------------------------------------------------------------
+# Phase 0.4 / 0.5 — sentinel↔daemon authentication and peer-CA
+# -----------------------------------------------------------------------------
+#
+# `sentinel_auth_secret` is the shared HMAC secret used by the daemon
+# to sign calls to the sentinel's /authorized-keys, /certs,
+# /sentinel/ca, and /sentinel/peer-cert endpoints (Phase 0.4) and by
+# the sentinel to sign the /sentinel/peers response (Phase 0.6).
+# When this is empty, the sentinel falls back to pre-Phase-0
+# behavior — unauthenticated endpoints + unsigned discovery — which
+# matches the audit-vulnerable baseline (findings A-CRIT-4, C-CRIT-2).
+# In production you want this set.
+#
+# Generate with:
+#   openssl rand -base64 48
+#
+# Must be at least 32 bytes after any encoding. Both the sentinel
+# and the spot/daemon VM see the same value via metadata.
+variable "sentinel_auth_secret" {
+  description = "Shared HMAC secret between sentinel and daemons (Phase 0.4/0.5/0.6). 32+ bytes. Empty = falls back to pre-Phase-0 behavior with the audit-known vulnerabilities."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+# `sentinel_admin_secret` gates POST /sentinel/tunnel-tokens — the runtime
+# path that lets an authorized caller (a cloud control plane's token-issuance
+# service, or an operator) register a freshly-minted tunnel-join token on an
+# already-running sentinel without a restart. Deliberately a SEPARATE secret
+# from sentinel_auth_secret: registering a brand-new node into a pool is a
+# materially bigger capability than the intra-cluster keysync/certsync
+# operations sentinel_auth_secret gates, so a compromised daemon holding only
+# the cluster-wide HMAC secret shouldn't also be able to mint tunnel access.
+#
+# When empty, the sentinel's TunnelTokenRegisterHandler stays disabled (its
+# own default, safe state) — a freshly-minted BYOC join token then has no way
+# to become valid on the sentinel except a full sentinel restart with
+# --tunnel-token-policy, which is exactly the gap that leaves BYOC hosts
+# unable to reconnect after enrollment (Containarium#935/#936).
+#
+# Generate with:
+#   openssl rand -base64 48
+#
+# Must be at least 32 bytes after any encoding (sentinel.SentinelMinSecretLen).
+variable "sentinel_admin_secret" {
+  description = "Shared HMAC secret gating POST /sentinel/tunnel-tokens (dynamic BYOC join-token registration). 32+ bytes. Empty = the endpoint stays disabled and freshly-minted join tokens are never registered with the sentinel."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+# `ssh_session_log_retention_days` bounds the sentinel's LOCAL copy of the SSH
+# session records (/var/log/containarium/ssh-sessions.jsonl, one JSONL line per
+# accepted/closed session) via logrotate (#2415, ISO 27001 A.8.15). The
+# authoritative copy is the tamper-evident audit chain on each backend, which
+# has its own retention; this value is how long the file on the sentinel VM
+# itself is kept after rotation.
+variable "ssh_session_log_retention_days" {
+  description = "Days of rotated SSH session records to keep on the sentinel VM (logrotate `rotate N` with `daily`). Default 90."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.ssh_session_log_retention_days >= 1 && var.ssh_session_log_retention_days == floor(var.ssh_session_log_retention_days)
+    error_message = "ssh_session_log_retention_days must be a whole number of days, at least 1."
+  }
+}
+
+# `enable_peer_mtls` turns on the Phase 0.5 peer-CA path. When true,
+# the sentinel auto-generates an RSA-4096 CA private key at
+# `/etc/containarium/ca.key` on first boot, mints itself a server
+# cert, and exposes the HTTPS binary-server listener on port 8889
+# (in addition to the existing HTTP listener on 8888). Daemons
+# fetch a leaf cert from /sentinel/peer-cert at startup and use it
+# for HTTPS peer-to-peer. Defaults to false during rollout — flip
+# to true once the daemon binaries on every peer support the flow.
+variable "enable_peer_mtls" {
+  description = "Enable Phase 0.5 peer-to-peer mTLS via the sentinel-managed CA. Requires sentinel_auth_secret to also be set."
+  type        = bool
+  default     = false
+}
+
+# -----------------------------------------------------------------------------
+# Conditional Features (production vs dev)
+# -----------------------------------------------------------------------------
+
+variable "enable_iap_firewall" {
+  description = "Create IAP SSH firewall rule (needed in VPC environments)"
+  type        = bool
+  default     = false
+}
+
+variable "spot_vm_external_ip" {
+  description = "Give the spot VM an ephemeral external IP. Default false: in sentinel mode the spot must be private (inbound via the sentinel, egress via Cloud NAT) — a public IP on the backend is an unintended exposure. Set true only for a sentinel-less / debug deployment that needs the spot directly reachable. (Non-sentinel deployments ignore this — they always get the static IP.)"
+  type        = bool
+  default     = false
+}
+
+# -----------------------------------------------------------------------------
+# Incus & Software
+# -----------------------------------------------------------------------------
+
+variable "incus_version" {
+  description = "Incus version to install (latest stable if empty)"
+  type        = string
+  default     = ""
+}
+
+variable "enable_monitoring" {
+  description = "Enable GCP monitoring and logging"
+  type        = bool
+  default     = true
+}
+
+# -----------------------------------------------------------------------------
+# Service Account & Labels
+# -----------------------------------------------------------------------------
+
+variable "service_account_email" {
+  description = "Service account email for the instance (uses default if null)"
+  type        = string
+  default     = null
+}
+
+variable "labels" {
+  description = "Labels to apply to resources"
+  type        = map(string)
+  default = {
+    managed_by = "terraform"
+    project    = "containarium"
+  }
+}
+
+# -----------------------------------------------------------------------------
+# DNS (optional)
+# -----------------------------------------------------------------------------
+
+variable "dns_zone_name" {
+  description = "Cloud DNS zone name for jump server DNS record (optional)"
+  type        = string
+  default     = ""
+}
+
+variable "dns_zone_domain" {
+  description = "Cloud DNS zone domain (e.g., example.com)"
+  type        = string
+  default     = ""
+}
+
+# -----------------------------------------------------------------------------
+# Spot Instance & Persistent Disk
+# -----------------------------------------------------------------------------
+
+variable "use_spot_instance" {
+  description = "Use spot (preemptible) instance for cost savings (60-91% cheaper)"
+  type        = bool
+  default     = false
+}
+
+variable "use_persistent_disk" {
+  description = "Use separate persistent disk for Incus data (survives spot termination)"
+  type        = bool
+  default     = true
+}
+
+variable "data_disk_size" {
+  description = "Size of persistent data disk for containers (GB)"
+  type        = number
+  default     = 500
+
+  validation {
+    condition     = var.data_disk_size >= 100 && var.data_disk_size <= 10000
+    error_message = "Data disk size must be between 100 and 10000 GB"
+  }
+}
+
+variable "data_disk_type" {
+  description = "Type of persistent data disk"
+  type        = string
+  default     = "pd-balanced"
+
+  validation {
+    condition     = contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced", "hyperdisk-throughput"], var.data_disk_type)
+    error_message = "Data disk type must be pd-standard, pd-balanced, pd-ssd, hyperdisk-balanced, or hyperdisk-throughput"
+  }
+}
+
+variable "enable_disk_snapshots" {
+  description = "Enable automated daily snapshots of persistent disk"
+  type        = bool
+  default     = true
+}
+
+# -----------------------------------------------------------------------------
+# Containarium Daemon
+# -----------------------------------------------------------------------------
+
+variable "containarium_version" {
+  description = <<-EOT
+    Containarium version to install. The startup script reconciles the
+    installed binary to this version on every boot (substring match against
+    `containarium version`), so bumping it upgrades the daemon — but note a
+    metadata-only `terraform apply` does NOT restart the instance, so the new
+    version takes effect on the next reboot/preemption-recovery (or force one
+    with `terraform apply -replace=<instance>`). On a sentinel-HA deployment a
+    recovered workhorse declines a sentinel-served binary whose version doesn't
+    match this value (avoids silent downgrade); upgrade the sentinel too so its
+    :8888 server hands out the matching version. See #385 and the module README.
+  EOT
+  type        = string
+  default     = "dev"
+}
+
+variable "containarium_binary_url" {
+  description = "URL to download containarium binary (empty = not installed via URL)"
+  type        = string
+  default     = ""
+}
+
+variable "enable_containarium_daemon" {
+  description = "Enable Containarium gRPC daemon service"
+  type        = bool
+  default     = true
+}
+
+# -----------------------------------------------------------------------------
+# Sentinel HA
+# -----------------------------------------------------------------------------
+
+variable "enable_sentinel" {
+  description = "Enable sentinel HA proxy for spot instance recovery (requires use_spot_instance=true)"
+  type        = bool
+  default     = false
+}
+
+variable "sentinel_machine_type" {
+  description = "Machine type for the sentinel VM (e2-micro is free tier). Trim bloat via startup-sentinel.sh to keep the 1 GB footprint manageable (#770)."
+  type        = string
+  default     = "e2-micro"
+}
+
+variable "sentinel_boot_disk_size" {
+  description = "Boot disk size for sentinel VM in GB (up to 30GB for free tier)"
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.sentinel_boot_disk_size >= 10 && var.sentinel_boot_disk_size <= 100
+    error_message = "Sentinel boot disk size must be between 10 and 100 GB"
+  }
+}
+
+variable "spot_vm_name_suffix" {
+  description = "Suffix appended to instance_name for the spot VM when sentinel is enabled (e.g., '-spot' gives 'instance-name-spot'). Empty string uses instance_name as-is."
+  type        = string
+  default     = ""
+}
+
+# -----------------------------------------------------------------------------
+# App hosting + PROXY v2 (real-client-IP preservation)
+#
+# These four variables form one logical feature: serving customer apps on
+# sentinel-fronted hostnames AND making sure the apps see real client IPs
+# instead of the sentinel/bridge gateway. They're independent (you can
+# enable app-hosting without PROXY v2 if you don't care about visitor IPs,
+# or PROXY v2 alone if you have your own routing on top) but in practice
+# the demo and prod clusters want both.
+# -----------------------------------------------------------------------------
+
+variable "enable_app_hosting" {
+  description = "Enable Containarium's app-hosting subsystem (Caddy reverse proxy, ACME, route store). Required for `expose_port` to provision public hostnames automatically."
+  type        = bool
+  default     = false
+}
+
+variable "base_domain" {
+  description = "Base domain for app-hosting. When set with enable_app_hosting=true, the daemon registers the management route at this hostname and Caddy ACMEs a cert for it; containers exposed via expose_port get subdomains of this base (e.g. blog.<base_domain>). Empty disables hostname-aware routing."
+  type        = string
+  default     = ""
+}
+
+variable "enable_proxy_protocol" {
+  description = "Have the sentinel emit PROXY v2 headers to the backend and have the backend's Caddy parse them so the real client IP propagates as X-Forwarded-For. In simple-proxy mode (single-spot-VM deployments) this also switches the sentinel from kernel iptables DNAT to a userspace TCP forwarder — iptables can't inject the header. Requires Containarium v0.16.7+ on both sentinel and backend."
+  type        = bool
+  default     = false
+}
+
+variable "proxy_protocol_trusted_cidrs" {
+  description = "Additional CIDR blocks the backend's Caddy will trust as sources of PROXY v2 frames — typically the sentinel's internal IP plus loopback. The incus bridge gateway (10.0.3.1/32) is appended automatically when enable_proxy_protocol=true and does NOT need listing here: Caddy runs inside the core-caddy LXC, so frames cross the bridge and arrive from 10.0.3.1 rather than the sentinel's own address, and a list without it silently drops every client IP. Wildcard 0.0.0.0/0 is rejected at startup to prevent IP spoofing."
+  type        = list(string)
+  default     = []
+}
+
+variable "zfs_encryption_keyfile" {
+  description = "Absolute path on the backend VM for the ZFS native encryption keyfile (e.g. /etc/containarium/zfs.key). When non-empty, the data-disk ZFS pool is created with encryption=on and reads the 32-byte raw key from this path on every boot. The keyfile is generated automatically on first boot if missing. Operators MUST back this file up off-host — losing it makes the pool unrecoverable. Empty (default) = no ZFS-layer encryption, relies on PD/CMEK only. See docs/SECURITY-ENCRYPTION-AT-REST.md."
+  type        = string
+  default     = ""
+}
+
+# Anonymous-box door (`ssh new.<domain>`, docs/architecture/ssh-new-anonymous-box.md).
+# Both empty (default) = no door: no second sshpiperd unit is installed, and
+# an already-installed one is disabled and removed on the next reconcile.
+variable "anon_door_addr" {
+  description = "Listen address for the anonymous-box door's own sshpiperd, as host:port. Production uses a dedicated IP on :22 (`<door ip>:22`, with new.<domain> pointing at it); a dev sentinel with no spare IP uses a second port on the existing one (`0.0.0.0:2022`). Empty = door disabled."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.anon_door_addr == "" || can(regex("^[^:]+:[0-9]+$", var.anon_door_addr))
+    error_message = "anon_door_addr must be host:port (e.g. 0.0.0.0:2022) or empty."
+  }
+}
+
+variable "anon_daemon_url" {
+  description = "REST base URL of the anon-pool daemon the door creates boxes on (the dedicated pool=anon backend started with CONTAINARIUM_ANON_DOOR=enable), e.g. http://<private ip>:8080. Required when anon_door_addr is set."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.anon_daemon_url == "" || can(regex("^https?://", var.anon_daemon_url))
+    error_message = "anon_daemon_url must start with http:// or https://, or be empty."
+  }
+}
+
+# Deprecated and ignored (#2734): the daemon no longer writes a bridge DNS
+# record, so there is nothing to carve out. Kept so existing module calls that
+# set it still plan; removed together with the daemon flag in #2735.
+variable "dns_passthrough_hosts" {
+  description = "Deprecated, ignored (#2734). Was: hostnames carved out of the bridge DNS record (--dns-passthrough-host). The daemon no longer writes that record."
+  type        = list(string)
+  default     = []
+}
+
+variable "ssh_host" {
+  description = "The sentinel's public SSH hostname (rendered as --ssh-host): surfaced to clients as the host to dial. Empty = direct mode."
+  type        = string
+  default     = ""
+}

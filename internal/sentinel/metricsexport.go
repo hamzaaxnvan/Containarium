@@ -77,3 +77,161 @@ type MetricsExportOptions struct {
 	IntervalSeconds int32
 }
 
+// clampExportInterval enforces the same per-sample billing floor the daemon's
+// collector uses. One policy, not two.
+func clampExportInterval(seconds int32) int32 {
+	if seconds < cloudexport.MinIntervalSeconds {
+		return cloudexport.MinIntervalSeconds
+	}
+	return seconds
+}
+
+// StartMetricsExport begins pushing the sentinel's series and returns a stop
+// function that flushes and shuts the pipeline down.
+func StartMetricsExport(m *Manager, opts MetricsExportOptions) (func(context.Context) error, error) {
+	if m == nil {
+		return nil, fmt.Errorf("metrics export: nil manager")
+	}
+	if opts.Exporter == nil {
+		return nil, fmt.Errorf("metrics export: no exporter configured — nothing to push to")
+	}
+
+	interval := time.Duration(clampExportInterval(opts.IntervalSeconds)) * time.Second
+	reader := sdkmetric.NewPeriodicReader(opts.Exporter, sdkmetric.WithInterval(interval))
+
+	providerOpts := []sdkmetric.Option{sdkmetric.WithReader(reader)}
+	if opts.Resource != nil {
+		providerOpts = append(providerOpts, sdkmetric.WithResource(opts.Resource))
+	}
+	provider := sdkmetric.NewMeterProvider(providerOpts...)
+
+	if err := registerSentinelInstruments(provider.Meter(sentinelMeterName), m, opts.SentinelID); err != nil {
+		// Shut the provider down rather than leaking its reader goroutine on
+		// a registration failure.
+		_ = provider.Shutdown(context.Background())
+		return nil, fmt.Errorf("metrics export: %w", err)
+	}
+
+	return provider.Shutdown, nil
+}
+
+// registerSentinelInstruments wires the observable instruments to the
+// Manager. Split out so tests can drive the real registration through a
+// ManualReader without an exporter or a network.
+//
+// All instruments are observable (async): every value is "read the current
+// state at collection time", which is exactly what an async callback is for,
+// and it keeps the hot paths (health checks, failover) free of metric writes.
+func registerSentinelInstruments(meter metric.Meter, m *Manager, sentinelID string) error {
+	state, err := meter.Int64ObservableGauge(metricSentinelState,
+		metric.WithDescription("Backend serving state: 1 proxy (up), 0 maintenance (down)."))
+	if err != nil {
+		return err
+	}
+	preempted, err := meter.Int64ObservableCounter(metricSentinelPreempted,
+		metric.WithDescription("Total spot-VM preemption events observed."))
+	if err != nil {
+		return err
+	}
+	recovered, err := meter.Int64ObservableCounter(metricSentinelRecovered,
+		metric.WithDescription("Total returns to proxy after an outage."))
+	if err != nil {
+		return err
+	}
+	failover, err := meter.Int64ObservableCounter(metricSentinelFailover,
+		metric.WithDescription("Total primary-backend failovers, including those absorbed without entering maintenance."))
+	if err != nil {
+		return err
+	}
+	backendHealthy, err := meter.Int64ObservableGauge(metricSentinelBackendHealthy,
+		metric.WithDescription("Per-backend health as seen by the sentinel: 1 healthy, 0 unhealthy."))
+	if err != nil {
+		return err
+	}
+	primaryPreferred, err := meter.Int64ObservableGauge(metricSentinelPrimaryPref,
+		metric.WithDescription("1 if the active primary is the best-priority registered backend, 0 if the sentinel is on a fallback."))
+	if err != nil {
+		return err
+	}
+	rss, err := meter.Int64ObservableGauge(metricSentinelRSS,
+		metric.WithDescription("Sentinel process resident set size."),
+		metric.WithUnit("By"))
+	if err != nil {
+		return err
+	}
+	goroutines, err := meter.Int64ObservableGauge(metricSentinelGoroutines,
+		metric.WithDescription("Goroutines in the sentinel process."))
+	if err != nil {
+		return err
+	}
+	openFDs, err := meter.Int64ObservableGauge(metricSentinelOpenFDs,
+		metric.WithDescription("Open file descriptors in the sentinel process."))
+	if err != nil {
+		return err
+	}
+
+	base := []attribute.KeyValue{attribute.String("sentinel", sentinelID)}
+	baseSet := metric.WithAttributes(base...)
+
+	_, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		stateVal := int64(0)
+		if m.CurrentState() == StateProxy {
+			stateVal = 1
+		}
+		o.ObserveInt64(state, stateVal, baseSet)
+		o.ObserveInt64(preempted, int64(m.PreemptCount()), baseSet)
+		o.ObserveInt64(recovered, int64(m.RecoveredCount()), baseSet)
+		o.ObserveInt64(failover, m.FailoverCount(), baseSet)
+
+		for id, healthy := range m.BackendHealthSnapshot() {
+			v := int64(0)
+			if healthy {
+				v = 1
+			}
+			o.ObserveInt64(backendHealthy, v, metric.WithAttributes(
+				append(append([]attribute.KeyValue{}, base...), attribute.String("backend", id))...))
+		}
+
+		// 0 for longer than a few minutes means stuck on a fallback (#2476);
+		// the alert this series exists for.
+		preferred := int64(0)
+		if m.primaryIsPreferred() {
+			preferred = 1
+		}
+		o.ObserveInt64(primaryPreferred, preferred, baseSet)
+
+		rt := collectRuntimeStats()
+		o.ObserveInt64(goroutines, int64(rt.Goroutines), baseSet)
+
+		// Absent, not zero, when /proc is unreadable — the same rule as the
+		// /metrics rendering (#1351). A zero would read as "this process uses
+		// no memory" and silence the alert this exists to enable, and unlike
+		// the text endpoint that zero would be persisted in Cloud Monitoring
+		// forever.
+		if ps := readProcStats(); ps.Available {
+			o.ObserveInt64(rss, safeInt64(ps.RSSBytes), baseSet)
+			if ps.OpenFDs > 0 {
+				o.ObserveInt64(openFDs, safeInt64(ps.OpenFDs), baseSet)
+			}
+		}
+		return nil
+	}, state, preempted, recovered, failover, backendHealthy, primaryPreferred, rss, goroutines, openFDs)
+
+	return err
+}
+
+// safeInt64 converts a uint64 counter to the int64 the OTel API takes,
+// saturating rather than wrapping.
+//
+// Guarded rather than suppressing gosec's G115: a value above 2^63 would wrap
+// to a NEGATIVE observation, and a negative resident-memory datapoint
+// persisted in Cloud Monitoring is worse than a clamped one — it would break
+// any alert expression built on the series. Real RSS and fd counts are nowhere
+// near this, which is exactly why the wrap would be baffling if it ever
+// happened.
+func safeInt64(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
