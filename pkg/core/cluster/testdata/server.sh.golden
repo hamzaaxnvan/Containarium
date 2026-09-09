@@ -29,3 +29,11 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now k3s.service
+
+# Bootstrap is done when the admin kubeconfig and the join token exist.
+i=0
+until [ -s /etc/rancher/k3s/k3s.yaml ] && [ -s /var/lib/rancher/k3s/server/node-token ]; do
+  i=$((i+1))
+  [ "$i" -gt 120 ] && { echo "k3s server did not come up" >&2; exit 1; }
+  sleep 2
+done
