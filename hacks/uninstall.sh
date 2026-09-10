@@ -157,3 +157,163 @@ remove_data_directory() {
     else
         log_info "Data directory not found"
     fi
+}
+
+remove_firewall_rules() {
+    log_info "Removing firewall rules..."
+
+    if command -v ufw &> /dev/null; then
+        # Remove Containarium-specific rules
+        ufw delete allow 50051/tcp 2>/dev/null || true
+        ufw delete allow 8080/tcp 2>/dev/null || true
+        log_success "Firewall rules removed"
+    else
+        log_info "UFW not installed, skipping firewall cleanup"
+    fi
+}
+
+list_containers() {
+    if command -v incus &> /dev/null; then
+        CONTAINER_COUNT=$(incus list -f json | jq '. | length' 2>/dev/null || echo "0")
+        if [ "$CONTAINER_COUNT" -gt 0 ]; then
+            log_warn "Found $CONTAINER_COUNT existing container(s)"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+delete_all_containers() {
+    log_info "Deleting all containers..."
+
+    if ! command -v incus &> /dev/null; then
+        log_info "Incus not found, skipping container cleanup"
+        return
+    fi
+
+    # Get list of containers
+    CONTAINERS=$(incus list -f json | jq -r '.[].name' 2>/dev/null || echo "")
+
+    if [ -z "$CONTAINERS" ]; then
+        log_info "No containers found"
+        return
+    fi
+
+    for container in $CONTAINERS; do
+        log_info "Deleting container: $container"
+        incus delete "$container" --force 2>/dev/null || true
+    done
+
+    log_success "All containers deleted"
+}
+
+remove_incus() {
+    log_info "Removing Incus..."
+
+    # Stop Incus service
+    if systemctl is-active --quiet incus; then
+        systemctl stop incus
+    fi
+
+    # Remove Incus packages
+    apt-get remove -y incus incus-tools incus-client 2>/dev/null || true
+    apt-get autoremove -y 2>/dev/null || true
+
+    # Remove Zabbly repository
+    rm -f /etc/apt/sources.list.d/zabbly-incus-stable.list
+    rm -f /usr/share/keyrings/zabbly-incus.gpg
+
+    # Remove Incus data (if purging all)
+    if [ "$PURGE_ALL" = true ]; then
+        rm -rf /var/lib/incus
+        rm -rf /var/log/incus
+    fi
+
+    log_success "Incus removed"
+}
+
+main() {
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo "  Containarium Uninstallation Script"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+
+    check_root
+
+    # Show what will be removed
+    echo "The following will be removed:"
+    echo "  • Containarium binary"
+    echo "  • Containarium systemd service"
+    echo "  • Containarium configuration files"
+    echo "  • Containarium data directory"
+    echo "  • Firewall rules (gRPC, REST API)"
+
+    if [ "$PURGE_ALL" = true ]; then
+        echo "  • All LXC containers (⚠️  DATA LOSS)"
+        echo "  • Incus installation"
+        echo "  • Incus data directory (⚠️  DATA LOSS)"
+    elif [ "$PURGE_INCUS" = true ]; then
+        echo "  • Incus installation (containers preserved)"
+    fi
+
+    echo ""
+
+    # Confirm action based on mode
+    if [ "$PURGE_ALL" = true ]; then
+        if list_containers; then
+            confirm_action "This will DELETE ALL CONTAINERS and all their data! This action CANNOT be undone!"
+        else
+            confirm_action "This will remove Containarium and Incus"
+        fi
+    elif [ "$PURGE_INCUS" = true ]; then
+        confirm_action "This will remove Containarium and Incus (but preserve existing containers)"
+    else
+        if list_containers; then
+            log_info "Existing containers will be preserved"
+        fi
+        confirm_action "This will remove Containarium (but keep Incus and containers)"
+    fi
+
+    # Remove Containarium
+    stop_containarium_service
+    remove_systemd_service
+    remove_containarium_binary
+    remove_config_files
+    remove_data_directory
+    remove_firewall_rules
+
+    # Remove containers if requested
+    if [ "$PURGE_ALL" = true ]; then
+        delete_all_containers
+    fi
+
+    # Remove Incus if requested
+    if [ "$PURGE_INCUS" = true ]; then
+        remove_incus
+    fi
+
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
+    echo -e "${GREEN}  ✅ Uninstallation Complete${NC}"
+    echo "═══════════════════════════════════════════════════════════════"
+    echo ""
+
+    if [ "$PURGE_INCUS" = false ]; then
+        echo "ℹ️  Incus is still installed. To remove it, run:"
+        echo "   sudo ./hacks/uninstall.sh --purge-incus"
+        echo ""
+    fi
+
+    if [ "$PURGE_ALL" = false ] && list_containers; then
+        echo "ℹ️  Existing containers are preserved but no longer managed."
+        echo "   You can view them with: incus list"
+        echo ""
+    fi
+
+    echo "To reinstall Containarium, run:"
+    echo "   sudo ./hacks/install.sh"
+    echo ""
+}
+
+main "$@"
