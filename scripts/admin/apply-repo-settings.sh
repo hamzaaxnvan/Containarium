@@ -170,3 +170,90 @@ desired_state() {
 protection_body() {
   local prot=$1
   jq '
+    if (.restrictions != null) then error("live protection has push restrictions; set them by hand") else . end
+    | if (.required_pull_request_reviews.dismissal_restrictions != null
+          or .required_pull_request_reviews.bypass_pull_request_allowances != null)
+      then error("live protection has dismissal/bypass lists; set the review rule by hand") else . end
+    | {
+        required_status_checks: (if .required_status_checks == null then null else {
+            strict: .required_status_checks.strict,
+            checks: [.required_status_checks.checks[] | {context, app_id}]
+          } end),
+        enforce_admins: .enforce_admins.enabled,
+        required_pull_request_reviews: {
+          dismiss_stale_reviews: true,
+          require_code_owner_reviews: true,
+          required_approving_review_count: ([.required_pull_request_reviews.required_approving_review_count // 0, 1] | max),
+          require_last_push_approval: (.required_pull_request_reviews.require_last_push_approval // false)
+        },
+        restrictions: null,
+        required_linear_history: (.required_linear_history.enabled // false),
+        allow_force_pushes: (.allow_force_pushes.enabled // false),
+        allow_deletions: (.allow_deletions.enabled // false),
+        block_creations: (.block_creations.enabled // false),
+        required_conversation_resolution: true,
+        lock_branch: (.lock_branch.enabled // false),
+        allow_fork_syncing: (.allow_fork_syncing.enabled // false)
+      }' <<<"$prot"
+}
+
+show_diff() {
+  local before=$1 after=$2
+  diff -u <(jq -S . <<<"$before") <(jq -S . <<<"$after") \
+    --label "$3" --label "$4" || true
+}
+
+before=$(read_state)
+desired=$(desired_state "$before")
+
+echo "== Before (live read-back, $REPO, branch $BRANCH) =="
+jq -S . <<<"$before"
+echo
+echo "== Planned change (live -> desired) =="
+if [[ "$before" == "$desired" ]]; then echo "(none: already compliant)"; else show_diff "$before" "$desired" live desired; fi
+echo
+
+if [[ $APPLY -eq 0 ]]; then
+  echo "DRY RUN: nothing was written. Re-run with --apply (repository admin) to apply."
+  exit 0
+fi
+
+echo "== Applying =="
+prot=$(api_get "repos/$REPO/branches/$BRANCH/protection")
+body=$(protection_body "$prot")
+api_send PUT "repos/$REPO/branches/$BRANCH/protection" "$body"
+echo "branch protection: written"
+
+api_send PUT "repos/$REPO/actions/permissions" \
+  '{"enabled":true,"allowed_actions":"selected","sha_pinning_required":true}'
+patterns=$(printf '%s\n' "${ALLOWED_PATTERNS[@]}" | jq -R . | jq -s .)
+api_send PUT "repos/$REPO/actions/permissions/selected-actions" \
+  "$(jq -n --argjson p "$patterns" '{github_owned_allowed:true, verified_allowed:false, patterns_allowed:$p}')"
+api_send PUT "repos/$REPO/actions/permissions/workflow" \
+  '{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}'
+echo "actions permissions: written"
+
+api_send PATCH "repos/$REPO" \
+  '{"security_and_analysis":{"secret_scanning":{"status":"enabled"},"secret_scanning_push_protection":{"status":"enabled"}}}'
+api_send PUT "repos/$REPO/vulnerability-alerts"
+api_send PUT "repos/$REPO/automated-security-fixes"
+echo "security settings: written"
+echo
+
+after=$(read_state)
+echo "== After (live read-back) =="
+jq -S . <<<"$after"
+echo
+
+rc=0
+if [[ "$after" != "$desired" ]]; then
+  echo "MISMATCH: read-back differs from desired (--- desired, +++ read-back):"; show_diff "$desired" "$after" desired read-back; rc=1
+fi
+# Required checks and enforce_admins must be exactly what they were.
+for k in contexts strict enforce_admins; do
+  if [[ "$(jq -c ".branch_protection.$k" <<<"$before")" != "$(jq -c ".branch_protection.$k" <<<"$after")" ]]; then
+    echo "REGRESSION: branch_protection.$k changed"; rc=1
+  fi
+done
+[[ $rc -eq 0 ]] && echo "OK: every setting reads back as desired; contexts, strict and enforce_admins unchanged."
+exit "$rc"
