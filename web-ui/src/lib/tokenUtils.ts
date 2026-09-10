@@ -4,3 +4,5 @@ export function isAdminToken(token: string): boolean {
     return Array.isArray(payload.roles) && payload.roles.includes('admin');
   } catch {
     return false;
+  }
+}
