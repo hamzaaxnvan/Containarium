@@ -65,3 +65,138 @@ func runSyncAccounts(cmd *cobra.Command, args []string) error {
 	// Owner accounts: restore the host jump-server user for every persisted
 	// container. The shared helper classifies "no extractable key" (benign —
 	// infra/CP/workspace boxes) separately from real create failures, so the
+	// command no longer fails-closed on the former. See #1010.
+	res, err := mgr.SyncOwnerAccounts(container.OwnerSyncOptions{
+		Force:    syncForce,
+		DryRun:   syncDryRun,
+		Verbose:  verbose,
+		OnlyUser: syncOnlyUser,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to sync owner accounts: %w", err)
+	}
+
+	// --user naming a container that does not exist must not look like success.
+	// The sweep would report "0 restored, N skipped" and exit 0, which reads as
+	// "nothing needed doing" when it actually means "you typo'd the box name".
+	if syncOnlyUser != "" && len(res.Restored) == 0 && len(res.NoKey) == 0 && len(res.Failed) == 0 {
+		if !container.UserExists(syncOnlyUser) {
+			return fmt.Errorf("no container found for --user %q (expected an incus container named %q)",
+				syncOnlyUser, syncOnlyUser+"-container")
+		}
+		fmt.Printf("  Account for %s already exists and is up to date (use --force to recreate)\n", syncOnlyUser)
+	}
+	for _, u := range res.Restored {
+		// Always print the key COUNT. A box whose container holds three keys
+		// coming back with one is the #1477 truncation, and without this line
+		// it stays invisible until somebody's login is refused.
+		keys := res.KeysRestored[u]
+		if syncDryRun {
+			fmt.Printf("  [DRY RUN] Would create jump server account for %s (%s)\n", u, pluralKeys(keys))
+		} else {
+			fmt.Printf("  ✓ Jump server account restored for %s (%s)\n", u, pluralKeys(keys))
+		}
+	}
+	for _, u := range res.Partial {
+		fmt.Printf("  ! Partial restore for %s — the account works, but at least one additional key could not be authorized\n", u)
+	}
+	for _, u := range res.NoKey {
+		fmt.Printf("  – No SSH key in container %s-container (infra/CP/workspace box?) — skipped\n", u)
+	}
+	for _, u := range res.Failed {
+		fmt.Printf("  ✗ Failed to create jump server account for %s\n", u)
+	}
+
+	// Sync collaborator accounts from PostgreSQL
+	collabRestored, collabSkipped, collabFailed := syncCollaboratorAccounts(mgr)
+
+	// Print summary
+	fmt.Println()
+	fmt.Println("==========================================")
+	fmt.Println("Jump Server Account Sync Summary")
+	fmt.Println("==========================================")
+	fmt.Println("Owner Accounts:")
+	if syncDryRun {
+		fmt.Printf("  Would restore: %d accounts\n", len(res.Restored))
+	} else {
+		fmt.Printf("  Restored:      %d accounts\n", len(res.Restored))
+	}
+	fmt.Printf("  Skipped:       %d accounts\n", res.Skipped)
+	if len(res.Partial) > 0 {
+		fmt.Printf("  Partial:       %d accounts (created, but not every key authorized)\n", len(res.Partial))
+	}
+	fmt.Printf("  No key (ok):   %d accounts\n", len(res.NoKey))
+	fmt.Printf("  Failed:        %d accounts\n", len(res.Failed))
+	fmt.Println()
+	fmt.Println("Collaborator Accounts:")
+	if syncDryRun {
+		fmt.Printf("  Would restore: %d accounts\n", collabRestored)
+	} else {
+		fmt.Printf("  Restored:      %d accounts\n", collabRestored)
+	}
+	fmt.Printf("  Skipped:       %d accounts\n", collabSkipped)
+	fmt.Printf("  Failed:        %d accounts\n", collabFailed)
+	fmt.Println("==========================================")
+
+	// Fail-close ONLY on genuine failures (a key existed but the account
+	// couldn't be created) — never on the benign no-key containers, which
+	// previously made a startup hook / CI treat a healthy host as failed.
+	totalFailed := len(res.Failed) + collabFailed
+	if totalFailed > 0 {
+		return fmt.Errorf("%d account(s) failed to sync", totalFailed)
+	}
+
+	return nil
+}
+
+// pluralKeys renders the installed-key count for the per-account line.
+func pluralKeys(n int) string {
+	if n == 1 {
+		return "1 key"
+	}
+	return fmt.Sprintf("%d keys", n)
+}
+
+// syncCollaboratorAccounts syncs collaborator jump server accounts from PostgreSQL
+func syncCollaboratorAccounts(mgr *container.Manager) (restored, skipped, failed int) {
+	fmt.Println()
+	fmt.Println("Syncing collaborator accounts from database...")
+
+	// Create collaborator store
+	collaboratorStore, err := collaborator.NewStore(context.Background(), getPostgresConnString())
+	if err != nil {
+		fmt.Printf("  ⚠ Failed to connect to collaborator database: %v\n", err)
+		fmt.Println("  Skipping collaborator sync (database not available)")
+		return 0, 0, 0
+	}
+	defer collaboratorStore.Close()
+
+	// Create collaborator manager
+	collaboratorMgr := container.NewCollaboratorManager(mgr, collaboratorStore)
+
+	// Sync collaborator accounts
+	if syncDryRun {
+		// In dry-run mode, just list what would be synced
+		collaborators, err := collaboratorStore.ListAll(context.Background())
+		if err != nil {
+			fmt.Printf("  ⚠ Failed to list collaborators: %v\n", err)
+			return 0, 0, 1
+		}
+
+		for _, c := range collaborators {
+			if container.UserExists(c.AccountName) {
+				fmt.Printf("  ✓ Jump server account %s already exists, skipping\n", c.AccountName)
+				skipped++
+			} else {
+				fmt.Printf("  [DRY RUN] Would create jump server account for %s\n", c.AccountName)
+				restored++
+			}
+		}
+		return restored, skipped, failed
+	}
+
+	// Actually sync the accounts
+	restored, skipped, failed = collaboratorMgr.SyncCollaboratorAccounts(verbose, syncForce)
+
+	return restored, skipped, failed
+}
