@@ -76,3 +76,43 @@ func (q *AutoQuarantine) OnScanResult(containerName, tenant, status string) {
 	if status == "clean" {
 		log.Printf("[auto-quarantine] clean verdict for %s (tenant %q) not used to release any quarantine (self-reported; release is operator/TTL)", containerName, tenant)
 		return
+	}
+	if status != "infected" {
+		return
+	}
+	expiry := q.now().Add(q.ttl)
+	mutate := func(existing []*pb.NetworkPolicyDenyRule) ([]*pb.NetworkPolicyDenyRule, error) {
+		return applyQuarantine(existing, expiry), nil
+	}
+	if _, err := q.store.MutateDenyRules(context.Background(), tenant, mutate); err != nil {
+		log.Printf("[auto-quarantine] infected tenant=%q: %v", tenant, err)
+		return
+	}
+	log.Printf("[auto-quarantine] QUARANTINED tenant %q (egress blocked) — malware in %s", tenant, containerName)
+}
+
+// applyQuarantine ensures a quarantine deny rule is present, refreshing its
+// expiry. If a 0.0.0.0/0 deny already exists with a DIFFERENT note (an operator's
+// own block), it is left untouched — that block already achieves containment, so
+// quarantine relies on it rather than overwriting it.
+func applyQuarantine(rules []*pb.NetworkPolicyDenyRule, expiry time.Time) []*pb.NetworkPolicyDenyRule {
+	exp := expiry.UTC().Format(time.RFC3339)
+	for _, r := range rules {
+		if isQuarantineCIDR(r) {
+			if r.GetNote() == quarantineNote {
+				r.ExpiresAt = exp // refresh our rule's expiry
+			}
+			// else: operator's own 0.0.0.0/0 deny — leave it, it already contains.
+			return rules
+		}
+	}
+	return append(rules, &pb.NetworkPolicyDenyRule{
+		Cidr:      quarantineCIDR,
+		Note:      quarantineNote,
+		ExpiresAt: exp,
+	})
+}
+
+func isQuarantineCIDR(r *pb.NetworkPolicyDenyRule) bool {
+	return strings.TrimSpace(r.GetCidr()) == quarantineCIDR
+}

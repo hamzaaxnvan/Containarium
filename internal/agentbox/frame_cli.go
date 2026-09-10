@@ -46,3 +46,52 @@ func RunFrameCLI(args []string, stdin io.Reader, stderr io.Writer) int {
 		stream = logframe.Stdout
 	case string(rune(logframe.Stderr)):
 		stream = logframe.Stderr
+	default:
+		fmt.Fprintf(stderr, "frame: stream must be %q (stdout) or %q (stderr), got %q\n",
+			rune(logframe.Stdout), rune(logframe.Stderr), args[0])
+		return 2
+	}
+
+	// #nosec G304 -- the log path is agent-box's own, built from sanitizeName
+	// in spawnBackgroundProcess; this process is spawned by that same code.
+	log, err := os.OpenFile(args[1], os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		fmt.Fprintf(stderr, "frame: open %s: %v\n", args[1], err)
+		return 1
+	}
+	defer func() { _ = log.Close() }()
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := stdin.Read(buf)
+		if n > 0 {
+			if werr := appendFrameLocked(log, stream, buf[:n]); werr != nil {
+				fmt.Fprintf(stderr, "frame: write: %v\n", werr)
+				return 1
+			}
+		}
+		if readErr == io.EOF {
+			return 0
+		}
+		if readErr != nil {
+			// The writer going away is the normal end of a run, not a fault.
+			return 0
+		}
+	}
+}
+
+// appendFrameLocked writes one frame under an exclusive advisory lock, so the
+// stdout and stderr framers never interleave mid-record in the shared log.
+// This is the cross-process equivalent of the mutex the in-process
+// frameWriter used to share.
+func appendFrameLocked(log *os.File, stream logframe.Stream, payload []byte) error {
+	if err := syscall.Flock(int(log.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(log.Fd()), syscall.LOCK_UN) }()
+
+	if _, err := log.Write(logframe.EncodeFrame(stream, payload)); err != nil {
+		return err
+	}
+	return nil
+}
