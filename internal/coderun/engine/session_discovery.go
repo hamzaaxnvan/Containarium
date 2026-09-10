@@ -93,3 +93,99 @@ func sessionSearchDir(n Name, home, cwd string) (dir, trimSuffix string, ok bool
 		return home + "/.pi/agent/sessions", "", true
 	default:
 		return "", "", false
+	}
+}
+
+// SessionSnapshotPath is where the pre-launch directory snapshot for the run
+// whose session sidecar is sidecarPath lives.
+func SessionSnapshotPath(sidecarPath string) string { return sidecarPath + ".snap" }
+
+// SessionDiscoveryPrepareCommand renders a POSIX shell command that records
+// which session entries already exist, to SessionSnapshotPath(sidecarPath).
+// It MUST run before the engine is launched; entries that appear afterwards
+// are the candidates for this run's session. ok=false means the engine
+// exposes no discoverable session id.
+func SessionDiscoveryPrepareCommand(n Name, home, cwd, sidecarPath string) (cmd string, ok bool) {
+	dir, trimSuffix, ok := sessionSearchDir(n, home, cwd)
+	if !ok {
+		return "", false
+	}
+	snap := SessionSnapshotPath(sidecarPath)
+	return "{ ls -1 " + shellQuoteSingle(dir) + " 2>/dev/null" + sessionEntryFilter(trimSuffix) + " || true; } > " +
+		shellQuoteSingle(snap) + " 2>/dev/null || true", true
+}
+
+// sessionEntryFilter keeps only entries that are session files (Claude Code's
+// project directory also holds per-session sub-directories).
+func sessionEntryFilter(trimSuffix string) string {
+	if trimSuffix == "" {
+		return ""
+	}
+	return " | grep " + shellQuoteSingle(strings.ReplaceAll(trimSuffix, ".", "\\.")+"$")
+}
+
+// SessionDiscoveryBackgroundCommand renders a POSIX shell command that
+// BACKGROUNDS (and detaches via setsid, so it outlives the exec call that
+// launched it) a short poll loop: look for a session entry that is NOT in the
+// snapshot SessionDiscoveryPrepareCommand took. It waits out the whole budget
+// (or until the run's sibling <name>.exit sidecar exists), then, only if
+// EXACTLY ONE new entry exists, writes its id to sidecarPath atomically
+// (temp-then-rename). No new entry, or several (a member's session and this
+// run's both appeared, in either order), writes nothing — an absent sidecar
+// is a normal, expected outcome, never an error the caller needs to see.
+// Plain-mode ids are best-effort: callers needing one reliably must use
+// structured output.
+//
+// ok=false (empty command) means this engine exposes no discoverable session
+// id at all; callers skip running anything.
+func SessionDiscoveryBackgroundCommand(n Name, home, cwd, sidecarPath string) (cmd string, ok bool) {
+	dir, trimSuffix, ok := sessionSearchDir(n, home, cwd)
+	if !ok {
+		return "", false
+	}
+	qdir := shellQuoteSingle(dir)
+	qsidecar := shellQuoteSingle(sidecarPath)
+	qtmp := shellQuoteSingle(sidecarPath + ".tmp")
+	qsnap := shellQuoteSingle(SessionSnapshotPath(sidecarPath))
+	qexit := shellQuoteSingle(strings.TrimSuffix(sidecarPath, ".session") + ".exit")
+
+	// New entries = listing minus snapshot. An unreadable/absent snapshot
+	// means we cannot tell old from new, so fail closed (write nothing).
+	// basename then strips trimSuffix when the engine's file name carries one
+	// (pi's own session file name already IS the id).
+	// The loop does NOT stop at the first new entry: a member's own
+	// interactive session (or any other process) may create a transcript
+	// before this run's engine writes its own, and adopting the first one
+	// would hand out somebody else's conversation. It runs the whole budget,
+	// or until the run's exit sidecar exists, and only then requires EXACTLY
+	// ONE new entry. Several (or none) writes nothing, in either ordering.
+	body := "[ -f " + qsnap + " ] || exit 0; " +
+		"i=0; while [ $i -lt " + strconv.Itoa(sessionDiscoveryAttempts) + " ] && [ ! -e " + qexit + " ]; do " +
+		"sleep " + sleepArg() + "; i=$((i+1)); done; " +
+		"new=$(ls -1 " + qdir + " 2>/dev/null" + sessionEntryFilter(trimSuffix) + " | grep -vxF -f " + qsnap + "); " +
+		"[ -n \"$new\" ] || exit 0; " +
+		"[ $(printf '%s\\n' \"$new\" | wc -l) -eq 1 ] || exit 0; " +
+		"b=$(basename \"$new\"); id=\"${b%" + trimSuffix + "}\"; " +
+		"printf '%s' \"$id\" > " + qtmp + " 2>/dev/null && mv -f " + qtmp + " " + qsidecar
+
+	// setsid + redirected stdio + disown-by-construction: this must survive
+	// the parent script (or SSH session, or exec call) returning, exactly
+	// like spawnBackgroundProcess's own detached children.
+	return "(setsid sh -c " + shellQuoteSingle(body) + " </dev/null >/dev/null 2>&1 &) 2>/dev/null || true", true
+}
+
+// sleepArg renders sessionDiscoveryIntervalMS as the fractional-second
+// argument `sleep` takes (POSIX sleep on Linux boxes accepts sub-second
+// values; GNU coreutils' sleep does).
+func sleepArg() string {
+	whole := sessionDiscoveryIntervalMS / 1000
+	frac := sessionDiscoveryIntervalMS % 1000
+	if frac == 0 {
+		return strconv.Itoa(whole)
+	}
+	fracStr := strconv.Itoa(frac)
+	for len(fracStr) < 3 {
+		fracStr = "0" + fracStr
+	}
+	return strconv.Itoa(whole) + "." + fracStr
+}

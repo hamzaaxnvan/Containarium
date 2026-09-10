@@ -337,3 +337,342 @@ func (c *Collector) initInstruments() error {
 	// Egress fan-out (#231 follow-on): the crawler-detection signal. A large,
 	// churning count of distinct outbound destinations is a crawler's hallmark;
 	// a normal app talks to a handful. Per-container aggregates only — the raw
+	// destination IPs stay in the conntrack store, never in metric labels (see
+	// docs/EGRESS-FANOUT-DETECTION.md).
+	c.containerEgressDistinctDest, err = meter.Int64Gauge("container.egress.distinct_destinations",
+		otelmetric.WithDescription("Distinct outbound destination IPs per container in the window (crawler-detection fan-out signal)"))
+	if err != nil {
+		return err
+	}
+
+	c.containerEgressConnections, err = meter.Int64Gauge("container.egress.connections",
+		otelmetric.WithDescription("Active egress connections per container in the window"))
+	if err != nil {
+		return err
+	}
+
+	// Aggregate metrics
+	c.containersRunning, err = meter.Int64Gauge("containarium.containers.running",
+		otelmetric.WithDescription("Number of running containers"))
+	if err != nil {
+		return err
+	}
+
+	c.containersStopped, err = meter.Int64Gauge("containarium.containers.stopped",
+		otelmetric.WithDescription("Number of stopped containers"))
+	if err != nil {
+		return err
+	}
+
+	c.backendHealthy, err = meter.Int64Gauge("containarium.backend.healthy",
+		otelmetric.WithDescription("Backend health status (1=healthy, 0=unhealthy)"))
+	if err != nil {
+		return err
+	}
+
+	c.peerMTLS, err = meter.Int64Gauge("containarium.peer.mtls.enabled",
+		otelmetric.WithDescription("Daemon-to-peer calls use peer mTLS (1=enabled, 0=plain HTTP). Emitted only on daemons with a sentinel URL or peers"))
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SetPeerMTLSFunc sets the probe behind containarium.peer.mtls.enabled.
+// Without it, or when relevant is false (no sentinel, no peers), the metric is not emitted.
+func (c *Collector) SetPeerMTLSFunc(fn func() (enabled, relevant bool)) {
+	c.peerMTLSFn = fn
+}
+
+// recordPeerMTLS records containarium.peer.mtls.enabled for this tick.
+func (c *Collector) recordPeerMTLS() {
+	if c.peerMTLSFn == nil {
+		return
+	}
+	enabled, relevant := c.peerMTLSFn()
+	if !relevant {
+		return
+	}
+	var v int64
+	if enabled {
+		v = 1
+	}
+	c.peerMTLS.Record(c.ctx, v, otelmetric.WithAttributes(
+		attribute.String("backend.id", c.config.LocalBackendID),
+	))
+}
+
+// Start begins the metrics collection loop
+func (c *Collector) Start() {
+	go c.collectLoop()
+	log.Printf("OTel metrics collector started (interval: %v, target: %s)", c.config.CollectionInterval, c.config.VictoriaMetricsURL)
+}
+
+// collectLoop runs the collection ticker
+func (c *Collector) collectLoop() {
+	// Collect immediately on start
+	c.collect()
+
+	ticker := time.NewTicker(c.config.CollectionInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.collect()
+		}
+	}
+}
+
+// collect gathers and records all metrics
+func (c *Collector) collect() {
+	ctx := c.ctx
+
+	// Collect system metrics (local)
+	localAttrs := otelmetric.WithAttributes(
+		attribute.String("backend.id", c.config.LocalBackendID),
+	)
+	sysRes, err := c.incusClient.GetSystemResources()
+	if err != nil {
+		log.Printf("Warning: failed to collect system metrics: %v", err)
+	} else {
+		c.systemCPUCount.Record(ctx, int64(sysRes.TotalCPUs), localAttrs)
+		c.systemMemTotal.Record(ctx, sysRes.TotalMemoryBytes, localAttrs)
+		c.systemMemUsed.Record(ctx, sysRes.UsedMemoryBytes, localAttrs)
+		c.systemDiskTotal.Record(ctx, sysRes.TotalDiskBytes, localAttrs)
+		c.systemDiskUsed.Record(ctx, sysRes.UsedDiskBytes, localAttrs)
+		c.systemCPULoad1m.Record(ctx, sysRes.CPULoad1Min, localAttrs)
+		c.systemCPULoad5m.Record(ctx, sysRes.CPULoad5Min, localAttrs)
+		c.systemCPULoad15m.Record(ctx, sysRes.CPULoad15Min, localAttrs)
+	}
+
+	// Record local backend health (always healthy if collecting)
+	c.backendHealthy.Record(ctx, 1, localAttrs)
+	c.recordPeerMTLS()
+
+	// Record peer backend health
+	if c.peerFetcher != nil {
+		for _, ph := range c.peerFetcher.FetchPeerHealth() {
+			peerAttrs := otelmetric.WithAttributes(
+				attribute.String("backend.id", ph.BackendID),
+			)
+			var val int64
+			if ph.Healthy {
+				val = 1
+			}
+			c.backendHealthy.Record(ctx, val, peerAttrs)
+		}
+	}
+
+	// Collect system metrics from peers
+	if c.peerFetcher != nil {
+		for _, ps := range c.peerFetcher.FetchPeerSystemMetrics("") {
+			peerAttrs := otelmetric.WithAttributes(
+				attribute.String("backend.id", ps.BackendID),
+			)
+			c.systemCPUCount.Record(ctx, ps.TotalCPUs, peerAttrs)
+			c.systemMemTotal.Record(ctx, ps.TotalMemoryBytes, peerAttrs)
+			c.systemMemUsed.Record(ctx, ps.UsedMemoryBytes, peerAttrs)
+			c.systemDiskTotal.Record(ctx, ps.TotalDiskBytes, peerAttrs)
+			c.systemDiskUsed.Record(ctx, ps.UsedDiskBytes, peerAttrs)
+			c.systemCPULoad1m.Record(ctx, ps.CPULoad1Min, peerAttrs)
+			c.systemCPULoad5m.Record(ctx, ps.CPULoad5Min, peerAttrs)
+			c.systemCPULoad15m.Record(ctx, ps.CPULoad15Min, peerAttrs)
+			c.containersRunning.Record(ctx, ps.ContainersRunning, peerAttrs)
+			c.containersStopped.Record(ctx, ps.ContainersStopped, peerAttrs)
+			if c.peerPoolHook != nil {
+				c.peerPoolHook(ps.BackendID, ps.StoragePools)
+			}
+		}
+	}
+
+	// List containers and collect per-container metrics
+	containers, err := c.incusClient.ListContainers()
+	if err != nil {
+		log.Printf("Warning: failed to list containers for metrics: %v", err)
+		return
+	}
+
+	var running, stopped int64
+	tickAt := time.Now()
+	var cpuReadings []ContainerCPUReading
+	for _, ct := range containers {
+		if ct.State == "Running" {
+			// Only count user containers for aggregate stats
+			if !ct.Role.IsCoreRole() {
+				running++
+			}
+
+			// Collect per-container metrics for ALL containers (core + user)
+			metrics, err := c.incusClient.GetContainerMetrics(ct.Name)
+			if err != nil {
+				continue
+			}
+
+			attrSet := []attribute.KeyValue{
+				attribute.String("container.name", ct.Name),
+				attribute.String("backend.id", c.config.LocalBackendID),
+			}
+			// Stamp the cloud container UUID as container.id when this box is a
+			// cloud-managed tenant. The cloud's MetricsService scopes tenant
+			// queries with {container_id="<uuid>"} (dots→underscores: the OTLP
+			// container.id attr becomes the container_id VM label), so without
+			// it the cloud can't join these per-container infra series
+			// (cpu/mem/disk/network) to a tenant and its history panels stay
+			// empty (#231). The value is the cloud_container_id container label
+			// — the same source container_ips.json reads (#536); see
+			// cloudContainerIDLabel in internal/server. Absent on standalone /
+			// non-cloud boxes, so it's omitted rather than emitted empty.
+			if cid := ct.Labels["cloud_container_id"]; cid != "" {
+				attrSet = append(attrSet, attribute.String("container.id", cid))
+			}
+			attrs := otelmetric.WithAttributes(attrSet...)
+
+			c.containerCPUUsage.Record(ctx, metrics.CPUUsageSeconds, attrs)
+			cpuReadings = append(cpuReadings, ContainerCPUReading{Name: ct.Name, IPAddress: ct.IPAddress, CPULimit: ct.CPU, CPUUsageSeconds: metrics.CPUUsageSeconds})
+			c.containerMemUsage.Record(ctx, metrics.MemoryUsageBytes, attrs)
+			c.containerDiskUsage.Record(ctx, metrics.DiskUsageBytes, attrs)
+			c.containerNetRx.Record(ctx, metrics.NetworkRxBytes, attrs)
+			c.containerNetTx.Record(ctx, metrics.NetworkTxBytes, attrs)
+			c.containerProcessCount.Record(ctx, int64(metrics.ProcessCount), attrs)
+		} else {
+			// Only count user containers for aggregate stats
+			if !ct.Role.IsCoreRole() {
+				stopped++
+			}
+		}
+	}
+
+	c.containersRunning.Record(ctx, running, localAttrs)
+	c.containersStopped.Record(ctx, stopped, localAttrs)
+	if c.cpuHook != nil {
+		c.cpuHook(tickAt, cpuReadings)
+	}
+
+	// Egress fan-out (crawler detection): record per-container distinct
+	// destination + egress connection counts from the conntrack collector.
+	if c.egressFetcher != nil {
+		c.RecordEgressFanout(c.egressFetcher.EgressFanout())
+	}
+
+	// Collect metrics from peer backends
+	if c.peerFetcher != nil {
+		peerMetrics := c.peerFetcher.FetchPeerMetrics("")
+		if len(peerMetrics) > 0 {
+			log.Printf("[metrics] collected %d metrics from peer backends", len(peerMetrics))
+		}
+		for _, pm := range peerMetrics {
+			attrs := otelmetric.WithAttributes(
+				attribute.String("container.name", pm.ContainerName),
+				attribute.String("backend.id", pm.BackendID),
+			)
+			c.containerCPUUsage.Record(ctx, pm.CPUUsageSeconds, attrs)
+			c.containerMemUsage.Record(ctx, pm.MemoryUsageBytes, attrs)
+			c.containerDiskUsage.Record(ctx, pm.DiskUsageBytes, attrs)
+			c.containerNetRx.Record(ctx, pm.NetworkRxBytes, attrs)
+			c.containerNetTx.Record(ctx, pm.NetworkTxBytes, attrs)
+			c.containerProcessCount.Record(ctx, pm.ProcessCount, attrs)
+		}
+	}
+}
+
+// RecordRequestRates records edge-measured per-container request rates
+// (container.request_rate) for one collection tick. The collector calls this
+// only when access-log aggregation is enabled (CONTAINARIUM_ACCESS_LOG=1, a
+// later wiring slice — see docs/REQUEST-RATE-PLANE-DESIGN.md); until then it
+// has no callers and the plane stays dark.
+//
+// Samples carry their own container.id (the cloud_container_id, empty on
+// standalone boxes) so the VM series joins to a tenant exactly like the bytes
+// plane; backend.id is this daemon's, since the aggregator runs against the
+// local edge.
+func (c *Collector) RecordRequestRates(samples []reqrate.Sample) {
+	for _, s := range samples {
+		attrSet := []attribute.KeyValue{
+			attribute.String("container.name", s.ContainerName),
+			attribute.String("backend.id", c.config.LocalBackendID),
+		}
+		if s.ContainerID != "" {
+			attrSet = append(attrSet, attribute.String("container.id", s.ContainerID))
+		}
+		c.containerRequestRate.Record(c.ctx, s.RequestsPerSec, otelmetric.WithAttributes(attrSet...))
+	}
+}
+
+// SetPeerFetcher sets the peer metrics fetcher for collecting metrics from peer backends.
+func (c *Collector) SetPeerFetcher(fetcher PeerMetricsFetcher) {
+	c.peerFetcher = fetcher
+}
+
+// SetCPUHook wires a consumer of each tick's local per-container CPU
+// counters — the threat-detection CPUSampler (#2635) — so it reuses this
+// read instead of polling Incus again. Must be called before Start.
+func (c *Collector) SetCPUHook(fn func(at time.Time, readings []ContainerCPUReading)) {
+	c.cpuHook = fn
+}
+
+// SetPeerStoragePoolHook wires the recorder for peers' storage pools
+// (#2823); called on each tick with every healthy peer's pools. Must be
+// called before Start.
+func (c *Collector) SetPeerStoragePoolHook(fn func(backendID string, pools []incus.StoragePoolUsage)) {
+	c.peerPoolHook = fn
+}
+
+// SetEgressFetcher sets the egress fan-out fetcher (crawler-detection signal).
+// When set, each collection tick records container.egress.* gauges from it.
+func (c *Collector) SetEgressFetcher(fetcher EgressFanoutFetcher) {
+	c.egressFetcher = fetcher
+}
+
+// RecordEgressFanout records per-container egress fan-out (distinct destinations
+// + egress connections) for one tick. Samples carry their own container.id (the
+// cloud_container_id, empty on standalone boxes) so the VM series joins to a
+// tenant like the bytes plane; backend.id is this daemon's. A spike in
+// distinct_destinations is the crawler tell — alert on it via the sentinel
+// alerting plane (see docs/EGRESS-FANOUT-DETECTION.md).
+func (c *Collector) RecordEgressFanout(stats []EgressFanoutStat) {
+	for _, s := range stats {
+		attrSet := []attribute.KeyValue{
+			attribute.String("container.name", s.ContainerName),
+			attribute.String("backend.id", c.config.LocalBackendID),
+		}
+		if s.ContainerID != "" {
+			attrSet = append(attrSet, attribute.String("container.id", s.ContainerID))
+		}
+		attrs := otelmetric.WithAttributes(attrSet...)
+		c.containerEgressDistinctDest.Record(c.ctx, int64(s.DistinctDestinations), attrs)
+		c.containerEgressConnections.Record(c.ctx, int64(s.EgressConnections), attrs)
+	}
+}
+
+// Stop shuts down the collector
+func (c *Collector) Stop() {
+	c.cancel()
+	if c.shutdownFn != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := c.shutdownFn(shutdownCtx); err != nil {
+			log.Printf("Warning: failed to shutdown OTel provider: %v", err)
+		}
+	}
+	log.Printf("OTel metrics collector stopped")
+}
+
+// MeterProvider returns the OTel MeterProvider for use by HTTP middleware
+func (c *Collector) MeterProvider() *sdkmetric.MeterProvider {
+	return c.provider
+}
+
+// stripProtocol removes http:// or https:// from a URL
+func stripProtocol(url string) string {
+	if len(url) > 8 && url[:8] == "https://" {
+		return url[8:]
+	}
+	if len(url) > 7 && url[:7] == "http://" {
+		return url[7:]
+	}
+	return url
+}
