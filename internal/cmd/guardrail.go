@@ -339,3 +339,231 @@ func runGuardrailApply(cmd *cobra.Command, args []string) error {
 
 	wipedUnits := make([]*pb.GuardrailTextUnit, 0, len(red.Wiped))
 	for id, text := range red.Wiped {
+		wipedUnits = append(wipedUnits, &pb.GuardrailTextUnit{UnitId: id, Text: text})
+	}
+	sort.Slice(wipedUnits, func(i, j int) bool { return wipedUnits[i].UnitId < wipedUnits[j].UnitId })
+	second, err := engine.Scan(ctx, &pb.GuardrailScanRequest{Units: wipedUnits, Kinds: kinds})
+	if err != nil {
+		return fmt.Errorf("re-scan: %w", err)
+	}
+	// A file the loader could not decode was never redacted and is not in
+	// --out, but it is part of what the caller asked to clean: a gap.
+	second.Gaps = append(second.Gaps, loadGaps...)
+	gate := guardrail.Gate(second, red.Wiped, policy, red.Blocked)
+
+	digest, err := guardrail.SubjectDigest(out)
+	if err != nil {
+		return err
+	}
+	policyHash, err := guardrail.PolicyHash(policy)
+	if err != nil {
+		return err
+	}
+	att := &pb.GuardrailAttestation{
+		SubjectSha256: digest,
+		EngineId:      first.GetEngineId(),
+		EngineVersion: first.GetEngineVersion(),
+		PolicyHash:    policyHash,
+		Found:         kindCounts(red.Found),
+		Residual:      kindCounts(gate.Residual),
+		CoverageGaps:  gate.Gaps,
+		Verdict:       gate.Verdict,
+		AttestedAt:    timestamppb.New(time.Now().UTC()),
+		KindsScanned:  kinds,
+	}
+	if signer != nil {
+		if err := signer(att); err != nil {
+			return err
+		}
+	}
+	attJSON, err := protojson.MarshalOptions{Multiline: true}.Marshal(att)
+	if err != nil {
+		return err
+	}
+	// #nosec G306 -- the attestation ships with the data and carries counts and hashes, never text
+	if err := os.WriteFile(guardrailAttestFile, append(attJSON, '\n'), 0o644); err != nil {
+		return err
+	}
+
+	w := cmd.OutOrStdout()
+	fmt.Fprintf(w, "engine: %s %s  kinds scanned: %s\n", att.EngineId, att.EngineVersion, kindNames(kinds))
+	fmt.Fprintf(w, "units: %d, found %d, redacted into %s\n", len(units), len(first.GetFindings()), out)
+	fmt.Fprintf(w, "re-scan: %d residual judged, %d inside placeholders ignored, %d gap(s)\n", sumCounts(gate.Residual), gate.InPlaceholder, gate.Gaps)
+	fmt.Fprintf(w, "vault: %s (%d tokens)  attestation: %s  signed: %v\n", guardrailVaultFile, len(red.Vault), guardrailAttestFile, signer != nil)
+	if server.policy != nil {
+		fmt.Fprintf(w, "policy: server policy revision %d (hash %s)\n", server.policy.GetRevision(), shortGuardrailHash(server.hash))
+	} else {
+		fmt.Fprintf(w, "policy: local (hash %s), NOT server-attested\n", shortGuardrailHash(policyHash))
+	}
+	fmt.Fprintf(w, "verdict: %s\n", strings.TrimPrefix(gate.Verdict.String(), "GUARDRAIL_VERDICT_"))
+	if gate.Verdict != pb.GuardrailVerdict_GUARDRAIL_VERDICT_PASS {
+		return errors.New("guardrail gate FAILED: " + strings.Join(gate.Reasons, "; "))
+	}
+	return nil
+}
+
+func runGuardrailVerify(cmd *cobra.Command, args []string) error {
+	b, err := os.ReadFile(guardrailAttestFile) // #nosec G304 -- operator-supplied --attestation path; CLI runs as the operator's UID
+	if err != nil {
+		return err
+	}
+	att := &pb.GuardrailAttestation{}
+	if err := protojson.Unmarshal(b, att); err != nil {
+		return fmt.Errorf("attestation %s: %w", guardrailAttestFile, err)
+	}
+	required, err := parseGuardrailKinds("require-kind", guardrailRequireKinds)
+	if err != nil {
+		return err
+	}
+	server, err := fetchGuardrailServerView()
+	if err != nil {
+		return err
+	}
+	verified := fmt.Sprintf("verified: %s is the subject attested PASS by %s %s (kinds scanned: %s; key %s) at %s",
+		args[0], att.GetEngineId(), att.GetEngineVersion(), kindNames(att.GetKindsScanned()), shortGuardrailHash(att.GetKeyId()), att.GetAttestedAt().AsTime().Format(time.RFC3339))
+
+	// With a server policy, the server decides: its policy hash and its
+	// trusted signers, never a key the caller hands in.
+	if server.policy != nil {
+		if guardrailTrustBundle != "" {
+			fmt.Fprintln(cmd.ErrOrStderr(), "guardrail: --trust-bundle ignored; the server's trusted and revoked signers decide who may sign")
+		}
+		if guardrailPublicKey != "" {
+			fmt.Fprintln(cmd.ErrOrStderr(), "guardrail: --public-key ignored; the server's trusted signers decide who may sign")
+		}
+		signer, err := guardrailpolicy.VerifyAttestation(att, server.policy, args[0], required)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "%s; server-trusted (policy revision %d, signer %q)\n", verified, server.policy.GetRevision(), signer.GetLabel())
+		return nil
+	}
+
+	if guardrailTrustBundle != "" {
+		if guardrailPublicKey != "" {
+			return errors.New("--trust-bundle and --public-key are mutually exclusive")
+		}
+		signer, err := verifyWithTrustBundle(guardrailTrustBundle, att, args[0], required)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "%s; NOT server-trusted (%s; checked against the trust bundle %q, signer %q, no revocation matched)\n", verified, server.localReason, guardrailTrustBundle, signer.GetLabel())
+		return nil
+	}
+
+	if guardrailPublicKey == "" {
+		return fmt.Errorf("%s: offline verify needs --public-key or --trust-bundle", server.localReason)
+	}
+	pub, err := guardrail.LoadPublicKey(guardrailPublicKey)
+	if err != nil {
+		return err
+	}
+	if err := guardrail.VerifySubject(att, pub, args[0]); err != nil {
+		return err
+	}
+	if err := guardrail.VerifyCoverage(att, required); err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "%s; NOT server-trusted (%s; checked against --public-key only)\n", verified, server.localReason)
+	return nil
+}
+
+// resolveApplyPolicy picks the policy apply runs under. With a server policy
+// in force it is the server's, and --policy is refused unless it hashes to
+// the server's: a local file can no longer weaken the gate silently. In
+// local mode it is --policy, or the default, and stderr says the result is
+// not server-attested.
+func resolveApplyPolicy(cmd *cobra.Command) (*pb.GuardrailPolicy, *guardrailServerView, error) {
+	var local *pb.GuardrailPolicy
+	if guardrailPolicyFile != "" {
+		b, err := os.ReadFile(guardrailPolicyFile) // #nosec G304 -- operator-supplied --policy path; CLI runs as the operator's UID
+		if err != nil {
+			return nil, nil, err
+		}
+		local = &pb.GuardrailPolicy{}
+		if err := protojson.Unmarshal(b, local); err != nil {
+			return nil, nil, fmt.Errorf("--policy %s: %w", guardrailPolicyFile, err)
+		}
+	}
+	server, err := fetchGuardrailServerView()
+	if err != nil {
+		return nil, nil, err
+	}
+	if server.policy == nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "guardrail: %s; running under the local policy. This result is NOT server-attested.\n", server.localReason)
+		if local == nil {
+			local = guardrail.DefaultPolicy()
+		}
+		return local, server, nil
+	}
+	if local != nil {
+		h, err := guardrail.PolicyHash(local)
+		if err != nil {
+			return nil, nil, err
+		}
+		if h != server.hash {
+			return nil, nil, fmt.Errorf("--policy %s (hash %s) does not match the server guardrail policy (revision %d, hash %s); omit --policy to run under the server's",
+				guardrailPolicyFile, shortGuardrailHash(h), server.policy.GetRevision(), shortGuardrailHash(server.hash))
+		}
+	}
+	return server.policy.GetPolicy(), server, nil
+}
+
+func runGuardrailKeygen(cmd *cobra.Command, _ []string) error {
+	pub, err := guardrail.GenerateKeyFiles(guardrailKeygenPrefix)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "wrote %s.key (private, keep here) and %s.pub (share with verifiers); key id %s\n",
+		guardrailKeygenPrefix, guardrailKeygenPrefix, guardrail.KeyID(pub)[:12])
+	return nil
+}
+
+// loadOrCreateRedactionKey reads a 32-byte hex key or mints one at path,
+// 0600, and says so: the key is what makes tokens stable across runs, so
+// losing it means the next run tokenizes the same values differently.
+func loadOrCreateRedactionKey(cmd *cobra.Command, path string) ([]byte, error) {
+	if b, err := os.ReadFile(path); err == nil { // #nosec G304 -- operator-supplied --redaction-key path; CLI runs as the operator's UID
+		key, err := hex.DecodeString(strings.TrimSpace(string(b)))
+		if err != nil || len(key) != 32 {
+			return nil, fmt.Errorf("--redaction-key %s: want 32 bytes as hex", path)
+		}
+		return key, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, []byte(hex.EncodeToString(key)+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "guardrail: new redaction key written to %s — keep it with the vault\n", path)
+	return key, nil
+}
+
+func writeGuardrailJSON(path string, v any, mode os.FileMode) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(b, '\n'), mode)
+}
+
+func kindCounts(m map[pb.GuardrailKind]int64) []*pb.GuardrailKindCount {
+	out := make([]*pb.GuardrailKindCount, 0, len(m))
+	for k, n := range m {
+		out = append(out, &pb.GuardrailKindCount{Kind: k, Findings: n})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Kind < out[j].Kind })
+	return out
+}
+
+func sumCounts(m map[pb.GuardrailKind]int64) int64 {
+	var n int64
+	for _, v := range m {
+		n += v
+	}
+	return n
+}
