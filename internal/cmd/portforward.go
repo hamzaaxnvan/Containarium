@@ -24,3 +24,12 @@ Examples:
   containarium portforward show
 
   # Setup port forwarding to Caddy
+  containarium portforward setup --caddy-ip 10.0.3.111
+
+  # Remove port forwarding rules
+  containarium portforward remove --caddy-ip 10.0.3.111`,
+}
+
+func init() {
+	rootCmd.AddCommand(portforwardCmd)
+}

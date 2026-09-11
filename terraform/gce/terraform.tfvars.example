@@ -10,3 +10,41 @@ admin_ssh_keys = {
   # username = "ssh-ed25519 AAAA... user@example.com"
 }
 
+# Instance configuration
+machine_type        = "e2-standard-2"  # 2 vCPU, 8GB RAM
+use_spot_instance   = true             # Use spot instance (cost-effective)
+use_persistent_disk = true             # Enable persistent disk for data
+
+# Disk sizes (GB)
+boot_disk_size = 100
+data_disk_size = 100
+
+# Security: Restrict SSH access to your IP
+# Get your IP: curl ifconfig.me
+allowed_ssh_sources = ["0.0.0.0/0"]  # WARNING: Replace with your IP for security!
+
+# Containarium daemon
+enable_containarium_daemon = false
+containarium_version       = "latest"
+containarium_binary_url    = ""  # Optional: URL to custom binary
+
+# Sentinel HA (recommended for production)
+enable_sentinel = false
+
+# Monitoring and backups
+enable_monitoring     = false
+enable_disk_snapshots = false
+
+# Instance name
+instance_name = "containarium-server"
+
+# Region/Zone
+region = "us-central1"
+zone   = "us-central1-a"
+
+# Labels
+labels = {
+  environment = "production"
+  managed_by  = "terraform"
+  project     = "containarium"
+}
