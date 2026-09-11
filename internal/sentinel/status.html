@@ -44,3 +44,144 @@
             letter-spacing: 0.05em;
             margin-bottom: 1.5rem;
         }
+        .mode-proxy {
+            background: #064e3b;
+            color: #6ee7b7;
+            border: 1px solid #065f46;
+        }
+        .mode-maintenance {
+            background: #78350f;
+            color: #fbbf24;
+            border: 1px solid #92400e;
+        }
+        .status-box {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 1rem 1.5rem;
+            text-align: left;
+            margin-bottom: 1rem;
+        }
+        .status-box-title {
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #64748b;
+            margin-bottom: 0.75rem;
+        }
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.4rem 0;
+        }
+        .status-row:not(:last-child) {
+            border-bottom: 1px solid #334155;
+        }
+        .status-label {
+            color: #64748b;
+            font-size: 0.875rem;
+        }
+        .status-value {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: #e2e8f0;
+        }
+        .value-ok { color: #6ee7b7; }
+        .value-warn { color: #fbbf24; }
+        .value-error { color: #f87171; }
+        .value-muted { color: #94a3b8; }
+        .footer {
+            margin-top: 2rem;
+            font-size: 0.75rem;
+            color: #475569;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Sentinel Status</h1>
+        <p class="subtitle">Auto-refreshes every 10 seconds</p>
+
+        {{if eq .State "proxy"}}
+        <div class="mode-badge mode-proxy">Proxy</div>
+        {{else}}
+        <div class="mode-badge mode-maintenance">Maintenance</div>
+        {{end}}
+
+        <div class="status-box">
+            <div class="status-box-title">General</div>
+            <div class="status-row">
+                <span class="status-label">Current Mode</span>
+                <span class="status-value">{{.State}}</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Spot VM IP</span>
+                <span class="status-value">{{if .SpotIP}}{{.SpotIP}}{{else}}<span class="value-muted">unknown</span>{{end}}</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Forwarded Ports</span>
+                <span class="status-value">{{.ForwardedPorts}}</span>
+            </div>
+        </div>
+
+        <div class="status-box">
+            <div class="status-box-title">Recovery</div>
+            <div class="status-row">
+                <span class="status-label">Preemption Count</span>
+                <span class="status-value">{{.PreemptCount}}</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Last Preemption</span>
+                <span class="status-value">{{if .LastPreemption}}<span class="value-warn">{{.LastPreemption}}</span>{{else}}<span class="value-muted">none</span>{{end}}</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Current Outage</span>
+                <span class="status-value">{{if .OutageDuration}}<span class="value-error">{{.OutageDuration}}</span>{{else}}<span class="value-ok">none</span>{{end}}</span>
+            </div>
+        </div>
+
+        <div class="status-box">
+            <div class="status-box-title">TLS Certificates</div>
+            <div class="status-row">
+                <span class="status-label">Synced Certs</span>
+                <span class="status-value">{{if gt .CertSyncCount 0}}<span class="value-ok">{{.CertSyncCount}}</span>{{else}}<span class="value-warn">0 (using self-signed)</span>{{end}}</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Last Sync</span>
+                <span class="status-value">{{if .CertLastSync}}{{.CertLastSync}}{{else}}<span class="value-muted">never</span>{{end}}</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Sync Status</span>
+                <span class="status-value">{{if .CertSyncError}}<span class="value-error">{{.CertSyncError}}</span>{{else}}<span class="value-ok">OK</span>{{end}}</span>
+            </div>
+        </div>
+
+        <div class="status-box">
+            <div class="status-box-title">SSH Proxy (sshpiper)</div>
+            <div class="status-row">
+                <span class="status-label">Synced Users</span>
+                <span class="status-value">{{if gt .KeySyncCount 0}}<span class="value-ok">{{.KeySyncCount}}</span>{{else}}<span class="value-warn">0</span>{{end}}</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Last Sync</span>
+                <span class="status-value">{{if .KeyLastSync}}{{.KeyLastSync}}{{else}}<span class="value-muted">never</span>{{end}}</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Sync Status</span>
+                <span class="status-value">{{if .KeySyncError}}<span class="value-error">{{.KeySyncError}}</span>{{else}}<span class="value-ok">OK</span>{{end}}</span>
+            </div>
+        </div>
+
+        <div class="status-box">
+            <div class="status-box-title">Tunnel Sessions</div>
+            <div class="status-row">
+                <span class="status-label">TLS <span class="value-muted">tunnel_sessions_tls</span></span>
+                <span class="status-value">{{.TunnelSessionsTLS}}</span>
+            </div>
+        </div>
+
+        <div class="footer">Containarium Sentinel</div>
+    </div>
+</body>
+</html>
