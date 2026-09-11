@@ -126,3 +126,36 @@ func VerifyChain(entries []ChainEntry, expectedRoot string) (firstBad int64, err
 	prev := expectedRoot
 	for i := range entries {
 		e := &entries[i]
+		if e.PrevHash != prev {
+			return e.ID, fmt.Errorf("row %d prev_hash mismatch: stored=%q expected=%q (chain broken at or before this row)",
+				e.ID, e.PrevHash, prev)
+		}
+		want, herr := computeRowHash(&e.AuditEntry, e.PrevHash, e.HashVersion)
+		if herr != nil {
+			return e.ID, fmt.Errorf("row %d: %w", e.ID, herr)
+		}
+		if e.RowHash != want {
+			return e.ID, fmt.Errorf("row %d row_hash mismatch: stored=%q computed=%q (this row was modified after insert)",
+				e.ID, abbrev(e.RowHash), abbrev(want))
+		}
+		prev = e.RowHash
+	}
+	return 0, nil
+}
+
+// ChainEntry augments AuditEntry with the hash-chain columns, for
+// verification consumers. The base Log/Query path returns plain
+// AuditEntry — most callers don't care about chain state.
+type ChainEntry struct {
+	AuditEntry
+	RowHash     string
+	PrevHash    string
+	HashVersion int16
+}
+
+func abbrev(h string) string {
+	if len(h) <= 16 {
+		return h
+	}
+	return strings.Join([]string{h[:8], h[len(h)-8:]}, "..")
+}
