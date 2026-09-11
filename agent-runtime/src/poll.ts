@@ -64,3 +64,70 @@ async function complete(
 ): Promise<boolean> {
   const res = await postJSON(
     `${cfg.baseUrl}/v1/agent-tasks/${encodeURIComponent(taskId)}/complete`,
+    cfg.token,
+    { taskId, leaseToken, artifactJson, error },
+  );
+  if (!res.ok) throw new Error(`complete failed: HTTP ${res.status} ${await res.text()}`);
+  const out = (await res.json()) as { accepted?: boolean };
+  return out.accepted === true;
+}
+
+// runPollLoop leases → runs → completes until aborted (or once). Errors on a
+// single iteration are logged and the loop backs off; one bad task never kills
+// the worker.
+export async function runPollLoop(
+  cfg: PollConfig,
+  engine: Engine,
+  engineCfg: EngineConfig,
+  signal?: AbortSignal,
+): Promise<void> {
+  while (!signal?.aborted) {
+    try {
+      const leased = await lease(cfg);
+      if (!leased.hasTask || !leased.taskId || !leased.leaseToken) {
+        if (cfg.once) return;
+        await sleep(cfg.idleMs);
+        continue;
+      }
+
+      // runTask (shared with the A2A path) never throws — a failed run comes
+      // back as state FAILED, which we map to the completion's error field.
+      const art = await runTask(
+        { id: leased.taskId, inputJson: leased.inputJson },
+        engine,
+        engineCfg,
+      );
+      const errMsg = art.state === "AGENT_TASK_STATE_FAILED" ? art.error : "";
+      const accepted = await complete(cfg, leased.taskId, leased.leaseToken, art.outputJson, errMsg);
+      process.stdout.write(
+        `agent-runtime poll: task ${leased.taskId} ${errMsg ? "failed" : "done"}` +
+          `${accepted ? "" : " (lease stale — result dropped)"}\n`,
+      );
+
+      if (cfg.once) return;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`agent-runtime poll: iteration error: ${msg}\n`);
+      await sleep(cfg.idleMs);
+    }
+  }
+}
+
+// pollConfigFromEnv reads the worker's poll settings from the environment the
+// daemon stamps onto a worker box.
+export function pollConfigFromEnv(): PollConfig {
+  const baseUrl = process.env.CONTAINARIUM_QUEUE_URL ?? "";
+  const token = process.env.CONTAINARIUM_QUEUE_TOKEN ?? "";
+  if (!baseUrl || !token) {
+    throw new Error("poll mode needs CONTAINARIUM_QUEUE_URL and CONTAINARIUM_QUEUE_TOKEN");
+  }
+  return {
+    baseUrl: baseUrl.replace(/\/$/, ""),
+    token,
+    workerId: process.env.CONTAINARIUM_WORKER_ID ?? "worker",
+    skillId: process.env.CONTAINARIUM_QUEUE_SKILL ?? "",
+    leaseSeconds: Number(process.env.CONTAINARIUM_LEASE_SECONDS ?? "300"),
+    idleMs: Number(process.env.CONTAINARIUM_POLL_IDLE_MS ?? "2000"),
+    once: process.env.CONTAINARIUM_POLL_ONCE === "1",
+  };
+}

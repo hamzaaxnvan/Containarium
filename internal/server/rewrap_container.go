@@ -85,3 +85,91 @@ func (s *ContainerServer) RewrapContainer(ctx context.Context, req *pb.RewrapCon
 	// working key, which is the guarantee.
 	if err := s.encryption.zfs.ChangeKey(ctx, root, newKey); err != nil {
 		return nil, status.Errorf(codes.Internal,
+			"rotating the key for %s failed and nothing was changed; the previous key is still the "+
+				"one that works: %v", root, err)
+	}
+
+	// From here the dataset is on the new key. Any container still recording
+	// the old ref would fail to start, so a failure below is reported loudly
+	// rather than swallowed.
+	rewrapped, err := s.encryption.recordRotation(root, newRef)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"the encryptionroot %s was rewrapped onto the new key, but recording it against every "+
+				"container failed (%v). Those containers still name the retired key and will not "+
+				"start until the ref is corrected", root, err)
+	}
+
+	log.Printf("[encryption] rotated the key for encryptionroot %s; %d container(s) now resolve the new ref",
+		root, len(rewrapped))
+	return &pb.RewrapContainerResponse{
+		Message: fmt.Sprintf(
+			"rotated the key for tenant encryptionroot %s; rotation is tenant-wide and covers %d container(s)",
+			root, len(rewrapped)),
+		RewrappedContainers: rewrapped,
+	}, nil
+}
+
+// recordRotation points every container sharing an encryptionroot at the new
+// key ref, and reports which ones.
+//
+// All of them, not just the one the caller named: they are opened by the
+// same key, so a container left recording the retired ref would try it on
+// its next start and fail.
+func (h *encryptionHooks) recordRotation(root string, newRef zfskey.KeyRef) ([]string, error) {
+	if !h.enabled() {
+		return nil, fmt.Errorf("encryption is not configured on this daemon")
+	}
+	sharing, err := h.containersUnder(root)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range sharing {
+		if err := h.refs.SetKeyRef(name, newRef); err != nil {
+			return nil, fmt.Errorf("record the new key ref for %s: %w", name, err)
+		}
+	}
+	return sharing, nil
+}
+
+// containersUnder lists the containers whose recorded pool resolves to the
+// given encryptionroot.
+func (h *encryptionHooks) containersUnder(root string) ([]string, error) {
+	lister, ok := h.refs.(encryptionStateLister)
+	if !ok {
+		return nil, fmt.Errorf("this daemon cannot enumerate encrypted containers, so a rotation " +
+			"cannot be recorded against all of them")
+	}
+	all, err := lister.ListEncrypted()
+	if err != nil {
+		return nil, fmt.Errorf("list encrypted containers: %w", err)
+	}
+
+	var sharing []string
+	for _, name := range all {
+		pool, err := h.refs.GetPool(name)
+		if err != nil || pool == "" {
+			continue
+		}
+		source, exists, err := h.pools.StoragePoolSource(pool)
+		if err != nil || !exists {
+			continue
+		}
+		if source == root {
+			sharing = append(sharing, name)
+		}
+	}
+	sort.Strings(sharing)
+	return sharing, nil
+}
+
+// encryptionStateLister is the optional half of the state store that can
+// enumerate encrypted containers.
+//
+// Optional because enumeration is only needed for rotation, and the
+// incus-backed store gets it from a container list the daemon already has —
+// while the migration and create paths need no such thing.
+type encryptionStateLister interface {
+	// ListEncrypted returns the names of containers carrying a key ref.
+	ListEncrypted() ([]string, error)
+}
