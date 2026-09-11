@@ -49,3 +49,54 @@ log() { logger -t mount-watchdog -- "$*" 2>/dev/null || true; echo "mount-watchd
 wedged() {
 	local enabled active
 	enabled=$(systemctl is-enabled "${SERVICE}" 2>/dev/null || echo "")
+	if [ "${enabled}" != "enabled" ]; then
+		return 1
+	fi
+	active=$(systemctl is-active "${SERVICE}" 2>/dev/null || echo "")
+	if [ "${active}" = "active" ]; then
+		return 1
+	fi
+	! mountpoint -q "${MOUNTPOINT}" 2>/dev/null
+}
+
+recover() {
+	log "detected: ${SERVICE} is enabled but inactive and ${MOUNTPOINT} is not mounted -- recovering (#1317)"
+
+	# Re-announce every dm-mapper device to udev. A .device unit stuck
+	# waiting for a lost/delayed "add" event is the proven root cause; this
+	# is the exact manual recovery step from the #1317 incident.
+	if compgen -G '/dev/mapper/*' >/dev/null 2>&1; then
+		for dev in /dev/mapper/*; do
+			[ "$(basename "${dev}")" = "control" ] && continue
+			udevadm trigger --action=add --settle "${dev}" 2>/dev/null || true
+		done
+	fi
+
+	# Scoped to the unit classes the #1317 incident named -- never a blanket
+	# `systemctl reset-failed`, which would also clear the failed state (and
+	# triage signal) of unrelated services on the host.
+	local mount_unit
+	mount_unit=$(systemd-escape --path --suffix=mount "${MOUNTPOINT}" 2>/dev/null || echo "")
+	# shellcheck disable=SC2086 # intentional: expands to zero or one unit name
+	systemctl reset-failed "${SERVICE}" ${mount_unit:+"${mount_unit}"} \
+		'dev-mapper-*.device' 'systemd-fsck@*.service' 'systemd-cryptsetup@*.service' \
+		>/dev/null 2>&1 || true
+
+	# Give udev a moment to settle the re-announced devices before asking
+	# systemd to bring the mount (and everything gated on it) back up.
+	sleep 3
+	if systemctl start "${SERVICE}"; then
+		log "recovery succeeded: ${SERVICE} is now $(systemctl is-active "${SERVICE}" 2>/dev/null || echo unknown)"
+	else
+		log "ALERT: recovery attempt failed -- ${SERVICE} is still not active after udev kick + reset-failed + start. Manual intervention needed (see docs/NODE-VM-PROVISIONING.md)."
+	fi
+}
+
+log "started (interval=${INTERVAL}s mountpoint=${MOUNTPOINT} service=${SERVICE})"
+
+while true; do
+	if wedged; then
+		recover
+	fi
+	sleep "${INTERVAL}"
+done

@@ -75,3 +75,81 @@ func parseCPUStat(content string) (cpuThrottle, bool) {
 
 // cgroupV2PathFromProc extracts the unified-hierarchy cgroup path from the
 // contents of a /proc/<pid>/cgroup file, relative to the cgroup root.
+//
+// Only the "0::" line is usable: on a hybrid host the v1 controllers are listed
+// first with their own paths, and cpu.stat lives under the v2 mount. A process
+// in the root cgroup ("0::/") yields "" — there is no per-container subtree to
+// read.
+//
+// Deriving the path from the container's init PID rather than assembling a
+// conventional name ("lxc.payload.<name>") keeps this working across Incus's
+// scope-naming variations and systemd-managed nesting.
+func cgroupV2PathFromProc(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "0::")
+		if !ok {
+			continue
+		}
+		return strings.Trim(rest, "/")
+	}
+	return ""
+}
+
+// CgroupV2PathFromProc is cgroupV2PathFromProc for callers outside this
+// package: the exec-telemetry watcher (#2637) resolves a container's init PID
+// to the cgroup path whose inode is the cgroup id the kernel reports.
+func CgroupV2PathFromProc(content string) string { return cgroupV2PathFromProc(content) }
+
+// readCPUThrottle resolves a process's cgroup and reads its throttling counters
+// from cgroupRoot.
+//
+// Every failure is a silent "no signal": metrics collection must not fail — or
+// log per container per scrape — just because a host mounts its cgroups
+// differently or the container exited between the state read and this one.
+func readCPUThrottle(procCgroupPath, cgroupRoot string) (cpuThrottle, bool) {
+	// #nosec G304 -- callers build this as /proc/<pid>/cgroup from an int64
+	// PID that Incus reported; it is a parameter only so the resolve-and-read
+	// path is testable against a fixture tree.
+	raw, err := os.ReadFile(procCgroupPath)
+	if err != nil {
+		return cpuThrottle{}, false
+	}
+
+	rel := cgroupV2PathFromProc(string(raw))
+	if rel == "" {
+		return cpuThrottle{}, false
+	}
+
+	// The cgroup path is read out of /proc, so it is host-derived rather than
+	// tenant-supplied — but it is still a variable path being resolved against
+	// a host directory, so contain it at the OS level instead of by inspection.
+	// os.Root refuses any traversal out of cgroupRoot, symlinks included, which
+	// a filepath.Clean check cannot promise.
+	root, err := os.OpenRoot(cgroupRoot)
+	if err != nil {
+		return cpuThrottle{}, false
+	}
+	defer func() { _ = root.Close() }()
+
+	f, err := root.Open(filepath.Join(rel, "cpu.stat"))
+	if err != nil {
+		return cpuThrottle{}, false
+	}
+	defer func() { _ = f.Close() }()
+
+	stat, err := io.ReadAll(f)
+	if err != nil {
+		return cpuThrottle{}, false
+	}
+	return parseCPUStat(string(stat))
+}
+
+// containerCPUThrottle reads the CFS throttling counters for the container
+// whose init process is pid. A non-positive pid (a stopped container) has no
+// cgroup to read.
+func containerCPUThrottle(pid int64) (cpuThrottle, bool) {
+	if pid <= 0 {
+		return cpuThrottle{}, false
+	}
+	return readCPUThrottle(fmt.Sprintf("/proc/%d/cgroup", pid), cgroupV2Root)
+}
