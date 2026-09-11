@@ -44,3 +44,50 @@ type Network struct {
 	// consumers TrimSpace where they need to. (EnvNetworkPolicyBPFObject)
 	PolicyBPFObject string
 
+	// PolicyEnforce arms packet drops (the second opt-in). Off = observation-only:
+	// even a stored enforce-mode policy only audits would-deny flows.
+	// (EnvNetworkPolicyEnforce)
+	PolicyEnforce bool
+
+	// PolicySignatures arms inbound cleartext exploit-signature scanning (Tier 2,
+	// #661) — separate from PolicyEnforce. (EnvNetworkPolicySignatures)
+	PolicySignatures bool
+
+	// CoreGuard is the raw CONTAINARIUM_CORE_GUARD value. Parsed by
+	// nicguard.ParseMode: unset is enforce, only "off" disables.
+	CoreGuard string
+
+	// TenantGuard is the raw CONTAINARIUM_TENANT_GUARD value, parsed the
+	// same way. (EnvTenantGuard)
+	TenantGuard string
+
+	// DefaultEgress, DefaultEgressDomains and DefaultEgressCIDRs are the raw
+	// values of the three variables above, parsed by
+	// netpolicy.ParseDefaultEgress.
+	DefaultEgress        string
+	DefaultEgressDomains string
+	DefaultEgressCIDRs   string
+
+	// NativeAccountTenancy arms automatic per-user account network namespaces
+	// (EnvNativeAccountTenancy). Off by default.
+	NativeAccountTenancy bool
+}
+
+// LoadNetwork reads the CONTAINARIUM_NETWORK_* namespace once. The two arming
+// flags use the shared truthy convention (1/true/yes/on), matching the switch /
+// envTruthy parsing they replace.
+func LoadNetwork() Network {
+	return Network{
+		PolicyBPFObject:  getString(EnvNetworkPolicyBPFObject, ""),
+		PolicyEnforce:    getBool(EnvNetworkPolicyEnforce),
+		PolicySignatures: getBool(EnvNetworkPolicySignatures),
+		CoreGuard:        getString(EnvCoreGuard, ""),
+		TenantGuard:      getString(EnvTenantGuard, ""),
+
+		DefaultEgress:        getString(EnvDefaultEgress, ""),
+		DefaultEgressDomains: getString(EnvDefaultEgressDomains, ""),
+		DefaultEgressCIDRs:   getString(EnvDefaultEgressCIDRs, ""),
+
+		NativeAccountTenancy: getBool(EnvNativeAccountTenancy),
+	}
+}
