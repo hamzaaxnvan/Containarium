@@ -83,3 +83,174 @@ function SecurityBadgePill({ badge }: { badge: SecurityBadge }) {
   );
   return null;
 }
+
+function IconBtn({ title, onClick, className = '', children }: { title: string; onClick: () => void; className?: string; children: React.ReactNode }) {
+  return (
+    <button
+      title={title}
+      onClick={onClick}
+      className={`rounded p-1 text-[var(--text-muted)] transition-colors hover:text-[var(--text)] hover:bg-[var(--surface-2)] ${className}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+export default function ContainerNode({ container, metrics, securityBadge, onDelete, onStart, onStop, onTerminal, onEditFirewall, onEditLabels, onResize, onToggleAutoSleep, onSecurityClick }: ContainerNodeProps) {
+  const isRunning = container.state === 'Running';
+  const username = container.username || container.name;
+
+  const cpuCores = parseInt(container.cpu) || 0;
+  const cpuUsagePct = metrics?.cpuUsagePercent || 0;
+  const cpuNorm = cpuCores > 0 ? Math.min((cpuUsagePct / (cpuCores * 100)) * 100, 100) : 0;
+
+  const memLimit = parseSize(container.memory);
+  const diskLimit = parseSize(container.disk);
+  const memUsed = metrics?.memoryUsageBytes || 0;
+  const diskUsed = metrics?.diskUsageBytes || 0;
+  const memPct = memLimit > 0 ? Math.min((memUsed / memLimit) * 100, 100) : 0;
+  const diskPct = diskLimit > 0 ? Math.min((diskUsed / diskLimit) * 100, 100) : 0;
+
+  return (
+    <div className="flex flex-col gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] p-4 shadow-sm transition-shadow hover:shadow-md hover:border-[var(--border)]">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold text-[var(--text)]">{username}</p>
+          <p className="truncate text-xs text-[var(--text-muted)]">{container.image || 'ubuntu:24.04'}</p>
+        </div>
+        {container.state === 'Stopped' && container.autoSleepEnabled ? (
+          <span className="shrink-0 inline-flex items-center gap-1 rounded-full border border-indigo-500/30 bg-indigo-500/15 px-2 py-0.5 text-[10px] font-medium text-indigo-400">
+            <Moon size={10} />
+            Sleeping
+          </span>
+        ) : (
+          <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium ${stateBadge(container.state)}`}>
+            {container.state}
+          </span>
+        )}
+      </div>
+
+      {/* IP + chips */}
+      <div className="flex flex-wrap items-center gap-1.5">
+        {container.ipAddress && (
+          <span className="flex items-center gap-1 rounded bg-[var(--surface-2)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--text-secondary)]">
+            <Network size={10} />
+            {container.ipAddress}
+          </span>
+        )}
+        {container.gpu && (
+          <span className="rounded border border-violet-500/30 bg-violet-500/10 px-1.5 py-0.5 text-[10px] text-[var(--c-violet)]">
+            GPU: {container.gpu}
+          </span>
+        )}
+        {container.backendId && (
+          <span className={`rounded border px-1.5 py-0.5 text-[10px] ${container.backendId.startsWith('tunnel-') ? 'border-indigo-500/30 bg-indigo-500/10 text-indigo-400' : 'border-blue-500/30 bg-blue-500/10 text-[var(--c-blue)]'}`}>
+            {container.backendId}
+          </span>
+        )}
+        {securityBadge && (
+          onSecurityClick
+            ? <button onClick={onSecurityClick} className="focus:outline-none"><SecurityBadgePill badge={securityBadge} /></button>
+            : <SecurityBadgePill badge={securityBadge} />
+        )}
+      </div>
+
+      {/* Resource bars */}
+      {isRunning && (
+        <div className="flex flex-col gap-2">
+          {container.cpu && (
+            <div>
+              <div className="mb-1 flex justify-between text-[10px] text-[var(--text-muted)]">
+                <span>CPU</span>
+                <span>{cpuUsagePct.toFixed(1)}% / {cpuCores}c</span>
+              </div>
+              <UsageBar used={cpuNorm} total={100} color={barColor(cpuNorm)} />
+            </div>
+          )}
+          {container.memory && memLimit > 0 && (
+            <div>
+              <div className="mb-1 flex justify-between text-[10px] text-[var(--text-muted)]">
+                <span>Memory</span>
+                <span>{formatBytes(memUsed)} / {container.memory}</span>
+              </div>
+              <UsageBar used={memPct} total={100} color={barColor(memPct)} />
+            </div>
+          )}
+          {(diskUsed > 0 || diskLimit > 0) && (
+            <div>
+              <div className="mb-1 flex justify-between text-[10px] text-[var(--text-muted)]">
+                <span>Disk</span>
+                <span>{formatBytes(diskUsed)}{container.disk ? ` / ${container.disk}` : ' used'}</span>
+              </div>
+              <UsageBar used={diskPct || 100} total={100} color={barColor(diskPct)} />
+            </div>
+          )}
+          {metrics && (
+            <div className="flex flex-wrap gap-1">
+              <span className="rounded bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--text-muted)]" title="Network I/O">
+                Net: {formatBytes(metrics.networkRxBytes)}↓ {formatBytes(metrics.networkTxBytes)}↑
+              </span>
+              <span className="rounded bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--text-muted)]" title="Running processes">
+                {metrics.processCount} procs
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Actions */}
+      <div className="flex items-center justify-end gap-0.5 border-t border-[var(--border-subtle)] pt-2">
+        {isRunning && container.accessType === 'ACCESS_TYPE_RDP' && (
+          <IconBtn title="Remote Desktop" onClick={() => window.open('/guacamole/', '_blank')}>
+            <Monitor size={14} />
+          </IconBtn>
+        )}
+        {isRunning && container.accessType !== 'ACCESS_TYPE_RDP' && onTerminal && (
+          <IconBtn title="Terminal" onClick={() => onTerminal(username)} className="hover:text-[var(--c-blue)]">
+            <Terminal size={14} />
+          </IconBtn>
+        )}
+        {onResize && (
+          <IconBtn title="Resize Resources" onClick={() => onResize(username)}>
+            <SlidersHorizontal size={14} />
+          </IconBtn>
+        )}
+        {onEditFirewall && (
+          <IconBtn title="Firewall" onClick={() => onEditFirewall(username)} className="hover:text-[var(--c-amber)]">
+            <Shield size={14} />
+          </IconBtn>
+        )}
+        {onToggleAutoSleep && (
+          <IconBtn
+            title={container.autoSleepEnabled ? `Auto-sleep · idle ${container.idleThresholdMinutes ?? 15}m` : 'Auto-sleep'}
+            onClick={() => onToggleAutoSleep(username, {
+              enabled: container.autoSleepEnabled ?? false,
+              threshold: container.idleThresholdMinutes ?? 15,
+            })}
+            className={container.autoSleepEnabled ? 'text-indigo-400 hover:text-indigo-300' : 'hover:text-indigo-400'}
+          >
+            <Moon size={14} />
+          </IconBtn>
+        )}
+        {onEditLabels && (
+          <IconBtn title="Edit Labels" onClick={() => onEditLabels(username)}>
+            <Tag size={14} />
+          </IconBtn>
+        )}
+        {isRunning ? (
+          <IconBtn title="Stop" onClick={() => onStop?.(username)} className="hover:text-[var(--c-amber)]">
+            <Square size={14} />
+          </IconBtn>
+        ) : (
+          <IconBtn title="Start" onClick={() => onStart?.(username)} className="hover:text-[var(--c-emerald)]">
+            <Play size={14} />
+          </IconBtn>
+        )}
+        <IconBtn title="Delete" onClick={() => onDelete(username)} className="hover:text-[var(--c-red)] hover:bg-red-500/10">
+          <Trash2 size={14} />
+        </IconBtn>
+      </div>
+    </div>
+  );
+}
