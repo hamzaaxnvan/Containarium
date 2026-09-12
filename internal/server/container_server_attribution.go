@@ -19,3 +19,69 @@ import (
 // management.
 //
 // Merge, not replace: each provided label is set via manager.AddLabel (which
+// writes incus.LabelPrefix+key), leaving labels not named here intact — so an
+// adopt can't clobber a box's monitoring / os-type / other labels. The labels
+// live on the Incus config, so they survive daemon restart and are read back on
+// list/get the same way create-time labels are. Like the other per-container
+// RPCs, req.Name carries the bare username and the manager resolves
+// <username>-container.
+//
+// Cloud→daemon plumbing (like /authorized-keys/sentinel), not a standalone
+// operator action — stamping cloud org UUIDs by hand is meaningless, so there's
+// no `containarium` CLI verb; the operator surface is the cloud's adopt flow.
+// The admin role is required (on top of containers:write) because cloud_org_id
+// is a protected attribution label that also feeds tenant resolution: the
+// control plane's adopt token must carry the admin role, matching create-time
+// stamping, and a tenant can never re-attribute its own box.
+func (s *ContainerServer) SetContainerAttribution(ctx context.Context, req *pb.SetContainerAttributionRequest) (*pb.SetContainerAttributionResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Name == "" {
+		return nil, status.Error(codes.InvalidArgument, "name is required")
+	}
+	if len(req.Labels) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "labels must not be empty")
+	}
+	for k := range req.Labels {
+		if k == "" {
+			return nil, status.Error(codes.InvalidArgument, "label key must not be empty")
+		}
+	}
+
+	if err := authorizeNetworkTenantLabels(ctx, req.Labels); err != nil {
+		return nil, err
+	}
+
+	username := req.Name
+	if err := auth.AuthorizeTenant(ctx, username); err != nil {
+		return nil, err
+	}
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: username})
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found: %v", username, err)
+	}
+	if info == nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found", username)
+	}
+	if info.IsCore {
+		return nil, status.Errorf(codes.InvalidArgument, "container %s is a core container; attribution is for user containers only", info.Ref.Name)
+	}
+
+	for k, v := range req.Labels {
+		if err := s.manager.AddLabel(username, k, v); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to set label %q: %v", k, err)
+		}
+	}
+
+	labels, err := s.manager.GetLabels(username)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to read labels back: %v", err)
+	}
+	log.Printf("[attribution] container=%s labels+=%d", info.Ref.Name, len(req.Labels))
+	return &pb.SetContainerAttributionResponse{Labels: labels}, nil
+}
