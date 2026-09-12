@@ -327,3 +327,662 @@ go build -o "$BIN" ./cmd/containariumd
 # --- daemon ---------------------------------------------------------------
 JWT_SECRET="${CONTAINARIUM_JWT_SECRET:-$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 
+# A PLACEHOLDER provider key, not a secret: its only job is to make
+# gatewayProviderKeysFromEnv() non-empty so the daemon serves the model gateway
+# and provisions skill boxes through it. Nothing here ever reaches a provider
+# successfully, by construction — see the header.
+GATEWAY_KEY="not-a-real-key-e2e-placeholder"
+
+log "starting daemon (grpc :$GRPC_PORT http :$HTTP_PORT, model gateway provider $PROVIDER)"
+# SC2024 (sudo doesn't affect redirects) is the intent, not a bug: the log file
+# is created by THIS shell inside our own mktemp workdir, so the diagnostics in
+# cleanup() can read it without sudo. Same shape as scripts/cluster-e2e.sh.
+# shellcheck disable=SC2024
+sudo env \
+  CONTAINARIUM_JWT_SECRET="$JWT_SECRET" \
+  CONTAINARIUM_POSTGRES_URL="$CONTAINARIUM_POSTGRES_URL" \
+  ANTHROPIC_API_KEY="$GATEWAY_KEY" \
+  "$BIN" daemon --port "$GRPC_PORT" --http-port "$HTTP_PORT" \
+  >"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+
+# 300 tries x 2s = 10 minutes. Most of that is the daemon's own "Waiting for
+# core containers to be ready…", measured at ~2 minutes on a host with the image
+# ALREADY cached; a freshly provisioned CI runner also pulls the image and
+# creates those containers first. The old 6-minute bound was within a factor of
+# two of that, and when it trips the lane reports "daemon HTTP gateway not
+# answering", which reads like a daemon bug rather than a cold host.
+DAEMON_WAIT_TRIES="${CONTAINARIUM_E2E_LEASE_DAEMON_WAIT_TRIES:-300}"
+log "waiting for the daemon's HTTP gateway (up to $((DAEMON_WAIT_TRIES * 2))s)"
+for i in $(seq 1 "$DAEMON_WAIT_TRIES"); do
+  if ! sudo kill -0 "$DAEMON_PID" 2>/dev/null; then
+    fail "daemon exited during startup"
+  fi
+  if daemon_is_ready "$HTTP_PORT" /v1/agent-skills; then
+    break
+  fi
+  [ "$i" = "$DAEMON_WAIT_TRIES" ] && fail "daemon HTTP gateway not answering after $((DAEMON_WAIT_TRIES * 2))s"
+  sleep 2
+done
+
+# The model gateway is only mounted when the daemon holds a provider key. If it
+# is absent, gateway.env is never seeded, every later assertion is about a
+# credential that was never issued, and the lane would go GREEN having tested
+# nothing. Check it before anything else.
+gw_health="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/__gateway/healthz")"
+[ "$gw_health" = "200" ] || fail "model gateway is not mounted (/__gateway/healthz -> $gw_health); the provider key was not picked up, so there would be no gateway token to revoke"
+ok "model gateway mounted (/__gateway/healthz -> 200)"
+
+# The revocation store is the other half of the property. A daemon without
+# Postgres says so in one startup line and then wipes seed files without
+# revoking anything — which would make assertion 2 impossible for a reason
+# that has nothing to do with the code under test.
+if grep -q 'model-gateway has no revocation store' "$DAEMON_LOG"; then
+  fail "daemon came up with no revocation store — Postgres is not reachable, so no credential can be killed before its expiry"
+fi
+ok "daemon has a revocation store (Postgres reachable)"
+
+# --- caller credentials ---------------------------------------------------
+# admin role: provisionSkillBox calls AuthorizeTenant on the box's tenant name
+# ("agent-<skill>"), which only the tenant itself or an admin passes. Wildcard
+# scopes: the skill's in-box token is the intersection of the caller's scopes
+# and the manifest's, and this caller must not be the thing that narrows it.
+TOKEN="$("$BIN" token generate --username lease-e2e --roles admin --scopes '*' \
+  --expiry 1h --secret "$JWT_SECRET" --raw)"
+[ -n "$TOKEN" ] || fail "could not mint a caller token"
+
+# read_out reads one of the curl output files above WITHOUT being able to kill
+# the script before the assertion that was going to interpret it.
+#
+# This is not defensive noise, it is the fix for a real hole: curl does NOT
+# create its `-o` file when the connection never happens ("Failed to connect"),
+# so a plain `body="$(cat "$out.body")"` dies under `set -euo pipefail` at the
+# READ, before the guard written to diagnose exactly that case can run. The
+# operator then sees `cat: …/during.body: No such file or directory` instead of
+# a named assertion failure. Missing file ⇒ empty, and the caller decides what
+# that means.
+read_out() { cat "$1" 2>/dev/null || true; }
+
+# read_code is read_out for a `-w '%{http_code}'` file, normalising "no file"
+# and "no response" to the same 000 curl itself would have written.
+read_code() {
+  local c
+  c="$(read_out "$1")"
+  [ -n "$c" ] || c="000"
+  printf '%s' "$c"
+}
+
+# run_skill POSTs RunAgentSkill with an explicit run id and writes the HTTP
+# status to <out>.code and the body to <out>.body. Synchronous by nature — the
+# caller decides whether to background it.
+run_skill() {
+  local run_id="$1" out="$2"
+  : >"$out.body"
+  curl -sS -o "$out.body" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:$HTTP_PORT/v1/agent-skills/$SKILL_ID/run" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"run_id\":\"$run_id\",\"input_json\":\"{}\"}" \
+    >"$out.code" 2>"$out.err" || true
+}
+
+# model_call presents a gateway token to /v1/model/<provider> and writes the
+# status to <out>.code, the body to <out>.body. The request is a real
+# provider-shaped call so nothing short-circuits before the revocation check.
+#
+# The ceiling is a PARAMETER because the two call sites need different ones, and
+# the difference is load-bearing for assertion 2's measurement — see
+# POLL_MAX_TIME below.
+model_call() {
+  local token="$1" out="$2" max_time="${3:-$MODEL_CALL_MAX_TIME}"
+  : >"$out.body"
+  curl -sS -o "$out.body" -w '%{http_code}' --max-time "$max_time" \
+    -X POST "http://127.0.0.1:$HTTP_PORT/v1/model/$PROVIDER/v1/messages" \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"claude-3-5-haiku-latest","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' \
+    >"$out.code" 2>"$out.err" || true
+}
+
+# run_skill_with_git is run_skill plus the #1861 repo fields. A separate
+# function rather than extra optional params on run_skill: every existing
+# call site (warm-up, the measured run above) passes none of these, and this
+# keeps their request body exactly as it always was.
+run_skill_with_git() {
+  local run_id="$1" out="$2" git_source="$3" git_ref="$4" git_credential="$5"
+  : >"$out.body"
+  local body
+  body="$(jq -nc --arg run_id "$run_id" --arg src "$git_source" --arg ref "$git_ref" --arg cred "$git_credential" \
+    '{run_id: $run_id, input_json: "{}", git_source: $src, git_ref: $ref, git_credential: $cred}')"
+  curl -sS -o "$out.body" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:$HTTP_PORT/v1/agent-skills/$SKILL_ID/run" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "$body" \
+    >"$out.code" 2>"$out.err" || true
+}
+
+# assert_revoked_within_budget is assertion 2's poll-until-revoked-or-budget
+# logic, reusable: #1861 holds the git-source run's own token to the exact
+# same bound rather than assuming it because the plain run proved it. The
+# original assertion 2 below is left untouched — this is a second, independent
+# instance of the same check, not a refactor of the first.
+assert_revoked_within_budget() {
+  local token="$1" exit_ms="$2" label="$3"
+  local revoked_at_ms="" last_code="" last_body=""
+  while :; do
+    model_call "$token" "$WORKDIR/after-$label" "$POLL_MAX_TIME"
+    last_code="$(read_code "$WORKDIR/after-$label.code")"
+    last_body="$(read_out "$WORKDIR/after-$label.body")"
+    case "$last_body" in
+      *"gateway token revoked"*) revoked_at_ms="$(now_ms)"; break ;;
+    esac
+    if [ "$(( $(now_ms) - exit_ms ))" -ge "$(( REVOKE_BUDGET_MS + POLL_GRACE_MS ))" ]; then
+      break
+    fi
+    sleep 0.2
+  done
+  if [ -z "$revoked_at_ms" ]; then
+    fail "assertion ($label): $(( REVOKE_BUDGET_MS + POLL_GRACE_MS ))ms after the run returned, the token is STILL accepted (last answer $last_code: $(printf '%s' "$last_body" | head -c 160 | tr '\n' ' ')) — the credential outlived its run"
+  fi
+  local revoked_after_ms=$(( revoked_at_ms - exit_ms ))
+  [ "$revoked_after_ms" -le "$REVOKE_BUDGET_MS" ] \
+    || fail "assertion ($label): the token WAS revoked, but only refused ${revoked_after_ms}ms after the run returned — past the ${REVOKE_BUDGET_MS}ms budget"
+  [ "$last_code" = "401" ] \
+    || fail "assertion ($label): body says revoked but status was $last_code, want 401"
+  ok "assertion ($label): token DEAD ${revoked_after_ms}ms after the run returned (budget ${REVOKE_BUDGET_MS}ms)"
+}
+
+# --- warm-up run: create the box, then install the stub agent-runtime -----
+# The warm-up is a real run with a real lease: it provisions, mints, seeds,
+# execs, revokes and wipes. Its only purpose here is to bring the box into
+# existence so the stub can be installed into it. The in-box agent has only
+# the dummy provider key, so it fails upstream; since #2931 RunAgentSkill
+# reports that as a 500 naming the in-box failure instead of a 200. That 500
+# still means the box was provisioned and the run started and ended, so it is
+# accepted. So is the 400 for a box with no agent-runtime yet (the recipe's
+# install is best-effort; incus reports bash's 127 as "Command not found").
+# Any other non-200 (provisioning, auth, a crash) still fails here.
+log "warm-up run (provisions the box; the agent-runtime recipe installs Node, this is the slow part)"
+WARM_RUN_ID="lease-e2e-warmup-$$"
+run_skill "$WARM_RUN_ID" "$WORKDIR/warm"
+warm_code="$(read_code "$WORKDIR/warm.code")"
+if [ "$warm_code" != "200" ]; then
+  if [ "$warm_code" = "500" ] && grep -q "agent run $WARM_RUN_ID failed: in-box agent on " "$WORKDIR/warm.body" 2>/dev/null; then
+    ok "warm-up's in-box agent failed upstream as expected with the dummy key (500 names the in-box failure)"
+  elif [ "$warm_code" = "400" ] && grep -q "agent run $WARM_RUN_ID failed: .*agent-runtime is not installed in the box" "$WORKDIR/warm.body" 2>/dev/null; then
+    ok "warm-up found no agent-runtime in the box yet (400 FailedPrecondition): the recipe's best-effort install did not land, which the stub below replaces anyway"
+  else
+    echo "---- warm-up response ----"; read_out "$WORKDIR/warm.body"; echo
+    fail "warm-up RunAgentSkill returned $warm_code (want 200, a 500 naming an in-box agent failure, or a 400 saying agent-runtime is not installed); the box never came up, so there is nothing to measure"
+  fi
+fi
+sudo incus info "$BOX" >/dev/null 2>&1 || fail "skill box $BOX does not exist after a successful run"
+ok "skill box $BOX provisioned (warm-up run $WARM_RUN_ID)"
+
+# The stub. /usr/local/bin comes first on the box's PATH, so this is the
+# agent-runtime the daemon's `bash -lc ... agent-runtime` resolves — whether or
+# not the recipe's best-effort assembly installed a real one.
+#
+# The marker line is not decoration. scripts/install-agent-runtime.sh writes this
+# same path, and on a host where the recipe's post_start succeeds it really does
+# install a working agent-runtime that this overwrites. The warm-up RPC blocks
+# until post_start finishes, so there is no clobber race today — but that is an
+# implementation detail of `deploy`, not a contract. If it ever changes, the
+# recipe wins, the measured run ends in milliseconds, and the gateway.env poll
+# below reports "the run finished before gateway.env could be read; raise
+# RUN_SECONDS" — a confident wrong diagnosis. Grepping for the marker right
+# before the measured run turns that into the truth instead.
+STUB_MARKER="containarium-lease-e2e-stub"
+log "installing the stub agent-runtime (sleep ${RUN_SECONDS}s) into $BOX"
+# The stub ends like a real successful run: it writes a minimal artifact.json
+# into the run's seed dir (AGENT_SEED_DIR, exported by the daemon's exec) and
+# exits 0. RunAgentSkill reports a run that leaves no artifact as failed
+# (#2931), so a stub that only slept would turn every measured run into a 500.
+sudo incus exec "$BOX" -- sh -c 'cat > /usr/local/bin/agent-runtime && chmod 0755 /usr/local/bin/agent-runtime' <<STUB
+#!/bin/sh
+# $STUB_MARKER
+sleep $RUN_SECONDS
+printf '%s' '{"outputJson":"{}","engine":"stub"}' > "\$AGENT_SEED_DIR/artifact.json"
+STUB
+sudo incus exec "$BOX" -- test -x /usr/local/bin/agent-runtime \
+  || fail "stub agent-runtime was not installed into $BOX"
+sudo incus exec "$BOX" -- grep -q "$STUB_MARKER" /usr/local/bin/agent-runtime \
+  || fail "/usr/local/bin/agent-runtime in $BOX is not this script's stub — something else (the agent-runtime recipe's install-agent-runtime.sh writes the same path) owns it, so the measured run would not last long enough to observe"
+ok "stub agent-runtime installed and verified by marker (the measured run will last ~${RUN_SECONDS}s)"
+
+# The warm-up's own lease must already be gone; if its seed dir is still
+# there, the measured run's "these files appeared" poll below would latch onto
+# a stale credential and assertion 1 would be about the wrong token. #1860:
+# the daemon's own lease end already removes the whole per-run directory, not
+# just the two files — this is defensive belt-and-suspenders, so it does the
+# same (rm -rf, not rm -f two names) rather than assume the exact old shape.
+sudo incus exec "$BOX" -- rm -rf "$AGENT_SEED_ROOT/$WARM_RUN_ID"
+
+# --- the measured run -----------------------------------------------------
+RUN_ID="lease-e2e-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+# #1860: this run's own directories, now that RUN_ID is known. No git_source
+# is passed to run_skill in this script, so RUN_WORKSPACE_DIR is never
+# created — assertion 3 below checks that plainly, rather than claiming to
+# prove removal of a workspace that was never asked for. The "fetch a repo,
+# then prove the workspace is gone too" case is #1861's e2e, on top of this.
+RUN_SEED_DIR="$AGENT_SEED_ROOT/$RUN_ID"
+RUN_WORKSPACE_DIR="$AGENT_WORKSPACE_ROOT/$RUN_ID"
+log "measured run $RUN_ID (RPC in the background so the run can be observed while it lasts)"
+run_skill "$RUN_ID" "$WORKDIR/run" &
+RUN_PID=$!
+
+# Read the run's gateway token out of the box while the run is in flight. The
+# file is written by provisionSkillBox before the agent exec starts and removed
+# by endRunLease after it returns, so its PRESENCE is the run's own liveness
+# signal — no sleep-and-hope.
+log "reading $RUN_SEED_DIR/gateway.env from the box during the run"
+GW_TOKEN=""
+gw_env=""
+for _ in $(seq 1 300); do
+  gw_env="$(sudo incus exec "$BOX" -- cat "$RUN_SEED_DIR/gateway.env" 2>/dev/null || true)"
+  if [ -n "$gw_env" ]; then
+    GW_TOKEN="$(printf '%s\n' "$gw_env" | sed -n "s/^export $GW_TOKEN_VAR=//p" | head -1)"
+    [ -n "$GW_TOKEN" ] && break
+  fi
+  if ! kill -0 "$RUN_PID" 2>/dev/null; then
+    fail "the run finished before gateway.env could be read; raise CONTAINARIUM_E2E_LEASE_RUN_SECONDS (currently ${RUN_SECONDS}s)"
+  fi
+  sleep 0.2
+done
+[ -n "$GW_TOKEN" ] || fail "never saw $GW_TOKEN_VAR in $RUN_SEED_DIR/gateway.env during the run"
+ok "read the run's gateway token from $RUN_SEED_DIR/gateway.env during the run (${#GW_TOKEN} bytes)"
+
+# --- assertion 1: accepted during the run --------------------------------
+model_call "$GW_TOKEN" "$WORKDIR/during"
+during_code="$(read_code "$WORKDIR/during.code")"
+during_body="$(read_out "$WORKDIR/during.body")"
+# The gateway must have ANSWERED. curl reports 000 when it never got an HTTP
+# response at all (connection refused, --max-time reached), and the body is then
+# empty — or, on a refused connection, not written at all, which is why both
+# reads above go through the read_out helpers. Without this check the assertion
+# would pass on a call that never reached the gateway.
+#
+# The same hole cannot exist in assertion 2: there a missing response simply
+# never says "gateway token revoked", so the budget runs out and the lane goes
+# red. Vacuous passes only ever hide in the assertion that accepts by default.
+if ! printf '%s' "$during_code" | grep -qE '^[1-5][0-9][0-9]$'; then
+  echo "---- curl stderr ----"; read_out "$WORKDIR/during.err"
+  fail "assertion 1: /v1/model/$PROVIDER returned no HTTP response (curl wrote status '$during_code') — the gateway never answered, so nothing was proved about the credential"
+fi
+case "$during_body" in
+  *"gateway token revoked"*)
+    # Two very different causes, and naming the wrong one sends the next reader
+    # hunting a daemon bug that does not exist. This is the only call in the
+    # script that reaches the provider, so on a runner with no egress it can burn
+    # MODEL_CALL_MAX_TIME seconds of a RUN_SECONDS window; if the run is already
+    # over, the token is legitimately revoked and the observation is simply too
+    # late. Ask the run whether it is still alive before blaming the daemon.
+    if ! kill -0 "$RUN_PID" 2>/dev/null; then
+      fail "assertion 1: the observation window closed before the model call returned — the run had already ended (and correctly revoked) by the time the gateway answered, so this says nothing about the lease. Raise CONTAINARIUM_E2E_LEASE_RUN_SECONDS (currently ${RUN_SECONDS}s) or lower CONTAINARIUM_E2E_LEASE_MODEL_MAX_TIME (currently ${MODEL_CALL_MAX_TIME}s)"
+    fi
+    fail "assertion 1: the gateway rejected the run's own token DURING the run as revoked, while the run is STILL RUNNING — the lease was ended too early" ;;
+  *"invalid gateway token"*|*"missing gateway token"*|*"token not valid for provider"*|*"unknown provider"*|*"missing provider in path"*)
+    fail "assertion 1: the gateway refused the credential for a reason unrelated to revocation ($during_code: $during_body) — the later 401 would prove nothing" ;;
+esac
+ok "assertion 1: token ACCEPTED during the run — /v1/model/$PROVIDER answered $during_code, not a gateway credential rejection"
+echo "     (upstream said: $(printf '%s' "$during_body" | head -c 160 | tr '\n' ' '))"
+
+# --- wait for the run to return ------------------------------------------
+wait "$RUN_PID" || true
+EXIT_MS="$(now_ms)"
+run_code="$(read_code "$WORKDIR/run.code")"
+if [ "$run_code" != "200" ]; then
+  echo "---- run response ----"; read_out "$WORKDIR/run.body"; echo
+  fail "measured RunAgentSkill returned $run_code (want 200)"
+fi
+echoed_run_id="$(jq -r '.runId // empty' <"$WORKDIR/run.body")"
+[ "$echoed_run_id" = "$RUN_ID" ] \
+  || fail "RunAgentSkillResponse.run_id was '$echoed_run_id', want '$RUN_ID' — the run this script measures is not the run the daemon leased"
+ok "run $RUN_ID returned 200 and echoed its run id"
+
+case "$SABOTAGE" in
+  no-revoke)
+    # Put the system in the state a missing revoke call produces: the rows the
+    # run just wrote are removed, so the gateway's lookup finds nothing. Exactly
+    # what #1817 added, undone at the only place it is observable.
+    deleted="$(psql_in_pg "DELETE FROM jwt_revocations WHERE reason = 'run_exit' RETURNING jti;" | wc -l)"
+    # Self-checking: a DELETE that matched nothing would leave the lane GREEN and
+    # make prove-lease-lane-can-fail report "the lane cannot fail", when the truth
+    # is that the sabotage misfired. Those two must never look alike.
+    [ "$deleted" -gt 0 ] \
+      || fail "SABOTAGE no-revoke deleted 0 rows from jwt_revocations — the sabotage misfired, so a green lane below would prove nothing either way"
+    echo "SABOTAGE: deleted $deleted run_exit revocation row(s) — assertion 2 must now go RED"
+    ;;
+  slow-revoke)
+    # The revocation really happened; the OBSERVATION is made late on purpose.
+    # This is the scenario that used to pass: the budget was only the poll loop's
+    # continuation condition, so a late-but-successful observation printed
+    # "token DEAD <over-budget>ms … (budget 5000ms)" and exited 0.
+    slow_ms=$(( REVOKE_BUDGET_MS + 1000 ))
+    echo "SABOTAGE: sleeping ${slow_ms}ms before the first poll so the revoked answer lands PAST the ${REVOKE_BUDGET_MS}ms budget — assertion 2 must now go RED on the budget, not on the revocation"
+    sleep "$(awk "BEGIN{printf \"%.3f\", $slow_ms/1000}")"
+    ;;
+esac
+
+# --- assertion 2: dead within the budget ---------------------------------
+# Two claims, both enforced: the token IS refused as revoked, and it is refused
+# WITHIN the budget. The loop finds the first; the gate after it enforces the
+# second. Keeping those separate is the whole point — the budget used to be only
+# this loop's continuation condition, checked after the body match, so a single
+# poll that started inside the budget and returned outside it would set
+# revoked_at_ms, break, and be reported as a PASS at any duration.
+log "polling /v1/model/$PROVIDER with the run's token until it is refused as revoked (budget ${REVOKE_BUDGET_MS}ms from run exit, polling up to $(( REVOKE_BUDGET_MS + POLL_GRACE_MS ))ms so a late answer can be reported as late)"
+revoked_at_ms=""
+last_code=""
+last_body=""
+while :; do
+  model_call "$GW_TOKEN" "$WORKDIR/after" "$POLL_MAX_TIME"
+  last_code="$(read_code "$WORKDIR/after.code")"
+  last_body="$(read_out "$WORKDIR/after.body")"
+  case "$last_body" in
+    *"gateway token revoked"*)
+      revoked_at_ms="$(now_ms)"
+      break ;;
+  esac
+  # Stop polling at budget+grace. Crossing the BUDGET is not a reason to stop:
+  # the extra window exists so a late revocation is reported as late rather than
+  # as absent. It can never turn into a pass — the gate below is the budget.
+  if [ "$(( $(now_ms) - EXIT_MS ))" -ge "$(( REVOKE_BUDGET_MS + POLL_GRACE_MS ))" ]; then
+    break
+  fi
+  sleep 0.2
+done
+
+if [ -z "$revoked_at_ms" ]; then
+  fail "assertion 2: $(( REVOKE_BUDGET_MS + POLL_GRACE_MS ))ms after the run returned, the run's gateway token is STILL accepted (last answer $last_code: $(printf '%s' "$last_body" | head -c 160 | tr '\n' ' ')) — the credential outlived its run"
+fi
+revoked_after_ms=$(( revoked_at_ms - EXIT_MS ))
+# THE GATE. #1819's criterion is the bound, so the bound is compared against the
+# MEASUREMENT, not merely used to decide how long to keep asking. Expected value
+# is ~10-20ms (the header explains why), so anything near the budget means
+# something structural changed and is worth a red lane.
+[ "$revoked_after_ms" -le "$REVOKE_BUDGET_MS" ] \
+  || fail "assertion 2: the run's gateway token WAS revoked, but it was only refused ${revoked_after_ms}ms after the run returned — past the ${REVOKE_BUDGET_MS}ms budget this lane exists to pin. The credential died, just not in time."
+[ "$last_code" = "401" ] \
+  || fail "assertion 2: the body says 'gateway token revoked' but the status was $last_code, want 401"
+ok "assertion 2: token DEAD ${revoked_after_ms}ms after the run returned — 401 'gateway token revoked' (budget ${REVOKE_BUDGET_MS}ms)"
+
+# --- assertion 3: the seed files are gone --------------------------------
+# #1860 note: runlease.End now removes the whole per-run directory, so this
+# ls is expected to fail outright (empty seed_ls) rather than succeed on an
+# empty directory — the loop below still holds either way, and stays as the
+# first, narrowest check: it is what would have caught the credential-leak
+# bug this whole script exists to prevent, independent of the directory
+# question assertion 3b checks next.
+seed_ls="$(sudo incus exec "$BOX" -- ls -A "$RUN_SEED_DIR" 2>/dev/null || true)"
+for leftover in token gateway.env; do
+  if printf '%s\n' "$seed_ls" | grep -qx "$leftover"; then
+    fail "assertion 3: $RUN_SEED_DIR/$leftover survived the run — the box is reused, so a readable credential file is a live credential
+$RUN_SEED_DIR now holds: $(printf '%s' "$seed_ls" | tr '\n' ' ')"
+  fi
+done
+ok "assertion 3: neither token nor gateway.env is left in $RUN_SEED_DIR (it holds: $(printf '%s' "$seed_ls" | tr '\n' ' '))"
+
+# --- assertion 3b: the run's own directories are gone entirely (#1860) ----
+# The whole per-run seed directory must be gone, not merely emptied — a bare
+# directory would still leave input.json/system_prompt.txt/agent-card.json
+# readable in a box that is reused across runs. This run passed no
+# git_source, so RUN_WORKSPACE_DIR was never created; checked here as "never
+# came into being", not "was removed" — #1861's e2e covers the fetch-then-
+# remove case once a repo is actually in play.
+if sudo incus exec "$BOX" -- test -e "$RUN_SEED_DIR"; then
+  fail "assertion 3b: $RUN_SEED_DIR still exists after the run — the directory itself must be gone, not just the credential files inside it"
+fi
+if sudo incus exec "$BOX" -- test -e "$RUN_WORKSPACE_DIR"; then
+  fail "assertion 3b: $RUN_WORKSPACE_DIR exists but this run passed no --git-source — nothing should have created it"
+fi
+ok "assertion 3b: $RUN_SEED_DIR is gone entirely, and $RUN_WORKSPACE_DIR (no git_source this run) was never created"
+
+# --- assertion 4: both lease rows are queryable by run id ----------------
+# Through the operator's own CLI, not SQL: `audit query --run-id` is the
+# interface an operator answering "what was this run given, and was it taken
+# back" actually has (#1825).
+audit_out="$(sudo env CONTAINARIUM_POSTGRES_URL="$CONTAINARIUM_POSTGRES_URL" \
+  "$BIN" audit query --run-id "$RUN_ID" --raw 2>&1)" || {
+  echo "$audit_out"
+  fail "assertion 4: containarium audit query --run-id $RUN_ID failed"
+}
+for action in agent.run_lease_issue agent.run_lease_end; do
+  printf '%s\n' "$audit_out" | grep -q "$action" \
+    || fail "assertion 4: no $action row for run $RUN_ID
+audit query --run-id $RUN_ID --raw returned:
+$audit_out"
+done
+ok "assertion 4: audit query --run-id $RUN_ID returns both agent.run_lease_issue and agent.run_lease_end"
+printf '%s\n' "$audit_out" | sed 's/^/     /'
+
+echo
+echo "PASS: a skill run's credentials died with the run."
+echo "      gateway token accepted during run $RUN_ID, 401 'gateway token revoked'"
+echo "      ${revoked_after_ms}ms after it returned (budget ${REVOKE_BUDGET_MS}ms), seed files wiped,"
+echo "      both lease rows queryable by run id."
+
+# --- #1861: coding skill on a repo (git source fetched into the workspace) -
+# Extends the proof above from "a skill run's credentials die with the run"
+# to "a skill run that fetched a repo leaves NOTHING behind": the checkout
+# is gone with the run, same as the credentials, and a credential passed for
+# the fetch never touches disk. Same box (already provisioned above), a
+# second stub, a second measured run — the credential-lifecycle machinery
+# under test is identical; only this run's request carries
+# git_source/git_ref/git_credential.
+#
+# Model-free by the same construction as assertions 1/2: PROVIDER carries a
+# placeholder key throughout this script (GATEWAY_KEY above), so no run here
+# ever reaches a real model — the "file:line" citation below comes from this
+# stub's own `grep -n` on the real checkout, not a model, and is exactly as
+# real as that grep is.
+echo
+log "installing the git-source stub agent-runtime (reads workspace.json, cites README.md, then sleeps ${RUN_SECONDS}s) into $BOX"
+GIT_STUB_SRC="$WORKDIR/git-stub.sh"
+cat >"$GIT_STUB_SRC" <<STUBEOF
+#!/bin/sh
+# $GIT_STUB_MARKER
+set -e
+ws_file="\$AGENT_SEED_DIR/workspace.json"
+ws_path="\$(sed -n 's/.*"path":"\([^"]*\)".*/\1/p' "\$ws_file")"
+readme="\$ws_path/README.md"
+line_no="\$(grep -n . "\$readme" | head -1 | cut -d: -f1)"
+[ -n "\$line_no" ] || line_no=0
+printf '{"outputJson":"code review complete; see README.md:%s"}' "\$line_no" > "\$AGENT_SEED_DIR/artifact.json"
+sleep $RUN_SECONDS
+STUBEOF
+sudo incus file push --mode 0755 "$GIT_STUB_SRC" "$BOX/usr/local/bin/agent-runtime"
+sudo incus exec "$BOX" -- test -x /usr/local/bin/agent-runtime \
+  || fail "git-source stub agent-runtime was not installed into $BOX"
+sudo incus exec "$BOX" -- grep -q "$GIT_STUB_MARKER" /usr/local/bin/agent-runtime \
+  || fail "/usr/local/bin/agent-runtime in $BOX is not this script's git-source stub"
+ok "git-source stub agent-runtime installed and verified by marker"
+
+RUN_ID2="lease-e2e-git-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+RUN_SEED_DIR2="$AGENT_SEED_ROOT/$RUN_ID2"
+RUN_WORKSPACE_DIR2="$AGENT_WORKSPACE_ROOT/$RUN_ID2"
+log "measured git-source run $RUN_ID2 (repo $FIXTURE_GIT_SOURCE @ $FIXTURE_GIT_SHA)"
+# No credential: GitHub validates ANY Authorization header it is given and
+# rejects an invalid one outright, even for a public repo (see assertion 8
+# below) — there is no "fake but harmless" bearer token that leaves this
+# fetch, the one assertions 5-7 depend on, still succeeding.
+run_skill_with_git "$RUN_ID2" "$WORKDIR/run2" "$FIXTURE_GIT_SOURCE" "$FIXTURE_GIT_SHA" "" &
+RUN2_PID=$!
+
+# Wait for BOTH signals the run is underway: its gateway token (same
+# mechanism as the plain run above) and its workspace (written by
+# provisionSkillBox's fetch step, which runs AFTER the seed exec that writes
+# gateway.env — so gateway.env alone is not proof the fetch has landed yet).
+log "reading $RUN_SEED_DIR2/gateway.env and $RUN_WORKSPACE_DIR2/README.md from the box during the run"
+GW_TOKEN2=""
+WORKSPACE_READY=""
+for _ in $(seq 1 300); do
+  if [ -z "$GW_TOKEN2" ]; then
+    gw_env2="$(sudo incus exec "$BOX" -- cat "$RUN_SEED_DIR2/gateway.env" 2>/dev/null || true)"
+    if [ -n "$gw_env2" ]; then
+      GW_TOKEN2="$(printf '%s\n' "$gw_env2" | sed -n "s/^export $GW_TOKEN_VAR=//p" | head -1)"
+    fi
+  fi
+  if [ -z "$WORKSPACE_READY" ] && sudo incus exec "$BOX" -- test -f "$RUN_WORKSPACE_DIR2/README.md"; then
+    WORKSPACE_READY=1
+  fi
+  if [ -n "$GW_TOKEN2" ] && [ -n "$WORKSPACE_READY" ]; then
+    break
+  fi
+  if ! kill -0 "$RUN2_PID" 2>/dev/null; then
+    wait "$RUN2_PID" || true
+    echo "---- git-source run response (code $(read_code "$WORKDIR/run2.code")) ----"
+    read_out "$WORKDIR/run2.body"; echo
+    fail "the git-source run finished before both gateway.env and the workspace could be observed (token seen: $([ -n "$GW_TOKEN2" ] && echo yes || echo no), workspace seen: $([ -n "$WORKSPACE_READY" ] && echo yes || echo no)); raise CONTAINARIUM_E2E_LEASE_RUN_SECONDS (currently ${RUN_SECONDS}s) if this returned 200, or read the response above if it did not"
+  fi
+  sleep 0.2
+done
+[ -n "$GW_TOKEN2" ] || fail "never saw $GW_TOKEN_VAR in $RUN_SEED_DIR2/gateway.env during the git-source run"
+[ -n "$WORKSPACE_READY" ] || fail "never saw $RUN_WORKSPACE_DIR2/README.md during the git-source run"
+ok "git-source run underway: gateway token read (${#GW_TOKEN2} bytes) and workspace populated"
+
+# --- assertion (token accepted during the git-source run) ----------------
+model_call "$GW_TOKEN2" "$WORKDIR/during2"
+during2_code="$(read_code "$WORKDIR/during2.code")"
+during2_body="$(read_out "$WORKDIR/during2.body")"
+if ! printf '%s' "$during2_code" | grep -qE '^[1-5][0-9][0-9]$'; then
+  fail "git-source run: /v1/model/$PROVIDER returned no HTTP response (curl wrote status '$during2_code')"
+fi
+case "$during2_body" in
+  *"gateway token revoked"*)
+    fail "git-source run: the gateway rejected the run's own token DURING the run as revoked" ;;
+  *"invalid gateway token"*|*"missing gateway token"*|*"token not valid for provider"*|*"unknown provider"*|*"missing provider in path"*)
+    fail "git-source run: the gateway refused the credential for a reason unrelated to revocation ($during2_code: $during2_body)" ;;
+esac
+ok "assertion (git-source token accepted): token ACCEPTED during the git-source run"
+
+# --- assertion 5: the workspace is the pinned commit, DURING the run -----
+# Must happen before the run returns: endRunLease's defer removes the whole
+# per-run directory as part of RunAgentSkill returning, so by the time curl
+# sees the HTTP response the workspace is already gone.
+actual_commit="$(sudo incus exec "$BOX" -- git -C "$RUN_WORKSPACE_DIR2" rev-parse HEAD 2>/dev/null || true)"
+[ "$actual_commit" = "$FIXTURE_GIT_SHA" ] \
+  || fail "assertion 5: git -C $RUN_WORKSPACE_DIR2 rev-parse HEAD = '$actual_commit', want the pinned $FIXTURE_GIT_SHA"
+ws_json="$(sudo incus exec "$BOX" -- cat "$RUN_SEED_DIR2/workspace.json" 2>/dev/null || true)"
+[ -n "$ws_json" ] || fail "assertion 5: $RUN_SEED_DIR2/workspace.json does not exist — the daemon did not write the workspace contract file"
+ws_json_commit="$(printf '%s' "$ws_json" | sed -n 's/.*"git_commit":"\([^"]*\)".*/\1/p')"
+[ "$ws_json_commit" = "$FIXTURE_GIT_SHA" ] \
+  || fail "assertion 5: workspace.json git_commit = '$ws_json_commit', want the pinned $FIXTURE_GIT_SHA (workspace.json: $ws_json)"
+# The literal citable line, computed independently of the stub's own copy of
+# this same grep — assertion 6 below checks the artifact against THIS value,
+# not against a hardcoded "1", so a fixture content change fails loudly on
+# the right assertion instead of passing by coincidence.
+expected_line_no="$(sudo incus exec "$BOX" -- sh -c "grep -n . '$RUN_WORKSPACE_DIR2/README.md' | head -1 | cut -d: -f1" 2>/dev/null || true)"
+[ -n "$expected_line_no" ] || fail "assertion 5: could not compute an expected README.md citation line — is the checkout empty?"
+ok "assertion 5: workspace at $RUN_WORKSPACE_DIR2 is checked out at the pinned commit $FIXTURE_GIT_SHA (workspace.json agrees)"
+
+# --- wait for the git-source run to return --------------------------------
+wait "$RUN2_PID" || true
+EXIT_MS2="$(now_ms)"
+run2_code="$(read_code "$WORKDIR/run2.code")"
+if [ "$run2_code" != "200" ]; then
+  echo "---- git-source run response ----"; read_out "$WORKDIR/run2.body"; echo
+  fail "measured git-source RunAgentSkill returned $run2_code (want 200)"
+fi
+echoed_run_id2="$(jq -r '.runId // empty' <"$WORKDIR/run2.body")"
+[ "$echoed_run_id2" = "$RUN_ID2" ] \
+  || fail "git-source RunAgentSkillResponse.run_id was '$echoed_run_id2', want '$RUN_ID2'"
+response_commit="$(jq -r '.gitCommit // empty' <"$WORKDIR/run2.body")"
+response_workspace="$(jq -r '.workspacePath // empty' <"$WORKDIR/run2.body")"
+[ "$response_commit" = "$FIXTURE_GIT_SHA" ] \
+  || fail "assertion 5: RunAgentSkillResponse.git_commit = '$response_commit', want the pinned $FIXTURE_GIT_SHA"
+[ "$response_workspace" = "$RUN_WORKSPACE_DIR2" ] \
+  || fail "assertion 5: RunAgentSkillResponse.workspace_path = '$response_workspace', want '$RUN_WORKSPACE_DIR2'"
+ok "git-source run $RUN_ID2 returned 200, echoed its run id, and reported git_commit/workspace_path matching the pinned fetch"
+
+# --- token dead within budget, for the git-source run's own token --------
+# Measured HERE, immediately after the cheap in-memory checks above and
+# BEFORE the incus-exec-heavy assertions below: revocation is already
+# durable by the time the HTTP response is written (endRunLease is a defer
+# inside RunAgentSkill), so every `sudo incus exec` this script runs before
+# starting to poll is elapsed time added to the reported number by THIS
+# SCRIPT, not by the daemon. Assertion 2 above avoids the same trap by
+# polling immediately after `wait`; this does the same for run 2's token.
+assert_revoked_within_budget "$GW_TOKEN2" "$EXIT_MS2" "git-source"
+
+case "$SABOTAGE" in
+  skip-workspace-removal)
+    echo "SABOTAGE: recreating $RUN_WORKSPACE_DIR2 after the run to simulate a skipped workspace removal — assertion 7 must now go RED"
+    sudo incus exec "$BOX" -- mkdir -p "$RUN_WORKSPACE_DIR2"
+    ;;
+esac
+
+# --- assertion 6: the artifact cites the real checkout --------------------
+artifact2="$(jq -r '.artifactJson // empty' <"$WORKDIR/run2.body")"
+case "$artifact2" in
+  *"README.md:$expected_line_no"*) ;;
+  *) fail "assertion 6: artifact does not contain 'README.md:$expected_line_no' (artifact: $artifact2)" ;;
+esac
+ok "assertion 6: artifact cites README.md:$expected_line_no, taken from a real grep -n on the checkout"
+
+# --- assertion 7: seed dir AND workspace are both gone entirely -----------
+if sudo incus exec "$BOX" -- test -e "$RUN_SEED_DIR2"; then
+  fail "assertion 7: $RUN_SEED_DIR2 still exists after the git-source run returned"
+fi
+if sudo incus exec "$BOX" -- test -e "$RUN_WORKSPACE_DIR2"; then
+  fail "assertion 7: $RUN_WORKSPACE_DIR2 still exists after the git-source run returned — a fetched checkout must not outlive its run"
+fi
+ok "assertion 7: both $RUN_SEED_DIR2 and $RUN_WORKSPACE_DIR2 are gone entirely"
+
+# --- assertion 8: a fake git_credential never leaks, even when the fetch
+# it authorizes FAILS -------------------------------------------------------
+# The original assumption here — "the fixture is public, so GitHub simply
+# ignores the header" — does not hold: GitHub's smart-HTTP backend validates
+# any Authorization header it is given and rejects an invalid one outright,
+# even for a public repo. Reproduced directly against this exact fixture
+# with this exact header shape: `git fetch` returns "remote: invalid
+# credentials" / exit 128, not a successful anonymous fallback. So there is
+# no way to make THIS run's fetch succeed with a fake credential attached —
+# the only reachable state is failure, and that is the more realistic case
+# to prove residency against anyway: a bad credential for a PRIVATE repo
+# (git_credential's actual use case) fails exactly the same way.
+RUN_ID3="lease-e2e-git-cred-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+RUN_WORKSPACE_DIR3="$AGENT_WORKSPACE_ROOT/$RUN_ID3"
+log "measured run $RUN_ID3 with a fake git_credential (expected to fail the fetch, not to succeed)"
+run_skill_with_git "$RUN_ID3" "$WORKDIR/run3" "$FIXTURE_GIT_SOURCE" "$FIXTURE_GIT_SHA" "$FIXTURE_GIT_CREDENTIAL"
+run3_code="$(read_code "$WORKDIR/run3.code")"
+run3_body="$(read_out "$WORKDIR/run3.body")"
+if [ "$run3_code" = "200" ]; then
+  fail "assertion 8: a run with a bogus git_credential against a public repo returned 200 — GitHub was expected to reject the bad Authorization header (verified locally against this exact fixture); if this now succeeds, this assertion needs to move to the success path instead"
+fi
+case "$run3_body" in
+  *"$FIXTURE_GIT_CREDENTIAL"*)
+    fail "assertion 8: the fake git_credential appears verbatim in the RPC error response ($run3_code: $run3_body) — a credential must never be echoed back to the caller" ;;
+esac
+ok "assertion 8 (response): a fake git_credential is absent from the error response when its fetch fails ($run3_code)"
+
+# The seed dir is unconditionally rm -rf'd on every exit path, including a
+# failed provision (internal/runlease's removeDirs always targets SeedDir) —
+# so this is guaranteed, not merely hoped for.
+if sudo incus exec "$BOX" -- test -e "$AGENT_SEED_ROOT/$RUN_ID3"; then
+  fail "assertion 8: $AGENT_SEED_ROOT/$RUN_ID3 still exists after a failed provision — cleanup must run on the failure path too"
+fi
+ok "assertion 8 (cleanup): $AGENT_SEED_ROOT/$RUN_ID3 is gone after the failed provision"
+
+# #1871: a failed fetch still leaves buildGitFetchScript's `mkdir -p`/
+# `git init` on disk (the failure happens at the `git fetch` step, after
+# those run) unless provisionSkillBox records the workspace on the lease
+# BEFORE attempting the fetch, not after it succeeds. Without that fix this
+# directory survives the failed provision indefinitely.
+if sudo incus exec "$BOX" -- test -e "$RUN_WORKSPACE_DIR3"; then
+  fail "assertion 8: $RUN_WORKSPACE_DIR3 still exists after a failed fetch — a partial workspace must not outlive its run either"
+fi
+ok "assertion 8 (cleanup): $RUN_WORKSPACE_DIR3 is gone after the failed fetch"
+
+if grep -qF "$FIXTURE_GIT_CREDENTIAL" "$DAEMON_LOG"; then
+  fail "assertion 8: the fake git_credential appears in the daemon log"
+fi
+ok "assertion 8 (daemon log): the fake git_credential does not appear in the daemon log"
+
+echo
+echo "PASS (#1861): a skill run that fetched a repo left nothing behind."
+echo "      workspace checked out at $FIXTURE_GIT_SHA, artifact cited README.md:$expected_line_no,"
+echo "      gateway token accepted during the run and dead after it returned,"
+echo "      seed dir and workspace both gone, and a fake git credential leaked nowhere"
+echo "      when its own fetch failed."

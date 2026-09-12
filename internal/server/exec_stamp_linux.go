@@ -26,3 +26,18 @@ func clockTicksPerSecond() uint64 {
 			}
 		}
 	}
+	return defaultUserHZ
+}
+
+// bootClockTicks reads CLOCK_BOOTTIME in /proc/<pid>/stat field 22 units.
+// x/sys/unix issues clock_gettime as a plain syscall (Go's runtime uses the
+// vDSO for CLOCK_MONOTONIC and CLOCK_REALTIME only); it takes no lock, opens
+// nothing and allocates nothing. Its cost is measured by
+// BenchmarkExecCapture (exec_stamp_bench_linux_test.go).
+func bootClockTicks() (threatdetect.ProcStartTicks, error) {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
+		return 0, err
+	}
+	return bootTicksOf(ts.Nano(), userHZ), nil
+}
