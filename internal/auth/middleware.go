@@ -123,3 +123,66 @@ func (am *AuthMiddleware) HTTPMiddleware(next http.Handler) http.Handler {
 		// Add to gRPC metadata for gateway forwarding. Phase
 		// 1.7b — propagate the optional `scopes` claim too;
 		// empty/missing scopes claim is omitted from the
+		// metadata so RequireScope sees "no restriction".
+		mdPairs := []string{
+			MDKeyUsername, claims.Username,
+			MDKeyRoles, strings.Join(claims.Roles, ","),
+		}
+		if len(claims.Scopes) > 0 {
+			mdPairs = append(mdPairs, MDKeyScopes, strings.Join(claims.Scopes, ","))
+		}
+		// #1677 — propagate the optional `act` delegation claim the same
+		// way: this is the exact hop ActFromGRPCContext exists for (see
+		// its doc comment) — without this, a delegated token's act would
+		// silently vanish for every REST/grpc-gateway caller, the primary
+		// API surface, even though ContextWithClaims sets it locally.
+		if claims.Act != nil {
+			if encoded, err := json.Marshal(claims.Act); err == nil {
+				mdPairs = append(mdPairs, MDKeyAct, string(encoded))
+			}
+		}
+		// #1678 — propagate the token's own jti the same way, so audit
+		// attribution (the first gRPC-side consumer) can name the acting
+		// credential without a new plumbing hop of its own.
+		if claims.ID != "" {
+			mdPairs = append(mdPairs, MDKeyJTI, claims.ID)
+		}
+		// #1922 — propagate the optional `run_id` claim the same way, so
+		// the tracker broker's write verbs can read the acting run's
+		// identity off the verified token rather than a request field.
+		if claims.RunID != "" {
+			mdPairs = append(mdPairs, MDKeyRunID, claims.RunID)
+		}
+		// #1922 — propagate the optional `tracker_conn` claim the same way,
+		// so the tracker verb RPCs can reject a request naming a different
+		// connection than the one this run is bound to.
+		if claims.TrackerConn != "" {
+			mdPairs = append(mdPairs, MDKeyTrackerConn, claims.TrackerConn)
+		}
+		// #2268 — propagate the optional `run_tenant` claim the same way,
+		// so the tracker verb RPCs can authorize a run token for the
+		// tenant it was started for (its own subject is the box).
+		if claims.RunTenant != "" {
+			mdPairs = append(mdPairs, MDKeyRunTenant, claims.RunTenant)
+		}
+		md := metadata.Pairs(mdPairs...)
+		ctx = metadata.NewOutgoingContext(ctx, md)
+
+		// Continue with modified request
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// ValidateToken validates a JWT and returns claims for use
+// on an API surface. Phase 1.6 — wraps ValidateAccessToken
+// so refresh tokens are rejected. Callers that legitimately
+// want any-token semantics (e.g. the refresh-exchange RPC
+// validating an incoming refresh token) should call the
+// TokenManager directly via ValidateRefreshToken.
+//
+// The name stays "ValidateToken" because every existing
+// callsite is on an API surface where access-only semantics
+// are the right policy.
+func (am *AuthMiddleware) ValidateToken(token string) (*Claims, error) {
+	return am.tokenManager.ValidateAccessToken(token)
+}
