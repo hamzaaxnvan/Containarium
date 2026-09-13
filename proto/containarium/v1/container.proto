@@ -1,0 +1,1757 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "google/protobuf/descriptor.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// Custom option to attach string names to enum values
+extend google.protobuf.EnumValueOptions {
+  string state_name = 50001;
+}
+
+// OSType represents the operating system type for a container
+enum OSType {
+  // Unspecified OS type (defaults to Ubuntu 24.04)
+  OS_TYPE_UNSPECIFIED = 0;
+
+  // Ubuntu 24.04 LTS
+  OS_TYPE_UBUNTU_2404 = 1;
+
+  // Rocky Linux 9 (RHEL 9 rebuild, for dev/test)
+  OS_TYPE_ROCKY_9 = 2;
+
+  // Red Hat Enterprise Linux 9 (for production, requires subscription)
+  OS_TYPE_RHEL_9 = 3;
+
+  // Windows Server 2022 (runs as QEMU/KVM VM, RDP access)
+  OS_TYPE_WINDOWS_2022 = 4;
+}
+
+// IsolationType selects the Incus instance type a box runs as — the
+// kernel boundary between the box and the host. Independent of OSType:
+// a Linux box can be a VM, and until this enum existed only Windows could
+// (#2196, the anonymous-box tier in docs/architecture/ssh-new-anonymous-box.md).
+enum IsolationType {
+  // Backend default: Windows runs as a VM, every other OS as a container.
+  ISOLATION_TYPE_UNSPECIFIED = 0;
+
+  // LXC container — shares the host kernel.
+  ISOLATION_TYPE_CONTAINER = 1;
+
+  // QEMU/KVM virtual machine — its own kernel. Requires a KVM-capable
+  // backend. Windows cannot be anything else.
+  ISOLATION_TYPE_VM = 2;
+}
+
+// AccessType indicates how to connect to an instance
+enum AccessType {
+  // SSH access (default for Linux containers)
+  ACCESS_TYPE_SSH = 0;
+
+  // RDP access (for Windows VMs, via Guacamole browser-based client)
+  ACCESS_TYPE_RDP = 1;
+}
+
+// ContainerState represents the current state of a container
+enum ContainerState {
+  // Unspecified state (should not be used)
+  CONTAINER_STATE_UNSPECIFIED = 0 [(state_name) = "Unknown"];
+
+  // Container is running
+  CONTAINER_STATE_RUNNING = 1 [(state_name) = "Running"];
+
+  // Container is stopped
+  CONTAINER_STATE_STOPPED = 2 [(state_name) = "Stopped"];
+
+  // Container is frozen (paused)
+  CONTAINER_STATE_FROZEN = 3 [(state_name) = "Frozen"];
+
+  // Container is being created
+  CONTAINER_STATE_CREATING = 4 [(state_name) = "Creating"];
+
+  // Container creation failed or is in error state
+  CONTAINER_STATE_ERROR = 5 [(state_name) = "Error"];
+
+  // Container is running but provisioning (installing stack/packages)
+  CONTAINER_STATE_PROVISIONING = 6 [(state_name) = "Provisioning"];
+}
+
+// DeletePolicy controls whether a container may be removed by the daemon's
+// UNATTENDED deletion paths (#284). It gates only the automated/bulk sweeps —
+// the ttlsweeper's auto-reap and `containarium prune`; a deliberate single-box
+// delete always succeeds regardless, so this is a guard against a "clean up
+// leaked boxes" sweep taking out a persistent box (e.g. a GitHub Actions
+// runner), not a deletion lock. Backed by the user.containarium.delete_policy
+// Incus config key (DeletePolicyKey / DeletePolicyProtected in pkg/core/incus).
+enum DeletePolicy {
+  // Unprotected — eligible for prune + auto-reap (today's default; the
+  // absent/empty config value maps here).
+  DELETE_POLICY_UNSPECIFIED = 0;
+
+  // Protected — skipped by the ttlsweeper auto-reap and `containarium prune`.
+  // A deliberate single-box delete still removes it.
+  DELETE_POLICY_PROTECTED = 1;
+}
+
+// BoxToolAccess is what a platform-started (unattended, headless) agent run on
+// a box may do without a person present (#2944). It governs only those runs;
+// the owner's own login and `containarium code run` over SSH are unaffected.
+// Backed by the user.containarium.tool_access Incus config key
+// (ToolAccessKey in pkg/core/incus). Only a recorded level changes behaviour:
+// UNSPECIFIED (key absent) keeps today's run path.
+enum BoxToolAccess {
+  // No level recorded (the key is absent). Platform-started runs behave exactly
+  // as before this setting existed. Setting it clears a recorded level.
+  BOX_TOOL_ACCESS_UNSPECIFIED = 0;
+
+  // Nothing that needs approval.
+  BOX_TOOL_ACCESS_NONE = 1;
+
+  // The platform-managed build and test toolchains.
+  BOX_TOOL_ACCESS_BUILD_TOOLS = 2;
+
+  // Passwordless sudo for the unprivileged run user. An explicit, per-box
+  // choice; software installed this way is the owner's to maintain.
+  BOX_TOOL_ACCESS_FULL_SUDO = 3;
+}
+
+// ResourceLimits defines resource constraints for a container
+message ResourceLimits {
+  // CPU limit (e.g., "4" for 4 cores)
+  string cpu = 1;
+
+  // Memory limit (e.g., "4GB", "2048MB")
+  string memory = 2;
+
+  // Disk/storage limit (e.g., "50GB", "100GB")
+  string disk = 3;
+
+  // GPU device ID for passthrough (e.g., "0" for first GPU, PCI address, or empty for none)
+  //
+  // Deprecated: single-GPU field. Prefer `gpus` for one-or-many. When `gpus`
+  // is non-empty it takes precedence and this field is ignored; when `gpus`
+  // is empty a non-empty `gpu` is treated as a single-element list.
+  string gpu = 4;
+
+  // GPU device IDs for passthrough — one entry per GPU to attach (each is a
+  // device index like "0"/"1" or a PCI address like "0000:0b:00.0"). Empty
+  // means no GPU. Supersedes the singular `gpu` field.
+  repeated string gpus = 5;
+
+  // storage_class is the K8s StorageClass for the box's data PVC (K8s
+  // runtime only). Empty means use the backend's cluster-wide default
+  // (CONTAINARIUM_K8S_STORAGE_CLASS). Ignored by the LXC backend.
+  // Example: "fast-nvme", "standard", "ceph-block".
+  string storage_class = 6;
+
+  // memory_request is the K8s memory *request* (what the scheduler reserves
+  // against node capacity), separate from the `memory` field above, which is
+  // always applied as the *limit* (K8s runtime only; ignored by the LXC
+  // backend, which has no separate request concept for `limits.memory`).
+  // Empty (the default) preserves today's behavior: `memory`'s value is used
+  // for both request and limit (Guaranteed QoS). Set this to something
+  // smaller than `memory` for Burstable QoS — e.g. request 128Mi, limit
+  // 256Mi, matching how most upstream Kubernetes workloads size a pod.
+  string memory_request = 7;
+
+  // cpu_request is the K8s CPU *request*, separate from the `cpu` field
+  // above (always applied as the limit). Same defaulting and K8s-only scope
+  // as memory_request.
+  string cpu_request = 8;
+}
+
+// NetworkInfo contains network configuration for a container
+message NetworkInfo {
+  // Primary IP address assigned to the container
+  string ip_address = 1;
+
+  // MAC address of the container's network interface
+  string mac_address = 2;
+
+  // Network interface name (e.g., "eth0")
+  string interface = 3;
+
+  // Network bridge name
+  string bridge = 4;
+}
+
+// Container represents a complete container instance
+// EncryptionState reports whether a container's data is protected by a
+// per-tenant ZFS key, and whether that key is currently loaded (#1202).
+//
+// An enum rather than a bool or a free-text warning: "unencrypted" and
+// "encrypted but currently unopenable" are different situations with
+// different operator responses, and a caller must be able to tell them apart
+// without parsing prose.
+enum EncryptionState {
+  // The daemon could not determine the state — it has no encryption wired,
+  // or the container's encryption state could not be read. Deliberately
+  // distinct from NONE: "we did not check" must never be reported as
+  // "there is nothing to check".
+  ENCRYPTION_STATE_UNSPECIFIED = 0;
+
+  // Not encrypted with a per-tenant key. Every container ships this way by
+  // default; pool-level encryption, if configured, is a separate control.
+  ENCRYPTION_STATE_NONE = 1;
+
+  // Encrypted, and the key is loaded — the container's data is readable.
+  ENCRYPTION_STATE_UNLOCKED = 2;
+
+  // Encrypted, and the key is NOT loaded. The container cannot start and its
+  // snapshots cannot be inspected until key custody is reachable again.
+  // ZFS still allows snapshots to be TAKEN in this state, which is why the
+  // backup window survives a key-custody outage (design resolved decision
+  // #3) — but reading one back will fail until the key returns.
+  ENCRYPTION_STATE_KEY_UNAVAILABLE = 3;
+}
+
+message Container {
+  // Unique container name (typically username-container)
+  string name = 1;
+
+  // Username who owns this container
+  string username = 2;
+
+  // Current state of the container
+  ContainerState state = 3;
+
+  // Resource limits applied to this container
+  ResourceLimits resources = 4;
+
+  // SSH public keys authorized for this container
+  repeated string ssh_keys = 5;
+
+  // Network information
+  NetworkInfo network = 6;
+
+  // Unix timestamp when container was created
+  int64 created_at = 7;
+
+  // Unix timestamp when container was last updated
+  int64 updated_at = 8;
+
+  // Custom labels for categorization and metadata
+  map<string, string> labels = 9;
+
+  // Image used to create the container (e.g., "images:ubuntu/24.04")
+  string image = 10;
+
+  // Whether the box was created with Podman support (enable_podman), read back
+  // from the box. Boxes created before this was recorded have no stored value
+  // and report true, as every box did previously; the K8s backend has no
+  // podman toggle and reports true.
+  bool podman_enabled = 11;
+
+  // Software stack installed in the container (e.g., "nodejs", "python")
+  string stack = 12;
+
+  // GPU device info (e.g., GPU ID or PCI address if attached). For a
+  // multi-GPU container this is the first device; see `gpu_devices` for all.
+  string gpu_device = 13;
+
+  // Backend ID this container runs on (e.g., "gcp-spot", "tunnel-node-a-gpu")
+  string backend_id = 14;
+
+  // Operating system type of the container
+  OSType os_type = 15;
+
+  // How to connect to this instance (SSH for Linux, RDP for Windows)
+  AccessType access_type = 16;
+
+  // RDP connection address (e.g., "10.100.0.50:3389") — populated for Windows VMs
+  string rdp_address = 17;
+
+  // Whether application-emitted OpenTelemetry is enabled for this
+  // container (mirrors the --monitoring flag passed at creation).
+  // When true, the LXC has OTEL_EXPORTER_OTLP_ENDPOINT and related
+  // env vars stamped on it. Read-only — set at create time;
+  // changing requires recreate (a ToggleMonitoring RPC may come
+  // later, but doesn't exist in v1).
+  bool monitoring_enabled = 18;
+
+  // Pool tag of the backend hosting this container (e.g., "prod",
+  // "demo", "lab"). Mirrors the peer's --pool registration tag and
+  // is the discriminator used for placement and per-pool routing
+  // (such as base-domain selection). Empty for untagged backends.
+  string pool = 19;
+
+  // Whether the container is opted into manual auto-sleep tracking
+  // (Phase 1 of the serverless feature). Read-only; toggled via
+  // ToggleAutoSleep. Backed by the user.containarium.auto_sleep_enabled
+  // Incus config key.
+  bool auto_sleep_enabled = 20;
+
+  // Idle minutes before the Phase 2 auto-sleep daemon would stop
+  // the container. Defaults to 15 when unset. Backed by the
+  // user.containarium.idle_threshold_minutes Incus config key.
+  int32 idle_threshold_minutes = 21;
+
+  // Wall-clock time at which the daemon's TTL sweeper will delete
+  // this container. Unset = no TTL, container persists indefinitely.
+  // Set via SetContainerTTL. Consumed by internal/ttlsweeper which
+  // runs once a minute and force-deletes any container whose
+  // ttl_expires_at has elapsed (with a small clock-skew grace
+  // margin). Used by the containarium-run GitHub Action's
+  // "keep on failure" path to schedule auto-deletion of debug boxes.
+  google.protobuf.Timestamp ttl_expires_at = 22;
+
+  // The host:port a client should SSH to in order to reach this
+  // container, as computed by the daemon from its own routing config —
+  // so a client never has to infer the SSH target from other fields:
+  //
+  //   - direct mode  → the container's reachable IP (same value as
+  //     network.ip_address);
+  //   - sentinel-jump mode → the configured sentinel's public host,
+  //     e.g. "region-a.example.com".
+  //
+  // Combined with `username`, this is the connect target
+  // `username@ssh_host`. Empty means "no explicit host — fall back to
+  // network.ip_address". Clients (the ssh_config generator, a future
+  // `connect` verb) should USE this verbatim rather than reconstructing
+  // a host from the IP / sentinel config themselves.
+  string ssh_host = 23;
+
+  // Two-phase reaping status (#525), read from the Incus config the daemon
+  // stamps. Lets a reader see where a box is in the stopped→delete lifecycle
+  // without host access (#264 fleet hygiene) — alongside ttl_expires_at (the
+  // absolute death date) and auto_sleep_enabled (idle→stop).
+  //
+  // stopped_at: when the box most recently became STOPPED (cleared on start,
+  // so a woken box has none). The stopped→delete timer runs from here. Unset
+  // when running / never stopped.
+  google.protobuf.Timestamp stopped_at = 24;
+
+  // delete_after_stopped_seconds: the box's stopped→delete window. > 0 means
+  // it auto-deletes once it has been stopped that long (reclaiming disk); 0 =
+  // never delete on stop. Opt-in, independent of auto_sleep_enabled.
+  int64 delete_after_stopped_seconds = 25;
+
+  // Whether this box is protected from the daemon's automated/bulk deletion
+  // paths (#284). DELETE_POLICY_PROTECTED means the ttlsweeper auto-reap and
+  // `containarium prune` skip it; a deliberate single-box delete still removes
+  // it. Read from the user.containarium.delete_policy Incus config key; set via
+  // SetContainerDeletePolicy. Absent/unprotected = DELETE_POLICY_UNSPECIFIED.
+  DeletePolicy delete_policy = 26;
+
+  // All GPU devices attached to this container (device index or PCI address
+  // per entry). For a single-GPU container this has one entry mirroring
+  // `gpu_device`; empty when no GPU is attached.
+  repeated string gpu_devices = 27;
+
+  // Whether this container's data is protected by a per-tenant ZFS key, and
+  // whether that key is currently loaded (#1202).
+  //
+  // KEY_UNAVAILABLE is the one an operator has to act on: the container will
+  // not start and its snapshots cannot be inspected until key custody is
+  // reachable. It is surfaced on status rather than only at the point of
+  // failure so the condition is visible before someone trips over it.
+  EncryptionState encryption_state = 28;
+
+  // How the box is isolated from the host: CONTAINER (LXC) or VM
+  // (QEMU/KVM), read back from the instance itself. UNSPECIFIED when the
+  // backend does not report it.
+  IsolationType isolation = 29;
+
+  // The tool-access level recorded for platform-started runs (#2944), read
+  // back from the instance config. UNSPECIFIED when none is recorded.
+  BoxToolAccess tool_access = 30;
+
+  // Resolved from current local Provider config, not the create request.
+  string network_tenant = 31;
+  // Which current Provider identity input selected network_tenant.
+  NetworkTenantSource network_tenant_source = 32;
+}
+
+// ContainerMetrics contains runtime metrics for a container
+message ContainerMetrics {
+  // Container name
+  string name = 1;
+
+  // CPU usage in seconds (cumulative CPU time used)
+  int64 cpu_usage_seconds = 2;
+
+  // Current memory usage in bytes
+  int64 memory_usage_bytes = 3;
+
+  // Peak memory usage in bytes
+  int64 memory_peak_bytes = 4;
+
+  // Disk usage in bytes (root filesystem)
+  int64 disk_usage_bytes = 5;
+
+  // Network bytes received (all interfaces except loopback)
+  int64 network_rx_bytes = 6;
+
+  // Network bytes transmitted (all interfaces except loopback)
+  int64 network_tx_bytes = 7;
+
+  // Number of running processes in container
+  int32 process_count = 8;
+
+  // CFS bandwidth-throttling counters, cumulative over the container's
+  // lifetime — like cpu_usage_seconds, callers take deltas between two reads.
+  //
+  // These are what separate a *throttled* box from an *idle* one: cumulative
+  // CPU time alone reads as the same low number in both cases, which left a
+  // starved tenant with no observable signal at all (#1573). A climbing
+  // cpu_nr_throttled means the box is hitting its own CFS quota (the
+  // limits.cpu.allowance ceiling); flat counters with low usage mean the box
+  // is idle or losing the host CPU race to neighbours — a distinction its own
+  // cgroup cannot make (#1571).
+  //
+  // All three zero means "no signal available" — the runtime doesn't expose
+  // cpu.stat, or the cgroup carries no CPU bandwidth limit — NOT "never
+  // throttled". Only the LXC/Incus backend populates these today.
+
+  // CFS periods elapsed
+  int64 cpu_nr_periods = 9;
+
+  // CFS periods in which the container was throttled
+  int64 cpu_nr_throttled = 10;
+
+  // Total time the container spent throttled, in microseconds
+  int64 cpu_throttled_usec = 11;
+}
+
+// NetworkTenantSource identifies the authoritative Provider resolution input.
+enum NetworkTenantSource {
+  NETWORK_TENANT_SOURCE_UNSPECIFIED = 0;
+  NETWORK_TENANT_SOURCE_NATIVE = 1;
+  NETWORK_TENANT_SOURCE_CLOUD_ORG_ID = 2;
+  NETWORK_TENANT_SOURCE_NAME = 3;
+}
+
+// CreateContainerRequest is the request to create a new container
+message CreateContainerRequest {
+  // Username for the container (required)
+  string username = 1;
+
+  // Resource limits (optional, uses defaults if not specified)
+  ResourceLimits resources = 2;
+
+  // SSH public keys to authorize (optional, can be added later)
+  repeated string ssh_keys = 3;
+
+  // Custom labels (optional)
+  map<string, string> labels = 4;
+
+  // Container image to use (optional, defaults to images:ubuntu/24.04)
+  string image = 5;
+
+  // Enable Podman support (optional, defaults to true)
+  bool enable_podman = 6;
+
+  // Async mode - if true, returns immediately with CREATING state
+  // Client should poll GetContainer to check completion
+  bool async = 7;
+
+  // Static IP address to assign (optional, e.g., "10.0.3.100")
+  // Must be within the container network CIDR (e.g., 10.0.3.0/24)
+  // If empty, DHCP will assign an IP automatically
+  string static_ip = 8;
+
+  // Software stack to install (optional, e.g., "nodejs", "python", "fullstack")
+  // Run `containarium create --help` for the ids and what each one installs; the
+  // catalog itself is pkg/core/stacks/stacks.yaml, overridable per host at
+  // /etc/containarium/stacks.yaml. An unknown id is rejected with
+  // INVALID_ARGUMENT, and the error lists the valid ids; a create routed to a
+  // peer backend is validated by that backend against its own catalog.
+  string stack = 9;
+
+  // GPU device ID for passthrough (e.g., "0" for first GPU, PCI address, or empty for none)
+  //
+  // Deprecated: single-GPU field. Prefer `gpus`. When `gpus` is non-empty it
+  // takes precedence; when `gpus` is empty a non-empty `gpu` is treated as a
+  // single-element list.
+  string gpu = 10;
+
+  // Target backend ID for creation (empty = primary backend)
+  string backend_id = 11;
+
+  // Operating system type (takes precedence over image when set)
+  OSType os_type = 12;
+
+  // Stack parameters — passed to install scripts as env vars
+  // (CONTAINARIUM_STACK_<key>). Set by the web UI's Create Container form
+  // based on the selected stack's declared parameters. Optional.
+  map<string, string> stack_parameters = 13;
+
+  // Enable application-emitted OpenTelemetry. When true, the daemon
+  // stamps the container with OTEL_EXPORTER_OTLP_ENDPOINT and
+  // related env vars pointing at the core OTel collector, so any
+  // OTel SDK inside the container ships telemetry to the platform's
+  // VictoriaMetrics without app-side configuration. Default false —
+  // opt-in matches the "platform doesn't move data unless told to"
+  // principle and avoids surprise telemetry from prototype
+  // workloads. The daemon's own cgroup-level metrics for the
+  // container are independent of this flag and continue regardless.
+  bool monitoring = 14;
+
+  // Pool selector — when set and backend_id is empty, the daemon
+  // picks any healthy peer tagged with this pool (--pool=<name> on
+  // the peer's daemon). When both pool and backend_id are set, the
+  // chosen backend_id must belong to this pool or the request is
+  // rejected. Empty means "untagged backends only" (legacy behavior).
+  string pool = 15;
+
+  // Git source provisioning — when git_source is set, the daemon
+  // fetches the repo into the box's workspace at create time (via
+  // incus exec, no caller→box SSH). Removes the caller's need to
+  // push code in over rsync/scp. See
+  // prd/oss/create-git-source.md (Containarium-cloud).
+  //
+  // git_source: clone URL, e.g. "https://github.com/org/repo".
+  string git_source = 16;
+
+  // git_ref: the exact ref to check out — full SHA (preferred,
+  // reproducible), branch, tag, or a server ref like
+  // "refs/pull/<n>/merge". Empty = the remote's default branch.
+  string git_ref = 17;
+
+  // git_credential: bearer token for private repos. Used daemon-side
+  // for a single fetch (injected as an ephemeral http.extraHeader)
+  // and never written to the box's .git/config. Empty = public repo.
+  string git_credential = 18;
+
+  // workspace_path: where in the box to place the source. Empty
+  // defaults to "/workspace".
+  string workspace_path = 19;
+
+  // Birth TTL (optional) — seconds from creation after which the box is
+  // auto-deleted. When > 0, the daemon stamps ttl_expires_at = now() +
+  // ttl_seconds at create time (same persistence as SetContainerTTL), so
+  // the box is born with a death date and the ttlsweeper reaps it even if
+  // the client dies right after create — no separate `ttl set` call needed
+  // (#523). 0 = no TTL (today's behavior). Capped at 604800 (7 days);
+  // larger values return InvalidArgument, same bound as SetContainerTTL.
+  int64 ttl_seconds = 20;
+
+  // Birth idle-stop (optional) — minutes of inactivity after which the box
+  // is auto-STOPPED (freeing CPU/RAM, keeping disk; wakes on next access).
+  // When > 0, the daemon enables auto-sleep at create time with this idle
+  // threshold (same persistence as ToggleAutoSleep), so the box is born
+  // with the stop timer too — no separate `toggle_auto_sleep` call to
+  // forget (#524, the stop half of #522's default-sleep→default-dead
+  // model; ttl_seconds is the delete half). 0 = no auto-sleep (today's
+  // behavior). The auto-sleep loop treats an open SSH/exec session as
+  // active, so an actively-debugged box is never stopped mid-session.
+  int32 idle_stop_minutes = 21;
+
+  // Birth stopped→delete (optional) — seconds the box may remain STOPPED
+  // before it is auto-deleted, reclaiming disk after idle_stop_minutes
+  // already reclaimed CPU/RAM (#525, the second timer of #522's two-phase
+  // lifecycle). The clock runs from the stop transition and RESETS when the
+  // box is woken (accessed), so a box someone keeps investigating is never
+  // reaped; only one left continuously stopped past this window is. This is
+  // a SEPARATE opt-in from idle_stop_minutes / auto-sleep: a scale-to-zero
+  // box that merely sleeps must never be deleted just for being stopped.
+  // 0 = never delete on stop (today's behavior).
+  int64 delete_after_stopped_seconds = 22;
+
+  // GPU device IDs for passthrough — one entry per GPU to attach (device
+  // index like "0"/"1" or PCI address like "0000:0b:00.0"). Supersedes the
+  // singular `gpu` field: when non-empty `gpu` is ignored; when empty a
+  // non-empty `gpu` is treated as a single-element list. Each device is
+  // resolved to a stable PCI address at create time.
+  repeated string gpus = 23;
+
+  // Encrypt the container's ZFS dataset with a tenant-scoped key rather
+  // than the pool-wide key, so a co-tenant — or host root, once the
+  // container is stopped and the key unloaded — sees ciphertext.
+  //
+  // Requires the daemon to be wired with a KeyProvider. Without one the
+  // request fails with FAILED_PRECONDITION; it never falls back to
+  // plaintext, because a create that silently ignores this flag would
+  // hand the caller an encryption guarantee they do not have.
+  //
+  // Default false: existing containers keep their current posture
+  // (pool-level encryption, or none). See
+  // docs/ZFS-PER-CONTAINER-ENCRYPTION-DESIGN.md.
+  bool encrypted = 24;
+
+  // Tenant that owns this container, scoping the encryption key: all of
+  // a tenant's containers share one ZFS encryptionroot, and different
+  // tenants always have distinct ones.
+  //
+  // The OSS daemon is single-tenant and accepts only "" or "default",
+  // rejecting anything else with INVALID_ARGUMENT; the multi-tenant
+  // cloud daemon accepts any non-empty value. The field is defined here
+  // so the wire shape stays stable across the OSS → cloud transition
+  // rather than changing when tenancy lands.
+  string tenant_id = 25;
+
+  // Region to place this container in (#1606) — a client-side placement
+  // hint in the same family as `pool` and `backend_id`. A standalone,
+  // single-backend daemon has exactly one region and ignores this field
+  // entirely: empty stays today's default behavior, and any non-empty
+  // value is likewise a no-op here. It exists so a hosted, multi-region
+  // control plane fronting several regional daemons has somewhere on this
+  // wire shape to receive the caller's choice — without it, a create
+  // against such a control plane with no configured default region has no
+  // way to express one at all. Empty = daemon/control-plane default.
+  string region = 26;
+
+  // Isolation picks container (LXC) or VM (QEMU/KVM). UNSPECIFIED keeps
+  // today's behavior: Windows → VM, everything else → container.
+  // CONTAINER with a Windows os_type is rejected with InvalidArgument.
+  // Only the LXC backend honors VM; the Kubernetes backend rejects it.
+  IsolationType isolation = 27;
+
+  // Opt out of auto-sleep at create (#2759). Meaningful only on a hosted
+  // control plane that turns auto-sleep on by default for some orgs (for
+  // example a seat-billed org defaulting to 30 minutes): true asks for a box
+  // with NO idle-stop timer. A standalone daemon never enables auto-sleep
+  // unless idle_stop_minutes > 0, so it ignores this field. Setting it
+  // together with idle_stop_minutes > 0 is contradictory and rejected with
+  // InvalidArgument.
+  bool disable_auto_sleep = 28;
+
+  // Validate only (#2925). Runs every pre-flight check the create would run
+  // (bounds, stack id, TTL and idle-stop ranges, encryption wiring, pool
+  // placement, ssh keys, image policy, CPU admission) and returns before
+  // anything is provisioned: no storage, no Box CR, no instance, no async
+  // job, and no CPU reservation is left behind. A rejection comes back as
+  // the same error the real create would return; success comes back with
+  // `dry_run` set on the response. Its purpose is `create --force`, which
+  // deletes the existing box first and must not do so for a request the
+  // daemon would reject. It does not check whether the box already exists
+  // (a --force caller expects it to).
+  //
+  // A create bound for a peer backend is NOT forwarded: a peer that predates
+  // this field would ignore it and really create the box. The stack is checked
+  // against that peer's own catalog (#2952), read with an ordinary
+  // GET /v1/stacks; the response says the peer's other checks were not run.
+  bool dry_run = 29;
+
+  // Administrator-authorized native NIC security domain, independent of the
+  // encryption tenant_id. Local Linux LXC only; required Guard before Start.
+  // Empty retains the default identity resolution (subject to authorization).
+  string network_tenant = 30;
+}
+
+// CreateContainerResponse is the response from creating a container
+message CreateContainerResponse {
+  // The created container
+  Container container = 1;
+
+  // Human-readable message about the creation
+  string message = 2;
+
+  // SSH connection string for the user (Linux containers)
+  string ssh_command = 3;
+
+  // RDP connection address (Windows VMs)
+  string rdp_address = 4;
+
+  // True when the request was a dry run (#2925) and nothing was created:
+  // `container` is unset. A client that asked for a dry run and gets false
+  // back is talking to a daemon that predates the field and really created
+  // (or tried to create) the box.
+  bool dry_run = 5;
+}
+
+// ListContainersRequest is the request to list containers
+message ListContainersRequest {
+  // Filter by state (optional, empty means all states)
+  ContainerState state = 1;
+
+  // Filter by username (optional, empty means all users)
+  string username = 2;
+
+  // Filter by labels (optional, empty means no filter)
+  map<string, string> label_filter = 3;
+}
+
+// ListContainersResponse is the response from listing containers
+message ListContainersResponse {
+  // List of containers matching the filter criteria
+  repeated Container containers = 1;
+
+  // Total count of containers
+  int32 total_count = 2;
+
+  // Backends that could not be reached while assembling this list (e.g.
+  // sentinel marked the peer unhealthy, or the forwarded request
+  // failed/timed out). A backend listed here contributed zero containers
+  // to `containers` — callers should render that distinctly from "this
+  // backend genuinely has no containers" rather than as a bare absence
+  // (#1902, sibling of GetMetricsResponse.unreachable_backends / #1901).
+  repeated UnreachableBackend unreachable_backends = 3;
+}
+
+// GetContainerRequest is the request to get a specific container
+message GetContainerRequest {
+  // Username of the container to get
+  string username = 1;
+}
+
+// GetContainerResponse is the response from getting a container
+message GetContainerResponse {
+  // The requested container
+  Container container = 1;
+
+  // Current metrics for the container (optional)
+  ContainerMetrics metrics = 2;
+}
+
+// DebugContainerRequest is the request to debug a container's SSH path
+message DebugContainerRequest {
+  // Username of the container to debug
+  string username = 1;
+}
+
+// DebugContainerResponse is the structured diagnostic report
+message DebugContainerResponse {
+  // Container runtime state from the daemon's view
+  // ("running", "stopped", "missing", "error: <reason>")
+  string container_state = 1;
+
+  // Whether a host-level Linux user with this username exists
+  bool host_user_exists = 2;
+
+  // The shell column from /etc/passwd for this user (empty if no user)
+  string host_user_shell = 3;
+
+  // Whether the shell file in host_user_shell actually exists & is executable
+  bool host_user_shell_exists = 4;
+
+  // Last N sshd journal lines mentioning this username (rejections, accepts)
+  repeated string recent_sshd_rejections = 5;
+
+  // One-line human-readable diagnosis of the most likely cause
+  string likely_cause = 6;
+
+  // Ordered concrete remediation steps the caller can take
+  repeated string next_actions = 7;
+
+  // Public source repository for the daemon serving this report. Agents
+  // can clone or webfetch this to grep for the exact code path that
+  // generated a symptom — useful when the structured fields are
+  // inconclusive (likely_cause == "no obvious host-side problem"…).
+  string source_repo = 8;
+
+  // Daemon version (containarium binary) that generated this report.
+  // Pair with source_repo to read code at the exact commit/tag.
+  string daemon_version = 9;
+
+  // Public SSH entrypoint (the sentinel host) clients dial to reach
+  // containers on this backend — the daemon's advertised --ssh-host.
+  // **Empty means this backend advertises NO external SSH entrypoint**
+  // (direct / in-network mode: reach the container by IP, or deploy through
+  // an in-network pipeline). When empty, the sentinel-side remediation hints
+  // don't apply — there is no sentinel to check. Lets an agent stop hunting
+  // for a jump host that doesn't exist. See #1011.
+  string ssh_ingress_host = 10;
+
+  // True when the host-level Linux user exists but the SAME username does
+  // NOT exist inside the running container (#1487). containarium-shell's
+  // login path `su`s into this username INSIDE the container, so this
+  // combination — host account provisioned, in-container account never
+  // created — makes the box permanently unreachable over SSH even though
+  // every other signal (Incus RUNNING, host user present, sshd healthy)
+  // looks fine. Only meaningful (and only checked) when host_user_exists
+  // is true and container_state is "running"; false otherwise, including
+  // "not checked" — callers must read it alongside those two fields, the
+  // same convention host_user_shell_exists already follows.
+  bool in_container_user_missing = 11;
+}
+
+// GetConsoleLogRequest is the request to fetch a VM instance's boot-time
+// console ring-buffer log.
+message GetConsoleLogRequest {
+  // Username of the container to fetch the console log for
+  string username = 1;
+}
+
+// GetConsoleLogResponse carries the instance's console ring-buffer log —
+// a static read, not a live attach. Useful for diagnosing a boot hang
+// (BIOS/UEFI POST, bootloader, kernel panic pre-network) where the
+// instance never came up far enough for SSH or the tunnel agent to work.
+message GetConsoleLogResponse {
+  // Raw console log content. Empty if the instance is not a VM (LXC
+  // containers have no serial console) or has produced no output yet.
+  string log = 1;
+}
+
+// DeleteContainerRequest is the request to delete a container
+message DeleteContainerRequest {
+  // Username of the container to delete
+  string username = 1;
+
+  // Force delete even if container is running
+  bool force = 2;
+}
+
+// DeleteContainerResponse is the response from deleting a container
+message DeleteContainerResponse {
+  // Success message
+  string message = 1;
+
+  // Name of the deleted container
+  string container_name = 2;
+}
+
+// StartContainerRequest is the request to start a container
+message StartContainerRequest {
+  // Username of the container to start
+  string username = 1;
+
+  // When true, the server blocks until the container's primary TCP
+  // port (from its route record) is accepting connections, or
+  // ready_timeout_seconds elapses. If the container has no route the
+  // probe is skipped. Used by `containarium wake` to give callers an
+  // "actually serving" signal rather than just "incus says started".
+  bool wait_for_ready = 2;
+
+  // Timeout for the readiness probe in seconds. Zero falls back to
+  // the server-side default (30s). Ignored when wait_for_ready is
+  // false.
+  int32 ready_timeout_seconds = 3;
+}
+
+// StartContainerResponse is the response from starting a container
+message StartContainerResponse {
+  // Success message
+  string message = 1;
+
+  // Updated container state
+  Container container = 2;
+
+  // True when wait_for_ready was set but the readiness probe timed
+  // out before the primary port accepted. The container is started
+  // either way — the caller can retry the probe or accept the start
+  // as best-effort.
+  bool ready_timed_out = 3;
+}
+
+// StopContainerRequest is the request to stop a container
+message StopContainerRequest {
+  // Username of the container to stop
+  string username = 1;
+
+  // Force stop (kill) instead of graceful shutdown
+  bool force = 2;
+
+  // Timeout in seconds for graceful shutdown (default: 30)
+  int32 timeout = 3;
+}
+
+// StopContainerResponse is the response from stopping a container
+message StopContainerResponse {
+  // Success message
+  string message = 1;
+
+  // Updated container state
+  Container container = 2;
+}
+
+// ToggleMonitoringRequest enables / disables OTel app telemetry on
+// an existing container. The four OTEL_* env vars are stamped (or
+// unset) and the container is restarted so the new env reaches the
+// app process.
+message ToggleMonitoringRequest {
+  // Username of the container.
+  string username = 1;
+
+  // Desired state. true → stamp env vars + restart. false → unset
+  // env vars + restart so the SDK falls back to its buffer+drop
+  // default.
+  bool enabled = 2;
+}
+
+// ToggleMonitoringResponse reports the new monitoring state.
+message ToggleMonitoringResponse {
+  // Operator-facing summary of what changed (e.g. "monitoring
+  // enabled — container restarted").
+  string message = 1;
+
+  // The effective monitoring_enabled state of the container after
+  // the toggle (mirrors Container.monitoring_enabled in subsequent
+  // GetContainer responses).
+  bool monitoring_enabled = 2;
+}
+
+// ToggleAutoSleepRequest opts a container into (or out of) auto-sleep
+// tracking. The flag and threshold are stored as Incus user.* config
+// keys; the actual sleep tick (Phase 2) and HTTP wake (Phase 3) are
+// separate work. This RPC only writes the metadata.
+message ToggleAutoSleepRequest {
+  // Username of the container.
+  string username = 1;
+
+  // Desired state. true → write user.containarium.auto_sleep_enabled
+  // = "true". false → write "false" (the threshold key is left in
+  // place so a re-enable picks up the prior value).
+  bool enabled = 2;
+
+  // Idle minutes before Phase 2 would stop the container. Ignored
+  // when enabled=false; 0 means "use existing key or fall back to 15".
+  int32 idle_threshold_minutes = 3;
+}
+
+// ToggleAutoSleepResponse reports the effective auto-sleep state.
+message ToggleAutoSleepResponse {
+  // Operator-facing summary (e.g. "auto-sleep enabled at 15m").
+  string message = 1;
+
+  // The effective auto_sleep_enabled state after the toggle.
+  bool auto_sleep_enabled = 2;
+
+  // The effective idle_threshold_minutes value (15 if defaulted).
+  int32 idle_threshold_minutes = 3;
+}
+
+// SetContainerTTLRequest schedules or clears a container's auto-delete
+// time. The daemon's ttlsweeper goroutine consumes ttl_expires_at and
+// force-deletes once the wall clock crosses it.
+message SetContainerTTLRequest {
+  // Container name (e.g. "alice-container"). Matches the URL path
+  // segment used by other per-container RPCs.
+  string name = 1;
+
+  // Duration from now() at which the container should be deleted.
+  // duration_seconds == 0 clears any existing TTL (the container
+  // persists indefinitely). duration_seconds > 0 sets ttl_expires_at
+  // to now() + duration. Capped at 604800 (7 days) — larger values
+  // return InvalidArgument. The cap mirrors the CLI's 168h ceiling
+  // (see containarium ttl set, PR #297) and bounds the worst-case
+  // forgotten-box cost.
+  int64 duration_seconds = 2;
+}
+
+// SetContainerTTLResponse reports the new TTL state.
+message SetContainerTTLResponse {
+  // The wall-clock deletion time the daemon committed. Unset when
+  // the caller passed duration_seconds == 0 (i.e. TTL cleared).
+  google.protobuf.Timestamp ttl_expires_at = 1;
+}
+
+// SetContainerDeletePolicyRequest sets or clears a container's protection from
+// the daemon's automated/bulk deletion paths (#284).
+message SetContainerDeletePolicyRequest {
+  // Container name — the bare username, matching the per-container RPC
+  // convention (the handler appends "-container"; see SetContainerTTL).
+  string name = 1;
+
+  // Target policy. DELETE_POLICY_PROTECTED protects the box from the ttlsweeper
+  // auto-reap and `containarium prune`; DELETE_POLICY_UNSPECIFIED clears the
+  // protection (back to the default — eligible for both).
+  DeletePolicy delete_policy = 2;
+}
+
+// SetContainerDeletePolicyResponse reports the committed delete policy.
+message SetContainerDeletePolicyResponse {
+  // The delete policy now in effect on the container.
+  DeletePolicy delete_policy = 1;
+}
+
+// SetContainerToolAccessRequest records the tool-access level for
+// platform-started runs on a container (#2944).
+message SetContainerToolAccessRequest {
+  // Container name — the bare username, matching the per-container RPC
+  // convention (the handler appends "-container"; see SetContainerDeletePolicy).
+  string name = 1;
+
+  // Target level. BOX_TOOL_ACCESS_UNSPECIFIED clears a recorded level.
+  BoxToolAccess tool_access = 2;
+}
+
+// SetContainerToolAccessResponse reports the level now recorded.
+message SetContainerToolAccessResponse {
+  // The tool-access level now recorded on the container.
+  BoxToolAccess tool_access = 1;
+}
+
+// SetContainerAttributionRequest merges labels onto an existing container
+// (cloud #746). Used by the hosted control plane's adopt flow (cloud #539) to
+// stamp attribution (cloud_org_id / cloud_container_id / managed_by) on a
+// pre-existing box after the fact.
+message SetContainerAttributionRequest {
+  // Container name — the bare username, matching the per-container RPC
+  // convention (the handler resolves <username>-container; see SetContainerTTL).
+  string name = 1;
+
+  // Labels to merge onto the container. Each entry is set; labels not named
+  // here are left intact (merge, not replace). An empty map is rejected.
+  map<string, string> labels = 2;
+}
+
+// SetContainerAttributionResponse reports the full label set now on the box.
+message SetContainerAttributionResponse {
+  // Every label currently on the container after the merge.
+  map<string, string> labels = 1;
+}
+
+// AddSSHKeyRequest is the request to add an SSH key to a container
+message AddSSHKeyRequest {
+  // Username of the container
+  string username = 1;
+
+  // SSH public key to add
+  string ssh_public_key = 2;
+}
+
+// AddSSHKeyResponse is the response from adding an SSH key
+message AddSSHKeyResponse {
+  // Success message
+  string message = 1;
+
+  // Total number of SSH keys now authorized
+  int32 total_keys = 2;
+}
+
+// SetSSHKeysRequest is the request to replace a container user's SSH keys
+message SetSSHKeysRequest {
+  // Username of the container
+  string username = 1;
+
+  // The complete desired list of SSH public keys. Each entry must be one line
+  // with no authorized_keys options (command=, from=, ...). Duplicates are
+  // collapsed.
+  repeated string ssh_public_keys = 2;
+
+  // Must be true to send an empty ssh_public_keys list (removing every
+  // caller-managed key). An empty list without it is rejected, so an omitted
+  // field cannot wipe a box's keys. Must be false when keys are given.
+  bool allow_empty = 3;
+}
+
+// SetSSHKeysResponse is the response from replacing SSH keys
+message SetSSHKeysResponse {
+  // Success message
+  string message = 1;
+
+  // Number of keys removed by this call
+  int32 removed_keys = 2;
+
+  // Number of distinct caller-managed keys now authorized (the deduplicated
+  // request list). Platform-managed keys, which are preserved, are not counted.
+  int32 total_keys = 3;
+}
+
+// RemoveSSHKeyRequest is the request to remove an SSH key from a container
+message RemoveSSHKeyRequest {
+  // Username of the container
+  string username = 1;
+
+  // SSH public key to remove (exact match)
+  string ssh_public_key = 2;
+}
+
+// RemoveSSHKeyResponse is the response from removing an SSH key
+message RemoveSSHKeyResponse {
+  // Success message
+  string message = 1;
+
+  // Total number of SSH keys remaining
+  int32 total_keys = 2;
+}
+
+// GetMetricsRequest is the request to get container metrics
+message GetMetricsRequest {
+  // Username of the container (empty for all containers)
+  string username = 1;
+}
+
+// GetMetricsResponse is the response from getting metrics
+message GetMetricsResponse {
+  // Metrics for requested container(s)
+  repeated ContainerMetrics metrics = 1;
+
+  // Backends that could not be reached for this fleet-wide metrics call
+  // (e.g. sentinel marked the peer unhealthy, or the forwarded request
+  // failed/timed out). Populated only on the no-username "all containers"
+  // path. A backend listed here contributed zero entries to `metrics` —
+  // callers should render that distinctly from "container has no usage
+  // yet" rather than as a bare absence (#1901).
+  repeated UnreachableBackend unreachable_backends = 2;
+}
+
+// UnreachableBackend names one peer backend that a fleet-wide metrics
+// fetch could not complete against, and why.
+message UnreachableBackend {
+  // Backend/peer ID, as returned by ListBackends.
+  string backend_id = 1;
+
+  // Human-readable reason (e.g. "peer marked unhealthy by sentinel",
+  // "peer fetch failed: <error>"). Not machine-parsed; for display/logs.
+  string reason = 2;
+}
+
+// ResizeContainerRequest is the request to resize container resources
+message ResizeContainerRequest {
+  // Username of the container to resize
+  string username = 1;
+
+  // New CPU limit (e.g., "4", "2-4") - empty means no change
+  string cpu = 2;
+
+  // New memory limit (e.g., "8GB", "4096MB") - empty means no change
+  string memory = 3;
+
+  // New disk size (e.g., "100GB") - empty means no change
+  // Note: Can only increase, cannot shrink
+  string disk = 4;
+
+  // memory_request is the K8s memory *request* (K8s backend only), mirroring
+  // CreateContainerRequest.memory_request. Empty means "no change" — the
+  // box's existing request is left alone (even when `memory` changes the
+  // limit), NOT re-derived from the new limit. Set together with `memory`,
+  // or alone to adjust only the reservation. Ignored by the LXC backend.
+  string memory_request = 5;
+
+  // cpu_request is the K8s CPU *request*, the resize-time counterpart to
+  // CreateContainerRequest.cpu_request. Same "empty = no change" and
+  // K8s-only scope as memory_request.
+  string cpu_request = 6;
+}
+
+// ResizeContainerResponse is the response from resizing a container
+message ResizeContainerResponse {
+  // Success message
+  string message = 1;
+
+  // Updated container with new resources
+  Container container = 2;
+}
+
+// Collaborator represents a user with access to a container
+message Collaborator {
+  // UUID identifier
+  string id = 1;
+
+  // Container name (e.g., "alice-container")
+  string container_name = 2;
+
+  // Container owner's username
+  string owner_username = 3;
+
+  // Collaborator's username (e.g., "bob")
+  string collaborator_username = 4;
+
+  // Full account name on jump server and container (e.g., "alice-container-bob")
+  string account_name = 5;
+
+  // SSH public key for this collaborator.
+  // Deprecated: prefer ssh_public_keys. Kept for back-compat — carries just
+  // the FIRST authorized key, not every key (#1144): before this field
+  // existed, a multi-key collaborator's several `authorized_keys` lines were
+  // newline-joined into this single scalar, silently violating its own "a
+  // key" contract for any consumer reading it as documented.
+  string ssh_public_key = 6;
+
+  // Unix timestamp when collaborator was added
+  int64 added_at = 7;
+
+  // Who added this collaborator
+  string created_by = 8;
+
+  // Has full sudo access (not just su - owner)
+  bool has_sudo = 9;
+
+  // Has docker/podman group membership for container runtime access
+  bool has_container_runtime = 10;
+
+  // Every SSH public key authorized for this collaborator (#369 authorizes
+  // more than one; #1144 is this field completing the response side —
+  // AddCollaboratorRequest already had the repeated equivalent). Mirrors
+  // ssh_public_key[0] at minimum; empty only if the stored value was itself
+  // empty.
+  repeated string ssh_public_keys = 11;
+}
+
+// AddCollaboratorRequest is the request to add a collaborator to a container
+message AddCollaboratorRequest {
+  // Container owner's username (e.g., "alice")
+  string owner_username = 1;
+
+  // Collaborator's username to add (e.g., "bob")
+  string collaborator_username = 2;
+
+  // SSH public key for the collaborator.
+  // Deprecated: prefer ssh_public_keys. Kept for back-compat — when
+  // ssh_public_keys is empty this single key is used.
+  string ssh_public_key = 3;
+
+  // Grant full sudo access (not just su - owner)
+  bool grant_sudo = 4;
+
+  // Add to docker/podman group for container runtime access
+  bool grant_container_runtime = 5;
+
+  // SSH public keys for the collaborator — all are authorized, so a
+  // collaborator with several machines can connect from any of them.
+  // Takes precedence over ssh_public_key when non-empty. See #369.
+  repeated string ssh_public_keys = 6;
+}
+
+// AddCollaboratorResponse is the response from adding a collaborator
+message AddCollaboratorResponse {
+  // Success message
+  string message = 1;
+
+  // The created collaborator details
+  Collaborator collaborator = 2;
+
+  // SSH connection command for the collaborator
+  string ssh_command = 3;
+}
+
+// RemoveCollaboratorRequest is the request to remove a collaborator from a container
+message RemoveCollaboratorRequest {
+  // Container owner's username
+  string owner_username = 1;
+
+  // Collaborator's username to remove
+  string collaborator_username = 2;
+}
+
+// RemoveCollaboratorResponse is the response from removing a collaborator
+message RemoveCollaboratorResponse {
+  // Success message
+  string message = 1;
+}
+
+// TerminateUserSessionsRequest names the user whose sessions to end.
+message TerminateUserSessionsRequest {
+  // The user: the owner of "<username>-container" and the collaborator of
+  // any "<owner>-container-<username>" jump account. Same value as the
+  // self-host user id (sshauthz.UserIDForLogin).
+  string username = 1;
+}
+
+// TerminateUserSessionsResponse reports what was ended.
+message TerminateUserSessionsResponse {
+  // Accounts (in a box, or the host jump account) that had live processes,
+  // all of which were killed.
+  int32 terminated_sessions = 1;
+  // Boxes on this backend the user reaches (owner box plus collaborator
+  // boxes) that were walked.
+  int32 boxes_touched = 2;
+}
+
+// ListCollaboratorsRequest is the request to list collaborators for a container
+message ListCollaboratorsRequest {
+  // Container owner's username
+  string owner_username = 1;
+}
+
+// ListCollaboratorsResponse is the response from listing collaborators
+message ListCollaboratorsResponse {
+  // List of collaborators
+  repeated Collaborator collaborators = 1;
+
+  // Total count of collaborators
+  int32 total_count = 2;
+}
+
+// CleanupDiskRequest is the request to clean up disk space in a container
+message CleanupDiskRequest {
+  // Username of the container
+  string username = 1;
+}
+
+// CleanupDiskResponse is the response from cleaning up disk space
+message CleanupDiskResponse {
+  // Human-readable summary of what was cleaned
+  string message = 1;
+
+  // Bytes freed by the cleanup
+  int64 freed_bytes = 2;
+
+  // Updated container info after cleanup
+  Container container = 3;
+}
+
+// InstallStackRequest is the request to install a stack on a running container
+message InstallStackRequest {
+  // Username of the container
+  string username = 1;
+
+  // Stack or base script ID to install (e.g., "nodejs", "clamav")
+  string stack_id = 2;
+}
+
+// InstallStackResponse is the response from installing a stack
+message InstallStackResponse {
+  // Human-readable result message
+  string message = 1;
+
+  // Updated container info after installation
+  Container container = 2;
+}
+
+// StackParameter describes an input the stack accepts at install time.
+// Returned by ListStacks so the web UI can render appropriate form fields.
+message StackParameter {
+  // Parameter key. The env var seen by install scripts is
+  // CONTAINARIUM_STACK_<name>.
+  string name = 1;
+  // Human-readable label shown in the web UI.
+  string label = 2;
+  // Optional helper text shown below the field.
+  string description = 3;
+  // "string" | "password" | "number" | "boolean"
+  string type = 4;
+  // Default value if the user leaves the field blank.
+  string default = 5;
+  // Whether the field is required.
+  bool required = 6;
+}
+
+// StackInfo describes a single software stack.
+message StackInfo {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string icon = 4;
+  repeated StackParameter parameters = 5;
+}
+
+// ListStacksRequest requests the catalog of available stacks.
+message ListStacksRequest {}
+
+// ListStacksResponse returns all configured software stacks.
+message ListStacksResponse {
+  repeated StackInfo stacks = 1;
+}
+
+// GetMonitoringInfoRequest is the request to get monitoring info
+message GetMonitoringInfoRequest {}
+
+// GetMonitoringInfoResponse is the response with monitoring configuration
+message GetMonitoringInfoResponse {
+  // Whether monitoring is enabled
+  bool enabled = 1;
+
+  // Grafana URL for dashboard access
+  string grafana_url = 2;
+
+  // Victoria Metrics URL for metrics API
+  string victoria_metrics_url = 3;
+}
+
+// CloudMetricsProvider identifies which host cloud's native monitoring
+// receives the opt-in export (#1069). Typed so the toggle can never be a
+// magic string. AWS is reserved for a future Sink implementation;
+// SetMetricsExport rejects it with UNIMPLEMENTED until one exists.
+enum CloudMetricsProvider {
+  // Unset. SetMetricsExport rejects this with INVALID_ARGUMENT when
+  // enabled=true; GetMetricsExport returns it when export has never been
+  // configured.
+  CLOUD_METRICS_PROVIDER_UNSPECIFIED = 0;
+
+  // Google Cloud Monitoring (Cloud Operations). The only implemented
+  // provider in the MVP.
+  CLOUD_METRICS_PROVIDER_GCP = 1;
+
+  // Amazon CloudWatch. Reserved — no Sink implementation yet;
+  // SetMetricsExport returns UNIMPLEMENTED.
+  CLOUD_METRICS_PROVIDER_AWS = 2;
+}
+
+// CloudMetricsGroup names an independently enableable set of exported
+// series (#1081). Export is organized into groups so the billed sample
+// surface — custom metrics are billed per ingested sample — stays a
+// deliberate, per-group choice rather than an all-or-nothing switch.
+// Typed so a group can never be a magic string. Absent/empty on the wire
+// means "host only" (CLOUD_METRICS_GROUP_HOST), which is exactly the
+// v0.60.0 behavior a persisted config resumes into.
+enum CloudMetricsGroup {
+  // Unset. Never a valid element of an explicit groups list;
+  // SetMetricsExport rejects a request whose groups contain it. An empty
+  // groups list (not a list of UNSPECIFIED) is what means "default to
+  // host".
+  CLOUD_METRICS_GROUP_UNSPECIFIED = 0;
+
+  // Host-infrastructure series (CPU load, memory, disk, container count)
+  // — the complete #1070 allowlist. The default when no group is named.
+  CLOUD_METRICS_GROUP_HOST = 1;
+
+  // Per-container series. Reserved by #1081 as an enableable group; the
+  // series themselves land in #1071/#1072, so enabling it today exports
+  // no additional series.
+  CLOUD_METRICS_GROUP_CONTAINER = 2;
+
+  // Platform-level series (API request/error counts, provisioning
+  // outcomes, peer connectivity). Reserved by #1081 as an enableable
+  // group; the series themselves land in #1082/#1083/#1084, so enabling
+  // it today exports no additional series.
+  CLOUD_METRICS_GROUP_PLATFORM = 3;
+}
+
+// SetMetricsExportRequest enables or disables cloud-native metrics export.
+// Enabling with provider=GCP triggers a synchronous Application Default
+// Credentials probe (monitoring-write scope) before anything is persisted
+// or started; enabling with an unresolvable ADC fails the call and leaves
+// the prior config untouched.
+message SetMetricsExportRequest {
+  // Desired state. true enables export (provider is required and is
+  // probed before persisting). false disables it; provider is ignored.
+  bool enabled = 1;
+
+  // Target cloud provider. Required when enabled=true. Must not be
+  // CLOUD_METRICS_PROVIDER_UNSPECIFIED (INVALID_ARGUMENT) or
+  // CLOUD_METRICS_PROVIDER_AWS (UNIMPLEMENTED — MVP is GCP-only).
+  CloudMetricsProvider provider = 2;
+
+  // The metric groups to export (#1081). Enables exactly these groups;
+  // an empty list defaults to [CLOUD_METRICS_GROUP_HOST], preserving the
+  // v0.60.0 host-only behavior. Every element must be a defined group
+  // other than CLOUD_METRICS_GROUP_UNSPECIFIED (INVALID_ARGUMENT
+  // otherwise). Ignored when enabled=false.
+  repeated CloudMetricsGroup groups = 3;
+}
+
+// SetMetricsExportResponse reports the effective state after the toggle.
+message SetMetricsExportResponse {
+  // Operator-facing summary of what changed (e.g. "cloud metrics export
+  // enabled for gcp").
+  string message = 1;
+
+  // The effective config after the call — mirrors GetMetricsExportResponse.
+  bool enabled = 2;
+  CloudMetricsProvider provider = 3;
+  int32 interval_seconds = 4;
+
+  // The effective set of enabled metric groups after the call (#1081),
+  // normalized: an omitted/empty request list resolves to
+  // [CLOUD_METRICS_GROUP_HOST].
+  repeated CloudMetricsGroup groups = 5;
+}
+
+// GetMetricsExportRequest requests the current cloud-native metrics
+// export configuration and health.
+message GetMetricsExportRequest {}
+
+// GetMetricsExportResponse reports the current cloud-native metrics
+// export configuration and last-known health. last_success_at,
+// last_error, and export_failures are zero-valued until the collector
+// (#1070/#1071) is wired — #1069 delivers the toggle, config
+// persistence, and enable-time credential probe only.
+message GetMetricsExportResponse {
+  // Whether export is currently enabled.
+  bool enabled = 1;
+
+  // The configured provider. CLOUD_METRICS_PROVIDER_UNSPECIFIED when
+  // export has never been configured on this host.
+  CloudMetricsProvider provider = 2;
+
+  // Export interval in seconds. Fixed default 60 in the MVP; #1069 does
+  // not expose a knob to change it.
+  int32 interval_seconds = 3;
+
+  // Wall-clock time of the last successful export batch.
+  google.protobuf.Timestamp last_success_at = 4;
+
+  // Human-readable detail of the most recent export failure, if any.
+  string last_error = 5;
+
+  // Count of failed export batches since the exporter was last (re)built.
+  int64 export_failures = 6;
+
+  // The set of enabled metric groups (#1081). Normalized: a host that has
+  // never configured groups (or a v0.60.0 config with none persisted)
+  // reports [CLOUD_METRICS_GROUP_HOST].
+  repeated CloudMetricsGroup groups = 7;
+}
+
+// MoveContainerRequest is the source-side request to migrate a
+// container to a peer daemon.
+message MoveContainerRequest {
+  // Username of the container to move (required). Must exist on the
+  // local daemon — moving a container the caller doesn't own returns
+  // PermissionDenied.
+  string username = 1;
+
+  // Target backend ID — the peer daemon to migrate to. Must appear in
+  // the source daemon's PeerPool. Trying to move to the local backend
+  // is a no-op error.
+  string target_backend_id = 2;
+
+  // Maximum pre-copy delta iterations before forcing the cutover.
+  // Each iteration copies the delta since the previous snapshot; with
+  // each iteration the dirty set should shrink, reducing the final
+  // cutover downtime. Range [0, 10]. Zero disables iterative delta
+  // and goes straight to stop + full copy. Default 3.
+  int32 max_iterations = 3;
+
+  // If a delta iteration completes in less than this many seconds,
+  // the caller decides the dirty set is small enough — skip remaining
+  // iterations and go straight to cutover. Range [1, 60]. Default 5.
+  int32 delta_threshold_seconds = 4;
+
+  // When true, attempt CRIU-based live migration via `incus move
+  // --stateful` — preserves process memory state and open sockets,
+  // sub-second downtime even on active workloads. Requires CRIU
+  // installed on both source and target, and is not supported for
+  // containers running podman/docker-in-LXC. Defaults to false
+  // (stop-and-copy) which is more reliable.
+  bool stateful = 5;
+}
+
+// MoveContainerResponse summarizes the migration outcome.
+message MoveContainerResponse {
+  // Human-readable success message.
+  string message = 1;
+
+  // The container's new IP address on the target daemon, after start.
+  string new_ip_address = 2;
+
+  // Backend the container now lives on (target_backend_id from req).
+  string target_backend_id = 3;
+
+  // Total iterations performed (initial copy + N deltas + final).
+  // Helpful for tuning max_iterations on subsequent moves of similar
+  // workloads.
+  int32 iterations_run = 4;
+
+  // Total wall-clock seconds the container was unreachable during the
+  // cutover (between stop on source and start on target with route
+  // updated). With pre-copy + ZFS this should be < 5s; on dir-pool or
+  // active workloads it may be tens of seconds. -1 if stateful=true
+  // succeeded and there was no observable downtime.
+  int32 downtime_seconds = 5;
+}
+
+// AdoptMigratedContainerRequest is sent by the source daemon's
+// MoveContainer to the destination daemon AFTER `incus copy` has
+// completed and the LXC exists on the destination's incusd. The
+// destination then registers the container with its own Containarium
+// state (host user account, route record at the new IP).
+//
+// Internal use only — exposed via REST for daemon-to-daemon coordination
+// over the same PeerPool channel used by other forwarding RPCs.
+message AdoptMigratedContainerRequest {
+  // Username of the migrated container.
+  string username = 1;
+
+  // The source daemon's record of which routes belonged to this
+  // container, so the destination can recreate them at its own
+  // container IP. Each entry is "<full-domain>|<port>|<protocol>".
+  // Empty for stateless containers with no exposed ports.
+  repeated string source_routes = 2;
+
+  // The source's stored KeyRef for an encrypted container, JSON-encoded.
+  // The destination records it so it can re-resolve the key on every
+  // later start, exactly as the source did. Empty for an unencrypted
+  // container, which is every container by default.
+  //
+  // A reference only — it carries no key bytes. The destination already
+  // proved it can resolve this ref during the pre-flight.
+  string zfs_key_ref = 3;
+
+  // The destination storage pool the container was copied into — the one
+  // the pre-flight returned, sourced at this tenant's encryptionroot.
+  // The destination records it because the pool's source IS the
+  // container's encryptionroot, and every later start has to find it.
+  // Empty for an unencrypted container.
+  string zfs_pool = 4;
+}
+
+// ContainerSnapshot is a point-in-time ZFS snapshot of a container's
+// dataset (#1160).
+message ContainerSnapshot {
+  // Snapshot name, unique per container.
+  string name = 1;
+
+  // Bytes uniquely held by this snapshot — space that would be freed by
+  // deleting it. Surfaced because a forgotten snapshot silently pins disk,
+  // and nothing else in the API would say so.
+  int64 used_bytes = 2;
+
+  // Bytes the snapshot references in total, including data it shares with
+  // the live dataset. Much larger than used_bytes for a fresh snapshot, and
+  // not the number that matters for reclaiming space.
+  int64 referenced_bytes = 3;
+}
+
+// CreateContainerSnapshotRequest snapshots a container's dataset.
+//
+// Succeeds even when the container's encryption key is unloaded: ZFS allows
+// it, and blocking on key-custody reachability would let a transient outage
+// suppress the backup window (encryption design, resolved decision #3).
+message CreateContainerSnapshotRequest {
+  // The container to snapshot.
+  string username = 1;
+
+  // Snapshot name. Must be unique for this container.
+  string name = 2;
+}
+
+message CreateContainerSnapshotResponse {
+  ContainerSnapshot snapshot = 1;
+  string message = 2;
+}
+
+message ListContainerSnapshotsRequest {
+  string username = 1;
+}
+
+message ListContainerSnapshotsResponse {
+  repeated ContainerSnapshot snapshots = 1;
+}
+
+message DeleteContainerSnapshotRequest {
+  string username = 1;
+  string name = 2;
+}
+
+message DeleteContainerSnapshotResponse {
+  string message = 1;
+
+  // Bytes reclaimed — what the snapshot uniquely held.
+  int64 freed_bytes = 2;
+}
+
+// RollbackContainerSnapshotRequest returns a container's dataset to the state
+// captured by a snapshot.
+//
+// Destructive twice over: everything written since the snapshot is discarded,
+// and any snapshot taken after it must be destroyed too. Both are refusals by
+// default (#1160b).
+message RollbackContainerSnapshotRequest {
+  string username = 1;
+
+  // The snapshot to roll back to.
+  string name = 2;
+
+  // Stop the container first. Without it, a rollback of a running container
+  // is refused: ZFS would fail on the busy dataset anyway, and "dataset is
+  // busy" is a far worse message than "stop the container first".
+  bool force = 3;
+
+  // Destroy snapshots taken after the target, which ZFS requires in order to
+  // roll back past them. Opt-in because it silently widens the blast radius
+  // from "lose writes since the snapshot" to "lose other restore points too".
+  bool destroy_newer = 4;
+}
+
+message RollbackContainerSnapshotResponse {
+  string message = 1;
+
+  // Whether the daemon stopped the container to perform the rollback. It is
+  // left stopped — restarting it is the caller's decision, since the data
+  // underneath just changed.
+  bool container_stopped = 2;
+
+  // Snapshots destroyed to make the rollback possible, so the caller has a
+  // record of the restore points they no longer have.
+  repeated string destroyed_snapshots = 3;
+}
+
+// DeleteTenantStorageRequest tears down a departing tenant's encrypted
+// storage (#1343): the Incus storage pool, and the encrypted dataset it is
+// sourced at.
+//
+// Refused while the tenant still has containers — deleting the pool from
+// under a live box destroys its storage.
+message DeleteTenantStorageRequest {
+  // The tenant being offboarded.
+  string tenant = 1;
+}
+
+// DeleteTenantStorageResponse records what was destroyed, so an operator has
+// a statement of what this removed rather than only that it succeeded.
+message DeleteTenantStorageResponse {
+  // Human-readable summary.
+  string message = 1;
+
+  // The Incus storage pool that was deleted.
+  string storage_pool = 2;
+
+  // The ZFS dataset that was destroyed — the tenant's encryptionroot, and
+  // with it the only thing that could decrypt their data.
+  string dataset = 3;
+}
+
+// RewrapContainerRequest rotates the key protecting a container's data
+// (#1204), driven by the control plane during a maintenance window.
+//
+// IMPORTANT: rotation is per-TENANT, not per-container. A tenant's
+// containers share one encryptionroot by design (#1199), so rewrapping the
+// container named here rotates the key for every container that tenant
+// owns. The RPC is named for a container because that is what a caller
+// holds; the response says how many containers were affected so the caller
+// cannot be surprised by it.
+message RewrapContainerRequest {
+  // The container whose tenant's key is being rotated.
+  string username = 1;
+
+  // The NEW key reference, JSON-encoded, already provisioned by whoever
+  // owns key custody. The daemon resolves it through its own KeyProvider —
+  // key material never crosses this wire, exactly as at create time.
+  //
+  // Rotation is control-plane-driven (design resolved decision #5): the
+  // daemon exposes the primitive and holds no rotation schedule of its own.
+  string new_key_ref = 2;
+}
+
+// RewrapContainerResponse reports the outcome of a rotation.
+message RewrapContainerResponse {
+  // Human-readable summary.
+  string message = 1;
+
+  // Every container now protected by the new key — the whole tenant, not
+  // just the one named in the request.
+  repeated string rewrapped_containers = 2;
+
+  // Whether the named container was running before the rotation and has
+  // been started again afterwards.
+  bool restarted = 3;
+}
+
+// PrepareEncryptedMigrationRequest asks a destination daemon whether it
+// can take over an encrypted container, BEFORE any data is copied.
+//
+// Only the key REFERENCE travels — never key material. The ref names a
+// key in whatever custody the destination is configured with; resolving
+// it is the destination's job with its own KeyProvider, which is the
+// whole point of the check.
+message PrepareEncryptedMigrationRequest {
+  // Username of the container about to be migrated.
+  string username = 1;
+
+  // The tenant whose encryptionroot the container lives under. The
+  // destination provisions storage for this tenant, not for the
+  // container: a tenant's containers share one encryptionroot.
+  string tenant = 2;
+
+  // The source's stored KeyRef, JSON-encoded exactly as it is held on
+  // the container's own metadata. An opaque reference (scheme + URI +
+  // metadata); it carries no key bytes.
+  string key_ref = 3;
+}
+
+// PrepareEncryptedMigrationResponse tells the source whether to proceed,
+// and where to put the container if so.
+message PrepareEncryptedMigrationResponse {
+  // Whether the destination resolved the KeyRef through its own key
+  // custody. False means the migration must not start: the container
+  // would arrive unopenable after a full data copy.
+  bool can_resolve = 1;
+
+  // Why not, when can_resolve is false. Operator-facing.
+  string reason = 2;
+
+  // The destination storage pool the container must be copied into —
+  // the pool sourced at this tenant's encryptionroot. A copy that
+  // ignores it lands on the destination's default pool, outside the
+  // tenant's encryptionroot, and the container arrives unencrypted
+  // while every daemon-side signal says otherwise.
+  string storage_pool = 3;
+}
+
+// AdoptMigratedContainerResponse confirms the destination registered
+// the container and returns its IP for the source's route swap.
+message AdoptMigratedContainerResponse {
+  // Success message.
+  string message = 1;
+
+  // The migrated container's new IP address on the destination's
+  // incusbr0. The source uses this for the final route store update.
+  string new_ip_address = 2;
+}

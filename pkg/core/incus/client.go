@@ -1092,3 +1092,2191 @@ func (c *Client) CreateContainer(config ContainerConfig) error {
 }
 
 // StartContainer starts a container
+func (c *Client) StartContainer(name string) error {
+	reqState := api.InstanceStatePut{
+		Action:  "start",
+		Timeout: 30,
+	}
+
+	op, err := c.server.UpdateInstanceState(name, reqState, "")
+	if err != nil {
+		return fmt.Errorf("failed to start container: %w", err)
+	}
+
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("failed to start container (operation failed): %w", err)
+	}
+
+	return nil
+}
+
+// StopContainer stops a container
+func (c *Client) StopContainer(name string, force bool) error {
+	reqState := api.InstanceStatePut{
+		Action:  "stop",
+		Timeout: 30,
+		Force:   force,
+	}
+
+	op, err := c.server.UpdateInstanceState(name, reqState, "")
+	if err != nil {
+		return fmt.Errorf("failed to stop container: %w", err)
+	}
+
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("failed to stop container (operation failed): %w", err)
+	}
+
+	return nil
+}
+
+// FreezeContainer pauses a running instance through the cgroup freezer.
+// Memory and disk are kept; the instance reports status "Frozen" until
+// UnfreezeContainer. This is the process responder's FREEZE action (#2636).
+func (c *Client) FreezeContainer(name string) error {
+	return c.updateState(name, "freeze")
+}
+
+// UnfreezeContainer resumes a frozen instance.
+func (c *Client) UnfreezeContainer(name string) error {
+	return c.updateState(name, "unfreeze")
+}
+
+func (c *Client) updateState(name, action string) error {
+	op, err := c.server.UpdateInstanceState(name, api.InstanceStatePut{Action: action, Timeout: 30}, "")
+	if err != nil {
+		return fmt.Errorf("failed to %s container: %w", action, err)
+	}
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("failed to %s container (operation failed): %w", action, err)
+	}
+	return nil
+}
+
+// DeleteContainer deletes a container
+func (c *Client) DeleteContainer(name string) error {
+	// The instance id goes to the delete observers (#2835), so they can tell
+	// this instance from a later one created under the same name.
+	var instanceID string
+	if inst, _, err := c.server.GetInstance(name); err == nil {
+		instanceID = inst.Config[InstanceIDKey]
+	} else {
+		log.Printf("[incus] delete %s: read its instance id first: %v (delete observers get none)", name, err)
+	}
+	op, err := c.server.DeleteInstance(name)
+	if err != nil {
+		return fmt.Errorf("failed to delete container: %w", err)
+	}
+
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("failed to delete container (operation failed): %w", err)
+	}
+
+	notifyContainerDeleted(name, instanceID)
+	return nil
+}
+
+// ListContainers lists all containers
+// listContainersConcurrency bounds how many containers' details
+// (GetInstance + GetInstanceState) ListContainers fetches from Incus at
+// once. Found live (#1532): fetching sequentially — one GetInstance plus
+// one GetInstanceState round-trip per container, one after another — made
+// `containarium list` itself exceed a 10s client deadline past ~180
+// containers on one host (roughly 2 round-trips x 180 = 360 sequential
+// Incus API calls). 32 is generous headroom over Incus's own local
+// unix-socket API, which is designed for concurrent HTTP-style access;
+// pick a number that keeps `list` well under a second at a few hundred
+// containers without hammering the Incus daemon.
+const listContainersConcurrency = 32
+
+func (c *Client) ListContainers() ([]ContainerInfo, error) {
+	// Get list of instance names (both containers and VMs)
+	names, err := c.server.GetInstanceNames(api.InstanceTypeAny)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	return fetchAllConcurrently(names, listContainersConcurrency, c.fetchContainerInfo), nil
+}
+
+// GetInstanceNames returns every instance name on this backend — the cheap
+// (1 round-trip) first half of ListContainers, exposed separately so a
+// caller that mostly cares "did the set of names change" doesn't have to
+// pay for every container's full details just to find out (#1541).
+func (c *Client) GetInstanceNames() ([]string, error) {
+	names, err := c.server.GetInstanceNames(api.InstanceTypeAny)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list instance names: %w", err)
+	}
+	return names, nil
+}
+
+// GetContainerWithNetwork fetches one container's full info including
+// network/IP state — the same per-container work ListContainers does for
+// every container, for exactly one. Unlike GetContainer (1 round-trip, no
+// network lookup), this costs 2 (GetInstance + GetInstanceState), the same
+// as one iteration of ListContainers' fan-out. For a caller that needs the
+// IP of one specific, already-known container name.
+func (c *Client) GetContainerWithNetwork(name string) (*ContainerInfo, error) {
+	info, ok := c.fetchContainerInfo(name)
+	if !ok {
+		return nil, fmt.Errorf("container not found: %s", name)
+	}
+	return &info, nil
+}
+
+// fetchAllConcurrently runs fetch(name) for every name with at most
+// concurrency in flight at once, returning only the results fetch reported
+// ok for (in no particular order — callers that need a stable order sort
+// afterward). Split out from ListContainers, real Incus calls injected only
+// via fetch, so the fan-out/skip logic is testable without a live Incus
+// server — same "generic loop, production function injected by the caller"
+// shape as waitForIP in wait_network.go.
+func fetchAllConcurrently[T any](names []string, concurrency int, fetch func(name string) (T, bool)) []T {
+	results := make([]T, len(names))
+	found := make([]bool, len(names))
+
+	var g errgroup.Group
+	g.SetLimit(concurrency)
+	for i, name := range names {
+		i, name := i, name
+		g.Go(func() error {
+			v, ok := fetch(name)
+			results[i] = v
+			found[i] = ok
+			return nil
+		})
+	}
+	_ = g.Wait() // fetch never returns an error of its own; per-item failures are dropped via found[i]
+
+	out := make([]T, 0, len(names))
+	for i, ok := range found {
+		if ok {
+			out = append(out, results[i])
+		}
+	}
+	return out
+}
+
+// fetchContainerInfo fetches one container's full ListContainers entry.
+// The second return is false when the container's details couldn't be
+// fetched (e.g. deleted between GetInstanceNames and GetInstance) — the
+// same "skip it" behavior ListContainers had inline before this was
+// split out for concurrent use.
+func (c *Client) fetchContainerInfo(name string) (ContainerInfo, bool) {
+	// Get full instance details for each container
+	inst, _, err := c.server.GetInstance(name)
+	if err != nil {
+		return ContainerInfo{}, false // Skip containers we can't get details for
+	}
+	info := containerInfoFromInstance(inst)
+
+	// Get IP address - need to get state separately
+	state, _, err := c.getInstanceStateWithRetry("list "+inst.Name, inst.Name)
+	if err == nil {
+		applyInstanceState(&info, state)
+	}
+	return info, true
+}
+
+// ListContainersFull returns what ListContainers returns, in one Incus request
+// (GET /1.0/instances?recursion=2, which carries every instance's state)
+// instead of one GetInstance plus one GetInstanceState per instance (#3050).
+// For a caller that lists every instance on a short cadence, such as the
+// network-policy reconcile loop. Unlike ListContainers, a failure fails the
+// whole list rather than skipping the instances it could not read.
+func (c *Client) ListContainersFull() ([]ContainerInfo, error) {
+	insts, err := c.server.GetInstancesFull(api.InstanceTypeAny)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list containers: %w", err)
+	}
+	out := make([]ContainerInfo, 0, len(insts))
+	for i := range insts {
+		info := containerInfoFromInstance(&insts[i].Instance)
+		if insts[i].State != nil {
+			applyInstanceState(&info, insts[i].State)
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+// applyInstanceState fills the fields ListContainers takes from an instance's
+// state: its init pid and primary address.
+func applyInstanceState(info *ContainerInfo, state *api.InstanceState) {
+	info.Pid = state.Pid
+	if state.Network != nil {
+		info.IPAddress = primaryNetworkInterface(state.Network)
+	}
+}
+
+// containerInfoFromInstance maps an instance's config and devices to its
+// ListContainers entry (everything but the state fields).
+func containerInfoFromInstance(inst *api.Instance) ContainerInfo {
+	{
+		info := ContainerInfo{
+			Name:                      inst.Name,
+			State:                     inst.Status,
+			InstanceType:              inst.Type,
+			CreatedAt:                 inst.CreatedAt,
+			Labels:                    extractLabelsFromConfig(inst.Config),
+			Role:                      Role(inst.Config[RoleKey]),
+			Tenant:                    inst.Config[TenantLabelKey],
+			Managed:                   hasContainariumConfig(inst.Config),
+			MonitoringEnabled:         inst.Config["environment.OTEL_EXPORTER_OTLP_ENDPOINT"] != "",
+			AutoSleepEnabled:          inst.Config[AutoSleepEnabledKey] == "true",
+			IdleThresholdMinutes:      parseIdleThresholdMinutes(inst.Config),
+			LastStartedAt:             parseLastStartedAt(inst.Config),
+			TTLExpiresAt:              parseTTLExpiresAt(inst.Config),
+			StoppedAt:                 parseStoppedAt(inst.Config),
+			DeleteAfterStoppedSeconds: parseDeleteAfterStoppedSeconds(inst.Config),
+			DeletePolicy:              inst.Config[DeletePolicyKey],
+			ToolAccess:                inst.Config[ToolAccessKey],
+			Stack:                     inst.Config[StackKey],
+			PodmanEnabled:             podmanEnabledFromConfig(inst.Config),
+			Image:                     imageDescriptionFromConfig(inst.Config),
+		}
+
+		// Get CPU and memory limits from config
+		if cpu := formatCPULimitFromConfig(inst.Config); cpu != "" {
+			info.CPU = cpu
+		}
+		if mem, ok := inst.Config["limits.memory"]; ok {
+			info.Memory = mem
+		}
+
+		// Parse devices for disk and GPU information
+		for deviceName, device := range inst.Devices {
+			deviceType, ok := device["type"]
+			if !ok {
+				continue
+			}
+
+			// Check for disk devices (root disk)
+			if deviceType == "disk" && deviceName == "root" {
+				if size, ok := device["size"]; ok {
+					info.Disk = size
+				}
+			}
+
+			// Check for GPU devices — a container may have several
+			// (gpu, gpu1, gpu2, ...); collect every one.
+			if deviceType == "gpu" {
+				info.GPUs = append(info.GPUs, gpuDeviceIdentity(device))
+			}
+		}
+		finalizeGPUInfo(&info)
+
+		// If no disk size found, check expanded devices (includes profile devices)
+		if info.Disk == "" {
+			for deviceName, device := range inst.ExpandedDevices {
+				deviceType, ok := device["type"]
+				if !ok {
+					continue
+				}
+				if deviceType == "disk" && deviceName == "root" {
+					if size, ok := device["size"]; ok {
+						info.Disk = size
+					}
+				}
+			}
+		}
+
+		return info
+	}
+}
+
+// GetContainer gets information about a specific container
+func (c *Client) GetContainer(name string) (*ContainerInfo, error) {
+	inst, _, err := c.server.GetInstance(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container: %w", err)
+	}
+
+	info := &ContainerInfo{
+		Name:                 inst.Name,
+		InstanceType:         inst.Type,
+		State:                inst.Status,
+		CreatedAt:            inst.CreatedAt,
+		Labels:               extractLabelsFromConfig(inst.Config),
+		Role:                 Role(inst.Config[RoleKey]),
+		Tenant:               inst.Config[TenantLabelKey],
+		Managed:              hasContainariumConfig(inst.Config),
+		MonitoringEnabled:    inst.Config["environment.OTEL_EXPORTER_OTLP_ENDPOINT"] != "",
+		AutoSleepEnabled:     inst.Config[AutoSleepEnabledKey] == "true",
+		IdleThresholdMinutes: parseIdleThresholdMinutes(inst.Config),
+		LastStartedAt:        parseLastStartedAt(inst.Config),
+		TTLExpiresAt:         parseTTLExpiresAt(inst.Config),
+		DeletePolicy:         inst.Config[DeletePolicyKey],
+		ToolAccess:           inst.Config[ToolAccessKey],
+		Stack:                inst.Config[StackKey],
+		PodmanEnabled:        podmanEnabledFromConfig(inst.Config),
+		Image:                imageDescriptionFromConfig(inst.Config),
+	}
+
+	// Get resource limits
+	if cpu := formatCPULimitFromConfig(inst.Config); cpu != "" {
+		info.CPU = cpu
+	}
+	if mem, ok := inst.Config["limits.memory"]; ok {
+		info.Memory = mem
+	}
+
+	// Parse devices for disk and GPU information
+	// First check instance-specific devices
+	for deviceName, device := range inst.Devices {
+		deviceType, ok := device["type"]
+		if !ok {
+			continue
+		}
+
+		// Check for disk devices (root disk)
+		if deviceType == "disk" && deviceName == "root" {
+			if size, ok := device["size"]; ok {
+				info.Disk = size
+			}
+		}
+
+		// Check for GPU devices — a container may have several
+		// (gpu, gpu1, gpu2, ...); collect every one.
+		if deviceType == "gpu" {
+			info.GPUs = append(info.GPUs, gpuDeviceIdentity(device))
+		}
+	}
+	finalizeGPUInfo(info)
+
+	// If no disk size found, check expanded devices (includes profile devices)
+	if info.Disk == "" {
+		for deviceName, device := range inst.ExpandedDevices {
+			deviceType, ok := device["type"]
+			if !ok {
+				continue
+			}
+			if deviceType == "disk" && deviceName == "root" {
+				if size, ok := device["size"]; ok {
+					info.Disk = size
+				}
+			}
+		}
+	}
+
+	// Get IP address - need to get state separately
+	state, _, err := c.getInstanceStateWithRetry("get "+name, name)
+	if err == nil && state.Network != nil {
+		info.IPAddress = primaryNetworkInterface(state.Network)
+	}
+
+	return info, nil
+}
+
+// execMaxAttempts bounds retries of an incus exec on the transient
+// PID-tracking failure (see isTransientExecErr). 4 attempts with the
+// linear backoff below is ~1s total — enough to ride out the race
+// without masking a genuinely wedged container.
+const execMaxAttempts = 4
+
+// execBackoffBase is the linear backoff unit between exec retries. A var
+// (not const) so tests can zero it; production keeps the default.
+var execBackoffBase = 150 * time.Millisecond
+
+// isTransientExecErr reports whether an incus exec error is the transient
+// "Failed to retrieve PID of executing child process". incus intermittently
+// fails to track the forked process — notably right after a container
+// launches (init/cgroup not fully settled) or under concurrent exec load —
+// so the command never actually ran. Retrying the exec absorbs it. The
+// daemon's provisioning commands (systemctl enable, apt/pip install, etc.)
+// are idempotent, so a retry is safe. A real non-zero command exit is a
+// DIFFERENT error and is deliberately NOT matched here, so we never silently
+// re-run a command that genuinely failed.
+func isTransientExecErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Failed to retrieve PID of executing child process")
+}
+
+// execWithRetry runs attempt up to execMaxAttempts times, retrying ONLY the
+// transient PID-tracking error with a linear backoff. attempt returns nil on
+// success; any other (non-transient) error returns immediately.
+func execWithRetry(what string, attempt func() error) error {
+	var err error
+	for i := 1; i <= execMaxAttempts; i++ {
+		if err = attempt(); err == nil || !isTransientExecErr(err) || i == execMaxAttempts {
+			return err
+		}
+		log.Printf("[incus] %s: transient exec error (attempt %d/%d), retrying: %v", what, i, execMaxAttempts, err)
+		time.Sleep(time.Duration(i) * execBackoffBase)
+	}
+	return err
+}
+
+// stateMaxAttempts bounds retries of an incus GetInstanceState call on the
+// transient "Instance not found" failure (see isTransientStateErr). Same
+// 4-attempts/linear-backoff shape as execWithRetry — this is the
+// GetInstanceState sibling of that fix, for the same class of liblxc-socket
+// flakiness (OSS #931).
+const stateMaxAttempts = 4
+
+// stateBackoffBase is the linear backoff unit between GetInstanceState
+// retries. A var (not const) so tests can zero it; production keeps the
+// default.
+var stateBackoffBase = 150 * time.Millisecond
+
+// isTransientStateErr reports whether a GetInstanceState error is the
+// transient "Instance not found" failure a running instance can
+// spuriously report on some hosts (OSS #931): the daemon's single
+// long-lived Incus connection gets wedged for one specific instance —
+// `incus list` / `incus info` against the SAME host, at the SAME moment,
+// correctly report it RUNNING — while GetInstanceState keeps returning
+// "Instance not found" until a retry unwedges it. Retrying absorbs it; an
+// instance that's ACTUALLY gone keeps returning this on every attempt and
+// surfaces the same error once retries are exhausted, so this never masks
+// a real deletion.
+func isTransientStateErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Instance not found")
+}
+
+// getInstanceStateWithRetry runs c.server.GetInstanceState up to
+// stateMaxAttempts times, retrying ONLY the transient "Instance not found"
+// error (isTransientStateErr) with a linear backoff — the GetInstanceState
+// sibling of execWithRetry.
+func (c *Client) getInstanceStateWithRetry(what, name string) (*api.InstanceState, string, error) {
+	return stateWithRetry(what, func() (*api.InstanceState, string, error) {
+		return c.server.GetInstanceState(name)
+	})
+}
+
+// InitPID returns the host pid of the instance's init process (0 when it is
+// not running). The process responder's kill path (#2638) uses it to
+// re-check that a pid still belongs to the container before signalling it.
+func (c *Client) InitPID(name string) (int64, error) {
+	state, _, err := c.getInstanceStateWithRetry("init pid "+name, name)
+	if err != nil {
+		return 0, fmt.Errorf("get instance state %s: %w", name, err)
+	}
+	return state.Pid, nil
+}
+
+// stateWithRetry is the generic retry loop behind getInstanceStateWithRetry,
+// split out (mirroring execWithRetry) so tests can exercise the retry/backoff
+// behavior against a fake attempt func without a real Incus server.
+func stateWithRetry(what string, attempt func() (*api.InstanceState, string, error)) (*api.InstanceState, string, error) {
+	var state *api.InstanceState
+	var etag string
+	var err error
+	for i := 1; i <= stateMaxAttempts; i++ {
+		state, etag, err = attempt()
+		if err == nil || !isTransientStateErr(err) || i == stateMaxAttempts {
+			return state, etag, err
+		}
+		log.Printf("[incus] %s: transient state error (attempt %d/%d), retrying: %v", what, i, stateMaxAttempts, err)
+		time.Sleep(time.Duration(i) * stateBackoffBase)
+	}
+	return state, etag, err
+}
+
+// Exec executes a command inside a container. Unbounded wait — see
+// ExecWithTimeout for a caller that needs a deadline instead.
+func (c *Client) Exec(containerName string, command []string) error {
+	req := api.InstanceExecPost{
+		Command:     command,
+		WaitForWS:   true,
+		Interactive: false,
+	}
+	return execWithRetry("exec "+containerName, func() error {
+		op, err := c.server.ExecInstance(containerName, req, nil)
+		if err != nil {
+			return fmt.Errorf("failed to execute command: %w", err)
+		}
+		if err := op.Wait(); err != nil {
+			return fmt.Errorf("command execution failed: %w", err)
+		}
+		return nil
+	})
+}
+
+// ExecWithTimeout is Exec bounded by an explicit deadline (cloud#1128):
+// op.Wait() has no deadline of its own, so a wedged Incus operation — same
+// class of liblxc-socket flakiness this file already retries around for
+// GetInstanceState (isTransientStateErr, citing OSS #931) — blocks the
+// caller forever instead of surfacing an error. Deliberately a separate
+// method rather than a change to Exec's own behavior: Exec backs steps
+// (package installs, stack setup) that can legitimately run for minutes,
+// and a blanket default here would risk turning a slow-but-real operation
+// into a false "wedged" failure.
+func (c *Client) ExecWithTimeout(containerName string, command []string, timeout time.Duration) error {
+	req := api.InstanceExecPost{
+		Command:     command,
+		WaitForWS:   true,
+		Interactive: false,
+	}
+	return execWithRetry("exec "+containerName, func() error {
+		op, err := c.server.ExecInstance(containerName, req, nil)
+		if err != nil {
+			return fmt.Errorf("failed to execute command: %w", err)
+		}
+		return waitWithTimeout(timeout, op.WaitContext)
+	})
+}
+
+// waitWithTimeout bounds wait (an Operation.WaitContext-shaped call) by
+// timeout. Split out from ExecWithTimeout (mirroring waitForIP /
+// stateWithRetry elsewhere in this file) so the bounding behavior is unit-
+// tested without a real Incus server. A context.DeadlineExceeded is
+// reported as "wedged" rather than merely "cancelled" — this caller never
+// cancelled anything, so the distinction matters to whoever reads the log.
+func waitWithTimeout(timeout time.Duration, wait func(ctx context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	err := wait(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("command execution timed out after %s (operation never completed — likely wedged, not merely slow)", timeout)
+	}
+	if err != nil {
+		return fmt.Errorf("command execution failed: %w", err)
+	}
+	return nil
+}
+
+// waitNetPollMin and waitNetPollMax bound the WaitForNetwork poll interval.
+//
+// This loop used to sleep a flat 1s between checks, which put a ~1s quantum
+// on every container create: a DHCP lease landing at 300ms was not observed
+// until 1s, and every caller of Manager.Create paid the difference. Opening
+// at 25ms and backing off to 500ms sees a fast lease almost immediately,
+// while a slow one — a Windows VM is given 120s — settles into a half-second
+// cadence instead of thousands of round-trips on the Incus socket.
+//
+// vars, not consts, so tests can zero them; production keeps the defaults.
+var (
+	waitNetPollMin = 25 * time.Millisecond
+	waitNetPollMax = 500 * time.Millisecond
+)
+
+// WaitForNetwork waits for the container to have a network IP.
+func (c *Client) WaitForNetwork(containerName string, timeout time.Duration) (string, error) {
+	return waitForIP(timeout, func() (string, error) {
+		info, err := c.GetContainer(containerName)
+		if err != nil {
+			return "", err
+		}
+		return info.IPAddress, nil
+	})
+}
+
+// waitForIP polls get until it returns a non-empty address or timeout
+// elapses, backing off from waitNetPollMin to waitNetPollMax between
+// attempts. An error from get is returned immediately — a lookup that fails
+// is not a container that hasn't leased yet.
+//
+// Split out (mirroring stateWithRetry) so tests can exercise the polling
+// against a fake get func without a real Incus server.
+func waitForIP(timeout time.Duration, get func() (string, error)) (string, error) {
+	deadline := time.Now().Add(timeout)
+	poll := waitNetPollMin
+
+	for {
+		ip, err := get()
+		if err != nil {
+			return "", err
+		}
+		if ip != "" {
+			return ip, nil
+		}
+
+		// Never sleep past the deadline: clamping here makes the last
+		// attempt land on it rather than overshooting by a full interval,
+		// which is what turned a 30s budget into a 31s one.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return "", fmt.Errorf("timeout waiting for container network")
+		}
+		time.Sleep(min(poll, remaining))
+		poll = min(poll*2, waitNetPollMax)
+	}
+}
+
+// WaitForAgent waits for a VM's QEMU guest agent to be reachable, by
+// retrying a no-op exec until it succeeds or timeout elapses.
+//
+// The guest agent connects over a vsock channel that is independent of
+// the network interface WaitForNetwork observes: Incus reports the
+// DHCP-leased IP as soon as the interface comes up, which is typically
+// (and on a loaded host, can be significantly) BEFORE the agent's own
+// handshake completes. Exec and file-push both require the agent, so a
+// caller that treats network-ready as exec-ready races it and can
+// observe Incus's own "VM agent isn't currently running" on an
+// otherwise healthy, still-booting VM (containarium#1862).
+func (c *Client) WaitForAgent(containerName string, timeout time.Duration) error {
+	return waitForAgent(timeout, func() error {
+		_, _, err := c.ExecWithOutput(containerName, []string{"true"})
+		return err
+	})
+}
+
+// waitForAgent polls attempt until it succeeds or timeout elapses,
+// backing off from waitNetPollMin to waitNetPollMax between tries —
+// the same shape as waitForIP, but inverted: here the error itself IS
+// the "not ready yet" signal (the agent isn't reachable), so every
+// error is retried instead of returned immediately.
+//
+// The deadline is checked before every attempt, not only after a
+// failed one: attempt (an Incus exec) has no bound of its own, so a
+// zero-or-negative budget — which IncusHost.WaitReady can hand in when
+// the network wait alone consumed the caller's whole timeout — must
+// never start one. It is checked again right after a successful
+// attempt too, since an exec that was already in flight when the
+// deadline passed would otherwise report success having silently
+// overrun the caller's budget.
+func waitForAgent(timeout time.Duration, attempt func() error) error {
+	deadline := time.Now().Add(timeout)
+	poll := waitNetPollMin
+	var lastErr error
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return fmt.Errorf("timeout waiting for VM guest agent: %w", lastErr)
+			}
+			return errors.New("timeout waiting for VM guest agent")
+		}
+
+		lastErr = attempt()
+		if lastErr == nil {
+			if time.Until(deadline) <= 0 {
+				return errors.New("timeout waiting for VM guest agent: agent became reachable after the deadline")
+			}
+			return nil
+		}
+
+		time.Sleep(min(poll, time.Until(deadline)))
+		poll = min(poll*2, waitNetPollMax)
+	}
+}
+
+// GetContainerIP returns the IP address of a container, or empty string if not found
+func (c *Client) GetContainerIP(containerName string) (string, error) {
+	info, err := c.GetContainer(containerName)
+	if err != nil {
+		return "", err
+	}
+	return info.IPAddress, nil
+}
+
+// FindCaddyContainerIP looks for a Caddy container and returns its IP address
+// It searches for containers with "caddy" in the name (case-insensitive)
+func (c *Client) FindCaddyContainerIP() (string, error) {
+	containers, err := c.ListContainers()
+	if err != nil {
+		return "", fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	// Look for containers with "caddy" in the name
+	for _, container := range containers {
+		nameLower := strings.ToLower(container.Name)
+		if strings.Contains(nameLower, "caddy") && container.IPAddress != "" {
+			return container.IPAddress, nil
+		}
+	}
+
+	return "", fmt.Errorf("no running Caddy container found")
+}
+
+// FindContainerByRole finds a running container with the given role label.
+// Returns the first match. Falls back to name-based matching for containers
+// created before role labels were introduced.
+func (c *Client) FindContainerByRole(role Role) (*ContainerInfo, error) {
+	containers, err := c.ListContainers()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	// First pass: match by role label
+	for i, ct := range containers {
+		if ct.State != "Running" {
+			continue
+		}
+		inst, _, err := c.server.GetInstance(ct.Name)
+		if err != nil {
+			continue
+		}
+		if Role(inst.Config[RoleKey]) == role {
+			return &containers[i], nil
+		}
+	}
+
+	// Fallback: name-based matching for pre-label containers
+	for i, ct := range containers {
+		if ct.State != "Running" {
+			continue
+		}
+		switch role {
+		case RolePostgres:
+			if ct.Name == "containarium-core-postgres" {
+				return &containers[i], nil
+			}
+		case RoleCaddy:
+			if ct.Name == "containarium-core-caddy" || strings.Contains(strings.ToLower(ct.Name), "caddy") {
+				return &containers[i], nil
+			}
+		case RoleVictoriaMetrics:
+			if ct.Name == "containarium-core-victoriametrics" {
+				return &containers[i], nil
+			}
+		case RoleSecurity:
+			if ct.Name == "containarium-core-security" {
+				return &containers[i], nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no running container found with role %s", role)
+}
+
+// UpdateContainerConfig sets a single config key on a container.
+func (c *Client) UpdateContainerConfig(name, key, value string) error {
+	inst, etag, err := c.server.GetInstance(name)
+	if err != nil {
+		return fmt.Errorf("failed to get container %s: %w", name, err)
+	}
+	inst.Config[key] = value
+	op, err := c.server.UpdateInstance(name, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to update container config: %w", err)
+	}
+	return op.Wait()
+}
+
+// GetRawInstance returns the raw config map for a container.
+func (c *Client) GetRawInstance(name string) (map[string]string, string, error) {
+	inst, etag, err := c.server.GetInstance(name)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to get instance %s: %w", name, err)
+	}
+	return inst.Config, etag, nil
+}
+
+// DataDir is the Incus data directory this client talks to: the directory
+// holding its unix socket (DefaultSocketPath's for a client without one). The
+// network-policy enforcer reads the bridges' dnsmasq lease files under it.
+func (c *Client) DataDir() string {
+	if c.socketPath != "" {
+		return filepath.Dir(c.socketPath)
+	}
+	return filepath.Dir(DefaultSocketPath)
+}
+
+// GetRawInstanceDevices returns an instance's expanded (profile-merged) device
+// map: device name -> its config keys. The network-policy enforcer reads the
+// primary NIC's `network`/`parent` and `ipv4.address` from it (#2618) — host-side
+// configuration that root inside the instance cannot change, unlike the
+// addresses the instance state reports from inside its own netns.
+func (c *Client) GetRawInstanceDevices(name string) (map[string]map[string]string, error) {
+	inst, _, err := c.server.GetInstance(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get instance %s: %w", name, err)
+	}
+	return inst.ExpandedDevices, nil
+}
+
+// GetConsoleLog returns the instance's boot-time console ring-buffer log.
+// The error is passed through as-is (wrapped with context) rather than
+// swallowed here — an LXC container without a console device and a genuine
+// backend failure both surface as an Incus API error, and only the caller
+// has enough context (does it already know this is a container vs a VM?)
+// to decide which one it's looking at.
+func (c *Client) GetConsoleLog(name string) (string, error) {
+	r, err := c.server.GetInstanceConsoleLog(name, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to get console log for %s: %w", name, err)
+	}
+	defer func() { _ = r.Close() }()
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", fmt.Errorf("failed to read console log for %s: %w", name, err)
+	}
+	return string(data), nil
+}
+
+// GetServerInfo gets information about the Incus server
+func (c *Client) GetServerInfo() (*api.Server, error) {
+	server, _, err := c.server.GetServer()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get server info: %w", err)
+	}
+	return server, nil
+}
+
+// GPUInfo holds information about a GPU device
+type GPUInfo struct {
+	Vendor        string // e.g., "NVIDIA Corporation", "AMD", "Intel"
+	Model         string // e.g., "GeForce RTX 4090", "NVIDIA A100"
+	PCIAddress    string // e.g., "0000:0b:00.0"
+	DriverVersion string // e.g., "570.86.15"
+	CUDAVersion   string // NVIDIA only
+	VRAMBytes     int64  // VRAM in bytes (when available)
+}
+
+// SystemResources holds system resource information
+type SystemResources struct {
+	TotalCPUs        int32
+	CPUModel         string // e.g. "AMD EPYC 7B13" (first socket's name), empty when unavailable
+	TotalMemoryBytes int64
+	UsedMemoryBytes  int64
+	TotalDiskBytes   int64
+	UsedDiskBytes    int64
+	UptimeSeconds    int64
+	// CPU load averages (from /proc/loadavg)
+	CPULoad1Min  float64
+	CPULoad5Min  float64
+	CPULoad15Min float64
+	// GPU devices
+	GPUs []GPUInfo
+}
+
+// GetSystemResources gets system resource information from Incus
+func (c *Client) GetSystemResources() (*SystemResources, error) {
+	if c.socketPath == "" {
+		return c.fetchSystemResources() // test doubles: no socket, no shared cache
+	}
+	return resourcesCacheFor(c.socketPath).get()
+}
+
+// fetchSystemResources performs the actual Incus reads (hardware discovery, pool list, each pool's usage). It has no
+// deadline of its own: GetSystemResources runs it on a short-timeout client behind the cache, because
+// GetServerResources can hang on a saturated host (#2325).
+func (c *Client) fetchSystemResources() (*SystemResources, error) {
+	resources, err := c.server.GetServerResources()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get server resources: %w", err)
+	}
+
+	res := &SystemResources{
+		TotalMemoryBytes: safecast.I64FromU64(resources.Memory.Total),
+		UsedMemoryBytes:  safecast.I64FromU64(resources.Memory.Used),
+	}
+
+	// Count total CPU cores and capture the CPU model from the first socket.
+	for _, socket := range resources.CPU.Sockets {
+		if res.CPUModel == "" && socket.Name != "" {
+			res.CPUModel = socket.Name
+		}
+		for _, core := range socket.Cores {
+			res.TotalCPUs += safecast.I32(len(core.Threads))
+		}
+	}
+
+	// Get storage pool info for disk usage
+	pools, err := c.server.GetStoragePools()
+	if err == nil {
+		for _, pool := range pools {
+			poolResources, err := c.server.GetStoragePoolResources(pool.Name)
+			if err == nil {
+				res.TotalDiskBytes += safecast.I64FromU64(poolResources.Space.Total)
+				res.UsedDiskBytes += safecast.I64FromU64(poolResources.Space.Used)
+			}
+		}
+	}
+
+	// Get CPU load averages from /proc/loadavg
+	load1, load5, load15, err := getCPULoadAvg()
+	if err == nil {
+		res.CPULoad1Min = load1
+		res.CPULoad5Min = load5
+		res.CPULoad15Min = load15
+	}
+
+	// Detect GPU devices
+	for _, card := range resources.GPU.Cards {
+		gpu := GPUInfo{
+			PCIAddress:    card.PCIAddress,
+			DriverVersion: card.DriverVersion,
+		}
+		if card.Vendor != "" {
+			gpu.Vendor = card.Vendor
+		} else if card.VendorID != "" {
+			gpu.Vendor = card.VendorID
+		}
+		if card.Product != "" {
+			gpu.Model = card.Product
+		} else if card.ProductID != "" {
+			gpu.Model = card.ProductID
+		}
+		// Enrich with NVIDIA-specific info
+		if card.Nvidia != nil {
+			if card.Nvidia.Model != "" {
+				gpu.Model = card.Nvidia.Model
+			}
+			gpu.CUDAVersion = card.Nvidia.CUDAVersion
+			gpu.DriverVersion = card.Nvidia.NVRMVersion
+			gpu.Vendor = "NVIDIA"
+		}
+		res.GPUs = append(res.GPUs, gpu)
+	}
+
+	return res, nil
+}
+
+// getCPULoadAvg reads CPU load averages from /proc/loadavg
+func getCPULoadAvg() (load1, load5, load15 float64, err error) {
+	data, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	fields := strings.Fields(string(data))
+	if len(fields) < 3 {
+		return 0, 0, 0, fmt.Errorf("unexpected /proc/loadavg format")
+	}
+
+	load1, err = strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	load5, err = strconv.ParseFloat(fields[1], 64)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	load15, err = strconv.ParseFloat(fields[2], 64)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	return load1, load5, load15, nil
+}
+
+// SetConfig sets a configuration key for a container (e.g., limits.cpu, limits.memory)
+// SetEnv sets an environment variable on an existing container. Thin
+// wrapper over SetConfig with the `environment.` key prefix; used by
+// migration adoption to re-stamp OTel env vars at the destination's
+// collector IP. Idempotent on retry.
+func (c *Client) SetEnv(containerName, key, value string) error {
+	return c.SetConfig(containerName, "environment."+key, value)
+}
+
+// UnsetEnv removes an environment variable from a container's Incus
+// config (i.e. deletes the `environment.<KEY>` config key entirely
+// rather than setting it to empty). Idempotent — missing keys are
+// not an error. Used by ToggleMonitoring's disable path so the SDK
+// inside the container sees an absent OTEL_EXPORTER_OTLP_ENDPOINT
+// (which makes it fall back to no-endpoint defaults) rather than
+// the literal empty string (which some SDKs treat as a misconfig).
+func (c *Client) UnsetEnv(containerName, key string) error {
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container: %w", err)
+	}
+	configKey := "environment." + key
+	if _, present := inst.Config[configKey]; !present {
+		return nil
+	}
+	delete(inst.Config, configKey)
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to update container config: %w", err)
+	}
+	return op.Wait()
+}
+
+// GetContainerImageFingerprint returns the Incus-computed
+// fingerprint of the image the container was created from.
+// Incus stores this in `volatile.base_image` at create
+// time; the fingerprint is the SHA-256 of the unified
+// image archive.
+//
+// Phase 3.1 Phase-C uses this to assert that the image
+// landed on disk matches the digest the operator declared
+// at CreateContainer time — a defense-in-depth check
+// against local-cache tampering. Returns empty + nil when
+// the instance has no `volatile.base_image` (e.g., it was
+// created via an alternative path that doesn't go through
+// simplestreams pull). Returns an error only on Incus
+// communication failure.
+func (c *Client) GetContainerImageFingerprint(containerName string) (string, error) {
+	inst, _, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return "", fmt.Errorf("get instance for fingerprint: %w", err)
+	}
+	return inst.Config["volatile.base_image"], nil
+}
+
+// PublishImage publishes a (stopped) container as a local image and points
+// alias at it (#1037). Re-baking is the expected lifecycle: an existing alias
+// is re-pointed to the fresh image and the replaced image is reaped
+// (best-effort), so the alias is always the newest bake and old bakes don't
+// accumulate. Returns the new image fingerprint.
+func (c *Client) PublishImage(containerName, alias string, properties map[string]string) (string, error) {
+	// Remember the image currently behind the alias so it can be reaped
+	// after the alias moves.
+	var oldFingerprint string
+	if a, _, err := c.server.GetImageAlias(alias); err == nil && a != nil {
+		oldFingerprint = a.Target
+	}
+
+	op, err := c.server.CreateImage(api.ImagesPost{
+		Source: &api.ImagesPostSource{
+			Type: "instance",
+			Name: containerName,
+		},
+		ImagePut: api.ImagePut{Properties: properties},
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("publish image from %s: %w", containerName, err)
+	}
+	if err := op.Wait(); err != nil {
+		return "", fmt.Errorf("publish image from %s: %w", containerName, err)
+	}
+	fingerprint, _ := op.Get().Metadata["fingerprint"].(string)
+	if fingerprint == "" {
+		return "", fmt.Errorf("publish image from %s: operation returned no fingerprint", containerName)
+	}
+
+	// Re-point the alias. DeleteImageAlias errors when the alias doesn't
+	// exist — fine either way, CreateImageAlias below is authoritative.
+	_ = c.server.DeleteImageAlias(alias)
+	if err := c.server.CreateImageAlias(api.ImageAliasesPost{
+		ImageAliasesEntry: api.ImageAliasesEntry{
+			Name:                 alias,
+			ImageAliasesEntryPut: api.ImageAliasesEntryPut{Target: fingerprint},
+		},
+	}); err != nil {
+		return "", fmt.Errorf("alias %s -> %s: %w", alias, fingerprint, err)
+	}
+
+	// Reap the replaced image. Best-effort: a failure leaves an unaliased
+	// image behind (disk cost), never a broken alias.
+	if oldFingerprint != "" && oldFingerprint != fingerprint {
+		if delOp, derr := c.server.DeleteImage(oldFingerprint); derr == nil {
+			_ = delOp.Wait()
+		}
+	}
+	return fingerprint, nil
+}
+
+// GetImageAliasProperties resolves a local image alias and returns the
+// image's properties. ok=false (no error) when the alias doesn't exist —
+// callers treat that as "no baked image; use the slow path", not a failure.
+func (c *Client) GetImageAliasProperties(alias string) (map[string]string, bool, error) {
+	a, _, err := c.server.GetImageAlias(alias)
+	if err != nil || a == nil {
+		return nil, false, nil
+	}
+	img, _, err := c.server.GetImage(a.Target)
+	if err != nil {
+		return nil, false, fmt.Errorf("get image %s for alias %s: %w", a.Target, alias, err)
+	}
+	return img.Properties, true, nil
+}
+
+// imageDescriptionFromConfig returns a human-readable label for the image a
+// container was launched from. Prefers Incus's auto-populated
+// image.description (e.g. "Ubuntu 24.04 LTS server"), falling back to the
+// volatile.base_image fingerprint when the description is missing — both
+// are set by Incus itself at launch, so this needs no extra plumbing on
+// either cloud-created or pre-existing BYOC containers. Empty when neither
+// key is present (e.g. a container from a very old client).
+func imageDescriptionFromConfig(config map[string]string) string {
+	if desc := config["image.description"]; desc != "" {
+		return desc
+	}
+	return config["volatile.base_image"]
+}
+
+// SetCPULimit updates a container's CPU limit, translating the request into
+// the correct Incus key(s) — limits.cpu for the visible core count/set, plus
+// limits.cpu.allowance for the CFS-bandwidth throttle on numeric requests
+// (whole-core or fractional; CPU-set/pinning notation sets limits.cpu only).
+// It clears both keys first so a resize between request shapes never leaves
+// a stale, conflicting limit behind. See issues #401 and #1029.
+func (c *Client) SetCPULimit(containerName, cpu string) error {
+	cl, err := parseCPULimit(cpu)
+	if err != nil {
+		return err
+	}
+
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container: %w", err)
+	}
+
+	delete(inst.Config, "limits.cpu")
+	delete(inst.Config, "limits.cpu.allowance")
+	if cl.Count != "" {
+		inst.Config["limits.cpu"] = cl.Count
+	}
+	if cl.Allowance != "" {
+		inst.Config["limits.cpu.allowance"] = cl.Allowance
+	}
+
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to update container config: %w", err)
+	}
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("failed to wait for config update: %w", err)
+	}
+	return nil
+}
+
+// SetCPUConfig writes limits.cpu and limits.cpu.allowance verbatim; an
+// empty value unsets that key. See Backend.SetCPUConfig.
+func (c *Client) SetCPUConfig(containerName, count, allowance string) error {
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container: %w", err)
+	}
+	for key, value := range map[string]string{"limits.cpu": count, "limits.cpu.allowance": allowance} {
+		if value == "" {
+			delete(inst.Config, key)
+		} else {
+			inst.Config[key] = value
+		}
+	}
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to update container config: %w", err)
+	}
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("failed to wait for config update: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) SetConfig(containerName, key, value string) error {
+	// Get current container configuration
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container: %w", err)
+	}
+
+	// Update the configuration
+	inst.Config[key] = value
+
+	// Apply the changes
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to update container config: %w", err)
+	}
+
+	// Wait for the operation to complete
+	err = op.Wait()
+	if err != nil {
+		return fmt.Errorf("failed to wait for config update: %w", err)
+	}
+
+	return nil
+}
+
+// UnsetConfig removes an arbitrary config key from a container's Incus
+// config (deletes the key rather than setting it to empty). Mirrors
+// UnsetEnv but for non-environment keys — used by SetContainerTTL's
+// clear path so "no TTL" is represented by key absence rather than a
+// stored empty string, which keeps parseTTLExpiresAt and the sweeper
+// from having to special-case empty values. Idempotent — a missing
+// key is not an error.
+func (c *Client) UnsetConfig(containerName, key string) error {
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container: %w", err)
+	}
+	if _, present := inst.Config[key]; !present {
+		return nil
+	}
+	delete(inst.Config, key)
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to update container config: %w", err)
+	}
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("failed to wait for config update: %w", err)
+	}
+	return nil
+}
+
+// SetDeviceSize sets the size of a device (e.g., root disk)
+func (c *Client) SetDeviceSize(containerName, deviceName, size string) error {
+	// Get current container configuration
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container: %w", err)
+	}
+
+	// Check if device exists
+	device, exists := inst.Devices[deviceName]
+	if !exists {
+		return fmt.Errorf("device %s not found in container", deviceName)
+	}
+
+	// If the disk is full, Incus cannot write backup.yaml during UpdateInstance.
+	// Detect this case and expand the ZFS quota to the requested size to unblock
+	// the operation.
+	if deviceName == "root" {
+		if err := c.ensureZFSQuotaHeadroom(containerName, device["pool"], size); err != nil {
+			fmt.Printf("Warning: ZFS quota pre-expand failed (non-fatal): %v\n", err)
+		}
+	}
+
+	// Update the device size
+	device["size"] = size
+	inst.Devices[deviceName] = device
+
+	// Apply the changes
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to update device size: %w", err)
+	}
+
+	// Wait for the operation to complete
+	err = op.Wait()
+	if err != nil {
+		return fmt.Errorf("failed to wait for device update: %w", err)
+	}
+
+	return nil
+}
+
+// ContainerDataset resolves the ZFS dataset backing a container's rootfs.
+//
+// Extracted from the quota-headroom path, which has computed this on real
+// hosts since long before it was needed elsewhere — so this is the daemon's
+// existing, exercised understanding of the layout rather than a fresh guess
+// at it. Anything that needs to name a container's dataset (per-tenant
+// encryption's dataset resolver, snapshot/rollback RPCs) should use this
+// rather than rebuild the string.
+//
+// Empty pool uses the configured storage pool.
+func (c *Client) ContainerDataset(containerName, pool string) (string, error) {
+	if containerName == "" {
+		return "", fmt.Errorf("container name is required")
+	}
+	if pool == "" {
+		pool = c.StoragePool()
+	}
+
+	poolConfig, _, err := c.server.GetStoragePool(pool)
+	if err != nil {
+		return "", fmt.Errorf("failed to get storage pool %s: %w", pool, err)
+	}
+	return buildContainerDataset(poolConfig.Config["source"], poolConfig.Name, containerName), nil
+}
+
+// buildContainerDataset is the pure half, so the layout can be tested without
+// an Incus server.
+//
+// Incus's rule is one segment: an instance's dataset is a `containers` child
+// of the pool's ROOT dataset, and the pool's `source` is that root dataset.
+//
+// This used to append `/containers/containers/`, and the doubling was
+// defended in a test as "incus's actual layout, not a typo". It was a typo of
+// a kind — read off a real host's dataset name without noticing that the
+// source already ended in `/containers`. On a daemon-provisioned pool
+// (EnsureStorage sets source to incus-local/containers) the correct answer
+// still READS as `incus-local/containers/containers/<name>`, which is how the
+// extra segment survived review and got pinned by unit tests. A real pool
+// settled it: #1336, and pkg/core/box/lxc's incus-tagged integration test is
+// the assertion that can actually tell the two apart.
+func buildContainerDataset(poolSource, poolName, containerName string) string {
+	zfsPool := poolSource
+	if zfsPool == "" {
+		// A pool created without an explicit source uses its own name.
+		zfsPool = poolName
+	}
+	return fmt.Sprintf("%s/containers/%s", zfsPool, containerName)
+}
+
+// ensureZFSQuotaHeadroom sets the property Incus uses for this instance volume
+// to targetSize. SetDeviceSize uses this before changing a root disk size, so
+// it is a persistent resize rather than the temporary device-update path.
+func (c *Client) ensureZFSQuotaHeadroom(containerName, pool, targetSize string) error {
+	if pool == "" {
+		pool = c.StoragePool()
+	}
+	storagePool, _, err := c.server.GetStoragePool(pool)
+	if err != nil {
+		return fmt.Errorf("get storage pool %s: %w", pool, err)
+	}
+	if storagePool == nil || storagePool.Driver != "zfs" {
+		return nil
+	}
+	quotaProperty, _, err := c.zfsQuotaProperties(containerName, pool, storagePool)
+	if err != nil {
+		return err
+	}
+
+	dataset, err := c.ContainerDataset(containerName, pool)
+	if err != nil {
+		return err
+	}
+
+	return c.setZFSProperty(dataset, quotaProperty, targetSize)
+}
+
+func (c *Client) getZFSProperty(dataset, property string) (string, error) {
+	if c.zfsGetPropertyFn != nil {
+		return c.zfsGetPropertyFn(dataset, property)
+	}
+	cmd := exec.Command("zfs", "get", "-Hp", "-o", "value", property, dataset) // #nosec G204 -- dataset is resolved by Incus
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("zfs get %s failed on %s: %w (output: %s)", property, dataset, err, string(output))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func (c *Client) setZFSProperty(dataset, property, value string) error {
+	if c.zfsSetPropertyFn != nil {
+		return c.zfsSetPropertyFn(dataset, property, value)
+	}
+	cmd := exec.Command("zfs", "set", fmt.Sprintf("%s=%s", property, value), dataset) // #nosec G204 -- dataset is resolved by Incus
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("zfs set %s failed on %s: %w (output: %s)", property, dataset, err, string(output))
+	}
+	return nil
+}
+
+// GetContainerMetrics gets runtime metrics for a container
+func (c *Client) GetContainerMetrics(name string) (*ContainerMetrics, error) {
+	state, _, err := c.getInstanceStateWithRetry("metrics "+name, name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container state: %w", err)
+	}
+
+	metrics := &ContainerMetrics{
+		Name:         name,
+		ProcessCount: safecast.I32(state.Processes),
+	}
+
+	// CPU usage (in nanoseconds, convert to seconds)
+	if state.CPU.Usage > 0 {
+		metrics.CPUUsageSeconds = state.CPU.Usage / 1000000000
+	}
+
+	// Memory usage
+	if state.Memory.Usage > 0 {
+		metrics.MemoryUsageBytes = state.Memory.Usage
+	}
+	if state.Memory.UsagePeak > 0 {
+		metrics.MemoryLimitBytes = state.Memory.UsagePeak
+	}
+
+	// Disk usage (root filesystem). The ZFS / btrfs backends report
+	// usage via state.Disk["root"].Usage natively. The "dir" backend
+	// — used on lab boxes that don't have a zpool — leaves that
+	// field at zero because the host filesystem has no per-container
+	// quota accounting. Without a fallback, every dir-backed deploy
+	// would show 0 B for disk usage in `list`, MCP `get_metrics`,
+	// and the OTel collector, which is misleading enough that
+	// operators stop trusting the field entirely. Walking the
+	// container's rootfs gives us the same number `du -bs` would
+	// (it IS what du does), at a cost that's acceptable for the
+	// list-containers cardinality we expect.
+	if rootDisk, ok := state.Disk["root"]; ok && rootDisk.Usage > 0 {
+		metrics.DiskUsageBytes = rootDisk.Usage
+	} else if rootfs := c.containerRootfsPath(name); rootfs != "" {
+		if bytes, err := dirSize(rootfs); err == nil {
+			metrics.DiskUsageBytes = bytes
+		}
+	}
+
+	// Network usage (sum all interfaces except lo)
+	for netName, network := range state.Network {
+		if netName != "lo" {
+			metrics.NetworkRxBytes += network.Counters.BytesReceived
+			metrics.NetworkTxBytes += network.Counters.BytesSent
+		}
+	}
+
+	// CFS throttling counters (#1573). Incus's own InstanceState reports CPU
+	// *usage* but no throttling, so this reads the container's cgroup directly
+	// on the host, resolved through the container's init PID. A container that
+	// isn't running, a host that mounts cgroups differently, or a cgroup with
+	// no bandwidth limit all leave the fields at zero rather than failing the
+	// whole metrics read — throttling is a diagnostic signal, not a reason to
+	// lose usage/memory/disk numbers.
+	if t, ok := containerCPUThrottle(state.Pid); ok {
+		metrics.CPUNrPeriods = t.NrPeriods
+		metrics.CPUNrThrottled = t.NrThrottled
+		metrics.CPUThrottledUsec = t.ThrottledUsec
+	}
+
+	return metrics, nil
+}
+
+// CheckVersion checks if the Incus version meets minimum requirements
+// Returns a warning message if version is below 6.19 (Docker build support)
+func (c *Client) CheckVersion() (string, error) {
+	server, err := c.GetServerInfo()
+	if err != nil {
+		return "", fmt.Errorf("failed to get Incus version: %w", err)
+	}
+
+	version := server.Environment.ServerVersion
+
+	// Parse version (format: "6.20" or "6.0.0")
+	var major, minor int
+	_, err = fmt.Sscanf(version, "%d.%d", &major, &minor)
+	if err != nil {
+		// Could not parse version, return warning but don't fail
+		return fmt.Sprintf("WARNING: Could not parse Incus version '%s', Docker builds may fail if running Incus < 6.19", version), nil
+	}
+
+	// Check minimum version (6.19+)
+	if major < 6 || (major == 6 && minor < 19) {
+		return fmt.Sprintf("WARNING: Incus %s detected. Docker builds require Incus 6.19+ due to AppArmor bug (CVE-2025-52881).\nInstall from Zabbly repository: https://pkgs.zabbly.com/", version), nil
+	}
+
+	return "", nil // Version is OK
+}
+
+// NetworkConfig holds configuration for creating a network
+type NetworkConfig struct {
+	Name        string // Network name (default: "incusbr0")
+	IPv4Address string // IPv4 address with CIDR (default: "10.100.0.1/24")
+	IPv4NAT     bool   // Enable NAT (default: true)
+}
+
+// DefaultNetworkConfig returns a safe default network configuration
+// Uses 10.100.0.0/24 to avoid conflicts with common subnets like 10.0.0.0/8
+func DefaultNetworkConfig() NetworkConfig {
+	return NetworkConfig{
+		Name:        "incusbr0",
+		IPv4Address: "10.100.0.1/24",
+		IPv4NAT:     true,
+	}
+}
+
+// EnsureNetwork creates a network if it doesn't exist
+// Returns the network name
+func (c *Client) EnsureNetwork(config NetworkConfig) (string, error) {
+	if config.Name == "" {
+		config.Name = "incusbr0"
+	}
+	if config.IPv4Address == "" {
+		config.IPv4Address = "10.100.0.1/24"
+	}
+
+	// Check if network already exists
+	networks, err := c.server.GetNetworkNames()
+	if err != nil {
+		return "", fmt.Errorf("failed to list networks: %w", err)
+	}
+
+	for _, n := range networks {
+		if n == config.Name {
+			// Network exists, return it
+			return config.Name, nil
+		}
+	}
+
+	// Create network
+	networkReq := api.NetworksPost{
+		Name: config.Name,
+		Type: "bridge",
+		NetworkPut: api.NetworkPut{
+			Config: map[string]string{
+				"ipv4.address": config.IPv4Address,
+				"ipv4.nat":     fmt.Sprintf("%t", config.IPv4NAT),
+			},
+		},
+	}
+
+	if err := c.server.CreateNetwork(networkReq); err != nil {
+		return "", fmt.Errorf("failed to create network %s: %w", config.Name, err)
+	}
+
+	return config.Name, nil
+}
+
+// EnsureStorage creates a storage pool if it doesn't exist, preferring a
+// driver that gives every container its own volume.
+//
+// Selection order is zfs, then btrfs, then dir — see SelectStorageDriver. The
+// `dir` driver is a last resort because it puts every tenant rootfs on one
+// filesystem, so they share one journal and one tenant's writeback stalls
+// another tenant's fsync (#1206). Landing on it produces a loud warning, or a
+// hard failure under StoragePolicyRequireIsolation.
+//
+// An already-existing pool is re-checked rather than accepted silently: a
+// backend provisioned on `dir` before this change never re-runs selection, so
+// without the re-check it would stay quiet forever.
+//
+// Returns the storage pool name.
+func (c *Client) EnsureStorage(name string) (string, error) {
+	if name == "" {
+		name = c.StoragePool()
+	}
+
+	// Check if storage pool already exists
+	pools, err := c.server.GetStoragePoolNames()
+	if err != nil {
+		return "", fmt.Errorf("failed to list storage pools: %w", err)
+	}
+
+	for _, p := range pools {
+		if p == name {
+			return name, c.reviewExistingStorage(name)
+		}
+	}
+
+	choice := SelectStorageDriver(c.probe())
+	warning, err := reviewStoragePool(c.storagePolicy, name, choice.Driver)
+	if err != nil {
+		return "", err
+	}
+	log.Printf("  Storage: creating pool %q on the %s driver — %s", name, choice.Driver, choice.Reason)
+	if warning != "" {
+		log.Print(warning)
+	}
+
+	poolReq := api.StoragePoolsPost{
+		Name:   name,
+		Driver: string(choice.Driver),
+		StoragePoolPut: api.StoragePoolPut{
+			Config: choice.Config,
+		},
+	}
+
+	if err := c.server.CreateStoragePool(poolReq); err != nil {
+		return "", fmt.Errorf("failed to create storage pool %s: %w", name, err)
+	}
+
+	return name, nil
+}
+
+// reviewExistingStorage applies the isolation policy to a pool that already
+// exists. A pool we cannot read is reported as unchecked rather than warned
+// about under a guessed driver — saying "we could not check" is honest;
+// warning about a driver we did not actually observe is not.
+func (c *Client) reviewExistingStorage(name string) error {
+	pool, _, err := c.server.GetStoragePool(name)
+	if err != nil {
+		log.Printf("  Note: storage pool %q exists but could not be read, so its tenant-isolation "+
+			"property was not checked: %v", name, err)
+		return nil
+	}
+
+	warning, err := reviewStoragePool(c.storagePolicy, name, StorageDriver(pool.Driver))
+	if err != nil {
+		return err
+	}
+	if warning != "" {
+		log.Print(warning)
+	}
+	return nil
+}
+
+// PoolDriver returns the typed driver for the named pool, and an error when
+// the pool could not be read.
+//
+// Distinct from GetStorageDriver, which collapses a read failure into the
+// "unknown" string. Callers that put the driver on the wire need to tell "we
+// could not read the pool" apart from "we read it and it is a driver we don't
+// classify" — reporting the first as the second would let an unreadable pool
+// look like an observed one. See #1209.
+func (c *Client) PoolDriver(name string) (StorageDriver, error) {
+	pool, _, err := c.server.GetStoragePool(name)
+	if err != nil {
+		return "", fmt.Errorf("read storage pool %s: %w", name, err)
+	}
+	return StorageDriver(pool.Driver), nil
+}
+
+// GetStorageDriver returns the driver type ("zfs", "dir", etc.) for the named pool.
+// Returns "unknown" if the pool cannot be found.
+func (c *Client) GetStorageDriver(name string) string {
+	pool, _, err := c.server.GetStoragePool(name)
+	if err != nil {
+		return "unknown"
+	}
+	return pool.Driver
+}
+
+// EnsureDefaultProfile configures the default profile with network and storage
+// rootDiskForPool returns the default profile's root-disk device for the given
+// storage pool, the pool it is moving away from (empty when there was no
+// device), and whether anything changed.
+//
+// Pure so the repoint decision is testable without an Incus server — the
+// decision is the part that was wrong (#1213), not the API call.
+func rootDiskForPool(existing map[string]string, storageName string) (device map[string]string, movedFrom string, changed bool) {
+	if existing == nil {
+		return map[string]string{"type": "disk", "path": "/", "pool": storageName}, "", true
+	}
+	if existing["pool"] == storageName {
+		return existing, "", false
+	}
+	// Repoint in place, preserving anything else the operator set on the
+	// device (size, io limits) — only the pool is ours to change.
+	from := existing["pool"]
+	updated := make(map[string]string, len(existing))
+	for k, v := range existing {
+		updated[k] = v
+	}
+	updated["pool"] = storageName
+	return updated, from, true
+}
+
+func (c *Client) EnsureDefaultProfile(networkName, storageName string) error {
+	// Get current default profile
+	profile, _, err := c.server.GetProfile("default")
+	if err != nil {
+		return fmt.Errorf("failed to get default profile: %w", err)
+	}
+
+	// Ensure devices map exists
+	if profile.Devices == nil {
+		profile.Devices = make(map[string]map[string]string)
+	}
+
+	needsUpdate := false
+
+	// Add the root disk device, or REPOINT it when the configured storage
+	// pool has changed (#1213).
+	//
+	// Setting it only when absent is what made a storage migration undo
+	// itself: an operator repointing the backend at an isolated pool kept a
+	// default profile whose root disk still named the old one, so every
+	// container inheriting the profile — which is every container created
+	// without an explicit disk size — landed back on the pool they were
+	// migrating away from. The contention probe went clean right after the
+	// migration and regressed as new tenants arrived.
+	if device, from, changed := rootDiskForPool(profile.Devices["root"], storageName); changed {
+		if from != "" {
+			log.Printf("[incus] default profile root disk moves from storage pool %q to %q; "+
+				"containers created from now on land on %q (#1213)", from, storageName, storageName)
+		}
+		profile.Devices["root"] = device
+		needsUpdate = true
+	}
+
+	// Add eth0 network device if not present
+	if _, ok := profile.Devices["eth0"]; !ok {
+		profile.Devices["eth0"] = map[string]string{
+			"type":    "nic",
+			"name":    "eth0",
+			"network": networkName,
+		}
+		needsUpdate = true
+	}
+
+	if needsUpdate {
+		if err := c.server.UpdateProfile("default", profile.ProfilePut, ""); err != nil {
+			return fmt.Errorf("failed to update default profile: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// InitializeInfrastructure ensures network, storage, and default profile are configured
+// This should be called once during daemon startup
+func (c *Client) InitializeInfrastructure(networkConfig NetworkConfig) error {
+	// 1. Ensure storage pool exists
+	storageName, err := c.EnsureStorage(c.StoragePool())
+	if err != nil {
+		return fmt.Errorf("failed to ensure storage: %w", err)
+	}
+
+	// 2. Ensure network exists
+	networkName, err := c.EnsureNetwork(networkConfig)
+	if err != nil {
+		return fmt.Errorf("failed to ensure network: %w", err)
+	}
+
+	// 3. Configure default profile
+	if err := c.EnsureDefaultProfile(networkName, storageName); err != nil {
+		return fmt.Errorf("failed to configure default profile: %w", err)
+	}
+
+	return nil
+}
+
+// GetNetworkSubnet returns the IPv4 subnet of a network
+func (c *Client) GetNetworkSubnet(networkName string) (string, error) {
+	network, _, err := c.server.GetNetwork(networkName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get network %s: %w", networkName, err)
+	}
+
+	if addr, ok := network.Config["ipv4.address"]; ok {
+		return addr, nil
+	}
+
+	return "", fmt.Errorf("network %s has no IPv4 address configured", networkName)
+}
+
+// WriteFile writes content to a file inside a container
+func (c *Client) WriteFile(containerName, path string, content []byte, mode string) error {
+	return c.PushFile(containerName, path, bytes.NewReader(content), mode)
+}
+
+// PushFile streams content to a file inside a container, so a caller with a
+// large file never has to hold it in memory.
+func (c *Client) PushFile(containerName, path string, content io.ReadSeeker, mode string) error {
+	return c.WriteFileStream(containerName, path, content, mode)
+}
+
+// WriteFileStream pushes content without accumulating it in memory.
+func (c *Client) WriteFileStream(containerName, path string, content io.Reader, mode string) error {
+	// Incus only seeks when replaying a request after a redirect. A decrypt
+	// stream cannot be replayed; fail that replay instead of buffering it or
+	// sending an incomplete file. Existing seekable PushFile callers retain
+	// their normal redirect support.
+	seeker, ok := content.(io.ReadSeeker)
+	if !ok {
+		seeker = forwardOnlyFile{Reader: content}
+	}
+	// Use incus file push functionality via the API
+	args := incus.InstanceFileArgs{
+		Content:   seeker,
+		WriteMode: "overwrite",
+	}
+
+	// Set file mode if provided
+	if mode != "" {
+		// Parse mode string to int
+		var modeInt int64
+		if _, err := fmt.Sscanf(mode, "%o", &modeInt); err == nil {
+			modeVal := int(modeInt)
+			args.Mode = modeVal
+		}
+	}
+
+	err := c.server.CreateInstanceFile(containerName, path, args)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return nil
+}
+
+type forwardOnlyFile struct{ io.Reader }
+
+func (forwardOnlyFile) Seek(int64, int) (int64, error) {
+	return 0, fmt.Errorf("cannot replay a streaming container file upload")
+}
+
+// ListDir returns the entry names of a directory inside the container. See
+// Backend.ListDir.
+func (c *Client) ListDir(containerName, path string) ([]string, error) {
+	reader, resp, err := c.server.GetInstanceFile(containerName, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list %s: %w", path, err)
+	}
+	if reader != nil {
+		_ = reader.Close()
+	}
+	if resp == nil || resp.Type != "directory" {
+		return nil, fmt.Errorf("failed to list %s: not a directory", path)
+	}
+	return resp.Entries, nil
+}
+
+// maxSymlinkHops bounds how many links ReadFile follows before
+// declaring a loop. Deep legitimate chains are 1-2 hops; anything
+// near this bound is a cycle.
+const maxSymlinkHops = 10
+
+// ReadFile reads content from a file inside a container, following
+// symlinks to the real file.
+//
+// Incus's file API answers a read of a symlink with the link *target
+// path* as the response body (response Type "symlink"), not the
+// file's content — so ignoring the type metadata silently returns a
+// path string where the caller expects file bytes. k3s's join token
+// at server/node-token is exactly such a symlink, which is how
+// workers were pushed a "token" with no CA hash (#1446).
+func (c *Client) ReadFile(containerName, filePath string) ([]byte, error) {
+	r, err := c.ReadFileStream(containerName, filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(r)
+}
+
+// ReadFileStream follows bounded symlink targets and transfers ownership
+// of the regular file response to the caller, who must close it.
+func (c *Client) ReadFileStream(containerName, filePath string) (io.ReadCloser, error) {
+	current := filePath
+	for hop := 0; ; hop++ {
+		reader, resp, err := c.server.GetInstanceFile(containerName, current)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file %s: %w", current, err)
+		}
+		if resp != nil && resp.Type == "directory" {
+			// Incus normally returns a nil reader for directories.
+			if reader != nil {
+				_ = reader.Close()
+			}
+			return nil, fmt.Errorf("failed to read file %s: it is a directory", current)
+		}
+		if reader == nil {
+			return nil, fmt.Errorf("failed to read file %s: missing response body", current)
+		}
+		if resp == nil || resp.Type != "symlink" {
+			return reader, nil
+		}
+		content, err := io.ReadAll(io.LimitReader(reader, 4097))
+		_ = reader.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read symlink %s: %w", current, err)
+		}
+		if len(content) > 4096 {
+			return nil, fmt.Errorf("failed to read symlink %s: target exceeds 4096 bytes", current)
+		}
+		if hop >= maxSymlinkHops {
+			return nil, fmt.Errorf("failed to read file %s: too many symlink hops (loop?)", filePath)
+		}
+		target := strings.TrimSpace(string(content))
+		if target == "" {
+			return nil, fmt.Errorf("failed to read file %s: symlink %s has an empty target", filePath, current)
+		}
+		// Instance paths are POSIX regardless of the host platform.
+		if !gopath.IsAbs(target) {
+			target = gopath.Join(gopath.Dir(current), target)
+		}
+		current = target
+	}
+}
+
+// ExecWithOutput executes a command inside a container and returns stdout/stderr
+func (c *Client) ExecWithOutput(containerName string, command []string) (string, string, error) {
+	var stdout, stderr bytes.Buffer
+
+	req := api.InstanceExecPost{
+		Command:     command,
+		WaitForWS:   true,
+		Interactive: false,
+		// Note: RecordOutput cannot be used with WaitForWS
+		// We capture output via the args.Stdout/Stderr instead
+	}
+
+	err := execWithRetry("exec "+containerName, func() error {
+		// Reset the capture buffers each attempt so a retried command's
+		// output replaces (not appends to) a failed attempt's partial output.
+		stdout.Reset()
+		stderr.Reset()
+		args := &incus.InstanceExecArgs{Stdout: &stdout, Stderr: &stderr}
+
+		op, err := c.server.ExecInstance(containerName, req, args)
+		if err != nil {
+			return fmt.Errorf("failed to execute command: %w", err)
+		}
+		if err := op.Wait(); err != nil {
+			return fmt.Errorf("command execution failed: %w", err)
+		}
+		// A non-zero exit is a genuine command failure, not the transient
+		// PID race — return it so execWithRetry does NOT retry it.
+		opMeta := op.Get()
+		if opMeta.Metadata != nil {
+			if returnVal, ok := opMeta.Metadata["return"].(float64); ok && returnVal != 0 {
+				return fmt.Errorf("command exited with code %d", int(returnVal))
+			}
+		}
+		return nil
+	})
+	return stdout.String(), stderr.String(), err
+}
+
+// ExecWithExitCode is ExecWithOutput's sibling that reports a non-zero exit
+// as data (exitCode) rather than folding it into err. See the Backend
+// interface doc for why this exists.
+//
+// err == nil and a nonzero exitCode both mean "the command ran and exited
+// nonzero" — the same event ExecWithOutput reports as
+// fmt.Errorf("command exited with code %d", ...). Returning nil here (not
+// that error) is deliberate: execWithRetry's isTransientExecErr only
+// matches liblxc-socket-wedge error strings, so returning nil is what
+// stops the retry loop after one attempt, exactly as the folded-error
+// version did — just without inventing an error value only to immediately
+// discard its meaning into an int.
+func (c *Client) ExecWithExitCode(containerName string, command []string) (stdout, stderr string, exitCode int, err error) {
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	req := api.InstanceExecPost{
+		Command:     command,
+		WaitForWS:   true,
+		Interactive: false,
+	}
+
+	err = execWithRetry("exec "+containerName, func() error {
+		stdoutBuf.Reset()
+		stderrBuf.Reset()
+		exitCode = 0
+		args := &incus.InstanceExecArgs{Stdout: &stdoutBuf, Stderr: &stderrBuf}
+
+		op, opErr := c.server.ExecInstance(containerName, req, args)
+		if opErr != nil {
+			return fmt.Errorf("failed to execute command: %w", opErr)
+		}
+		if opErr := op.Wait(); opErr != nil {
+			return fmt.Errorf("command execution failed: %w", opErr)
+		}
+		if opMeta := op.Get(); opMeta.Metadata != nil {
+			if returnVal, ok := opMeta.Metadata["return"].(float64); ok {
+				exitCode = int(returnVal)
+			}
+		}
+		return nil
+	})
+	return stdoutBuf.String(), stderrBuf.String(), exitCode, err
+}
+
+// CleanupDisk frees disk space inside a container by removing temp files,
+// package manager caches, and trimming journal logs.
+// Returns a human-readable summary and the number of bytes freed.
+func (c *Client) CleanupDisk(containerName string) (string, int64, error) {
+	// Get disk usage before cleanup
+	dfBefore, _, _ := c.ExecWithOutput(containerName, []string{"df", "-B1", "/"})
+	usedBefore := parseDfUsedBytes(dfBefore)
+
+	// Run cleanup commands (ignore individual errors — some may not apply)
+	cleanupScript := `
+rm -rf /tmp/* /tmp/.* 2>/dev/null
+apt-get clean 2>/dev/null
+dnf clean all 2>/dev/null
+journalctl --vacuum-size=50M 2>/dev/null
+`
+	if _, _, err := c.ExecWithOutput(containerName, []string{"/bin/bash", "-c", cleanupScript}); err != nil {
+		log.Printf("[incus] CleanupDisk %s: best-effort cleanup script error (ignored): %v", containerName, err)
+	}
+
+	// Get disk usage after cleanup
+	dfAfter, _, _ := c.ExecWithOutput(containerName, []string{"df", "-B1", "/"})
+	usedAfter := parseDfUsedBytes(dfAfter)
+
+	var freedBytes int64
+	if usedBefore > 0 && usedAfter > 0 && usedBefore > usedAfter {
+		freedBytes = usedBefore - usedAfter
+	}
+
+	summary := fmt.Sprintf("Cleaned temp files, package cache, and trimmed journal logs. Freed %s.", formatBytesHuman(freedBytes))
+	return summary, freedBytes, nil
+}
+
+// parseDfUsedBytes parses "df -B1 /" output and returns the "Used" column in bytes.
+func parseDfUsedBytes(dfOutput string) int64 {
+	lines := strings.Split(strings.TrimSpace(dfOutput), "\n")
+	if len(lines) < 2 {
+		return 0
+	}
+	fields := strings.Fields(lines[1])
+	if len(fields) < 4 {
+		return 0
+	}
+	used, err := strconv.ParseInt(fields[2], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return used
+}
+
+// formatBytesHuman formats bytes into a human-readable string.
+func formatBytesHuman(b int64) string {
+	if b <= 0 {
+		return "0 B"
+	}
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	return fmt.Sprintf("%.1f %s", float64(b)/float64(div), units[exp])
+}
+
+// postureMarkerKeys are host-side posture markers the daemon stamps on any
+// instance it brings under a policy, INCLUDING instances it does not own (a
+// VM or container made directly in Incus). They record "this check ran", not
+// "a tenant owns this", so they must not make an instance count as managed
+// (#2619). Add any new such marker here; an unknown user.containarium.* key is
+// deliberately treated as ownership, because mistaking an owned tenant box for
+// an unmanaged one would hide an unguarded tenant.
+var postureMarkerKeys = map[string]bool{
+	sshdpolicy.MarkerKey: true,
+}
+
+// hasContainariumConfig reports whether config carries an ownership-bearing
+// user.containarium.* key: the signal that separates an instance Containarium
+// manages from one created directly in Incus. Posture markers do not count.
+func hasContainariumConfig(config map[string]string) bool {
+	for k := range config {
+		if strings.HasPrefix(k, "user.containarium.") && !postureMarkerKeys[k] {
+			return true
+		}
+	}
+	return false
+}
+
+// extractLabelsFromConfig extracts labels from container config
+// Labels are stored with prefix "containarium.label.<key>=<value>"
+func extractLabelsFromConfig(config map[string]string) map[string]string {
+	labels := make(map[string]string)
+	for key, value := range config {
+		if strings.HasPrefix(key, LabelPrefix) {
+			labelKey := key[len(LabelPrefix):]
+			labels[labelKey] = value
+		}
+	}
+	return labels
+}
+
+// GetLabels retrieves labels from a container
+func (c *Client) GetLabels(containerName string) (map[string]string, error) {
+	inst, _, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container: %w", err)
+	}
+	return extractLabelsFromConfig(inst.Config), nil
+}
+
+// SetLabels sets labels on a container, replacing all existing labels
+func (c *Client) SetLabels(containerName string, labels map[string]string) error {
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container: %w", err)
+	}
+
+	// Clear existing labels
+	for key := range inst.Config {
+		if strings.HasPrefix(key, LabelPrefix) {
+			delete(inst.Config, key)
+		}
+	}
+
+	// Set new labels
+	for key, value := range labels {
+		inst.Config[LabelPrefix+key] = value
+	}
+
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to update container labels: %w", err)
+	}
+
+	return op.Wait()
+}
+
+// AddLabel adds or updates a single label on a container
+func (c *Client) AddLabel(containerName, key, value string) error {
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container: %w", err)
+	}
+
+	inst.Config[LabelPrefix+key] = value
+
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to add label: %w", err)
+	}
+
+	return op.Wait()
+}
+
+// RemoveLabel removes a single label from a container
+func (c *Client) RemoveLabel(containerName, key string) error {
+	inst, etag, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return fmt.Errorf("failed to get container: %w", err)
+	}
+
+	delete(inst.Config, LabelPrefix+key)
+
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to remove label: %w", err)
+	}
+
+	return op.Wait()
+}
+
+// MatchLabels checks if a container's labels match the given filter
+// All filter labels must be present and have matching values
+func MatchLabels(containerLabels, filter map[string]string) bool {
+	for key, value := range filter {
+		if containerLabels[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+// containerRootfsPath resolves the on-disk rootfs directory for the
+// named container so dirSize can walk it. Returns "" when the path
+// can't be resolved or doesn't exist — callers treat empty as "skip
+// the fallback."
+//
+// Conventional layout (matches incus's "dir" + "zfs" mount layout):
+//
+//	<pool_source>/containers/<name>/rootfs
+//
+// When the pool has no explicit source config (the typical dir-
+// backend case) we fall back to incus's hard-coded default of
+// /var/lib/incus/storage-pools/<pool>.
+func (c *Client) containerRootfsPath(containerName string) string {
+	inst, _, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return ""
+	}
+	pool := ""
+	if rootDev, ok := inst.ExpandedDevices["root"]; ok {
+		pool = rootDev["pool"]
+	}
+	if pool == "" {
+		pool = c.StoragePool()
+	}
+	poolCfg, _, err := c.server.GetStoragePool(pool)
+	if err != nil {
+		return ""
+	}
+	path := buildContainerRootfsPath(pool, poolCfg.Config["source"], containerName)
+	if _, err := os.Stat(path); err != nil {
+		return ""
+	}
+	return path
+}
+
+// buildContainerRootfsPath is the pure path-construction half of
+// containerRootfsPath — separated so it's easy to test without an
+// Incus server. The poolSource argument matches the value Incus
+// stores under `Config["source"]` on a storage pool; an absolute
+// path is used as-is, anything else falls through to the conventional
+// /var/lib/incus/storage-pools/<pool> default.
+func buildContainerRootfsPath(pool, poolSource, containerName string) string {
+	base := poolSource
+	if !filepath.IsAbs(base) {
+		base = filepath.Join("/var/lib/incus/storage-pools", pool)
+	}
+	return filepath.Join(base, "containers", containerName, "rootfs")
+}
+
+// dirSize returns the cumulative size of regular files under root.
+// Skips directories, symlinks, sockets, and unreadable entries —
+// matches `du -bs` semantics for the metric we surface. Used as a
+// fallback when Incus's per-container disk-usage field is zero
+// (dir backend has no quota accounting; see GetContainerMetrics).
+func dirSize(root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Unreadable entry — skip rather than abort. A best-
+			// effort metric is more useful than no metric.
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
+}
