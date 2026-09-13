@@ -103,3 +103,56 @@ func attachConsole(username string) error {
 			}
 		}
 	}()
+
+	// console -> stdout
+	go func() {
+		for {
+			msgType, data, err := conn.ReadMessage()
+			if err != nil {
+				close(done)
+				return
+			}
+			if msgType == websocket.BinaryMessage {
+				_, _ = os.Stdout.Write(data)
+			}
+		}
+	}()
+
+	select {
+	case <-detach:
+		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "detaching")
+		_ = conn.WriteMessage(websocket.CloseMessage, closeMsg)
+	case <-done:
+	}
+
+	fmt.Print("\r\n")
+	return nil
+}
+
+// consoleWebSocketURL builds the console-attach WebSocket URL from an
+// http(s):// --server address.
+func consoleWebSocketURL(serverAddr, username string) (string, error) {
+	base := serverAddr
+	if !strings.Contains(base, "://") {
+		base = "http://" + base
+	}
+	u, err := url.Parse(strings.TrimSuffix(base, "/"))
+	if err != nil {
+		return "", fmt.Errorf("invalid --server address: %w", err)
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("unsupported --server scheme %q for console attach", u.Scheme)
+	}
+	// Path takes the decoded form (a literal "/" in username is just
+	// another path separator there); RawPath carries the pre-escaped form
+	// url.URL.String() actually serializes, matching how the HTTP client
+	// escapes a username in its own container paths.
+	u.Path = fmt.Sprintf("/v1/containers/%s/console-attach", username)
+	u.RawPath = fmt.Sprintf("/v1/containers/%s/console-attach", url.PathEscape(username))
+	return u.String(), nil
+}

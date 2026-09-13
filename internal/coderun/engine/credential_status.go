@@ -53,3 +53,31 @@ var credentialStatusSources = []CredentialStatusSource{
 
 // ParseCredentialStatusSource validates a probe's trimmed stdout against the
 // values above. Anything else is an error naming what was seen rather
+// than silently defaulting to "none" — a script that printed something else
+// means the detection logic and this parser have drifted, which must fail
+// loudly, not report a possibly-wrong status.
+func ParseCredentialStatusSource(s string) (CredentialStatusSource, error) {
+	for _, v := range credentialStatusSources {
+		if CredentialStatusSource(s) == v {
+			return v, nil
+		}
+	}
+	return "", fmt.Errorf("unrecognized credential-status probe output %q", s)
+}
+
+// CredentialStatusScript renders a POSIX script that probes box state for
+// the named engine and echoes EXACTLY ONE line: one of the
+// CredentialStatusSource values above. ok=false means this engine has no
+// probe yet — callers must refuse cleanly, never guess.
+func CredentialStatusScript(n Name) (script string, ok bool) {
+	switch n {
+	case NameClaude:
+		return claudeCredentialStatusScript, true
+	case NamePi:
+		return piCredentialStatusScript, true
+	case NameCodex:
+		return codexCredentialStatusScript, true
+	default:
+		return "", false
+	}
+}

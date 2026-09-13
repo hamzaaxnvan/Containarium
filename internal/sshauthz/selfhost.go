@@ -115,3 +115,43 @@ func (d *SelfHostDecider) localFacts(ctx context.Context, login string) (string,
 	if d.Boxes == nil {
 		return "", false
 	}
+	names, err := d.Boxes.ExistingContainerNames()
+	if err != nil {
+		return "", false
+	}
+	switch {
+	case names[login+"-container"]:
+		// owner account
+	default:
+		box, isCollab := container.CollaboratorJumpAccountContainer(login)
+		if !isCollab || !names[box] || d.Collaborators == nil {
+			return "", false
+		}
+		exists, err := d.Collaborators.CollaboratorExists(ctx, box, UserIDForLogin(login))
+		if err != nil || !exists {
+			return "", false
+		}
+	}
+	if !d.jumpAccountHasKeys(login) {
+		return "", false
+	}
+	return UserIDForLogin(login), true
+}
+
+func (d *SelfHostDecider) jumpAccountHasKeys(login string) bool {
+	root := d.HomeRoot
+	if root == "" {
+		root = "/home"
+	}
+	// #nosec G304 -- login is checked above to contain no path separators.
+	data, err := os.ReadFile(filepath.Join(root, login, ".ssh", "authorized_keys"))
+	return err == nil && strings.TrimSpace(string(data)) != ""
+}
+
+func denyResponse(reason pb.SSHDenyReason, userID string) *pb.AuthorizeSSHResponse {
+	return &pb.AuthorizeSSHResponse{
+		Decision:   pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_DENY,
+		DenyReason: reason,
+		UserId:     userID,
+	}
+}
