@@ -211,3 +211,217 @@ Defaults:%s iolog_file=%%{user}.%%{seq}
 		accountName, accountName,
 		accountName,
 		accountName,
+	)
+}
+
+// generateCollaboratorSudoers generates sudoers configuration with session logging
+func (cm *CollaboratorManager) generateCollaboratorSudoers(accountName, ownerUsername string) string {
+	// Enable I/O logging for full session capture
+	// Logs are stored in /var/log/sudo-io/{accountName}/
+	return fmt.Sprintf(`# Collaborator %s - can switch to %s with session logging
+Defaults:%s log_input, log_output
+Defaults:%s iolog_dir=/var/log/sudo-io/%s
+Defaults:%s iolog_file=%%{user}.%%{seq}
+
+# Allow passwordless switch to container owner only
+%s ALL=(%s) NOPASSWD: /bin/su - %s
+%s ALL=(%s) NOPASSWD: /usr/bin/su - %s
+`,
+		accountName, ownerUsername,
+		accountName,
+		accountName, accountName,
+		accountName,
+		accountName, ownerUsername, ownerUsername,
+		accountName, ownerUsername, ownerUsername,
+	)
+}
+
+// RemoveCollaborator removes a collaborator from a container
+func (cm *CollaboratorManager) RemoveCollaborator(ownerUsername, collaboratorUsername string) error {
+	containerName := ownerUsername + "-container"
+	accountName := containerName + "-" + collaboratorUsername
+
+	// Remove user from container (best effort)
+	if err := cm.removeCollaboratorUser(containerName, accountName); err != nil {
+		fmt.Printf("Warning: failed to remove user from container: %v\n", err)
+	}
+
+	// Remove jump server account
+	if err := DeleteJumpServerAccount(accountName, true); err != nil {
+		fmt.Printf("Warning: failed to remove jump server account: %v\n", err)
+	}
+
+	// Remove from database
+	if err := cm.store.Remove(context.Background(), containerName, collaboratorUsername); err != nil {
+		return fmt.Errorf("failed to remove collaborator from database: %w", err)
+	}
+
+	return nil
+}
+
+// removeCollaboratorUser removes a collaborator user from the container.
+//
+// Revoking a collaborator must END their access now, not merely block the next
+// reconnect: a plain `userdel -r` neither kills the account's live SSH session
+// nor — without -f — even succeeds while the account is in use (it exits with
+// "user is currently used by process"), so an active shell survives the revoke.
+// So we terminate the account's sessions/processes first, then force-remove it.
+// This mirrors the host-side jump-server account deletion, which already kills a
+// live session before userdel (see runUserdel, #1035); this is the same fix for
+// the in-container account.
+func (cm *CollaboratorManager) removeCollaboratorUser(containerName, accountName string) error {
+	// Remove sudoers file
+	sudoersPath := fmt.Sprintf("/etc/sudoers.d/%s", accountName)
+	_ = cm.manager.incus.Exec(containerName, []string{"rm", "-f", sudoersPath})
+
+	// Terminate any live session/processes owned by the account BEFORE deleting
+	// it — the same sequence TerminateUserSessions runs (#2522).
+	_ = cm.manager.TerminateAccountSessions(containerName, accountName)
+
+	// Delete user and home directory. -f forces removal even if the account was
+	// referenced a moment ago, so a lingering process can't block the delete
+	// (and can't leave a re-loginnable account behind).
+	if err := cm.manager.incus.Exec(containerName, []string{"userdel", "-rf", accountName}); err != nil {
+		return fmt.Errorf("failed to delete user: %w", err)
+	}
+
+	return nil
+}
+
+// CollaboratorJumpAccountContainer maps a COLLABORATOR jump-server account name
+// back to the owner container it grants access to. Collaborator accounts are
+// named "<owner>-container-<collaborator>" (see AddCollaborator); the container
+// is "<owner>-container". Returns (containerName, true) for a collaborator
+// account, or ("", false) for anything else (e.g. a bare owner account
+// "<owner>", which callers resolve with the usual "<owner>-container").
+//
+// This exists because the /authorized-keys orphan filter and the orphan reaper
+// (internal/server/dual_server.go) derived the container as
+// `username+"-container"` for EVERY jump account. That is right for owners but
+// yields "<owner>-container-<collab>-container" for collaborators — a name that
+// never exists — so every collaborator was misclassified as an orphan: filtered
+// out of the sentinel keysync (→ sshpiperd "no pipe" → publickey denied) AND
+// eligible for reaping. #1140.
+func CollaboratorJumpAccountContainer(jumpUser string) (string, bool) {
+	const infix = "-container-"
+	i := strings.Index(jumpUser, infix)
+	if i < 0 {
+		return "", false
+	}
+	return jumpUser[:i+len("-container")], true
+}
+
+// ListCollaborators returns all collaborators for a container
+func (cm *CollaboratorManager) ListCollaborators(ownerUsername string) ([]*collaborator.Collaborator, error) {
+	containerName := ownerUsername + "-container"
+	return cm.store.List(context.Background(), containerName)
+}
+
+// ListByCollaborator returns every box collaboratorUsername reaches as a
+// collaborator (#2522).
+func (cm *CollaboratorManager) ListByCollaborator(ctx context.Context, collaboratorUsername string) ([]*collaborator.Collaborator, error) {
+	return cm.store.ListByCollaborator(ctx, collaboratorUsername)
+}
+
+// GetCollaborator returns a specific collaborator
+func (cm *CollaboratorManager) GetCollaborator(ownerUsername, collaboratorUsername string) (*collaborator.Collaborator, error) {
+	containerName := ownerUsername + "-container"
+	return cm.store.Get(context.Background(), containerName, collaboratorUsername)
+}
+
+// RemoveAllCollaborators removes all collaborators for a container
+// This is called when deleting a container
+func (cm *CollaboratorManager) RemoveAllCollaborators(ownerUsername string) error {
+	containerName := ownerUsername + "-container"
+
+	// Get all collaborators first
+	collaborators, err := cm.store.List(context.Background(), containerName)
+	if err != nil {
+		return fmt.Errorf("failed to list collaborators: %w", err)
+	}
+
+	// Remove jump server accounts for all collaborators
+	for _, c := range collaborators {
+		if err := DeleteJumpServerAccount(c.AccountName, true); err != nil {
+			fmt.Printf("Warning: failed to remove jump server account %s: %v\n", c.AccountName, err)
+		}
+	}
+
+	// Remove all collaborators from database
+	_, err = cm.store.RemoveByContainer(context.Background(), containerName)
+	if err != nil {
+		return fmt.Errorf("failed to remove collaborators from database: %w", err)
+	}
+
+	return nil
+}
+
+// GenerateSSHCommand generates the SSH command for a collaborator
+func (cm *CollaboratorManager) GenerateSSHCommand(ownerUsername, collaboratorUsername, jumpServerHost string) string {
+	accountName := ownerUsername + "-container-" + collaboratorUsername
+	return fmt.Sprintf("ssh -J %s@%s %s@<container-ip>", accountName, jumpServerHost, accountName)
+}
+
+// isValidCollaboratorUsername validates collaborator username format
+func isValidCollaboratorUsername(username string) bool {
+	if len(username) == 0 || len(username) > 32 {
+		return false
+	}
+
+	for _, ch := range username {
+		if (ch < 'a' || ch > 'z') &&
+			(ch < 'A' || ch > 'Z') &&
+			(ch < '0' || ch > '9') &&
+			ch != '-' && ch != '_' {
+			return false
+		}
+	}
+
+	// Cannot start with digit or dash
+	firstChar := rune(username[0])
+	return (firstChar < '0' || firstChar > '9') && firstChar != '-'
+}
+
+// SyncCollaboratorAccounts recreates jump server accounts for all collaborators.
+// When force is true, accounts are recreated even if they already exist.
+func (cm *CollaboratorManager) SyncCollaboratorAccounts(verbose, force bool) (restored, skipped, failed int) {
+	collaborators, err := cm.store.ListAll(context.Background())
+	if err != nil {
+		if verbose {
+			fmt.Printf("Failed to list collaborators: %v\n", err)
+		}
+		return 0, 0, 1
+	}
+
+	for _, c := range collaborators {
+		// Check if jump server account exists
+		if !force && userExists(c.AccountName) {
+			if verbose {
+				fmt.Printf("  ✓ Jump server account %s already exists, skipping\n", c.AccountName)
+			}
+			skipped++
+			continue
+		}
+
+		// Create jump server account
+		if err := CreateJumpServerAccount(c.AccountName, c.SSHPublicKey, verbose); err != nil {
+			if verbose {
+				fmt.Printf("  ✗ Failed to create jump server account for %s: %v\n", c.AccountName, err)
+			}
+			failed++
+			continue
+		}
+
+		if verbose {
+			fmt.Printf("  ✓ Jump server account restored for collaborator %s\n", c.AccountName)
+		}
+		restored++
+	}
+
+	return restored, skipped, failed
+}
+
+// GetStore returns the collaborator store (for server handlers)
+func (cm *CollaboratorManager) GetStore() *collaborator.Store {
+	return cm.store
+}

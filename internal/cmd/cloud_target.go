@@ -48,3 +48,20 @@ func errRequiresCloud(op string) error {
 // credentials file (the same one `containarium whoami` reports), or "" if
 // there is none — no session, an unrecognized server, or a daemon target
 // (which never has one). Mirrors resolveAuthToken's shape/failure posture:
+// best-effort, never itself an error, so a caller with nothing to resolve
+// gets an empty string and produces its own actionable message.
+func resolveOrgID(server string) string {
+	path, err := credentials.DefaultPath()
+	if err != nil {
+		return ""
+	}
+	cf, err := credentials.Load(path)
+	if err != nil {
+		return ""
+	}
+	creds, ok := cf.Get(server)
+	if !ok {
+		return ""
+	}
+	return creds.OrgID
+}
