@@ -297,3 +297,603 @@ FIXTURE_GIT_CREDENTIAL="e2e-fake-credential-1773-$$-not-a-real-secret"
 
 # Matches the daemon's agentSeedRoot / agentWorkspaceRoot
 # (internal/server/agent_server.go).
+AGENT_SEED_ROOT="/etc/containarium/agent/runs"
+AGENT_WORKSPACE_ROOT="/workspace/runs"
+
+WORKDIR="$(mktemp -d)"
+BIN="$WORKDIR/containariumd"
+DAEMON_LOG="$WORKDIR/daemon.log"
+FIXTURE_CLONE="$WORKDIR/fixture-clone"
+PG_CONTAINER=""
+CONTAINER_RUNTIME=""
+DAEMON_PID=""
+
+log() { echo "==> $*"; }
+ok() { echo "OK   $*"; }
+fail() { echo "FATAL: $*" >&2; exit 1; }
+
+# ========================================================================
+# Pre-flight: fail loudly, never skip silently. (The ONE legitimate skip is
+# the credential gate above, and it already happened.)
+# ========================================================================
+[ -S /var/lib/incus/unix.socket ] || fail "no Incus socket at /var/lib/incus/unix.socket"
+command -v go >/dev/null || fail "no Go toolchain"
+command -v curl >/dev/null || fail "no curl"
+command -v git >/dev/null || fail "no git (this script computes the fixture's file list from its own clone)"
+command -v jq >/dev/null || fail "no jq (the RPC response is JSON and this script asserts on its fields)"
+sudo -n true 2>/dev/null || fail "needs passwordless sudo (daemon and Incus operations run as root)"
+[ -n "$RELEASE" ] || fail "no release tag: set CONTAINARIUM_E2E_CREW_RELEASE to a PUBLISHED v-tag whose agent-runtime bundle exists, or fetch tags so 'git tag --list v*' is non-empty"
+case "$RELEASE" in v*) ;; *) fail "CONTAINARIUM_E2E_CREW_RELEASE='$RELEASE' must be v-prefixed (install-agent-runtime.sh builds the artifact URL from it)" ;; esac
+case "$SABOTAGE" in
+  ''|fixture-path-mismatch|blank-pr-title) ;;
+  *) fail "unknown CONTAINARIUM_E2E_SABOTAGE=$SABOTAGE (want empty, 'fixture-path-mismatch' or 'blank-pr-title')" ;;
+esac
+
+cleanup() {
+  status=$?
+  set +e
+  if [ -n "$DAEMON_PID" ]; then
+    log "stopping daemon (pid $DAEMON_PID)"
+    sudo kill "$DAEMON_PID" 2>/dev/null
+    sleep 2
+    sudo kill -9 "$DAEMON_PID" 2>/dev/null
+  fi
+  # Member boxes are named deterministically from the skill id, so a red run
+  # would otherwise hand its boxes — including a serve-mode agent-runtime
+  # holding a stale gateway token — to the next run.
+  for m in $CREW_MEMBERS $PACK_PRODUCER; do
+    if sudo incus info "agent-$m-container" >/dev/null 2>&1; then
+      log "sweeping member box agent-$m-container"
+      sudo incus delete --force "agent-$m-container" 2>/dev/null
+    fi
+  done
+  if [ -n "$PG_CONTAINER" ]; then
+    log "stopping throwaway postgres"
+    "$CONTAINER_RUNTIME" rm -f "$PG_CONTAINER" >/dev/null 2>&1
+  fi
+  if [ $status -ne 0 ] && [ -f "$DAEMON_LOG" ]; then
+    # Gateway and crew lines over the WHOLE log first: whether the gateway was
+    # mounted at all, whether a member's serve mode started, and whether a hop
+    # failed are each decided in one line the daemon prints once, and a tail
+    # alone cannot answer them.
+    echo "---- daemon log: gateway / crew / agent-skill lines (whole run) ----"
+    grep -E 'model-gateway|Model-gateway|\[crew\]|\[agent-skill\]|quota' "$DAEMON_LOG" || echo "(none)"
+    echo "---- daemon log (last 120 lines) ----"
+    tail -120 "$DAEMON_LOG"
+    # The in-box loop's own log is where a model/tool failure actually lands;
+    # the daemon only ever sees "the hop failed".
+    for m in $CREW_MEMBERS; do
+      echo "---- agent-runtime.log in agent-$m-container (last 60 lines) ----"
+      sudo incus exec "agent-$m-container" -- tail -60 /var/log/agent-runtime.log 2>/dev/null || echo "(unavailable)"
+    done
+  fi
+  sudo rm -rf "$WORKDIR" 2>/dev/null || rm -rf "$WORKDIR"
+  exit $status
+}
+trap cleanup EXIT
+
+# The release's agent-runtime bundle must actually be published, checked BEFORE
+# any spend. install-agent-runtime.sh's failure is best-effort by design (the
+# recipe logs "assembly skipped/failed" and carries on), so a wrong tag would
+# otherwise produce boxes with no runtime and a red lane ten minutes later
+# blaming A2A.
+#
+# WHY THIS POLLS RATHER THAN CHECKS ONCE. This lane is release-blocking, so it
+# runs on a `v*` tag push — at which point the newest reachable v-tag IS the tag
+# being released, and the workflow that publishes its agent-runtime bundle
+# (release.yml) is running IN PARALLEL with this one. A single check would lose
+# that race and report a missing bundle when the truth is "not yet". So wait,
+# bounded, and say which of the two it was.
+BUNDLE_URL="https://github.com/FootprintAI/Containarium/releases/download/$RELEASE/agent-runtime-bundle.tar.gz"
+BUNDLE_WAIT_S="${CONTAINARIUM_E2E_CREW_BUNDLE_WAIT:-1200}"
+log "waiting for the agent-runtime bundle for $RELEASE to be published (up to ${BUNDLE_WAIT_S}s; on a tag push release.yml is publishing it right now)"
+bundle_code=""
+bundle_deadline=$(( $(date +%s) + BUNDLE_WAIT_S ))
+while :; do
+  bundle_code="$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 60 -I "$BUNDLE_URL" || true)"
+  [ "$bundle_code" = "200" ] && break
+  [ "$(date +%s)" -ge "$bundle_deadline" ] && break
+  sleep 15
+done
+[ "$bundle_code" = "200" ] \
+  || fail "agent-runtime bundle for $RELEASE is still not downloadable after ${BUNDLE_WAIT_S}s ($BUNDLE_URL -> $bundle_code). Either the tag's release.yml has not published it (or failed), or CONTAINARIUM_E2E_CREW_RELEASE names a tag that has no bundle. Either way the member boxes would come up with no in-box loop, so this stops before spending money."
+ok "agent-runtime bundle for $RELEASE is published"
+
+
+# ========================================================================
+# The fixture's REAL file list, computed independently of the run.
+#
+# Load-bearing: assertion 4 asks whether the artifact's paths exist in the
+# fixture, and the only way that question means anything is if the answer
+# comes from somewhere the run never touched. So it comes from this script's
+# own clone of the pinned commit on the HOST, not from the box's checkout and
+# not from the artifact.
+# ========================================================================
+log "cloning the fixture at $FIXTURE_GIT_SHA to compute its real file list"
+git init -q "$FIXTURE_CLONE"
+git -C "$FIXTURE_CLONE" remote add origin "$FIXTURE_GIT_SOURCE"
+git -C "$FIXTURE_CLONE" fetch -q --depth 1 origin "$FIXTURE_GIT_SHA"
+git -C "$FIXTURE_CLONE" checkout -q FETCH_HEAD
+FIXTURE_PATHS_FILE="$WORKDIR/fixture-paths.txt"
+git -C "$FIXTURE_CLONE" ls-tree -r --name-only HEAD >"$FIXTURE_PATHS_FILE"
+fixture_path_count="$(wc -l <"$FIXTURE_PATHS_FILE" | tr -d ' ')"
+[ "$fixture_path_count" -gt 0 ] || fail "the fixture clone at $FIXTURE_GIT_SHA lists no files — the pin is wrong or the fetch failed"
+ok "fixture at $FIXTURE_GIT_SHA holds $fixture_path_count file(s): $(tr '\n' ' ' <"$FIXTURE_PATHS_FILE")"
+
+# The fixture task. Names an EXISTING file explicitly and caps max_files at 1,
+# because AC2's claim is about the artifact touching a real path — a task that
+# invites a new file would be testing the model's restraint instead of the
+# crew's contract. The shape is issue-implementer's documented task contract
+# (pkg/core/skills/skills.yaml): {"task": {...}, "constraints": {...}}.
+TASK_JSON="$(jq -nc --arg url "$FIXTURE_GIT_SOURCE" '{
+  task: {
+    title: "README.md does not say what this repository is",
+    body: "README.md opens with a greeting and a link but never says what the repository is for. Add one short sentence to the EXISTING README.md explaining that this repository is GitHub'"'"'s fork-and-pull-request tutorial fixture. Edit README.md only; do not create any new file and do not touch index.html or styles.css.",
+    url: ($url + "/blob/main/README.md"),
+    labels: ["documentation", "good-first-issue"]
+  },
+  constraints: { max_files: 1 }
+}')"
+
+# ========================================================================
+# Postgres: real. The crew-run store is Postgres-backed and the run's archive
+# row is what GetCrewRun reads back.
+# ========================================================================
+if [ -z "${CONTAINARIUM_POSTGRES_URL:-}" ]; then
+  # Pick a runtime that ANSWERS, not merely one that is on PATH — a host can
+  # carry a docker shim whose real binary is gone, and `command -v` cannot tell
+  # the difference (the agent-skill-lease-e2e.sh precedent).
+  for rt in docker podman; do
+    rt_path="$(command -v "$rt" || true)"
+    [ -n "$rt_path" ] || continue
+    if "$rt_path" info >/dev/null 2>&1; then
+      CONTAINER_RUNTIME="$rt_path"
+      break
+    fi
+    log "$rt is on PATH but not usable; trying the next runtime"
+  done
+  [ -n "$CONTAINER_RUNTIME" ] || fail "set CONTAINARIUM_POSTGRES_URL or install a working docker/podman for a throwaway postgres"
+  PG_PORT="$(( (RANDOM % 1000) + 17432 ))"
+  PG_CONTAINER="crew-e2e-pg-$$"
+  log "starting throwaway postgres on :$PG_PORT"
+  "$CONTAINER_RUNTIME" run -d --name "$PG_CONTAINER" \
+    -e POSTGRES_USER=containarium -e POSTGRES_PASSWORD=e2e -e POSTGRES_DB=containarium \
+    -p "127.0.0.1:${PG_PORT}:5432" postgres:16-alpine >/dev/null
+  export CONTAINARIUM_POSTGRES_URL="postgres://containarium:e2e@127.0.0.1:${PG_PORT}/containarium?sslmode=disable"
+  # TCP (-h 127.0.0.1) readiness probe: the postgres entrypoint runs a
+  # temporary Unix-socket-only server during init and then shuts it down, so a
+  # default probe answers "ready" about the wrong server (#1514).
+  for _ in $(seq 1 90); do
+    "$CONTAINER_RUNTIME" exec "$PG_CONTAINER" pg_isready -h 127.0.0.1 -U containarium >/dev/null 2>&1 && break
+    sleep 1
+  done
+  "$CONTAINER_RUNTIME" exec "$PG_CONTAINER" pg_isready -h 127.0.0.1 -U containarium >/dev/null 2>&1 \
+    || fail "postgres did not become ready"
+fi
+
+# ========================================================================
+# Build the system under test, stamped with the published release tag so the
+# member boxes' post_start pulls a REAL agent-runtime (see RELEASE above).
+# ========================================================================
+log "building containariumd stamped as $RELEASE"
+go build -ldflags "-X github.com/footprintai/containarium/pkg/version.Version=$RELEASE" \
+  -o "$BIN" ./cmd/containariumd
+
+JWT_SECRET="${CONTAINARIUM_JWT_SECRET:-$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+
+log "starting daemon (grpc :$GRPC_PORT http :$HTTP_PORT, model gateway provider $PROVIDER from \$$PROVIDER_KEY_ENV, quota ${GATEWAY_QUOTA_CALLS} calls / ${GATEWAY_QUOTA_TOKENS} tokens per ${GATEWAY_QUOTA_WINDOW})"
+# SC2024 (sudo doesn't affect redirects) is the intent, not a bug: the log file
+# is created by THIS shell inside our own mktemp workdir, so cleanup() can read
+# it without sudo. Same shape as scripts/cluster-e2e.sh.
+# shellcheck disable=SC2024
+sudo env \
+  CONTAINARIUM_JWT_SECRET="$JWT_SECRET" \
+  CONTAINARIUM_POSTGRES_URL="$CONTAINARIUM_POSTGRES_URL" \
+  "$PROVIDER_KEY_ENV=$PROVIDER_KEY" \
+  CONTAINARIUM_GATEWAY_QUOTA_WINDOW="$GATEWAY_QUOTA_WINDOW" \
+  CONTAINARIUM_GATEWAY_QUOTA_CALLS="$GATEWAY_QUOTA_CALLS" \
+  CONTAINARIUM_GATEWAY_QUOTA_TOKENS="$GATEWAY_QUOTA_TOKENS" \
+  "$BIN" daemon --port "$GRPC_PORT" --http-port "$HTTP_PORT" \
+  >"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+
+DAEMON_WAIT_TRIES="${CONTAINARIUM_E2E_CREW_DAEMON_WAIT_TRIES:-300}"
+log "waiting for the daemon's HTTP gateway (up to $((DAEMON_WAIT_TRIES * 2))s)"
+for i in $(seq 1 "$DAEMON_WAIT_TRIES"); do
+  sudo kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon exited during startup"
+  if daemon_is_ready "$HTTP_PORT" /v1/crews; then
+    break
+  fi
+  [ "$i" = "$DAEMON_WAIT_TRIES" ] && fail "daemon HTTP gateway not answering after $((DAEMON_WAIT_TRIES * 2))s"
+  sleep 2
+done
+
+# The gateway must be mounted, or the boxes run in direct mode with no
+# credential at all, every model call fails "Not logged in", and the lane would
+# go red for a reason that has nothing to do with engineer-crew.
+gw_health="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/__gateway/healthz")"
+[ "$gw_health" = "200" ] \
+  || fail "model gateway is not mounted (/__gateway/healthz -> $gw_health); \$$PROVIDER_KEY_ENV was not picked up, so no member box would have a model credential"
+ok "model gateway mounted for provider $PROVIDER (/__gateway/healthz -> 200)"
+
+# admin role: provisionSkillBox calls AuthorizeTenant on each member box's
+# tenant name ("agent-<skill>"), which only the tenant itself or an admin
+# passes. Wildcard scopes: a member's in-box token is the intersection of the
+# caller's scopes and the manifest's, and this caller must not be the thing
+# that narrows it.
+TOKEN="$("$BIN" token generate --username crew-e2e --roles admin --scopes '*' \
+  --expiry 2h --secret "$JWT_SECRET" --raw)"
+[ -n "$TOKEN" ] || fail "could not mint a caller token"
+
+read_out() { cat "$1" 2>/dev/null || true; }
+read_code() {
+  local c
+  c="$(read_out "$1")"
+  [ -n "$c" ] || c="000"
+  printf '%s' "$c"
+}
+
+# ========================================================================
+# Pre-provision the member boxes and verify the in-box loop EXISTS, before
+# committing any spend.
+#
+# Deploying the agent-runtime recipe under exactly the box name
+# provisionSkillBox derives ("agent-" + skill id) means the crew run below
+# takes that function's idempotent REUSE path: it skips deploy and just
+# re-mints, re-seeds and re-applies policy. So this is not a special path
+# through the daemon — it is the same path every second-and-later run of a
+# skill takes, and it costs no model tokens.
+# ========================================================================
+for m in $CREW_MEMBERS; do
+  log "pre-provisioning member box agent-$m (recipe agent-runtime, release $RELEASE) — the recipe's post_start installs Node, this is the slow part"
+  : >"$WORKDIR/deploy-$m.body"
+  deploy_code="$(curl -sS -o "$WORKDIR/deploy-$m.body" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:$HTTP_PORT/v1/recipes/agent-runtime/deploy" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg name "agent-$m" --arg rel "$RELEASE" '{name: $name, parameters: {release: $rel}}')" || true)"
+  if [ "$deploy_code" != "200" ]; then
+    echo "---- deploy response ----"; read_out "$WORKDIR/deploy-$m.body"; echo
+    fail "deploying agent-$m returned $deploy_code (want 200); the member box does not exist, so the crew run would fail on provisioning"
+  fi
+  sudo incus exec "agent-$m-container" -- test -x /usr/local/bin/agent-runtime \
+    || fail "agent-$m-container has no /usr/local/bin/agent-runtime after deploying release $RELEASE — install-agent-runtime.sh's assembly is best-effort and evidently skipped or failed. Without the in-box loop the crew's A2A hop cannot be served, and the failure would otherwise appear only AFTER the model spend. Check the box's post_start output: sudo incus exec agent-$m-container -- journalctl -b | tail"
+  sudo incus exec "agent-$m-container" -- test -x /usr/local/bin/agent-box \
+    || fail "agent-$m-container has no /usr/local/bin/agent-box — the agent's MCP tool surface is missing, so it could not edit a file even with a working model"
+  ok "member box agent-$m-container has agent-runtime and agent-box on PATH"
+
+  # Cost ceilings the daemon does not set for us. The daemon's serve-mode exec
+  # is `bash -lc`, a LOGIN shell, so /etc/profile.d is sourced before
+  # agent-runtime starts; CONTAINARIUM_AGENT_ENGINE / _MODE / AGENT_SEED_DIR
+  # are set as a command prefix by the daemon and correctly win over anything
+  # here, while _MODEL and _MAX_TURNS are not, which is exactly the seam this
+  # uses. Same spirit as agent-skill-lease-e2e.sh pushing a stub runtime: the
+  # harness configures the box it is measuring, through a documented seam.
+  profile_src="$WORKDIR/99-e2e-model-$m.sh"
+  {
+    echo "# installed by scripts/engineer-crew-e2e.sh — cost ceilings for this lane"
+    echo "export CONTAINARIUM_AGENT_MAX_TURNS=$AGENT_MAX_TURNS"
+    if [ -n "$AGENT_MODEL" ]; then echo "export CONTAINARIUM_AGENT_MODEL=$AGENT_MODEL"; fi
+  } >"$profile_src"
+  sudo incus file push --mode 0644 "$profile_src" "agent-$m-container/etc/profile.d/99-e2e-model.sh"
+  sudo incus exec "agent-$m-container" -- test -f /etc/profile.d/99-e2e-model.sh \
+    || fail "could not install the cost-ceiling profile into agent-$m-container"
+  ok "cost ceilings installed in agent-$m-container (max_turns=$AGENT_MAX_TURNS model=${AGENT_MODEL:-<engine default>})"
+done
+
+# ========================================================================
+# THE MEASURED RUN — the only model spend in this script.
+# ========================================================================
+RUN_ID="crew-e2e-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+RUN_SEED_DIR="$AGENT_SEED_ROOT/$RUN_ID"
+RUN_WORKSPACE_DIR="$AGENT_WORKSPACE_ROOT/$RUN_ID"
+
+run_crew() {
+  local out="$1" body
+  body="$(jq -nc --arg crew "$CREW_ID" --arg run_id "$RUN_ID" --arg input "$TASK_JSON" \
+    --arg src "$FIXTURE_GIT_SOURCE" --arg ref "$FIXTURE_GIT_SHA" \
+    '{crew_id: $crew, run_id: $run_id, input_json: $input, git_source: $src, git_ref: $ref}')"
+  : >"$out.body"
+  curl -sS -o "$out.body" -w '%{http_code}' --max-time "$RUN_TIMEOUT_S" \
+    -X POST "http://127.0.0.1:$HTTP_PORT/v1/crews/$CREW_ID/run" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "$body" >"$out.code" 2>"$out.err" || true
+}
+
+log "running $CREW_ID as $RUN_ID against $FIXTURE_GIT_SOURCE @ $FIXTURE_GIT_SHA (REAL model: provider $PROVIDER, model ${AGENT_MODEL:-<engine default>}) — RPC in the background so the run can be observed while it lasts"
+run_crew "$WORKDIR/run" &
+RUN_PID=$!
+
+# --- assertion 1: a member's own gateway token is ACCEPTED mid-run --------
+# Proves the real key is live and the gateway really is brokering — the
+# precondition for every assertion below. Read from the seed directory the
+# daemon wrote, exactly as scripts/agent-skill-lease-e2e.sh's assertion 1
+# does, so this is the same observation on the crew path.
+log "reading $RUN_SEED_DIR/gateway.env out of the first member box during the run"
+GW_TOKEN=""
+GW_TOKEN_VAR=""
+# These are gatewayProviderEnvs' `tokenVar` values, verbatim
+# (internal/server/agent_gateway.go) — the variable each engine actually reads
+# out of gateway.env. NOT the provider-key names the daemon reads from ITS
+# env, which is a different set and only coincides for anthropic; openai's
+# in-box token variable is CODEX_API_KEY, not OPENAI_API_KEY (#2256: the
+# Codex CLI's documented headless-auth variable, since a bare OPENAI_API_KEY
+# needs a `codex login` step this box never gets); gemini's is
+# CONTAINARIUM_GATEWAY_TOKEN, not GEMINI_API_KEY. Getting this wrong makes
+# the lane fail with "never saw X in gateway.env" on a run that was
+# perfectly healthy.
+case "$PROVIDER" in
+  anthropic) GW_TOKEN_VAR="ANTHROPIC_AUTH_TOKEN" ;;
+  openai)    GW_TOKEN_VAR="CODEX_API_KEY" ;;
+  gemini)    GW_TOKEN_VAR="CONTAINARIUM_GATEWAY_TOKEN" ;;
+  *)         fail "no gateway.env token variable known for provider '$PROVIDER' — add it from gatewayProviderEnvs in internal/server/agent_gateway.go" ;;
+esac
+FIRST_MEMBER="${CREW_MEMBERS%% *}"
+for _ in $(seq 1 600); do
+  gw_env="$(sudo incus exec "agent-$FIRST_MEMBER-container" -- cat "$RUN_SEED_DIR/gateway.env" 2>/dev/null || true)"
+  if [ -n "$gw_env" ]; then
+    GW_TOKEN="$(printf '%s\n' "$gw_env" | sed -n "s/^export $GW_TOKEN_VAR=//p" | head -1)"
+    [ -n "$GW_TOKEN" ] && break
+  fi
+  if ! kill -0 "$RUN_PID" 2>/dev/null; then
+    wait "$RUN_PID" || true
+    echo "---- run response (code $(read_code "$WORKDIR/run.code")) ----"; read_out "$WORKDIR/run.body"; echo
+    fail "the crew run finished before $RUN_SEED_DIR/gateway.env could be read from agent-$FIRST_MEMBER-container — read the response above; a fast failure here usually means provisioning, not the model"
+  fi
+  sleep 0.5
+done
+[ -n "$GW_TOKEN" ] || fail "never saw $GW_TOKEN_VAR in $RUN_SEED_DIR/gateway.env in agent-$FIRST_MEMBER-container during the run"
+ok "read $FIRST_MEMBER's gateway token from $RUN_SEED_DIR/gateway.env during the run (${#GW_TOKEN} bytes)"
+
+# The member's token, presented to the gateway, must be ACCEPTED and must
+# reach the provider. Unlike the lease lane — where ANY upstream answer proved
+# acceptance because no real key existed — here a provider auth failure means
+# the configured key is bad, and the whole lane is then measuring nothing. So
+# this distinguishes them.
+: >"$WORKDIR/during.body"
+during_code="$(curl -sS -o "$WORKDIR/during.body" -w '%{http_code}' --max-time 60 \
+  -X POST "http://127.0.0.1:$HTTP_PORT/v1/model/$PROVIDER/v1/messages" \
+  -H "Authorization: Bearer $GW_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"claude-3-5-haiku-latest","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' 2>/dev/null || true)"
+during_body="$(read_out "$WORKDIR/during.body")"
+case "$during_body" in
+  *"gateway token revoked"*)
+    fail "assertion 1: the gateway rejected the member's own token DURING the run as revoked" ;;
+  *"invalid gateway token"*|*"missing gateway token"*|*"token not valid for provider"*|*"unknown provider"*)
+    fail "assertion 1: the gateway refused the member's credential ($during_code: $during_body) — no member could reach a model, so nothing below would be about engineer-crew" ;;
+esac
+# Anthropic-shaped only for the anthropic provider; for the others this probe's
+# body is the wrong shape and a 4xx from the provider is expected and fine —
+# what matters is that it was the PROVIDER answering, not the gateway refusing.
+if [ "$PROVIDER" = anthropic ]; then
+  case "$during_code" in
+    401|403)
+      fail "assertion 1: the provider refused the gateway's real key ($during_code: $(printf '%s' "$during_body" | head -c 200 | tr '\n' ' ')) — \$$PROVIDER_KEY_ENV is not a working key, so this lane cannot measure anything" ;;
+  esac
+fi
+ok "assertion 1: a member's gateway token is ACCEPTED and reaches provider $PROVIDER (/v1/model/$PROVIDER answered $during_code)"
+
+# --- wait for the crew run -----------------------------------------------
+log "waiting for the crew run to return (up to ${RUN_TIMEOUT_S}s; two real model conversations)"
+wait "$RUN_PID" || true
+run_code="$(read_code "$WORKDIR/run.code")"
+run_body="$(read_out "$WORKDIR/run.body")"
+
+# --- assertion 2: COMPLETED with an artifact ------------------------------
+if [ "$run_code" != "200" ]; then
+  echo "---- run response ----"; printf '%s\n' "$run_body"
+  fail "RunCrew returned $run_code (want 200)"
+fi
+echoed_run_id="$(printf '%s' "$run_body" | jq -r '.run.id // empty')"
+[ "$echoed_run_id" = "$RUN_ID" ] \
+  || fail "assertion 2: CrewRun.id was '$echoed_run_id', want '$RUN_ID' — the run this script measures is not the run the daemon drove"
+run_state="$(printf '%s' "$run_body" | jq -r '.run.state // empty')"
+if [ "$run_state" != "CREW_RUN_STATE_COMPLETED" ]; then
+  echo "---- run error ----"; printf '%s' "$run_body" | jq -r '.run.error // "(none)"'
+  fail "assertion 2: CrewRun.state = '$run_state', want CREW_RUN_STATE_COMPLETED"
+fi
+ARTIFACT="$(printf '%s' "$run_body" | jq -r '.run.artifactJson // empty')"
+[ -n "$ARTIFACT" ] \
+  || fail "assertion 2: CrewRun.artifact_json is empty on a COMPLETED run — the reviewer hop returned nothing to open a PR from"
+run_commit="$(printf '%s' "$run_body" | jq -r '.run.gitCommit // empty')"
+ok "assertion 2: run $RUN_ID is CREW_RUN_STATE_COMPLETED with a $(printf '%s' "$ARTIFACT" | wc -c | tr -d ' ')-byte artifact (git_commit $run_commit)"
+
+# --- assertion 2b: the Proof Pack came from a box other than the coder's ---
+# (#2799.) The fixture declares no test commands and has no Makefile, so the
+# expected status is NO_COMMANDS; any status proves the commands were run in
+# the producer's box. An error means no pack was produced at all.
+pack_producer_box="$(printf '%s' "$run_body" | jq -r '.run.proofPack.producerBox // empty')"
+pack_coder_box="$(printf '%s' "$run_body" | jq -r '.run.proofPack.coderBox // empty')"
+pack_status="$(printf '%s' "$run_body" | jq -r '.run.proofPack.status // empty')"
+if [ "$pack_producer_box" != "agent-$PACK_PRODUCER-container" ] || [ "$pack_coder_box" != "agent-issue-implementer-container" ]; then
+  fail "assertion 2b: proof_pack producer_box='$pack_producer_box' coder_box='$pack_coder_box', want agent-$PACK_PRODUCER-container and agent-issue-implementer-container"
+fi
+case "$pack_status" in
+  PROOF_PACK_STATUS_PASSED|PROOF_PACK_STATUS_FAILED|PROOF_PACK_STATUS_NO_COMMANDS) ;;
+  *) fail "assertion 2b: no Proof Pack was produced (status '$pack_status'): $(printf '%s' "$run_body" | jq -r '.run.proofPack.error // "(no proof_pack on the run)"')" ;;
+esac
+ok "assertion 2b: Proof Pack $pack_status produced in $pack_producer_box, not the coder's $pack_coder_box"
+
+# --- sabotage hooks: applied to the harness's own view of the artifact ----
+# Deliberately AFTER the real run and BEFORE the assertions that read these
+# values, so each sabotage isolates exactly one assertion and every other one
+# stays green — which is what makes a red run attributable.
+case "$SABOTAGE" in
+  fixture-path-mismatch)
+    echo "SABOTAGE: replacing the independently-computed fixture file list with paths the fixture does not contain — assertion 4 must now go RED"
+    printf 'no/such/file.txt\nanother/missing/path.md\n' >"$FIXTURE_PATHS_FILE"
+    ;;
+  blank-pr-title)
+    echo "SABOTAGE: blanking pr_title in the artifact the assertions read — assertion 5 must now go RED"
+    ARTIFACT="$(printf '%s' "$ARTIFACT" | jq -c '.pr_title = ""')"
+    ;;
+esac
+
+# --- assertion 3: the artifact is well-formed and carries files ----------
+printf '%s' "$ARTIFACT" | jq -e . >/dev/null 2>&1 \
+  || fail "assertion 3: artifact_json does not parse as JSON. The model was asked for a bare JSON object and returned something else (a code fence, prose around it). Artifact: $(printf '%s' "$ARTIFACT" | head -c 400)"
+files_count="$(printf '%s' "$ARTIFACT" | jq '(.files // []) | length')"
+if [ "$files_count" -eq 0 ]; then
+  # Empty files + a non-empty summary is a LEGITIMATE engineer-crew outcome
+  # ("cannot be done as a small change") and a COMPLETED run — but it is not
+  # what THIS fixture task asks for, and AC2's claim is about a non-empty
+  # files array. So it is a red lane here, with the reason the model gave.
+  fail "assertion 3: the artifact's files array is empty. That is a legitimate crew outcome in general, but this fixture task asks for a one-line edit to an existing README.md, so it means the model declined a task it should have done. review_notes: $(printf '%s' "$ARTIFACT" | jq -r '.review_notes // "(none)"') / drafter_summary: $(printf '%s' "$ARTIFACT" | jq -r '.drafter_summary // "(none)"')"
+fi
+ok "assertion 3: artifact parses and carries $files_count changed file(s)"
+
+# --- assertion 4 (AC2, first half): files touch a real fixture path -------
+artifact_paths="$(printf '%s' "$ARTIFACT" | jq -r '.files[].path')"
+matched=0
+unknown=""
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  if grep -Fxq "$p" "$FIXTURE_PATHS_FILE"; then
+    echo "     files[].path $p -> EXISTS in the fixture at $FIXTURE_GIT_SHA"
+    matched=$((matched + 1))
+  else
+    echo "     files[].path $p -> NOT in the fixture (a file the agent created)"
+    unknown="$unknown $p"
+  fi
+done <<<"$artifact_paths"
+[ "$matched" -gt 0 ] \
+  || fail "assertion 4: no path in the artifact exists in the fixture at $FIXTURE_GIT_SHA. Every path the crew returned is new, so the change is not an edit to the repo it was given. Artifact paths:$(printf '%s' "$artifact_paths" | tr '\n' ' ') / fixture holds: $(tr '\n' ' ' <"$FIXTURE_PATHS_FILE")"
+ok "assertion 4: $matched of $files_count artifact path(s) exist in the fixture at $FIXTURE_GIT_SHA"
+if [ -n "$unknown" ]; then
+  # NOT a failure, and the distinction is deliberate. AC2's claim is that the
+  # files touch a real path, which is now proved. "The agent also added a file
+  # the task did not ask for" is a prompt-quality signal about
+  # issue-implementer, not a property of the crew mechanism — and making it a
+  # gate would hand a release-blocking lane a dependency on model determinism.
+  # Printed loudly so it is visible in the log and can be acted on separately.
+  echo "NOTE assertion 4: the agent also created file(s) the task did not ask for:$unknown"
+  echo "     Not a failure (AC2 asks whether files touch a real fixture path, which they do), but it is"
+  echo "     a signal about issue-implementer's prompt discipline worth a look if it recurs."
+fi
+
+# --- assertion 5 (AC2, second half): pr_title is non-empty ---------------
+pr_title="$(printf '%s' "$ARTIFACT" | jq -r '.pr_title // ""')"
+[ -n "$pr_title" ] \
+  || fail "assertion 5: pr_title is empty. The cloud control plane opens a PR from this field (Containarium-cloud PROpener), so an empty title is an unopenable PR. Artifact: $(printf '%s' "$ARTIFACT" | head -c 400)"
+ok "assertion 5: pr_title is non-empty: \"$pr_title\""
+# Reported, not gated: the prompt asks for <= 72 chars, and a title one
+# character over is not worth a red release-blocking lane.
+title_len="${#pr_title}"
+[ "$title_len" -le 72 ] || echo "NOTE assertion 5: pr_title is $title_len chars, over the prompt's 72-char guidance"
+pr_body="$(printf '%s' "$ARTIFACT" | jq -r '.pr_body // ""')"
+[ -n "$pr_body" ] || echo "NOTE assertion 5: pr_body is empty (the prompt asks for one; not gated by AC2)"
+
+# ========================================================================
+# assertion 6: CREDENTIAL HYGIENE — the half of AC2 that matters most here,
+# because this is the first lane in the repo that holds a real provider key.
+# ========================================================================
+# The model gateway's entire reason to exist is that a box never sees the real
+# provider key: it holds a scoped, per-run gateway token, and the gateway
+# swaps in the real key upstream (internal/modelgateway/providers.go inject +
+# stripGatewayAuth). This asserts that, against a key that is actually real —
+# which no other test in this repo can do.
+if printf '%s' "$ARTIFACT" | grep -qF "$PROVIDER_KEY"; then
+  fail "assertion 6: the REAL provider key appears verbatim in the crew artifact — an agent read it and echoed it into its output"
+fi
+if printf '%s' "$run_body" | grep -qF "$PROVIDER_KEY"; then
+  fail "assertion 6: the REAL provider key appears verbatim in the RunCrew response"
+fi
+if grep -qF "$PROVIDER_KEY" "$DAEMON_LOG"; then
+  fail "assertion 6: the REAL provider key appears in the daemon log"
+fi
+ok "assertion 6 (provider key): the real \$$PROVIDER_KEY_ENV appears in neither the artifact, the RPC response, nor the daemon log"
+
+for m in $CREW_MEMBERS; do
+  # grep -r over the whole per-run seed dir, not just gateway.env: the point is
+  # that the key is nowhere in what the box was handed, and naming only the
+  # file we expect it not to be in would miss it landing in input.json or a
+  # prompt.
+  #
+  # The pattern goes in over STDIN (`grep -Ff -`), not as an argv element, so
+  # the real key never appears in the host's process list. A script whose
+  # subject is credential hygiene should not itself be the leak. (The daemon
+  # start above cannot avoid `sudo env KEY=...` — same exposure as
+  # scripts/agent-skill-lease-e2e.sh's, on an ephemeral runner — but every
+  # check after it can, and does.)
+  if printf '%s' "$PROVIDER_KEY" | sudo incus exec "agent-$m-container" -- grep -rqFf - "$RUN_SEED_DIR" 2>/dev/null; then
+    fail "assertion 6: the REAL provider key is present inside agent-$m-container's seed directory $RUN_SEED_DIR — the box must only ever hold a scoped gateway token"
+  fi
+  # And the box really did hold a gateway token, so the check above is not
+  # vacuously passing on a box that had no credential at all.
+  sudo incus exec "agent-$m-container" -- grep -q "$GW_TOKEN_VAR" "$RUN_SEED_DIR/gateway.env" 2>/dev/null \
+    || echo "NOTE assertion 6: $RUN_SEED_DIR/gateway.env is already gone in agent-$m-container (see assertion 7) — the key-absence check above still holds"
+  ok "assertion 6 (box $m): the real provider key is absent from $RUN_SEED_DIR in agent-$m-container"
+done
+
+# --- assertion 7: seed dir AND workspace are both gone entirely, for every
+# crew member (#2100/#2101) -------------------------------------------------
+# RunCrew now ends every member's lease at each of its three terminal paths,
+# so a crew member's per-run seed directory and fetched workspace must not
+# outlive the run — the same contract RunAgentSkill's lease-end already has;
+# see scripts/agent-skill-lease-e2e.sh assertion 7 for the pattern this
+# follows.
+[ "$run_commit" = "$FIXTURE_GIT_SHA" ] \
+  || fail "assertion 7: CrewRun.git_commit = '$run_commit', want the pinned $FIXTURE_GIT_SHA — the members did not all check out the commit this lane pinned, so the artifact is about a tree this script never inspected"
+ok "assertion 7 (pinned fetch): every member fetched the pinned commit $FIXTURE_GIT_SHA"
+
+for m in $CREW_MEMBERS; do
+  if sudo incus exec "agent-$m-container" -- test -e "$RUN_SEED_DIR"; then
+    fail "assertion 7: $RUN_SEED_DIR still exists in agent-$m-container after the crew run returned"
+  fi
+  if sudo incus exec "agent-$m-container" -- test -e "$RUN_WORKSPACE_DIR"; then
+    fail "assertion 7: $RUN_WORKSPACE_DIR still exists in agent-$m-container after the crew run returned — a fetched checkout must not outlive its run"
+  fi
+  ok "assertion 7 (box $m): both $RUN_SEED_DIR and $RUN_WORKSPACE_DIR are gone entirely"
+done
+
+echo
+echo "PASS: $CREW_ID turned an issue-shaped task into a reviewed change against a real repo."
+echo "      run $RUN_ID COMPLETED with $files_count file(s), $matched of them existing in"
+echo "      $FIXTURE_GIT_SOURCE @ $FIXTURE_GIT_SHA; pr_title \"$pr_title\";"
+echo "      the real provider key stayed in the daemon's gateway and reached no box, artifact,"
+echo "      response or log."
+
+# ========================================================================
+# assertion 8: a supplied git_credential leaks nowhere on the crew path
+# either.
+#
+# The same property scripts/agent-skill-lease-e2e.sh assertion 8 proves for
+# RunAgentSkill, re-proved for RunCrew rather than assumed from it: both go
+# through provisionSkillBox, but "both call the same function" is an
+# implementation detail and this is a credential.
+#
+# Costs nothing: GitHub validates any Authorization header it is given and
+# rejects an invalid one outright, even for a public repo, so this run fails
+# its own fetch before any box runs a model. That failure is the realistic
+# case anyway — a bad credential for a private repo fails identically.
+# ========================================================================
+RUN_ID2="crew-e2e-cred-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+log "run $RUN_ID2 with a fake git_credential (expected to FAIL its fetch, before any model call)"
+: >"$WORKDIR/run2.body"
+run2_code="$(curl -sS -o "$WORKDIR/run2.body" -w '%{http_code}' --max-time 600 \
+  -X POST "http://127.0.0.1:$HTTP_PORT/v1/crews/$CREW_ID/run" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg crew "$CREW_ID" --arg run_id "$RUN_ID2" --arg input "$TASK_JSON" \
+      --arg src "$FIXTURE_GIT_SOURCE" --arg ref "$FIXTURE_GIT_SHA" --arg cred "$FIXTURE_GIT_CREDENTIAL" \
+      '{crew_id: $crew, run_id: $run_id, input_json: $input, git_source: $src, git_ref: $ref, git_credential: $cred}')" \
+  2>/dev/null || true)"
+run2_body="$(read_out "$WORKDIR/run2.body")"
+if [ "$run2_code" = "200" ]; then
+  fail "assertion 8: a crew run with a bogus git_credential against a public repo returned 200 — GitHub was expected to reject the bad Authorization header (verified against this exact fixture, see agent-skill-lease-e2e.sh assertion 8). If this now succeeds, this assertion needs to move to the success path instead — and note it just spent a second real crew run's worth of tokens."
+fi
+case "$run2_body" in
+  *"$FIXTURE_GIT_CREDENTIAL"*)
+    fail "assertion 8: the fake git_credential appears verbatim in the RPC error response ($run2_code) — a credential must never be echoed back to the caller" ;;
+esac
+if grep -qF "$FIXTURE_GIT_CREDENTIAL" "$DAEMON_LOG"; then
+  fail "assertion 8: the fake git_credential appears in the daemon log"
+fi
+for m in $CREW_MEMBERS; do
+  if sudo incus exec "agent-$m-container" -- grep -rqF "$FIXTURE_GIT_CREDENTIAL" "$AGENT_SEED_ROOT/$RUN_ID2" 2>/dev/null; then
+    fail "assertion 8: the fake git_credential is on disk inside agent-$m-container under $AGENT_SEED_ROOT/$RUN_ID2"
+  fi
+done
+ok "assertion 8: a fake git_credential leaked into neither the error response ($run2_code), the daemon log, nor any member box"
+
+echo
+echo "PASS (credential hygiene): a real provider key and a supplied git credential both"
+echo "      stayed out of every box, artifact, response and log on the crew path."
