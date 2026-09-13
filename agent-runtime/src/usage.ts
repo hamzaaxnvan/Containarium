@@ -11,3 +11,17 @@ export function sumUsage(first: unknown, second: unknown): unknown {
   if (isRecord(first) && isRecord(second)) {
     // defineProperty, not assignment: a "__proto__" key from parsed JSON is
     // data, and `out["__proto__"] = x` would set the prototype instead.
+    const out: Record<string, unknown> = {};
+    const put = (k: string, v: unknown): void => {
+      Object.defineProperty(out, k, { value: v, enumerable: true, writable: true, configurable: true });
+    };
+    for (const [k, v] of Object.entries(first)) put(k, v);
+    for (const [k, v] of Object.entries(second)) put(k, Object.hasOwn(first, k) ? sumUsage(first[k], v) : v);
+    return out;
+  }
+  return second;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
