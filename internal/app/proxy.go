@@ -532,3 +532,1072 @@ func (p *ProxyManager) patchTLSPolicies(url string, policies []CaddyTLSAutomatio
 	if err != nil {
 		return fmt.Errorf("failed to marshal policies: %w", err)
 	}
+
+	req, err := http.NewRequest("PATCH", url, bytes.NewReader(policyJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to update TLS policy: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned error updating TLS policy (status %d): %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// ProvisionTLS puts `domain` under Caddy's TLS automation by adding it as an
+// explicit subject in /config/apps/tls/automation/policies, bootstrapping the
+// TLS app first if this host has never had one.
+//
+// Note this is NOT on-demand issuance. Caddy's `on_demand` mode — where a cert
+// is minted lazily on first TLS handshake for an unknown SNI host, gated by an
+// `ask` endpoint — is never enabled anywhere in this codebase
+// (CaddyTLSAutomationPolicy.OnDemand is declared but never set; see #1586).
+// Every certificate this daemon obtains comes from an explicit subject written
+// here, or from the `*.<base-domain>` wildcard written by ProvisionWildcardTLS.
+//
+// The practical consequence, and the reason this distinction is worth a
+// comment: a hostname that never reaches this function never gets a
+// certificate, and Caddy reports that as a TLS handshake failure (alert 80,
+// "no peer certificate available") rather than an HTTP error. Reconciliation
+// for that state lives in EnsureTLSSubjects (#1584).
+func (p *ProxyManager) ProvisionTLS(domain string) error {
+	// Caddy's admin API returns 400 "invalid traversal path" when you
+	// PATCH/POST a sub-path whose parent doesn't exist yet. On a fresh
+	// Caddy that's never had a TLS app configured, /config/apps/tls is
+	// `null`, so /config/apps/tls/automation/policies has no parent.
+	// Bootstrap the app first if it's missing.
+	if err := p.ensureTLSApp(); err != nil {
+		return fmt.Errorf("failed to bootstrap TLS app: %w", err)
+	}
+
+	// First, check if there's an existing automation policy we can add to
+	// Get current TLS config
+	url := fmt.Sprintf("%s/config/apps/tls/automation/policies", p.caddyAdminURL)
+	resp, err := p.httpClient.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to get TLS policies: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Anything other than 200 must abort. Treating a failed read as "this host
+	// has no policies" falls through to the create branch below, and POST to a
+	// Caddy admin API array path APPENDS — so a transient failure would graft a
+	// duplicate policy alongside the real ones rather than appending a subject
+	// to the existing one. Caddy matches the first policy whose subjects match,
+	// so a duplicate carrying different issuers can shadow the intended one
+	// (#1590).
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned %d reading TLS policies: %s",
+			resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read TLS policies response: %w", err)
+	}
+	var policies []CaddyTLSAutomationPolicy
+	// A TLS app that exists with no policies serializes as `null`, which
+	// unmarshals to a nil slice — not an error.
+	if err := json.Unmarshal(body, &policies); err != nil {
+		return fmt.Errorf("failed to unmarshal TLS policies: %w", err)
+	}
+
+	// Check if domain is already in a policy
+	for i := range policies {
+		for _, subject := range policies[i].Subjects {
+			if subject == domain {
+				// Present — but presence is not enough (#1066). A policy that
+				// predates DNS-01 being configured still carries HTTP-01 /
+				// TLS-ALPN-01 issuers, and those categorically cannot solve a
+				// wildcard subject, so Caddy never even attempts the
+				// certificate: the subject just sits there with no cert and
+				// no error.
+				//
+				// Repairing here rather than only on append is what reaches a
+				// host that ALREADY hit the bug. Such a host has the subject
+				// in the array from a previous run, so an append-only fix
+				// would return early every time and never heal it.
+				dnsRepaired := p.ensureDNSIssuers(&policies[i])
+				// Same reasoning one field over (#1616): a policy written
+				// before an ACME email was configured carries issuers with no
+				// contact, so ZeroSSL can never register and neither CA can
+				// mail an expiry warning. An append-only fix would return
+				// early here forever and never reach a host already in that
+				// state, which is every host that has provisioned TLS.
+				emailRepaired := p.ensureIssuerEmail(&policies[i])
+				if dnsRepaired || emailRepaired {
+					if dnsRepaired {
+						log.Printf("[ProxyManager] policy for %s had no DNS-01 issuers; adding them so the "+
+							"wildcard subject can actually be issued (#1066)", domain)
+					}
+					if emailRepaired {
+						log.Printf("[ProxyManager] policy for %s had issuers with no ACME contact address; "+
+							"setting it so ZeroSSL can register and expiry warnings are delivered (#1616)", domain)
+					}
+					return p.patchTLSPolicies(url, policies)
+				}
+				return nil
+			}
+		}
+	}
+
+	// Add domain to a new or existing policy
+	// If there are existing policies, add to the first one that has issuers configured
+	if len(policies) > 0 {
+		// Add domain to the first policy's subjects
+		policies[0].Subjects = append(policies[0].Subjects, domain)
+
+		// The policy we are appending to may predate DNS-01 being configured,
+		// in which case its issuers cannot satisfy a wildcard subject (#1066),
+		// or predate the ACME email being configured, leaving a ZeroSSL issuer
+		// that can never register (#1616). The create-new-policy branch below
+		// gets both right via NewTLSPolicyWithDNS; this branch has to do the
+		// same explicitly.
+		p.ensureDNSIssuers(&policies[0])
+		p.ensureIssuerEmail(&policies[0])
+
+		return p.patchTLSPolicies(url, policies)
+	}
+
+	// No existing policies, create a new one with ACME issuers (DNS-01 when
+	// configured, otherwise Caddy's default HTTP-01 + TLS-ALPN-01).
+	newPolicy := NewTLSPolicyWithDNS([]string{domain}, p.dnsChallenge)
+
+	policyJSON, err := json.Marshal([]CaddyTLSAutomationPolicy{newPolicy})
+	if err != nil {
+		return fmt.Errorf("failed to marshal new policy: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(policyJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to create TLS policy: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned error creating TLS policy (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// subjectCovers reports whether TLS automation subject `subject` already
+// obtains a certificate valid for `domain`.
+//
+// Either the subject is the host itself, or it's a wildcard one label above
+// it. The one-label rule is the actual X.509/ACME semantic: `*.example.com`
+// covers `app.example.com` but NOT `a.b.example.com`. Getting this wrong in
+// either direction has a real cost — too permissive leaves a deeper host with
+// no certificate and no signal (#1584), too strict adds a redundant per-host
+// subject that burns Let's Encrypt rate-limit budget the wildcard exists to
+// conserve (#378).
+func subjectCovers(subject, domain string) bool {
+	if subject == domain {
+		return true
+	}
+	rest, ok := strings.CutPrefix(subject, "*.")
+	if !ok {
+		return false
+	}
+	// domain must be exactly one label deeper than the wildcard's base.
+	host, found := strings.CutSuffix(domain, "."+rest)
+	return found && host != "" && !strings.Contains(host, ".")
+}
+
+// EnsureTLSSubjects reconciles Caddy's TLS automation subjects against the set
+// of hostnames that should have certificates, adding any that are missing.
+//
+// This is the repair path for #1584. TLS subjects were previously written
+// exactly once, by ProvisionTLS at route-add time. If that write didn't land —
+// ProvisionTLS failed and the error was swallowed (#1585), Caddy reverted to
+// its stub config (#400), or the route reached Caddy some other way — nothing
+// ever put the subject back. RouteSyncJob couldn't help: it re-provisions only
+// when a route is MISSING from Caddy, and needsUpdate compares upstream IP,
+// port and protocol, never TLS subjects. "Route present, subject absent" was
+// therefore indistinguishable from "in sync", and the host served on :80 while
+// :443 returned `tls: internal error` — alert 80, no peer certificate — with
+// no error anywhere and no path to recovery short of manual admin-API surgery.
+//
+// Called on every sync tick, so the no-change case must be cheap and silent:
+// one GET, no write. Missing subjects are batched into a single write rather
+// than one call per domain, because rewriting the policy array repeatedly
+// churns certificate management for every subject on the host.
+//
+// Only adds. Removal stays with RemoveTLSSubject on the delete cascade, so a
+// transiently-empty route list can never strip live subjects.
+func (p *ProxyManager) EnsureTLSSubjects(domains []string) error {
+	if len(domains) == 0 {
+		return nil
+	}
+
+	if err := p.ensureTLSApp(); err != nil {
+		return fmt.Errorf("bootstrap TLS app: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/config/apps/tls/automation/policies", p.caddyAdminURL)
+	resp, err := p.httpClient.Get(url)
+	if err != nil {
+		return fmt.Errorf("get TLS policies: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Anything other than 200 must abort. Treating a failed read as "no
+	// policies" would fall through to the create branch below, and POST to a
+	// Caddy array path APPENDS — so a transient admin-API error would graft a
+	// duplicate policy alongside the real ones. This runs on every sync tick,
+	// so a flapping admin API would accumulate them.
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned %d reading TLS policies: %s",
+			resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read TLS policies: %w", err)
+	}
+	var policies []CaddyTLSAutomationPolicy
+	// A TLS app that exists but has no policies serializes as `null`, which
+	// unmarshals to a nil slice — not an error.
+	if err := json.Unmarshal(body, &policies); err != nil {
+		return fmt.Errorf("unmarshal TLS policies: %w", err)
+	}
+
+	// Collect what's missing, deduplicating the input: two routes can share a
+	// hostname, and the same host must not land in the subjects array twice.
+	// Also note which policies are doing the covering — see below.
+	var missing []string
+	seen := make(map[string]bool, len(domains))
+	covering := make(map[int]bool)
+	for _, d := range domains {
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+
+		covered := false
+		for i, pol := range policies {
+			for _, subject := range pol.Subjects {
+				if subjectCovers(subject, d) {
+					covered = true
+					covering[i] = true
+					break
+				}
+			}
+			if covered {
+				break
+			}
+		}
+		if !covered {
+			missing = append(missing, d)
+		}
+	}
+
+	// A covering subject is only worth anything if its policy can actually be
+	// issued. A wildcard covered by a policy whose issuers predate DNS-01 is
+	// the #1066 trap one level up: `*.example.com` "covers" app.example.com on
+	// paper, but HTTP-01 / TLS-ALPN-01 categorically cannot solve a wildcard,
+	// so no certificate is ever obtained and the host shows exactly the #1584
+	// symptom. Skipping the repair because coverage looked satisfied is how
+	// this reconciler would recreate the bug it exists to fix.
+	//
+	// A no-op when DNS-01 isn't configured or the issuers already carry it, so
+	// the every-tick no-change path still performs no write.
+	repaired := false
+	for i := range policies {
+		if !covering[i] {
+			continue
+		}
+		if p.ensureDNSIssuers(&policies[i]) {
+			repaired = true
+		}
+		if p.ensureIssuerEmail(&policies[i]) {
+			repaired = true
+		}
+	}
+
+	if len(missing) == 0 {
+		if repaired {
+			log.Printf("[ProxyManager] repaired issuers on TLS policies covering %d host(s): DNS-01 "+
+				"challenge config and/or the ACME contact address were missing, either of which "+
+				"leaves a subject that is never successfully issued (#1066, #1616)", len(seen))
+			return p.patchTLSPolicies(url, policies)
+		}
+		return nil
+	}
+
+	log.Printf("[ProxyManager] reconciling %d TLS subject(s) missing from Caddy's automation "+
+		"policies: %v — these hosts would otherwise serve on :80 with no certificate (#1584)",
+		len(missing), missing)
+	warnUncoveredDNSZones(missing)
+
+	if len(policies) > 0 {
+		policies[0].Subjects = append(policies[0].Subjects, missing...)
+		// The policy we're appending to may predate DNS-01 being configured,
+		// in which case its issuers cannot satisfy the subject we just added
+		// and Caddy would never attempt it (#1066) — or predate the ACME email
+		// being configured, leaving an issuer that can never register (#1616).
+		p.ensureDNSIssuers(&policies[0])
+		p.ensureIssuerEmail(&policies[0])
+		return p.patchTLSPolicies(url, policies)
+	}
+
+	// No policies at all — create one carrying every missing subject.
+	newPolicy := NewTLSPolicyWithDNS(missing, p.dnsChallenge)
+	policyJSON, err := json.Marshal([]CaddyTLSAutomationPolicy{newPolicy})
+	if err != nil {
+		return fmt.Errorf("marshal new TLS policy: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(policyJSON))
+	if err != nil {
+		return fmt.Errorf("create TLS policy request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	postResp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("create TLS policy: %w", err)
+	}
+	defer postResp.Body.Close()
+
+	if postResp.StatusCode != http.StatusOK && postResp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(postResp.Body)
+		return fmt.Errorf("caddy returned %d creating TLS policy: %s", postResp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// ProvisionWildcardTLS adds a single "*.<baseDomain>" wildcard subject to
+// Caddy's TLS automation, issued via DNS-01. This is the per-cluster
+// alternative to per-subdomain on-demand issuance: one cert covers every
+// subdomain, eliminating the Let's Encrypt per-domain rate-limit exposure and
+// the HTTP-01 redirect failure mode (issue #378).
+//
+// Requires a DNS-01 challenge to be configured — HTTP-01 / TLS-ALPN-01 cannot
+// issue wildcard certificates, so this returns an error rather than silently
+// falling back to a path that can't work.
+func (p *ProxyManager) ProvisionWildcardTLS() error {
+	if p.dnsChallenge == nil {
+		return fmt.Errorf("wildcard TLS requires an ACME DNS-01 provider (set CONTAINARIUM_ACME_DNS_PROVIDER); HTTP-01 / TLS-ALPN-01 cannot issue wildcard certificates")
+	}
+	if p.baseDomain == "" {
+		return fmt.Errorf("wildcard TLS requires a base domain")
+	}
+	return p.ProvisionTLS("*." + p.baseDomain)
+}
+
+// RemoveRoute removes a route from Caddy by subdomain or full domain
+func (p *ProxyManager) RemoveRoute(domain string) error {
+	// Extract route ID from domain (same logic as AddRoute)
+	routeID := domain
+	if p.baseDomain != "" {
+		// If domain contains the base domain, extract just the subdomain part
+		if strings.HasSuffix(domain, "."+p.baseDomain) {
+			routeID = strings.TrimSuffix(domain, "."+p.baseDomain)
+		} else if strings.HasSuffix(domain, p.baseDomain) {
+			routeID = strings.TrimSuffix(domain, p.baseDomain)
+		}
+	}
+
+	// First try to delete by ID (for routes created via our API)
+	url := fmt.Sprintf("%s/id/%s", p.caddyAdminURL, routeID)
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to remove route: %w", err)
+	}
+	resp.Body.Close()
+
+	// If deleted successfully by ID, we're done
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	// If route not found by ID, try to find and delete by index
+	// This handles routes created via Caddyfile or without @id
+	return p.removeRouteByDomain(domain)
+}
+
+// removeRouteByDomain finds a route by its domain and deletes it by index
+func (p *ProxyManager) removeRouteByDomain(domain string) error {
+	// Get all routes
+	routesURL := fmt.Sprintf("%s/config/apps/http/servers/%s/routes", p.caddyAdminURL, p.serverName)
+	req, err := http.NewRequest("GET", routesURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to list routes: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to list routes (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// Parse routes to find the index of the one matching our domain
+	var routes []caddyRouteRaw
+	if err := json.NewDecoder(resp.Body).Decode(&routes); err != nil {
+		return fmt.Errorf("failed to decode routes: %w", err)
+	}
+
+	// Find the route with matching host
+	for i, route := range routes {
+		if len(route.Match) > 0 {
+			for _, host := range route.Match[0].Host {
+				if host == domain {
+					// Found the route, delete by index
+					deleteURL := fmt.Sprintf("%s/config/apps/http/servers/%s/routes/%d", p.caddyAdminURL, p.serverName, i)
+					delReq, err := http.NewRequest("DELETE", deleteURL, nil)
+					if err != nil {
+						return fmt.Errorf("failed to create delete request: %w", err)
+					}
+
+					delResp, err := p.httpClient.Do(delReq)
+					if err != nil {
+						return fmt.Errorf("failed to delete route: %w", err)
+					}
+					delResp.Body.Close()
+
+					if delResp.StatusCode != http.StatusOK {
+						return fmt.Errorf("failed to delete route (status %d)", delResp.StatusCode)
+					}
+					return nil
+				}
+			}
+		}
+	}
+
+	// Route not found - this is acceptable, might already be deleted
+	return nil
+}
+
+// ListRoutes returns all configured routes
+func (p *ProxyManager) ListRoutes() ([]Route, error) {
+	url := fmt.Sprintf("%s/config/apps/http/servers/%s/routes", p.caddyAdminURL, p.serverName)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list routes: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		// Handle case when no routes are configured (path doesn't exist in Caddy config)
+		// Caddy returns 400 with "invalid traversal path" when the http app or server doesn't exist
+		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound {
+			return []Route{}, nil
+		}
+		return nil, fmt.Errorf("caddy returned error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var caddyRoutes []caddyRouteRaw
+	if err := json.NewDecoder(resp.Body).Decode(&caddyRoutes); err != nil {
+		return nil, fmt.Errorf("failed to decode routes: %w", err)
+	}
+
+	var routes []Route
+	for _, cr := range caddyRoutes {
+		if len(cr.Match) > 0 && len(cr.Match[0].Host) > 0 {
+			fullDomain := cr.Match[0].Host[0]
+			route := Route{
+				Subdomain:  cr.ID,
+				FullDomain: fullDomain,
+				Protocol:   RouteProtocolHTTP, // Default to HTTP
+			}
+
+			// Extract upstream info from handler if available
+			if len(cr.Handle) > 0 {
+				var handler CaddyReverseProxyHandler
+				if err := json.Unmarshal(cr.Handle[0], &handler); err == nil {
+					if len(handler.Upstreams) > 0 {
+						dial := handler.Upstreams[0].Dial
+						// Parse ip:port from Dial field
+						if lastColon := strings.LastIndex(dial, ":"); lastColon != -1 {
+							route.UpstreamIP = dial[:lastColon]
+							if port, err := strconv.Atoi(dial[lastColon+1:]); err == nil {
+								route.UpstreamPort = port
+							}
+						} else {
+							route.UpstreamIP = dial
+						}
+					}
+
+					// Detect gRPC routes by checking for HTTP/2 transport
+					if handler.Transport != nil && handler.Transport.Protocol == "http" {
+						for _, v := range handler.Transport.Versions {
+							if v == "h2c" || v == "2" {
+								route.Protocol = RouteProtocolGRPC
+								break
+							}
+						}
+					}
+				}
+			}
+
+			routes = append(routes, route)
+		}
+	}
+
+	return routes, nil
+}
+
+// UpdateRoute updates an existing HTTP route
+func (p *ProxyManager) UpdateRoute(subdomain, containerIP string, port int) error {
+	return p.UpdateRouteWithProtocol(subdomain, containerIP, port, RouteProtocolHTTP)
+}
+
+// UpdateGRPCRoute updates an existing gRPC route
+func (p *ProxyManager) UpdateGRPCRoute(subdomain, containerIP string, port int) error {
+	return p.UpdateRouteWithProtocol(subdomain, containerIP, port, RouteProtocolGRPC)
+}
+
+// UpdateRouteWithProtocol updates an existing route with the specified protocol
+func (p *ProxyManager) UpdateRouteWithProtocol(subdomain, containerIP string, port int, protocol RouteProtocol) error {
+	// Remove existing route first (idempotent; route may not exist yet)
+	if err := p.RemoveRoute(subdomain); err != nil {
+		log.Printf("[ProxyManager] RemoveRoute(%s) before update: %v", subdomain, err)
+	}
+
+	// Add new route with protocol
+	return p.addRouteWithProtocol(subdomain, containerIP, port, protocol)
+}
+
+// EnsureServerConfig ensures the Caddy server has basic configuration
+// This should be called once during initialization
+func (p *ProxyManager) EnsureServerConfig() error {
+	// First, ensure the HTTP app exists
+	if err := p.ensureHTTPApp(); err != nil {
+		return fmt.Errorf("failed to ensure HTTP app: %w", err)
+	}
+
+	// Ensure the TLS app exists (required for ProvisionTLS to work)
+	if err := p.ensureTLSApp(); err != nil {
+		// Non-fatal: routes will work over HTTP, but TLS provisioning may fail
+		fmt.Printf("Warning: Failed to ensure TLS app: %v\n", err)
+	}
+
+	// Check if server config exists
+	url := fmt.Sprintf("%s/config/apps/http/servers/%s", p.caddyAdminURL, p.serverName)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		// Server might not be configured, create it
+		return p.createServerConfig()
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadRequest {
+		return p.createServerConfig()
+	}
+
+	// The server config already exists — createServerConfig() (a full PUT of
+	// {Listen, Routes: []}) would clobber every route Caddy already holds, so
+	// it must never be called here. Instead reconcile just the listen array:
+	// a host that flips on CONTAINARIUM_BYOC_INGRESS_ADDR (#733 slice 3) after
+	// its edge was already provisioned needs the new loopback listener added
+	// to a live config, and this was the only path that could add it.
+	//
+	// Decode only `{listen}` from this response — CaddyServerConfig.Routes is
+	// []CaddyRouteTyped, whose Handle field is the []CaddyHandler interface
+	// slice encoding/json cannot unmarshal into (the ensureHTTPApp bug this
+	// file already carries a regression test for).
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read existing server config: %w", err)
+	}
+	var existing struct {
+		Listen []string `json:"listen"`
+	}
+	if err := json.Unmarshal(body, &existing); err != nil {
+		return fmt.Errorf("failed to parse existing server config: %w", err)
+	}
+
+	have := make(map[string]bool, len(existing.Listen))
+	for _, a := range existing.Listen {
+		have[a] = true
+	}
+	for _, a := range p.listenAddrs() {
+		if !have[a] {
+			// Only now — an actual gap — pay for the heavier
+			// getFullConfig/loadConfig round trip.
+			return p.addMissingListenAddrs()
+		}
+	}
+	return nil
+}
+
+// addMissingListenAddrs adds any of listenAddrs() not already present in the
+// live "listen" array. Goes through getFullConfig/loadConfig — the same
+// GET-mutate-POST/load round trip EnableProxyProtocol uses — rather than a
+// scoped PUT to .../listen: Caddy's admin API rejects a PUT at a path that
+// already holds a value (409 "key already exists"), so a direct PUT only
+// ever works the first time a listen array is set. loadConfig's POST /load
+// is an atomic whole-config swap, so this is race-free and — since only the
+// `listen` key on this one server object is touched — every existing route
+// survives untouched. Working with the raw map[string]interface{} tree also
+// sidesteps the CaddyRouteTyped interface-decode landmine noted above.
+func (p *ProxyManager) addMissingListenAddrs() error {
+	config, err := p.getFullConfig()
+	if err != nil {
+		return fmt.Errorf("get full config: %w", err)
+	}
+	apps := getMapField(config, "apps")
+	httpApp := getMapField(apps, "http")
+	servers := getMapField(httpApp, "servers")
+	srv := getMapField(servers, p.serverName)
+	if srv == nil {
+		return fmt.Errorf("HTTP server %q missing from config", p.serverName)
+	}
+
+	currentRaw, _ := srv["listen"].([]interface{})
+	current := make([]string, 0, len(currentRaw))
+	have := make(map[string]bool, len(currentRaw))
+	for _, a := range currentRaw {
+		s, _ := a.(string)
+		current = append(current, s)
+		have[s] = true
+	}
+
+	merged := current
+	for _, a := range p.listenAddrs() {
+		if !have[a] {
+			merged = append(merged, a)
+			have[a] = true
+		}
+	}
+	srv["listen"] = toAnySlice(merged)
+
+	if err := p.loadConfig(config); err != nil {
+		return fmt.Errorf("load config with updated listen addrs: %w", err)
+	}
+	log.Printf("Caddy listen addrs updated: %v", merged)
+	return nil
+}
+
+// ensureTLSApp ensures the TLS app with automation exists in Caddy config.
+// Without this, ProvisionTLS calls will fail with "invalid traversal path".
+func (p *ProxyManager) ensureTLSApp() error {
+	url := fmt.Sprintf("%s/config/apps/tls", p.caddyAdminURL)
+	resp, err := p.httpClient.Get(url)
+	if err != nil {
+		return p.createTLSApp()
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadRequest {
+		return p.createTLSApp()
+	}
+
+	// Check if it's null or empty. Caddy returns "null\n" (with trailing
+	// newline) for a missing config path, so trim whitespace before
+	// comparing.
+	body, _ := io.ReadAll(resp.Body)
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" || trimmed == "null" {
+		return p.createTLSApp()
+	}
+
+	return nil
+}
+
+// createTLSApp creates the base TLS app with automation policies using ACME issuers
+func (p *ProxyManager) createTLSApp() error {
+	// Typed config (was a map[string]interface{}). When no DNS challenge is
+	// configured the issuers carry no `challenges` field, so the emitted JSON
+	// is identical to the previous default. With DNS-01 configured, both the
+	// ACME and ZeroSSL issuers gain the provider's `challenges.dns` block.
+	tlsApp := CaddyTLSApp{
+		Automation: &CaddyTLSAutomation{
+			Policies: []CaddyTLSAutomationPolicy{
+				{Issuers: issuersFor(p.dnsChallenge)},
+			},
+		},
+	}
+
+	configJSON, err := json.Marshal(tlsApp)
+	if err != nil {
+		return fmt.Errorf("failed to marshal TLS config: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/config/apps/tls", p.caddyAdminURL)
+	req, err := http.NewRequest("PUT", url, bytes.NewReader(configJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to create TLS app: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned error creating TLS app (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// ensureHTTPApp ensures the HTTP app and server exist in Caddy config.
+//
+// We probe with a loose schema (map[string]json.RawMessage on servers) rather
+// than the typed CaddyHTTPApp. The full type transitively contains
+// []CaddyHandler — an interface slice — which encoding/json cannot decode
+// into, so a strict decode would always fail on any non-empty config and
+// fall through to createHTTPApp's PUT, which 409s because the http app
+// already exists. The result before this fix was that every daemon startup
+// logged "key already exists: http" and silently lost any subsequent route
+// updates the daemon tried to apply (e.g. registering a newly-connected
+// tunnel-promoted pool primary).
+func (p *ProxyManager) ensureHTTPApp() error {
+	url := fmt.Sprintf("%s/config/apps/http", p.caddyAdminURL)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return p.createHTTPApp()
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadRequest {
+		return p.createHTTPApp()
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" || trimmed == "null" {
+		return p.createHTTPApp()
+	}
+
+	var probe struct {
+		Servers map[string]json.RawMessage `json:"servers,omitempty"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return p.createHTTPApp()
+	}
+
+	if probe.Servers == nil {
+		return p.createHTTPApp()
+	}
+
+	if _, exists := probe.Servers[p.serverName]; !exists {
+		return p.createServerConfig()
+	}
+
+	return nil
+}
+
+// createHTTPApp creates the HTTP app with the server already configured
+func (p *ProxyManager) createHTTPApp() error {
+	// Create HTTP app with the server configured (avoid separate creation)
+	httpApp := CaddyHTTPApp{
+		Servers: map[string]*CaddyServerConfig{
+			p.serverName: {
+				Listen: p.listenAddrs(),
+				Routes: []CaddyRouteTyped{},
+			},
+		},
+	}
+
+	configJSON, err := json.Marshal(httpApp)
+	if err != nil {
+		return fmt.Errorf("failed to marshal HTTP app config: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/config/apps/http", p.caddyAdminURL)
+	req, err := http.NewRequest("PUT", url, bytes.NewReader(configJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP app: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned error creating HTTP app (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// EnableProxyProtocol installs a [proxy_protocol, tls] listener_wrappers chain
+// and sets trusted_proxies on the Caddy server, so connections arriving from
+// trustedCIDRs (typically the sentinel's IP, or 127.0.0.0/8 in tunnel mode)
+// are PROXY-decoded and the real client IP propagates as X-Forwarded-For to
+// upstream containers.
+//
+// trustedCIDRs MUST NOT be empty or wildcard — an unrestricted allow list lets
+// any direct VPC client spoof its source IP via a forged PROXY header.
+//
+// Implementation: GETs the full Caddy config, sets the two new fields on the
+// HTTP server map in place (preserving listen/routes/automatic_https/etc.),
+// then atomically POSTs /load. A naive PATCH on the server path REPLACES the
+// resource at that path — that wipes everything else on the server, which is
+// exactly the regression we're avoiding here.
+func (p *ProxyManager) EnableProxyProtocol(trustedCIDRs []string) error {
+	if len(trustedCIDRs) == 0 {
+		return fmt.Errorf("EnableProxyProtocol: trustedCIDRs must not be empty (refusing to accept PROXY headers from any source)")
+	}
+	for _, c := range trustedCIDRs {
+		if c == "0.0.0.0/0" || c == "::/0" {
+			return fmt.Errorf("EnableProxyProtocol: refusing wildcard CIDR %q — pin to the sentinel IP or 127.0.0.0/8", c)
+		}
+	}
+
+	config, err := p.getFullConfig()
+	if err != nil {
+		return fmt.Errorf("get full config: %w", err)
+	}
+	apps := getMapField(config, "apps")
+	httpApp := getMapField(apps, "http")
+	servers := getMapField(httpApp, "servers")
+	srv := getMapField(servers, p.serverName)
+	if srv == nil {
+		return fmt.Errorf("HTTP server %q missing from config", p.serverName)
+	}
+
+	// Set only the two fields we care about — leave listen/routes/etc intact.
+	// proxy_protocol must come before tls in the wrapper chain so the PROXY
+	// header is consumed before TLS parsing.
+	srv["listener_wrappers"] = []interface{}{
+		map[string]interface{}{
+			"wrapper": "proxy_protocol",
+			"timeout": "5s",
+			"allow":   toAnySlice(trustedCIDRs),
+		},
+		map[string]interface{}{"wrapper": "tls"},
+	}
+	// trusted_proxies is the union of the PROXY-sender set and any CDN ranges
+	// from ConfigureClientIP, and client_ip_headers rides along, so the two
+	// calls are order-independent and a self-heal re-emits both (#1829).
+	applyClientIPTrust(srv, p.clientIPHeaders, p.trustedProxyCIDRs, trustedCIDRs)
+
+	if err := p.loadConfig(config); err != nil {
+		return fmt.Errorf("load config with proxy_protocol: %w", err)
+	}
+	// Remember the trusted set so EnsureBaseConfig can re-apply the wrappers
+	// after a stub-Caddyfile revert (#400).
+	p.proxyProtocolTrusted = append(p.proxyProtocolTrusted[:0], trustedCIDRs...)
+	return nil
+}
+
+// EnsureBaseConfig re-asserts the base Caddy edge config — the http app, the
+// `srv0` server, the tls app, and (when configured) the PROXY listener
+// wrappers — rebuilding them when the bundled Caddy has reverted to its stub
+// Caddyfile (`{ admin :2019 }`).
+//
+// The bundled `*-core-caddy` boots from that stub and is configured entirely
+// over the admin API; any caddy reload/restart/crash drops the running config
+// back to the stub, which wipes the http app. The periodic route sync then
+// loops on `400 invalid traversal path` and :443 goes permanently dark with no
+// self-heal (issue #400). Calling this at the top of every sync makes the edge
+// reconcile itself: once the base is rebuilt, the normal route/L4 diff
+// repopulates HTTP routes (with TLS subjects, via AddRoute→ProvisionTLS) and
+// re-activates layer4.
+//
+// It is cheap when the config is intact (a single GET) and only issues writes
+// on a detected revert. Returns whether it rebuilt.
+func (p *ProxyManager) EnsureBaseConfig() (bool, error) {
+	intact, err := p.baseConfigIntact()
+	if err != nil {
+		return false, err
+	}
+	if intact {
+		return false, nil
+	}
+	if err := p.EnsureServerConfig(); err != nil {
+		return false, fmt.Errorf("rebuild base server config: %w", err)
+	}
+	if len(p.proxyProtocolTrusted) > 0 {
+		if err := p.EnableProxyProtocol(p.proxyProtocolTrusted); err != nil {
+			return true, fmt.Errorf("re-apply PROXY protocol after rebuild: %w", err)
+		}
+	}
+	// Re-apply CDN client-IP trust too (#1829). Idempotent when PROXY protocol
+	// already re-emitted it above; required when PROXY is not configured.
+	if len(p.clientIPHeaders) > 0 || len(p.trustedProxyCIDRs) > 0 {
+		if err := p.ConfigureClientIP(p.clientIPHeaders, p.trustedProxyCIDRs); err != nil {
+			return true, fmt.Errorf("re-apply client-IP trust after rebuild: %w", err)
+		}
+	}
+	return true, nil
+}
+
+// baseConfigIntact reports whether the Caddy http server `srv0` is present and
+// (when PROXY protocol is configured) still carries its listener wrappers. A
+// false return means Caddy has reverted to the stub Caddyfile and the base
+// config must be rebuilt. See EnsureBaseConfig (#400).
+func (p *ProxyManager) baseConfigIntact() (bool, error) {
+	url := fmt.Sprintf("%s/config/apps/http/servers/%s", p.caddyAdminURL, p.serverName)
+	resp, err := p.httpClient.Get(url)
+	if err != nil {
+		return false, fmt.Errorf("probe http server config: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadRequest {
+		return false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("probe http server config: status %d: %s", resp.StatusCode, string(body))
+	}
+	body, _ := io.ReadAll(resp.Body)
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" || trimmed == "null" {
+		return false, nil
+	}
+	// When PROXY protocol is enabled the server must keep its listener wrappers;
+	// a rebuilt-but-bare server (no wrappers) means the wrappers were wiped too.
+	if len(p.proxyProtocolTrusted) > 0 {
+		var srv map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &srv); err != nil {
+			// Malformed — treat as reverted so we rebuild from a known-good base.
+			return false, nil
+		}
+		if _, ok := srv["listener_wrappers"]; !ok {
+			return false, nil
+		}
+	}
+	// Likewise, configured client-IP headers must still be present; a server
+	// that lost them is a partial revert (#1829).
+	if len(p.clientIPHeaders) > 0 {
+		var srv map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &srv); err != nil {
+			return false, nil
+		}
+		if _, ok := srv["client_ip_headers"]; !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// toAnySlice converts a []string into []interface{} for embedding into raw
+// (map[string]interface{}) Caddy config nodes that we'll re-marshal to JSON.
+func toAnySlice(in []string) []interface{} {
+	out := make([]interface{}, len(in))
+	for i, s := range in {
+		out[i] = s
+	}
+	return out
+}
+
+// getFullConfig reads the complete Caddy config as a raw map.
+func (p *ProxyManager) getFullConfig() (map[string]interface{}, error) {
+	url := fmt.Sprintf("%s/config/", p.caddyAdminURL)
+	resp, err := p.httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("get config: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("caddy returned %d: %s", resp.StatusCode, string(b))
+	}
+	var config map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	return config, nil
+}
+
+// loadConfig atomically replaces the entire Caddy config via POST /load.
+func (p *ProxyManager) loadConfig(config map[string]interface{}) error {
+	body, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	url := fmt.Sprintf("%s/load", p.caddyAdminURL)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create /load request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("post /load: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy /load returned %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+// createServerConfig creates the initial Caddy server configuration
+func (p *ProxyManager) createServerConfig() error {
+	config := CaddyServerConfig{
+		Listen: p.listenAddrs(),
+		Routes: []CaddyRouteTyped{},
+	}
+
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/config/apps/http/servers/%s", p.caddyAdminURL, p.serverName)
+	req, err := http.NewRequest("PUT", url, bytes.NewReader(configJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to create server config: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}

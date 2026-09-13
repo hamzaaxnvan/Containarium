@@ -43,3 +43,33 @@ Example (box 10.100.0.156, bridge gw 10.100.0.1, operator SOCKS on a tailnet IP)
     --allow 10.100.0.156
 
   # then inside the box:  curl --proxy socks5h://10.100.0.1:18080 https://ifconfig.me
+  # (or Chrome --proxy-server=socks5://10.100.0.1:18080)
+
+Runs in the foreground until interrupted.`,
+	RunE: runEgressRelay,
+}
+
+func init() {
+	rootCmd.AddCommand(egressRelayCmd)
+	egressRelayCmd.Flags().StringVar(&egressRelayListen, "listen", "", "host bind address the box can reach, e.g. 10.100.0.1:18080 (required)")
+	egressRelayCmd.Flags().StringVar(&egressRelayUpstream, "upstream", "", "host-reachable SOCKS proxy to forward to, e.g. 100.124.9.5:1080 (required)")
+	egressRelayCmd.Flags().StringArrayVar(&egressRelayAllow, "allow", nil, "permitted source IP or CIDR (the target box); repeatable; required (empty = deny all)")
+}
+
+func runEgressRelay(cmd *cobra.Command, args []string) error {
+	if egressRelayListen == "" || egressRelayUpstream == "" {
+		return fmt.Errorf("--listen and --upstream are required")
+	}
+	if len(egressRelayAllow) == 0 {
+		return fmt.Errorf("--allow is required (a relay with no allowed source forwards for no one)")
+	}
+
+	r, err := egressproxy.New(egressRelayListen, egressRelayUpstream, egressRelayAllow, log.Printf)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return r.Serve(ctx)
+}
