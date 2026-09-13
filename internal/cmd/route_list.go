@@ -58,3 +58,64 @@ func runRouteList(cmd *cobra.Command, args []string) error {
 		return printRouteJSONFormat(routes)
 	default:
 		return fmt.Errorf("unknown format: %s (use: table, json)", routeListFormat)
+	}
+
+	return nil
+}
+
+func printRouteTableFormat(routes []*pb.ProxyRoute, totalCount int32) {
+	fmt.Printf("%-35s %-25s %-8s %-12s\n", "DOMAIN", "TARGET", "PORT", "STATUS")
+	fmt.Printf("%-35s %-25s %-8s %-12s\n",
+		strings.Repeat("-", 35),
+		strings.Repeat("-", 25),
+		strings.Repeat("-", 8),
+		strings.Repeat("-", 12))
+
+	if len(routes) == 0 {
+		fmt.Println("No routes configured.")
+		return
+	}
+
+	for _, route := range routes {
+		status := "active"
+		if !route.Active {
+			status = "inactive"
+		}
+
+		domain := route.FullDomain
+		if domain == "" {
+			domain = route.Subdomain
+		}
+
+		fmt.Printf("%-35s %-25s %-8d %-12s\n",
+			truncateRoute(domain, 35),
+			truncateRoute(route.ContainerIp, 25),
+			route.Port,
+			status)
+	}
+
+	fmt.Println()
+	fmt.Printf("Total: %d routes\n", totalCount)
+}
+
+func printRouteJSONFormat(routes []*pb.ProxyRoute) error {
+	output := map[string]interface{}{
+		"routes":      routes,
+		"total_count": len(routes),
+	}
+
+	data, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	fmt.Println(string(data))
+	return nil
+}
+
+func truncateRoute(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
+}
