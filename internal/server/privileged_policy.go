@@ -59,3 +59,126 @@ import (
 const privilegedPolicyEnv = "CONTAINARIUM_PRIVILEGED_PODMAN_POLICY"
 
 type PrivilegedPolicy int
+
+const (
+	PrivilegedPolicyAll PrivilegedPolicy = iota // pre-Phase-3 default
+	PrivilegedPolicyAdminOnly
+	PrivilegedPolicyDisabled
+)
+
+// The accepted spellings, one per policy. Parsing compares the normalised
+// value against these; String renders them back.
+const (
+	privilegedPolicyValueAll       = "all"
+	privilegedPolicyValueAdminOnly = "admin-only"
+	privilegedPolicyValueDisabled  = "disabled"
+)
+
+func (p PrivilegedPolicy) String() string {
+	switch p {
+	case PrivilegedPolicyAll:
+		return privilegedPolicyValueAll
+	case PrivilegedPolicyAdminOnly:
+		return privilegedPolicyValueAdminOnly
+	case PrivilegedPolicyDisabled:
+		return privilegedPolicyValueDisabled
+	}
+	return fmt.Sprintf("PrivilegedPolicy(%d)", int(p))
+}
+
+var (
+	privilegedPolicyOnce sync.Once
+	privilegedPolicy     PrivilegedPolicy
+	privilegedPolicyErr  error
+)
+
+// parsePrivilegedPolicy maps the raw env value to a policy. set reports
+// whether the variable is present in the environment at all. The value is
+// trimmed and lower-cased first. Only an unset variable yields the
+// backwards-compatible `all`. A set value, including a blank one, that
+// matches none of the three spellings returns an error AND PrivilegedPolicyDisabled,
+// so a caller that ignores the error still fails closed.
+func parsePrivilegedPolicy(raw string, set bool) (PrivilegedPolicy, error) {
+	norm := strings.ToLower(strings.TrimSpace(raw))
+	if !set {
+		return PrivilegedPolicyAll, nil
+	}
+	switch norm {
+	case privilegedPolicyValueAll:
+		return PrivilegedPolicyAll, nil
+	case privilegedPolicyValueAdminOnly:
+		return PrivilegedPolicyAdminOnly, nil
+	case privilegedPolicyValueDisabled:
+		return PrivilegedPolicyDisabled, nil
+	}
+	return PrivilegedPolicyDisabled, fmt.Errorf(
+		"%s=%q is not a recognised policy; it must be one of %q, %q or %q (case-insensitive), or unset",
+		privilegedPolicyEnv, raw,
+		privilegedPolicyValueAll, privilegedPolicyValueAdminOnly, privilegedPolicyValueDisabled)
+}
+
+// loadPrivilegedPolicy reads the policy once per process. An unrecognised
+// value resolves to PrivilegedPolicyDisabled (fail closed); the error is
+// kept for validatePrivilegedPolicyEnv to report at startup.
+func loadPrivilegedPolicy() PrivilegedPolicy {
+	privilegedPolicyOnce.Do(func() {
+		raw, set := os.LookupEnv(privilegedPolicyEnv)
+		privilegedPolicy, privilegedPolicyErr = parsePrivilegedPolicy(raw, set)
+		switch {
+		case privilegedPolicyErr != nil:
+			log.Printf("ERROR: %v; treating it as %q (privileged Podman is OFF for every caller)", privilegedPolicyErr, privilegedPolicy)
+		case privilegedPolicy == PrivilegedPolicyAll:
+			log.Printf("WARNING: %s is %q — any user who enables Podman gets a privileged container (audit A-HIGH-3 still open)", privilegedPolicyEnv, privilegedPolicy)
+		case privilegedPolicy == PrivilegedPolicyAdminOnly:
+			log.Printf("[privileged-policy] enabled = admin-only; non-admin podman requests will be rejected")
+		case privilegedPolicy == PrivilegedPolicyDisabled:
+			log.Printf("[privileged-policy] enabled = disabled; privileged Podman is OFF for every caller including admins")
+		}
+	})
+	return privilegedPolicy
+}
+
+// validatePrivilegedPolicyEnv loads the policy eagerly and returns an error
+// when the variable is set to an unrecognised value. NewDualServer calls it
+// so the daemon refuses to start on a typo instead of discovering it at the
+// first podman create.
+func validatePrivilegedPolicyEnv() error {
+	loadPrivilegedPolicy()
+	return privilegedPolicyErr
+}
+
+// AuthorizePrivilegedPodman decides whether the caller's
+// `enable_podman=true` request should result in a privileged
+// container. Returns:
+//
+//	(true,  nil)       — set EnablePodmanPrivileged=true
+//	(false, nil)       — set EnablePodmanPrivileged=false (Podman
+//	                     runs unprivileged; some workloads break,
+//	                     but the daemon doesn't return an error)
+//	(false, err)       — reject the CreateContainer call entirely
+//	                     with status.Error
+//
+// The choice between "silently downgrade" and "reject" depends on
+// policy:
+//   - PrivilegedPolicyAll       → (true, nil)
+//   - PrivilegedPolicyAdminOnly → (true, nil) for admin; (false,
+//     PermissionDenied) for non-admin
+//   - PrivilegedPolicyDisabled  → (false, nil) — downgrade
+func AuthorizePrivilegedPodman(ctx context.Context) (bool, error) {
+	switch loadPrivilegedPolicy() {
+	case PrivilegedPolicyAll:
+		return true, nil
+	case PrivilegedPolicyDisabled:
+		return false, nil
+	case PrivilegedPolicyAdminOnly:
+		if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+			return false, status.Errorf(codes.PermissionDenied,
+				"privileged Podman is admin-only on this daemon (set %s=disabled to drop privileged mode entirely)",
+				privilegedPolicyEnv)
+		}
+		return true, nil
+	}
+	// Unreachable with the three policies above; fail closed if a new one
+	// is added without a case here.
+	return false, nil
+}

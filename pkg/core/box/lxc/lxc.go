@@ -94,3 +94,195 @@ func (b *Backend) List(_ context.Context) ([]box.BoxStatus, error) {
 // is stamped above the seam by the server (from the daemon's --ssh-host flag).
 func (b *Backend) Resolve(ctx context.Context, ref box.BoxRef) (*box.BoxEndpoint, error) {
 	st, err := b.Get(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if st == nil {
+		return nil, nil
+	}
+	return &box.BoxEndpoint{
+		SSHUser:    st.Ref.Tenant,
+		DirectIP:   st.IPAddress,
+		AccessType: pb.AccessType_ACCESS_TYPE_SSH,
+	}, nil
+}
+
+// SetAuthorizedKeys sets the container's authorized SSH keys to exactly the
+// given set.
+func (b *Backend) SetAuthorizedKeys(_ context.Context, ref box.BoxRef, keys []string) error {
+	return b.mgr.SetAuthorizedKeys(ref.Tenant, keys)
+}
+
+// Resize updates the container's resource limits; empty fields are unchanged.
+func (b *Backend) Resize(_ context.Context, ref box.BoxRef, r box.ResourceLimits) error {
+	return b.mgr.Resize(containerName(ref), r.CPU, r.Memory, r.Disk, false)
+}
+
+// SetMeta replaces the container's labels (the runtime-neutral metadata LXC
+// supports today; TTL/delete-policy route through dedicated server methods
+// pending follow-up).
+func (b *Backend) SetMeta(_ context.Context, ref box.BoxRef, meta map[string]string) error {
+	return b.mgr.SetLabels(ref.Tenant, meta)
+}
+
+// SetOwner records tenant as the box's explicit owner
+// (user.containarium.tenant), overriding the name convention. Used by the
+// anonymous-box claim (#2199): the box keeps its name and login, only its
+// owner changes.
+func (b *Backend) SetOwner(_ context.Context, ref box.BoxRef, tenant string) error {
+	return b.mgr.SetTenant(containerName(ref), tenant)
+}
+
+// GetMeta reads the container's labels.
+func (b *Backend) GetMeta(_ context.Context, ref box.BoxRef) (map[string]string, error) {
+	return b.mgr.GetLabels(ref.Tenant)
+}
+
+// Exec runs a command inside the container and returns its output.
+// Implements box.ExecCapable.
+func (b *Backend) Exec(_ context.Context, ref box.BoxRef, cmd []string) (string, string, error) {
+	return b.mgr.ExecWithOutput(containerName(ref), cmd)
+}
+
+// WriteFile writes a file inside the container. Implements box.ExecCapable.
+func (b *Backend) WriteFile(_ context.Context, ref box.BoxRef, path string, content []byte, mode string) error {
+	return b.mgr.WriteFile(containerName(ref), path, content, mode)
+}
+
+// Metrics returns runtime metrics for the container. Implements
+// box.MetricsCapable.
+func (b *Backend) Metrics(_ context.Context, ref box.BoxRef) (*box.BoxMetrics, error) {
+	m, err := b.mgr.GetMetrics(ref.Tenant)
+	if err != nil {
+		return nil, err
+	}
+	if m == nil {
+		return nil, nil
+	}
+	return &box.BoxMetrics{
+		CPUUsageSeconds:  m.CPUUsageSeconds,
+		MemoryUsageBytes: m.MemoryUsageBytes,
+		MemoryLimitBytes: m.MemoryLimitBytes,
+		DiskUsageBytes:   m.DiskUsageBytes,
+		NetworkRxBytes:   m.NetworkRxBytes,
+		NetworkTxBytes:   m.NetworkTxBytes,
+		ProcessCount:     m.ProcessCount,
+		CPUNrPeriods:     m.CPUNrPeriods,
+		CPUNrThrottled:   m.CPUNrThrottled,
+		CPUThrottledUsec: m.CPUThrottledUsec,
+	}, nil
+}
+
+// --- pure mapping helpers (unit-tested directly) ---
+
+// specToCreateOptions maps the runtime-neutral spec onto the Manager's
+// CreateOptions.
+func specToCreateOptions(spec box.BoxSpec) container.CreateOptions {
+	return container.CreateOptions{
+		Username:               spec.Ref.Tenant,
+		NetworkTenant:          spec.NetworkTenant,
+		Image:                  spec.Image,
+		CPU:                    spec.Resources.CPU,
+		Memory:                 spec.Resources.Memory,
+		Disk:                   spec.Resources.Disk,
+		GPUs:                   spec.GPUs,
+		SSHKeys:                spec.SSHKeys,
+		Labels:                 spec.Labels,
+		StaticIP:               spec.StaticIP,
+		StoragePool:            spec.StoragePool,
+		EnablePodman:           spec.EnablePodman,
+		EnablePodmanPrivileged: spec.EnablePodmanPrivileged,
+		OSType:                 spec.OSType,
+		Isolation:              spec.Isolation,
+		Monitoring:             spec.Monitoring,
+		OTelCollectorEndpoint:  spec.OTelCollectorEndpoint,
+		BackendID:              spec.OTelBackendID,
+		OTelBearer:             spec.OTelBearer,
+		Stack:                  spec.Stack,
+		StackParameters:        spec.StackParams,
+		GitSource:              spec.GitSource,
+		GitRef:                 spec.GitRef,
+		GitCredential:          spec.GitCredential,
+		WorkspacePath:          spec.WorkspacePath,
+		AutoStart:              spec.AutoStart,
+		OnProvisioning:         spec.OnProvisioning,
+	}
+}
+
+// StatusFromInfo maps incus.ContainerInfo onto the runtime-neutral BoxStatus.
+func StatusFromInfo(info *incus.ContainerInfo) box.BoxStatus {
+	key, source := incus.NetworkTenantIdentity(info)
+	return box.BoxStatus{
+		Ref:                       box.BoxRef{Tenant: tenantOf(info), Name: info.Name},
+		NetworkTenant:             key,
+		NetworkTenantSource:       networkTenantSourceProto(source),
+		State:                     parseState(info.State),
+		IPAddress:                 info.IPAddress,
+		Resources:                 box.ResourceLimits{CPU: info.CPU, Memory: info.Memory, Disk: info.Disk},
+		Labels:                    info.Labels,
+		GPU:                       info.GPU,
+		GPUs:                      info.GPUs,
+		BackendID:                 info.BackendID,
+		CreatedAt:                 info.CreatedAt,
+		Isolation:                 ostype.IsolationFromInstanceType(info.InstanceType),
+		IsCore:                    info.Role.IsCoreRole(),
+		MonitoringEnabled:         info.MonitoringEnabled,
+		AutoSleepEnabled:          info.AutoSleepEnabled,
+		IdleThresholdMinutes:      info.IdleThresholdMinutes,
+		TTLExpiresAt:              info.TTLExpiresAt,
+		StoppedAt:                 info.StoppedAt,
+		DeleteAfterStoppedSeconds: info.DeleteAfterStoppedSeconds,
+		DeletePolicy:              info.DeletePolicy,
+		ToolAccess:                info.ToolAccess,
+		Image:                     info.Image,
+		Stack:                     info.Stack,
+		PodmanEnabled:             info.PodmanEnabled,
+	}
+}
+
+// parseState maps an incus state string to the proto enum. Mirrors the
+// daemon's toProtoContainer mapping so the seam reports identical states.
+func parseState(s string) pb.ContainerState {
+	switch s {
+	case "Running":
+		return pb.ContainerState_CONTAINER_STATE_RUNNING
+	case "Stopped":
+		return pb.ContainerState_CONTAINER_STATE_STOPPED
+	case "Frozen":
+		return pb.ContainerState_CONTAINER_STATE_FROZEN
+	default:
+		return pb.ContainerState_CONTAINER_STATE_UNSPECIFIED
+	}
+}
+
+// tenantOf recovers the routing user/tenant from container info: the daemon's
+// reported Username when present, else the name with the "-container" suffix
+// stripped (the create-time naming convention).
+func tenantOf(info *incus.ContainerInfo) string {
+	if info.Username != "" {
+		return info.Username
+	}
+	return strings.TrimSuffix(info.Name, "-container")
+}
+
+// containerName resolves the substrate-level container name for a ref: the
+// explicit Name when set, else derived from Tenant via the naming convention.
+func containerName(ref box.BoxRef) string {
+	if ref.Name != "" {
+		return ref.Name
+	}
+	return ref.Tenant + "-container"
+}
+
+func networkTenantSourceProto(source incus.NetworkTenantSource) pb.NetworkTenantSource {
+	switch source {
+	case incus.NetworkTenantSourceNative:
+		return pb.NetworkTenantSource_NETWORK_TENANT_SOURCE_NATIVE
+	case incus.NetworkTenantSourceCloud:
+		return pb.NetworkTenantSource_NETWORK_TENANT_SOURCE_CLOUD_ORG_ID
+	case incus.NetworkTenantSourceName:
+		return pb.NetworkTenantSource_NETWORK_TENANT_SOURCE_NAME
+	default:
+		return pb.NetworkTenantSource_NETWORK_TENANT_SOURCE_UNSPECIFIED
+	}
+}

@@ -1625,3 +1625,546 @@ func (m *Manager) buildSNIRoutingHandlerDial(fallback fallbackDial) func(net.Con
 		if err != nil || dst == nil {
 			return
 		}
+		defer func() { _ = dst.Close() }()
+
+		// Optionally prepend a PROXY v2 header so the downstream Caddy can
+		// recover the real client IP (otherwise it sees the sentinel/loopback
+		// peer of the forwarded TCP stream). Must be written before any TLS
+		// bytes — peekedConn replays the ClientHello starting at the next
+		// Read on our side, but we haven't copied any of it to dst yet.
+		if m.config.ProxyProtocol {
+			if err := writeProxyHeader(dst, conn); err != nil {
+				log.Printf("[sentinel] proxy-proto: %v", err)
+				return
+			}
+		}
+
+		// #1349: a peer that vanishes without FIN/RST (a preempted or
+		// powered-off backend, or a client that just drops off the
+		// network) leaves the corresponding io.Copy's Read blocked
+		// forever — no bytes, no EOF, no error — so neither goroutine
+		// below ever reaches its done<- signal and the deferred Close
+		// calls above never run. Wrapping both sides so every Read
+		// refreshes an idle deadline turns that into a timeout, which
+		// unblocks this copy and, via the resulting Close, the other
+		// direction's blocked Read too.
+		idleTimeout := m.proxyIdleTimeout
+		if idleTimeout <= 0 {
+			idleTimeout = sniProxyIdleTimeout
+		}
+		src := &idleTimeoutConn{Conn: peekedConn, idleTimeout: idleTimeout}
+		backend := &idleTimeoutConn{Conn: dst, idleTimeout: idleTimeout}
+
+		done := make(chan struct{}, 2)
+		go func() { _, _ = io.Copy(backend, src); done <- struct{}{} }()
+		go func() { _, _ = io.Copy(src, backend); done <- struct{}{} }()
+		<-done
+	}
+}
+
+// serveBYOCIngress serves one public-ingress connection for a BYOC tenant
+// subdomain (#733). Unlike the raw TLS passthrough the primary path uses, the
+// BYOC host has no cert — so the sentinel TERMINATES TLS here with the
+// `*.containarium.dev` wildcard it already syncs (CertStore.GetCertificate),
+// then reverse-proxies the decrypted HTTP to the box by PLAINTEXT-forwarding
+// over the tunnel: every request dials a fresh yamux stream via
+// DialTunnel(spotID, route.Port). The box (and host) need no cert.
+//
+// It takes over conn entirely (terminates + serves), so the caller must return
+// after invoking it rather than falling through to the passthrough copy.
+func (m *Manager) serveBYOCIngress(conn net.Conn, route BYOCRoute) {
+	dial := m.byocDial
+	if dial == nil && m.tunnelRegistry != nil {
+		dial = func(spotID string, port int) (net.Conn, error) {
+			return m.tunnelRegistry.DialTunnel(spotID, port)
+		}
+	}
+	if dial == nil || m.certStore == nil {
+		_ = conn.Close()
+		return
+	}
+
+	tlsConn := tls.Server(conn, &tls.Config{
+		MinVersion:     tls.VersionTLS12,
+		GetCertificate: m.certStore.GetCertificate,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		_ = tlsConn.Close()
+		return
+	}
+	defer func() { _ = tlsConn.Close() }()
+
+	// Dial target is the box's plaintext HTTP port over the tunnel; spotID is
+	// the tunnel key (mirror the primary path's "tunnel-" prefix stripping).
+	spotID := strings.TrimPrefix(route.BackendID, "tunnel-")
+	proxy := &httputil.ReverseProxy{
+		Director: func(r *http.Request) {
+			// Preserve the client's Host (r.Host) — the box's Caddy routes by
+			// it. The scheme is plaintext over the tunnel; the URL host is a
+			// placeholder (the dial ignores it and routes by spotID).
+			r.URL.Scheme = "http"
+			r.URL.Host = route.Hostname
+		},
+		Transport: &http.Transport{
+			// Every request opens a fresh tunnel stream — DialTunnel routes by
+			// spotID, so the dial address is ignored. No cross-request pooling
+			// over the tunnel (one yamux stream per request; correctness over
+			// throughput for v1).
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return dial(spotID, route.Port)
+			},
+			DisableKeepAlives: true,
+		},
+		ErrorLog: log.Default(),
+	}
+
+	// Serve HTTP over the single terminated-TLS connection. A blocking one-shot
+	// listener hands the conn to http.Server once, then blocks Accept until the
+	// conn closes — so Serve (and this func's deferred Close) doesn't tear the
+	// connection down mid-response. IdleTimeout bounds an idle keep-alive conn
+	// so the serving goroutine can't leak.
+	srv := &http.Server{
+		Handler:           proxy,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	_ = srv.Serve(newOneShotListener(tlsConn))
+}
+
+// oneShotListener feeds a single already-accepted conn to an http.Server, then
+// blocks Accept until that conn closes so Serve stays alive for the whole
+// (possibly keep-alive) connection and returns only once it's done. This avoids
+// the premature teardown a return-ErrClosed-immediately listener causes for a
+// proxied response. See #733.
+type oneShotListener struct {
+	ch     chan net.Conn
+	closed chan struct{}
+	conn   net.Conn
+}
+
+func newOneShotListener(conn net.Conn) *oneShotListener {
+	l := &oneShotListener{ch: make(chan net.Conn, 1), closed: make(chan struct{})}
+	nc := &notifyConn{Conn: conn, closed: l.closed}
+	l.conn = nc
+	l.ch <- nc
+	close(l.ch)
+	return l
+}
+
+func (l *oneShotListener) Accept() (net.Conn, error) {
+	if c, ok := <-l.ch; ok {
+		return c, nil
+	}
+	<-l.closed // block until the served conn is closed, then let Serve return
+	return nil, net.ErrClosed
+}
+func (l *oneShotListener) Close() error   { return nil }
+func (l *oneShotListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+// notifyConn closes `closed` exactly once when the wrapped conn is closed, so
+// oneShotListener learns the served connection is done.
+type notifyConn struct {
+	net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (c *notifyConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// writeProxyHeader writes a PROXY v2 header to dst describing the client TCP
+// connection conn. Returns an error if either address is missing or the write
+// fails. Non-TCP addresses are skipped silently — without addresses we can't
+// build a meaningful header, but failing the connection would be worse than
+// degrading to the legacy "sentinel-as-client" behavior.
+func writeProxyHeader(dst io.Writer, conn net.Conn) error {
+	src, _ := conn.RemoteAddr().(*net.TCPAddr)
+	dstAddr, _ := conn.LocalAddr().(*net.TCPAddr)
+	if src == nil || dstAddr == nil {
+		return nil
+	}
+	if _, err := WriteProxyV2(dst, src, dstAddr); err != nil {
+		return fmt.Errorf("write header: %w", err)
+	}
+	return nil
+}
+
+// setHTTPSMaintenanceHandler sets the dispatch handler to serve maintenance TLS page.
+func (m *Manager) setHTTPSMaintenanceHandler() {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if m.certStore != nil {
+		tlsCfg.GetCertificate = m.certStore.GetCertificate
+	} else {
+		cert, err := generateSelfSignedCert()
+		if err == nil {
+			tlsCfg.Certificates = []tls.Certificate{cert}
+		}
+	}
+
+	handler := maintenanceHandler()
+
+	m.httpsDispatch.SetHandler(func(conn net.Conn) {
+		tlsConn := tls.Server(conn, tlsCfg)
+		defer func() { _ = tlsConn.Close() }()
+		if err := tlsConn.Handshake(); err != nil {
+			return
+		}
+		// Serve one HTTP request over the TLS connection
+		_ = http.Serve(&singleConnListener{conn: tlsConn}, handler)
+	})
+	log.Printf("[sentinel] maintenance HTTPS handler set on ConnMux")
+}
+
+// singleConnListener is a net.Listener that serves exactly one connection.
+type singleConnListener struct {
+	conn net.Conn
+	done bool
+}
+
+func (sl *singleConnListener) Accept() (net.Conn, error) {
+	if sl.done {
+		return nil, net.ErrClosed
+	}
+	sl.done = true
+	return sl.conn, nil
+}
+func (sl *singleConnListener) Close() error   { return nil }
+func (sl *singleConnListener) Addr() net.Addr { return sl.conn.LocalAddr() }
+
+func startMaintenanceHTTPOnly(httpPort int, manager *Manager) (stop func(), err error) {
+	httpSrv := NewMaintenanceServer(httpPort, manager)
+
+	go func() {
+		log.Printf("[sentinel] maintenance HTTP server listening on :%d", httpPort)
+		if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Printf("[sentinel] maintenance HTTP server error: %v", err)
+		}
+	}()
+
+	return func() {
+		_ = httpSrv.Close()
+	}, nil
+}
+
+// handleEvent processes a VM lifecycle event from the GCP event watcher.
+func (m *Manager) handleEvent(ctx context.Context, event VMEvent) {
+	gcpBackend := m.backends.Get("gcp")
+
+	switch event.Type {
+	case EventPreempted:
+		m.preemptCount++
+		m.lastPreemption = event.Timestamp
+		log.Printf("[sentinel] EVENT: PREEMPTION detected at %s (total: %d) — %s",
+			event.Timestamp.Format(time.RFC3339), m.preemptCount, event.Detail)
+		// The "down" event. Notify immediately — the on-spot vmalert is
+		// dying with the VM, so this outbound webhook is the alert path.
+		m.fireAlert("preempted", "gcp", 0)
+
+		if gcpBackend != nil {
+			gcpBackend.Healthy = false
+			gcpBackend.healthyCount = 0
+			gcpBackend.unhealthyCount = 0
+		}
+
+		// In hybrid mode: failover to tunnel if available
+		m.mu.RLock()
+		isPrimary := m.primary == gcpBackend
+		m.mu.RUnlock()
+
+		if isPrimary && m.currentState() == StateProxy {
+			m.failoverPrimary(ctx, gcpBackend)
+		}
+
+		// Try to restart the GCP VM
+		if gcpBackend != nil && gcpBackend.Provider != nil {
+			m.diagnoseAndRecover(ctx, gcpBackend)
+		}
+
+	case EventStopped, EventTerminated:
+		log.Printf("[sentinel] EVENT: VM %s at %s — %s", event.Type, event.Timestamp.Format(time.RFC3339), event.Detail)
+		if gcpBackend != nil {
+			gcpBackend.Healthy = false
+			gcpBackend.healthyCount = 0
+
+			m.mu.RLock()
+			isPrimary := m.primary == gcpBackend
+			m.mu.RUnlock()
+
+			if isPrimary && m.currentState() == StateProxy {
+				m.failoverPrimary(ctx, gcpBackend)
+			}
+			if gcpBackend.Provider != nil {
+				m.diagnoseAndRecover(ctx, gcpBackend)
+			}
+		}
+
+	case EventStarted:
+		log.Printf("[sentinel] EVENT: VM started at %s — %s", event.Timestamp.Format(time.RFC3339), event.Detail)
+	}
+}
+
+func (m *Manager) checkRecoveryTimeout() {
+	if m.config.RecoveryTimeout <= 0 || m.outageStart.IsZero() {
+		return
+	}
+	elapsed := time.Since(m.outageStart)
+	if elapsed > m.config.RecoveryTimeout {
+		log.Printf("[sentinel] WARNING: recovery has taken %s (threshold: %s) — manual intervention may be needed",
+			elapsed.Round(time.Second), m.config.RecoveryTimeout)
+	}
+}
+
+// recoveryOutcome reports what diagnoseAndRecover did, so the periodic
+// retry driver (maybeRetryRecovery) can manage the backoff schedule.
+type recoveryOutcome int
+
+const (
+	recoveryNoop        recoveryOutcome = iota // nothing to start (running/provisioning) or no provider
+	recoveryStartOK                            // StartInstance command accepted
+	recoveryStartFailed                        // StartInstance errored (e.g. no spot capacity)
+)
+
+// diagnoseAndRecover inspects the backend's cloud status and, if it's
+// stopped/terminated, attempts to start it. It then advances the backoff
+// schedule based on the outcome (#514) so subsequent maybeRetryRecovery
+// ticks re-attempt on an exponential cadence rather than once-and-wait.
+func (m *Manager) diagnoseAndRecover(ctx context.Context, b *Backend) recoveryOutcome {
+	if b.Provider == nil {
+		return recoveryNoop
+	}
+
+	status, err := b.Provider.GetInstanceStatus(ctx)
+	if err != nil {
+		log.Printf("[sentinel] failed to get status for %s: %v", b.ID, err)
+		// Treat an unreadable status like a failed attempt: keep trying,
+		// but backed off, rather than hammering the status API.
+		m.advanceRecoveryBackoff()
+		return recoveryStartFailed
+	}
+
+	log.Printf("[sentinel] backend %s status: %s", b.ID, status)
+
+	switch status {
+	case StatusStopped, StatusTerminated:
+		log.Printf("[sentinel] attempting to start %s...", b.ID)
+		if err := b.Provider.StartInstance(ctx); err != nil {
+			log.Printf("[sentinel] failed to start %s: %v (will retry, backing off)", b.ID, err)
+			m.advanceRecoveryBackoff()
+			return recoveryStartFailed
+		}
+		log.Printf("[sentinel] start command sent for %s", b.ID)
+		// Start accepted — re-probe soon (initial interval) so we catch
+		// it either coming healthy or, if capacity is then lost again,
+		// retrying without a long stall.
+		m.scheduleRecovery(m.config.RecoveryBackoffInitial)
+		return recoveryStartOK
+	case StatusProvisioning:
+		log.Printf("[sentinel] %s is provisioning...", b.ID)
+		m.scheduleRecovery(m.config.RecoveryBackoffInitial)
+		return recoveryNoop
+	case StatusRunning:
+		// Cloud says running but TCP health failed — starting won't help;
+		// the health check will flip it healthy when the daemon answers.
+		log.Printf("[sentinel] %s reports running but health check failed", b.ID)
+		m.scheduleRecovery(m.config.RecoveryBackoffInitial)
+		return recoveryNoop
+	}
+	return recoveryNoop
+}
+
+// scheduleRecovery sets the current backoff and the next-attempt time.
+func (m *Manager) scheduleRecovery(d time.Duration) {
+	if d <= 0 {
+		d = m.config.RecoveryBackoffInitial
+	}
+	m.recoveryBackoff = d
+	m.nextRecoveryAttempt = time.Now().Add(d)
+}
+
+// advanceRecoveryBackoff doubles the backoff (capped at Max) and schedules
+// the next attempt. Called on a failed start / unreadable status.
+func (m *Manager) advanceRecoveryBackoff() {
+	next := m.recoveryBackoff * 2
+	if m.recoveryBackoff == 0 {
+		next = m.config.RecoveryBackoffInitial
+	}
+	if next > m.config.RecoveryBackoffMax {
+		next = m.config.RecoveryBackoffMax
+	}
+	m.scheduleRecovery(next)
+}
+
+// resetRecovery clears the backoff schedule — called when the backend
+// recovers (switch back to proxy), so the next outage starts fresh.
+func (m *Manager) resetRecovery() {
+	m.recoveryBackoff = 0
+	m.nextRecoveryAttempt = time.Time{}
+}
+
+// maybeRetryRecovery re-attempts recovery while the sentinel is stuck in
+// maintenance with a provider-backed (GCP) backend, gated by the backoff
+// schedule. This is the periodic counterpart to the one-shot recovery at
+// the proxy→maintenance transition: it lets a preempted spot self-heal
+// when capacity returns, without a start attempt every health-check tick
+// (#514). Called from the Run() loop's tick, single-goroutine.
+func (m *Manager) maybeRetryRecovery(ctx context.Context) {
+	if m.currentState() != StateMaintenance {
+		return
+	}
+	if !m.nextRecoveryAttempt.IsZero() && time.Now().Before(m.nextRecoveryAttempt) {
+		return // backoff window not elapsed yet
+	}
+	var target *Backend
+	for _, b := range m.backends.All() {
+		if b.Type == BackendGCP && b.Provider != nil && !b.Healthy {
+			target = b
+			break
+		}
+	}
+	if target == nil {
+		return // nothing provider-backed to recover (e.g. pure tunnel mode)
+	}
+	m.diagnoseAndRecover(ctx, target)
+}
+
+func (m *Manager) cleanup() {
+	if m.stopMaintenance != nil {
+		m.stopMaintenance()
+		m.stopMaintenance = nil
+	}
+	if err := disableForwarding(); err != nil {
+		log.Printf("[sentinel] cleanup: disableForwarding: %v", err)
+	}
+	log.Printf("[sentinel] cleanup complete")
+}
+
+// --- Tunnel callbacks ---
+
+// OnTunnelConnect is called when a remote spot connects via tunnel.
+func (m *Manager) OnTunnelConnect(spot *TunnelSpot) {
+	b := &Backend{
+		ID:           "tunnel-" + spot.ID,
+		Type:         BackendTunnel,
+		IP:           spot.LocalIP,
+		ExternalPort: spot.ExternalPort,
+		Provider:     NewTunnelProvider(nil, spot.ID), // tunnel provider can't restart VMs
+		Priority:     10,                              // lower priority than GCP for HTTP
+		Pool:         spot.Pool,
+	}
+	m.backends.Add(b)
+
+	log.Printf("[sentinel] tunnel connected: %s at %s (total backends: %d)", b.ID, b.IP, m.backends.Count())
+
+	// If the tunnel handshake declared this spot is a primary (slice 6),
+	// auto-register it in the primary registry pointing at its loopback
+	// alias. The SNI router will then forward inbound traffic for the
+	// primary's hostname/aliases through the tunnel.
+	if spot.PublicHostname != "" && spot.PublicPort != 0 && m.primaries != nil {
+		m.primaries.Register(Primary{
+			Pool:        spot.Pool,
+			Hostname:    spot.PublicHostname,
+			Aliases:     spot.PublicAliases,
+			BaseDomains: spot.PublicBaseDomains,
+			IP:          spot.LocalIP,
+			Port:        spot.PublicPort,
+			BackendID:   b.ID,
+		})
+		log.Printf("[sentinel] tunnel-promoted primary: pool=%q hostname=%q aliases=%v base_domains=%v -> %s:%d",
+			spot.Pool, spot.PublicHostname, spot.PublicAliases, spot.PublicBaseDomains, spot.LocalIP, spot.PublicPort)
+	}
+
+	// Start sync loops for this tunnel backend
+	ctx := context.Background()
+	m.startSyncLoops(ctx, b)
+
+	// Health check loop will pick it up and switch to proxy if needed
+}
+
+// OnTunnelDisconnect is called when a remote spot disconnects.
+func (m *Manager) OnTunnelDisconnect(spot *TunnelSpot) {
+	backendID := "tunnel-" + spot.ID
+	if m.primaries != nil {
+		if n := m.primaries.UnregisterByBackendID(backendID); n > 0 {
+			log.Printf("[sentinel] removed %d primary registration(s) for disconnected tunnel %s", n, backendID)
+		}
+	}
+	if m.certStore != nil {
+		m.certStore.DropBackend(backendID)
+	}
+	removed := m.backends.Remove(backendID)
+	if removed == nil {
+		return
+	}
+
+	log.Printf("[sentinel] tunnel disconnected: %s (remaining backends: %d)", backendID, m.backends.Count())
+
+	// Remove this backend's users from sshpiper config. Apply() rewrites
+	// config.yaml, which sshpiperd's yaml plugin re-reads per connection — no
+	// restart needed (a restart would drop every live session, issue #301).
+	m.keyStore.RemoveBackend(backendID)
+	if err := m.keyStore.Apply(); err != nil {
+		log.Printf("[sentinel] key apply after tunnel disconnect failed: %v", err)
+	}
+
+	// If this was the primary, failover
+	m.mu.RLock()
+	wasPrimary := m.primary == removed
+	m.mu.RUnlock()
+
+	if wasPrimary && m.currentState() == StateProxy {
+		next := m.backends.SelectPrimary()
+		if next != nil {
+			log.Printf("[sentinel] failover after tunnel disconnect: → %s (%s)", next.ID, next.IP)
+			if err := m.switchToProxy(next); err != nil {
+				log.Printf("[sentinel] failover failed: %v", err)
+			}
+		} else {
+			m.outageStart = time.Now()
+			if err := m.switchToMaintenance(); err != nil {
+				log.Printf("[sentinel] failed to switch to maintenance: %v", err)
+			}
+		}
+	}
+}
+
+// --- Exported state getters ---
+
+func (m *Manager) CurrentState() State       { return m.currentState() }
+func (m *Manager) PreemptCount() int         { return m.preemptCount }
+func (m *Manager) RecoveredCount() int       { return m.recoveredCount }
+func (m *Manager) LastPreemption() time.Time { return m.lastPreemption }
+
+// SpotIP returns the primary backend IP (backward compat).
+func (m *Manager) SpotIP() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.primary != nil {
+		return m.primary.IP
+	}
+	return ""
+}
+
+// Backends returns status info for all backends.
+func (m *Manager) Backends() []*Backend {
+	return m.backends.All()
+}
+
+func (m *Manager) OutageDuration() time.Duration {
+	if m.currentState() != StateMaintenance || m.outageStart.IsZero() {
+		return 0
+	}
+	return time.Since(m.outageStart)
+}
+
+// excludePort returns a copy of ports with the given port removed.
+func excludePort(ports []int, exclude int) []int {
+	result := make([]int, 0, len(ports))
+	for _, p := range ports {
+		if p != exclude {
+			result = append(result, p)
+		}
+	}
+	return result
+}
