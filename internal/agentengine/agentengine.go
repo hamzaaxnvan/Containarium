@@ -180,3 +180,185 @@ type Resolved struct {
 }
 
 // NotReadyError is returned when a named engine's provider has no resolvable
+// key, in gateway mode. Reason and Fix are meant to be read by a human — the
+// same text a FailedPrecondition error and a ListAgentEngines row both show,
+// so "why can't this run" and "why does this engine show as not ready" never
+// say two different things for the same cause.
+type NotReadyError struct {
+	Engine   pb.AgentEngine
+	Provider string
+	KeyOwner string
+	Reason   string
+	Fix      string
+}
+
+func (e *NotReadyError) Error() string {
+	return fmt.Sprintf("engine %s (provider %s) not ready: %s", EnvValue(e.Engine), e.Provider, e.Reason)
+}
+
+// Override picks the engine a run should ask Resolve for: requested when the
+// caller named one (#2228's per-invocation --engine on RunAgentSkillRequest /
+// RunCrewRequest.engine_overrides), else the skill manifest's own choice.
+// Resolve itself stays agnostic to which of the two `want` came from — the
+// same readiness check and the same refusal text apply either way, so an
+// override naming an engine with no usable key is refused exactly like an
+// unready manifest engine.
+func Override(manifest, requested pb.AgentEngine) pb.AgentEngine {
+	if requested != pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED {
+		return requested
+	}
+	return manifest
+}
+
+// Resolve turns a manifest's engine choice into the engine and provider one
+// run actually uses, or a *NotReadyError when a named engine's provider has
+// no key anywhere gw can see.
+//
+//	gw == nil (direct mode):
+//	  want == UNSPECIFIED -> Engine=UNSPECIFIED, Provider="", Default=true
+//	    (no CONTAINARIUM_AGENT_ENGINE exported — byte-identical to today)
+//	  want named           -> Engine=want, Provider="", Default=false
+//	    (exported as-is; NEVER refused — the daemon holds no key to check
+//	    against, and direct mode is the box's own secrets deciding)
+//
+//	gw != nil (gateway mode):
+//	  want == UNSPECIFIED -> Engine=ForProvider(gw.DefaultProvider),
+//	    Provider=gw.DefaultProvider, Default=true (today's primary-provider
+//	    pinning, unchanged)
+//	  want named          -> provider := Provider(want); ready when
+//	    gw.GlobalProviders[provider] (no owner lookup needed) or
+//	    gw.Keys != nil && gw.Keys.KeyFor(ctx, keyOwner, provider) is ok;
+//	    else *NotReadyError
+func Resolve(ctx context.Context, want pb.AgentEngine, keyOwner string, gw *Gateway) (Resolved, error) {
+	if gw == nil {
+		if want == pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED {
+			return Resolved{Engine: pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED, Default: true}, nil
+		}
+		return Resolved{Engine: want, Default: false}, nil
+	}
+
+	if want == pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED && gw.NoGlobalFallback && keyOwner != "" {
+		for _, p := range defaultProviderOrder {
+			if gw.ownerHasKey(ctx, keyOwner, p) {
+				return Resolved{Engine: ForProvider(p), Provider: p, Default: true}, nil
+			}
+		}
+		return Resolved{}, &NotReadyError{
+			Engine:   want,
+			Provider: defaultProviderOrder[0],
+			KeyOwner: keyOwner,
+			Reason:   "no provider key is registered for this key owner, and this daemon does not fall back to a daemon-global key",
+			Fix:      fmt.Sprintf("containarium gateway key set %s --provider %s --key <value>", keyOwner, defaultProviderOrder[0]),
+		}
+	}
+
+	if want == pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED {
+		return Resolved{
+			Engine:   ForProvider(gw.DefaultProvider),
+			Provider: gw.DefaultProvider,
+			Default:  true,
+		}, nil
+	}
+
+	provider, ok := Provider(want)
+	if !ok {
+		// Not reachable with a Parse-produced value, but a caller could in
+		// principle hand Resolve a raw enum value Parse never returns (e.g.
+		// from a future engine added to the proto before this package knows
+		// its provider) — fail loudly rather than mint a token for "".
+		return Resolved{}, fmt.Errorf("engine %v has no known gateway provider", want)
+	}
+
+	if gw.globalCovers(provider, keyOwner) || gw.ownerHasKey(ctx, keyOwner, provider) {
+		return Resolved{Engine: want, Provider: provider, Default: false}, nil
+	}
+
+	return Resolved{}, &NotReadyError{
+		Engine:   want,
+		Provider: provider,
+		KeyOwner: keyOwner,
+		Reason:   fmt.Sprintf("no key for provider %s", provider),
+		Fix:      fmt.Sprintf("containarium gateway key set %s --provider %s --key <value>", keyOwnerOrPlaceholder(keyOwner), provider),
+	}
+}
+
+func keyOwnerOrPlaceholder(keyOwner string) string {
+	if keyOwner == "" {
+		return "<key-owner>"
+	}
+	return keyOwner
+}
+
+// SkillEngine is the minimal view of a catalog skill Statuses needs: its id
+// and its manifest's own engine choice. Deliberately narrower than
+// *pb.AgentSkill — Statuses only ever reads these two fields, and a narrow
+// input type keeps this package's tests from having to construct a full
+// skill (recipe, scopes, agent card, ...) just to exercise grouping.
+type SkillEngine struct {
+	ID     string
+	Engine pb.AgentEngine
+}
+
+// Statuses is Resolve applied to every concrete engine, for one key owner —
+// the read-only readiness report ListAgentEngines serves (#2223). It never
+// errors on a not-ready engine: that IS a row, not a failure. skills groups
+// each row's SkillIds: only a skill whose manifest names that engine
+// EXPLICITLY (#2222 Q2, decided 2026-10-01) — an unspecified-engine skill is
+// never attributed to any row, even the one is_default marks.
+func Statuses(ctx context.Context, keyOwner string, gw *Gateway, skills []SkillEngine) []*pb.AgentEngineStatus {
+	defaultEngine := pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED
+	if gw != nil {
+		defaultEngine = ForProvider(gw.DefaultProvider)
+	}
+
+	skillIDs := make(map[pb.AgentEngine][]string)
+	for _, s := range skills {
+		if s.Engine == pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED {
+			continue
+		}
+		skillIDs[s.Engine] = append(skillIDs[s.Engine], s.ID)
+	}
+
+	out := make([]*pb.AgentEngineStatus, 0, len(All()))
+	for _, e := range All() {
+		provider, _ := Provider(e) // ok=false unreachable for a value from All()
+		providerEnum, _ := gatewayprovider.FromName(provider)
+
+		row := &pb.AgentEngineStatus{
+			Engine:    e,
+			Provider:  providerEnum,
+			IsDefault: gw != nil && e == defaultEngine,
+			SkillIds:  skillIDs[e],
+		}
+
+		if gw == nil {
+			row.Readiness = pb.AgentEngineReadiness_AGENT_ENGINE_READINESS_UNKNOWN_DIRECT_MODE
+			row.Source = pb.AgentCredentialSource_AGENT_CREDENTIAL_SOURCE_DIRECT_MODE
+			row.Reason = "daemon serves no model gateway; the box's own secrets decide"
+			out = append(out, row)
+			continue
+		}
+
+		res, err := Resolve(ctx, e, keyOwner, gw)
+		if err == nil {
+			row.Readiness = pb.AgentEngineReadiness_AGENT_ENGINE_READINESS_READY
+			if gw.globalCovers(res.Provider, keyOwner) {
+				row.Source = pb.AgentCredentialSource_AGENT_CREDENTIAL_SOURCE_GLOBAL_KEY
+			} else {
+				row.Source = pb.AgentCredentialSource_AGENT_CREDENTIAL_SOURCE_OWNER_KEY
+			}
+			out = append(out, row)
+			continue
+		}
+
+		row.Readiness = pb.AgentEngineReadiness_AGENT_ENGINE_READINESS_NOT_READY
+		var notReady *NotReadyError
+		if errors.As(err, &notReady) {
+			row.Reason = notReady.Reason + "; fix: " + notReady.Fix
+		} else {
+			row.Reason = err.Error()
+		}
+		out = append(out, row)
+	}
+	return out
+}
