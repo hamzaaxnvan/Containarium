@@ -62,3 +62,68 @@ export function useAlertingInfo(server: Server | null) {
 
   return {
     info: data || null,
+    isLoading,
+    error,
+    refresh: () => mutate(),
+  };
+}
+
+/**
+ * Hook for fetching webhook delivery history
+ */
+export function useWebhookDeliveries(server: Server | null) {
+  const isVisible = usePageVisibility();
+  const fetcher = async (): Promise<WebhookDeliveriesResponse> => {
+    if (!server) throw new Error('No server');
+    const client = getClient(server);
+    return client.listWebhookDeliveries(50, 0);
+  };
+
+  const swrKey = server ? `webhook-deliveries-${server.id}` : null;
+
+  const { data, error, isLoading, mutate } = useSWR<WebhookDeliveriesResponse>(
+    swrKey,
+    fetcher,
+    {
+      refreshInterval: isVisible ? 30000 : 0,
+      revalidateOnFocus: true,
+      dedupingInterval: 5000,
+    }
+  );
+
+  return {
+    deliveries: data?.deliveries || [],
+    totalCount: data?.totalCount || 0,
+    isLoading,
+    error,
+    refresh: () => mutate(),
+  };
+}
+
+/**
+ * Hook for fetching default (built-in) alert rules
+ */
+export function useDefaultAlertRules(server: Server | null) {
+  const fetcher = async (): Promise<AlertRulesResponse> => {
+    if (!server) throw new Error('No server');
+    const client = getClient(server);
+    return client.listDefaultAlertRules();
+  };
+
+  const swrKey = server ? `default-alert-rules-${server.id}` : null;
+
+  const { data, error, isLoading } = useSWR<AlertRulesResponse>(
+    swrKey,
+    fetcher,
+    {
+      revalidateOnFocus: false,
+      dedupingInterval: 60000,
+    }
+  );
+
+  return {
+    rules: data?.rules || [],
+    isLoading,
+    error,
+  };
+}
