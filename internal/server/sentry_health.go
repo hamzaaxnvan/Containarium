@@ -88,3 +88,183 @@ func (h *SentryHealth) Run(ctx context.Context) {
 	ticks, stop := h.newTicker(h.interval)
 	defer stop()
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			h.Check(ctx)
+		}
+	}
+}
+
+// Check runs one health pass: upsert the finding for the current reason
+// while unhealthy, and resolve every open finding whose subject is no longer
+// the current reason (all of them once healthy).
+func (h *SentryHealth) Check(ctx context.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	subject, note, unhealthy := sentryUnhealthySubject(h.status())
+	backendID := h.backendID()
+	h.adoptLocked(ctx, backendID)
+
+	for id, open := range h.open {
+		if unhealthy && open == subject {
+			continue
+		}
+		if _, err := h.store.Resolve(ctx, id); err != nil && !errors.Is(err, threatdetect.ErrFindingNotOpen) && !errors.Is(err, threatdetect.ErrFindingNotFound) {
+			log.Printf("[sentry-health] resolve finding %d (%q): %v", id, open, err)
+			continue // retried next tick
+		}
+		delete(h.open, id)
+	}
+
+	if !unhealthy {
+		return
+	}
+	f, err := h.store.Upsert(ctx, &threatdetect.Finding{
+		Rule:      pb.ThreatRuleId_THREAT_RULE_ID_SENTRY_UNAVAILABLE,
+		Severity:  pb.ThreatSeverity_THREAT_SEVERITY_MEDIUM,
+		BackendID: backendID,
+		Subject:   subject,
+		Evidence:  threatdetect.Evidence{Configs: []threatdetect.ConfigEvidence{{Note: note}}},
+	})
+	if err != nil {
+		log.Printf("[sentry-health] upsert SENTRY_UNAVAILABLE (%q): %v", note, err)
+		return
+	}
+	h.open[f.ID] = f.Subject
+}
+
+// adoptLocked loads, once, the open SENTRY_UNAVAILABLE rows for this backend
+// that an earlier daemon process left behind, so a restart onto a healthy
+// sentry resolves them instead of leaving them open forever. The query is
+// narrowed to this rule and backend in the store, so open findings of other
+// rules cannot push a stale row out of the page; the 200-row cap then bounds
+// only distinct open reasons on one backend, which in practice is a handful.
+// A List failure is retried on the next tick.
+func (h *SentryHealth) adoptLocked(ctx context.Context, backendID string) {
+	if h.adopted {
+		return
+	}
+	rows, err := h.store.List(ctx, threatdetect.ListFilter{
+		State:     threatdetect.FindingStateOpen,
+		Rule:      pb.ThreatRuleId_THREAT_RULE_ID_SENTRY_UNAVAILABLE,
+		BackendID: backendID,
+		Limit:     200,
+	})
+	if err != nil {
+		log.Printf("[sentry-health] list open findings: %v", err)
+		return
+	}
+	for _, f := range rows {
+		h.open[f.ID] = f.Subject
+	}
+	h.adopted = true
+}
+
+// sentryUnhealthySubject reports whether resp describes an armed sentry that
+// is not running cleanly. note is the full status reason, exactly as
+// `containarium security sentry status` prints it, and goes into the
+// finding's evidence. subject is the same reason with each unhealthy rule's
+// error text dropped ("rule DENY_BURST unhealthy: panic: …" becomes "rule
+// DENY_BURST unhealthy"): a panic message can vary between checks (an index,
+// an address), and a varying subject would resolve one finding and open
+// another on every tick instead of deduping into one row. DISABLED is not a
+// fault (the loop never runs unarmed anyway).
+func sentryUnhealthySubject(resp *pb.GetSentryStatusResponse) (subject, note string, unhealthy bool) {
+	cpuDown := cpuSamplerUnavailable(resp)
+	execDown := execTelemetryDown(resp)
+	switch resp.GetState() {
+	case pb.SentryState_SENTRY_STATE_DISABLED:
+		return "", "", false
+	case pb.SentryState_SENTRY_STATE_OK:
+		if !anyRuleUnhealthy(resp) {
+			if !cpuDown && !execDown {
+				return "", "", false
+			}
+			// Only a signal source is down: the status reason is empty, so the
+			// finding is about that source alone (#2660 for the sampler,
+			// #2637 for exec telemetry) — or both, joined.
+			var subjects, notes []string
+			if cpuDown {
+				subjects = append(subjects, cpuSamplerSubject)
+				notes = append(notes, "cpu-sampler: "+resp.GetCpuSampler())
+			}
+			if execDown {
+				subjects = append(subjects, execTelemetrySubject)
+				notes = append(notes, "exec-telemetry: "+resp.GetExecTelemetry())
+			}
+			return strings.Join(subjects, "; "), strings.Join(notes, "; "), true
+		}
+		note = reasonOr(resp, "a rule is unhealthy")
+	default: // UNAVAILABLE, DEGRADED, UNSPECIFIED
+		note = reasonOr(resp, "sentry state "+strings.TrimPrefix(resp.GetState().String(), "SENTRY_STATE_"))
+	}
+	subject = note
+	for _, r := range resp.GetRules() {
+		if r.GetHealthy() || r.GetLastError() == "" {
+			continue
+		}
+		prefix := ruleUnhealthyPrefix(r.GetRule())
+		subject = strings.ReplaceAll(subject, prefix+": "+r.GetLastError(), prefix)
+	}
+	if cpuDown {
+		// Both faults are one finding: its subject names the sampler without
+		// its varying detail, its note carries the detail.
+		subject += "; " + cpuSamplerSubject
+		note += "; cpu-sampler: " + resp.GetCpuSampler()
+	}
+	if execDown {
+		subject += "; " + execTelemetrySubject
+		note += "; exec-telemetry: " + resp.GetExecTelemetry()
+	}
+	return subject, note, true
+}
+
+// execTelemetrySubject is the stable subject of an exec-telemetry fault
+// (#2637); the watcher's own reason ("unavailable (netbpf: execwatch: load
+// collection: …)") varies and lives in the finding's evidence note.
+const execTelemetrySubject = "exec-telemetry unavailable"
+
+// execTelemetryDown reports whether the status says the exec telemetry
+// cannot run (GetSentryStatusResponse.exec_telemetry begins "unavailable").
+// An armed backend blind to execs is not silent, same rule as the sampler.
+// An empty field (a status from before the field existed) is not a fault.
+func execTelemetryDown(resp *pb.GetSentryStatusResponse) bool {
+	return strings.HasPrefix(resp.GetExecTelemetry(), "unavailable")
+}
+
+// cpuSamplerSubject is the stable subject of a CPU-sampler fault; the
+// sampler's own reason ("unavailable (incus client unavailable: …)") varies
+// and lives in the finding's evidence note.
+const cpuSamplerSubject = "cpu-sampler unavailable"
+
+// cpuSamplerUnavailable reports whether the status says the CPU sampler
+// cannot run (GetSentryStatusResponse.cpu_sampler begins "unavailable"; #2645).
+// An armed backend blind to CPU is not silent (#2660).
+func cpuSamplerUnavailable(resp *pb.GetSentryStatusResponse) bool {
+	return strings.HasPrefix(resp.GetCpuSampler(), "unavailable")
+}
+
+func anyRuleUnhealthy(resp *pb.GetSentryStatusResponse) bool {
+	for _, r := range resp.GetRules() {
+		if !r.GetHealthy() {
+			return true
+		}
+	}
+	return false
+}
+
+// ruleUnhealthyPrefix is the stable head of an unhealthy rule's part of the
+// status reason; ThreatDetectionServer.sentryStatus appends ": <last_error>".
+func ruleUnhealthyPrefix(rule pb.ThreatRuleId) string {
+	return "rule " + strings.TrimPrefix(rule.String(), "THREAT_RULE_ID_") + " unhealthy"
+}
+
+func reasonOr(resp *pb.GetSentryStatusResponse, fallback string) string {
+	if r := resp.GetReason(); r != "" {
+		return r
+	}
+	return fallback
+}
