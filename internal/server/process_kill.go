@@ -75,3 +75,157 @@ type hostProcessKiller struct {
 	procRoot string
 	// initPID returns the container's init pid on the host (0 = not running).
 	initPID func(container string) (int64, error)
+	// open pins pid; errKillProcessGone when it no longer exists.
+	open func(pid int) (pidHandle, error)
+}
+
+func newHostProcessKiller(initPID func(string) (int64, error)) *hostProcessKiller {
+	return &hostProcessKiller{procRoot: execProcRoot, initPID: initPID, open: openPID}
+}
+
+// KillInContainer implements processKiller. Order matters: pin the process
+// first, then compare cgroups and start time, then signal through the pin.
+// A reuse that happens after the pin makes the signal fail (the pinned
+// process is gone) instead of reaching the newcomer. The cgroup check
+// catches a reuse by the host or another box; the start-time check catches
+// a reuse inside the same box between the stamp and the pin (#2765): the
+// pinned pid's /proc/<pid>/stat field 22 must not be later than the exec's
+// boot-clock stamp, both CLOCK_BOOTTIME in USER_HZ ticks. This is the only
+// stat read of the exec path: one per kill attempt, none per exec.
+func (k *hostProcessKiller) KillInContainer(container string, pid uint32, stamp threatdetect.ProcStartTicks) error {
+	if pid <= 1 {
+		return fmt.Errorf("refusing to signal pid %d", pid)
+	}
+	initPID, err := k.initPID(container)
+	if err != nil {
+		return fmt.Errorf("read init pid of %s: %w", container, err)
+	}
+	if initPID <= 0 {
+		return fmt.Errorf("container %s is not running: %w", container, errKillProcessGone)
+	}
+	// Up front, before any pid is pinned or compared (#2768, decided on
+	// #2781): only an Incus container has a payload cgroup that every one of
+	// its processes sits under. On another runtime the compare below could
+	// never hold and would misreport every kill as "pid reused".
+	initRel, err := cgroupV2PathOf(k.procRoot, initPID)
+	if err != nil {
+		return fmt.Errorf("resolve cgroup of %s init %d: %w", container, initPID, err)
+	}
+	want, ok := incusPayloadRoot(initRel)
+	if !ok {
+		return fmt.Errorf("container %s init cgroup %q: %w", container, initRel, errKillRuntimeUnsupported)
+	}
+	if int64(pid) == initPID {
+		return fmt.Errorf("pid %d: %w", pid, errKillContainerInit)
+	}
+	if stamp == 0 {
+		return fmt.Errorf("pid %d: matched exec has no stamp: %w", pid, errKillStartTimeUnknown)
+	}
+	h, err := k.open(int(pid))
+	if err != nil {
+		return fmt.Errorf("pid %d: %w", pid, err)
+	}
+	defer func() { _ = h.Close() }()
+
+	got, err := containerCgroupOf(k.procRoot, int64(pid))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("pid %d: %w", pid, errKillProcessGone)
+		}
+		return fmt.Errorf("resolve cgroup of pid %d: %w", pid, err)
+	}
+	if got != want {
+		return fmt.Errorf("pid %d in %q, container %s in %q: %w", pid, got, container, want, errKillPIDReused)
+	}
+	// After the pin: while the pinned process lives it holds the pid, so
+	// /proc/<pid> is that process; if it died since, /proc/<pid> is gone
+	// (process gone) or a newcomer that started after the pin, hence after
+	// the stamp (refused), and the pidfd signal would fail anyway.
+	cur, err := readProcStart(k.procRoot, pid)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("pid %d: %w", pid, errKillProcessGone)
+		}
+		return fmt.Errorf("pid %d: read start time: %v: %w", pid, err, errKillStartTimeUnknown)
+	}
+	if startedAfterStamp(cur, stamp) {
+		return fmt.Errorf("pid %d started at %d ticks since boot, after its matched exec was seen at %d: %w", pid, cur, stamp, errKillPIDReused)
+	}
+	if err := h.Kill(); err != nil {
+		return fmt.Errorf("pid %d: %w", pid, err)
+	}
+	return nil
+}
+
+// containerCgroupOf reads /proc/<pid>/cgroup and returns the container root
+// cgroup it sits under (containerCgroupRoot), the same resolution the exec
+// watcher registers with the kernel.
+func containerCgroupOf(procRoot string, pid int64) (string, error) {
+	rel, err := cgroupV2PathOf(procRoot, pid)
+	if err != nil {
+		return "", err
+	}
+	return containerCgroupRoot(rel), nil
+}
+
+// cgroupV2PathOf reads pid's cgroup v2 path from /proc/<pid>/cgroup.
+func cgroupV2PathOf(procRoot string, pid int64) (string, error) {
+	// #nosec G304 -- procRoot is a constant (or a test fixture) and pid an
+	// integer from Incus or the kernel's exec record.
+	raw, err := os.ReadFile(filepath.Join(procRoot, strconv.FormatInt(pid, 10), "cgroup"))
+	if err != nil {
+		return "", err
+	}
+	rel := incus.CgroupV2PathFromProc(string(raw))
+	if rel == "" {
+		return "", fmt.Errorf("pid %d: no cgroup v2 path", pid)
+	}
+	return rel, nil
+}
+
+// procStatStartTimeField is the 1-based field of /proc/<pid>/stat holding
+// the process start time (proc(5): "(22) starttime", clock ticks since
+// boot). Fields are counted from 3 after the comm's closing parenthesis.
+const procStatStartTimeField = 22
+
+// readProcStart is the stat reader the kill uses: readProcStartTime, a
+// counting fake in the tests that prove the exec path never reads /proc
+// per exec.
+var readProcStart = readProcStartTime
+
+// readProcStartTime reads pid's start time from <procRoot>/<pid>/stat. A
+// missing file (fs.ErrNotExist) means the process is gone.
+func readProcStartTime(procRoot string, pid uint32) (threatdetect.ProcStartTicks, error) {
+	// #nosec G304 -- procRoot is a constant (or a test fixture) and pid an
+	// integer from the kernel's exec record.
+	raw, err := os.ReadFile(filepath.Join(procRoot, strconv.FormatUint(uint64(pid), 10), "stat"))
+	if err != nil {
+		return 0, err
+	}
+	return parseProcStatStartTime(raw)
+}
+
+// parseProcStatStartTime returns field 22 of a /proc/<pid>/stat line. The
+// comm (field 2) is in parentheses and may itself contain spaces and
+// parentheses, so the fields are split after the LAST ')' — a process
+// cannot rename itself into shifting the start time. 0 is never a valid
+// start time here (it is the "unknown" value), so it is an error.
+func parseProcStatStartTime(stat []byte) (threatdetect.ProcStartTicks, error) {
+	i := bytes.LastIndexByte(stat, ')')
+	if i < 0 {
+		return 0, errors.New("stat: no comm terminator")
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	const idx = procStatStartTimeField - 3 // fields[0] is field 3 (state)
+	if len(fields) <= idx {
+		return 0, fmt.Errorf("stat: %d fields after comm, need %d", len(fields), idx+1)
+	}
+	v, err := strconv.ParseUint(fields[idx], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("stat: start time %q: %w", fields[idx], err)
+	}
+	if v == 0 {
+		return 0, errors.New("stat: start time 0")
+	}
+	return threatdetect.ProcStartTicks(v), nil
+}

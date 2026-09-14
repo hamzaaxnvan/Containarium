@@ -296,3 +296,78 @@ func (s *Scanner) getAlerts(baseURL string) ([]Alert, error) {
 
 	var alerts []Alert
 	for _, za := range result.Alerts {
+		risk := strings.ToLower(za.Risk)
+		if risk == "" {
+			risk = "informational"
+		}
+
+		fp := AlertFingerprint(za.PluginID, za.URL, za.Alert)
+
+		cweIDs := ""
+		if za.CWEId != "" && za.CWEId != "0" {
+			cweIDs = "CWE-" + za.CWEId
+		}
+
+		alerts = append(alerts, Alert{
+			Fingerprint: fp,
+			PluginID:    za.PluginID,
+			AlertName:   za.Alert,
+			Risk:        risk,
+			Confidence:  strings.ToLower(za.Confidence),
+			Description: za.Description,
+			URL:         za.URL,
+			Method:      za.Method,
+			Evidence:    za.Evidence,
+			Solution:    za.Solution,
+			CWEIDs:      cweIDs,
+			References:  za.Reference,
+		})
+	}
+
+	return alerts, nil
+}
+
+// apiGet makes a GET request to ZAP's REST API and returns parsed JSON
+func (s *Scanner) apiGet(path string) (map[string]interface{}, error) {
+	raw, err := s.apiGetRaw(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse ZAP API response: %w", err)
+	}
+	return result, nil
+}
+
+// apiGetRaw makes a GET request to ZAP's REST API and returns the raw body
+func (s *Scanner) apiGetRaw(path string) (string, error) {
+	if s.apiBase == "" {
+		return "", fmt.Errorf("ZAP API base URL not set — daemon not running")
+	}
+
+	resp, err := s.httpClient.Get(s.apiBase + path)
+	if err != nil {
+		return "", fmt.Errorf("ZAP API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read ZAP API response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ZAP API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return string(body), nil
+}
+
+// AlertFingerprint generates a SHA-256 fingerprint for deduplication
+func AlertFingerprint(pluginID, url, alert string) string {
+	data := fmt.Sprintf("%s|%s|%s", pluginID, url, alert)
+	hash := sha256.Sum256([]byte(data))
+	return fmt.Sprintf("%x", hash)
+}
