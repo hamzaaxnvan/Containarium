@@ -135,3 +135,141 @@ func runTokenInspect(cmd *cobra.Command, args []string) error {
 		}
 		if _, verr := tm.ValidateToken(token); verr == nil {
 			inspected.SignatureOK = true
+			inspected.Validated = true
+		} else {
+			inspected.Validated = true
+			// SignatureOK stays false; the validator's
+			// generic "invalid token" error is intentional
+			// and we surface that fact rather than
+			// inventing a more-specific reason.
+		}
+	}
+
+	if tokenRaw {
+		// JSON output for scripting / jq.
+		out, _ := json.MarshalIndent(inspected, "", "  ")
+		fmt.Println(string(out))
+		return nil
+	}
+
+	// Human-readable banner.
+	fmt.Printf("\n═══════════════════════════════════════════════════════════════\n")
+	fmt.Printf("  JWT Inspection\n")
+	fmt.Printf("═══════════════════════════════════════════════════════════════\n\n")
+	if inspected.Username != "" {
+		fmt.Printf("  Username:  %s\n", inspected.Username)
+	}
+	if inspected.Subject != "" && inspected.Subject != inspected.Username {
+		fmt.Printf("  Subject:   %s\n", inspected.Subject)
+	}
+	if len(inspected.Roles) > 0 {
+		fmt.Printf("  Roles:     %v\n", inspected.Roles)
+	}
+	if len(inspected.Scopes) > 0 {
+		fmt.Printf("  Scopes:    %v\n", inspected.Scopes)
+	} else {
+		fmt.Printf("  Scopes:    <none> (unrestricted)\n")
+	}
+	if inspected.TokenType != "" {
+		fmt.Printf("  Type:      %s\n", inspected.TokenType)
+	} else {
+		fmt.Printf("  Type:      <unset> (legacy / access semantics)\n")
+	}
+	if inspected.Issuer != "" {
+		fmt.Printf("  Issuer:    %s\n", inspected.Issuer)
+	}
+	if len(inspected.Audience) > 0 {
+		fmt.Printf("  Audience:  %v\n", inspected.Audience)
+	}
+	if inspected.JTI != "" {
+		fmt.Printf("  JTI:       %s\n", inspected.JTI)
+	}
+	if !inspected.IssuedAt.IsZero() {
+		fmt.Printf("  Issued:    %s\n", inspected.IssuedAt.Format(time.RFC3339))
+	}
+	if !inspected.Expiry.IsZero() {
+		now := time.Now()
+		remaining := inspected.Expiry.Sub(now).Round(time.Second)
+		if remaining > 0 {
+			fmt.Printf("  Expires:   %s (in %s)\n", inspected.Expiry.Format(time.RFC3339), remaining)
+		} else {
+			fmt.Printf("  Expires:   %s (EXPIRED %s ago)\n", inspected.Expiry.Format(time.RFC3339), -remaining)
+		}
+	}
+	if !inspected.NotBefore.IsZero() {
+		fmt.Printf("  NotBefore: %s\n", inspected.NotBefore.Format(time.RFC3339))
+	}
+	fmt.Println()
+	if inspected.Validated {
+		if inspected.SignatureOK {
+			fmt.Printf("  ✓ Signature valid (iss + aud + exp all check out)\n")
+		} else {
+			fmt.Printf("  ✗ Signature INVALID (or iss/aud/exp mismatch)\n")
+		}
+	} else {
+		fmt.Printf("  (signature not validated — pass --secret or --secret-file to check)\n")
+	}
+	fmt.Println()
+	return nil
+}
+
+// claimsFromRaw extracts the well-known claim names from
+// the decoded payload. Tolerant — missing fields just
+// stay zero. The JWT spec says exp/iat/nbf can be either
+// numeric (seconds since epoch) or RFC3339; the json
+// package gives us a float64 for the numeric case, which
+// we coerce.
+func claimsFromRaw(raw map[string]any) inspectedClaims {
+	out := inspectedClaims{}
+	if v, ok := raw["username"].(string); ok {
+		out.Username = v
+	}
+	if v, ok := raw["sub"].(string); ok {
+		out.Subject = v
+	}
+	if v, ok := raw["roles"].([]any); ok {
+		for _, r := range v {
+			if s, ok := r.(string); ok {
+				out.Roles = append(out.Roles, s)
+			}
+		}
+	}
+	if v, ok := raw["scopes"].([]any); ok {
+		for _, s := range v {
+			if str, ok := s.(string); ok {
+				out.Scopes = append(out.Scopes, str)
+			}
+		}
+	}
+	if v, ok := raw["tt"].(string); ok {
+		out.TokenType = v
+	}
+	if v, ok := raw["iss"].(string); ok {
+		out.Issuer = v
+	}
+	switch v := raw["aud"].(type) {
+	case string:
+		if v != "" {
+			out.Audience = []string{v}
+		}
+	case []any:
+		for _, a := range v {
+			if s, ok := a.(string); ok {
+				out.Audience = append(out.Audience, s)
+			}
+		}
+	}
+	if v, ok := raw["jti"].(string); ok {
+		out.JTI = v
+	}
+	if v, ok := raw["iat"].(float64); ok {
+		out.IssuedAt = time.Unix(int64(v), 0).UTC()
+	}
+	if v, ok := raw["nbf"].(float64); ok {
+		out.NotBefore = time.Unix(int64(v), 0).UTC()
+	}
+	if v, ok := raw["exp"].(float64); ok {
+		out.Expiry = time.Unix(int64(v), 0).UTC()
+	}
+	return out
+}
