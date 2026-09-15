@@ -52,3 +52,22 @@ export type GatewayProvider = z.infer<typeof GatewayProviderSchema>;
 
 export const AgentEngineStatusSchema = z.object({
   engine: AgentEngineSchema,
+  provider: GatewayProviderSchema,
+  readiness: AgentEngineReadinessSchema,
+  reason: z.string().default(''),
+  source: AgentCredentialSourceSchema,
+  isDefault: z.boolean().default(false),
+  skillIds: z.array(z.string()).default([]),
+});
+export type AgentEngineStatus = z.infer<typeof AgentEngineStatusSchema>;
+
+// AGENT_ENGINE_STATUS_KEYS pins the exact wire keys this schema expects, so
+// swagger-contract.test.ts can diff them against the generated swagger's
+// AgentEngineStatus property names.
+export const AgentEngineStatusKeys = ['engine', 'provider', 'readiness', 'reason', 'source', 'isDefault', 'skillIds'] as const;
+
+export const ListAgentEnginesResponseSchema = z.object({
+  engines: z.array(AgentEngineStatusSchema).default([]),
+  keyOwner: z.string().default(''),
+});
+export type ListAgentEnginesResponse = z.infer<typeof ListAgentEnginesResponseSchema>;

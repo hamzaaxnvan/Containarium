@@ -2531,3 +2531,1270 @@ type ListBadDestinationsRequest struct {
 
 func (x *ListBadDestinationsRequest) Reset() {
 	*x = ListBadDestinationsRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListBadDestinationsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListBadDestinationsRequest) ProtoMessage() {}
+
+func (x *ListBadDestinationsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListBadDestinationsRequest.ProtoReflect.Descriptor instead.
+func (*ListBadDestinationsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{24}
+}
+
+type ListBadDestinationsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Entries       []*BadDestinationEntry `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListBadDestinationsResponse) Reset() {
+	*x = ListBadDestinationsResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListBadDestinationsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListBadDestinationsResponse) ProtoMessage() {}
+
+func (x *ListBadDestinationsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListBadDestinationsResponse.ProtoReflect.Descriptor instead.
+func (*ListBadDestinationsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *ListBadDestinationsResponse) GetEntries() []*BadDestinationEntry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+type AddBadDestinationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Cidr          string                 `protobuf:"bytes,1,opt,name=cidr,proto3" json:"cidr,omitempty"`
+	Label         string                 `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AddBadDestinationRequest) Reset() {
+	*x = AddBadDestinationRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AddBadDestinationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AddBadDestinationRequest) ProtoMessage() {}
+
+func (x *AddBadDestinationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AddBadDestinationRequest.ProtoReflect.Descriptor instead.
+func (*AddBadDestinationRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *AddBadDestinationRequest) GetCidr() string {
+	if x != nil {
+		return x.Cidr
+	}
+	return ""
+}
+
+func (x *AddBadDestinationRequest) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+type AddBadDestinationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Entry         *BadDestinationEntry   `protobuf:"bytes,1,opt,name=entry,proto3" json:"entry,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AddBadDestinationResponse) Reset() {
+	*x = AddBadDestinationResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AddBadDestinationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AddBadDestinationResponse) ProtoMessage() {}
+
+func (x *AddBadDestinationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AddBadDestinationResponse.ProtoReflect.Descriptor instead.
+func (*AddBadDestinationResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *AddBadDestinationResponse) GetEntry() *BadDestinationEntry {
+	if x != nil {
+		return x.Entry
+	}
+	return nil
+}
+
+type RemoveBadDestinationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Cidr          string                 `protobuf:"bytes,1,opt,name=cidr,proto3" json:"cidr,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveBadDestinationRequest) Reset() {
+	*x = RemoveBadDestinationRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveBadDestinationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveBadDestinationRequest) ProtoMessage() {}
+
+func (x *RemoveBadDestinationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveBadDestinationRequest.ProtoReflect.Descriptor instead.
+func (*RemoveBadDestinationRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *RemoveBadDestinationRequest) GetCidr() string {
+	if x != nil {
+		return x.Cidr
+	}
+	return ""
+}
+
+type RemoveBadDestinationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveBadDestinationResponse) Reset() {
+	*x = RemoveBadDestinationResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveBadDestinationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveBadDestinationResponse) ProtoMessage() {}
+
+func (x *RemoveBadDestinationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveBadDestinationResponse.ProtoReflect.Descriptor instead.
+func (*RemoveBadDestinationResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{29}
+}
+
+// MinerSignature is one entry of the miner-signature list: the embedded,
+// versioned baseline or an operator addition.
+type MinerSignature struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Kind    MinerSignatureKind     `protobuf:"varint,1,opt,name=kind,proto3,enum=containarium.v1.MinerSignatureKind" json:"kind,omitempty"`
+	Pattern string                 `protobuf:"bytes,2,opt,name=pattern,proto3" json:"pattern,omitempty"`
+	Label   string                 `protobuf:"bytes,3,opt,name=label,proto3" json:"label,omitempty"`
+	// True for a baseline entry shipped with the daemon; those cannot be
+	// removed.
+	Builtin       bool `protobuf:"varint,4,opt,name=builtin,proto3" json:"builtin,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MinerSignature) Reset() {
+	*x = MinerSignature{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MinerSignature) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MinerSignature) ProtoMessage() {}
+
+func (x *MinerSignature) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MinerSignature.ProtoReflect.Descriptor instead.
+func (*MinerSignature) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *MinerSignature) GetKind() MinerSignatureKind {
+	if x != nil {
+		return x.Kind
+	}
+	return MinerSignatureKind_MINER_SIGNATURE_KIND_UNSPECIFIED
+}
+
+func (x *MinerSignature) GetPattern() string {
+	if x != nil {
+		return x.Pattern
+	}
+	return ""
+}
+
+func (x *MinerSignature) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *MinerSignature) GetBuiltin() bool {
+	if x != nil {
+		return x.Builtin
+	}
+	return false
+}
+
+type ListMinerSignaturesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListMinerSignaturesRequest) Reset() {
+	*x = ListMinerSignaturesRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListMinerSignaturesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListMinerSignaturesRequest) ProtoMessage() {}
+
+func (x *ListMinerSignaturesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListMinerSignaturesRequest.ProtoReflect.Descriptor instead.
+func (*ListMinerSignaturesRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{31}
+}
+
+type ListMinerSignaturesResponse struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Signatures []*MinerSignature      `protobuf:"bytes,1,rep,name=signatures,proto3" json:"signatures,omitempty"`
+	// Version of the embedded baseline this daemon build ships.
+	BaselineVersion string `protobuf:"bytes,2,opt,name=baseline_version,json=baselineVersion,proto3" json:"baseline_version,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *ListMinerSignaturesResponse) Reset() {
+	*x = ListMinerSignaturesResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListMinerSignaturesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListMinerSignaturesResponse) ProtoMessage() {}
+
+func (x *ListMinerSignaturesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListMinerSignaturesResponse.ProtoReflect.Descriptor instead.
+func (*ListMinerSignaturesResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *ListMinerSignaturesResponse) GetSignatures() []*MinerSignature {
+	if x != nil {
+		return x.Signatures
+	}
+	return nil
+}
+
+func (x *ListMinerSignaturesResponse) GetBaselineVersion() string {
+	if x != nil {
+		return x.BaselineVersion
+	}
+	return ""
+}
+
+type AddMinerSignatureRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// kind and pattern are required; builtin is ignored.
+	Signature     *MinerSignature `protobuf:"bytes,1,opt,name=signature,proto3" json:"signature,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AddMinerSignatureRequest) Reset() {
+	*x = AddMinerSignatureRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AddMinerSignatureRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AddMinerSignatureRequest) ProtoMessage() {}
+
+func (x *AddMinerSignatureRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AddMinerSignatureRequest.ProtoReflect.Descriptor instead.
+func (*AddMinerSignatureRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *AddMinerSignatureRequest) GetSignature() *MinerSignature {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+type AddMinerSignatureResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Signature     *MinerSignature        `protobuf:"bytes,1,opt,name=signature,proto3" json:"signature,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AddMinerSignatureResponse) Reset() {
+	*x = AddMinerSignatureResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AddMinerSignatureResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AddMinerSignatureResponse) ProtoMessage() {}
+
+func (x *AddMinerSignatureResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AddMinerSignatureResponse.ProtoReflect.Descriptor instead.
+func (*AddMinerSignatureResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *AddMinerSignatureResponse) GetSignature() *MinerSignature {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+type RemoveMinerSignatureRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Kind          MinerSignatureKind     `protobuf:"varint,1,opt,name=kind,proto3,enum=containarium.v1.MinerSignatureKind" json:"kind,omitempty"`
+	Pattern       string                 `protobuf:"bytes,2,opt,name=pattern,proto3" json:"pattern,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveMinerSignatureRequest) Reset() {
+	*x = RemoveMinerSignatureRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveMinerSignatureRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveMinerSignatureRequest) ProtoMessage() {}
+
+func (x *RemoveMinerSignatureRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveMinerSignatureRequest.ProtoReflect.Descriptor instead.
+func (*RemoveMinerSignatureRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *RemoveMinerSignatureRequest) GetKind() MinerSignatureKind {
+	if x != nil {
+		return x.Kind
+	}
+	return MinerSignatureKind_MINER_SIGNATURE_KIND_UNSPECIFIED
+}
+
+func (x *RemoveMinerSignatureRequest) GetPattern() string {
+	if x != nil {
+		return x.Pattern
+	}
+	return ""
+}
+
+type RemoveMinerSignatureResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveMinerSignatureResponse) Reset() {
+	*x = RemoveMinerSignatureResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveMinerSignatureResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveMinerSignatureResponse) ProtoMessage() {}
+
+func (x *RemoveMinerSignatureResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveMinerSignatureResponse.ProtoReflect.Descriptor instead.
+func (*RemoveMinerSignatureResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{36}
+}
+
+// ListFindingsRequest filters ListFindings. Every field is optional; an
+// unset field matches everything. tenant_id is enforced by the server's RBAC
+// interceptor the same way ListContainersRequest.username is: a non-admin
+// caller may only ever see their own tenant_id, regardless of what (if
+// anything) they set here.
+type ListFindingsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Exact match. THREAT_SEVERITY_UNSPECIFIED (default) matches any severity.
+	Severity ThreatSeverity `protobuf:"varint,1,opt,name=severity,proto3,enum=containarium.v1.ThreatSeverity" json:"severity,omitempty"`
+	TenantId string         `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	// Only findings last seen at or after this time. Unset matches everything.
+	Since *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=since,proto3" json:"since,omitempty"`
+	// Exact match. FINDING_STATE_UNSPECIFIED (default) matches any state.
+	State FindingState `protobuf:"varint,4,opt,name=state,proto3,enum=containarium.v1.FindingState" json:"state,omitempty"`
+	// <= 0 or > 200 is treated as the server default (50).
+	Limit         int32 `protobuf:"varint,5,opt,name=limit,proto3" json:"limit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListFindingsRequest) Reset() {
+	*x = ListFindingsRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListFindingsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListFindingsRequest) ProtoMessage() {}
+
+func (x *ListFindingsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListFindingsRequest.ProtoReflect.Descriptor instead.
+func (*ListFindingsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *ListFindingsRequest) GetSeverity() ThreatSeverity {
+	if x != nil {
+		return x.Severity
+	}
+	return ThreatSeverity_THREAT_SEVERITY_UNSPECIFIED
+}
+
+func (x *ListFindingsRequest) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
+func (x *ListFindingsRequest) GetSince() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Since
+	}
+	return nil
+}
+
+func (x *ListFindingsRequest) GetState() FindingState {
+	if x != nil {
+		return x.State
+	}
+	return FindingState_FINDING_STATE_UNSPECIFIED
+}
+
+func (x *ListFindingsRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type ListFindingsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Findings      []*Finding             `protobuf:"bytes,1,rep,name=findings,proto3" json:"findings,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListFindingsResponse) Reset() {
+	*x = ListFindingsResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListFindingsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListFindingsResponse) ProtoMessage() {}
+
+func (x *ListFindingsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListFindingsResponse.ProtoReflect.Descriptor instead.
+func (*ListFindingsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *ListFindingsResponse) GetFindings() []*Finding {
+	if x != nil {
+		return x.Findings
+	}
+	return nil
+}
+
+type ResolveFindingRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResolveFindingRequest) Reset() {
+	*x = ResolveFindingRequest{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResolveFindingRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResolveFindingRequest) ProtoMessage() {}
+
+func (x *ResolveFindingRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResolveFindingRequest.ProtoReflect.Descriptor instead.
+func (*ResolveFindingRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *ResolveFindingRequest) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+type ResolveFindingResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Finding       *Finding               `protobuf:"bytes,1,opt,name=finding,proto3" json:"finding,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResolveFindingResponse) Reset() {
+	*x = ResolveFindingResponse{}
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResolveFindingResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResolveFindingResponse) ProtoMessage() {}
+
+func (x *ResolveFindingResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_threatdetection_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResolveFindingResponse.ProtoReflect.Descriptor instead.
+func (*ResolveFindingResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_threatdetection_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *ResolveFindingResponse) GetFinding() *Finding {
+	if x != nil {
+		return x.Finding
+	}
+	return nil
+}
+
+var File_containarium_v1_threatdetection_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_threatdetection_proto_rawDesc = "" +
+	"\n" +
+	"%containarium/v1/threatdetection.proto\x12\x0fcontainarium.v1\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1cgoogle/api/annotations.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\"\xcc\x02\n" +
+	"\fFlowEvidence\x12\x15\n" +
+	"\x06src_ip\x18\x01 \x01(\tR\x05srcIp\x12\x15\n" +
+	"\x06dst_ip\x18\x02 \x01(\tR\x05dstIp\x12\x19\n" +
+	"\bsrc_port\x18\x03 \x01(\rR\asrcPort\x12\x19\n" +
+	"\bdst_port\x18\x04 \x01(\rR\adstPort\x12\x1a\n" +
+	"\bprotocol\x18\x05 \x01(\tR\bprotocol\x12\x14\n" +
+	"\x05bytes\x18\x06 \x01(\x03R\x05bytes\x12\x18\n" +
+	"\apackets\x18\a \x01(\x03R\apackets\x129\n" +
+	"\n" +
+	"first_seen\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tfirstSeen\x127\n" +
+	"\tlast_seen\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\blastSeen\x12\x18\n" +
+	"\amatched\x18\n" +
+	" \x01(\tR\amatched\"\x8a\x01\n" +
+	"\fDenyEvidence\x12\x15\n" +
+	"\x06dst_ip\x18\x01 \x01(\tR\x05dstIp\x12\x19\n" +
+	"\bdst_port\x18\x02 \x01(\rR\adstPort\x12\x1a\n" +
+	"\bprotocol\x18\x03 \x01(\tR\bprotocol\x12\x16\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\x12\x14\n" +
+	"\x05count\x18\x05 \x01(\x03R\x05count\"\x8c\x01\n" +
+	"\x0eConfigEvidence\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1c\n" +
+	"\tdirective\x18\x02 \x01(\tR\tdirective\x12\x14\n" +
+	"\x05value\x18\x03 \x01(\tR\x05value\x12\x1e\n" +
+	"\n" +
+	"remediated\x18\x04 \x01(\bR\n" +
+	"remediated\x12\x12\n" +
+	"\x04note\x18\x05 \x01(\tR\x04note\"\x87\x01\n" +
+	"\x10ListenerEvidence\x12\x12\n" +
+	"\x04port\x18\x01 \x01(\rR\x04port\x12!\n" +
+	"\fbind_address\x18\x02 \x01(\tR\vbindAddress\x12\x10\n" +
+	"\x03pid\x18\x03 \x01(\rR\x03pid\x12\x16\n" +
+	"\x06binary\x18\x04 \x01(\tR\x06binary\x12\x12\n" +
+	"\x04note\x18\x05 \x01(\tR\x04note\"\x8c\x01\n" +
+	"\vCPUEvidence\x12\x1d\n" +
+	"\n" +
+	"mean_cores\x18\x01 \x01(\x01R\tmeanCores\x12\x1d\n" +
+	"\n" +
+	"peak_cores\x18\x02 \x01(\x01R\tpeakCores\x12%\n" +
+	"\x0ewindow_seconds\x18\x03 \x01(\x03R\rwindowSeconds\x12\x18\n" +
+	"\asamples\x18\x04 \x01(\x05R\asamples\"\xe3\x01\n" +
+	"\fExecEvidence\x12\x10\n" +
+	"\x03pid\x18\x01 \x01(\rR\x03pid\x12\x12\n" +
+	"\x04ppid\x18\x02 \x01(\rR\x04ppid\x12\x10\n" +
+	"\x03uid\x18\x03 \x01(\rR\x03uid\x12\x12\n" +
+	"\x04comm\x18\x04 \x01(\tR\x04comm\x12\x1a\n" +
+	"\bfilename\x18\x05 \x01(\tR\bfilename\x12\x12\n" +
+	"\x04argv\x18\x06 \x01(\tR\x04argv\x12%\n" +
+	"\x0eargv_truncated\x18\a \x01(\bR\rargvTruncated\x12\x16\n" +
+	"\x06sha256\x18\b \x01(\tR\x06sha256\x12\x18\n" +
+	"\amatched\x18\t \x01(\tR\amatched\"\xd7\x02\n" +
+	"\bEvidence\x123\n" +
+	"\x05flows\x18\x01 \x03(\v2\x1d.containarium.v1.FlowEvidenceR\x05flows\x125\n" +
+	"\x06denies\x18\x02 \x03(\v2\x1d.containarium.v1.DenyEvidenceR\x06denies\x129\n" +
+	"\aconfigs\x18\x03 \x03(\v2\x1f.containarium.v1.ConfigEvidenceR\aconfigs\x12?\n" +
+	"\tlisteners\x18\x04 \x03(\v2!.containarium.v1.ListenerEvidenceR\tlisteners\x12.\n" +
+	"\x03cpu\x18\x05 \x03(\v2\x1c.containarium.v1.CPUEvidenceR\x03cpu\x123\n" +
+	"\x05execs\x18\x06 \x03(\v2\x1d.containarium.v1.ExecEvidenceR\x05execs\"\xff\x01\n" +
+	"\x18MiningBehaviorThresholds\x12\x1b\n" +
+	"\tmin_cores\x18\x01 \x01(\x01R\bminCores\x121\n" +
+	"\x06window\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x06window\x12;\n" +
+	"\fflow_min_age\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\n" +
+	"flowMinAge\x12#\n" +
+	"\rstratum_ports\x18\x04 \x03(\rR\fstratumPorts\x121\n" +
+	"\x15min_fraction_of_limit\x18\x05 \x01(\x01R\x12minFractionOfLimit\"\xb1\x04\n" +
+	"\aFinding\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x121\n" +
+	"\x04rule\x18\x02 \x01(\x0e2\x1d.containarium.v1.ThreatRuleIdR\x04rule\x12;\n" +
+	"\bseverity\x18\x03 \x01(\x0e2\x1f.containarium.v1.ThreatSeverityR\bseverity\x12\x1b\n" +
+	"\ttenant_id\x18\x04 \x01(\tR\btenantId\x12\x1c\n" +
+	"\tcontainer\x18\x05 \x01(\tR\tcontainer\x12\x1d\n" +
+	"\n" +
+	"backend_id\x18\x06 \x01(\tR\tbackendId\x12\x18\n" +
+	"\asubject\x18\a \x01(\tR\asubject\x123\n" +
+	"\x05state\x18\b \x01(\x0e2\x1d.containarium.v1.FindingStateR\x05state\x12\x14\n" +
+	"\x05count\x18\t \x01(\x03R\x05count\x125\n" +
+	"\bevidence\x18\n" +
+	" \x01(\v2\x19.containarium.v1.EvidenceR\bevidence\x129\n" +
+	"\n" +
+	"first_seen\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\tfirstSeen\x127\n" +
+	"\tlast_seen\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\blastSeen\x12<\n" +
+	"\bresponse\x18\r \x01(\v2 .containarium.v1.FindingResponseR\bresponse\"\xae\x04\n" +
+	"\x0fFindingResponse\x126\n" +
+	"\x06action\x18\x01 \x01(\x0e2\x1e.containarium.v1.ProcessActionR\x06action\x124\n" +
+	"\x05state\x18\x02 \x01(\x0e2\x1e.containarium.v1.ResponseStateR\x05state\x12%\n" +
+	"\x0eprocess_killed\x18\x03 \x01(\bR\rprocessKilled\x129\n" +
+	"\n" +
+	"applied_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tappliedAt\x129\n" +
+	"\n" +
+	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12;\n" +
+	"\vreleased_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"releasedAt\x12\x1f\n" +
+	"\vreleased_by\x18\a \x01(\tR\n" +
+	"releasedBy\x12\x14\n" +
+	"\x05error\x18\b \x01(\tR\x05error\x12\x1d\n" +
+	"\n" +
+	"killed_pid\x18\t \x01(\rR\tkilledPid\x12I\n" +
+	"\x10kill_skip_reason\x18\n" +
+	" \x01(\x0e2\x1f.containarium.v1.KillSkipReasonR\x0ekillSkipReason\x12\x14\n" +
+	"\x05kills\x18\v \x01(\rR\x05kills\x12\x1c\n" +
+	"\tcontainer\x18\f \x01(\tR\tcontainer\"\xb0\x02\n" +
+	"\rProcessPolicy\x126\n" +
+	"\x06action\x18\x01 \x01(\x0e2\x1e.containarium.v1.ProcessActionR\x06action\x12-\n" +
+	"\x12throttle_allowance\x18\x02 \x01(\tR\x11throttleAllowance\x12+\n" +
+	"\x03ttl\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\x12&\n" +
+	"\fkill_process\x18\x04 \x01(\bH\x00R\vkillProcess\x88\x01\x01\x12R\n" +
+	"\x0fmining_behavior\x18\x05 \x01(\v2).containarium.v1.MiningBehaviorThresholdsR\x0eminingBehaviorB\x0f\n" +
+	"\r_kill_process\"7\n" +
+	"\x17GetProcessPolicyRequest\x12\x1c\n" +
+	"\tcontainer\x18\x01 \x01(\tR\tcontainer\"\xb1\x01\n" +
+	"\x18GetProcessPolicyResponse\x126\n" +
+	"\x06policy\x18\x01 \x01(\v2\x1e.containarium.v1.ProcessPolicyR\x06policy\x12\x1f\n" +
+	"\vis_override\x18\x02 \x01(\bR\n" +
+	"isOverride\x12<\n" +
+	"\teffective\x18\x03 \x01(\v2\x1e.containarium.v1.ProcessPolicyR\teffective\"\x96\x01\n" +
+	"\x17SetProcessPolicyRequest\x12\x1c\n" +
+	"\tcontainer\x18\x01 \x01(\tR\tcontainer\x126\n" +
+	"\x06policy\x18\x02 \x01(\v2\x1e.containarium.v1.ProcessPolicyR\x06policy\x12%\n" +
+	"\x0eclear_override\x18\x03 \x01(\bR\rclearOverride\"X\n" +
+	"\x18SetProcessPolicyResponse\x12<\n" +
+	"\teffective\x18\x01 \x01(\v2\x1e.containarium.v1.ProcessPolicyR\teffective\";\n" +
+	"\x1bReleaseProcessActionRequest\x12\x1c\n" +
+	"\tcontainer\x18\x01 \x01(\tR\tcontainer\"\xbc\x01\n" +
+	"\x1cReleaseProcessActionResponse\x122\n" +
+	"\afinding\x18\x01 \x01(\v2\x18.containarium.v1.FindingR\afinding\x12*\n" +
+	"\x11finding_kept_open\x18\x02 \x01(\bR\x0ffindingKeptOpen\x12<\n" +
+	"\breleased\x18\x03 \x01(\v2 .containarium.v1.FindingResponseR\breleased\"\xb8\x01\n" +
+	"\n" +
+	"RuleStatus\x121\n" +
+	"\x04rule\x18\x01 \x01(\x0e2\x1d.containarium.v1.ThreatRuleIdR\x04rule\x12\x18\n" +
+	"\ahealthy\x18\x02 \x01(\bR\ahealthy\x12\x1d\n" +
+	"\n" +
+	"last_error\x18\x03 \x01(\tR\tlastError\x12>\n" +
+	"\rlast_error_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\vlastErrorAt\"\x18\n" +
+	"\x16GetSentryStatusRequest\"\xba\x02\n" +
+	"\x17GetSentryStatusResponse\x122\n" +
+	"\x05state\x18\x01 \x01(\x0e2\x1c.containarium.v1.SentryStateR\x05state\x12\x16\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\x121\n" +
+	"\x05rules\x18\x03 \x03(\v2\x1b.containarium.v1.RuleStatusR\x05rules\x12\x1f\n" +
+	"\vcpu_sampler\x18\x04 \x01(\tR\n" +
+	"cpuSampler\x12%\n" +
+	"\x0eexec_telemetry\x18\x05 \x01(\tR\rexecTelemetry\x12(\n" +
+	"\x10exec_events_lost\x18\x06 \x01(\x03R\x0eexecEventsLost\x12.\n" +
+	"\x13exec_hashes_dropped\x18\a \x01(\x03R\x11execHashesDropped\"\xa5\x01\n" +
+	"\tExecEvent\x12\x1c\n" +
+	"\tcontainer\x18\x01 \x01(\tR\tcontainer\x12\x1b\n" +
+	"\ttenant_id\x18\x02 \x01(\tR\btenantId\x12*\n" +
+	"\x02at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x02at\x121\n" +
+	"\x04exec\x18\x04 \x01(\v2\x1d.containarium.v1.ExecEvidenceR\x04exec\"L\n" +
+	"\x18StreamExecEventsResponse\x120\n" +
+	"\x05event\x18\x01 \x01(\v2\x1a.containarium.v1.ExecEventR\x05event\"\x80\x01\n" +
+	"\x17StreamExecEventsRequest\x12\x1c\n" +
+	"\tcontainer\x18\x01 \x01(\tR\tcontainer\x12/\n" +
+	"\x05since\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x05since\x12\x16\n" +
+	"\x06follow\x18\x03 \x01(\bR\x06follow\"W\n" +
+	"\x13BadDestinationEntry\x12\x12\n" +
+	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12\x14\n" +
+	"\x05label\x18\x02 \x01(\tR\x05label\x12\x16\n" +
+	"\x06source\x18\x03 \x01(\tR\x06source\"\x1c\n" +
+	"\x1aListBadDestinationsRequest\"]\n" +
+	"\x1bListBadDestinationsResponse\x12>\n" +
+	"\aentries\x18\x01 \x03(\v2$.containarium.v1.BadDestinationEntryR\aentries\"D\n" +
+	"\x18AddBadDestinationRequest\x12\x12\n" +
+	"\x04cidr\x18\x01 \x01(\tR\x04cidr\x12\x14\n" +
+	"\x05label\x18\x02 \x01(\tR\x05label\"W\n" +
+	"\x19AddBadDestinationResponse\x12:\n" +
+	"\x05entry\x18\x01 \x01(\v2$.containarium.v1.BadDestinationEntryR\x05entry\"1\n" +
+	"\x1bRemoveBadDestinationRequest\x12\x12\n" +
+	"\x04cidr\x18\x01 \x01(\tR\x04cidr\"\x1e\n" +
+	"\x1cRemoveBadDestinationResponse\"\x93\x01\n" +
+	"\x0eMinerSignature\x127\n" +
+	"\x04kind\x18\x01 \x01(\x0e2#.containarium.v1.MinerSignatureKindR\x04kind\x12\x18\n" +
+	"\apattern\x18\x02 \x01(\tR\apattern\x12\x14\n" +
+	"\x05label\x18\x03 \x01(\tR\x05label\x12\x18\n" +
+	"\abuiltin\x18\x04 \x01(\bR\abuiltin\"\x1c\n" +
+	"\x1aListMinerSignaturesRequest\"\x89\x01\n" +
+	"\x1bListMinerSignaturesResponse\x12?\n" +
+	"\n" +
+	"signatures\x18\x01 \x03(\v2\x1f.containarium.v1.MinerSignatureR\n" +
+	"signatures\x12)\n" +
+	"\x10baseline_version\x18\x02 \x01(\tR\x0fbaselineVersion\"Y\n" +
+	"\x18AddMinerSignatureRequest\x12=\n" +
+	"\tsignature\x18\x01 \x01(\v2\x1f.containarium.v1.MinerSignatureR\tsignature\"Z\n" +
+	"\x19AddMinerSignatureResponse\x12=\n" +
+	"\tsignature\x18\x01 \x01(\v2\x1f.containarium.v1.MinerSignatureR\tsignature\"p\n" +
+	"\x1bRemoveMinerSignatureRequest\x127\n" +
+	"\x04kind\x18\x01 \x01(\x0e2#.containarium.v1.MinerSignatureKindR\x04kind\x12\x18\n" +
+	"\apattern\x18\x02 \x01(\tR\apattern\"\x1e\n" +
+	"\x1cRemoveMinerSignatureResponse\"\xec\x01\n" +
+	"\x13ListFindingsRequest\x12;\n" +
+	"\bseverity\x18\x01 \x01(\x0e2\x1f.containarium.v1.ThreatSeverityR\bseverity\x12\x1b\n" +
+	"\ttenant_id\x18\x02 \x01(\tR\btenantId\x120\n" +
+	"\x05since\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x05since\x123\n" +
+	"\x05state\x18\x04 \x01(\x0e2\x1d.containarium.v1.FindingStateR\x05state\x12\x14\n" +
+	"\x05limit\x18\x05 \x01(\x05R\x05limit\"L\n" +
+	"\x14ListFindingsResponse\x124\n" +
+	"\bfindings\x18\x01 \x03(\v2\x18.containarium.v1.FindingR\bfindings\"'\n" +
+	"\x15ResolveFindingRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\"L\n" +
+	"\x16ResolveFindingResponse\x122\n" +
+	"\afinding\x18\x01 \x01(\v2\x18.containarium.v1.FindingR\afinding*\x9e\x01\n" +
+	"\x0eThreatSeverity\x12\x1f\n" +
+	"\x1bTHREAT_SEVERITY_UNSPECIFIED\x10\x00\x12\x17\n" +
+	"\x13THREAT_SEVERITY_LOW\x10\x01\x12\x1a\n" +
+	"\x16THREAT_SEVERITY_MEDIUM\x10\x02\x12\x18\n" +
+	"\x14THREAT_SEVERITY_HIGH\x10\x03\x12\x1c\n" +
+	"\x18THREAT_SEVERITY_CRITICAL\x10\x04*\x87\x03\n" +
+	"\fThreatRuleId\x12\x1e\n" +
+	"\x1aTHREAT_RULE_ID_UNSPECIFIED\x10\x00\x12\"\n" +
+	"\x1eTHREAT_RULE_ID_BAD_DESTINATION\x10\x01\x12$\n" +
+	" THREAT_RULE_ID_CROSS_TENANT_FLOW\x10\x02\x12\x1d\n" +
+	"\x19THREAT_RULE_ID_DENY_BURST\x10\x03\x12)\n" +
+	"%THREAT_RULE_ID_BOX_SSHD_PASSWORD_AUTH\x10\x04\x12)\n" +
+	"%THREAT_RULE_ID_BOX_ROGUE_SSH_LISTENER\x10\x05\x12%\n" +
+	"!THREAT_RULE_ID_SENTRY_UNAVAILABLE\x10\b\x12\"\n" +
+	"\x1eTHREAT_RULE_ID_MINING_BEHAVIOR\x10\x06\x12\"\n" +
+	"\x1eTHREAT_RULE_ID_MINER_SIGNATURE\x10\a\x12)\n" +
+	"%THREAT_RULE_ID_PROCESS_ACTION_EXPIRED\x10\t*a\n" +
+	"\fFindingState\x12\x1d\n" +
+	"\x19FINDING_STATE_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12FINDING_STATE_OPEN\x10\x01\x12\x1a\n" +
+	"\x16FINDING_STATE_RESOLVED\x10\x02*\x81\x01\n" +
+	"\rProcessAction\x12\x1e\n" +
+	"\x1aPROCESS_ACTION_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14PROCESS_ACTION_ALERT\x10\x01\x12\x1b\n" +
+	"\x17PROCESS_ACTION_THROTTLE\x10\x02\x12\x19\n" +
+	"\x15PROCESS_ACTION_FREEZE\x10\x03*\xb8\x01\n" +
+	"\rResponseState\x12\x1e\n" +
+	"\x1aRESPONSE_STATE_UNSPECIFIED\x10\x00\x12\x17\n" +
+	"\x13RESPONSE_STATE_NONE\x10\x01\x12\x1a\n" +
+	"\x16RESPONSE_STATE_APPLIED\x10\x02\x12\x19\n" +
+	"\x15RESPONSE_STATE_FAILED\x10\x03\x12\x1b\n" +
+	"\x17RESPONSE_STATE_RELEASED\x10\x04\x12\x1a\n" +
+	"\x16RESPONSE_STATE_EXPIRED\x10\x05*\xb2\x02\n" +
+	"\x0eKillSkipReason\x12 \n" +
+	"\x1cKILL_SKIP_REASON_UNSPECIFIED\x10\x00\x12\x1f\n" +
+	"\x1bKILL_SKIP_REASON_PID_REUSED\x10\x01\x12!\n" +
+	"\x1dKILL_SKIP_REASON_PROCESS_GONE\x10\x02\x12#\n" +
+	"\x1fKILL_SKIP_REASON_CONTAINER_INIT\x10\x03\x12&\n" +
+	"\"KILL_SKIP_REASON_POLICY_UNREADABLE\x10\x04\x12\x1a\n" +
+	"\x16KILL_SKIP_REASON_OTHER\x10\x05\x12'\n" +
+	"#KILL_SKIP_REASON_START_TIME_UNKNOWN\x10\x06\x12(\n" +
+	"$KILL_SKIP_REASON_RUNTIME_UNSUPPORTED\x10\a*\x94\x01\n" +
+	"\vSentryState\x12\x1c\n" +
+	"\x18SENTRY_STATE_UNSPECIFIED\x10\x00\x12\x19\n" +
+	"\x15SENTRY_STATE_DISABLED\x10\x01\x12\x1c\n" +
+	"\x18SENTRY_STATE_UNAVAILABLE\x10\x02\x12\x19\n" +
+	"\x15SENTRY_STATE_DEGRADED\x10\x03\x12\x13\n" +
+	"\x0fSENTRY_STATE_OK\x10\x04*\x99\x01\n" +
+	"\x12MinerSignatureKind\x12$\n" +
+	" MINER_SIGNATURE_KIND_UNSPECIFIED\x10\x00\x12\x1d\n" +
+	"\x19MINER_SIGNATURE_KIND_NAME\x10\x01\x12\x1d\n" +
+	"\x19MINER_SIGNATURE_KIND_ARGV\x10\x02\x12\x1f\n" +
+	"\x1bMINER_SIGNATURE_KIND_SHA256\x10\x032\x9e$\n" +
+	"\x16ThreatDetectionService\x12\xae\x02\n" +
+	"\x0fGetSentryStatus\x12'.containarium.v1.GetSentryStatusRequest\x1a(.containarium.v1.GetSentryStatusResponse\"\xc7\x01\x92A\xa1\x01\n" +
+	"\bSecurity\x12\"Get threat-detection sentry status\x1aqReturns the background detection engine's on/off state (disabled, unavailable, degraded, ok) and per-rule health.\x82\xd3\xe4\x93\x02\x1c\x12\x1a/v1/security/sentry/status\x12\xa5\x02\n" +
+	"\x13ListBadDestinations\x12+.containarium.v1.ListBadDestinationsRequest\x1a,.containarium.v1.ListBadDestinationsResponse\"\xb2\x01\x92A\x89\x01\n" +
+	"\bSecurity\x12\x1bList known-bad destinations\x1a`Returns the merged baseline (embedded, versioned) and operator-added known-bad-destination list.\x82\xd3\xe4\x93\x02\x1f\x12\x1d/v1/security/bad-destinations\x12\x8e\x02\n" +
+	"\x11AddBadDestination\x12).containarium.v1.AddBadDestinationRequest\x1a*.containarium.v1.AddBadDestinationResponse\"\xa1\x01\x92Av\n" +
+	"\bSecurity\x12\x1bAdd a known-bad destination\x1aMAdds an operator-supplied CIDR or exact IP to the known-bad-destination list.\x82\xd3\xe4\x93\x02\":\x01*\"\x1d/v1/security/bad-destinations\x12\xd1\x02\n" +
+	"\x14RemoveBadDestination\x12,.containarium.v1.RemoveBadDestinationRequest\x1a-.containarium.v1.RemoveBadDestinationResponse\"\xdb\x01\x92A\xa8\x01\n" +
+	"\bSecurity\x12(Remove an operator-added bad destination\x1arRemoves a previously operator-added entry from the known-bad-destination list. Baseline entries cannot be removed.\x82\xd3\xe4\x93\x02)*'/v1/security/bad-destinations/{cidr=**}\x12\xb5\x02\n" +
+	"\fListFindings\x12$.containarium.v1.ListFindingsRequest\x1a%.containarium.v1.ListFindingsResponse\"\xd7\x01\x92A\xb6\x01\n" +
+	"\bSecurity\x12\x16List security findings\x1a\x91\x01Lists security findings with optional severity/tenant/since/state filters, most recently seen first. Non-admin callers only see their own tenant.\x82\xd3\xe4\x93\x02\x17\x12\x15/v1/security/findings\x12\xb4\x02\n" +
+	"\x0eResolveFinding\x12&.containarium.v1.ResolveFindingRequest\x1a'.containarium.v1.ResolveFindingResponse\"\xd0\x01\x92A\xa2\x01\n" +
+	"\bSecurity\x12\x1aResolve a security finding\x1azMarks an open finding as resolved. Fails with FAILED_PRECONDITION if it's already resolved, NOT_FOUND if it doesn't exist.\x82\xd3\xe4\x93\x02$\"\"/v1/security/findings/{id}/resolve\x12\xf1\x02\n" +
+	"\x10GetProcessPolicy\x12(.containarium.v1.GetProcessPolicyRequest\x1a).containarium.v1.GetProcessPolicyResponse\"\x87\x02\x92A\xe0\x01\n" +
+	"\bSecurity\x12\x16Get the process policy\x1a\xbb\x01Returns the stored process policy (backend default, or a container's override when ?container= is given) and the effective policy after override → default → built-in ALERT resolution.\x82\xd3\xe4\x93\x02\x1d\x12\x1b/v1/security/process-policy\x12\xe9\x03\n" +
+	"\x10SetProcessPolicy\x12(.containarium.v1.SetProcessPolicyRequest\x1a).containarium.v1.SetProcessPolicyResponse\"\xff\x02\x92A\xd5\x02\n" +
+	"\bSecurity\x12\x16Set the process policy\x1a\xb0\x02Sets what a HIGH mining finding does to its container: ALERT (default), THROTTLE or FREEZE, with the throttle allowance and TTL, and whether a miner-signature match also SIGKILLs the process (kill_process, default false). With container set it writes a per-container override; clear_override removes one.\x82\xd3\xe4\x93\x02 :\x01*\x1a\x1b/v1/security/process-policy\x12\x97\x03\n" +
+	"\x14ReleaseProcessAction\x12,.containarium.v1.ReleaseProcessActionRequest\x1a-.containarium.v1.ReleaseProcessActionResponse\"\xa1\x02\x92A\xef\x01\n" +
+	"\bSecurity\x12\x18Release a process action\x1a\xc8\x01Restores the container's recorded CPU limit (THROTTLE) or unfreezes it (FREEZE), marks the action released by the operator, and resolves its finding. NOT_FOUND when no action is open on the container.\x82\xd3\xe4\x93\x02(:\x01*\"#/v1/security/process-policy/release\x12\xdc\x02\n" +
+	"\x13ListMinerSignatures\x12+.containarium.v1.ListMinerSignaturesRequest\x1a,.containarium.v1.ListMinerSignaturesResponse\"\xe9\x01\x92A\xc0\x01\n" +
+	"\bSecurity\x12\x15List miner signatures\x1a\x9c\x01Returns the merged baseline (embedded, versioned) and operator-added miner-signature list: binary names, command-line markers and executable SHA-256 hashes.\x82\xd3\xe4\x93\x02\x1f\x12\x1d/v1/security/miner-signatures\x12\x99\x02\n" +
+	"\x11AddMinerSignature\x12).containarium.v1.AddMinerSignatureRequest\x1a*.containarium.v1.AddMinerSignatureResponse\"\xac\x01\x92A\x80\x01\n" +
+	"\bSecurity\x12\x15Add a miner signature\x1a]Adds an operator-supplied name, argv or sha256 entry to the miner-signature list. Admin only.\x82\xd3\xe4\x93\x02\":\x01*\"\x1d/v1/security/miner-signatures\x12\xd1\x02\n" +
+	"\x14RemoveMinerSignature\x12,.containarium.v1.RemoveMinerSignatureRequest\x1a-.containarium.v1.RemoveMinerSignatureResponse\"\xdb\x01\x92A\xb2\x01\n" +
+	"\bSecurity\x12(Remove an operator-added miner signature\x1a|Removes a previously operator-added miner-signature entry (?kind=&pattern=). Baseline entries cannot be removed. Admin only.\x82\xd3\xe4\x93\x02\x1f*\x1d/v1/security/miner-signatures\x12\x8d\x04\n" +
+	"\x10StreamExecEvents\x12(.containarium.v1.StreamExecEventsRequest\x1a).containarium.v1.StreamExecEventsResponse\"\xa1\x03\x92A\xfd\x02\n" +
+	"\bSecurity\x12\x1cStream container exec events\x1a\xd2\x02Streams process execs observed in tenant containers by the host-side eBPF exec telemetry, attributed to the container, as newline-delimited JSON (each chunk wraps one event under `result.event`). `since` replays the daemon's bounded in-memory buffer; `follow` keeps the stream open for new events. Events are not written to the audit log.\x82\xd3\xe4\x93\x02\x1a\x12\x18/v1/security/exec-events0\x01BKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_threatdetection_proto_rawDescOnce sync.Once
+	file_containarium_v1_threatdetection_proto_rawDescData []byte
+)
+
+func file_containarium_v1_threatdetection_proto_rawDescGZIP() []byte {
+	file_containarium_v1_threatdetection_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_threatdetection_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_threatdetection_proto_rawDesc), len(file_containarium_v1_threatdetection_proto_rawDesc)))
+	})
+	return file_containarium_v1_threatdetection_proto_rawDescData
+}
+
+var file_containarium_v1_threatdetection_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
+var file_containarium_v1_threatdetection_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
+var file_containarium_v1_threatdetection_proto_goTypes = []any{
+	(ThreatSeverity)(0),                  // 0: containarium.v1.ThreatSeverity
+	(ThreatRuleId)(0),                    // 1: containarium.v1.ThreatRuleId
+	(FindingState)(0),                    // 2: containarium.v1.FindingState
+	(ProcessAction)(0),                   // 3: containarium.v1.ProcessAction
+	(ResponseState)(0),                   // 4: containarium.v1.ResponseState
+	(KillSkipReason)(0),                  // 5: containarium.v1.KillSkipReason
+	(SentryState)(0),                     // 6: containarium.v1.SentryState
+	(MinerSignatureKind)(0),              // 7: containarium.v1.MinerSignatureKind
+	(*FlowEvidence)(nil),                 // 8: containarium.v1.FlowEvidence
+	(*DenyEvidence)(nil),                 // 9: containarium.v1.DenyEvidence
+	(*ConfigEvidence)(nil),               // 10: containarium.v1.ConfigEvidence
+	(*ListenerEvidence)(nil),             // 11: containarium.v1.ListenerEvidence
+	(*CPUEvidence)(nil),                  // 12: containarium.v1.CPUEvidence
+	(*ExecEvidence)(nil),                 // 13: containarium.v1.ExecEvidence
+	(*Evidence)(nil),                     // 14: containarium.v1.Evidence
+	(*MiningBehaviorThresholds)(nil),     // 15: containarium.v1.MiningBehaviorThresholds
+	(*Finding)(nil),                      // 16: containarium.v1.Finding
+	(*FindingResponse)(nil),              // 17: containarium.v1.FindingResponse
+	(*ProcessPolicy)(nil),                // 18: containarium.v1.ProcessPolicy
+	(*GetProcessPolicyRequest)(nil),      // 19: containarium.v1.GetProcessPolicyRequest
+	(*GetProcessPolicyResponse)(nil),     // 20: containarium.v1.GetProcessPolicyResponse
+	(*SetProcessPolicyRequest)(nil),      // 21: containarium.v1.SetProcessPolicyRequest
+	(*SetProcessPolicyResponse)(nil),     // 22: containarium.v1.SetProcessPolicyResponse
+	(*ReleaseProcessActionRequest)(nil),  // 23: containarium.v1.ReleaseProcessActionRequest
+	(*ReleaseProcessActionResponse)(nil), // 24: containarium.v1.ReleaseProcessActionResponse
+	(*RuleStatus)(nil),                   // 25: containarium.v1.RuleStatus
+	(*GetSentryStatusRequest)(nil),       // 26: containarium.v1.GetSentryStatusRequest
+	(*GetSentryStatusResponse)(nil),      // 27: containarium.v1.GetSentryStatusResponse
+	(*ExecEvent)(nil),                    // 28: containarium.v1.ExecEvent
+	(*StreamExecEventsResponse)(nil),     // 29: containarium.v1.StreamExecEventsResponse
+	(*StreamExecEventsRequest)(nil),      // 30: containarium.v1.StreamExecEventsRequest
+	(*BadDestinationEntry)(nil),          // 31: containarium.v1.BadDestinationEntry
+	(*ListBadDestinationsRequest)(nil),   // 32: containarium.v1.ListBadDestinationsRequest
+	(*ListBadDestinationsResponse)(nil),  // 33: containarium.v1.ListBadDestinationsResponse
+	(*AddBadDestinationRequest)(nil),     // 34: containarium.v1.AddBadDestinationRequest
+	(*AddBadDestinationResponse)(nil),    // 35: containarium.v1.AddBadDestinationResponse
+	(*RemoveBadDestinationRequest)(nil),  // 36: containarium.v1.RemoveBadDestinationRequest
+	(*RemoveBadDestinationResponse)(nil), // 37: containarium.v1.RemoveBadDestinationResponse
+	(*MinerSignature)(nil),               // 38: containarium.v1.MinerSignature
+	(*ListMinerSignaturesRequest)(nil),   // 39: containarium.v1.ListMinerSignaturesRequest
+	(*ListMinerSignaturesResponse)(nil),  // 40: containarium.v1.ListMinerSignaturesResponse
+	(*AddMinerSignatureRequest)(nil),     // 41: containarium.v1.AddMinerSignatureRequest
+	(*AddMinerSignatureResponse)(nil),    // 42: containarium.v1.AddMinerSignatureResponse
+	(*RemoveMinerSignatureRequest)(nil),  // 43: containarium.v1.RemoveMinerSignatureRequest
+	(*RemoveMinerSignatureResponse)(nil), // 44: containarium.v1.RemoveMinerSignatureResponse
+	(*ListFindingsRequest)(nil),          // 45: containarium.v1.ListFindingsRequest
+	(*ListFindingsResponse)(nil),         // 46: containarium.v1.ListFindingsResponse
+	(*ResolveFindingRequest)(nil),        // 47: containarium.v1.ResolveFindingRequest
+	(*ResolveFindingResponse)(nil),       // 48: containarium.v1.ResolveFindingResponse
+	(*timestamppb.Timestamp)(nil),        // 49: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),          // 50: google.protobuf.Duration
+}
+var file_containarium_v1_threatdetection_proto_depIdxs = []int32{
+	49, // 0: containarium.v1.FlowEvidence.first_seen:type_name -> google.protobuf.Timestamp
+	49, // 1: containarium.v1.FlowEvidence.last_seen:type_name -> google.protobuf.Timestamp
+	8,  // 2: containarium.v1.Evidence.flows:type_name -> containarium.v1.FlowEvidence
+	9,  // 3: containarium.v1.Evidence.denies:type_name -> containarium.v1.DenyEvidence
+	10, // 4: containarium.v1.Evidence.configs:type_name -> containarium.v1.ConfigEvidence
+	11, // 5: containarium.v1.Evidence.listeners:type_name -> containarium.v1.ListenerEvidence
+	12, // 6: containarium.v1.Evidence.cpu:type_name -> containarium.v1.CPUEvidence
+	13, // 7: containarium.v1.Evidence.execs:type_name -> containarium.v1.ExecEvidence
+	50, // 8: containarium.v1.MiningBehaviorThresholds.window:type_name -> google.protobuf.Duration
+	50, // 9: containarium.v1.MiningBehaviorThresholds.flow_min_age:type_name -> google.protobuf.Duration
+	1,  // 10: containarium.v1.Finding.rule:type_name -> containarium.v1.ThreatRuleId
+	0,  // 11: containarium.v1.Finding.severity:type_name -> containarium.v1.ThreatSeverity
+	2,  // 12: containarium.v1.Finding.state:type_name -> containarium.v1.FindingState
+	14, // 13: containarium.v1.Finding.evidence:type_name -> containarium.v1.Evidence
+	49, // 14: containarium.v1.Finding.first_seen:type_name -> google.protobuf.Timestamp
+	49, // 15: containarium.v1.Finding.last_seen:type_name -> google.protobuf.Timestamp
+	17, // 16: containarium.v1.Finding.response:type_name -> containarium.v1.FindingResponse
+	3,  // 17: containarium.v1.FindingResponse.action:type_name -> containarium.v1.ProcessAction
+	4,  // 18: containarium.v1.FindingResponse.state:type_name -> containarium.v1.ResponseState
+	49, // 19: containarium.v1.FindingResponse.applied_at:type_name -> google.protobuf.Timestamp
+	49, // 20: containarium.v1.FindingResponse.expires_at:type_name -> google.protobuf.Timestamp
+	49, // 21: containarium.v1.FindingResponse.released_at:type_name -> google.protobuf.Timestamp
+	5,  // 22: containarium.v1.FindingResponse.kill_skip_reason:type_name -> containarium.v1.KillSkipReason
+	3,  // 23: containarium.v1.ProcessPolicy.action:type_name -> containarium.v1.ProcessAction
+	50, // 24: containarium.v1.ProcessPolicy.ttl:type_name -> google.protobuf.Duration
+	15, // 25: containarium.v1.ProcessPolicy.mining_behavior:type_name -> containarium.v1.MiningBehaviorThresholds
+	18, // 26: containarium.v1.GetProcessPolicyResponse.policy:type_name -> containarium.v1.ProcessPolicy
+	18, // 27: containarium.v1.GetProcessPolicyResponse.effective:type_name -> containarium.v1.ProcessPolicy
+	18, // 28: containarium.v1.SetProcessPolicyRequest.policy:type_name -> containarium.v1.ProcessPolicy
+	18, // 29: containarium.v1.SetProcessPolicyResponse.effective:type_name -> containarium.v1.ProcessPolicy
+	16, // 30: containarium.v1.ReleaseProcessActionResponse.finding:type_name -> containarium.v1.Finding
+	17, // 31: containarium.v1.ReleaseProcessActionResponse.released:type_name -> containarium.v1.FindingResponse
+	1,  // 32: containarium.v1.RuleStatus.rule:type_name -> containarium.v1.ThreatRuleId
+	49, // 33: containarium.v1.RuleStatus.last_error_at:type_name -> google.protobuf.Timestamp
+	6,  // 34: containarium.v1.GetSentryStatusResponse.state:type_name -> containarium.v1.SentryState
+	25, // 35: containarium.v1.GetSentryStatusResponse.rules:type_name -> containarium.v1.RuleStatus
+	49, // 36: containarium.v1.ExecEvent.at:type_name -> google.protobuf.Timestamp
+	13, // 37: containarium.v1.ExecEvent.exec:type_name -> containarium.v1.ExecEvidence
+	28, // 38: containarium.v1.StreamExecEventsResponse.event:type_name -> containarium.v1.ExecEvent
+	50, // 39: containarium.v1.StreamExecEventsRequest.since:type_name -> google.protobuf.Duration
+	31, // 40: containarium.v1.ListBadDestinationsResponse.entries:type_name -> containarium.v1.BadDestinationEntry
+	31, // 41: containarium.v1.AddBadDestinationResponse.entry:type_name -> containarium.v1.BadDestinationEntry
+	7,  // 42: containarium.v1.MinerSignature.kind:type_name -> containarium.v1.MinerSignatureKind
+	38, // 43: containarium.v1.ListMinerSignaturesResponse.signatures:type_name -> containarium.v1.MinerSignature
+	38, // 44: containarium.v1.AddMinerSignatureRequest.signature:type_name -> containarium.v1.MinerSignature
+	38, // 45: containarium.v1.AddMinerSignatureResponse.signature:type_name -> containarium.v1.MinerSignature
+	7,  // 46: containarium.v1.RemoveMinerSignatureRequest.kind:type_name -> containarium.v1.MinerSignatureKind
+	0,  // 47: containarium.v1.ListFindingsRequest.severity:type_name -> containarium.v1.ThreatSeverity
+	49, // 48: containarium.v1.ListFindingsRequest.since:type_name -> google.protobuf.Timestamp
+	2,  // 49: containarium.v1.ListFindingsRequest.state:type_name -> containarium.v1.FindingState
+	16, // 50: containarium.v1.ListFindingsResponse.findings:type_name -> containarium.v1.Finding
+	16, // 51: containarium.v1.ResolveFindingResponse.finding:type_name -> containarium.v1.Finding
+	26, // 52: containarium.v1.ThreatDetectionService.GetSentryStatus:input_type -> containarium.v1.GetSentryStatusRequest
+	32, // 53: containarium.v1.ThreatDetectionService.ListBadDestinations:input_type -> containarium.v1.ListBadDestinationsRequest
+	34, // 54: containarium.v1.ThreatDetectionService.AddBadDestination:input_type -> containarium.v1.AddBadDestinationRequest
+	36, // 55: containarium.v1.ThreatDetectionService.RemoveBadDestination:input_type -> containarium.v1.RemoveBadDestinationRequest
+	45, // 56: containarium.v1.ThreatDetectionService.ListFindings:input_type -> containarium.v1.ListFindingsRequest
+	47, // 57: containarium.v1.ThreatDetectionService.ResolveFinding:input_type -> containarium.v1.ResolveFindingRequest
+	19, // 58: containarium.v1.ThreatDetectionService.GetProcessPolicy:input_type -> containarium.v1.GetProcessPolicyRequest
+	21, // 59: containarium.v1.ThreatDetectionService.SetProcessPolicy:input_type -> containarium.v1.SetProcessPolicyRequest
+	23, // 60: containarium.v1.ThreatDetectionService.ReleaseProcessAction:input_type -> containarium.v1.ReleaseProcessActionRequest
+	39, // 61: containarium.v1.ThreatDetectionService.ListMinerSignatures:input_type -> containarium.v1.ListMinerSignaturesRequest
+	41, // 62: containarium.v1.ThreatDetectionService.AddMinerSignature:input_type -> containarium.v1.AddMinerSignatureRequest
+	43, // 63: containarium.v1.ThreatDetectionService.RemoveMinerSignature:input_type -> containarium.v1.RemoveMinerSignatureRequest
+	30, // 64: containarium.v1.ThreatDetectionService.StreamExecEvents:input_type -> containarium.v1.StreamExecEventsRequest
+	27, // 65: containarium.v1.ThreatDetectionService.GetSentryStatus:output_type -> containarium.v1.GetSentryStatusResponse
+	33, // 66: containarium.v1.ThreatDetectionService.ListBadDestinations:output_type -> containarium.v1.ListBadDestinationsResponse
+	35, // 67: containarium.v1.ThreatDetectionService.AddBadDestination:output_type -> containarium.v1.AddBadDestinationResponse
+	37, // 68: containarium.v1.ThreatDetectionService.RemoveBadDestination:output_type -> containarium.v1.RemoveBadDestinationResponse
+	46, // 69: containarium.v1.ThreatDetectionService.ListFindings:output_type -> containarium.v1.ListFindingsResponse
+	48, // 70: containarium.v1.ThreatDetectionService.ResolveFinding:output_type -> containarium.v1.ResolveFindingResponse
+	20, // 71: containarium.v1.ThreatDetectionService.GetProcessPolicy:output_type -> containarium.v1.GetProcessPolicyResponse
+	22, // 72: containarium.v1.ThreatDetectionService.SetProcessPolicy:output_type -> containarium.v1.SetProcessPolicyResponse
+	24, // 73: containarium.v1.ThreatDetectionService.ReleaseProcessAction:output_type -> containarium.v1.ReleaseProcessActionResponse
+	40, // 74: containarium.v1.ThreatDetectionService.ListMinerSignatures:output_type -> containarium.v1.ListMinerSignaturesResponse
+	42, // 75: containarium.v1.ThreatDetectionService.AddMinerSignature:output_type -> containarium.v1.AddMinerSignatureResponse
+	44, // 76: containarium.v1.ThreatDetectionService.RemoveMinerSignature:output_type -> containarium.v1.RemoveMinerSignatureResponse
+	29, // 77: containarium.v1.ThreatDetectionService.StreamExecEvents:output_type -> containarium.v1.StreamExecEventsResponse
+	65, // [65:78] is the sub-list for method output_type
+	52, // [52:65] is the sub-list for method input_type
+	52, // [52:52] is the sub-list for extension type_name
+	52, // [52:52] is the sub-list for extension extendee
+	0,  // [0:52] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_threatdetection_proto_init() }
+func file_containarium_v1_threatdetection_proto_init() {
+	if File_containarium_v1_threatdetection_proto != nil {
+		return
+	}
+	file_containarium_v1_threatdetection_proto_msgTypes[10].OneofWrappers = []any{}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_threatdetection_proto_rawDesc), len(file_containarium_v1_threatdetection_proto_rawDesc)),
+			NumEnums:      8,
+			NumMessages:   41,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_threatdetection_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_threatdetection_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_threatdetection_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_threatdetection_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_threatdetection_proto = out.File
+	file_containarium_v1_threatdetection_proto_goTypes = nil
+	file_containarium_v1_threatdetection_proto_depIdxs = nil
+}
