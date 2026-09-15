@@ -43,3 +43,15 @@ func (a *adapter) begin(c libplugin.ConnMetadata) error {
 	}
 	if len(a.routes) >= 4096 {
 		return fmt.Errorf("routing provenance capacity exhausted")
+	}
+	a.routes[c.UniqueID()] = routeRef{ref: ref, token: r.RouteToken}
+	return nil
+}
+
+// report distinguishes an explicit stale-route rejection from a control outage.
+func (a *adapter) report(b binding, outcome pb.SSHUpstreamOutcome) (bool, error) {
+	ctx, cancel := sshcontrol.CallContext(a.ctx)
+	defer cancel()
+	r, err := a.control.Client.CompleteSSHUpstream(ctx, &pb.CompleteSSHUpstreamRequest{Connection: b.ref, RouteToken: b.route, LeaseToken: b.lease, Outcome: outcome})
+	return r.GetAccepted(), err
+}
