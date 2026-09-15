@@ -84,3 +84,90 @@ func (s *ContainerServer) PrepareEncryptedMigration(ctx context.Context, req *pb
 	if pool == "" {
 		// enabled() said yes and EnsureTenantStorage returned no pool: the
 		// hooks are half-wired. Refusing keeps the source from copying into
+		// the default pool, which would arrive unencrypted.
+		return refused("this daemon resolved the key for tenant %s but resolved no storage pool "+
+			"for them", req.GetTenant()), nil
+	}
+
+	log.Printf("[move] pre-flight accepted for %s (tenant %s): key resolved, storage pool %s ready",
+		req.GetUsername(), req.GetTenant(), pool)
+	return &pb.PrepareEncryptedMigrationResponse{CanResolve: true, StoragePool: pool}, nil
+}
+
+// refused builds a plain "no, and here is why" answer.
+func refused(format string, args ...any) *pb.PrepareEncryptedMigrationResponse {
+	reason := fmt.Sprintf(format, args...)
+	log.Printf("[move] pre-flight refused: %s", reason)
+	return &pb.PrepareEncryptedMigrationResponse{CanResolve: false, Reason: reason}
+}
+
+// migrationRef reports the durable KeyRef and storage pool recorded for a
+// container, and false when the container is not encrypted.
+//
+// Read-only, and deliberately tolerant of a daemon with no encryption wired:
+// on that daemon every container is unencrypted, which is the correct answer
+// rather than an error.
+func (h *encryptionHooks) migrationRef(containerName string) (ref zfskey.KeyRef, pool string, ok bool, err error) {
+	if !h.enabled() {
+		return zfskey.KeyRef{}, "", false, nil
+	}
+	ref, present, err := h.refs.GetKeyRef(containerName)
+	if err != nil {
+		return zfskey.KeyRef{}, "", false, fmt.Errorf("read the encryption key ref of %s: %w", containerName, err)
+	}
+	if !present {
+		return zfskey.KeyRef{}, "", false, nil
+	}
+	pool, err = h.refs.GetPool(containerName)
+	if err != nil {
+		return zfskey.KeyRef{}, "", false, fmt.Errorf("read the storage pool of %s: %w", containerName, err)
+	}
+	return ref, pool, true, nil
+}
+
+// recordAdoptedPlacement stores the encryption placement a migrated
+// container arrived with, so the destination can find its encryptionroot on
+// every later start.
+//
+// The source proved during the pre-flight that this daemon can resolve the
+// ref; what is recorded here is where the container actually landed. Without
+// it the container runs until its first stop and then never starts again,
+// with nothing on the container saying why.
+//
+// A no-op for an unencrypted migration, which is every migration today.
+func (s *ContainerServer) recordAdoptedPlacement(req *pb.AdoptMigratedContainerRequest) error {
+	refJSON, pool := req.GetZfsKeyRef(), req.GetZfsPool()
+	if refJSON == "" && pool == "" {
+		return nil // unencrypted; nothing to record
+	}
+	// Half a message is not something to record "as much as possible" of. A
+	// ref with no pool leaves a container that refuses to start; a pool with
+	// no ref reads as UNENCRYPTED, which is the direction that loses data
+	// silently rather than loudly.
+	if refJSON == "" || pool == "" {
+		return status.Errorf(codes.InvalidArgument,
+			"encrypted adoption of %s is missing half its placement (key_ref set: %t, pool set: %t); "+
+				"refusing rather than recording a container that cannot be unlocked or, worse, one "+
+				"that reads as unencrypted", req.GetUsername(), refJSON != "", pool != "")
+	}
+
+	if !s.encryption.enabled() {
+		return status.Errorf(codes.FailedPrecondition,
+			"this daemon has no key custody configured but was handed encrypted container %s; the "+
+				"migration pre-flight should have prevented this. Refusing rather than adopting a "+
+				"container nobody here can unlock", req.GetUsername())
+	}
+
+	var ref zfskey.KeyRef
+	if err := json.Unmarshal([]byte(refJSON), &ref); err != nil {
+		return status.Errorf(codes.InvalidArgument, "adopted key_ref is not a decodable KeyRef: %v", err)
+	}
+
+	containerName := fmt.Sprintf("%s-container", req.GetUsername())
+	if err := s.encryption.RecordPlacement(containerName, ref, pool); err != nil {
+		return fmt.Errorf("record the encryption placement of adopted container %s: %w", containerName, err)
+	}
+	log.Printf("[move] adopted %s under storage pool %s; its encryptionroot is that pool's source",
+		containerName, pool)
+	return nil
+}
