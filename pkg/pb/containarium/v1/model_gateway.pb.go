@@ -762,3 +762,195 @@ func (x *ListGatewayModelsResponse) Reset() {
 	mi := &file_containarium_v1_model_gateway_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListGatewayModelsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListGatewayModelsResponse) ProtoMessage() {}
+
+func (x *ListGatewayModelsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_model_gateway_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListGatewayModelsResponse.ProtoReflect.Descriptor instead.
+func (*ListGatewayModelsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_model_gateway_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ListGatewayModelsResponse) GetModels() []*GatewayModel {
+	if x != nil {
+		return x.Models
+	}
+	return nil
+}
+
+func (x *ListGatewayModelsResponse) GetKeyOwner() string {
+	if x != nil {
+		return x.KeyOwner
+	}
+	return ""
+}
+
+var File_containarium_v1_model_gateway_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_model_gateway_proto_rawDesc = "" +
+	"\n" +
+	"#containarium/v1/model_gateway.proto\x12\x0fcontainarium.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\"\x91\x01\n" +
+	"\x1bSetTenantProviderKeyRequest\x12\x1b\n" +
+	"\tkey_owner\x18\x01 \x01(\tR\bkeyOwner\x12<\n" +
+	"\bprovider\x18\x02 \x01(\x0e2 .containarium.v1.GatewayProviderR\bprovider\x12\x17\n" +
+	"\aapi_key\x18\x03 \x01(\tR\x06apiKey\"\xce\x01\n" +
+	"\x1cSetTenantProviderKeyResponse\x12\x1b\n" +
+	"\tkey_owner\x18\x01 \x01(\tR\bkeyOwner\x12<\n" +
+	"\bprovider\x18\x02 \x01(\x0e2 .containarium.v1.GatewayProviderR\bprovider\x12 \n" +
+	"\vfingerprint\x18\x03 \x01(\tR\vfingerprint\x121\n" +
+	"\x06set_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x05setAt\"{\n" +
+	"\x1eDeleteTenantProviderKeyRequest\x12\x1b\n" +
+	"\tkey_owner\x18\x01 \x01(\tR\bkeyOwner\x12<\n" +
+	"\bprovider\x18\x02 \x01(\x0e2 .containarium.v1.GatewayProviderR\bprovider\"H\n" +
+	"\x1fDeleteTenantProviderKeyResponse\x12%\n" +
+	"\x0etokens_revoked\x18\x01 \x01(\bR\rtokensRevoked\"~\n" +
+	"!GetTenantProviderKeyStatusRequest\x12\x1b\n" +
+	"\tkey_owner\x18\x01 \x01(\tR\bkeyOwner\x12<\n" +
+	"\bprovider\x18\x02 \x01(\x0e2 .containarium.v1.GatewayProviderR\bprovider\"\xe6\x01\n" +
+	"\"GetTenantProviderKeyStatusResponse\x12\x1b\n" +
+	"\tkey_owner\x18\x01 \x01(\tR\bkeyOwner\x12<\n" +
+	"\bprovider\x18\x02 \x01(\x0e2 .containarium.v1.GatewayProviderR\bprovider\x12\x10\n" +
+	"\x03set\x18\x03 \x01(\bR\x03set\x12 \n" +
+	"\vfingerprint\x18\x04 \x01(\tR\vfingerprint\x121\n" +
+	"\x06set_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\x05setAt\"\xed\x01\n" +
+	"\x17MintGatewayTokenRequest\x12\x10\n" +
+	"\x03box\x18\x01 \x01(\tR\x03box\x12<\n" +
+	"\bprovider\x18\x02 \x01(\x0e2 .containarium.v1.GatewayProviderR\bprovider\x12\x15\n" +
+	"\x06run_id\x18\x03 \x01(\tR\x05runId\x12%\n" +
+	"\x0eallowed_models\x18\x04 \x03(\tR\rallowedModels\x12+\n" +
+	"\x03ttl\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\x12\x17\n" +
+	"\adry_run\x18\x06 \x01(\bR\x06dryRun\"\xbe\x01\n" +
+	"\x18MintGatewayTokenResponse\x12\x14\n" +
+	"\x05token\x18\x01 \x01(\tR\x05token\x12\x19\n" +
+	"\bbase_url\x18\x02 \x01(\tR\abaseUrl\x12\x1b\n" +
+	"\tkey_owner\x18\x03 \x01(\tR\bkeyOwner\x129\n" +
+	"\n" +
+	"expires_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12\x19\n" +
+	"\btoken_id\x18\x05 \x01(\tR\atokenId\"j\n" +
+	"\x18ListGatewayModelsRequest\x12<\n" +
+	"\bprovider\x18\x01 \x01(\x0e2 .containarium.v1.GatewayProviderR\bprovider\x12\x10\n" +
+	"\x03box\x18\x02 \x01(\tR\x03box\"\x1e\n" +
+	"\fGatewayModel\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"o\n" +
+	"\x19ListGatewayModelsResponse\x125\n" +
+	"\x06models\x18\x01 \x03(\v2\x1d.containarium.v1.GatewayModelR\x06models\x12\x1b\n" +
+	"\tkey_owner\x18\x02 \x01(\tR\bkeyOwner*\xcf\x01\n" +
+	"\x0fGatewayProvider\x12 \n" +
+	"\x1cGATEWAY_PROVIDER_UNSPECIFIED\x10\x00\x12\x1e\n" +
+	"\x1aGATEWAY_PROVIDER_ANTHROPIC\x10\x01\x12\x1b\n" +
+	"\x17GATEWAY_PROVIDER_OPENAI\x10\x02\x12\x1b\n" +
+	"\x17GATEWAY_PROVIDER_GEMINI\x10\x03\x12\"\n" +
+	"\x1eGATEWAY_PROVIDER_GEMINI_OPENAI\x10\x04\x12\x1c\n" +
+	"\x18GATEWAY_PROVIDER_KAFEIDO\x10\x052\xb5\x0e\n" +
+	"\x13ModelGatewayService\x12\x8c\x03\n" +
+	"\x14SetTenantProviderKey\x12,.containarium.v1.SetTenantProviderKeyRequest\x1a-.containarium.v1.SetTenantProviderKeyResponse\"\x96\x02\x92A\xda\x01\n" +
+	"\fModelGateway\x12\x1eSet a key owner's provider key\x1a\xa9\x01Stores (or rotates) the real upstream API key one key owner spends for one provider. Requires the gateway:admin scope. The response carries a fingerprint, never the key.\x82\xd3\xe4\x93\x022:\x01*\x1a-/v1/model-gateway/keys/{key_owner}/{provider}\x12\xd0\x02\n" +
+	"\x17DeleteTenantProviderKey\x12/.containarium.v1.DeleteTenantProviderKeyRequest\x1a0.containarium.v1.DeleteTenantProviderKeyResponse\"\xd1\x01\x92A\x98\x01\n" +
+	"\fModelGateway\x12!Delete a key owner's provider key\x1aeRemoves the stored key and revokes the owner's live gateway tokens. Requires the gateway:admin scope.\x82\xd3\xe4\x93\x02/*-/v1/model-gateway/keys/{key_owner}/{provider}\x12\xde\x02\n" +
+	"\x1aGetTenantProviderKeyStatus\x122.containarium.v1.GetTenantProviderKeyStatusRequest\x1a3.containarium.v1.GetTenantProviderKeyStatusResponse\"\xd6\x01\x92A\x9d\x01\n" +
+	"\fModelGateway\x12%Get a key owner's provider key status\x1afReturns set/unset, a fingerprint, and set_at. Never returns the key. Requires the gateway:admin scope.\x82\xd3\xe4\x93\x02/\x12-/v1/model-gateway/keys/{key_owner}/{provider}\x12\x94\x03\n" +
+	"\x10MintGatewayToken\x12(.containarium.v1.MintGatewayTokenRequest\x1a).containarium.v1.MintGatewayTokenResponse\"\xaa\x02\x92A\x83\x02\n" +
+	"\fModelGateway\x12\x1eMint a gateway token for a box\x1a\xd2\x01Issues a short-lived scoped token the box presents to the model gateway instead of a real provider key. Requires the gateway:mint scope and ownership of the box. dry_run validates everything and issues nothing.\x82\xd3\xe4\x93\x02\x1d:\x01*\"\x18/v1/model-gateway/tokens\x12\xc3\x02\n" +
+	"\x11ListGatewayModels\x12).containarium.v1.ListGatewayModelsRequest\x1a*.containarium.v1.ListGatewayModelsResponse\"\xd6\x01\x92A\xa7\x01\n" +
+	"\fModelGateway\x12(List upstream models through the gateway\x1amProxies the provider's model list using the resolved key owner's stored key. Requires the gateway:mint scope.\x82\xd3\xe4\x93\x02%\x12#/v1/model-gateway/{provider}/modelsBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_model_gateway_proto_rawDescOnce sync.Once
+	file_containarium_v1_model_gateway_proto_rawDescData []byte
+)
+
+func file_containarium_v1_model_gateway_proto_rawDescGZIP() []byte {
+	file_containarium_v1_model_gateway_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_model_gateway_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_model_gateway_proto_rawDesc), len(file_containarium_v1_model_gateway_proto_rawDesc)))
+	})
+	return file_containarium_v1_model_gateway_proto_rawDescData
+}
+
+var file_containarium_v1_model_gateway_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_containarium_v1_model_gateway_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_containarium_v1_model_gateway_proto_goTypes = []any{
+	(GatewayProvider)(0),                       // 0: containarium.v1.GatewayProvider
+	(*SetTenantProviderKeyRequest)(nil),        // 1: containarium.v1.SetTenantProviderKeyRequest
+	(*SetTenantProviderKeyResponse)(nil),       // 2: containarium.v1.SetTenantProviderKeyResponse
+	(*DeleteTenantProviderKeyRequest)(nil),     // 3: containarium.v1.DeleteTenantProviderKeyRequest
+	(*DeleteTenantProviderKeyResponse)(nil),    // 4: containarium.v1.DeleteTenantProviderKeyResponse
+	(*GetTenantProviderKeyStatusRequest)(nil),  // 5: containarium.v1.GetTenantProviderKeyStatusRequest
+	(*GetTenantProviderKeyStatusResponse)(nil), // 6: containarium.v1.GetTenantProviderKeyStatusResponse
+	(*MintGatewayTokenRequest)(nil),            // 7: containarium.v1.MintGatewayTokenRequest
+	(*MintGatewayTokenResponse)(nil),           // 8: containarium.v1.MintGatewayTokenResponse
+	(*ListGatewayModelsRequest)(nil),           // 9: containarium.v1.ListGatewayModelsRequest
+	(*GatewayModel)(nil),                       // 10: containarium.v1.GatewayModel
+	(*ListGatewayModelsResponse)(nil),          // 11: containarium.v1.ListGatewayModelsResponse
+	(*timestamppb.Timestamp)(nil),              // 12: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),                // 13: google.protobuf.Duration
+}
+var file_containarium_v1_model_gateway_proto_depIdxs = []int32{
+	0,  // 0: containarium.v1.SetTenantProviderKeyRequest.provider:type_name -> containarium.v1.GatewayProvider
+	0,  // 1: containarium.v1.SetTenantProviderKeyResponse.provider:type_name -> containarium.v1.GatewayProvider
+	12, // 2: containarium.v1.SetTenantProviderKeyResponse.set_at:type_name -> google.protobuf.Timestamp
+	0,  // 3: containarium.v1.DeleteTenantProviderKeyRequest.provider:type_name -> containarium.v1.GatewayProvider
+	0,  // 4: containarium.v1.GetTenantProviderKeyStatusRequest.provider:type_name -> containarium.v1.GatewayProvider
+	0,  // 5: containarium.v1.GetTenantProviderKeyStatusResponse.provider:type_name -> containarium.v1.GatewayProvider
+	12, // 6: containarium.v1.GetTenantProviderKeyStatusResponse.set_at:type_name -> google.protobuf.Timestamp
+	0,  // 7: containarium.v1.MintGatewayTokenRequest.provider:type_name -> containarium.v1.GatewayProvider
+	13, // 8: containarium.v1.MintGatewayTokenRequest.ttl:type_name -> google.protobuf.Duration
+	12, // 9: containarium.v1.MintGatewayTokenResponse.expires_at:type_name -> google.protobuf.Timestamp
+	0,  // 10: containarium.v1.ListGatewayModelsRequest.provider:type_name -> containarium.v1.GatewayProvider
+	10, // 11: containarium.v1.ListGatewayModelsResponse.models:type_name -> containarium.v1.GatewayModel
+	1,  // 12: containarium.v1.ModelGatewayService.SetTenantProviderKey:input_type -> containarium.v1.SetTenantProviderKeyRequest
+	3,  // 13: containarium.v1.ModelGatewayService.DeleteTenantProviderKey:input_type -> containarium.v1.DeleteTenantProviderKeyRequest
+	5,  // 14: containarium.v1.ModelGatewayService.GetTenantProviderKeyStatus:input_type -> containarium.v1.GetTenantProviderKeyStatusRequest
+	7,  // 15: containarium.v1.ModelGatewayService.MintGatewayToken:input_type -> containarium.v1.MintGatewayTokenRequest
+	9,  // 16: containarium.v1.ModelGatewayService.ListGatewayModels:input_type -> containarium.v1.ListGatewayModelsRequest
+	2,  // 17: containarium.v1.ModelGatewayService.SetTenantProviderKey:output_type -> containarium.v1.SetTenantProviderKeyResponse
+	4,  // 18: containarium.v1.ModelGatewayService.DeleteTenantProviderKey:output_type -> containarium.v1.DeleteTenantProviderKeyResponse
+	6,  // 19: containarium.v1.ModelGatewayService.GetTenantProviderKeyStatus:output_type -> containarium.v1.GetTenantProviderKeyStatusResponse
+	8,  // 20: containarium.v1.ModelGatewayService.MintGatewayToken:output_type -> containarium.v1.MintGatewayTokenResponse
+	11, // 21: containarium.v1.ModelGatewayService.ListGatewayModels:output_type -> containarium.v1.ListGatewayModelsResponse
+	17, // [17:22] is the sub-list for method output_type
+	12, // [12:17] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_model_gateway_proto_init() }
+func file_containarium_v1_model_gateway_proto_init() {
+	if File_containarium_v1_model_gateway_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_model_gateway_proto_rawDesc), len(file_containarium_v1_model_gateway_proto_rawDesc)),
+			NumEnums:      1,
+			NumMessages:   11,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_model_gateway_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_model_gateway_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_model_gateway_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_model_gateway_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_model_gateway_proto = out.File
+	file_containarium_v1_model_gateway_proto_goTypes = nil
+	file_containarium_v1_model_gateway_proto_depIdxs = nil
+}
