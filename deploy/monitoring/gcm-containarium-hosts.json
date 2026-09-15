@@ -96,3 +96,151 @@
           }
         }
       },
+      {
+        "yPos": 4, "xPos": 6, "width": 6, "height": 4,
+        "widget": {
+          "title": "Containers + heartbeat",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.host.container.count/gauge\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${resource.label.instance_id} containers"
+              },
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.export.heartbeat/gauge\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${metric.label.backend_id} heartbeat"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "yPos": 8, "xPos": 0, "width": 6, "height": 4,
+        "widget": {
+          "title": "Platform: API requests / errors by code_class",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.platform.api.requests/counter\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_RATE", "groupByFields": ["metric.label.code_class"] }
+                  }
+                },
+                "plotType": "STACKED_BAR",
+                "legendTemplate": "requests ${metric.label.code_class}"
+              },
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.platform.api.errors/counter\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_RATE", "groupByFields": ["metric.label.code_class"] }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "errors ${metric.label.code_class}"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "yPos": 8, "xPos": 6, "width": 6, "height": 4,
+        "widget": {
+          "title": "Platform: provisioning attempts / failures by operation",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.platform.provision.attempts/counter\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_RATE", "groupByFields": ["metric.label.operation"] }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "attempts ${metric.label.operation}"
+              },
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.platform.provision.failures/counter\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_RATE", "groupByFields": ["metric.label.operation"] }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "failures ${metric.label.operation}"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "yPos": 12, "xPos": 0, "width": 6, "height": 4,
+        "widget": {
+          "title": "Platform: provisioning mean duration by operation",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.platform.provision.duration_seconds_sum/counter\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_RATE", "groupByFields": ["metric.label.operation"] }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "duration_seconds_sum rate ${metric.label.operation}"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "yPos": 12, "xPos": 6, "width": 3, "height": 4,
+        "widget": {
+          "title": "Platform: peers connected",
+          "scorecard": {
+            "timeSeriesQuery": {
+              "timeSeriesFilter": {
+                "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.platform.peers.connected/gauge\"",
+                "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }
+              }
+            },
+            "sparkChartView": { "sparkChartType": "SPARK_LINE" }
+          }
+        }
+      },
+      {
+        "yPos": 12, "xPos": 9, "width": 3, "height": 4,
+        "widget": {
+          "title": "Platform: per-peer tunnel state",
+          "xyChart": {
+            "dataSets": [
+              {
+                "timeSeriesQuery": {
+                  "timeSeriesFilter": {
+                    "filter": "resource.type = \"prometheus_target\" AND metric.type = \"prometheus.googleapis.com/containarium.platform.tunnel.state/gauge\"",
+                    "aggregation": { "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN", "groupByFields": ["metric.label.peer_id"] }
+                  }
+                },
+                "plotType": "LINE",
+                "legendTemplate": "${metric.label.peer_id}"
+              }
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
