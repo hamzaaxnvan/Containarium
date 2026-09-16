@@ -76,3 +76,55 @@ func New(t *testing.T) *Pool {
 		t.Fatalf("mkdir mountpoint: %v", err)
 	}
 	f, err := os.Create(p.Image)
+	if err != nil {
+		t.Fatalf("create vdev: %v", err)
+	}
+	if err := f.Truncate(vdevSize); err != nil {
+		t.Fatalf("truncate vdev: %v", err)
+	}
+	_ = f.Close()
+
+	Run(t, "zpool", "create", "-m", p.Mount, p.Name, p.Image)
+	t.Cleanup(func() {
+		// -f because a failed test may have left a dataset mounted.
+		_ = exec.Command("zpool", "destroy", "-f", p.Name).Run()
+	})
+	return p
+}
+
+// Dataset returns a child dataset name under the pool.
+func (p *Pool) Dataset(name string) string { return p.Name + "/" + name }
+
+// ContainsPlaintext reports whether the pool's backing file contains the
+// needle. The pool is synced first so writes have reached the vdev.
+func (p *Pool) ContainsPlaintext(t *testing.T, needle []byte) bool {
+	t.Helper()
+	_ = exec.Command("zpool", "sync", p.Name).Run()
+
+	data, err := os.ReadFile(p.Image)
+	if err != nil {
+		t.Fatalf("read vdev image: %v", err)
+	}
+	return bytes.Contains(data, needle)
+}
+
+// UnmountIfMounted unmounts a dataset, tolerating "not currently mounted".
+//
+// Needed because `zfs load-key` makes a dataset readable but does NOT
+// remount it, so after an unload/load cycle a dataset has its key available
+// and no mount. In production the mount is Incus's job, which is why the
+// pre-start hook only loads the key.
+func UnmountIfMounted(t *testing.T, dataset string) {
+	t.Helper()
+	out, err := exec.Command("zfs", "unmount", dataset).CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "not currently mounted") {
+		t.Fatalf("zfs unmount %s: %v\n%s", dataset, err, out)
+	}
+}
+
+// IsMounted reports the dataset's `mounted` property.
+func IsMounted(t *testing.T, dataset string) bool {
+	t.Helper()
+	out := Run(t, "zfs", "get", "-H", "-o", "value", "mounted", dataset)
+	return strings.TrimSpace(out) == "yes"
+}
