@@ -108,3 +108,114 @@ def init(
     if _initialized:
         logger.debug("init() called twice — returning existing handle")
         return _shutdown_handle  # type: ignore[return-value]
+
+    if service_name:
+        # setdefault — explicit user env still wins over the arg.
+        os.environ.setdefault("OTEL_SERVICE_NAME", service_name)
+
+    config = DistroConfig.from_env()
+
+    if not config.endpoint:
+        logger.warning(
+            "containarium_telemetry: OTEL_EXPORTER_OTLP_ENDPOINT not set; "
+            "telemetry will be a no-op. Enable monitoring on the LXC with "
+            "`containarium monitoring enable <username>`."
+        )
+        _shutdown_handle = Shutdown(None)
+        _initialized = True
+        return _shutdown_handle
+
+    protocol = _otlp_protocol(config)
+
+    try:
+        resource = build_resource(config, extra_attrs=extra_attrs)
+
+        # Metrics pipeline.
+        reader = PeriodicExportingMetricReader(
+            _make_metric_exporter(protocol),
+            export_interval_millis=metric_export_interval_ms,
+            export_timeout_millis=metric_export_timeout_ms,
+        )
+        provider = MeterProvider(resource=resource, metric_readers=[reader])
+        metrics.set_meter_provider(provider)
+
+        # Traces pipeline (#386). Only install our TracerProvider when no
+        # real one is set yet (OTel's default is a ProxyTracerProvider) —
+        # don't clobber an app that wired its own. We attach the
+        # BatchSpanProcessor only when we're the ones setting it, so we
+        # never leak an exporter/worker thread onto an unused provider.
+        tracer_provider: Optional[TracerProvider] = None
+        if type(trace.get_tracer_provider()).__name__ == "ProxyTracerProvider":
+            tracer_provider = TracerProvider(resource=resource)
+            tracer_provider.add_span_processor(
+                BatchSpanProcessor(_make_span_exporter(protocol))
+            )
+            trace.set_tracer_provider(tracer_provider)
+    except Exception as e:  # noqa: BLE001 — fail-open per contract
+        logger.warning("containarium_telemetry init failed: %s", e)
+        _shutdown_handle = Shutdown(None)
+        _initialized = True
+        return _shutdown_handle
+
+    # Skip instrumentation registration when invoked from the
+    # auto-instrument runtime (containarium-instrument /
+    # opentelemetry-instrument) — the runtime registers them itself
+    # after we return.
+    if os.environ.get(AUTO_INSTRUMENT_ENV_KEY) != "1":
+        register_instrumentations(instrumentations)
+
+    _shutdown_handle = Shutdown(provider, tracer_provider)
+    _initialized = True
+    return _shutdown_handle
+
+
+def _otlp_protocol(config: DistroConfig) -> str:
+    """Normalize OTEL_EXPORTER_OTLP_PROTOCOL.
+
+    Per the OTel spec the value is one of `grpc`, `http/protobuf`, or
+    `http/json`; the default (matching the SDK and the distro's prior
+    behavior) is `http/protobuf`. Only `grpc` selects the gRPC exporter;
+    everything else maps to HTTP.
+    """
+    return (config.protocol or "http/protobuf").strip().lower()
+
+
+def _make_metric_exporter(protocol: str):
+    """Build the OTLP metric exporter for the selected transport.
+
+    gRPC is imported lazily so the optional `grpc` extra isn't required
+    for the default HTTP path.
+    """
+    if protocol == "grpc":
+        from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
+            OTLPMetricExporter,
+        )
+
+        return OTLPMetricExporter()
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+        OTLPMetricExporter,
+    )
+
+    return OTLPMetricExporter()
+
+
+def _make_span_exporter(protocol: str):
+    """Build the OTLP span exporter for the selected transport."""
+    if protocol == "grpc":
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+            OTLPSpanExporter,
+        )
+
+        return OTLPSpanExporter()
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+        OTLPSpanExporter,
+    )
+
+    return OTLPSpanExporter()
+
+
+def _reset_for_tests() -> None:
+    """Reset module-level init state. Tests only — not part of the API."""
+    global _initialized, _shutdown_handle
+    _initialized = False
+    _shutdown_handle = None
