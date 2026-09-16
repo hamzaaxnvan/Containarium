@@ -141,3 +141,433 @@ if [ ! -f /var/lib/incus/.initialized ]; then
         # Create a ZFS pool using a file-based vdev
         # This allows ZFS features (quotas, compression) without a separate disk
         mkdir -p /var/lib/incus/disks
+        truncate -s 50G /var/lib/incus/disks/incus.img
+        zpool create \
+            -o ashift=12 \
+            -O compression=lz4 \
+            -O atime=off \
+            -O xattr=sa \
+            -m /var/lib/incus/storage \
+            incus-local /var/lib/incus/disks/incus.img
+
+        zfs create incus-local/containers
+        echo "✓ ZFS pool created (file-backed, 50GB)"
+    fi
+
+    # Initialize Incus with ZFS
+    cat <<EOF | incus admin init --preseed
+config: {}
+networks:
+- name: incusbr0
+  type: bridge
+  config:
+    ipv4.address: 10.0.3.1/24
+    ipv4.nat: "true"
+    ipv6.address: none
+storage_pools:
+- name: default
+  driver: zfs
+  config:
+    source: incus-local/containers
+profiles:
+- name: default
+  devices:
+    eth0:
+      name: eth0
+      network: incusbr0
+      type: nic
+    root:
+      path: /
+      pool: default
+      type: disk
+      size: 20GB
+cluster: null
+EOF
+    touch /var/lib/incus/.initialized
+    echo "✓ Incus initialized with ZFS (quotas ENFORCED)"
+else
+    echo "✓ Incus already initialized"
+fi
+
+# Configure Incus networking
+echo "==> Configuring Incus network..."
+# Ensure bridge is created with proper subnet
+if ! incus network show incusbr0 &> /dev/null; then
+    incus network create incusbr0 \
+        ipv4.address=10.0.3.1/24 \
+        ipv4.nat=true \
+        ipv6.address=none
+    echo "✓ Created incusbr0 bridge (10.0.3.0/24)"
+else
+    echo "✓ incusbr0 bridge already exists"
+fi
+
+# Load kernel modules for Docker support in containers
+echo "==> Loading kernel modules for Docker support..."
+MODULES=(
+    "overlay"
+    "br_netfilter"
+    "nf_nat"
+    "xt_conntrack"
+    "ip_tables"
+    "iptable_nat"
+)
+
+for mod in "$${MODULES[@]}"; do
+    if ! lsmod | grep -q "^$mod "; then
+        modprobe "$mod"
+        echo "$mod" >> /etc/modules-load.d/containarium.conf
+        echo "✓ Loaded $mod"
+    fi
+done
+
+# Configure sysctl for containers and Docker
+echo "==> Configuring sysctl for containers..."
+cat > /etc/sysctl.d/99-containarium.conf <<EOF
+# Enable IP forwarding
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+
+# Bridge netfilter
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+
+# Increase inotify limits (for many containers)
+fs.inotify.max_user_instances = 1024
+fs.inotify.max_user_watches = 524288
+EOF
+
+sysctl --system
+echo "✓ Sysctl configured"
+
+# Configure SSH for security
+echo "==> Hardening SSH configuration..."
+cat >> /etc/ssh/sshd_config.d/containarium.conf <<EOF
+# Containarium SSH hardening
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+X11Forwarding no
+MaxAuthTries 3
+LoginGraceTime 20s
+EOF
+
+systemctl restart sshd
+echo "✓ SSH hardened"
+
+# Set up admin users (from Terraform variable)
+echo "==> Setting up admin users..."
+IFS=',' read -ra USERS <<< "$ADMIN_USERS"
+for username in "$${USERS[@]}"; do
+    if ! id "$username" &>/dev/null; then
+        # Create user without creating a new primary group (use existing or
+        # fall back to "users") — a bare useradd tries to auto-create a
+        # same-named primary group, which fails outright if a group of that
+        # name already exists (e.g. "admin" collides with a pre-existing
+        # system group shipped in the stock Ubuntu image; kafeido-infra#41).
+        useradd -m -s /bin/bash -N -G sudo "$username" || useradd -m -s /bin/bash -g users -G sudo "$username"
+        echo "$username ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/"$username"
+        chmod 0440 /etc/sudoers.d/"$username"
+        echo "✓ Created user: $username"
+    else
+        echo "✓ User already exists: $username"
+    fi
+done
+
+# Install monitoring agents (if enabled)
+if [ "$ENABLE_MONITORING" = "true" ]; then
+    echo "==> Installing Google Cloud monitoring agent..."
+    curl -sSO https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+    bash add-google-cloud-ops-agent-repo.sh --also-install
+    rm add-google-cloud-ops-agent-repo.sh
+    echo "✓ Monitoring agent installed"
+fi
+
+# Create containarium directory structure
+echo "==> Creating Containarium directory structure..."
+mkdir -p /opt/containarium/{bin,config,logs}
+chmod 755 /opt/containarium
+
+# Install Containarium daemon
+echo "==> Installing Containarium daemon..."
+CONTAINARIUM_VERSION="${containarium_version}"
+CONTAINARIUM_BINARY_URL="${containarium_binary_url}"
+
+if [ -n "$CONTAINARIUM_BINARY_URL" ]; then
+    # Download from specified URL (e.g., GitHub releases)
+    echo "Downloading from: $CONTAINARIUM_BINARY_URL"
+    curl -fsSL "$CONTAINARIUM_BINARY_URL" -o /usr/local/bin/containariumd
+    chmod +x /usr/local/bin/containariumd
+    # Rollout Phase 1 (#1781): keep the old name working as a symlink so any
+    # runbook/cron this inventory missed keeps working.
+    ln -sf /usr/local/bin/containariumd /usr/local/bin/containarium
+    echo "✓ Containarium daemon downloaded"
+else
+    echo "⚠ No Containarium binary URL provided, daemon not installed"
+    echo "  You can manually install it later by copying the binary to /usr/local/bin/containariumd"
+fi
+
+# Verify installation
+if [ -f /usr/local/bin/containariumd ]; then
+    /usr/local/bin/containariumd version || echo "Containarium binary installed (version command not available)"
+    echo "✓ Containarium daemon ready"
+fi
+
+# Create welcome message
+cat > /etc/motd <<'EOF'
+   ____            _        _                 _
+  / ___|___  _ __ | |_ __ _(_)_ __   __ _ _ __(_)_   _ _ __ ___
+ | |   / _ \| '_ \| __/ _` | | '_ \ / _` | '__| | | | | '_ ` _ \
+ | |__| (_) | | | | || (_| | | | | | (_| | |  | | |_| | | | | | |
+  \____\___/|_| |_|\__\__,_|_|_| |_|\__,_|_|  |_|\__,_|_| |_| |_|
+
+  SSH Jump Server + LXC Container Platform
+
+  Documentation: https://github.com/footprintai/Containarium
+
+  Quick Start:
+    - List containers:     incus list
+    - Create container:    containarium create <username>
+    - View daemon status:  systemctl status containarium
+    - View logs:           journalctl -u containarium -f
+
+  Daemon API:   0.0.0.0:50051 (gRPC)
+  Network:      10.0.3.0/24 (incusbr0)
+
+EOF
+
+echo "✓ Welcome message created"
+
+# Configure JWT secret
+echo "==> Configuring JWT secret for REST API..."
+mkdir -p /etc/containarium
+chmod 0700 /etc/containarium
+if [ -n "$JWT_SECRET" ]; then
+    echo "$JWT_SECRET" > /etc/containarium/jwt.secret
+    chmod 600 /etc/containarium/jwt.secret
+    echo "✓ JWT secret configured from Terraform variable"
+elif [ ! -f /etc/containarium/jwt.secret ]; then
+    openssl rand -base64 32 > /etc/containarium/jwt.secret
+    chmod 600 /etc/containarium/jwt.secret
+    echo "✓ JWT secret auto-generated"
+else
+    echo "✓ JWT secret already exists"
+fi
+
+# Phase 0.4: sentinel↔daemon shared HMAC secret. Same pattern as
+# the spot startup script — write to EnvironmentFile, systemd
+# drop-in loads it. Standalone daemons usually don't talk to a
+# sentinel at all, but we still write the env file so they can if
+# CONTAINARIUM_SENTINEL_URL is set out-of-band.
+if [ -n "$SENTINEL_AUTH_SECRET" ]; then
+    umask 077
+    cat > /etc/containarium/env.secrets <<EOF
+CONTAINARIUM_SENTINEL_AUTH_SECRET=$SENTINEL_AUTH_SECRET
+EOF
+    chmod 0600 /etc/containarium/env.secrets
+    echo "✓ /etc/containarium/env.secrets written"
+fi
+
+# Install systemd service via the binary's built-in command.
+echo "==> Installing Containarium systemd service..."
+if [ -f /usr/local/bin/containariumd ]; then
+    /usr/local/bin/containariumd service install
+    echo "✓ Containarium daemon service installed and started"
+
+    # Phase 0.4/0.5 secrets drop-in (mirrors startup-spot.sh).
+    mkdir -p /etc/systemd/system/containarium.service.d
+    cat > /etc/systemd/system/containarium.service.d/secrets.conf <<'EOF'
+[Service]
+EnvironmentFile=-/etc/containarium/env.secrets
+EOF
+    chmod 0644 /etc/systemd/system/containarium.service.d/secrets.conf
+    systemctl daemon-reload
+    systemctl restart containarium.service
+    echo "✓ wrote secrets.conf systemd drop-in"
+
+    # Check status
+    sleep 2
+    if systemctl is-active --quiet containarium; then
+        echo "✓ Containarium daemon is running"
+    else
+        echo "⚠ Containarium daemon failed to start, check: journalctl -u containarium"
+    fi
+else
+    echo "⚠ Containarium binary not found, service not started"
+    echo "  Install binary manually and run: containarium service install"
+fi
+
+# SSH live authorization for direct logins to this jump host (#2527).
+# Opt-in (ssh_authz_keys_command): an upgrade changes nothing until an
+# operator enables it. sshd's AuthorizedKeysCommand asks the local daemon
+# (containarium ssh-authz-keys -> SSHAuthzService.Authorize) about every key
+# offered on a login to this host.
+#   - containarium-authz is the dedicated unprivileged AuthorizedKeysCommandUser.
+#   - Its JWT carries only ssh:authorize, is minted here from the local JWT
+#     secret, and is readable only by that account. The sentinel secret is
+#     never exposed to it.
+#   - The daemon accepts that token only with --ssh-authz-keys-command
+#     (CONTAINARIUM_SSH_AUTHZ_KEYS_COMMAND), set below.
+# The static authorized_keys files stay as they are: they are the sentinel's
+# upstream path.
+SSH_AUTHZ_DIR="/etc/containarium-authz"
+SSH_AUTHZ_TOKEN="$SSH_AUTHZ_DIR/ssh-authz-keys.token"
+SSH_AUTHZ_DROPIN="/etc/ssh/sshd_config.d/containarium-ssh-authz.conf"
+if [ "$SSH_AUTHZ_KEYS_COMMAND" = "true" ]; then
+    if [ ! -f /usr/local/bin/containariumd ]; then
+        echo "⚠ ssh_authz_keys_command is set but the Containarium binary is missing — AuthorizedKeysCommand not installed"
+    else
+        echo "==> Enabling sshd AuthorizedKeysCommand (ssh-authz-keys)..."
+        if ! id containarium-authz &>/dev/null; then
+            useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin containarium-authz
+        fi
+        install -d -m 0750 -o root -g containarium-authz "$SSH_AUTHZ_DIR"
+        # The token cannot be non-expiring: the daemon caps every token, and
+        # --expiry 0 on an access token means the 15-minute default. A timer
+        # re-mints it instead: 24h lifetime, renewed at boot and every 6h, so
+        # one missed run never leaves sshd without a valid token.
+        SSH_AUTHZ_RENEW=/usr/local/sbin/containarium-ssh-authz-token
+        cat > "$SSH_AUTHZ_RENEW" <<'SSHAUTHZRENEWEOF'
+#!/bin/sh
+# Re-mints the ssh-authz-keys token (#2527); run by
+# containarium-ssh-authz-token.timer. Written to a temp file and renamed, so
+# the AuthorizedKeysCommand never reads a half-written token.
+set -eu
+dir=/etc/containarium-authz
+tmp="$(mktemp "$dir/.ssh-authz-keys.token.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+/usr/local/bin/containariumd token generate \
+    --username containarium-authz --roles "" --scopes ssh:authorize \
+    --token-type access --expiry 24h \
+    --secret-file /etc/containarium/jwt.secret --raw > "$tmp"
+chown containarium-authz:containarium-authz "$tmp"
+chmod 0400 "$tmp"
+mv -f "$tmp" "$dir/ssh-authz-keys.token"
+trap - EXIT
+SSHAUTHZRENEWEOF
+        chmod 0755 "$SSH_AUTHZ_RENEW"
+        cat > /etc/systemd/system/containarium-ssh-authz-token.service <<'EOF'
+[Unit]
+Description=Renew the Containarium ssh-authz-keys token (#2527)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/containarium-ssh-authz-token
+EOF
+        cat > /etc/systemd/system/containarium-ssh-authz-token.timer <<'EOF'
+[Unit]
+Description=Renew the Containarium ssh-authz-keys token (#2527)
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=6h
+
+[Install]
+WantedBy=timers.target
+EOF
+        chmod 0644 /etc/systemd/system/containarium-ssh-authz-token.service \
+            /etc/systemd/system/containarium-ssh-authz-token.timer
+        "$SSH_AUTHZ_RENEW"
+
+        mkdir -p /etc/systemd/system/containarium.service.d
+        cat > /etc/systemd/system/containarium.service.d/ssh-authz-keys.conf <<'EOF'
+[Service]
+Environment=CONTAINARIUM_SSH_AUTHZ_KEYS_COMMAND=true
+EOF
+        chmod 0644 /etc/systemd/system/containarium.service.d/ssh-authz-keys.conf
+        systemctl daemon-reload
+        systemctl enable containarium-ssh-authz-token.timer
+        systemctl start containarium-ssh-authz-token.timer
+        systemctl restart containarium.service
+
+        SSH_AUTHZ_KEYS_ARGS="ssh-authz-keys --token-file $SSH_AUTHZ_TOKEN"
+        if [ "$SSH_AUTHZ_KEYS_ENFORCE" = "true" ]; then
+            SSH_AUTHZ_KEYS_ARGS="$SSH_AUTHZ_KEYS_ARGS --enforce"
+        fi
+        # Global directives, no Match block (#1137).
+        cat > "$SSH_AUTHZ_DROPIN" <<SSHAUTHZEOF
+# Containarium SSH live authorization for direct logins (#2527)
+AuthorizedKeysCommand /usr/local/bin/containariumd $SSH_AUTHZ_KEYS_ARGS %u %f %t %k
+AuthorizedKeysCommandUser containarium-authz
+SSHAUTHZEOF
+        chmod 0644 "$SSH_AUTHZ_DROPIN"
+        # Validate before restarting: a bad drop-in must fail the install,
+        # not take sshd down on its next restart (#1137).
+        SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+        if "$SSHD_BIN" -t; then
+            systemctl restart sshd
+            echo "✓ sshd AuthorizedKeysCommand enabled ($SSH_AUTHZ_DROPIN)"
+        else
+            rm -f "$SSH_AUTHZ_DROPIN"
+            echo "⚠ sshd rejected $SSH_AUTHZ_DROPIN — removed it; AuthorizedKeysCommand not enabled"
+        fi
+    fi
+fi
+
+# Set up logrotate
+cat > /etc/logrotate.d/containarium <<'EOF'
+/opt/containarium/logs/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    notifempty
+    create 0644 root root
+    sharedscripts
+}
+EOF
+
+echo "✓ Logrotate configured"
+
+# Create info script
+cat > /usr/local/bin/containarium-info <<'SCRIPT'
+#!/bin/bash
+# Display Containarium system information
+
+echo "=== Containarium System Information ==="
+echo ""
+echo "Host:"
+echo "  Hostname: $(hostname)"
+echo "  IP: $(hostname -I | awk '{print $1}')"
+echo "  OS: $(lsb_release -d | cut -f2)"
+echo "  Kernel: $(uname -r)"
+echo ""
+echo "Incus:"
+echo "  Version: $(incus --version)"
+echo "  Containers: $(incus list --format csv | wc -l)"
+echo "  Running: $(incus list --format csv | grep -c RUNNING || echo 0)"
+echo "  Stopped: $(incus list --format csv | grep -c STOPPED || echo 0)"
+echo ""
+echo "Resources:"
+echo "  CPUs: $(nproc)"
+echo "  Memory: $(free -h | awk '/^Mem:/ {print $2}')"
+echo "  Disk: $(df -h / | awk 'NR==2 {print $2}')"
+echo ""
+echo "Network:"
+echo "  Bridge: incusbr0 (10.0.3.1/24)"
+echo ""
+SCRIPT
+
+chmod +x /usr/local/bin/containarium-info
+
+# Final system status
+echo ""
+echo "================================================"
+echo "Containarium Setup Complete!"
+echo "================================================"
+echo ""
+incus --version
+incus network list
+echo ""
+echo "Kernel modules loaded:"
+lsmod | grep -E "(overlay|br_netfilter|nf_nat)"
+echo ""
+echo "Jump server is ready for containers!"
+echo "Run 'containarium-info' to see system status"
+echo ""
+
+# Mark setup as complete
+touch /opt/containarium/.setup_complete
+date > /opt/containarium/.setup_timestamp
+
+exit 0
