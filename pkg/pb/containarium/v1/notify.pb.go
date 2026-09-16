@@ -412,3 +412,280 @@ func (x *DeleteNotifyChannelRequest) Reset() {
 	ms.StoreMessageInfo(mi)
 }
 
+func (x *DeleteNotifyChannelRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteNotifyChannelRequest) ProtoMessage() {}
+
+func (x *DeleteNotifyChannelRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_notify_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteNotifyChannelRequest.ProtoReflect.Descriptor instead.
+func (*DeleteNotifyChannelRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_notify_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DeleteNotifyChannelRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+type DeleteNotifyChannelResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteNotifyChannelResponse) Reset() {
+	*x = DeleteNotifyChannelResponse{}
+	mi := &file_containarium_v1_notify_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteNotifyChannelResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteNotifyChannelResponse) ProtoMessage() {}
+
+func (x *DeleteNotifyChannelResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_notify_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteNotifyChannelResponse.ProtoReflect.Descriptor instead.
+func (*DeleteNotifyChannelResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_notify_proto_rawDescGZIP(), []int{6}
+}
+
+type TestNotifyChannelRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TestNotifyChannelRequest) Reset() {
+	*x = TestNotifyChannelRequest{}
+	mi := &file_containarium_v1_notify_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TestNotifyChannelRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TestNotifyChannelRequest) ProtoMessage() {}
+
+func (x *TestNotifyChannelRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_notify_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TestNotifyChannelRequest.ProtoReflect.Descriptor instead.
+func (*TestNotifyChannelRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_notify_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *TestNotifyChannelRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+type TestNotifyChannelResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Human-readable result, e.g. "test push accepted by https://ntfy.example.com".
+	Message       string `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TestNotifyChannelResponse) Reset() {
+	*x = TestNotifyChannelResponse{}
+	mi := &file_containarium_v1_notify_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TestNotifyChannelResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TestNotifyChannelResponse) ProtoMessage() {}
+
+func (x *TestNotifyChannelResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_notify_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TestNotifyChannelResponse.ProtoReflect.Descriptor instead.
+func (*TestNotifyChannelResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_notify_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *TestNotifyChannelResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+var File_containarium_v1_notify_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_notify_proto_rawDesc = "" +
+	"\n" +
+	"\x1ccontainarium/v1/notify.proto\x12\x0fcontainarium.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\"\x90\x02\n" +
+	"\rNotifyChannel\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x126\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\".containarium.v1.NotifyChannelKindR\x04kind\x12\x16\n" +
+	"\x06server\x18\x03 \x01(\tR\x06server\x12\x14\n" +
+	"\x05topic\x18\x04 \x01(\tR\x05topic\x12\x1b\n" +
+	"\thas_token\x18\x05 \x01(\bR\bhasToken\x12%\n" +
+	"\x0eredact_command\x18\x06 \x01(\bR\rredactCommand\x129\n" +
+	"\n" +
+	"updated_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"\xf9\x01\n" +
+	"\x17SetNotifyChannelRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x126\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\".containarium.v1.NotifyChannelKindR\x04kind\x12\x16\n" +
+	"\x06server\x18\x03 \x01(\tR\x06server\x12\x14\n" +
+	"\x05topic\x18\x04 \x01(\tR\x05topic\x12\x14\n" +
+	"\x05token\x18\x05 \x01(\tR\x05token\x12\x1f\n" +
+	"\vclear_token\x18\x06 \x01(\bR\n" +
+	"clearToken\x12%\n" +
+	"\x0eredact_command\x18\a \x01(\bR\rredactCommand\"T\n" +
+	"\x18SetNotifyChannelResponse\x128\n" +
+	"\achannel\x18\x01 \x01(\v2\x1e.containarium.v1.NotifyChannelR\achannel\"5\n" +
+	"\x17GetNotifyChannelRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\"T\n" +
+	"\x18GetNotifyChannelResponse\x128\n" +
+	"\achannel\x18\x01 \x01(\v2\x1e.containarium.v1.NotifyChannelR\achannel\"8\n" +
+	"\x1aDeleteNotifyChannelRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\"\x1d\n" +
+	"\x1bDeleteNotifyChannelResponse\"6\n" +
+	"\x18TestNotifyChannelRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\"5\n" +
+	"\x19TestNotifyChannelResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage*V\n" +
+	"\x11NotifyChannelKind\x12#\n" +
+	"\x1fNOTIFY_CHANNEL_KIND_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18NOTIFY_CHANNEL_KIND_NTFY\x10\x012\x91\n" +
+	"\n" +
+	"\rNotifyService\x12\xa8\x03\n" +
+	"\x10SetNotifyChannel\x12(.containarium.v1.SetNotifyChannelRequest\x1a).containarium.v1.SetNotifyChannelResponse\"\xbe\x02\x92A\x9d\x02\n" +
+	"\x06Notify\x12\x18Set notification channel\x1a\xf8\x01Create or replace the user's push channel for waiting permission requests. Only ntfy is supported. A token, when given, is stored as a broker-only tenant secret and requires an https server; it is never returned. An empty username means the caller.\x82\xd3\xe4\x93\x02\x17:\x01*\x1a\x12/v1/notify/channel\x12\xb6\x02\n" +
+	"\x10GetNotifyChannel\x12(.containarium.v1.GetNotifyChannelRequest\x1a).containarium.v1.GetNotifyChannelResponse\"\xcc\x01\x92A\xae\x01\n" +
+	"\x06Notify\x12\x18Get notification channel\x1a\x89\x01Return the user's push channel. has_token says whether a token is stored; the token itself is never returned. NOT_FOUND when none is set.\x82\xd3\xe4\x93\x02\x14\x12\x12/v1/notify/channel\x12\x87\x02\n" +
+	"\x13DeleteNotifyChannel\x12+.containarium.v1.DeleteNotifyChannelRequest\x1a,.containarium.v1.DeleteNotifyChannelResponse\"\x94\x01\x92Aw\n" +
+	"\x06Notify\x12\x1bDelete notification channel\x1aPRemove the user's push channel and its stored token. No further pushes are sent.\x82\xd3\xe4\x93\x02\x14*\x12/v1/notify/channel\x12\x91\x02\n" +
+	"\x11TestNotifyChannel\x12).containarium.v1.TestNotifyChannelRequest\x1a*.containarium.v1.TestNotifyChannelResponse\"\xa4\x01\x92A\x7f\n" +
+	"\x06Notify\x12\x18Send a test notification\x1a[Publish one test push through the user's channel and report whether the server accepted it.\x82\xd3\xe4\x93\x02\x1c:\x01*\"\x17/v1/notify/channel/testBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_notify_proto_rawDescOnce sync.Once
+	file_containarium_v1_notify_proto_rawDescData []byte
+)
+
+func file_containarium_v1_notify_proto_rawDescGZIP() []byte {
+	file_containarium_v1_notify_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_notify_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_notify_proto_rawDesc), len(file_containarium_v1_notify_proto_rawDesc)))
+	})
+	return file_containarium_v1_notify_proto_rawDescData
+}
+
+var file_containarium_v1_notify_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_containarium_v1_notify_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_containarium_v1_notify_proto_goTypes = []any{
+	(NotifyChannelKind)(0),              // 0: containarium.v1.NotifyChannelKind
+	(*NotifyChannel)(nil),               // 1: containarium.v1.NotifyChannel
+	(*SetNotifyChannelRequest)(nil),     // 2: containarium.v1.SetNotifyChannelRequest
+	(*SetNotifyChannelResponse)(nil),    // 3: containarium.v1.SetNotifyChannelResponse
+	(*GetNotifyChannelRequest)(nil),     // 4: containarium.v1.GetNotifyChannelRequest
+	(*GetNotifyChannelResponse)(nil),    // 5: containarium.v1.GetNotifyChannelResponse
+	(*DeleteNotifyChannelRequest)(nil),  // 6: containarium.v1.DeleteNotifyChannelRequest
+	(*DeleteNotifyChannelResponse)(nil), // 7: containarium.v1.DeleteNotifyChannelResponse
+	(*TestNotifyChannelRequest)(nil),    // 8: containarium.v1.TestNotifyChannelRequest
+	(*TestNotifyChannelResponse)(nil),   // 9: containarium.v1.TestNotifyChannelResponse
+	(*timestamppb.Timestamp)(nil),       // 10: google.protobuf.Timestamp
+}
+var file_containarium_v1_notify_proto_depIdxs = []int32{
+	0,  // 0: containarium.v1.NotifyChannel.kind:type_name -> containarium.v1.NotifyChannelKind
+	10, // 1: containarium.v1.NotifyChannel.updated_at:type_name -> google.protobuf.Timestamp
+	0,  // 2: containarium.v1.SetNotifyChannelRequest.kind:type_name -> containarium.v1.NotifyChannelKind
+	1,  // 3: containarium.v1.SetNotifyChannelResponse.channel:type_name -> containarium.v1.NotifyChannel
+	1,  // 4: containarium.v1.GetNotifyChannelResponse.channel:type_name -> containarium.v1.NotifyChannel
+	2,  // 5: containarium.v1.NotifyService.SetNotifyChannel:input_type -> containarium.v1.SetNotifyChannelRequest
+	4,  // 6: containarium.v1.NotifyService.GetNotifyChannel:input_type -> containarium.v1.GetNotifyChannelRequest
+	6,  // 7: containarium.v1.NotifyService.DeleteNotifyChannel:input_type -> containarium.v1.DeleteNotifyChannelRequest
+	8,  // 8: containarium.v1.NotifyService.TestNotifyChannel:input_type -> containarium.v1.TestNotifyChannelRequest
+	3,  // 9: containarium.v1.NotifyService.SetNotifyChannel:output_type -> containarium.v1.SetNotifyChannelResponse
+	5,  // 10: containarium.v1.NotifyService.GetNotifyChannel:output_type -> containarium.v1.GetNotifyChannelResponse
+	7,  // 11: containarium.v1.NotifyService.DeleteNotifyChannel:output_type -> containarium.v1.DeleteNotifyChannelResponse
+	9,  // 12: containarium.v1.NotifyService.TestNotifyChannel:output_type -> containarium.v1.TestNotifyChannelResponse
+	9,  // [9:13] is the sub-list for method output_type
+	5,  // [5:9] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_notify_proto_init() }
+func file_containarium_v1_notify_proto_init() {
+	if File_containarium_v1_notify_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_notify_proto_rawDesc), len(file_containarium_v1_notify_proto_rawDesc)),
+			NumEnums:      1,
+			NumMessages:   9,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_notify_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_notify_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_notify_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_notify_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_notify_proto = out.File
+	file_containarium_v1_notify_proto_goTypes = nil
+	file_containarium_v1_notify_proto_depIdxs = nil
+}
