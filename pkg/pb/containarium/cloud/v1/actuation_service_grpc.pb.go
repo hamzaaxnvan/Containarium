@@ -304,3 +304,207 @@ type ActuationServiceServer interface {
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
+type UnimplementedActuationServiceServer struct{}
+
+func (UnimplementedActuationServiceServer) EnrollHost(context.Context, *EnrollHostRequest) (*EnrollHostResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnrollHost not implemented")
+}
+func (UnimplementedActuationServiceServer) ReportHostStatus(context.Context, *ReportHostStatusRequest) (*ReportHostStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportHostStatus not implemented")
+}
+func (UnimplementedActuationServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedActuationServiceServer) ReportContainerState(context.Context, *ReportContainerStateRequest) (*ReportContainerStateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportContainerState not implemented")
+}
+func (UnimplementedActuationServiceServer) WatchAssignments(*WatchAssignmentsRequest, grpc.ServerStreamingServer[AssignmentBatch]) error {
+	return status.Error(codes.Unimplemented, "method WatchAssignments not implemented")
+}
+func (UnimplementedActuationServiceServer) GetSSHTrustBundle(context.Context, *GetSSHTrustBundleRequest) (*GetSSHTrustBundleResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSSHTrustBundle not implemented")
+}
+func (UnimplementedActuationServiceServer) AuthorizeSSH(context.Context, *v1.AuthorizeSSHRequest) (*v1.AuthorizeSSHResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AuthorizeSSH not implemented")
+}
+func (UnimplementedActuationServiceServer) mustEmbedUnimplementedActuationServiceServer() {}
+func (UnimplementedActuationServiceServer) testEmbeddedByValue()                          {}
+
+// UnsafeActuationServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ActuationServiceServer will
+// result in compilation errors.
+type UnsafeActuationServiceServer interface {
+	mustEmbedUnimplementedActuationServiceServer()
+}
+
+func RegisterActuationServiceServer(s grpc.ServiceRegistrar, srv ActuationServiceServer) {
+	// If the following call panics, it indicates UnimplementedActuationServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ActuationService_ServiceDesc, srv)
+}
+
+func _ActuationService_EnrollHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnrollHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActuationServiceServer).EnrollHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActuationService_EnrollHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActuationServiceServer).EnrollHost(ctx, req.(*EnrollHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActuationService_ReportHostStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportHostStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActuationServiceServer).ReportHostStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActuationService_ReportHostStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActuationServiceServer).ReportHostStatus(ctx, req.(*ReportHostStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActuationService_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActuationServiceServer).Heartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActuationService_Heartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActuationServiceServer).Heartbeat(ctx, req.(*HeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActuationService_ReportContainerState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportContainerStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActuationServiceServer).ReportContainerState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActuationService_ReportContainerState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActuationServiceServer).ReportContainerState(ctx, req.(*ReportContainerStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActuationService_WatchAssignments_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchAssignmentsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ActuationServiceServer).WatchAssignments(m, &grpc.GenericServerStream[WatchAssignmentsRequest, AssignmentBatch]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ActuationService_WatchAssignmentsServer = grpc.ServerStreamingServer[AssignmentBatch]
+
+func _ActuationService_GetSSHTrustBundle_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSSHTrustBundleRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActuationServiceServer).GetSSHTrustBundle(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActuationService_GetSSHTrustBundle_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActuationServiceServer).GetSSHTrustBundle(ctx, req.(*GetSSHTrustBundleRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ActuationService_AuthorizeSSH_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(v1.AuthorizeSSHRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ActuationServiceServer).AuthorizeSSH(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ActuationService_AuthorizeSSH_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ActuationServiceServer).AuthorizeSSH(ctx, req.(*v1.AuthorizeSSHRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ActuationService_ServiceDesc is the grpc.ServiceDesc for ActuationService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ActuationService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.cloud.v1.ActuationService",
+	HandlerType: (*ActuationServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "EnrollHost",
+			Handler:    _ActuationService_EnrollHost_Handler,
+		},
+		{
+			MethodName: "ReportHostStatus",
+			Handler:    _ActuationService_ReportHostStatus_Handler,
+		},
+		{
+			MethodName: "Heartbeat",
+			Handler:    _ActuationService_Heartbeat_Handler,
+		},
+		{
+			MethodName: "ReportContainerState",
+			Handler:    _ActuationService_ReportContainerState_Handler,
+		},
+		{
+			MethodName: "GetSSHTrustBundle",
+			Handler:    _ActuationService_GetSSHTrustBundle_Handler,
+		},
+		{
+			MethodName: "AuthorizeSSH",
+			Handler:    _ActuationService_AuthorizeSSH_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchAssignments",
+			Handler:       _ActuationService_WatchAssignments_Handler,
+			ServerStreams: true,
+		},
+	},
+	Metadata: "containarium/cloud/v1/actuation_service.proto",
+}
