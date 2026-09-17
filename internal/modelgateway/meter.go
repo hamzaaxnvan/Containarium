@@ -54,3 +54,32 @@ func (m *Meter) add(tenant, skill, provider string, u Usage, blocked bool) {
 	if r == nil {
 		r = &MeterRow{Tenant: tenant, Skill: skill, Provider: provider, Model: u.Model}
 		m.rows[k] = r
+	}
+	r.Calls++
+	if blocked {
+		r.BlockedCalls++
+	}
+	r.InputTokens += u.InputTokens
+	r.OutputTokens += u.OutputTokens
+	r.CachedTokens += u.CachedTokens
+}
+
+// Snapshot returns the rollups in a stable order.
+func (m *Meter) Snapshot() []MeterRow {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]MeterRow, 0, len(m.rows))
+	for _, r := range m.rows {
+		out = append(out, *r)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Tenant != out[j].Tenant {
+			return out[i].Tenant < out[j].Tenant
+		}
+		if out[i].Provider != out[j].Provider {
+			return out[i].Provider < out[j].Provider
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
+}

@@ -256,3 +256,777 @@ func (x *SetSecretRequest) Reset() {
 	mi := &file_containarium_v1_secrets_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetSecretRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetSecretRequest) ProtoMessage() {}
+
+func (x *SetSecretRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetSecretRequest.ProtoReflect.Descriptor instead.
+func (*SetSecretRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *SetSecretRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *SetSecretRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *SetSecretRequest) GetValue() string {
+	if x != nil {
+		return x.Value
+	}
+	return ""
+}
+
+// Deprecated: Marked as deprecated in containarium/v1/secrets.proto.
+func (x *SetSecretRequest) GetDelivery() string {
+	if x != nil {
+		return x.Delivery
+	}
+	return ""
+}
+
+func (x *SetSecretRequest) GetDeliveryMode() SecretDelivery {
+	if x != nil {
+		return x.DeliveryMode
+	}
+	return SecretDelivery_SECRET_DELIVERY_UNSPECIFIED
+}
+
+type SetSecretResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Operator-facing summary ("created" / "updated to version N").
+	Message string `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	// Resulting metadata after the write.
+	Secret        *SecretMetadata `protobuf:"bytes,2,opt,name=secret,proto3" json:"secret,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetSecretResponse) Reset() {
+	*x = SetSecretResponse{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetSecretResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetSecretResponse) ProtoMessage() {}
+
+func (x *SetSecretResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetSecretResponse.ProtoReflect.Descriptor instead.
+func (*SetSecretResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *SetSecretResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *SetSecretResponse) GetSecret() *SecretMetadata {
+	if x != nil {
+		return x.Secret
+	}
+	return nil
+}
+
+// GetSecretRequest reads a single secret's plaintext value. Always
+// audit-logged. Auth: admin JWT in v1 (decision #3); per-LXC tokens
+// in v2.
+type GetSecretRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetSecretRequest) Reset() {
+	*x = GetSecretRequest{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSecretRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSecretRequest) ProtoMessage() {}
+
+func (x *GetSecretRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSecretRequest.ProtoReflect.Descriptor instead.
+func (*GetSecretRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *GetSecretRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *GetSecretRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+type GetSecretResponse struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Secret *SecretMetadata        `protobuf:"bytes,1,opt,name=secret,proto3" json:"secret,omitempty"`
+	// The decrypted plaintext value. Caller's responsibility to keep
+	// safe — once it's on the wire, the daemon's encryption guarantee
+	// ends.
+	Value         string `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetSecretResponse) Reset() {
+	*x = GetSecretResponse{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSecretResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSecretResponse) ProtoMessage() {}
+
+func (x *GetSecretResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSecretResponse.ProtoReflect.Descriptor instead.
+func (*GetSecretResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *GetSecretResponse) GetSecret() *SecretMetadata {
+	if x != nil {
+		return x.Secret
+	}
+	return nil
+}
+
+func (x *GetSecretResponse) GetValue() string {
+	if x != nil {
+		return x.Value
+	}
+	return ""
+}
+
+// ListSecretsRequest enumerates secrets for a tenant. Returns
+// metadata only — never values.
+type ListSecretsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username (tenant) whose secrets to list.
+	Username      string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListSecretsRequest) Reset() {
+	*x = ListSecretsRequest{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListSecretsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListSecretsRequest) ProtoMessage() {}
+
+func (x *ListSecretsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListSecretsRequest.ProtoReflect.Descriptor instead.
+func (*ListSecretsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ListSecretsRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+type ListSecretsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Secrets       []*SecretMetadata      `protobuf:"bytes,1,rep,name=secrets,proto3" json:"secrets,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListSecretsResponse) Reset() {
+	*x = ListSecretsResponse{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListSecretsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListSecretsResponse) ProtoMessage() {}
+
+func (x *ListSecretsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListSecretsResponse.ProtoReflect.Descriptor instead.
+func (*ListSecretsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ListSecretsResponse) GetSecrets() []*SecretMetadata {
+	if x != nil {
+		return x.Secrets
+	}
+	return nil
+}
+
+// DeleteSecretRequest removes a secret. Does NOT clean up env-var
+// stamps on running containers — operators / agents re-stamp via
+// RefreshSecrets if they want the change to reach a running process
+// without a container restart.
+type DeleteSecretRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteSecretRequest) Reset() {
+	*x = DeleteSecretRequest{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteSecretRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteSecretRequest) ProtoMessage() {}
+
+func (x *DeleteSecretRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteSecretRequest.ProtoReflect.Descriptor instead.
+func (*DeleteSecretRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *DeleteSecretRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *DeleteSecretRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+type DeleteSecretResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Message       string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteSecretResponse) Reset() {
+	*x = DeleteSecretResponse{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteSecretResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteSecretResponse) ProtoMessage() {}
+
+func (x *DeleteSecretResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteSecretResponse.ProtoReflect.Descriptor instead.
+func (*DeleteSecretResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *DeleteSecretResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// RefreshSecretsRequest re-stamps the LXC's environment.<NAME>
+// config keys from the current secret DB state for the tenant. Used
+// after rotation when the operator wants the next process exec'd in
+// the LXC to see the new value without restarting the container.
+//
+// Running processes in the container do NOT pick up the new env
+// (Linux environments are inherited at fork time, not refreshed).
+// For that, the tenant restarts the container or starts a new
+// process.
+type RefreshSecretsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RefreshSecretsRequest) Reset() {
+	*x = RefreshSecretsRequest{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RefreshSecretsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RefreshSecretsRequest) ProtoMessage() {}
+
+func (x *RefreshSecretsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RefreshSecretsRequest.ProtoReflect.Descriptor instead.
+func (*RefreshSecretsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *RefreshSecretsRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+type RefreshSecretsResponse struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Message string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	// Count of env vars actually stamped (matches the number of
+	// secrets owned by the tenant at refresh time).
+	Stamped       int32 `protobuf:"varint,2,opt,name=stamped,proto3" json:"stamped,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RefreshSecretsResponse) Reset() {
+	*x = RefreshSecretsResponse{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RefreshSecretsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RefreshSecretsResponse) ProtoMessage() {}
+
+func (x *RefreshSecretsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RefreshSecretsResponse.ProtoReflect.Descriptor instead.
+func (*RefreshSecretsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *RefreshSecretsResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *RefreshSecretsResponse) GetStamped() int32 {
+	if x != nil {
+		return x.Stamped
+	}
+	return 0
+}
+
+// SetTenantKMSKeyRequest sets or clears a tenant's per-tenant KEK for
+// secrets envelope encryption. This is a privileged, admin-only
+// operation performed ON BEHALF OF a tenant — unlike SetSecret/GetSecret,
+// it always requires the admin role and an explicitly granted
+// secrets:write scope, even when the caller's own subject equals
+// username, because changing which key encrypts a tenant's secrets is
+// not something a tenant does to itself in the platform's actual usage.
+type SetTenantKMSKeyRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username (tenant) whose KEK to set or clear.
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// GCP Cloud KMS CryptoKey resource name
+	// (projects/P/locations/L/keyRings/R/cryptoKeys/K) that this tenant's
+	// secrets will be wrapped under going forward. The daemon re-wraps
+	// every existing secret the tenant owns under this key.
+	//
+	// Empty clears the override: existing secrets are re-wrapped back
+	// under the daemon's shared KEK (CONTAINARIUM_GCP_KMS_KEY_NAME)
+	// before the tenant's own key can be invalidated by whoever manages
+	// it upstream.
+	//
+	// Requires CONTAINARIUM_KMS_BACKEND=gcp — per-tenant keys are not
+	// yet supported for the vault/aws/inproc backends.
+	KekResourceName string `protobuf:"bytes,2,opt,name=kek_resource_name,json=kekResourceName,proto3" json:"kek_resource_name,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *SetTenantKMSKeyRequest) Reset() {
+	*x = SetTenantKMSKeyRequest{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetTenantKMSKeyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetTenantKMSKeyRequest) ProtoMessage() {}
+
+func (x *SetTenantKMSKeyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetTenantKMSKeyRequest.ProtoReflect.Descriptor instead.
+func (*SetTenantKMSKeyRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *SetTenantKMSKeyRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *SetTenantKMSKeyRequest) GetKekResourceName() string {
+	if x != nil {
+		return x.KekResourceName
+	}
+	return ""
+}
+
+type SetTenantKMSKeyResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Operator-facing summary, including how many secrets were re-wrapped.
+	Message string `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	// True if the tenant now has a per-tenant key (kek_resource_name was
+	// non-empty in the request); false if cleared back to the shared KEK.
+	HasTenantKey  bool `protobuf:"varint,2,opt,name=has_tenant_key,json=hasTenantKey,proto3" json:"has_tenant_key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetTenantKMSKeyResponse) Reset() {
+	*x = SetTenantKMSKeyResponse{}
+	mi := &file_containarium_v1_secrets_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetTenantKMSKeyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetTenantKMSKeyResponse) ProtoMessage() {}
+
+func (x *SetTenantKMSKeyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_secrets_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetTenantKMSKeyResponse.ProtoReflect.Descriptor instead.
+func (*SetTenantKMSKeyResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_secrets_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *SetTenantKMSKeyResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *SetTenantKMSKeyResponse) GetHasTenantKey() bool {
+	if x != nil {
+		return x.HasTenantKey
+	}
+	return false
+}
+
+var File_containarium_v1_secrets_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_secrets_proto_rawDesc = "" +
+	"\n" +
+	"\x1dcontainarium/v1/secrets.proto\x12\x0fcontainarium.v1\"\xfe\x01\n" +
+	"\x0eSecretMetadata\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x18\n" +
+	"\aversion\x18\x03 \x01(\x05R\aversion\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\x04 \x01(\tR\tcreatedAt\x12\x1d\n" +
+	"\n" +
+	"updated_at\x18\x05 \x01(\tR\tupdatedAt\x12\x1e\n" +
+	"\bdelivery\x18\x06 \x01(\tB\x02\x18\x01R\bdelivery\x12D\n" +
+	"\rdelivery_mode\x18\a \x01(\x0e2\x1f.containarium.v1.SecretDeliveryR\fdeliveryMode\"\xbe\x01\n" +
+	"\x10SetSecretRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
+	"\x05value\x18\x03 \x01(\tR\x05value\x12\x1e\n" +
+	"\bdelivery\x18\x04 \x01(\tB\x02\x18\x01R\bdelivery\x12D\n" +
+	"\rdelivery_mode\x18\x05 \x01(\x0e2\x1f.containarium.v1.SecretDeliveryR\fdeliveryMode\"f\n" +
+	"\x11SetSecretResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\x127\n" +
+	"\x06secret\x18\x02 \x01(\v2\x1f.containarium.v1.SecretMetadataR\x06secret\"B\n" +
+	"\x10GetSecretRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\"b\n" +
+	"\x11GetSecretResponse\x127\n" +
+	"\x06secret\x18\x01 \x01(\v2\x1f.containarium.v1.SecretMetadataR\x06secret\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\"0\n" +
+	"\x12ListSecretsRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\"P\n" +
+	"\x13ListSecretsResponse\x129\n" +
+	"\asecrets\x18\x01 \x03(\v2\x1f.containarium.v1.SecretMetadataR\asecrets\"E\n" +
+	"\x13DeleteSecretRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\"0\n" +
+	"\x14DeleteSecretResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\"3\n" +
+	"\x15RefreshSecretsRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\"L\n" +
+	"\x16RefreshSecretsResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\x12\x18\n" +
+	"\astamped\x18\x02 \x01(\x05R\astamped\"`\n" +
+	"\x16SetTenantKMSKeyRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12*\n" +
+	"\x11kek_resource_name\x18\x02 \x01(\tR\x0fkekResourceName\"Y\n" +
+	"\x17SetTenantKMSKeyResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\x12$\n" +
+	"\x0ehas_tenant_key\x18\x02 \x01(\bR\fhasTenantKey*\xa2\x01\n" +
+	"\x0eSecretDelivery\x12\x1f\n" +
+	"\x1bSECRET_DELIVERY_UNSPECIFIED\x10\x00\x12\x17\n" +
+	"\x13SECRET_DELIVERY_ENV\x10\x01\x12\x18\n" +
+	"\x14SECRET_DELIVERY_FILE\x10\x02\x12\x1b\n" +
+	"\x17SECRET_DELIVERY_COMPOSE\x10\x03\x12\x1f\n" +
+	"\x1bSECRET_DELIVERY_BROKER_ONLY\x10\x04BKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_secrets_proto_rawDescOnce sync.Once
+	file_containarium_v1_secrets_proto_rawDescData []byte
+)
+
+func file_containarium_v1_secrets_proto_rawDescGZIP() []byte {
+	file_containarium_v1_secrets_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_secrets_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_secrets_proto_rawDesc), len(file_containarium_v1_secrets_proto_rawDesc)))
+	})
+	return file_containarium_v1_secrets_proto_rawDescData
+}
+
+var file_containarium_v1_secrets_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_containarium_v1_secrets_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_containarium_v1_secrets_proto_goTypes = []any{
+	(SecretDelivery)(0),             // 0: containarium.v1.SecretDelivery
+	(*SecretMetadata)(nil),          // 1: containarium.v1.SecretMetadata
+	(*SetSecretRequest)(nil),        // 2: containarium.v1.SetSecretRequest
+	(*SetSecretResponse)(nil),       // 3: containarium.v1.SetSecretResponse
+	(*GetSecretRequest)(nil),        // 4: containarium.v1.GetSecretRequest
+	(*GetSecretResponse)(nil),       // 5: containarium.v1.GetSecretResponse
+	(*ListSecretsRequest)(nil),      // 6: containarium.v1.ListSecretsRequest
+	(*ListSecretsResponse)(nil),     // 7: containarium.v1.ListSecretsResponse
+	(*DeleteSecretRequest)(nil),     // 8: containarium.v1.DeleteSecretRequest
+	(*DeleteSecretResponse)(nil),    // 9: containarium.v1.DeleteSecretResponse
+	(*RefreshSecretsRequest)(nil),   // 10: containarium.v1.RefreshSecretsRequest
+	(*RefreshSecretsResponse)(nil),  // 11: containarium.v1.RefreshSecretsResponse
+	(*SetTenantKMSKeyRequest)(nil),  // 12: containarium.v1.SetTenantKMSKeyRequest
+	(*SetTenantKMSKeyResponse)(nil), // 13: containarium.v1.SetTenantKMSKeyResponse
+}
+var file_containarium_v1_secrets_proto_depIdxs = []int32{
+	0, // 0: containarium.v1.SecretMetadata.delivery_mode:type_name -> containarium.v1.SecretDelivery
+	0, // 1: containarium.v1.SetSecretRequest.delivery_mode:type_name -> containarium.v1.SecretDelivery
+	1, // 2: containarium.v1.SetSecretResponse.secret:type_name -> containarium.v1.SecretMetadata
+	1, // 3: containarium.v1.GetSecretResponse.secret:type_name -> containarium.v1.SecretMetadata
+	1, // 4: containarium.v1.ListSecretsResponse.secrets:type_name -> containarium.v1.SecretMetadata
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_secrets_proto_init() }
+func file_containarium_v1_secrets_proto_init() {
+	if File_containarium_v1_secrets_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_secrets_proto_rawDesc), len(file_containarium_v1_secrets_proto_rawDesc)),
+			NumEnums:      1,
+			NumMessages:   13,
+			NumExtensions: 0,
+			NumServices:   0,
+		},
+		GoTypes:           file_containarium_v1_secrets_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_secrets_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_secrets_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_secrets_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_secrets_proto = out.File
+	file_containarium_v1_secrets_proto_goTypes = nil
+	file_containarium_v1_secrets_proto_depIdxs = nil
+}
