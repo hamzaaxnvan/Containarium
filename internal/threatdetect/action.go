@@ -122,3 +122,127 @@ const memActionRingCap = 1000
 type MemActionStore struct {
 	mu     sync.Mutex
 	nextID int64
+	rows   []*SecurityAction
+}
+
+// NewMemActionStore builds an empty degraded-mode store.
+func NewMemActionStore() *MemActionStore { return &MemActionStore{} }
+
+func (s *MemActionStore) Insert(_ context.Context, a *SecurityAction) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a.Open() {
+		for _, r := range s.rows {
+			if r.Container == a.Container && r.Open() {
+				return fmt.Errorf("threatdetect: %s: %w", a.Container, ErrActionOpen)
+			}
+		}
+	}
+	s.nextID++
+	a.ID = s.nextID
+	cp := *a
+	s.rows = append(s.rows, &cp)
+	if len(s.rows) > memActionRingCap {
+		s.rows = s.rows[1:]
+	}
+	return nil
+}
+
+func (s *MemActionStore) Open(_ context.Context, container string) (*SecurityAction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.rows {
+		if r.Container == container && r.Open() {
+			cp := *r
+			return &cp, nil
+		}
+	}
+	return nil, fmt.Errorf("threatdetect: %s: %w", container, ErrNoOpenAction)
+}
+
+func (s *MemActionStore) Release(_ context.Context, id int64, releasedBy string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.rows {
+		if r.ID == id && r.Open() {
+			r.ReleasedAt, r.ReleasedBy = at, releasedBy
+			return nil
+		}
+	}
+	return fmt.Errorf("threatdetect: action %d: %w", id, ErrNoOpenAction)
+}
+
+func (s *MemActionStore) ListExpired(_ context.Context, now time.Time) ([]*SecurityAction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*SecurityAction
+	for _, r := range s.rows {
+		if r.Open() && !r.Pending && !r.ExpiresAt.After(now) {
+			cp := *r
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+
+func (s *MemActionStore) MarkApplied(_ context.Context, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.rows {
+		if r.ID == id && r.Open() && r.Pending {
+			r.Pending = false
+			return nil
+		}
+	}
+	return fmt.Errorf("threatdetect: action %d: %w", id, ErrNoOpenAction)
+}
+
+func (s *MemActionStore) Fail(_ context.Context, id int64, cause string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.rows {
+		if r.ID == id && r.Open() {
+			r.Pending, r.Error, r.ReleasedAt, r.ReleasedBy = false, cause, at, ReleasedByError
+			return nil
+		}
+	}
+	return fmt.Errorf("threatdetect: action %d: %w", id, ErrNoOpenAction)
+}
+
+func (s *MemActionStore) Latest(_ context.Context, container string) (*SecurityAction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.rows) - 1; i >= 0; i-- {
+		if s.rows[i].Container == container {
+			cp := *s.rows[i]
+			return &cp, nil
+		}
+	}
+	return nil, fmt.Errorf("threatdetect: %s: %w", container, ErrNoOpenAction)
+}
+
+func (s *MemActionStore) ListOrphaned(_ context.Context, cutoff time.Time) ([]*SecurityAction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*SecurityAction
+	for _, r := range s.rows {
+		if r.Open() && r.Pending && !r.AppliedAt.After(cutoff) {
+			cp := *r
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+
+func (s *MemActionStore) ListByFinding(_ context.Context, findingID int64) ([]*SecurityAction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*SecurityAction
+	for i := len(s.rows) - 1; i >= 0; i-- {
+		if s.rows[i].FindingID == findingID {
+			cp := *s.rows[i]
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
