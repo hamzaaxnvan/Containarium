@@ -234,3 +234,62 @@ export class ClaudeEngine implements Engine {
 }
 
 // claudeEnding reads how the turn ended from the result message (#2513): the
+// API stop reason, the SDK's terminal reason and the result subtype. Anything
+// but a successful end_turn (or an unreported stop reason) that completed is
+// abnormal; so is a run with no result message at all.
+function claudeEnding(
+  result: ClaudeResult | undefined,
+  finalText: string,
+  schemaBound: boolean,
+): RunEnding {
+  const stop = result?.stop_reason ?? null;
+  const terminal = result?.terminal_reason;
+  const fields: EndingField[] = [{ name: "stop_reason", value: stop ?? "unknown" }];
+  if (terminal) fields.push({ name: "terminal_reason", value: terminal });
+  fields.push({ name: "result", value: result?.subtype ?? "none" });
+  if (result?.subtype === "success" && result.is_error) fields.push({ name: "is_error", value: "true" });
+  const abnormal =
+    result === undefined ||
+    result.subtype !== "success" ||
+    result.is_error ||
+    (stop !== null && stop !== "end_turn") ||
+    (terminal !== undefined && terminal !== "completed");
+  const hasFinalOutput = schemaBound
+    ? result?.subtype === "success" && result.structured_output !== undefined
+    : finalText.trim() !== "";
+  return { finalMessage: finalText, hasFinalOutput, abnormal, fields };
+}
+
+// structuredOutput is the SDK-validated output of a schema-bound run, or
+// throws naming why there is none.
+function structuredOutput(result: ClaudeResult | undefined): unknown {
+  const want = "no structured output matching agent_card.output_schema_json";
+  if (result === undefined)
+    throw new Error(`claude: run ended without a result message — ${want}`);
+  if (result.subtype !== "success")
+    throw new Error(`claude: ${resultErrorText(result)} — ${want}`);
+  if (result.structured_output === undefined)
+    throw new Error(`claude: run ended with ${want}`);
+  return result.structured_output;
+}
+
+// resultErrorText renders an error result as "<subtype>: <errors>" (or just
+// the subtype), the journal's error line for it.
+function resultErrorText(result: ClaudeResult): string {
+  const detail = "errors" in result ? (result.errors ?? []).join("; ") : "";
+  return detail ? `${result.subtype}: ${detail}` : result.subtype;
+}
+
+// toolResultText flattens a tool_result's content to text: text blocks
+// verbatim, anything else (an image, a document) as a [type] placeholder.
+function toolResultText(
+  content: string | ReadonlyArray<{ type: string; text?: string }> | undefined,
+): string {
+  if (content === undefined) return "";
+  if (typeof content === "string") return content;
+  return content
+    .map((b) =>
+      b.type === "text" && typeof b.text === "string" ? b.text : `[${b.type}]`,
+    )
+    .join("\n");
+}

@@ -221,3 +221,227 @@ func (s *ContainerServer) MoveContainer(ctx context.Context, req *pb.MoveContain
 		syncName = fmt.Sprintf("containarium-move-sync%d", i)
 		start := time.Now()
 
+		if err := s.moveRunner.Snapshot(containerName, syncName); err != nil {
+			cleanupSnaps()
+			return nil, fmt.Errorf("phase 2 iter %d: snapshot: %w", i, err)
+		}
+		createdSnaps = append(createdSnaps, syncName)
+
+		log.Printf("[move] phase 2 iter %d: delta refresh of %s/%s ...", i, containerName, syncName)
+		if err := s.moveRunner.CopyRefresh(containerName, syncName, targetRemote, encStoragePool); err != nil {
+			cleanupSnaps()
+			return nil, fmt.Errorf("phase 2 iter %d: refresh: %w", i, err)
+		}
+		iterations++
+
+		elapsed := time.Since(start)
+		log.Printf("[move] phase 2 iter %d done in %s", i, elapsed)
+		if elapsed < time.Duration(params.deltaThresholdSeconds)*time.Second {
+			log.Printf("[move] delta below threshold (%ds), proceeding to cutover", params.deltaThresholdSeconds)
+			break
+		}
+	}
+
+	// PHASE 3 — cutover. From here until the route swap, the
+	// container is offline. We measure the gap and surface it as
+	// downtime_seconds.
+	cutoverStart := time.Now()
+
+	log.Printf("[move] phase 3: stopping source container %s", containerName)
+	if err := s.moveRunner.Stop(containerName); err != nil {
+		cleanupSnaps()
+		return nil, fmt.Errorf("phase 3: stop source: %w", err)
+	}
+
+	// Best-effort restart-on-rollback. If anything below this point
+	// fails before route swap, we want the source container running
+	// so the public hostname comes back.
+	rollback := func() {
+		if err := s.moveRunner.Start(containerName); err != nil {
+			log.Printf("[move] rollback: failed to restart source container: %v", err)
+		} else {
+			log.Printf("[move] rollback: source container restarted")
+		}
+	}
+
+	finalSnap := "containarium-move-final"
+	if err := s.moveRunner.Snapshot(containerName, finalSnap); err != nil {
+		rollback()
+		cleanupSnaps()
+		return nil, fmt.Errorf("phase 3: final snapshot: %w", err)
+	}
+	createdSnaps = append(createdSnaps, finalSnap)
+
+	if err := s.moveRunner.CopyRefresh(containerName, finalSnap, targetRemote, encStoragePool); err != nil {
+		rollback()
+		cleanupSnaps()
+		return nil, fmt.Errorf("phase 3: final delta copy: %w", err)
+	}
+	iterations++
+
+	// Tell the destination to adopt the now-copied LXC: create the
+	// host user, return the new container IP. We pass the route info
+	// over so the destination can prepare matching route store rows
+	// if desired (today: it just registers them at the new IP). All
+	// of this happens over the PeerClient REST forward — same auth
+	// path as other cross-daemon calls.
+	sourceRoutes := []string{}
+	if s.routeStore != nil {
+		routes, err := s.routeStore.ListByContainer(ctx, containerName)
+		if err == nil {
+			for _, r := range routes {
+				sourceRoutes = append(sourceRoutes, fmt.Sprintf("%s|%d|%s", r.FullDomain, r.TargetPort, r.Protocol))
+			}
+		}
+	}
+
+	authToken := extractAuthToken(ctx)
+	adoptReq := &pb.AdoptMigratedContainerRequest{
+		Username:     req.Username,
+		SourceRoutes: sourceRoutes,
+		// Empty for an unencrypted container. The destination needs both to
+		// find the encryptionroot on every later start; it already proved
+		// during the pre-flight that it can resolve this ref.
+		ZfsKeyRef: encRefJSON,
+		ZfsPool:   encStoragePool,
+	}
+	adoptResp, err := adoptFn(targetPeer, authToken, adoptReq)
+	if err != nil {
+		rollback()
+		cleanupSnaps()
+		return nil, fmt.Errorf("phase 3: adopt on target: %w", err)
+	}
+	newIP := adoptResp.NewIpAddress
+	if newIP == "" {
+		rollback()
+		cleanupSnaps()
+		return nil, fmt.Errorf("phase 3: target returned empty new IP")
+	}
+
+	// Route swap. Past this point, traffic resumes on the new VM.
+	// downtime stopwatch can stop.
+	if s.routeStore != nil {
+		routes, err := s.routeStore.ListByContainer(ctx, containerName)
+		if err == nil {
+			for _, r := range routes {
+				r.TargetIP = newIP
+				if err := s.routeStore.Save(ctx, r); err != nil {
+					log.Printf("[move] warning: update route %s target_ip failed: %v", r.FullDomain, err)
+				}
+			}
+		}
+	}
+	downtime := int32(time.Since(cutoverStart).Seconds())
+
+	// Cleanup on source: best-effort cascade (LXC delete, host user
+	// removal, route store cleanup). At this point the migration has
+	// already succeeded — anything failing here is recoverable by
+	// operator action and shouldn't fail the response.
+	s.cascadeContainerCleanup(ctx, containerName, req.Username)
+	cleanupSnaps() // remove the sync trail on the source
+
+	return &pb.MoveContainerResponse{
+		Message:         fmt.Sprintf("Container %s migrated to %s (downtime %ds)", req.Username, req.TargetBackendId, downtime),
+		NewIpAddress:    newIP,
+		TargetBackendId: req.TargetBackendId,
+		IterationsRun:   iterations,
+		DowntimeSeconds: downtime,
+	}, nil
+}
+
+// SetMigrationRunner wires the Incus migration helper so the
+// orchestrator above has something to call. Same pattern as the other
+// SetXxx methods on ContainerServer (peerPool, routeStore, etc.) —
+// DualServer injects after construction, and the field stays nil on
+// daemons compiled without migration support (where MoveContainer
+// returns "not configured").
+func (s *ContainerServer) SetMigrationRunner(r incus.MigrationRunner) {
+	s.moveRunner = r
+}
+
+// adoptFn is the function the orchestrator calls to ask the
+// destination daemon to adopt the just-copied LXC. Production code
+// points it at forwardAdoptMigratedContainer (the real HTTP forward
+// via PeerClient). Tests swap it via overrideAdoptForTest to assert
+// on the orchestration logic without exercising the HTTP path.
+var adoptFn = forwardAdoptMigratedContainer
+
+// overrideAdoptForTest replaces the adopt function for the duration
+// of a test. Returns a restore-callback for use as `defer prev()`.
+// Test-only — see move_container_test.go.
+func overrideAdoptForTest(f func(*PeerClient, string, *pb.AdoptMigratedContainerRequest) (*pb.AdoptMigratedContainerResponse, error)) func() {
+	prev := adoptFn
+	adoptFn = f
+	return func() { adoptFn = prev }
+}
+
+// prepareFn is the seam the migration pre-flight goes through, so tests can
+// drive the orchestrator without a peer. Mirrors adoptFn.
+var prepareFn = forwardPrepareEncryptedMigration
+
+// overridePrepareForTest swaps the pre-flight forwarder and returns a restore
+// function.
+func overridePrepareForTest(f func(*PeerClient, string, *pb.PrepareEncryptedMigrationRequest) (*pb.PrepareEncryptedMigrationResponse, error)) func() {
+	prev := prepareFn
+	prepareFn = f
+	return func() { prepareFn = prev }
+}
+
+// forwardPrepareEncryptedMigration issues the pre-flight REST call to a peer
+// over the existing PeerClient generic forwarder.
+//
+// Only the KeyRef travels. There is no field on this request that could carry
+// key material, and that is the point: the destination resolves the reference
+// with its own custody rather than being handed a key.
+func forwardPrepareEncryptedMigration(peer *PeerClient, authToken string, req *pb.PrepareEncryptedMigrationRequest) (*pb.PrepareEncryptedMigrationResponse, error) {
+	body, err := json.Marshal(map[string]interface{}{
+		"username": req.Username,
+		"tenant":   req.Tenant,
+		"key_ref":  req.KeyRef,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal pre-flight request: %w", err)
+	}
+	respBody, code, err := peer.ForwardRequest("POST",
+		fmt.Sprintf("/v1/containers/%s/prepare-encrypted-migration", req.Username), authToken, body)
+	if err != nil {
+		return nil, fmt.Errorf("peer pre-flight RPC: %w", err)
+	}
+	if code >= 400 {
+		return nil, fmt.Errorf("peer pre-flight RPC returned %d: %s", code, string(respBody))
+	}
+	var resp pb.PrepareEncryptedMigrationResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("decode pre-flight response: %w", err)
+	}
+	return &resp, nil
+}
+
+// forwardAdoptMigratedContainer issues the AdoptMigratedContainer
+// REST call to a peer over the existing PeerClient generic forwarder.
+// Kept in this file so the source-side orchestrator above reads
+// linearly without jumping between packages.
+func forwardAdoptMigratedContainer(peer *PeerClient, authToken string, req *pb.AdoptMigratedContainerRequest) (*pb.AdoptMigratedContainerResponse, error) {
+	body, err := json.Marshal(map[string]interface{}{
+		"username":      req.Username,
+		"source_routes": req.SourceRoutes,
+		"zfs_key_ref":   req.ZfsKeyRef,
+		"zfs_pool":      req.ZfsPool,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal adopt request: %w", err)
+	}
+	respBody, status, err := peer.ForwardRequest("POST",
+		fmt.Sprintf("/v1/containers/%s/adopt", req.Username), authToken, body)
+	if err != nil {
+		return nil, fmt.Errorf("peer adopt RPC: %w", err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer adopt RPC returned %d: %s", status, string(respBody))
+	}
+	var resp pb.AdoptMigratedContainerResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("decode adopt response: %w", err)
+	}
+	return &resp, nil
+}
