@@ -38,3 +38,44 @@ if [ -f /etc/agent-box-hostkey/host_key ]; then
 elif [ ! -f "$ED_HOSTKEY" ]; then
   dropbearkey -t ed25519 -f "$ED_HOSTKEY" >/dev/null 2>&1
 fi
+# Same for the RSA host key (both are mounted + pinned, since the sshpiper
+# gateway may negotiate either).
+if [ -f /etc/agent-box-hostkey/host_key_rsa ]; then
+  dropbearconvert openssh dropbear /etc/agent-box-hostkey/host_key_rsa "$RSA_HOSTKEY" >/dev/null 2>&1 \
+    || dropbearkey -t rsa -s 3072 -f "$RSA_HOSTKEY" >/dev/null 2>&1
+elif [ ! -f "$RSA_HOSTKEY" ]; then
+  dropbearkey -t rsa -s 3072 -f "$RSA_HOSTKEY" >/dev/null 2>&1
+fi
+
+# dropbear flags:
+#   -F  foreground (PID 1)            -E  log to stderr
+#   -s  disable password auth         -j -k  no local/remote port forwarding
+#   -p 2222  unprivileged port        -r  host key file (repeatable)
+dropbear_flags=(-F -E -s -j -k -p 2222 -r "$ED_HOSTKEY" -r "$RSA_HOSTKEY")
+
+# Session mode (AGENTBOX_MODE, default "mcp"):
+#   mcp    every session is a forced command into agent-box — the key can start
+#          the MCP server and nothing else, so a leaked key's blast radius is one
+#          box's MCP surface, never a shell. This is the default and the property
+#          the K8s agent-box design is built around.
+#   shell  interactive login shell (the agent user's /bin/bash). Opt-in: it
+#          trades the forced-command guarantee for a general shell, so anyone who
+#          can authenticate gets shell access inside the box. Use it for a
+#          developer-style SSH box, and pair it with a default-deny NetworkPolicy
+#          so the shell can't reach the cluster network.
+case "${AGENTBOX_MODE:-mcp}" in
+  mcp)
+    # agent-box-session, not agent-box: the wrapper loads the tenant's
+    # mounted secrets into the environment first, per session, so a
+    # refreshed Secret reaches the next session without a restart (#1190).
+    exec dropbear "${dropbear_flags[@]}" -c /usr/local/bin/agent-box-session
+    ;;
+  shell)
+    echo "[agent-box-entrypoint] AGENTBOX_MODE=shell — interactive shell enabled, forced-command MCP disabled" >&2
+    exec dropbear "${dropbear_flags[@]}"
+    ;;
+  *)
+    echo "[agent-box-entrypoint] unknown AGENTBOX_MODE='${AGENTBOX_MODE}' (want: mcp | shell)" >&2
+    exit 1
+    ;;
+esac

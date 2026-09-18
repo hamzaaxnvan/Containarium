@@ -38,3 +38,24 @@ func codeEgressTools() []Tool {
 func handleCodeEgressPolicy(client API, args map[string]interface{}) (string, error) {
 	resp, err := codeegress.Get(client, getStringArg(args, "tenant", ""))
 	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	if err := codeegress.WriteResponse(&b, resp); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+// GetCodingToolEgressPolicy reads a policy over the generated REST gateway.
+func (c *Client) GetCodingToolEgressPolicy(req *pb.GetCodingToolEgressPolicyRequest) (*pb.GetCodingToolEgressPolicyResponse, error) {
+	respBody, err := c.doRequest("GET", codeegress.PolicyPath(req.GetTenant()), nil)
+	if err != nil {
+		return nil, err
+	}
+	out := &pb.GetCodingToolEgressPolicyResponse{}
+	if err := protojson.Unmarshal(respBody, out); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return out, nil
+}

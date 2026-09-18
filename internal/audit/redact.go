@@ -36,3 +36,79 @@ import (
 var sensitivePatterns = []struct {
 	pattern *regexp.Regexp
 	replace string
+}{
+	// JWT shape: three base64url-segments separated by dots,
+	// preceded by an optional "Bearer ".
+	{
+		pattern: regexp.MustCompile(`(?i)(?:bearer\s+)?eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`),
+		replace: "[REDACTED-JWT]",
+	},
+	// `password=...` / `pass=...` until space or end of line.
+	{
+		pattern: regexp.MustCompile(`(?i)\b(password|passwd|pass|secret|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[=:]\s*\S+`),
+		replace: "$1=[REDACTED]",
+	},
+	// AWS-style access key id (AKIA + 16 chars).
+	{
+		pattern: regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
+		replace: "[REDACTED-AWS-AK]",
+	},
+	// SSH private-key block start. If a multi-line key got
+	// flattened into detail, this neutralizes it.
+	{
+		pattern: regexp.MustCompile(`-----BEGIN [A-Z ]+PRIVATE KEY-----`),
+		replace: "[REDACTED-PRIVATE-KEY]",
+	},
+	// PEM-style "PRIVATE KEY" anywhere — secondary catch for
+	// non-standard headers that the previous pattern missed.
+	{
+		pattern: regexp.MustCompile(`(?i)private\s*key\s*[:=]\s*\S+`),
+		replace: "private_key=[REDACTED]",
+	},
+}
+
+// Redact scrubs common sensitive patterns from `s`. Returns the
+// redacted form. Safe on empty input. The function is pure — no
+// global state, no logging.
+func Redact(s string) string {
+	if s == "" {
+		return s
+	}
+	out := s
+	for _, p := range sensitivePatterns {
+		out = p.pattern.ReplaceAllString(out, p.replace)
+	}
+	return out
+}
+
+// HasSensitive returns true if `s` looks like it contains a
+// pattern Redact would scrub. Useful for tests and for asserting
+// "the middleware never lets sensitive data flow through" in
+// regression suites.
+func HasSensitive(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, p := range sensitivePatterns {
+		if p.pattern.MatchString(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// TrimDetail enforces the upper-bound on audit detail length so
+// a buggy handler that logs a 10MB request body can't bloat the
+// audit table. The cap is generous (8 KiB) — anything realistic
+// fits.
+const MaxDetailLength = 8 * 1024
+
+// SanitizeDetail combines Redact with a length cap; this is the
+// canonical entry point for anything writing to audit_logs.detail.
+func SanitizeDetail(s string) string {
+	s = Redact(s)
+	if len(s) > MaxDetailLength {
+		s = s[:MaxDetailLength] + " [truncated]"
+	}
+	return strings.TrimSpace(s)
+}
