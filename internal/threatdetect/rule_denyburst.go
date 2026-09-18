@@ -61,3 +61,129 @@ func NewDenyBurstRule(n int, window time.Duration) *DenyBurstRule {
 	if window <= 0 {
 		window = DefaultDenyBurstWindow
 	}
+	return &DenyBurstRule{
+		n:       n,
+		window:  window,
+		records: make(map[string][]denyBurstRecord),
+		dirty:   make(map[string]bool),
+	}
+}
+
+// CountLogOnlyDenies makes the rule also count would-deny events from tenants
+// whose network policy is only observed (log_only), not enforced. By default
+// it counts enforced drops only: on an observation-only host ordinary egress
+// that no allow-list covers yet would otherwise read as "fence probing"
+// (#2612). Returns the rule for chaining at construction.
+func (r *DenyBurstRule) CountLogOnlyDenies(on bool) *DenyBurstRule {
+	r.countLogOnly = on
+	return r
+}
+
+func (r *DenyBurstRule) ID() pb.ThreatRuleId { return pb.ThreatRuleId_THREAT_RULE_ID_DENY_BURST }
+
+// OnFlows: deny-burst is a deny-shaped rule; flow records carry no denial
+// information.
+func (r *DenyBurstRule) OnFlows(RuleContext, []netbpf.FlowRecord) []RawFinding { return nil }
+
+// OnDeny records the event into the source tenant's window. Never fires
+// directly — see the type doc for why evaluation is deferred to Sweep. An
+// event whose source IP doesn't resolve to a known tenant is dropped: a
+// probe from an unrecognized IP has no tenant to attribute the burst to.
+func (r *DenyBurstRule) OnDeny(ctx RuleContext, ev netbpf.DenyEvent) []RawFinding {
+	if ev.LogOnly && !r.countLogOnly {
+		return nil
+	}
+	tenantID, ok := ctx.TenantForIP(ev.Src())
+	if !ok {
+		return nil
+	}
+	now := ctx.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.records[tenantID] = append(r.records[tenantID], denyBurstRecord{
+		at:     now,
+		dst:    ev.Dst().String(),
+		dport:  uint32(ev.Dport),
+		proto:  protoName(ev.Proto),
+		reason: denyReasonName(ev.Reason),
+	})
+	r.dirty[tenantID] = true
+	return nil
+}
+
+// Sweep prunes every tracked tenant's window to [now-window, now] and, for
+// a tenant with new denies since the last Sweep (dirty) whose pruned window
+// still holds >= n records, returns a MEDIUM finding. Window expiry — the
+// pruned count dropping below n with no new denies — naturally stops future
+// findings until fresh denies re-cross the threshold, without any separate
+// "reset" bookkeeping.
+func (r *DenyBurstRule) Sweep(_ RuleContext, now time.Time) []RawFinding {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var out []RawFinding
+	for tenantID, records := range r.records {
+		cutoff := now.Add(-r.window)
+		kept := records[:0]
+		for _, rec := range records {
+			if rec.at.After(cutoff) {
+				kept = append(kept, rec)
+			}
+		}
+		if len(kept) == 0 {
+			delete(r.records, tenantID)
+			delete(r.dirty, tenantID)
+			continue
+		}
+		r.records[tenantID] = kept
+
+		fire := r.dirty[tenantID] && len(kept) >= r.n
+		r.dirty[tenantID] = false
+		if !fire {
+			continue
+		}
+
+		out = append(out, RawFinding{
+			Rule:     pb.ThreatRuleId_THREAT_RULE_ID_DENY_BURST,
+			Severity: pb.ThreatSeverity_THREAT_SEVERITY_MEDIUM,
+			TenantID: tenantID,
+			// Subject "" — the dedupe scope is the whole tenant, not a
+			// single peer/destination (a probe typically fans out across
+			// many destinations).
+			Subject:  "",
+			Evidence: Evidence{Denies: denyEvidenceFromRecords(kept)},
+		})
+	}
+	return out
+}
+
+// denyEvidenceFromRecords aggregates window records into DenyEvidence rows
+// grouped by (dst, dport, proto, reason), most-recent group last — Capped()
+// (applied by the store on write) keeps only the most recent EvidenceCap
+// groups.
+func denyEvidenceFromRecords(records []denyBurstRecord) []DenyEvidence {
+	type key struct {
+		dst, proto, reason string
+		dport              uint32
+	}
+	order := make([]key, 0, len(records))
+	counts := make(map[key]int64, len(records))
+	for _, rec := range records {
+		k := key{dst: rec.dst, proto: rec.proto, reason: rec.reason, dport: rec.dport}
+		if _, seen := counts[k]; !seen {
+			order = append(order, k)
+		}
+		counts[k]++
+	}
+	out := make([]DenyEvidence, 0, len(order))
+	for _, k := range order {
+		out = append(out, DenyEvidence{
+			DstIP:    k.dst,
+			DstPort:  k.dport,
+			Protocol: k.proto,
+			Reason:   k.reason,
+			Count:    counts[k],
+		})
+	}
+	return out
+}
