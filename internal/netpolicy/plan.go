@@ -83,3 +83,46 @@ func AggregateDenies(rows []DenyRow, allowed func(netip.Addr) bool) []Destinatio
 	out := make([]Destination, 0, len(agg))
 	for _, e := range agg {
 		out = append(out, *e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		if c := out[i].IP.Compare(out[j].IP); c != 0 {
+			return c < 0
+		}
+		return out[i].Port < out[j].Port
+	})
+	return out
+}
+
+func protoLabel(p int) string {
+	switch p {
+	case 6:
+		return "tcp"
+	case 17:
+		return "udp"
+	case 1:
+		return "icmp"
+	default:
+		return strconv.Itoa(p)
+	}
+}
+
+// Allows reports whether the policy's egress CIDRs, plus any implicit
+// prefixes, cover ip. Domain entries are not consulted: their resolved
+// addresses live in the enforcer, so a destination allowed only through
+// egress_domains still shows up in a plan (the response says so).
+func (c CompiledPolicy) Allows(ip netip.Addr, implicit []netip.Prefix) bool {
+	for _, p := range c.EgressCIDRs {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	for _, p := range implicit {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
