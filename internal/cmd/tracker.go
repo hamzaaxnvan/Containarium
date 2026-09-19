@@ -79,3 +79,328 @@ A "broad" warning is not an error — the connection still works. It
 means a daemon compromise could do more with this credential than the
 narrowest type would have allowed.`,
 	Args: cobra.ExactArgs(2),
+	RunE: runTrackerStatus,
+}
+
+var (
+	trackerProvider         string
+	trackerBaseURL          string
+	trackerProject          string
+	trackerCredentialSecret string
+
+	// Connection policy (#2024). Zero values mean the daemon's
+	// documented defaults; `connect` replaces the whole connection, so
+	// re-running it without these flags resets the policy to defaults.
+	trackerLabelAllow  []string
+	trackerAutoChain   bool
+	trackerMaxDepth    int32
+	trackerMaxChildren int32
+	trackerRunTimeout  time.Duration
+)
+
+func init() {
+	rootCmd.AddCommand(trackerCmd)
+
+	trackerCmd.AddCommand(trackerConnectCmd)
+	trackerConnectCmd.Flags().StringVar(&trackerProvider, "provider", "",
+		`Tracker provider: "github" or "gitlab". Required.`)
+	trackerConnectCmd.Flags().StringVar(&trackerBaseURL, "base-url", "",
+		`Empty selects the provider's SaaS endpoint (github.com / gitlab.com). `+
+			`Set for GitHub Enterprise Server or self-managed GitLab.`)
+	trackerConnectCmd.Flags().StringVar(&trackerProject, "project", "",
+		`"owner/repo" (GitHub) or "group/subgroup/project" (GitLab). Required.`)
+	trackerConnectCmd.Flags().StringVar(&trackerCredentialSecret, "credential-secret", "",
+		`Name of a secret owned by username, in broker-only delivery mode. Required.`)
+	trackerConnectCmd.Flags().StringArrayVar(&trackerLabelAllow, "label-allow", nil,
+		`Label glob a run may write via "tracker issue create" / "issue label" (repeat for multiple; '*' matches anything). `+
+			`Default: scope:*, model:*, agent:needs-approval. The dispatcher's agent:queued/running/done/failed are never writable by a run.`)
+	trackerConnectCmd.Flags().BoolVar(&trackerAutoChain, "auto-chain", false,
+		`Let a run's follow-up issues skip the agent:needs-approval gate. Default off: a human releases every hop.`)
+	trackerConnectCmd.Flags().Int32Var(&trackerMaxDepth, "max-depth", 0,
+		`Maximum follow-up chain depth (0 = daemon default, 3).`)
+	trackerConnectCmd.Flags().Int32Var(&trackerMaxChildren, "max-children", 0,
+		`Maximum follow-up issues one run may file (0 = daemon default, 5).`)
+	trackerConnectCmd.Flags().DurationVar(&trackerRunTimeout, "run-timeout", 0,
+		`Run timeout the dispatcher applies (0 = daemon default, 1h).`)
+
+	trackerCmd.AddCommand(trackerListCmd)
+	trackerCmd.AddCommand(trackerDisconnectCmd)
+	trackerCmd.AddCommand(trackerStatusCmd)
+}
+
+// buildTrackerPolicy turns the `connect` policy flags into the proto
+// message. Zero values pass through as zero (the daemon applies the
+// documented defaults); negatives and blank allow-list entries are
+// rejected here rather than round-tripping to the daemon's own check.
+func buildTrackerPolicy(allow []string, autoChain bool, maxDepth, maxChildren int32, runTimeout time.Duration) (*pb.TrackerPolicy, error) {
+	if maxDepth < 0 {
+		return nil, fmt.Errorf("--max-depth must not be negative")
+	}
+	if maxChildren < 0 {
+		return nil, fmt.Errorf("--max-children must not be negative")
+	}
+	if runTimeout < 0 {
+		return nil, fmt.Errorf("--run-timeout must not be negative")
+	}
+	out := &pb.TrackerPolicy{
+		AutoChain:         autoChain,
+		MaxDepth:          maxDepth,
+		MaxChildrenPerRun: maxChildren,
+		RunTimeoutSeconds: int64(runTimeout.Seconds()),
+	}
+	for _, pattern := range allow {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			return nil, fmt.Errorf("--label-allow entries must not be empty")
+		}
+		out.LabelAllowList = append(out.LabelAllowList, pattern)
+	}
+	return out, nil
+}
+
+// parseTrackerProvider maps the CLI's --provider flag to the proto enum.
+// Unlike --protocol elsewhere in this package, there is no default —
+// provider is never inferred, per the design note (a self-managed host
+// named "git.<company>" can be either product).
+func parseTrackerProvider(s string) (pb.TrackerProvider, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "github":
+		return pb.TrackerProvider_TRACKER_PROVIDER_GITHUB, nil
+	case "gitlab":
+		return pb.TrackerProvider_TRACKER_PROVIDER_GITLAB, nil
+	default:
+		return pb.TrackerProvider_TRACKER_PROVIDER_UNSPECIFIED, fmt.Errorf(`--provider must be "github" or "gitlab", got %q`, s)
+	}
+}
+
+func runTrackerConnect(cmd *cobra.Command, args []string) error {
+	username, name := args[0], args[1]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for tracker commands (daemon owns the connection store)")
+	}
+	provider, err := parseTrackerProvider(trackerProvider)
+	if err != nil {
+		return err
+	}
+	if trackerProject == "" {
+		return fmt.Errorf("--project is required")
+	}
+	if trackerCredentialSecret == "" {
+		return fmt.Errorf("--credential-secret is required")
+	}
+	policy, err := buildTrackerPolicy(trackerLabelAllow, trackerAutoChain, trackerMaxDepth, trackerMaxChildren, trackerRunTimeout)
+	if err != nil {
+		return err
+	}
+
+	req := &pb.SetTrackerConnectionRequest{
+		Username:         username,
+		Name:             name,
+		Provider:         provider,
+		BaseUrl:          trackerBaseURL,
+		Project:          trackerProject,
+		CredentialSecret: trackerCredentialSecret,
+		Policy:           policy,
+	}
+
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		_, msg, err := h.SetTrackerConnection(req)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("✓ %s\n", msg)
+		return nil
+	}
+	g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = g.Close() }()
+	_, msg, err := g.SetTrackerConnection(req)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ %s\n", msg)
+	return nil
+}
+
+func runTrackerList(cmd *cobra.Command, args []string) error {
+	username := args[0]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for tracker commands")
+	}
+
+	var list []*pb.TrackerConnection
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if list, err = h.ListTrackerConnections(username); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if list, err = g.ListTrackerConnections(username); err != nil {
+			return err
+		}
+	}
+
+	if len(list) == 0 {
+		fmt.Printf("(no tracker connections for %s)\n", username)
+		return nil
+	}
+	fmt.Printf("%-16s %-8s %-24s %s\n", "NAME", "PROVIDER", "PROJECT", "CREDENTIAL SECRET")
+	for _, c := range list {
+		fmt.Printf("%-16s %-8s %-24s %s\n", c.GetName(), trackerProviderLabel(c.GetProvider()), c.GetProject(), c.GetCredentialSecret())
+	}
+	return nil
+}
+
+func runTrackerDisconnect(cmd *cobra.Command, args []string) error {
+	username, name := args[0], args[1]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for tracker commands")
+	}
+
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		msg, err := h.DeleteTrackerConnection(username, name)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("✓ %s\n", msg)
+		return nil
+	}
+	g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = g.Close() }()
+	msg, err := g.DeleteTrackerConnection(username, name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ %s\n", msg)
+	return nil
+}
+
+func runTrackerStatus(cmd *cobra.Command, args []string) error {
+	username, name := args[0], args[1]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for tracker commands")
+	}
+
+	var resp *pb.GetTrackerStatusResponse
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if resp, err = h.GetTrackerStatus(username, name); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if resp, err = g.GetTrackerStatus(username, name); err != nil {
+			return err
+		}
+	}
+
+	printTrackerStatus(resp)
+	return nil
+}
+
+// printTrackerStatus renders a GetTrackerStatusResponse. Factored out
+// from runTrackerStatus so it's testable without a client.
+func printTrackerStatus(resp *pb.GetTrackerStatusResponse) {
+	if resp.GetHostGitVersion() != "" {
+		gitNote := ""
+		if !resp.GetHostGitSufficient() {
+			gitNote = " (too old — `tracker change submit` will fail; need >= 2.31)"
+		}
+		fmt.Printf("host git:         %s%s\n", resp.GetHostGitVersion(), gitNote)
+	} else {
+		fmt.Printf("host git:         not found — `tracker change submit` will fail\n")
+	}
+	fmt.Printf("reachable:        %v\n", resp.GetReachable())
+	fmt.Printf("credential valid: %v\n", resp.GetCredentialValid())
+	if !resp.GetReachable() || !resp.GetCredentialValid() {
+		if resp.GetDetail() != "" {
+			fmt.Printf("detail:           %s\n", resp.GetDetail())
+		}
+		return
+	}
+	fmt.Printf("breadth:          %s\n", trackerBreadthLabel(resp.GetCredentialBreadth()))
+	fmt.Printf("kind:             %s\n", trackerKindLabel(resp.GetCredentialKind()))
+	if len(resp.GetCredentialScopes()) > 0 {
+		fmt.Printf("scopes:           %s\n", strings.Join(resp.GetCredentialScopes(), ", "))
+	}
+	if resp.GetCredentialExpiresAt() != nil {
+		fmt.Printf("expires:          %s\n", resp.GetCredentialExpiresAt().AsTime().Format("2006-01-02"))
+	} else {
+		fmt.Printf("expires:          unknown\n")
+	}
+	if resp.GetCredentialBreadth() == pb.TrackerCredentialBreadth_TRACKER_CREDENTIAL_BREADTH_BROAD {
+		provider := trackerProviderLabel(resp.GetConnection().GetProvider())
+		fmt.Printf("\n⚠ this credential is broader than %s's preferred type — consider rotating to a narrower one.\n", provider)
+	}
+}
+
+// trackerProviderLabel renders the enum for the list table without the
+// TRACKER_PROVIDER_ prefix.
+func trackerProviderLabel(p pb.TrackerProvider) string {
+	switch p {
+	case pb.TrackerProvider_TRACKER_PROVIDER_GITHUB:
+		return "github"
+	case pb.TrackerProvider_TRACKER_PROVIDER_GITLAB:
+		return "gitlab"
+	default:
+		return "unspecified"
+	}
+}
+
+// trackerBreadthLabel renders the breadth enum for tracker status output.
+func trackerBreadthLabel(b pb.TrackerCredentialBreadth) string {
+	switch b {
+	case pb.TrackerCredentialBreadth_TRACKER_CREDENTIAL_BREADTH_PREFERRED:
+		return "preferred"
+	case pb.TrackerCredentialBreadth_TRACKER_CREDENTIAL_BREADTH_BROAD:
+		return "broad"
+	default:
+		return "unknown"
+	}
+}
+
+// trackerKindLabel renders the credential kind enum for tracker status output.
+func trackerKindLabel(k pb.TrackerCredentialKind) string {
+	switch k {
+	case pb.TrackerCredentialKind_TRACKER_CREDENTIAL_KIND_PROJECT:
+		return "project"
+	case pb.TrackerCredentialKind_TRACKER_CREDENTIAL_KIND_GROUP:
+		return "group"
+	case pb.TrackerCredentialKind_TRACKER_CREDENTIAL_KIND_PERSONAL:
+		return "personal"
+	default:
+		return "unknown"
+	}
+}

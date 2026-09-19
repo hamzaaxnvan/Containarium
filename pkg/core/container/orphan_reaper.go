@@ -91,3 +91,65 @@ func userShell(username string) (string, error) {
 	}
 	return fields[6], nil
 }
+
+func reapOnce(
+	homeRoot string,
+	containerExistsFn func(username string) bool,
+	userShellFn func(username string) (string, error),
+	deleteFn func(username string, verbose bool) error,
+) {
+	entries, err := os.ReadDir(homeRoot)
+	if err != nil {
+		log.Printf("[orphan-reaper] failed to read %s: %v", homeRoot, err)
+		return
+	}
+
+	var orphans []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		username := e.Name()
+		if !isValidUsername(username) {
+			continue // directory name isn't a containarium username shape at all
+		}
+		akPath := filepath.Join(homeRoot, username, ".ssh", "authorized_keys")
+		if _, statErr := os.Stat(akPath); os.IsNotExist(statErr) {
+			continue // no authorized_keys → not a containarium user
+		}
+		// A home directory with authorized_keys is not, by itself,
+		// proof the reaper created it — a manually-provisioned admin
+		// account can happen to live under the same homeRoot with its
+		// own SSH key. Only reap accounts actually running the
+		// containarium-managed shell; anything else (bash, zsh, etc.)
+		// is left alone even if no matching container exists. A real
+		// incident: an operator's own admin login shared this
+		// heuristic's shape and got userdel'd by an upgrade that
+		// enabled this reaper for the first time.
+		if shell, err := userShellFn(username); err != nil || shell != containerShellPath {
+			continue
+		}
+		if containerExistsFn(username) {
+			continue
+		}
+		orphans = append(orphans, username)
+	}
+
+	if len(orphans) == 0 {
+		return
+	}
+
+	log.Printf("[orphan-reaper] found %d orphaned host accounts; reaping", len(orphans))
+	reaped, failed := 0, 0
+	for _, username := range orphans {
+		if err := deleteFn(username, false); err != nil {
+			log.Printf("[orphan-reaper] userdel %s failed: %v", username, err)
+			failed++
+		} else {
+			reaped++
+		}
+	}
+	if reaped > 0 || failed > 0 {
+		log.Printf("[orphan-reaper] reaped=%d failed=%d (failed entries retry next tick)", reaped, failed)
+	}
+}
