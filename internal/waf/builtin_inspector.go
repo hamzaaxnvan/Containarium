@@ -10,3 +10,41 @@ import "bytes"
 type builtinSig struct {
 	id      uint16
 	name    string
+	pattern []byte
+}
+
+func builtinSignatures() []builtinSig {
+	return []builtinSig{
+		{1, "log4shell-jndi", []byte("${jndi:")},
+		{2, "shellshock", []byte("() {")},
+		{3, "spring4shell", []byte("class.module.classLoader")},
+		{4, "path-traversal", []byte("../../../")},
+		{5, "etc-passwd", []byte("/etc/passwd")},
+	}
+}
+
+// BuiltinInspector is the reference Inspector (#662 PR-2): it substring-matches a
+// curated set of cleartext exploit signatures over the REASSEMBLED request head —
+// so it catches a signature split across TCP segments that the in-kernel
+// single-packet scan (Tier 2) cannot. No WAF-engine dependency; the Coraza-backed
+// inspector (full HTTP parse + OWASP CRS) is a follow-up behind the same
+// interface and a `waf` build tag.
+type BuiltinInspector struct {
+	sigs []builtinSig
+}
+
+// NewBuiltinInspector builds the reference inspector from the curated set.
+func NewBuiltinInspector() *BuiltinInspector {
+	return &BuiltinInspector{sigs: builtinSignatures()}
+}
+
+// Inspect blocks on the first signature whose pattern appears anywhere in the
+// reassembled head.
+func (b *BuiltinInspector) Inspect(head []byte) Verdict {
+	for _, s := range b.sigs {
+		if len(s.pattern) > 0 && bytes.Contains(head, s.pattern) {
+			return Verdict{Block: true, RuleID: s.id, RuleName: s.name}
+		}
+	}
+	return Verdict{}
+}

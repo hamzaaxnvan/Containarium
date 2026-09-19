@@ -104,3 +104,163 @@ const (
 // +protobuf=true
 // +protobuf.embed=string
 // +protobuf.options.marshal=false
+// +protobuf.options.(gogoproto.goproto_stringer)=false
+// +k8s:deepcopy-gen=true
+// +k8s:openapi-gen=true
+// +k8s:openapi-model-package=io.k8s.apimachinery.pkg.api.resource
+type Quantity struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	String_       *string                `protobuf:"bytes,1,opt,name=string" json:"string,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Quantity) Reset() {
+	*x = Quantity{}
+	mi := &file_k8s_io_apimachinery_pkg_api_resource_generated_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Quantity) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Quantity) ProtoMessage() {}
+
+func (x *Quantity) ProtoReflect() protoreflect.Message {
+	mi := &file_k8s_io_apimachinery_pkg_api_resource_generated_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Quantity.ProtoReflect.Descriptor instead.
+func (*Quantity) Descriptor() ([]byte, []int) {
+	return file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *Quantity) GetString_() string {
+	if x != nil && x.String_ != nil {
+		return *x.String_
+	}
+	return ""
+}
+
+// QuantityValue makes it possible to use a Quantity as value for a command
+// line parameter.
+//
+// +protobuf=true
+// +protobuf.embed=string
+// +protobuf.options.marshal=false
+// +protobuf.options.(gogoproto.goproto_stringer)=false
+// +k8s:deepcopy-gen=true
+// +k8s:openapi-model-package=io.k8s.apimachinery.pkg.api.resource
+type QuantityValue struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	String_       *string                `protobuf:"bytes,1,opt,name=string" json:"string,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *QuantityValue) Reset() {
+	*x = QuantityValue{}
+	mi := &file_k8s_io_apimachinery_pkg_api_resource_generated_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *QuantityValue) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*QuantityValue) ProtoMessage() {}
+
+func (x *QuantityValue) ProtoReflect() protoreflect.Message {
+	mi := &file_k8s_io_apimachinery_pkg_api_resource_generated_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use QuantityValue.ProtoReflect.Descriptor instead.
+func (*QuantityValue) Descriptor() ([]byte, []int) {
+	return file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *QuantityValue) GetString_() string {
+	if x != nil && x.String_ != nil {
+		return *x.String_
+	}
+	return ""
+}
+
+var File_k8s_io_apimachinery_pkg_api_resource_generated_proto protoreflect.FileDescriptor
+
+const file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDesc = "" +
+	"\n" +
+	"4k8s.io/apimachinery/pkg/api/resource/generated.proto\x12$k8s.io.apimachinery.pkg.api.resource\"\"\n" +
+	"\bQuantity\x12\x16\n" +
+	"\x06string\x18\x01 \x01(\tR\x06string\"'\n" +
+	"\rQuantityValue\x12\x16\n" +
+	"\x06string\x18\x01 \x01(\tR\x06stringB\xce\x02\n" +
+	"(com.k8s.io.apimachinery.pkg.api.resourceB\x0eGeneratedProtoP\x01ZZgithub.com/footprintai/containarium/pkg/pb/thirdparty/k8s.io/apimachinery/pkg/api/resource\xa2\x02\x06KIAPAR\xaa\x02$K8s.Io.Apimachinery.Pkg.Api.Resource\xca\x02$K8s\\Io\\Apimachinery\\Pkg\\Api\\Resource\xe2\x020K8s\\Io\\Apimachinery\\Pkg\\Api\\Resource\\GPBMetadata\xea\x02)K8s::Io::Apimachinery::Pkg::Api::Resource"
+
+var (
+	file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDescOnce sync.Once
+	file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDescData []byte
+)
+
+func file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDescGZIP() []byte {
+	file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDescOnce.Do(func() {
+		file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDesc), len(file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDesc)))
+	})
+	return file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDescData
+}
+
+var file_k8s_io_apimachinery_pkg_api_resource_generated_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_k8s_io_apimachinery_pkg_api_resource_generated_proto_goTypes = []any{
+	(*Quantity)(nil),      // 0: k8s.io.apimachinery.pkg.api.resource.Quantity
+	(*QuantityValue)(nil), // 1: k8s.io.apimachinery.pkg.api.resource.QuantityValue
+}
+var file_k8s_io_apimachinery_pkg_api_resource_generated_proto_depIdxs = []int32{
+	0, // [0:0] is the sub-list for method output_type
+	0, // [0:0] is the sub-list for method input_type
+	0, // [0:0] is the sub-list for extension type_name
+	0, // [0:0] is the sub-list for extension extendee
+	0, // [0:0] is the sub-list for field type_name
+}
+
+func init() { file_k8s_io_apimachinery_pkg_api_resource_generated_proto_init() }
+func file_k8s_io_apimachinery_pkg_api_resource_generated_proto_init() {
+	if File_k8s_io_apimachinery_pkg_api_resource_generated_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDesc), len(file_k8s_io_apimachinery_pkg_api_resource_generated_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   2,
+			NumExtensions: 0,
+			NumServices:   0,
+		},
+		GoTypes:           file_k8s_io_apimachinery_pkg_api_resource_generated_proto_goTypes,
+		DependencyIndexes: file_k8s_io_apimachinery_pkg_api_resource_generated_proto_depIdxs,
+		MessageInfos:      file_k8s_io_apimachinery_pkg_api_resource_generated_proto_msgTypes,
+	}.Build()
+	File_k8s_io_apimachinery_pkg_api_resource_generated_proto = out.File
+	file_k8s_io_apimachinery_pkg_api_resource_generated_proto_goTypes = nil
+	file_k8s_io_apimachinery_pkg_api_resource_generated_proto_depIdxs = nil
+}
