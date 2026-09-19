@@ -37,3 +37,42 @@ var ErrCrossOriginNextLink = errors.New("refusing to follow pagination link to a
 // NextPageURL returns the rel="next" target of an RFC 8288 Link header
 // — the pagination mechanism both GitHub and GitLab use — or "" when
 // there is no next page.
+func NextPageURL(linkHeader string) string {
+	for _, part := range strings.Split(linkHeader, ",") {
+		segs := strings.Split(part, ";")
+		target := strings.TrimSpace(segs[0])
+		if !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+			continue
+		}
+		for _, param := range segs[1:] {
+			k, v, ok := strings.Cut(strings.TrimSpace(param), "=")
+			if !ok || strings.TrimSpace(k) != "rel" {
+				continue
+			}
+			for _, rel := range strings.Fields(strings.Trim(strings.TrimSpace(v), `"`)) {
+				if rel == "next" {
+					return target[1 : len(target)-1]
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// CheckSameOrigin refuses a pagination link whose scheme or host
+// differs from the request that produced it: following it would send
+// the connection's credential to a host the operator never configured.
+func CheckSameOrigin(current, next string) error {
+	cu, err := url.Parse(current)
+	if err != nil {
+		return fmt.Errorf("parse current page URL: %w", err)
+	}
+	nu, err := url.Parse(next)
+	if err != nil {
+		return fmt.Errorf("parse next page URL: %w", err)
+	}
+	if !strings.EqualFold(cu.Scheme, nu.Scheme) || !strings.EqualFold(cu.Host, nu.Host) {
+		return fmt.Errorf("%w (%s://%s, expected %s://%s)", ErrCrossOriginNextLink, nu.Scheme, nu.Host, cu.Scheme, cu.Host)
+	}
+	return nil
+}
