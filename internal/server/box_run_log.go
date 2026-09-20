@@ -264,3 +264,269 @@ func boxRunProto(name, dir string, r agentbox.RunRecord, outcome agentbox.RunOut
 // boxRunLogPath is the log the reader reads: always derived from the run
 // name, never the record's own log_path, which the box's user can write.
 func boxRunLogPath(dir, name string) string { return dir + "/" + name + ".log" }
+
+// boxRunWindow is one read of a run's record and log.
+type boxRunWindow struct {
+	found   bool
+	record  agentbox.RunRecord
+	logSeen bool   // the log file exists
+	unsafe  bool   // the log is not a plain file at its own path
+	size    int64  // the log's size, read after the record
+	raw     []byte // up to limit bytes from the offset
+}
+
+func readBoxRunWindow(exec boxScriptFunc, box, dir, name string, offset int64, limit int) (boxRunWindow, error) {
+	out, err := exec(box, boxRunTailScript(dir, name, offset, limit))
+	if err != nil {
+		return boxRunWindow{}, err
+	}
+	recLine, rest, _ := strings.Cut(out, "\n")
+	if recLine == "missing" {
+		return boxRunWindow{}, nil
+	}
+	exitLine, rest, _ := strings.Cut(rest, "\n")
+	logLine, rest, found := strings.Cut(rest, "\n")
+	recB64, okR := strings.CutPrefix(recLine, "R ")
+	exitB64, okX := strings.CutPrefix(exitLine, "X ")
+	logState, okL := strings.CutPrefix(logLine, "L ")
+	if !okR || !okX || !okL || !found {
+		return boxRunWindow{}, fmt.Errorf("unexpected run read output %q", strings.Join([]string{recLine, exitLine, logLine}, " | "))
+	}
+	recData, err := decodeB64Field(recB64)
+	if err != nil {
+		return boxRunWindow{}, fmt.Errorf("decode run record: %w", err)
+	}
+	record, err := agentbox.DecodeRunRecord(recData)
+	if err != nil {
+		return boxRunWindow{}, status.Errorf(codes.FailedPrecondition, "run %q: %v", name, err)
+	}
+	sidecar, _ := decodeB64Field(exitB64)
+	w := boxRunWindow{found: true, record: agentbox.FoldExitSidecar(record, sidecar)}
+	switch logState {
+	case "none":
+		return w, nil
+	case "unsafe":
+		w.unsafe = true
+		return w, nil
+	}
+	w.size, err = strconv.ParseInt(strings.TrimSpace(logState), 10, 64)
+	if err != nil {
+		return boxRunWindow{}, fmt.Errorf("unexpected log size %q", logState)
+	}
+	w.logSeen, w.raw = true, []byte(rest)
+	return w, nil
+}
+
+// boxRunResponse turns one read into the response. A combined log is served
+// as-is, like TailRunLog. A framed log is consumed whole frames at a time —
+// at least one, then as many more as fit in maxBytes — with stdout payloads
+// in chunk and stderr frames dropped and flagged. ended is set only once the
+// run has an exit code and the reader has reached the end of its log.
+func boxRunResponse(w boxRunWindow, offset int64, maxBytes, readLimit int) (*pb.TailBoxRunLogResponse, error) {
+	resp := &pb.TailBoxRunLogResponse{EndOffset: offset}
+	exited := w.record.ExitCode != nil
+	if w.record.CaptureMode != agentbox.CaptureFramed {
+		chunk := w.raw
+		if len(chunk) > maxBytes {
+			chunk, resp.Truncated = chunk[:maxBytes], true
+		}
+		resp.Chunk = chunk
+		resp.EndOffset = offset + int64(len(chunk))
+	} else {
+		var demux logframe.Demuxer
+		consumed, stopped := 0, false
+		for {
+			i := bytes.IndexByte(w.raw[consumed:], '\n')
+			if i < 0 {
+				break
+			}
+			line := w.raw[consumed : consumed+i+1]
+			if consumed > 0 && consumed+len(line) > maxBytes {
+				stopped = true
+				break
+			}
+			frames, err := demux.Write(line)
+			if err != nil {
+				if consumed == 0 && offset > 0 {
+					return nil, status.Errorf(codes.InvalidArgument, "start_offset %d is not at a frame boundary of this framed log", offset)
+				}
+				return nil, status.Errorf(codes.DataLoss, "framed log at offset %d: %v", offset+int64(consumed), err)
+			}
+			for _, f := range frames {
+				if f.Stream == logframe.Stdout {
+					resp.Chunk = append(resp.Chunk, f.Payload...)
+				} else {
+					resp.StderrDropped = true
+				}
+			}
+			consumed += len(line)
+		}
+		resp.EndOffset = offset + int64(consumed)
+		resp.Truncated = stopped || (len(w.raw) >= readLimit && consumed < len(w.raw))
+	}
+	resp.Ended = exited && !resp.Truncated && resp.EndOffset >= w.size
+	return resp, nil
+}
+
+// boxRunExecFn returns the exec seam: the injected fake, else the container
+// manager.
+func (s *ContainerServer) boxRunExecFn() boxScriptFunc {
+	if s.boxRunExec != nil {
+		return s.boxRunExec
+	}
+	if s.manager == nil {
+		return nil
+	}
+	mgr := s.manager
+	return func(box, script string) (string, error) {
+		out, stderr, code, err := mgr.ExecWithExitCode(box, []string{"sh", "-c", script})
+		if err != nil {
+			return "", err
+		}
+		if code != 0 {
+			return "", fmt.Errorf("exit %d: %s", code, strings.TrimSpace(stderr))
+		}
+		return out, nil
+	}
+}
+
+func (s *ContainerServer) boxRunDir() string {
+	if s.boxRunLogDir != "" {
+		return s.boxRunLogDir
+	}
+	return agentbox.DefaultLogDir
+}
+
+// authorizeBoxRuns is the access check for both RPCs: the same ssh:write
+// scope connecting to the box (AddSSHKey) needs, held by the box's owner (or
+// an admin) or by one of the box's collaborators.
+func (s *ContainerServer) authorizeBoxRuns(ctx context.Context, owner string) error {
+	if err := auth.RequireScope(ctx, auth.ScopeSSHWrite); err != nil {
+		return err
+	}
+	if auth.AuthorizeTenant(ctx, owner) == nil {
+		return nil
+	}
+	subject, _, _ := auth.SubjectFromGRPCContext(ctx)
+	check := s.boxRunCollaborator
+	if check == nil && s.collaboratorManager != nil {
+		check = func(owner, subject string) (bool, error) {
+			_, err := s.collaboratorManager.GetCollaborator(owner, subject)
+			if errors.Is(err, collaborator.ErrNotFound) {
+				return false, nil
+			}
+			return err == nil, err
+		}
+	}
+	if check != nil {
+		ok, err := check(owner, subject)
+		if err != nil {
+			return status.Errorf(codes.Internal, "look up collaborators of %q: %v", owner, err)
+		}
+		if ok {
+			return nil
+		}
+	}
+	return status.Error(codes.PermissionDenied, "not the box's owner or a collaborator on it")
+}
+
+func validateBoxRunOwner(username string) error {
+	if !validRunPathID(username) {
+		return status.Errorf(codes.InvalidArgument, "username must match %s", runIDPattern.String())
+	}
+	return nil
+}
+
+// ListBoxRuns lists a box's current code-run records (#2123).
+func (s *ContainerServer) ListBoxRuns(ctx context.Context, req *pb.ListBoxRunsRequest) (*pb.ListBoxRunsResponse, error) {
+	if err := validateBoxRunOwner(req.GetUsername()); err != nil {
+		return nil, err
+	}
+	if err := s.authorizeBoxRuns(ctx, req.GetUsername()); err != nil {
+		return nil, err
+	}
+	exec := s.boxRunExecFn()
+	if exec == nil {
+		return nil, status.Error(codes.Unavailable, "no container backend to read run records from")
+	}
+	dir := s.boxRunDir()
+	out, err := exec(req.GetUsername()+"-container", boxRunListScript(dir))
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read run records of %q: %v", req.GetUsername(), err)
+	}
+	return &pb.ListBoxRunsResponse{Runs: parseBoxRunList(out, dir)}, nil
+}
+
+// TailBoxRunLog returns one byte window of a box run's log (#2123).
+func (s *ContainerServer) TailBoxRunLog(ctx context.Context, req *pb.TailBoxRunLogRequest) (*pb.TailBoxRunLogResponse, error) {
+	// Both names become paths inside the box: validate before anything
+	// else touches them.
+	if err := validateBoxRunOwner(req.GetUsername()); err != nil {
+		return nil, err
+	}
+	if !validRunPathID(req.GetRunName()) {
+		return nil, status.Errorf(codes.InvalidArgument, "run_name must match %s and not be . or ..", runIDPattern.String())
+	}
+	if req.GetStartOffset() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "start_offset must be >= 0")
+	}
+	if err := s.authorizeBoxRuns(ctx, req.GetUsername()); err != nil {
+		return nil, err
+	}
+	maxBytes := int(req.GetMaxBytes())
+	switch {
+	case maxBytes <= 0:
+		maxBytes = tailRunLogDefaultBytes
+	case maxBytes > tailRunLogMaxBytes:
+		maxBytes = tailRunLogMaxBytes
+	}
+	follow := time.Duration(min(max(req.GetFollowSeconds(), 0), tailRunLogMaxFollow)) * time.Second
+	exec := s.boxRunExecFn()
+	if exec == nil {
+		return nil, status.Error(codes.Unavailable, "no container backend to read the log from")
+	}
+	poll := s.boxRunPoll
+	if poll <= 0 {
+		poll = tailRunLogPoll
+	}
+
+	box, dir, name, offset := req.GetUsername()+"-container", s.boxRunDir(), req.GetRunName(), req.GetStartOffset()
+	// One extra byte tells a full window from a truncated one; a framed log
+	// is read at least one whole frame deep.
+	readLimit := maxBytes + 1
+	deadline := time.Now().Add(follow)
+	for {
+		w, err := readBoxRunWindow(exec, box, dir, name, offset, max(readLimit, boxRunMaxFrameLine+1))
+		if err != nil {
+			if _, ok := status.FromError(err); ok && status.Code(err) != codes.Unknown {
+				return nil, err
+			}
+			return nil, status.Errorf(codes.Unavailable, "read run %q on %s: %v", name, box, err)
+		}
+		if !w.found {
+			return nil, status.Errorf(codes.NotFound, "run %q not found on %s's box", name, req.GetUsername())
+		}
+		if w.unsafe {
+			return nil, status.Errorf(codes.FailedPrecondition, "run %q: log is not a regular file at %s", name, boxRunLogPath(dir, name))
+		}
+		if w.record.CaptureMode != agentbox.CaptureFramed && len(w.raw) > readLimit {
+			w.raw = w.raw[:readLimit]
+		}
+		limit := readLimit
+		if w.record.CaptureMode == agentbox.CaptureFramed {
+			limit = max(readLimit, boxRunMaxFrameLine+1)
+		}
+		resp, err := boxRunResponse(w, offset, maxBytes, limit)
+		if err != nil {
+			return nil, err
+		}
+		if resp.EndOffset != offset || resp.Ended || !time.Now().Add(poll).Before(deadline) {
+			return resp, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		case <-time.After(poll):
+		}
+	}
+}
