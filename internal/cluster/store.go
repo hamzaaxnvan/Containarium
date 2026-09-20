@@ -116,3 +116,239 @@ func (s *PGStore) initSchema(ctx context.Context) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_k8s_cluster_events_cluster ON k8s_cluster_events(cluster_id, id DESC);
 	`
+	_, err := s.pool.Exec(ctx, schema)
+	return err
+}
+
+func (s *PGStore) clusterID(ctx context.Context, owner, name string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM k8s_clusters WHERE owner = $1 AND name = $2`, owner, name).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return id, err
+}
+
+func (s *PGStore) Create(ctx context.Context, c *Cluster) error {
+	groups, err := json.Marshal(c.NodeGroups)
+	if err != nil {
+		return fmt.Errorf("marshal node groups: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO k8s_clusters (id, owner, name, state, state_reason, k3s_version, api_endpoint, node_groups, node_isolation, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		c.ID, c.Owner, c.Name, string(c.State), c.StateReason, c.K3sVersion, c.APIEndpoint, groups,
+		string(c.NodeIsolation.OrDefault()), c.CreatedAt, c.UpdatedAt)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+		return ErrAlreadyExists
+	}
+	return err
+}
+
+func scanCluster(row pgx.Row) (*Cluster, error) {
+	var c Cluster
+	var state, isolation string
+	var groups []byte
+	err := row.Scan(&c.ID, &c.Owner, &c.Name, &state, &c.StateReason, &c.K3sVersion, &c.APIEndpoint, &groups, &isolation, &c.CreatedAt, &c.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.State = State(state)
+	c.NodeIsolation = Isolation(isolation).OrDefault()
+	if err := json.Unmarshal(groups, &c.NodeGroups); err != nil {
+		return nil, fmt.Errorf("unmarshal node groups: %w", err)
+	}
+	return &c, nil
+}
+
+const clusterCols = `id, owner, name, state, state_reason, k3s_version, api_endpoint, node_groups, node_isolation, created_at, updated_at`
+
+func (s *PGStore) Get(ctx context.Context, owner, name string) (*Cluster, error) {
+	return scanCluster(s.pool.QueryRow(ctx,
+		`SELECT `+clusterCols+` FROM k8s_clusters WHERE owner = $1 AND name = $2`, owner, name))
+}
+
+func (s *PGStore) List(ctx context.Context, owner string) ([]*Cluster, error) {
+	query := `SELECT ` + clusterCols + ` FROM k8s_clusters ORDER BY owner, name`
+	args := []any{}
+	if owner != "" {
+		query = `SELECT ` + clusterCols + ` FROM k8s_clusters WHERE owner = $1 ORDER BY owner, name`
+		args = append(args, owner)
+	}
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Cluster
+	for rows.Next() {
+		c, err := scanCluster(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *PGStore) exec1(ctx context.Context, query string, args ...any) error {
+	tag, err := s.pool.Exec(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PGStore) SetState(ctx context.Context, owner, name string, st State, reason string) error {
+	return s.exec1(ctx,
+		`UPDATE k8s_clusters SET state = $3, state_reason = $4, updated_at = $5 WHERE owner = $1 AND name = $2`,
+		owner, name, string(st), reason, time.Now().UTC())
+}
+
+func (s *PGStore) SetEndpoint(ctx context.Context, owner, name, endpoint string) error {
+	return s.exec1(ctx,
+		`UPDATE k8s_clusters SET api_endpoint = $3, updated_at = $4 WHERE owner = $1 AND name = $2`,
+		owner, name, endpoint, time.Now().UTC())
+}
+
+func (s *PGStore) UpdateNodeGroups(ctx context.Context, owner, name string, groups []NodeGroup) error {
+	data, err := json.Marshal(groups)
+	if err != nil {
+		return fmt.Errorf("marshal node groups: %w", err)
+	}
+	return s.exec1(ctx,
+		`UPDATE k8s_clusters SET node_groups = $3, updated_at = $4 WHERE owner = $1 AND name = $2`,
+		owner, name, data, time.Now().UTC())
+}
+
+// SetNodeGroupTarget rewrites node_groups server-side: every element
+// keeps its position and every field except the named group's
+// target_nodes, computed by Postgres FROM THE ROW AS IT STANDS AT
+// UPDATE TIME. Two concurrent calls for different groups therefore
+// serialize on Postgres' normal per-row locking and each transforms
+// whatever the other already committed — neither can carry a stale
+// copy of the other's group forward, which is exactly what
+// UpdateNodeGroups' read-modify-write-the-whole-array pattern could
+// not guarantee.
+func (s *PGStore) SetNodeGroupTarget(ctx context.Context, owner, name, group string, target int32) error {
+	return s.exec1(ctx, `
+		UPDATE k8s_clusters SET
+			node_groups = (
+				SELECT jsonb_agg(
+					CASE WHEN elem->>'name' = $3
+						THEN jsonb_set(elem, '{target_nodes}', to_jsonb($4::int))
+						ELSE elem
+					END
+					ORDER BY ord
+				)
+				FROM jsonb_array_elements(node_groups) WITH ORDINALITY AS t(elem, ord)
+			),
+			updated_at = $5
+		WHERE owner = $1 AND name = $2`,
+		owner, name, group, target, time.Now().UTC())
+}
+
+func (s *PGStore) Delete(ctx context.Context, owner, name string) error {
+	// Nodes and events go with the cluster via ON DELETE CASCADE.
+	return s.exec1(ctx, `DELETE FROM k8s_clusters WHERE owner = $1 AND name = $2`, owner, name)
+}
+
+func (s *PGStore) UpsertNode(ctx context.Context, n *Node) error {
+	id, err := s.clusterID(ctx, n.Owner, n.Cluster)
+	if err != nil {
+		return err
+	}
+	// The conflict update replaces the WHOLE record (cluster binding
+	// and created_at included) so re-registering a reused VM name
+	// behaves identically on both store impls.
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO k8s_cluster_nodes (vm_name, cluster_id, role, node_group, state, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (vm_name) DO UPDATE SET cluster_id = EXCLUDED.cluster_id, role = EXCLUDED.role,
+			node_group = EXCLUDED.node_group, state = EXCLUDED.state, created_at = EXCLUDED.created_at`,
+		n.VMName, id, n.Role, n.Group, string(n.State), n.CreatedAt)
+	return err
+}
+
+func (s *PGStore) ListNodes(ctx context.Context, owner, name string) ([]*Node, error) {
+	id, err := s.clusterID(ctx, owner, name)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT vm_name, role, node_group, state, created_at FROM k8s_cluster_nodes WHERE cluster_id = $1 ORDER BY vm_name`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Node
+	for rows.Next() {
+		n := &Node{Owner: owner, Cluster: name}
+		var state string
+		if err := rows.Scan(&n.VMName, &n.Role, &n.Group, &state, &n.CreatedAt); err != nil {
+			return nil, err
+		}
+		n.State = NodeState(state)
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (s *PGStore) DeleteNode(ctx context.Context, owner, name, vmName string) error {
+	id, err := s.clusterID(ctx, owner, name)
+	if err != nil {
+		return err
+	}
+	return s.exec1(ctx, `DELETE FROM k8s_cluster_nodes WHERE vm_name = $1 AND cluster_id = $2`, vmName, id)
+}
+
+func (s *PGStore) AppendEvent(ctx context.Context, owner, name string, e Event) error {
+	id, err := s.clusterID(ctx, owner, name)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(ctx,
+		`INSERT INTO k8s_cluster_events (cluster_id, at, kind, node_group, reason) VALUES ($1, $2, $3, $4, $5)`,
+		id, e.At, string(e.Kind), e.Group, e.Reason)
+	return err
+}
+
+func (s *PGStore) ListEvents(ctx context.Context, owner, name string, limit int) ([]Event, error) {
+	id, err := s.clusterID(ctx, owner, name)
+	if err != nil {
+		return nil, err
+	}
+	query := `SELECT at, kind, node_group, reason FROM k8s_cluster_events WHERE cluster_id = $1 ORDER BY id DESC`
+	args := []any{id}
+	if limit > 0 {
+		query += ` LIMIT $2`
+		args = append(args, limit)
+	}
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		var e Event
+		var kind string
+		if err := rows.Scan(&e.At, &kind, &e.Group, &e.Reason); err != nil {
+			return nil, err
+		}
+		e.Kind = EventKind(kind)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// Close is a no-op: the pool is shared and owned by the caller.
+func (s *PGStore) Close() {}
