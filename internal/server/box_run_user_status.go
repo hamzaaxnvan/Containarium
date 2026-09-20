@@ -35,3 +35,40 @@ func (s *ContainerServer) GetBoxRunUserStatus(ctx context.Context, req *pb.GetBo
 	if listExec == nil || startExec == nil {
 		return nil, status.Error(codes.Unavailable, "no container backend to check the run user on")
 	}
+
+	level, err := s.boxRunRecordedToolAccess(ctx, req.GetUsername())
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the tool-access level of %q: %v", req.GetUsername(), err)
+	}
+	resp := &pb.GetBoxRunUserStatusResponse{RunUser: boxRunUnprivilegedUser, ToolAccessRecorded: level != ""}
+	if level == "" {
+		return resp, nil
+	}
+	// The same refusal StartBoxRun gives for a level it cannot enforce, so a
+	// pre-check never reports "fine" for a box the run would refuse.
+	if _, err := boxRunPolicyFor(level); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%q: %v", req.GetUsername(), err)
+	}
+
+	box := req.GetUsername() + "-container"
+	out, err := listExec(box, boxRunUserExistsScript())
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "check for the run user on %q: %v", req.GetUsername(), err)
+	}
+	switch strings.TrimSpace(out) {
+	case "yes":
+		resp.RunUserExists = true
+	case "no":
+		resp.State = codeCredentialSourcePB(engine.CredentialStatusNone)
+		return resp, nil
+	default:
+		return nil, status.Errorf(codes.Unavailable, "check for the run user on %q: unexpected output %q", req.GetUsername(), strings.TrimSpace(out))
+	}
+
+	state, err := boxRunSignInState(startExec, box)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "check the run user's sign-in on %q: %v", req.GetUsername(), err)
+	}
+	resp.State = codeCredentialSourcePB(state)
+	return resp, nil
+}
