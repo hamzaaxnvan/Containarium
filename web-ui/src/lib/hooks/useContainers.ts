@@ -79,3 +79,249 @@ export function useContainers(server: Server | null) {
     }
   );
 
+  // Fetch available backends
+  const backendsFetcher = async (): Promise<BackendInfo[]> => {
+    if (!server) return [];
+    const client = getClient(server);
+    try {
+      return await client.listBackends();
+    } catch {
+      return [];
+    }
+  };
+
+  const backendsKey = server ? 'backends-' + server.id : null;
+  const { data: backends } = useSWR<BackendInfo[]>(
+    backendsKey,
+    backendsFetcher,
+    {
+      refreshInterval: isVisible ? 30000 : 0,
+      revalidateOnFocus: false,
+      dedupingInterval: 15000,
+    }
+  );
+
+  // Fetch core infrastructure services
+  const coreServicesFetcher = async (): Promise<CoreService[]> => {
+    if (!server) return [];
+    const client = getClient(server);
+    try {
+      return await client.getCoreServices();
+    } catch {
+      return [];
+    }
+  };
+
+  const coreServicesKey = server ? 'core-services-' + server.id : null;
+  const { data: coreServices } = useSWR<CoreService[]>(
+    coreServicesKey,
+    coreServicesFetcher,
+    {
+      refreshInterval: isVisible ? 30000 : 0, // Refresh every 30s (paused when tab hidden)
+      revalidateOnFocus: true,
+      dedupingInterval: 10000,
+    }
+  );
+
+  /**
+   * Create a new container with async API and polling for completion
+   */
+  const createContainer = async (
+    request: CreateContainerRequest,
+    onProgress?: (progress: CreateContainerProgress) => void
+  ) => {
+    if (!server) throw new Error('No server selected');
+
+    const client = getClient(server);
+
+    // Notify starting
+    if (onProgress) {
+      onProgress({ state: 'Creating', message: 'Initiating container creation...' });
+    }
+
+    // Initiate async container creation (returns immediately)
+    await client.createContainer(request, true);
+
+    // Poll for completion
+    if (onProgress) {
+      onProgress({ state: 'Creating', message: 'Container is being provisioned...' });
+    }
+
+    const container = await client.waitForContainer(
+      request.username,
+      (state, message) => {
+        if (onProgress) {
+          onProgress({ state, message });
+        }
+      }
+    );
+
+    // Revalidate container list
+    await mutate();
+
+    return container;
+  };
+
+  /**
+   * Delete a container
+   */
+  const deleteContainer = async (username: string, force: boolean = false) => {
+    if (!server) throw new Error('No server selected');
+
+    const client = getClient(server);
+    await client.deleteContainer(username, force);
+
+    // Revalidate container list
+    await mutate();
+  };
+
+  /**
+   * Start a container
+   */
+  const startContainer = async (username: string) => {
+    if (!server) throw new Error('No server selected');
+
+    const client = getClient(server);
+    const container = await client.startContainer(username);
+
+    // Revalidate container list
+    await mutate();
+
+    return container;
+  };
+
+  /**
+   * Stop a container
+   */
+  const stopContainer = async (username: string, force: boolean = false) => {
+    if (!server) throw new Error('No server selected');
+
+    const client = getClient(server);
+    const container = await client.stopContainer(username, force);
+
+    // Revalidate container list
+    await mutate();
+
+    return container;
+  };
+
+  /**
+   * Refresh container list
+   */
+  const refresh = () => mutate();
+
+  /**
+   * Get labels for a container
+   */
+  const getLabels = async (username: string): Promise<Record<string, string>> => {
+    if (!server) throw new Error('No server selected');
+    const client = getClient(server);
+    return client.getLabels(username);
+  };
+
+  /**
+   * Set labels on a container
+   */
+  const setLabels = async (username: string, labels: Record<string, string>): Promise<Record<string, string>> => {
+    if (!server) throw new Error('No server selected');
+    const client = getClient(server);
+    const result = await client.setLabels(username, labels);
+    // Revalidate container list to show updated labels
+    await mutate();
+    return result;
+  };
+
+  /**
+   * Remove a label from a container
+   */
+  const removeLabel = async (username: string, key: string): Promise<Record<string, string>> => {
+    if (!server) throw new Error('No server selected');
+    const client = getClient(server);
+    const result = await client.removeLabel(username, key);
+    // Revalidate container list to show updated labels
+    await mutate();
+    return result;
+  };
+
+  /**
+   * Enable or disable auto-sleep on a container
+   */
+  const toggleAutoSleep = async (
+    username: string,
+    enabled: boolean,
+    idleThresholdMinutes: number,
+  ) => {
+    if (!server) throw new Error('No server selected');
+    const client = getClient(server);
+    const result = await client.toggleAutoSleep(username, enabled, idleThresholdMinutes);
+    await mutate();
+    return result;
+  };
+
+  /**
+   * Resize a container's resources (CPU, memory, disk)
+   */
+  const resizeContainer = async (
+    username: string,
+    resources: { cpu?: string; memory?: string; disk?: string }
+  ) => {
+    if (!server) throw new Error('No server selected');
+
+    const client = getClient(server);
+    const container = await client.resizeContainer(username, resources);
+
+    // Revalidate container list
+    await mutate();
+
+    return container;
+  };
+
+  /**
+   * Clean up disk space in a container
+   */
+  const cleanupDisk = async (username: string) => {
+    if (!server) throw new Error('No server selected');
+
+    const client = getClient(server);
+    const result = await client.cleanupDisk(username);
+
+    // Revalidate container list
+    await mutate();
+
+    return result;
+  };
+
+  const getSystemInfoForBackend = async (backendId: string): Promise<SystemInfo | null> => {
+    if (!server) return null;
+    const client = getClient(server);
+    try {
+      return await client.getSystemInfo(backendId);
+    } catch {
+      return null;
+    }
+  };
+
+  return {
+    containers: data || [],
+    coreServices: coreServices || [],
+    systemInfo: systemInfo || null,
+    backends: backends || [],
+    isLoading,
+    error,
+    createContainer,
+    deleteContainer,
+    startContainer,
+    stopContainer,
+    resizeContainer,
+    cleanupDisk,
+    getLabels,
+    setLabels,
+    removeLabel,
+    toggleAutoSleep,
+    getSystemInfoForBackend,
+    refresh,
+    // Event stream status
+    eventStatus,
+    reconnectEvents: reconnect,
+  };
+}
