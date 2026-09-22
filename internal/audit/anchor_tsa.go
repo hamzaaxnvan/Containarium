@@ -307,3 +307,313 @@ func walkDER(b []byte, depth int) ([]byte, error) {
 
 // tsaPostFunc sends one DER TimeStampReq and returns the raw reply. A field
 // on the sink so tests substitute a fake TSA.
+type tsaPostFunc func(ctx context.Context, req []byte) ([]byte, error)
+
+// newHTTPTSAPost posts to tsaURL over HTTP(S) with a 60 s timeout. Redirects
+// are refused: the operator configured this URL.
+func newHTTPTSAPost(base *http.Client, tsaURL string) tsaPostFunc {
+	c := http.Client{}
+	if base != nil {
+		c = *base
+	}
+	c.Timeout = tsaCallTimeout
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	shown := redactURL(tsaURL)
+	return func(ctx context.Context, body []byte) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(ctx, tsaCallTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, tsaURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("audit: build TSA request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/timestamp-query")
+		req.Header.Set("Accept", "application/timestamp-reply")
+		resp, err := c.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("audit: TSA %s: %w", shown, err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("audit: TSA %s returned HTTP %d", shown, resp.StatusCode)
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, maxTSAResponseBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("audit: read TSA %s reply: %w", shown, err)
+		}
+		if len(data) > maxTSAResponseBytes {
+			return nil, fmt.Errorf("audit: TSA %s reply is larger than %d bytes", shown, maxTSAResponseBytes)
+		}
+		return data, nil
+	}
+}
+
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid URL>"
+	}
+	return u.Redacted()
+}
+
+// TSAAnchorSink is a RootSink that stamps each anchor record at an RFC 3161
+// TSA and stores the verified token next to the local anchor file. It is
+// always used behind a TeeSink after the FileSink it reads roots from.
+type TSAAnchorSink struct {
+	url   string // redacted, for logs
+	trust *x509.CertPool
+	local *FileSink
+	dir   string
+	post  tsaPostFunc
+}
+
+// TSAAnchorSinkFor builds the TSA sink from the daemon's configuration. Both
+// empty means no TSA sink (nil, nil). One without the other is an error: a
+// URL without a trust bundle would store tokens nobody checked.
+func TSAAnchorSinkFor(local *FileSink, tsaURL, trustBundlePath string) (*TSAAnchorSink, error) {
+	tsaURL, trustBundlePath = strings.TrimSpace(tsaURL), strings.TrimSpace(trustBundlePath)
+	switch {
+	case tsaURL == "" && trustBundlePath == "":
+		return nil, nil
+	case trustBundlePath == "":
+		return nil, errors.New("audit: a TSA URL is set but no TSA trust bundle; tokens are verified before they are stored, so both are required")
+	case tsaURL == "":
+		return nil, errors.New("audit: a TSA trust bundle is set but no TSA URL")
+	}
+	u, err := url.Parse(tsaURL)
+	if err != nil {
+		return nil, fmt.Errorf("audit: TSA URL: %w", err)
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return nil, fmt.Errorf("audit: TSA URL %s must be http or https", u.Redacted())
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("audit: TSA URL %s has no host", u.Redacted())
+	}
+	trust, err := LoadTSATrustBundle(trustBundlePath)
+	if err != nil {
+		return nil, err
+	}
+	return newTSAAnchorSink(local, tsaURL, trust, newHTTPTSAPost(nil, tsaURL))
+}
+
+// ComposeAnchorSink is the daemon's anchor sink: the local file alone when
+// neither external sink is configured (nil), else a TeeSink writing the file
+// first, then the bucket, then the TSA.
+func ComposeAnchorSink(file *FileSink, bucket *GCSAnchorSink, tsa *TSAAnchorSink) RootSink {
+	var externals []RootSink
+	if bucket != nil {
+		externals = append(externals, bucket)
+	}
+	if tsa != nil {
+		externals = append(externals, tsa)
+	}
+	if len(externals) == 0 {
+		return file
+	}
+	return NewTeeSink(file, externals...)
+}
+
+func newTSAAnchorSink(local *FileSink, tsaURL string, trust *x509.CertPool, post tsaPostFunc) (*TSAAnchorSink, error) {
+	if local == nil || trust == nil || post == nil {
+		return nil, errors.New("audit: TSA sink needs the local anchor file, a trust bundle and a transport")
+	}
+	return &TSAAnchorSink{url: redactURL(tsaURL), trust: trust, local: local, dir: TSATokenDir(local.path), post: post}, nil
+}
+
+// URI is the TSA, for log lines.
+func (s *TSAAnchorSink) URI() string { return s.url }
+
+// TokenDir is where tokens are stored.
+func (s *TSAAnchorSink) TokenDir() string { return s.dir }
+
+func (s *TSAAnchorSink) tokenPath(checkpoint int64) string {
+	return filepath.Join(s.dir, tsaTokenName(checkpoint))
+}
+
+func (s *TSAAnchorSink) PublishRoot(ctx context.Context, checkpoint int64, root string) error {
+	digest := AnchorRecordDigest(checkpoint, root)
+	path := s.tokenPath(checkpoint)
+	existing, err := readTokenFile(path)
+	switch {
+	case err == nil:
+		return s.checkExisting(existing, digest, checkpoint, path)
+	case !errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("audit: read timestamp token %s: %w", path, err)
+	}
+
+	token, err := s.stamp(ctx, digest)
+	if err != nil {
+		return err
+	}
+	if err := writeTokenOnce(s.dir, path, token); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			if existing, rerr := readTokenFile(path); rerr == nil {
+				return s.checkExisting(existing, digest, checkpoint, path)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// checkExisting: a stored token for the same record is an idempotent
+// republish; one for a different record is a conflict (RootSink contract).
+func (s *TSAAnchorSink) checkExisting(token, digest []byte, checkpoint int64, path string) error {
+	_, err := VerifyTSAToken(token, s.trust, digest)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrTSAImprintMismatch):
+		return fmt.Errorf("%w: checkpoint=%d (%s)", ErrAnchorConflict, checkpoint, path)
+	}
+	return fmt.Errorf("audit: stored timestamp token %s does not verify: %w", path, err)
+}
+
+// stamp asks the TSA for a token over digest and returns it only once it
+// verifies against the trust bundle with the nonce sent.
+func (s *TSAAnchorSink) stamp(ctx context.Context, digest []byte) ([]byte, error) {
+	var nb [8]byte
+	if _, err := rand.Read(nb[:]); err != nil {
+		return nil, fmt.Errorf("audit: TSA nonce: %w", err)
+	}
+	nonce := new(big.Int).SetBytes(nb[:])
+	req := timestamp.Request{HashAlgorithm: crypto.SHA256, HashedMessage: digest, Certificates: true, Nonce: nonce}
+	body, err := req.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("audit: build TSA request: %w", err)
+	}
+	reply, err := s.post(ctx, body)
+	if err != nil {
+		return nil, err
+	}
+	if len(reply) > maxTSAResponseBytes {
+		return nil, fmt.Errorf("reply from %s: %w: %w", s.url, ErrTSATokenInvalid, ErrTSATokenTooLarge)
+	}
+	if err := strictDERGate(reply); err != nil {
+		return nil, fmt.Errorf("reply from %s: %w", s.url, err)
+	}
+	// ParseResponse turns a non-granted PKIStatus into an error.
+	ts, err := recoverParse(func() (*timestamp.Timestamp, error) { return timestamp.ParseResponse(reply) })
+	if err != nil {
+		if isTSAStatusError(err) {
+			return nil, fmt.Errorf("audit: TSA %s refused the request: %v", s.url, err)
+		}
+		return nil, fmt.Errorf("%w: reply from %s: %v", ErrTSATokenInvalid, s.url, err)
+	}
+	info, err := VerifyTSAToken(ts.RawToken, s.trust, digest)
+	if err != nil {
+		return nil, fmt.Errorf("token from %s: %w", s.url, err)
+	}
+	if info.Nonce == nil || info.Nonce.Cmp(nonce) != 0 {
+		return nil, fmt.Errorf("token from %s: %w", s.url, ErrTSANonceMismatch)
+	}
+	return ts.RawToken, nil
+}
+
+// isTSAStatusError: timestamp.ParseResponse reports a non-granted status as
+// a plain error starting with the status name.
+func isTSAStatusError(err error) bool {
+	var pe timestamp.ParseError
+	if errors.As(err, &pe) {
+		return false
+	}
+	for _, st := range []timestamp.Status{timestamp.GrantedWithMods, timestamp.Rejection, timestamp.Waiting, timestamp.RevocationWarning, timestamp.RevocationNotification} {
+		if strings.HasPrefix(err.Error(), st.String()+":") {
+			return true
+		}
+	}
+	return false
+}
+
+// writeTokenOnce writes token to path without ever replacing an existing
+// file: a temp file in the same directory, then a hard link, which fails if
+// path exists. A crash leaves at most a stray temp file, never a partial
+// token at path.
+func writeTokenOnce(dir, path string, token []byte) error {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("audit: create token directory %s: %w", dir, err)
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-*.tsr")
+	if err != nil {
+		return fmt.Errorf("audit: create token temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(token); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("audit: write token: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("audit: sync token: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("audit: close token: %w", err)
+	}
+	if err := os.Link(tmpName, path); err != nil {
+		return fmt.Errorf("audit: store token %s: %w", path, err)
+	}
+	return nil
+}
+
+// LastPublished reports the highest checkpoint with a stored token, with the
+// local file's root for it. The token must verify against that root: a token
+// the local record does not match is an error, never "not anchored".
+func (s *TSAAnchorSink) LastPublished(ctx context.Context) (int64, string, bool, error) {
+	cps, _, err := listTSATokens(s.dir)
+	if err != nil {
+		return 0, "", false, err
+	}
+	if len(cps) == 0 {
+		return 0, "", false, nil
+	}
+	cp := cps[len(cps)-1]
+	local, err := s.local.Checkpoints()
+	if err != nil {
+		return 0, "", false, err
+	}
+	root, found := "", false
+	for _, c := range local {
+		if c.Checkpoint == cp {
+			root, found = c.Root, true
+		}
+	}
+	if !found {
+		return 0, "", false, fmt.Errorf("audit: timestamp token for checkpoint %d has no record in the local anchor file", cp)
+	}
+	token, err := readTokenFile(s.tokenPath(cp))
+	if err != nil {
+		return 0, "", false, fmt.Errorf("audit: read timestamp token: %w", err)
+	}
+	if _, err := VerifyTSAToken(token, s.trust, AnchorRecordDigest(cp, root)); err != nil {
+		return 0, "", false, fmt.Errorf("audit: timestamp token for checkpoint %d: %w", cp, err)
+	}
+	return cp, root, true, nil
+}
+
+// listTSATokens returns the checkpoints with a token file in dir, ascending,
+// and the names of other entries. A missing directory is no tokens.
+func listTSATokens(dir string) (cps []int64, unrecognised []string, err error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("audit: list timestamp tokens in %s: %w", dir, err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".tmp-") {
+			continue // a write interrupted before the link
+		}
+		base, ok := strings.CutSuffix(name, ".tsr")
+		cp, perr := strconv.ParseInt(base, 10, 64)
+		if !ok || !e.Type().IsRegular() || perr != nil || cp < 0 || tsaTokenName(cp) != name {
+			unrecognised = append(unrecognised, name)
+			continue
+		}
+		cps = append(cps, cp)
+	}
+	sort.Slice(cps, func(i, j int) bool { return cps[i] < cps[j] })
+	return cps, unrecognised, nil
+}
