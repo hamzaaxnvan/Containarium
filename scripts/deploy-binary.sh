@@ -87,3 +87,183 @@ verify_remote() {
     # The runner is invoked with the remote shell command as its last argument.
     local label="$1"; shift
     local got
+    got="$("$@" "sha256sum /tmp/containariumd 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true)"
+    got="$(printf '%s' "$got" | tr -d '[:space:]')"
+    if [ -z "$got" ]; then
+        echo "  ERROR: could not read the uploaded binary's checksum on $label" >&2
+        return 1
+    fi
+    if [ "$got" != "$EXPECTED_SHA" ]; then
+        echo "  ERROR: checksum mismatch on $label — refusing to install." >&2
+        echo "         expected $EXPECTED_SHA" >&2
+        echo "         got      $got" >&2
+        echo "         The transfer was corrupted or truncated. Nothing was stopped;" >&2
+        echo "         re-run to retry. If scp keeps truncating on this link, try:" >&2
+        echo "           cat '$BINARY' | ssh <host> 'cat > /tmp/containariumd'" >&2
+        return 1
+    fi
+    echo "  checksum OK on $label"
+}
+
+# Parse flags
+BUILD=false
+for arg in "$@"; do
+    case "$arg" in
+        --build) BUILD=true ;;
+    esac
+done
+
+# 1. Build if requested
+if $BUILD; then
+    echo "==> Building binary..."
+    make build-linux
+fi
+
+if [[ ! -f "$BINARY" ]]; then
+    echo "Error: $BINARY not found. Run with --build or 'make build-linux' first."
+    exit 1
+fi
+
+BINARY_SIZE=$(du -h "$BINARY" | cut -f1)
+echo "==> Binary: $BINARY ($BINARY_SIZE)"
+
+# 1b. Preflight: the sentinel↔daemon HMAC secret must already be provisioned.
+#
+# v0.19.0+ gates the sentinel-facing endpoints (/authorized-keys, /certs,
+# /authorized-keys/sentinel) behind an HMAC over CONTAINARIUM_SENTINEL_AUTH_SECRET
+# (>=32 bytes), loaded from /etc/containarium/env.secrets via a systemd
+# EnvironmentFile drop-in. Swapping a v0.19.0+ binary onto a host that lacks the
+# secret silently 401s every sentinel keysync/certsync cycle — sshpiper config
+# freezes, upstream pointers go stale, and tenants get locked out for hours
+# before anyone finds the 401 (issue #341). Refuse to swap the binary until the
+# secret is in place rather than recreate that outage.
+#
+# Set ALLOW_MISSING_SENTINEL_SECRET=1 to bypass (deliberate pre-HMAC rollback,
+# or an unsecured single-node dev box). See docs/SENTINEL-AUTH-SECRET.md for how
+# to generate and distribute the secret.
+SECRET_FILE="/etc/containarium/env.secrets"
+SECRET_MIN_LEN=32
+RUNBOOK="docs/SENTINEL-AUTH-SECRET.md"
+# grep emits SECRET_OK iff env.secrets holds a CONTAINARIUM_SENTINEL_AUTH_SECRET
+# value of at least SECRET_MIN_LEN chars; SECRET_MISSING otherwise (incl. no file).
+SECRET_CHECK_CMD="sudo grep -Eq '^CONTAINARIUM_SENTINEL_AUTH_SECRET=.{${SECRET_MIN_LEN},}' '$SECRET_FILE' 2>/dev/null && echo SECRET_OK || echo SECRET_MISSING"
+
+if [[ "${ALLOW_MISSING_SENTINEL_SECRET:-0}" == "1" ]]; then
+    echo "==> ALLOW_MISSING_SENTINEL_SECRET=1 — skipping HMAC secret preflight (#341)"
+else
+    echo "==> Preflight: checking CONTAINARIUM_SENTINEL_AUTH_SECRET on sentinel + primary (#341)..."
+    missing=()
+
+    sentinel_secret=$(gcloud compute ssh "$SENTINEL_VM" --zone="$ZONE" --project="$PROJECT" \
+        --tunnel-through-iap --ssh-flag="-p 2222" --command="$SECRET_CHECK_CMD" 2>/dev/null || echo SECRET_MISSING)
+    [[ "$sentinel_secret" == *SECRET_OK* ]] || missing+=("sentinel ($SENTINEL_VM)")
+
+    primary_secret=$(gcloud compute ssh "$PRIMARY_VM" --zone="$ZONE" --project="$PROJECT" \
+        --tunnel-through-iap --command="$SECRET_CHECK_CMD" 2>/dev/null || echo SECRET_MISSING)
+    [[ "$primary_secret" == *SECRET_OK* ]] || missing+=("primary ($PRIMARY_VM)")
+
+    if (( ${#missing[@]} > 0 )); then
+        echo ""
+        echo "ERROR: CONTAINARIUM_SENTINEL_AUTH_SECRET (>=${SECRET_MIN_LEN} bytes) is not provisioned on:"
+        for h in "${missing[@]}"; do echo "         - $h"; done
+        echo ""
+        echo "  Deploying a v0.19.0+ binary here would silently 401 every sentinel"
+        echo "  keysync/certsync cycle and can SSH-lock tenants for hours (#341)."
+        echo ""
+        echo "  Provision the secret first (one per cluster, same value on every host):"
+        echo "    see $RUNBOOK"
+        echo ""
+        echo "  To bypass intentionally (pre-HMAC rollback / unsecured dev box):"
+        echo "    ALLOW_MISSING_SENTINEL_SECRET=1 $0 $*"
+        exit 1
+    fi
+    echo "  OK: secret present on sentinel and primary"
+fi
+
+# Compute the expected checksum once, after any --build has produced the binary.
+if [ ! -f "$BINARY" ]; then
+    echo "ERROR: $BINARY not found (use --build, or build it first)" >&2
+    exit 1
+fi
+# Pick the checksum tool by availability, not by letting one fail. Under
+# `set -euo pipefail` a failed command substitution aborts the script, so a
+# "try sha256sum, fall back to shasum" shape would exit before ever reaching
+# the fallback — the fallback would be dead code, and running from macOS
+# (shasum, no sha256sum) would abort the deploy here.
+if command -v sha256sum >/dev/null 2>&1; then
+    EXPECTED_SHA="$(sha256sum "$BINARY" | cut -d' ' -f1)"
+elif command -v shasum >/dev/null 2>&1; then
+    EXPECTED_SHA="$(shasum -a 256 "$BINARY" | cut -d' ' -f1)"
+else
+    echo "ERROR: neither sha256sum nor shasum found — cannot verify transfers." >&2
+    echo "       Refusing to deploy unverified; install one and re-run." >&2
+    exit 1
+fi
+echo "==> Shipping $BINARY (sha256 $EXPECTED_SHA)"
+
+# 2. Upload to sentinel
+echo "==> Uploading to sentinel..."
+gcloud compute scp "$BINARY" "$SENTINEL_VM:/tmp/containariumd" \
+    --zone="$ZONE" --project="$PROJECT" --tunnel-through-iap --scp-flag="-P 2222"
+# Sentinel daemon holds /usr/local/bin/containariumd open, so a plain `cp`
+# fails with "Text file busy". Stop the service before copying, mirroring
+# the primary-VM pattern below. The final `ln -sf` keeps the pre-#1780 name
+# working as a compat symlink for the duration of the rollout.
+verify_remote "sentinel ($SENTINEL_VM)" \
+    gcloud compute ssh "$SENTINEL_VM" --zone="$ZONE" --project="$PROJECT" \
+    --tunnel-through-iap --ssh-flag="-p 2222" --command
+gcloud compute ssh "$SENTINEL_VM" --zone="$ZONE" --project="$PROJECT" \
+    --tunnel-through-iap --ssh-flag="-p 2222" \
+    --command="$(deploy_install_cmd "$SENTINEL_SERVICE" "$SENTINEL_HEALTH_URL")"
+echo "  Sentinel updated, restarted and healthy ($SENTINEL_SERVICE)"
+
+# 3. Deploy on primary
+echo "==> Deploying on primary ($PRIMARY_VM)..."
+gcloud compute scp "$BINARY" "$PRIMARY_VM:/tmp/containariumd" \
+    --zone="$ZONE" --project="$PROJECT" --tunnel-through-iap
+verify_remote "primary ($PRIMARY_VM)" \
+    gcloud compute ssh "$PRIMARY_VM" --zone="$ZONE" --project="$PROJECT" \
+    --tunnel-through-iap --command
+gcloud compute ssh "$PRIMARY_VM" --zone="$ZONE" --project="$PROJECT" \
+    --tunnel-through-iap \
+    --command="$(deploy_install_cmd "$PRIMARY_SERVICE" "$PRIMARY_HEALTH_URL")"
+echo "  Primary updated, restarted and healthy ($PRIMARY_SERVICE)"
+
+# 4. Deploy on peers.
+# Guard the expansion: with PEERS=" " (the "primary+sentinel only" idiom) the
+# array is empty, and `"${PEERS[@]}"` under `set -u` on bash 3.2 (macOS) errors
+# "PEERS[@]: unbound variable". Skip the loop entirely when there are none.
+if (( ${#PEERS[@]} > 0 )); then
+  for peer in "${PEERS[@]}"; do
+    echo "==> Deploying on peer ($peer)..."
+    scp "$BINARY" "$peer:/tmp/containariumd" 2>/dev/null || {
+        echo "  Warning: failed to upload to $peer (skipping)"
+        continue
+    }
+    # Verify before telling the operator to install it. Printing the install
+    # command for a truncated upload is how a corrupt binary gets run by hand.
+    if ! verify_remote "peer ($peer)" ssh "$peer"; then
+        echo "  Warning: skipping $peer — re-run to retry the upload"
+        continue
+    fi
+    # Peers need interactive sudo — print the command for the user
+    echo "  Binary uploaded to $peer:/tmp/containariumd"
+    echo "  Run on $peer:"
+    echo "    sudo systemctl stop containarium-tunnel && sudo systemctl stop $PRIMARY_SERVICE && sleep 1 && sudo cp /tmp/containariumd /usr/local/bin/containariumd && sudo chmod +x /usr/local/bin/containariumd && sudo ln -sf /usr/local/bin/containariumd /usr/local/bin/containarium && sudo systemctl start $PRIMARY_SERVICE && sudo systemctl start containarium-tunnel"
+  done
+fi
+
+echo ""
+echo "=== Deploy complete ==="
+echo "  Sentinel: updated and restarted"
+echo "  Primary:  updated and restarted"
+echo "  Peers:    binary uploaded for immediate use"
+echo ""
+echo "  NOTE: If peers have --sentinel-url configured, they will auto-update"
+echo "        from the sentinel within 5 minutes. Otherwise, run the printed"
+echo "        commands with sudo on each peer."
+echo ""
+echo "  NOTE: Peer daemons also need CONTAINARIUM_SENTINEL_AUTH_SECRET set to the"
+echo "        same cluster secret (the preflight above only gates sentinel +"
+echo "        primary). Verify each peer has it before they take sentinel"
+echo "        keysync/certsync traffic — see $RUNBOOK."

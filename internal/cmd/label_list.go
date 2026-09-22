@@ -65,3 +65,70 @@ func runLabelList(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func getLabelsRemoteHTTP(username string) (map[string]string, error) {
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	info, err := httpClient.GetContainer(username)
+	if err != nil {
+		return nil, fmt.Errorf("container %q not found: %w", username, err)
+	}
+
+	return info.Labels, nil
+}
+
+func printLabelsTable(username string, labels map[string]string) {
+	containerName := username + "-container"
+	fmt.Printf("Labels for container %s:\n\n", containerName)
+
+	if len(labels) == 0 {
+		fmt.Println("  (no labels)")
+		return
+	}
+
+	// Sort keys for consistent output
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Find max key length for alignment
+	maxKeyLen := 0
+	for _, k := range keys {
+		if len(k) > maxKeyLen {
+			maxKeyLen = len(k)
+		}
+	}
+
+	fmt.Printf("  %-*s  %s\n", maxKeyLen, "KEY", "VALUE")
+	fmt.Printf("  %s  %s\n", strings.Repeat("-", maxKeyLen), strings.Repeat("-", 30))
+
+	for _, key := range keys {
+		fmt.Printf("  %-*s  %s\n", maxKeyLen, key, labels[key])
+	}
+
+	fmt.Printf("\nTotal: %d label(s)\n", len(labels))
+}
+
+func printLabelsJSON(username string, labels map[string]string) error {
+	output := map[string]interface{}{
+		"container": username + "-container",
+		"username":  username,
+		"labels":    labels,
+		"count":     len(labels),
+	}
+
+	data, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	fmt.Println(string(data))
+	return nil
+}
