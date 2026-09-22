@@ -41,3 +41,18 @@ func HTTPMetricsMiddleware(next http.Handler, provider *sdkmetric.MeterProvider)
 		// keeps the real writer's Flusher reachable for server-streaming
 		// responses (#2773).
 		rw := httpx.NewStatusWriter(w)
+
+		next.ServeHTTP(rw, r)
+
+		duration := time.Since(start).Seconds()
+
+		attrs := otelmetric.WithAttributes(
+			attribute.String("method", r.Method),
+			attribute.String("route", r.URL.Path),
+			attribute.String("status_code", fmt.Sprintf("%d", rw.StatusCode)),
+		)
+
+		requestsTotal.Add(r.Context(), 1, attrs)
+		requestDuration.Record(r.Context(), duration, attrs)
+	})
+}
