@@ -222,3 +222,116 @@ message ScaleEvent {
 // Cluster is a managed Kubernetes cluster.
 message Cluster {
   // Cluster name, unique per owner.
+  string name = 1;
+  // Owning tenant (username).
+  string owner = 2;
+  ClusterState state = 3;
+  // Why the cluster is in ERROR/DEGRADED, empty otherwise.
+  string state_reason = 4;
+  // Pinned k3s version the cluster runs (set by the provisioner).
+  string k3s_version = 5;
+  // Worker size classes.
+  repeated NodeGroup node_groups = 6;
+  // External API endpoint (host:port), set once published.
+  string api_endpoint = 7;
+  google.protobuf.Timestamp created_at = 8;
+  // Isolation class of this cluster's nodes. Always populated on read
+  // (never UNSPECIFIED) so an auditor can answer "which clusters share
+  // a kernel with this host" from any cluster read.
+  NodeIsolation node_isolation = 9;
+}
+
+message CreateClusterRequest {
+  // Cluster name (DNS-label syntax).
+  string name = 1;
+  // Owning tenant. Empty = the authenticated caller. Setting another
+  // tenant requires the admin role.
+  string owner = 2;
+  // Worker size classes. Empty = the platform's default presets.
+  repeated NodeGroup node_groups = 3;
+  // Requested node isolation class. Unspecified = VM. CONTAINER is
+  // refused with FailedPrecondition unless the host carries the
+  // operator opt-in.
+  NodeIsolation node_isolation = 4;
+}
+
+message CreateClusterResponse {
+  Cluster cluster = 1;
+  string message = 2;
+}
+
+message ListClustersRequest {
+  // Owner filter. Non-admin callers may only list their own clusters;
+  // empty = the authenticated caller (admins: all clusters).
+  string owner = 1;
+}
+
+message ListClustersResponse {
+  repeated Cluster clusters = 1;
+}
+
+message GetClusterRequest {
+  string name = 1;
+  // Owning tenant. Empty = the authenticated caller.
+  string owner = 2;
+}
+
+message GetClusterResponse {
+  Cluster cluster = 1;
+}
+
+message DeleteClusterRequest {
+  string name = 1;
+  // Owning tenant. Empty = the authenticated caller.
+  string owner = 2;
+}
+
+message DeleteClusterResponse {
+  string message = 1;
+}
+
+message GetClusterKubeconfigRequest {
+  string name = 1;
+  // Owning tenant. Empty = the authenticated caller.
+  string owner = 2;
+}
+
+message GetClusterKubeconfigResponse {
+  // kubeconfig YAML with the server URL rewritten to api_endpoint.
+  string kubeconfig = 1;
+}
+
+message GetClusterStatusRequest {
+  string name = 1;
+  // Owning tenant. Empty = the authenticated caller.
+  string owner = 2;
+  // Max scale events to return, newest first. 0 = server default (20).
+  int32 events_limit = 3;
+}
+
+// NodeGroupStatus is a group's observed count against its bounds.
+message NodeGroupStatus {
+  NodeGroup group = 1;
+  int32 current_nodes = 2;
+}
+
+message GetClusterStatusResponse {
+  Cluster cluster = 1;
+  repeated ClusterNode nodes = 2;
+  repeated NodeGroupStatus groups = 3;
+  // Newest first.
+  repeated ScaleEvent events = 4;
+}
+
+message UpdateClusterNodePoolRequest {
+  string name = 1;
+  // Owning tenant. Empty = the authenticated caller.
+  string owner = 2;
+  // Replacement set of node groups (validated like create).
+  repeated NodeGroup node_groups = 3;
+}
+
+message UpdateClusterNodePoolResponse {
+  Cluster cluster = 1;
+  string message = 2;
+}

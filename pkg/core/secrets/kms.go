@@ -132,3 +132,71 @@ func NewInProcKMS(masterKey []byte) (*InProcKMS, error) {
 }
 
 // Wrap encrypts the DEK under the master key with a fresh
+// nonce. The output bytes are nonce || ciphertext-with-
+// tag, so Unwrap doesn't need to know the nonce
+// separately. Phase-A simplicity; Phase-B+ may attach
+// versioning bytes via a TLV envelope.
+func (k *InProcKMS) Wrap(_ context.Context, plaintextDEK []byte) ([]byte, string, error) {
+	if err := checkWrapPlaintext(plaintextDEK); err != nil {
+		return nil, "", err
+	}
+	nonce := make([]byte, NonceSize)
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, "", fmt.Errorf("generate wrap nonce: %w", err)
+	}
+	// Use the literal kek-id as AAD so a wrapped DEK can't
+	// be replayed under a different KMS backend's row.
+	wrapped := k.aead.Seal(nil, nonce, plaintextDEK, []byte(inprocKEKID))
+	// Prepend the nonce so Unwrap doesn't need it
+	// separately. Layout: [12-byte nonce][ciphertext+tag].
+	out := make([]byte, 0, NonceSize+len(wrapped))
+	out = append(out, nonce...)
+	out = append(out, wrapped...)
+	return out, inprocKEKID, nil
+}
+
+// Unwrap reverses Wrap. The kekID must match the sentinel
+// or we refuse — that's how Phase-B+ readers know not to
+// route a real-KMS row through the inproc backend by
+// mistake.
+func (k *InProcKMS) Unwrap(_ context.Context, wrappedDEK []byte, kekID string) ([]byte, error) {
+	if kekID != inprocKEKID {
+		return nil, fmt.Errorf("InProcKMS: refusing to unwrap row whose kek_id=%q (not %q)", kekID, inprocKEKID)
+	}
+	if len(wrappedDEK) < NonceSize+1 {
+		return nil, errors.New("InProcKMS: wrapped DEK too short")
+	}
+	nonce := wrappedDEK[:NonceSize]
+	ct := wrappedDEK[NonceSize:]
+	pt, err := k.aead.Open(nil, nonce, ct, []byte(inprocKEKID))
+	if err != nil {
+		return nil, ErrAuthentication
+	}
+	if len(pt) == 0 {
+		// Wrap never accepts an empty plaintext, so an empty
+		// result is a malformed row, not a value.
+		return nil, errors.New("InProcKMS: unwrapped plaintext is empty")
+	}
+	return pt, nil
+}
+
+// NewDEK generates a 32-byte Data Encryption Key from
+// crypto/rand. Used at every Set call before the KMS Wrap.
+// Caller MUST zero the returned slice after use.
+func NewDEK() ([]byte, error) {
+	dek := make([]byte, DEKSize)
+	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
+		return nil, fmt.Errorf("generate DEK: %w", err)
+	}
+	return dek, nil
+}
+
+// ZeroBytes overwrites the slice in place. Defense-in-
+// depth — the Go garbage collector may relocate the
+// backing array, but explicit zero closes the easy
+// memory-inspection paths.
+func ZeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
