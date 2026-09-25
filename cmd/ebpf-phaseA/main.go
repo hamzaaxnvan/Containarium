@@ -84,3 +84,89 @@ func run(objPath, veth string, tenant uint32, allowIntra bool, allow cidrList, p
 	cfg := netbpf.PolicyConfig{TenantID: tenant, Mode: netbpf.ModeLogOnly}
 	if allowIntra {
 		cfg.AllowIntra = 1
+	}
+	if err := loader.SetVethPolicy(ifindex, cfg); err != nil {
+		return err
+	}
+
+	for _, c := range allow {
+		p, err := netip.ParsePrefix(c)
+		if err != nil {
+			return fmt.Errorf("parse --allow-cidr %q: %w", c, err)
+		}
+		if !p.Addr().Is4() {
+			return fmt.Errorf("--allow-cidr %q is not IPv4 (Phase A is IPv4-only)", c)
+		}
+		p = p.Masked()
+		if err := loader.AddEgress(netbpf.EgressEntry{
+			PrefixLen: 32 + safecast.U32(p.Bits()),
+			TenantID:  tenant,
+			Addr:      p.Addr().As4(),
+		}); err != nil {
+			return err
+		}
+		log.Printf("egress allow: tenant=%d %s", tenant, p)
+	}
+
+	if peerIP != "" {
+		a, err := netip.ParseAddr(peerIP)
+		if err != nil || !a.Is4() {
+			return fmt.Errorf("--peer-ip %q must be an IPv4 address", peerIP)
+		}
+		if err := loader.SetIPTenant(a.As4(), peerTenant); err != nil {
+			return err
+		}
+		log.Printf("peer registered: %s -> tenant=%d", peerIP, peerTenant)
+	}
+
+	if err := loader.AttachVeth(ifindex); err != nil {
+		return err
+	}
+	log.Printf("attached netpolicy to %s (ifindex %d), tenant=%d allow_intra=%v mode=log_only",
+		veth, ifindex, tenant, allowIntra)
+
+	// Drain the denied-flow perf ring in the background.
+	rd, err := perf.NewReader(loader.EventsMap(), os.Getpagesize())
+	if err != nil {
+		return fmt.Errorf("open perf reader: %w", err)
+	}
+	defer func() { _ = rd.Close() }()
+	go func() {
+		for {
+			rec, err := rd.Read()
+			if err != nil {
+				return // reader closed on exit
+			}
+			if rec.LostSamples > 0 {
+				log.Printf("perf: lost %d samples", rec.LostSamples)
+				continue
+			}
+			ev, err := netbpf.ParseDenyEvent(rec.RawSample)
+			if err != nil {
+				log.Printf("perf: decode: %v", err)
+				continue
+			}
+			log.Printf("WOULD-DENY src=%s dst=%s proto=%d dport=%d (tenant=%d ifindex=%d)",
+				ev.Src(), ev.Dst(), ev.Proto, ev.Dport, ev.TenantID, ev.Ifindex)
+		}
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	log.Printf("watching every %s; ^C to detach + exit", every)
+	for {
+		select {
+		case <-tick.C:
+			seen, deny, err := loader.Stats()
+			if err != nil {
+				return err
+			}
+			log.Printf("seen=%d would_deny=%d", seen, deny)
+		case s := <-sig:
+			log.Printf("got %s; detaching and exiting", s)
+			return nil
+		}
+	}
+}

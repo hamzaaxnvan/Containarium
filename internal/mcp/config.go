@@ -26,3 +26,90 @@ type Config struct {
 	// token. The file is re-read on every request to the Containarium
 	// API, so rotating the token is a single `mv newtoken oldpath`
 	// step — no MCP restart needed. Empty means use JWTToken instead.
+	// Whitespace around the token in the file is trimmed.
+	JWTTokenFile string
+
+	// Debug enables debug logging
+	Debug bool
+
+	// MCPTools is the operator-facing tool allow-list (#1922 step 7):
+	// a comma-separated list of exact tool names and/or "prefix_*"
+	// globs. Empty (the default) means every registered tool is
+	// available — today's behavior, unchanged. Set to curate what an
+	// in-box agent sees when this MCP server is mounted with a
+	// narrowly-scoped JWT (e.g. "tracker_*" for the tracker broker's
+	// tools only) — on top of, not instead of, the existing per-tool
+	// RequiredScope check. See filterToolsByAllowlist.
+	MCPTools string
+}
+
+// LoadConfig loads configuration from environment variables, with a
+// final fallback to ~/.containarium/credentials.json (the file
+// `containarium login` writes — see internal/credentials). The
+// precedence is, highest first:
+//
+//  1. CONTAINARIUM_JWT_TOKEN (static, in-process)
+//  2. CONTAINARIUM_JWT_TOKEN_FILE (re-read per request — rotation-safe)
+//  3. credentials.json lookup for ServerURL (or DefaultServer when
+//     ServerURL is empty). Static for the life of the process —
+//     prefer (2) when you need long-running token rotation.
+//
+// Fallback (3) is best-effort: any error reading credentials.json is
+// logged + ignored, leaving JWTToken empty so the existing
+// "missing token" message in cmd/mcp-server fires with full guidance.
+// Logging lands on stderr (the MCP protocol owns stdout), so it
+// never corrupts the JSON-RPC stream.
+func LoadConfig() *Config {
+	debug := false
+	if debugStr := os.Getenv("CONTAINARIUM_DEBUG"); debugStr != "" {
+		debug, _ = strconv.ParseBool(debugStr)
+	}
+
+	jwt := config.LoadJWT()
+	cfg := &Config{
+		ServerURL:    os.Getenv("CONTAINARIUM_SERVER_URL"),
+		JWTToken:     jwt.Token,
+		JWTTokenFile: jwt.TokenFile,
+		Debug:        debug,
+		MCPTools:     os.Getenv(EnvMCPTools),
+	}
+
+	if cfg.JWTToken == "" && cfg.JWTTokenFile == "" {
+		applyCredentialsFileFallback(cfg)
+	}
+
+	return cfg
+}
+
+// applyCredentialsFileFallback populates cfg.JWTToken (and ServerURL,
+// when unset) from the user's ~/.containarium/credentials.json. A
+// missing file or missing entry is silent — the existing env-var
+// error message in cmd/mcp-server then surfaces with full guidance.
+func applyCredentialsFileFallback(cfg *Config) {
+	path, err := credentials.DefaultPath()
+	if err != nil {
+		// Home directory unresolvable — exotic env (no $HOME); leave
+		// the env-var error to be the user's only signal.
+		return
+	}
+	cf, err := credentials.Load(path)
+	if err != nil {
+		// Malformed / unreadable credentials file — log so the
+		// operator sees it, but don't fail-stop; an explicit
+		// env-var override may still be incoming via main.go's
+		// startup check.
+		log.Printf("[mcp-config] credentials.json at %s unreadable, ignoring: %v", path, err)
+		return
+	}
+	creds, ok := cf.Get(cfg.ServerURL) // empty ServerURL → falls back to DefaultServer
+	if !ok {
+		return
+	}
+	cfg.JWTToken = creds.Token
+	if cfg.ServerURL == "" {
+		// User didn't pin a server; credentials.json's DefaultServer
+		// answered the lookup, so adopt it as ServerURL too. Required
+		// in the file's schema (Save enforces it's a key in Servers).
+		cfg.ServerURL = cf.DefaultServer
+	}
+}
