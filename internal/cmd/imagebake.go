@@ -50,3 +50,39 @@ func init() {
 
 func runImageBake(cmd *cobra.Command, args []string) error {
 	if serverAddr != "" {
+		return fmt.Errorf("image-bake runs on the backend host against local Incus; it is not available in --server mode (SSH to the host and run it there)")
+	}
+
+	osType := pb.OSType_OS_TYPE_UNSPECIFIED
+	if bakeOSType != "" {
+		osType = ostype.OSTypeFromString(bakeOSType)
+		if osType == pb.OSType_OS_TYPE_UNSPECIFIED {
+			return fmt.Errorf("invalid --os-type %q (expected ubuntu, rocky9, or rhel9)", bakeOSType)
+		}
+	}
+
+	mgr, err := container.New()
+	if err != nil {
+		return fmt.Errorf("failed to connect to Incus: %w", err)
+	}
+
+	res, err := mgr.BakeBaseImage(container.BakeOptions{
+		Image:        bakeImage,
+		OSType:       osType,
+		EnablePodman: bakePodman,
+		Verbose:      true,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Println()
+	fmt.Printf("✓ Baked %s\n", res.Alias)
+	fmt.Printf("  Source:      %s\n", res.SourceImage)
+	fmt.Printf("  Fingerprint: %s\n", res.Fingerprint)
+	fmt.Println()
+	fmt.Println("Stackless creates for this image/podman combination now clone the")
+	fmt.Println("baked image and skip the in-container package install. Re-run this")
+	fmt.Println("command periodically to pick up security updates.")
+	return nil
+}
