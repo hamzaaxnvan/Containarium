@@ -76,3 +76,160 @@ func (c *kmsServiceClient) GetEnvelopeCoverage(ctx context.Context, in *GetEnvel
 	err := c.cc.Invoke(ctx, KmsService_GetEnvelopeCoverage_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kmsServiceClient) MigrateToEnvelope(ctx context.Context, in *MigrateToEnvelopeRequest, opts ...grpc.CallOption) (*MigrateToEnvelopeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrateToEnvelopeResponse)
+	err := c.cc.Invoke(ctx, KmsService_MigrateToEnvelope_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// KmsServiceServer is the server API for KmsService service.
+// All implementations must embed UnimplementedKmsServiceServer
+// for forward compatibility.
+//
+// KmsService exposes read + migration-trigger operations for the
+// tenant-secrets envelope-encryption layer (see
+// docs/security/KMS-ENVELOPE-DESIGN.md). It deliberately does NOT
+// expose backend *configuration* — selecting a KMS backend and
+// supplying its credentials stays an operator/systemd concern
+// (CONTAINARIUM_KMS_BACKEND + the per-backend env vars), never an
+// over-the-wire action. Every RPC requires the `kms:admin` scope
+// AND the admin role; these are platform-wide, not tenant-scoped.
+type KmsServiceServer interface {
+	// GetKMSStatus reports the active backend and the
+	// envelope-retirement gate. Read-only; safe to poll from a
+	// dashboard.
+	GetKMSStatus(context.Context, *GetKMSStatusRequest) (*GetKMSStatusResponse, error)
+	// GetEnvelopeCoverage counts stored secrets by encryption mode.
+	// Legacy=0 means every row is envelope-wrapped — the precondition
+	// for retiring the on-host master key.
+	GetEnvelopeCoverage(context.Context, *GetEnvelopeCoverageRequest) (*GetEnvelopeCoverageResponse, error)
+	// MigrateToEnvelope re-wraps legacy rows under the active KMS KEK.
+	// Idempotent and resumable: already-envelope rows are skipped, and
+	// max_rows lets a large backlog be chunked across windows. Fails
+	// with FailedPrecondition if no KMS backend is configured.
+	MigrateToEnvelope(context.Context, *MigrateToEnvelopeRequest) (*MigrateToEnvelopeResponse, error)
+	mustEmbedUnimplementedKmsServiceServer()
+}
+
+// UnimplementedKmsServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedKmsServiceServer struct{}
+
+func (UnimplementedKmsServiceServer) GetKMSStatus(context.Context, *GetKMSStatusRequest) (*GetKMSStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetKMSStatus not implemented")
+}
+func (UnimplementedKmsServiceServer) GetEnvelopeCoverage(context.Context, *GetEnvelopeCoverageRequest) (*GetEnvelopeCoverageResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetEnvelopeCoverage not implemented")
+}
+func (UnimplementedKmsServiceServer) MigrateToEnvelope(context.Context, *MigrateToEnvelopeRequest) (*MigrateToEnvelopeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MigrateToEnvelope not implemented")
+}
+func (UnimplementedKmsServiceServer) mustEmbedUnimplementedKmsServiceServer() {}
+func (UnimplementedKmsServiceServer) testEmbeddedByValue()                    {}
+
+// UnsafeKmsServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to KmsServiceServer will
+// result in compilation errors.
+type UnsafeKmsServiceServer interface {
+	mustEmbedUnimplementedKmsServiceServer()
+}
+
+func RegisterKmsServiceServer(s grpc.ServiceRegistrar, srv KmsServiceServer) {
+	// If the following call panics, it indicates UnimplementedKmsServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&KmsService_ServiceDesc, srv)
+}
+
+func _KmsService_GetKMSStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetKMSStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KmsServiceServer).GetKMSStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KmsService_GetKMSStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KmsServiceServer).GetKMSStatus(ctx, req.(*GetKMSStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KmsService_GetEnvelopeCoverage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetEnvelopeCoverageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KmsServiceServer).GetEnvelopeCoverage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KmsService_GetEnvelopeCoverage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KmsServiceServer).GetEnvelopeCoverage(ctx, req.(*GetEnvelopeCoverageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KmsService_MigrateToEnvelope_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MigrateToEnvelopeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KmsServiceServer).MigrateToEnvelope(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KmsService_MigrateToEnvelope_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KmsServiceServer).MigrateToEnvelope(ctx, req.(*MigrateToEnvelopeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// KmsService_ServiceDesc is the grpc.ServiceDesc for KmsService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var KmsService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.KmsService",
+	HandlerType: (*KmsServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetKMSStatus",
+			Handler:    _KmsService_GetKMSStatus_Handler,
+		},
+		{
+			MethodName: "GetEnvelopeCoverage",
+			Handler:    _KmsService_GetEnvelopeCoverage_Handler,
+		},
+		{
+			MethodName: "MigrateToEnvelope",
+			Handler:    _KmsService_MigrateToEnvelope_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/kms.proto",
+}
