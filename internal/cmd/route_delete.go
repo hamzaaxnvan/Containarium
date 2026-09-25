@@ -28,3 +28,19 @@ func runRouteDelete(cmd *cobra.Command, args []string) error {
 
 	if serverAddr == "" {
 		return fmt.Errorf("--server is required")
+	}
+
+	apiClient, err := newRouteClient()
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer func() { _ = apiClient.Close() }()
+
+	if err := apiClient.DeleteRoute(domain); err != nil {
+		return fmt.Errorf("failed to delete route: %w", err)
+	}
+
+	fmt.Printf("Route deleted: %s\n", domain)
+
+	return nil
+}

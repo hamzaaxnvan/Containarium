@@ -106,3 +106,219 @@ func (s *ComposeAutostartServer) execAgentBoxCompose(username, verb string, args
 func (s *ComposeAutostartServer) Discover(ctx context.Context, req *pb.DiscoverRequest) (*pb.DiscoverResponse, error) {
 	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
 		return nil, err
+	}
+	// The username is REQUEST input and names whose box is touched, so it
+	// must be checked against the authenticated caller — not trusted.
+	if err := auth.AuthorizeTenant(ctx, req.GetUsername()); err != nil {
+		return nil, err
+	}
+	args := []string{}
+	if req.GetRoot() != "" {
+		args = append(args, "--root", req.GetRoot())
+	}
+	if d := req.GetMaxDepth(); d > 0 {
+		args = append(args, "--max-depth", strconv.Itoa(int(d)))
+	}
+	for _, sk := range req.GetSkip() {
+		args = append(args, "--skip", sk)
+	}
+	if req.GetNoSkip() {
+		args = append(args, "--no-skip")
+	}
+
+	raw, err := s.execAgentBoxCompose(req.GetUsername(), "discover", args)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Stacks []discoveredStack `json:"stacks"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, status.Errorf(codes.Internal, "parse discover result: %v", err)
+	}
+
+	stacks := make([]*pb.ComposeStack, 0, len(result.Stacks))
+	for i := range result.Stacks {
+		stacks = append(stacks, result.Stacks[i].toProto())
+	}
+	return &pb.DiscoverResponse{Stacks: stacks}, nil
+}
+
+// ---- Enable --------------------------------------------------------
+
+// Enable mutates state INSIDE a tenant's box (#1716). Before this guard any
+// caller reaching the gRPC surface could pass an arbitrary username and turn
+// compose autostart on in someone else's box.
+func (s *ComposeAutostartServer) Enable(ctx context.Context, req *pb.EnableRequest) (*pb.EnableResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	// The username is REQUEST input and names whose box is touched, so it
+	// must be checked against the authenticated caller — not trusted.
+	if err := auth.AuthorizeTenant(ctx, req.GetUsername()); err != nil {
+		return nil, err
+	}
+	if req.GetDir() == "" {
+		return nil, status.Error(codes.InvalidArgument, "dir is required")
+	}
+	args := []string{"--dir", req.GetDir()}
+	if req.GetForce() {
+		args = append(args, "--force")
+	}
+
+	raw, err := s.execAgentBoxCompose(req.GetUsername(), "enable", args)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Unit       string `json:"unit"`
+		Dir        string `json:"dir"`
+		ComposeBin string `json:"compose_bin"`
+		Already    bool   `json:"already"`
+		Message    string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, status.Errorf(codes.Internal, "parse enable result: %v", err)
+	}
+	return &pb.EnableResponse{
+		Unit:       result.Unit,
+		Dir:        result.Dir,
+		ComposeBin: result.ComposeBin,
+		Already:    result.Already,
+		Message:    result.Message,
+	}, nil
+}
+
+// ---- Disable -------------------------------------------------------
+
+// Disable mutates state inside a tenant's box (#1716). Removing autostart
+// from another tenant's stack is the more damaging direction: it is silent
+// until their services fail to come back after a reboot.
+func (s *ComposeAutostartServer) Disable(ctx context.Context, req *pb.DisableRequest) (*pb.DisableResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	// The username is REQUEST input and names whose box is touched, so it
+	// must be checked against the authenticated caller — not trusted.
+	if err := auth.AuthorizeTenant(ctx, req.GetUsername()); err != nil {
+		return nil, err
+	}
+	if req.GetDir() == "" {
+		return nil, status.Error(codes.InvalidArgument, "dir is required")
+	}
+	args := []string{"--dir", req.GetDir()}
+
+	raw, err := s.execAgentBoxCompose(req.GetUsername(), "disable", args)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Unit    string `json:"unit"`
+		Dir     string `json:"dir"`
+		Already bool   `json:"already"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, status.Errorf(codes.Internal, "parse disable result: %v", err)
+	}
+	return &pb.DisableResponse{
+		Unit:    result.Unit,
+		Dir:     result.Dir,
+		Already: result.Already,
+		Message: result.Message,
+	}, nil
+}
+
+// ---- Status --------------------------------------------------------
+
+// Status reports another box's compose state, so it is tenant-scoped for the
+// same reason as Discover (#1716).
+func (s *ComposeAutostartServer) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
+		return nil, err
+	}
+	// The username is REQUEST input and names whose box is touched, so it
+	// must be checked against the authenticated caller — not trusted.
+	if err := auth.AuthorizeTenant(ctx, req.GetUsername()); err != nil {
+		return nil, err
+	}
+	if req.GetDir() == "" {
+		return nil, status.Error(codes.InvalidArgument, "dir is required")
+	}
+	args := []string{"--dir", req.GetDir()}
+
+	raw, err := s.execAgentBoxCompose(req.GetUsername(), "status", args)
+	if err != nil {
+		return nil, err
+	}
+
+	var ds discoveredStack
+	if err := json.Unmarshal(raw, &ds); err != nil {
+		return nil, status.Errorf(codes.Internal, "parse status result: %v", err)
+	}
+	return &pb.StatusResponse{Stack: ds.toProto()}, nil
+}
+
+// ---- helpers -------------------------------------------------------
+
+// discoveredStack is the wire-shape from agent-box's compose CLI
+// (matches the json tags on agentbox.ComposeStack — see
+// internal/agentbox/compose.go). We don't import agentbox.ComposeStack
+// directly because:
+//   - it would couple internal/server to internal/agentbox at
+//     compile time
+//   - the agent-box struct evolves with the in-box surface; the proto
+//     evolves with the platform contract; explicit mapping keeps the
+//     two from drifting silently.
+//
+// If a future agent-box field needs surfacing, add it here AND in the
+// proto, both in the same PR.
+type discoveredStack struct {
+	ComposeDir        string `json:"compose_dir"`
+	ComposeFile       string `json:"compose_file"`
+	ComposeBin        string `json:"compose_bin"`
+	ComposeModifiedAt string `json:"compose_modified_at"`
+	RunningCount      int    `json:"running_count"`
+	TotalCount        int    `json:"total_count"`
+	AutostartEnabled  bool   `json:"autostart_enabled"`
+	UnitModifiedAt    string `json:"unit_modified_at"`
+}
+
+func (d discoveredStack) toProto() *pb.ComposeStack {
+	return &pb.ComposeStack{
+		ComposeDir:        d.ComposeDir,
+		ComposeFile:       d.ComposeFile,
+		ComposeBin:        d.ComposeBin,
+		ComposeModifiedAt: d.ComposeModifiedAt,
+		RunningCount:      clampToInt32(d.RunningCount),
+		TotalCount:        clampToInt32(d.TotalCount),
+		AutostartEnabled:  d.AutostartEnabled,
+		UnitModifiedAt:    d.UnitModifiedAt,
+	}
+}
+
+// clampToInt32 bounds an int (from agent-box's JSON, where service
+// counts arrive as JSON numbers and Go decodes into int) to int32
+// range before assigning to the proto field. Realistic compose stacks
+// have a handful of services, but the agent-box CLI is in-the-box
+// untrusted-ish — defensively clamp rather than overflow-cast.
+// Negative values shouldn't occur (counts are non-negative by
+// construction) but clamp them to 0 too.
+func clampToInt32(n int) int32 {
+	if n < 0 {
+		return 0
+	}
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int32(n)
+}
+
+// The real *incus.Client implements the IncusExecer seam. We don't
+// import pkg/core/incus here to avoid the dep cycle; the real wiring
+// happens in dual_server.go (or whatever wires gRPC services) where
+// the daemon already holds an *incus.Client and just passes it to
+// NewComposeAutostartServer.
