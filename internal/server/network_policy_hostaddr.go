@@ -107,3 +107,77 @@ func parseDnsmasqLeases(r io.Reader, now time.Time) map[string]netip.Addr {
 		if len(f) < 3 {
 			continue
 		}
+		expiry, err := strconv.ParseInt(f[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		if expiry != 0 && time.Unix(expiry, 0).Before(now) {
+			continue
+		}
+		ip, err := netip.ParseAddr(f[2])
+		if err != nil || !ip.Is4() {
+			continue
+		}
+		out[strings.ToLower(f[1])] = ip
+	}
+	return out
+}
+
+// leaseReader looks up the DHCP lease a bridge's dnsmasq holds for a MAC. The
+// enforcer's reconcile creates one per pass so each lease file is read at most
+// once per pass however many instances share the bridge.
+type leaseReader struct {
+	dir   string // defaultIncusLeaseDir, or a test override
+	now   time.Time
+	cache map[string]map[string]netip.Addr // network -> mac -> ip
+}
+
+func newLeaseReader(dir string, now time.Time) *leaseReader {
+	return &leaseReader{dir: dir, now: now, cache: make(map[string]map[string]netip.Addr)}
+}
+
+// lookup returns the leased IPv4 for mac on network, if any.
+func (l *leaseReader) lookup(network, mac string) (netip.Addr, bool) {
+	if network == "" || mac == "" {
+		return netip.Addr{}, false
+	}
+	// network is the Incus bridge name from host-side device config; a valid one
+	// is a single path segment. Reject anything with a separator or "." element
+	// so the join cannot escape the lease dir (defence in depth — the value is
+	// host-controlled, not guest-controlled).
+	if network != filepath.Base(network) || network == "." || network == ".." || strings.ContainsAny(network, `/\`) {
+		return netip.Addr{}, false
+	}
+	leases, ok := l.cache[network]
+	if !ok {
+		leases = map[string]netip.Addr{}
+		leasePath := filepath.Join(l.dir, network, "dnsmasq.leases")
+		if f, err := os.Open(leasePath); err == nil { // #nosec G304 -- base dir is fixed; network is a validated single path segment from host-side Incus config
+			leases = parseDnsmasqLeases(f, l.now)
+			_ = f.Close()
+		}
+		l.cache[network] = leases
+	}
+	ip, ok := leases[strings.ToLower(mac)]
+	return ip, ok
+}
+
+// hostIPv4For resolves the box address for nic from host-side sources: the
+// static device address, else the bridge's DHCP lease — but a lease counts only
+// when it equals the address the guest itself reports. dnsmasq moves a lease on
+// a DHCP release/request that names the MAC, and a neighbour can send those on
+// the bridge, so a lease alone could be made to disagree with the box's real
+// address and get the box's genuine traffic flagged as spoofed (a cross-tenant
+// DoS under enforce). Requiring both to agree means neither side can move the
+// validated address on its own: the guest cannot (its report is not trusted
+// alone) and a neighbour cannot (the lease is not trusted alone). ok is false
+// when nothing host-side knows it, or the two disagree.
+func hostIPv4For(nic hostNIC, leases *leaseReader, guest [4]byte, hasGuest bool) ([4]byte, bool) {
+	if nic.StaticIP.IsValid() {
+		return nic.StaticIP.As4(), true
+	}
+	if ip, ok := leases.lookup(nic.Network, nic.HWAddr); ok && hasGuest && ip.As4() == guest {
+		return ip.As4(), true
+	}
+	return [4]byte{}, false
+}
