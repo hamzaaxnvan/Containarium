@@ -7,3 +7,22 @@
     "sshKeys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop"],
     "network": {"ipAddress": "10.0.0.10", "macAddress": "00:16:3e:aa:bb:cc", "interface": "eth0", "bridge": "incusbr0"},
     "createdAt": "1771122760",
+    "updatedAt": "1771209160",
+    "labels": {"team": "demo", "project": "blog"},
+    "image": "images:ubuntu/24.04",
+    "podmanEnabled": true,
+    "backendId": "backend-a",
+    "osType": "OS_TYPE_UBUNTU_2404",
+    "accessType": "ACCESS_TYPE_SSH"
+  },
+  "metrics": {
+    "name": "alice-container",
+    "cpuUsageSeconds": "1234",
+    "memoryUsageBytes": "536870912",
+    "memoryPeakBytes": "1073741824",
+    "diskUsageBytes": "5368709120",
+    "networkRxBytes": "104857600",
+    "networkTxBytes": "52428800",
+    "processCount": 42
+  }
+}
