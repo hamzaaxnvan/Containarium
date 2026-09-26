@@ -37,3 +37,30 @@ func runAgentCredentialStatus(cmd *cobra.Command, args []string) error {
 	defer func() { _ = c.Close() }()
 
 	resp, err := c.GetSkillBoxCredentialStatus(skillID)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Engine:            %s\n", agentengine.EnvValue(resp.GetEngine()))
+	fmt.Printf("Credential source: %s\n", credentialSourceDisplay(resp.GetCredentialSource()))
+	if resp.GetCheckedAt() != nil {
+		fmt.Printf("Checked at:        %s\n", resp.GetCheckedAt().AsTime().Format("2006-01-02T15:04:05Z07:00"))
+	}
+	return nil
+}
+
+// credentialSourceDisplay renders the enum for a human, same
+// trim-the-generated-prefix convention agent_engines.go's trimEnumPrefix
+// uses for the sibling AgentCredentialSource/AgentEngineReadiness enums.
+func credentialSourceDisplay(src pb.CodeCredentialSource) string {
+	switch src {
+	case pb.CodeCredentialSource_CODE_CREDENTIAL_SOURCE_INTERACTIVE:
+		return "interactive"
+	case pb.CodeCredentialSource_CODE_CREDENTIAL_SOURCE_API_KEY:
+		return "api-key"
+	case pb.CodeCredentialSource_CODE_CREDENTIAL_SOURCE_NONE:
+		return "none"
+	default:
+		return strings.ToLower(strings.TrimPrefix(src.String(), "CODE_CREDENTIAL_SOURCE_"))
+	}
+}
