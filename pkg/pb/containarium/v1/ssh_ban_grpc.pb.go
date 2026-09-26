@@ -50,3 +50,160 @@ func NewSentinelSSHBanServiceClient(cc grpc.ClientConnInterface) SentinelSSHBanS
 func (c *sentinelSSHBanServiceClient) GetSSHBan(ctx context.Context, in *GetSSHBanRequest, opts ...grpc.CallOption) (*GetSSHBanResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSSHBanResponse)
+	err := c.cc.Invoke(ctx, SentinelSSHBanService_GetSSHBan_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sentinelSSHBanServiceClient) ListSSHBans(ctx context.Context, in *ListSSHBansRequest, opts ...grpc.CallOption) (*ListSSHBansResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSSHBansResponse)
+	err := c.cc.Invoke(ctx, SentinelSSHBanService_ListSSHBans_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sentinelSSHBanServiceClient) UnbanSSHSource(ctx context.Context, in *UnbanSSHSourceRequest, opts ...grpc.CallOption) (*UnbanSSHSourceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UnbanSSHSourceResponse)
+	err := c.cc.Invoke(ctx, SentinelSSHBanService_UnbanSSHSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SentinelSSHBanServiceServer is the server API for SentinelSSHBanService service.
+// All implementations must embed UnimplementedSentinelSSHBanServiceServer
+// for forward compatibility.
+//
+// SentinelSSHBanService controls the enforcing plugin, not system fail2ban.
+// The sentinel mounts REST behind its admin HMAC and forwards to a local socket.
+type SentinelSSHBanServiceServer interface {
+	// Inspect one source IP, including tracked, banned, and exempt states.
+	GetSSHBan(context.Context, *GetSSHBanRequest) (*GetSSHBanResponse, error)
+	// Page through current bans on one independently enforcing listener.
+	ListSSHBans(context.Context, *ListSSHBansRequest) (*ListSSHBansResponse, error)
+	// Atomically clear exactly one source's counter and ban; admin-only.
+	UnbanSSHSource(context.Context, *UnbanSSHSourceRequest) (*UnbanSSHSourceResponse, error)
+	mustEmbedUnimplementedSentinelSSHBanServiceServer()
+}
+
+// UnimplementedSentinelSSHBanServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSentinelSSHBanServiceServer struct{}
+
+func (UnimplementedSentinelSSHBanServiceServer) GetSSHBan(context.Context, *GetSSHBanRequest) (*GetSSHBanResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSSHBan not implemented")
+}
+func (UnimplementedSentinelSSHBanServiceServer) ListSSHBans(context.Context, *ListSSHBansRequest) (*ListSSHBansResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSSHBans not implemented")
+}
+func (UnimplementedSentinelSSHBanServiceServer) UnbanSSHSource(context.Context, *UnbanSSHSourceRequest) (*UnbanSSHSourceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UnbanSSHSource not implemented")
+}
+func (UnimplementedSentinelSSHBanServiceServer) mustEmbedUnimplementedSentinelSSHBanServiceServer() {}
+func (UnimplementedSentinelSSHBanServiceServer) testEmbeddedByValue()                               {}
+
+// UnsafeSentinelSSHBanServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SentinelSSHBanServiceServer will
+// result in compilation errors.
+type UnsafeSentinelSSHBanServiceServer interface {
+	mustEmbedUnimplementedSentinelSSHBanServiceServer()
+}
+
+func RegisterSentinelSSHBanServiceServer(s grpc.ServiceRegistrar, srv SentinelSSHBanServiceServer) {
+	// If the following call panics, it indicates UnimplementedSentinelSSHBanServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&SentinelSSHBanService_ServiceDesc, srv)
+}
+
+func _SentinelSSHBanService_GetSSHBan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSSHBanRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SentinelSSHBanServiceServer).GetSSHBan(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SentinelSSHBanService_GetSSHBan_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SentinelSSHBanServiceServer).GetSSHBan(ctx, req.(*GetSSHBanRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SentinelSSHBanService_ListSSHBans_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSSHBansRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SentinelSSHBanServiceServer).ListSSHBans(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SentinelSSHBanService_ListSSHBans_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SentinelSSHBanServiceServer).ListSSHBans(ctx, req.(*ListSSHBansRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SentinelSSHBanService_UnbanSSHSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UnbanSSHSourceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SentinelSSHBanServiceServer).UnbanSSHSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SentinelSSHBanService_UnbanSSHSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SentinelSSHBanServiceServer).UnbanSSHSource(ctx, req.(*UnbanSSHSourceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// SentinelSSHBanService_ServiceDesc is the grpc.ServiceDesc for SentinelSSHBanService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SentinelSSHBanService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.SentinelSSHBanService",
+	HandlerType: (*SentinelSSHBanServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetSSHBan",
+			Handler:    _SentinelSSHBanService_GetSSHBan_Handler,
+		},
+		{
+			MethodName: "ListSSHBans",
+			Handler:    _SentinelSSHBanService_ListSSHBans_Handler,
+		},
+		{
+			MethodName: "UnbanSSHSource",
+			Handler:    _SentinelSSHBanService_UnbanSSHSource_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/ssh_ban.proto",
+}
