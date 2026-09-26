@@ -390,3 +390,101 @@ message GetSSHTrustBundleResponse {
 
   google.protobuf.Timestamp generated_at = 5;
 }
+
+service ActuationService {
+  // EnrollHost redeems a single-use join token and registers the BYO host.
+  // Self-authenticating via the token in the body (NOT host-bearer — the row
+  // doesn't exist yet).
+  rpc EnrollHost(EnrollHostRequest) returns (EnrollHostResponse) {
+    option (google.api.http) = {
+      post: "/v1/actuation/enroll"
+      body: "*"
+    };
+  }
+
+  // ReportHostStatus upserts the calling host's capability profile +
+  // `doctor` self-check and bumps its heartbeat. Requires a valid
+  // `host-bearer` header. Idempotent.
+  rpc ReportHostStatus(ReportHostStatusRequest) returns (ReportHostStatusResponse) {
+    option (google.api.http) = {
+      post: "/v1/actuation/status"
+      body: "*"
+    };
+  }
+
+  // Heartbeat updates hosts.last_heartbeat_at for the calling host.
+  // A stale gap (>2 × the host's expected interval) marks the host
+  // for the HostSweeper, which reassigns its containers. Hosts are
+  // expected to call this every N seconds with N << the staleness
+  // threshold.
+  //
+  // Auth: requires a valid `host-bearer` header. Returns
+  // Unauthenticated if missing / malformed / tombstoned. The
+  // method is otherwise idempotent.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse) {
+    option (google.api.http) = {
+      post: "/v1/actuation/heartbeat"
+      body: "*"
+    };
+  }
+
+  // ReportContainerState records the calling host's observed state
+  // for one of its assigned containers. The cloud uses this to
+  // surface the user-facing containers.state field and (in a future
+  // slice) to react to FAILED reports with reassignment.
+  //
+  // Errors:
+  //   - InvalidArgument: malformed container_id, empty / unknown state.
+  //   - NotFound: no live assignment for that container belongs to
+  //     the calling host. Single error code for "container unknown"
+  //     and "container is on a different host" — the calling host
+  //     can't distinguish, by design.
+  //   - Unauthenticated: missing / invalid host-bearer.
+  rpc ReportContainerState(ReportContainerStateRequest) returns (ReportContainerStateResponse) {
+    option (google.api.http) = {
+      post: "/v1/actuation/containers/{container_id}/state"
+      body: "*"
+    };
+  }
+
+  // WatchAssignments is a long-lived server stream. The host opens
+  // it on startup and keeps it open; the cloud sends:
+  //   1. an immediate snapshot of the host's current assignments,
+  //   2. a fresh snapshot on each subsequent change.
+  //
+  // v1 implementation polls the store on a fixed interval and sends
+  // a batch every tick. Hosts treat each batch as authoritative
+  // and apply it idempotently. A future slice replaces the poll
+  // with a notification bus that wakes the loop on assignment
+  // mutations (currently scheduler-create / host-retire-cascade /
+  // stale-host-sweeper).
+  //
+  // No HTTP gateway annotation — grpc-gateway's SSE bridge for
+  // server-streams is awkward enough that hosts (which are always
+  // platform-daemons speaking real gRPC) should just use the
+  // native channel.
+  rpc WatchAssignments(WatchAssignmentsRequest) returns (stream AssignmentBatch);
+
+  // GetSSHTrustBundle returns what this host needs to trust the cloud's SSH
+  // CA and refuse revoked certificates: the CA public keys for sshd's
+  // TrustedUserCAKeys, and a KRL spec for RevokedKeys.
+  //
+  // Auth: requires a valid `host-bearer` header — the same channel the host
+  // already uses for enrollment and heartbeats, so no new transport, no new
+  // credential, and nothing for an operator to wire up per host.
+  //
+  // Errors:
+  //   - Unauthenticated: missing / invalid host-bearer.
+  //   - Unimplemented: this daemon has no SSH CA configured.
+  rpc GetSSHTrustBundle(GetSSHTrustBundleRequest) returns (GetSSHTrustBundleResponse) {
+    option (google.api.http) = {get: "/v1/actuation/ssh-trust-bundle"};
+  }
+
+  // AuthorizeSSH is the managed-mode answer to SSHAuthzService.Authorize
+  // (#2516): the daemon forwards the sentinel's question with its host
+  // bearer and relays the answer. It reuses containarium.v1's messages so
+  // the daemon never translates, hence the lint exemption.
+  //
+  // Auth: requires a valid `host-bearer` header.
+  rpc AuthorizeSSH(containarium.v1.AuthorizeSSHRequest) returns (containarium.v1.AuthorizeSSHResponse);
+}
