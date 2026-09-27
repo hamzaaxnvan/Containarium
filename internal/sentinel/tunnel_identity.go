@@ -228,3 +228,80 @@ func (id *TunnelIdentity) TLSCertificate() tls.Certificate {
 		PrivateKey:  id.key,
 		Leaf:        id.cert,
 	}
+}
+
+func pinForSPKI(spki []byte) TunnelPin {
+	sum := sha256.Sum256(spki)
+	return TunnelPin(TunnelPinPrefix + hex.EncodeToString(sum[:]))
+}
+
+// parsePin validates and normalises a single pin.
+func parsePin(s string) (TunnelPin, error) {
+	digest, ok := strings.CutPrefix(s, TunnelPinPrefix)
+	if !ok {
+		return "", fmt.Errorf("tunnel pin %q: must start with %q", s, TunnelPinPrefix)
+	}
+	raw, err := hex.DecodeString(digest)
+	if err != nil || len(raw) != sha256.Size {
+		return "", fmt.Errorf("tunnel pin %q: digest must be %d hex characters", s, 2*sha256.Size)
+	}
+	return TunnelPin(TunnelPinPrefix + hex.EncodeToString(raw)), nil
+}
+
+// ParsePins parses a comma-separated list of pins, as accepted by a tunnel
+// client during key rotation (old and new pin both trusted). Surrounding
+// whitespace is ignored, hex is normalised to lowercase and duplicates are
+// dropped. An empty list, an empty entry, or any malformed entry is an
+// error.
+func ParsePins(s string) ([]TunnelPin, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, errors.New("tunnel pin list is empty")
+	}
+	parts := strings.Split(s, ",")
+	pins := make([]TunnelPin, 0, len(parts))
+	seen := make(map[TunnelPin]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("tunnel pin list %q has an empty entry", s)
+		}
+		pin, err := parsePin(part)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := seen[pin]; dup {
+			continue
+		}
+		seen[pin] = struct{}{}
+		pins = append(pins, pin)
+	}
+	return pins, nil
+}
+
+// VerifyPinned returns a tls.Config.VerifyPeerCertificate callback that
+// accepts the peer only if the SubjectPublicKeyInfo of its leaf certificate
+// matches one of pins. Certificate validity dates, subject, issuer and any
+// further chain entries are ignored: the pin authenticates a key, not a
+// WebPKI certificate. An empty pin set rejects every peer.
+func VerifyPinned(pins []TunnelPin) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+	want := append([]TunnelPin(nil), pins...)
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(want) == 0 {
+			return errors.New("tunnel pin verification: no pins configured")
+		}
+		if len(rawCerts) == 0 {
+			return errors.New("tunnel pin verification: peer presented no certificate")
+		}
+		leaf, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("tunnel pin verification: parse peer certificate: %w", err)
+		}
+		got := pinForSPKI(leaf.RawSubjectPublicKeyInfo)
+		for _, p := range want {
+			if subtle.ConstantTimeCompare([]byte(got), []byte(p)) == 1 {
+				return nil
+			}
+		}
+		return fmt.Errorf("tunnel pin verification: peer key %s matches no configured pin", got)
+	}
+}
