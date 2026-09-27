@@ -262,3 +262,533 @@ func TestLogin_HappyPath_WritesCredentials(t *testing.T) {
 	creds, ok := cf.Get(f.srv.URL)
 	if !ok {
 		t.Fatalf("credentials not stored for %s (file holds %d server(s))", f.srv.URL, len(cf.Servers))
+	}
+	if creds.Token != "ctnr_test_token" {
+		t.Fatalf("Token = %s, want %s", tokenFingerprint(creds.Token), tokenFingerprint("ctnr_test_token"))
+	}
+	if creds.UserEmail != "alice@example.com" {
+		t.Fatalf("UserEmail = %q", creds.UserEmail)
+	}
+	if creds.OrgID != "org_42" {
+		t.Fatalf("OrgID = %q", creds.OrgID)
+	}
+	if creds.IssuedAt.IsZero() {
+		t.Fatal("IssuedAt not set")
+	}
+	if creds.ExpiresAt == nil {
+		t.Fatal("ExpiresAt not parsed from RFC3339 response")
+	}
+	if cf.DefaultServer == "" {
+		t.Fatal("DefaultServer not auto-set on first login")
+	}
+
+	// File mode 0600 (POSIX only).
+	if runtime.GOOS != "windows" {
+		st, _ := os.Stat(path)
+		if st.Mode().Perm() != 0o600 {
+			t.Fatalf("file mode = %o, want 0600", st.Mode().Perm())
+		}
+	}
+
+	// Output mentions the user code and the email.
+	o := out.String()
+	if !strings.Contains(o, "WXYZ-1234") {
+		t.Errorf("output missing user code:\n%s", o)
+	}
+	if !strings.Contains(o, "alice@example.com") {
+		t.Errorf("output missing user email:\n%s", o)
+	}
+
+	// Device name defaulted to non-empty.
+	got := f.gotDevice.Load()
+	if got == nil || got.(string) == "" {
+		t.Errorf("device_name not sent in createSession request")
+	}
+}
+
+func TestLogin_DeniedInBrowser_Errors(t *testing.T) {
+	withTempHome(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/cli/sessions", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(createSessionResp{
+			SessionID:       "sess-x",
+			UserCode:        "DENIED",
+			VerificationURL: "http://example.invalid/cli/authorize",
+			ExpiresIn:       60,
+		})
+	})
+	mux.HandleFunc("/v1/cli/sessions/sess-x/status", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(sessionStatusResp{Status: "denied"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	loginServer = srv.URL
+	loginNoBrowser = true
+	old := loginPollIntervalForTest()
+	defer restorePollInterval(old)
+	setPollInterval(10 * time.Millisecond)
+
+	var out bytes.Buffer
+	loginCmd.SetOut(&out)
+	loginCmd.SetErr(&out)
+	err := runLogin(loginCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("expected denied error, got %v", err)
+	}
+}
+
+func TestLogout_RemovesServer(t *testing.T) {
+	home := withTempHome(t)
+	_ = seedCreds(t, home, "https://cloud.containarium.dev", map[string]credentials.ServerCreds{
+		"https://cloud.containarium.dev":  {Token: "cloud-tok"},
+		"https://self-hosted.example.com": {Token: "self-tok"},
+	})
+
+	loginServer = "https://self-hosted.example.com"
+	logoutAll = false
+	var out bytes.Buffer
+	logoutCmd.SetOut(&out)
+	if err := runLogout(logoutCmd, nil); err != nil {
+		t.Fatalf("runLogout: %v", err)
+	}
+	cf, _ := credentials.Load(filepath.Join(home, credentials.DefaultRelPath))
+	if _, ok := cf.Get("https://self-hosted.example.com"); ok {
+		t.Fatal("self-hosted creds still present after logout")
+	}
+	if _, ok := cf.Get("https://cloud.containarium.dev"); !ok {
+		t.Fatal("cloud creds wrongly removed by single-server logout")
+	}
+}
+
+func TestLogout_All_WipesEverything(t *testing.T) {
+	home := withTempHome(t)
+	_ = seedCreds(t, home, "https://cloud.containarium.dev", map[string]credentials.ServerCreds{
+		"https://cloud.containarium.dev":  {Token: "cloud-tok"},
+		"https://self-hosted.example.com": {Token: "self-tok"},
+	})
+
+	loginServer = ""
+	logoutAll = true
+	var out bytes.Buffer
+	logoutCmd.SetOut(&out)
+	if err := runLogout(logoutCmd, nil); err != nil {
+		t.Fatalf("runLogout --all: %v", err)
+	}
+	cf, _ := credentials.Load(filepath.Join(home, credentials.DefaultRelPath))
+	if len(cf.Servers) != 0 {
+		t.Fatalf("Servers = %+v, want empty", cf.Servers)
+	}
+	if cf.DefaultServer != "" {
+		t.Fatalf("DefaultServer = %q, want empty", cf.DefaultServer)
+	}
+}
+
+func TestLogout_NoDefault_NoServer_Errors(t *testing.T) {
+	withTempHome(t)
+	loginServer = ""
+	logoutAll = false
+	var out bytes.Buffer
+	logoutCmd.SetOut(&out)
+	err := runLogout(logoutCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when no default and no --server")
+	}
+}
+
+func TestWhoami_PrintsIdentity(t *testing.T) {
+	home := withTempHome(t)
+	exp := time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC)
+	_ = seedCreds(t, home, "https://cloud.containarium.dev", map[string]credentials.ServerCreds{
+		"https://cloud.containarium.dev": {
+			Token: "tok", UserEmail: "alice@example.com", OrgID: "org_42",
+			IssuedAt: time.Now().UTC(), ExpiresAt: &exp,
+		},
+	})
+	whoamiServerFlag = ""
+	var out bytes.Buffer
+	whoamiCmd.SetOut(&out)
+	if err := runWhoami(whoamiCmd, nil); err != nil {
+		t.Fatalf("runWhoami: %v", err)
+	}
+	o := out.String()
+	for _, want := range []string{"alice@example.com", "org_42", "cloud.containarium.dev", "2026-12-31"} {
+		if !strings.Contains(o, want) {
+			t.Errorf("whoami output missing %q:\n%s", want, o)
+		}
+	}
+}
+
+func TestWhoami_NoCredentials_Errors(t *testing.T) {
+	withTempHome(t)
+	whoamiServerFlag = ""
+	var out bytes.Buffer
+	whoamiCmd.SetOut(&out)
+	if err := runWhoami(whoamiCmd, nil); err == nil {
+		t.Fatal("expected error when no credentials present")
+	}
+}
+
+func TestConfigGetToken_EmitsTokenNoNewline(t *testing.T) {
+	home := withTempHome(t)
+	_ = seedCreds(t, home, "https://cloud.containarium.dev", map[string]credentials.ServerCreds{
+		"https://cloud.containarium.dev": {Token: "ctnr_pipeable"},
+	})
+	configTokenSrv = ""
+	var out bytes.Buffer
+	configGetTokenCmd.SetOut(&out)
+	if err := runConfigGetToken(configGetTokenCmd, nil); err != nil {
+		t.Fatalf("runConfigGetToken: %v", err)
+	}
+	got := out.String()
+	if got != "ctnr_pipeable" {
+		t.Fatalf("got %q, want %q (no trailing newline)", got, "ctnr_pipeable")
+	}
+}
+
+func TestConfigGetToken_NoCreds_Errors(t *testing.T) {
+	withTempHome(t)
+	configTokenSrv = ""
+	var out bytes.Buffer
+	configGetTokenCmd.SetOut(&out)
+	if err := runConfigGetToken(configGetTokenCmd, nil); err == nil {
+		t.Fatal("expected error when no credentials")
+	}
+}
+
+func TestNormalizeServer_LoginPathTrim(t *testing.T) {
+	got := pickLoginServer("https://cloud.containarium.dev/")
+	if got != "https://cloud.containarium.dev" {
+		t.Fatalf("pickLoginServer = %q", got)
+	}
+	if d := pickLoginServer(""); d != defaultLoginServer {
+		t.Fatalf("default = %q, want %q", d, defaultLoginServer)
+	}
+}
+
+func TestDeviceName_FallbacksAreNonEmpty(t *testing.T) {
+	if deviceName("explicit") != "explicit" {
+		t.Fatal("explicit override not respected")
+	}
+	if deviceName("") == "" {
+		t.Fatal("deviceName fallback returned empty string")
+	}
+}
+
+// TestDeviceName_DefaultIsAutoDisambiguated guards the #456 fix: the
+// default device name carries a per-login suffix so repeat logins from
+// one host don't collide with a still-live token of the same name.
+func TestDeviceName_DefaultIsAutoDisambiguated(t *testing.T) {
+	// Explicit override is verbatim — no suffix, byte-for-byte.
+	if got := deviceName("cloud-mcp"); got != "cloud-mcp" {
+		t.Fatalf("explicit override mutated: %q", got)
+	}
+
+	// The default name starts with the sanitized "<user>@<host>" base
+	// (charset-conformed for the cloud, #634) and appends "-<suffix>".
+	base := sanitizeDeviceLabel(defaultDeviceBase())
+	a := deviceName("")
+	if !strings.HasPrefix(a, base+"-") {
+		t.Fatalf("default %q should start with base %q + '-'", a, base)
+	}
+
+	// Two successive default names must differ (collision-avoidance is
+	// the whole point) and only in the suffix.
+	b := deviceName("")
+	if a == b {
+		t.Fatalf("two default device names collided: %q == %q", a, b)
+	}
+	for _, n := range []string{a, b} {
+		suffix := strings.TrimPrefix(n, base+"-")
+		if len(suffix) != 6 {
+			t.Errorf("suffix %q (from %q) is not 6 chars", suffix, n)
+		}
+	}
+}
+
+// cloudDeviceNameRe mirrors the cloud's device_name validation
+// (#634): 1-64 chars of [-_.() a-zA-Z0-9].
+var cloudDeviceNameRe = regexp.MustCompile(`^[-_.() a-zA-Z0-9]{1,64}$`)
+
+// TestDeviceName_DefaultMatchesCloudCharset guards #634: the auto-generated
+// default must satisfy the cloud's device_name validation with no user
+// action — the old "<user>@<host>" default carried '@' and 400'd every login.
+func TestDeviceName_DefaultMatchesCloudCharset(t *testing.T) {
+	got := deviceName("")
+	if !cloudDeviceNameRe.MatchString(got) {
+		t.Errorf("default device name %q does not match cloud charset %s", got, cloudDeviceNameRe)
+	}
+	if strings.Contains(got, "@") {
+		t.Errorf("default device name %q still contains '@'", got)
+	}
+}
+
+func TestDefaultDeviceName_SanitizesAndClamps(t *testing.T) {
+	// '@' (user@host) and '\' (Windows DOMAIN\user) map to '-'.
+	if got := defaultDeviceName("alice@laptop.local", "abc123"); got != "alice-laptop.local-abc123" {
+		t.Errorf("sanitize @ : got %q", got)
+	}
+	if got := defaultDeviceName(`CORP\bob`, "abc123"); got != "CORP-bob-abc123" {
+		t.Errorf("sanitize backslash: got %q", got)
+	}
+	// Over-long base is clamped so "<base>-<suffix>" fits 64 chars, suffix kept.
+	long := defaultDeviceName(strings.Repeat("x", 200), "abc123")
+	if len(long) > allowedDeviceNameLen {
+		t.Errorf("clamped name %q exceeds %d chars (len %d)", long, allowedDeviceNameLen, len(long))
+	}
+	if !strings.HasSuffix(long, "-abc123") {
+		t.Errorf("clamp dropped the suffix: %q", long)
+	}
+	if !cloudDeviceNameRe.MatchString(long) {
+		t.Errorf("clamped name %q violates cloud charset", long)
+	}
+	// An all-disallowed base trims to empty → fall back to the bare suffix
+	// (still a valid, non-empty device name).
+	if got := defaultDeviceName("@@@", "abc123"); got != "abc123" {
+		t.Errorf("all-disallowed base: got %q, want bare suffix", got)
+	}
+}
+
+// TestEmailFromToken covers the identity-from-JWT recovery used for the
+// "Logged in as …" banner (the cloud session-status response omits the email).
+func TestEmailFromToken(t *testing.T) {
+	mk := func(claims string) string {
+		return "hdr." + base64.RawURLEncoding.EncodeToString([]byte(claims)) + ".sig"
+	}
+	cases := []struct{ name, tok, want string }{
+		{"email claim wins", mk(`{"email":"alice@example.com","sub":"u1"}`), "alice@example.com"},
+		{"preferred_username fallback", mk(`{"preferred_username":"alice","sub":"u1"}`), "alice"},
+		{"sub fallback", mk(`{"sub":"user-123"}`), "user-123"},
+		{"empty claims", mk(`{}`), ""},
+		{"opaque non-jwt token", "opaque-api-token", ""},
+		{"too few segments", "a.b", ""},
+		{"bad base64 payload", "hdr.!!!notb64!!!.sig", ""},
+		{"non-json payload", "hdr." + base64.RawURLEncoding.EncodeToString([]byte("not json")) + ".sig", ""},
+	}
+	for _, c := range cases {
+		if got := emailFromToken(c.tok); got != c.want {
+			t.Errorf("%s: emailFromToken() = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestIsCloudServer(t *testing.T) {
+	cases := []struct {
+		srv  string
+		want bool
+	}{
+		{defaultLoginServer, true},
+		{"https://cloud.containarium.dev", true},
+		{"https://cloud.containarium.dev/", true}, // trailing slash normalized
+		{"https://CLOUD.containarium.DEV", true},  // host case-insensitive
+		{"https://self-hosted.example.com", false},
+		{"http://127.0.0.1:8080", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := isCloudServer(c.srv); got != c.want {
+			t.Errorf("isCloudServer(%q) = %v, want %v", c.srv, got, c.want)
+		}
+	}
+}
+
+func TestResolveAccessModel(t *testing.T) {
+	cases := []struct {
+		declared, srv string
+		want          credentials.AccessModel
+	}{
+		// The server's declaration wins — even against the host heuristic.
+		{"token", "https://self-hosted.example.com", credentials.AccessModelToken},
+		{"sshKey", defaultLoginServer, credentials.AccessModelSSHKey},
+		// No / unrecognized declaration → host heuristic (cloud=token, else sshKey).
+		{"", defaultLoginServer, credentials.AccessModelToken},
+		{"", "https://self-hosted.example.com", credentials.AccessModelSSHKey},
+		{"bogus", defaultLoginServer, credentials.AccessModelToken},
+		{"bogus", "https://self-hosted.example.com", credentials.AccessModelSSHKey},
+	}
+	for _, c := range cases {
+		if got := resolveAccessModel(c.declared, c.srv); got != c.want {
+			t.Errorf("resolveAccessModel(%q, %q) = %q, want %q", c.declared, c.srv, got, c.want)
+		}
+	}
+}
+
+func TestFetchSessionStatus_DecodesAccessModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"CLI_SESSION_STATUS_APPROVED","token":"t","accessModel":"token"}`))
+	}))
+	defer srv.Close()
+
+	st, err := fetchSessionStatus(context.Background(), srv.Client(), srv.URL+"/status")
+	if err != nil {
+		t.Fatalf("fetchSessionStatus: %v", err)
+	}
+	if st.AccessModel != "token" {
+		t.Errorf("AccessModel = %q, want \"token\"", st.AccessModel)
+	}
+}
+
+func TestShortDeviceSuffix_HexAndVaries(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		s := shortDeviceSuffix()
+		if len(s) != 6 {
+			t.Fatalf("suffix %q not 6 chars", s)
+		}
+		if _, err := hex.DecodeString(s); err != nil {
+			t.Fatalf("suffix %q not hex: %v", s, err)
+		}
+		seen[s] = true
+	}
+	// 100 draws from 24 bits should essentially never all collide.
+	if len(seen) < 90 {
+		t.Errorf("suffix not varying enough: %d unique of 100", len(seen))
+	}
+}
+
+// The poll-interval is a package-level const for production but we
+// need to override it in tests so the device-flow test runs in
+// milliseconds, not seconds. We swap the global via a mutator
+// rather than threading a parameter through runLogin — it's only
+// used here.
+
+func setPollInterval(d time.Duration) { pollIntervalOverride = d }
+
+func loginPollIntervalForTest() time.Duration { return pollIntervalOverride }
+
+func restorePollInterval(d time.Duration) { pollIntervalOverride = d }
+
+// --- #455: pollSession transient-error resilience ---
+
+// statusServer stands up a programmable /status endpoint. handler is
+// invoked with the 1-based poll count so a test can vary the reply by
+// attempt (e.g. "fail 3 times, then approve"). Returns the server and a
+// pointer to the live poll counter.
+func statusServer(t *testing.T, sessionID string, handler func(n int32, w http.ResponseWriter)) (*httptest.Server, *int32) {
+	t.Helper()
+	var n int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/cli/sessions/"+sessionID+"/status", func(w http.ResponseWriter, r *http.Request) {
+		handler(atomic.AddInt32(&n, 1), w)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &n
+}
+
+// TestPollSession_RidesTransientErrors is the core #455 regression: a
+// 5xx on the first polls must NOT abort the login. Pre-fix, pollSession
+// returned on poll #1; now it rides through and succeeds once the
+// server recovers.
+func TestPollSession_RidesTransientErrors(t *testing.T) {
+	srv, _ := statusServer(t, "sess-1", func(n int32, w http.ResponseWriter) {
+		if n <= 3 {
+			http.Error(w, "upstream hiccup", http.StatusBadGateway)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(sessionStatusResp{Status: "approved", Token: "ctnr_ok"})
+	})
+	var out bytes.Buffer
+	st, err := pollSession(context.Background(), &out, srv.Client(), srv.URL, "sess-1", time.Millisecond, 5*time.Second)
+	if err != nil {
+		t.Fatalf("pollSession should ride out transient 5xx then approve, got err: %v", err)
+	}
+	if st.Token != "ctnr_ok" {
+		t.Fatalf("Token = %s, want %s", tokenFingerprint(st.Token), tokenFingerprint("ctnr_ok"))
+	}
+	if !strings.Contains(out.String(), "retrying") {
+		t.Errorf("expected a transient-retry notice in output, got:\n%s", out.String())
+	}
+}
+
+// TestPollSession_GivesUpAfterConsecutiveFailures: a server that's down
+// for good must fail fast at the consecutive cap, not silently retry
+// the entire maxWait window.
+func TestPollSession_GivesUpAfterConsecutiveFailures(t *testing.T) {
+	srv, n := statusServer(t, "sess-1", func(_ int32, w http.ResponseWriter) {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	})
+	_, err := pollSession(context.Background(), nil, srv.Client(), srv.URL, "sess-1", time.Millisecond, 30*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "consecutive failures") {
+		t.Fatalf("want consecutive-failures error, got %v", err)
+	}
+	if got := atomic.LoadInt32(n); got != int32(maxConsecutivePollFailures) {
+		t.Errorf("polled %d times, want exactly %d (the cap)", got, maxConsecutivePollFailures)
+	}
+}
+
+// TestPollSession_SessionGoneIsTerminal: a 404 is terminal — stop at
+// once (surfaced as the expired message), never retry.
+func TestPollSession_SessionGoneIsTerminal(t *testing.T) {
+	srv, n := statusServer(t, "sess-1", func(_ int32, w http.ResponseWriter) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	_, err := pollSession(context.Background(), nil, srv.Client(), srv.URL, "sess-1", time.Millisecond, 5*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "expired before approval") {
+		t.Fatalf("want terminal expired error, got %v", err)
+	}
+	if got := atomic.LoadInt32(n); got != 1 {
+		t.Errorf("polled %d times on a 404, want exactly 1 (no retry)", got)
+	}
+}
+
+// TestPollSession_TimeoutWrapsSentinel: a forever-pending session over
+// a tiny window returns errPollTimeout, so runLogin can distinguish a
+// timeout (→ #456 guidance) from other failures.
+func TestPollSession_TimeoutWrapsSentinel(t *testing.T) {
+	srv, _ := statusServer(t, "sess-1", func(_ int32, w http.ResponseWriter) {
+		_ = json.NewEncoder(w).Encode(sessionStatusResp{Status: "pending"})
+	})
+	_, err := pollSession(context.Background(), nil, srv.Client(), srv.URL, "sess-1", 5*time.Millisecond, 25*time.Millisecond)
+	if !errors.Is(err, errPollTimeout) {
+		t.Fatalf("want errPollTimeout, got %v", err)
+	}
+}
+
+// --- #456: actionable guidance on the timeout path ---
+
+// TestLogin_Timeout_PrintsCollisionGuidance: when approval never lands
+// (the device-name-collision symptom), runLogin must point the user at
+// the remedy — revoke the old token or pick a different --device-name —
+// instead of leaving a bare timeout.
+func TestLogin_Timeout_PrintsCollisionGuidance(t *testing.T) {
+	withTempHome(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/cli/sessions", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(createSessionResp{
+			SessionID:       "sess-1",
+			UserCode:        "WXYZ-1234",
+			VerificationURL: "http://example.invalid/cli/authorize?code=WXYZ-1234",
+			ExpiresIn:       600,
+		})
+	})
+	mux.HandleFunc("/v1/cli/sessions/sess-1/status", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(sessionStatusResp{Status: "pending"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	loginServer = srv.URL
+	loginNoBrowser = true
+	loginDeviceName = "cloud-mcp"
+
+	oldPoll, oldWait := pollIntervalOverride, maxWaitOverride
+	defer func() { pollIntervalOverride = oldPoll; maxWaitOverride = oldWait; loginDeviceName = "" }()
+	pollIntervalOverride = 5 * time.Millisecond
+	maxWaitOverride = 25 * time.Millisecond
+
+	var out bytes.Buffer
+	loginCmd.SetOut(&out)
+	loginCmd.SetErr(&out)
+	err := runLogin(loginCmd, nil)
+	if !errors.Is(err, errPollTimeout) {
+		t.Fatalf("want errPollTimeout from runLogin, got %v", err)
+	}
+	o := out.String()
+	for _, want := range []string{"already be in use", "cloud-mcp", "--device-name", "/settings/api-tokens"} {
+		if !strings.Contains(o, want) {
+			t.Errorf("timeout guidance missing %q:\n%s", want, o)
+		}
+	}
+}
