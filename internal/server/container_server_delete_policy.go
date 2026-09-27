@@ -44,3 +44,34 @@ func (s *ContainerServer) SetContainerDeletePolicy(ctx context.Context, req *pb.
 	username := req.Name
 	if err := auth.AuthorizeTenant(ctx, username); err != nil {
 		return nil, err
+	}
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: username})
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found: %v", username, err)
+	}
+	if info == nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found", username)
+	}
+	if info.IsCore {
+		return nil, status.Errorf(codes.InvalidArgument, "container %s is a core container; delete policy is for user containers only", info.Ref.Name)
+	}
+	containerName := info.Ref.Name
+
+	if req.DeletePolicy == pb.DeletePolicy_DELETE_POLICY_PROTECTED {
+		if err := s.manager.SetConfig(containerName, incus.DeletePolicyKey, incus.DeletePolicyProtected); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to set %s: %v", incus.DeletePolicyKey, err)
+		}
+		log.Printf("[delete-policy] protected container=%s", containerName)
+		return &pb.SetContainerDeletePolicyResponse{DeletePolicy: pb.DeletePolicy_DELETE_POLICY_PROTECTED}, nil
+	}
+
+	// Unprotect: remove the key entirely so the prune filter / ttlsweeper see
+	// "absent" rather than an empty string. UnsetConfig is idempotent —
+	// clearing an already-unprotected box is a no-op.
+	if err := s.manager.UnsetConfig(containerName, incus.DeletePolicyKey); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to clear %s: %v", incus.DeletePolicyKey, err)
+	}
+	log.Printf("[delete-policy] unprotected container=%s", containerName)
+	return &pb.SetContainerDeletePolicyResponse{DeletePolicy: pb.DeletePolicy_DELETE_POLICY_UNSPECIFIED}, nil
+}
