@@ -432,3 +432,438 @@ func (x *AnonymousDoorConfig) String() string {
 
 func (*AnonymousDoorConfig) ProtoMessage() {}
 
+func (x *AnonymousDoorConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AnonymousDoorConfig.ProtoReflect.Descriptor instead.
+func (*AnonymousDoorConfig) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_anonbox_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *AnonymousDoorConfig) GetEnabled() bool {
+	if x != nil {
+		return x.Enabled
+	}
+	return false
+}
+
+func (x *AnonymousDoorConfig) GetDisabledMessage() string {
+	if x != nil {
+		return x.DisabledMessage
+	}
+	return ""
+}
+
+func (x *AnonymousDoorConfig) GetBannedFingerprints() []string {
+	if x != nil {
+		return x.BannedFingerprints
+	}
+	return nil
+}
+
+func (x *AnonymousDoorConfig) GetLimits() *AnonymousBoxLimits {
+	if x != nil {
+		return x.Limits
+	}
+	return nil
+}
+
+type GetAnonymousDoorConfigRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetAnonymousDoorConfigRequest) Reset() {
+	*x = GetAnonymousDoorConfigRequest{}
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetAnonymousDoorConfigRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetAnonymousDoorConfigRequest) ProtoMessage() {}
+
+func (x *GetAnonymousDoorConfigRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetAnonymousDoorConfigRequest.ProtoReflect.Descriptor instead.
+func (*GetAnonymousDoorConfigRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_anonbox_proto_rawDescGZIP(), []int{6}
+}
+
+type SetAnonymousDoorConfigRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Config        *AnonymousDoorConfig   `protobuf:"bytes,1,opt,name=config,proto3" json:"config,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetAnonymousDoorConfigRequest) Reset() {
+	*x = SetAnonymousDoorConfigRequest{}
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetAnonymousDoorConfigRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetAnonymousDoorConfigRequest) ProtoMessage() {}
+
+func (x *SetAnonymousDoorConfigRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetAnonymousDoorConfigRequest.ProtoReflect.Descriptor instead.
+func (*SetAnonymousDoorConfigRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_anonbox_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *SetAnonymousDoorConfigRequest) GetConfig() *AnonymousDoorConfig {
+	if x != nil {
+		return x.Config
+	}
+	return nil
+}
+
+type ListAnonymousBoxesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListAnonymousBoxesRequest) Reset() {
+	*x = ListAnonymousBoxesRequest{}
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListAnonymousBoxesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListAnonymousBoxesRequest) ProtoMessage() {}
+
+func (x *ListAnonymousBoxesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListAnonymousBoxesRequest.ProtoReflect.Descriptor instead.
+func (*ListAnonymousBoxesRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_anonbox_proto_rawDescGZIP(), []int{8}
+}
+
+type AnonymousBox struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	BoxName string                 `protobuf:"bytes,1,opt,name=box_name,json=boxName,proto3" json:"box_name,omitempty"`
+	// sha256 hex of the fingerprint — never the key or the raw fingerprint.
+	FingerprintHash string                 `protobuf:"bytes,2,opt,name=fingerprint_hash,json=fingerprintHash,proto3" json:"fingerprint_hash,omitempty"`
+	SshHost         string                 `protobuf:"bytes,3,opt,name=ssh_host,json=sshHost,proto3" json:"ssh_host,omitempty"`
+	CreatedAt       *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	TtlExpiresAt    *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=ttl_expires_at,json=ttlExpiresAt,proto3" json:"ttl_expires_at,omitempty"`
+	Claimed         bool                   `protobuf:"varint,6,opt,name=claimed,proto3" json:"claimed,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *AnonymousBox) Reset() {
+	*x = AnonymousBox{}
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AnonymousBox) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AnonymousBox) ProtoMessage() {}
+
+func (x *AnonymousBox) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AnonymousBox.ProtoReflect.Descriptor instead.
+func (*AnonymousBox) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_anonbox_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *AnonymousBox) GetBoxName() string {
+	if x != nil {
+		return x.BoxName
+	}
+	return ""
+}
+
+func (x *AnonymousBox) GetFingerprintHash() string {
+	if x != nil {
+		return x.FingerprintHash
+	}
+	return ""
+}
+
+func (x *AnonymousBox) GetSshHost() string {
+	if x != nil {
+		return x.SshHost
+	}
+	return ""
+}
+
+func (x *AnonymousBox) GetCreatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return nil
+}
+
+func (x *AnonymousBox) GetTtlExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.TtlExpiresAt
+	}
+	return nil
+}
+
+func (x *AnonymousBox) GetClaimed() bool {
+	if x != nil {
+		return x.Claimed
+	}
+	return false
+}
+
+type ListAnonymousBoxesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Boxes         []*AnonymousBox        `protobuf:"bytes,1,rep,name=boxes,proto3" json:"boxes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListAnonymousBoxesResponse) Reset() {
+	*x = ListAnonymousBoxesResponse{}
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListAnonymousBoxesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListAnonymousBoxesResponse) ProtoMessage() {}
+
+func (x *ListAnonymousBoxesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_anonbox_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListAnonymousBoxesResponse.ProtoReflect.Descriptor instead.
+func (*ListAnonymousBoxesResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_anonbox_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ListAnonymousBoxesResponse) GetBoxes() []*AnonymousBox {
+	if x != nil {
+		return x.Boxes
+	}
+	return nil
+}
+
+var File_containarium_v1_anonbox_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_anonbox_proto_rawDesc = "" +
+	"\n" +
+	"\x1dcontainarium/v1/anonbox.proto\x12\x0fcontainarium.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\"y\n" +
+	"\x19EnsureAnonymousBoxRequest\x12 \n" +
+	"\vfingerprint\x18\x01 \x01(\tR\vfingerprint\x12\x1d\n" +
+	"\n" +
+	"public_key\x18\x02 \x01(\tR\tpublicKey\x12\x1b\n" +
+	"\tsource_ip\x18\x03 \x01(\tR\bsourceIp\"\x8d\x02\n" +
+	"\x1aEnsureAnonymousBoxResponse\x12\x19\n" +
+	"\bbox_name\x18\x01 \x01(\tR\aboxName\x12\x19\n" +
+	"\bssh_host\x18\x02 \x01(\tR\asshHost\x12\x19\n" +
+	"\bssh_port\x18\x03 \x01(\x05R\asshPort\x12\x19\n" +
+	"\bssh_user\x18\x04 \x01(\tR\asshUser\x12@\n" +
+	"\x0ettl_expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\fttlExpiresAt\x12\x16\n" +
+	"\x06reused\x18\x06 \x01(\bR\x06reused\x12)\n" +
+	"\x10previous_expired\x18\a \x01(\bR\x0fpreviousExpired\"|\n" +
+	"\x18ClaimAnonymousBoxRequest\x12\x1f\n" +
+	"\vclaim_token\x18\x01 \x01(\tR\n" +
+	"claimToken\x12\x16\n" +
+	"\x06tenant\x18\x02 \x01(\tR\x06tenant\x12'\n" +
+	"\x0fauthorized_keys\x18\x03 \x03(\tR\x0eauthorizedKeys\"N\n" +
+	"\x19ClaimAnonymousBoxResponse\x12\x19\n" +
+	"\bbox_name\x18\x01 \x01(\tR\aboxName\x12\x16\n" +
+	"\x06tenant\x18\x02 \x01(\tR\x06tenant\"\xb4\x02\n" +
+	"\x12AnonymousBoxLimits\x12\x10\n" +
+	"\x03cpu\x18\x01 \x01(\tR\x03cpu\x12\x16\n" +
+	"\x06memory\x18\x02 \x01(\tR\x06memory\x12\x12\n" +
+	"\x04disk\x18\x03 \x01(\tR\x04disk\x12\x1f\n" +
+	"\vttl_seconds\x18\x04 \x01(\x03R\n" +
+	"ttlSeconds\x12\x1b\n" +
+	"\tmax_boxes\x18\x05 \x01(\x05R\bmaxBoxes\x12.\n" +
+	"\x13per_fingerprint_rps\x18\x06 \x01(\x01R\x11perFingerprintRps\x122\n" +
+	"\x15per_fingerprint_burst\x18\a \x01(\x05R\x13perFingerprintBurst\x12\x1c\n" +
+	"\n" +
+	"per_ip_rps\x18\b \x01(\x01R\bperIpRps\x12 \n" +
+	"\fper_ip_burst\x18\t \x01(\x05R\n" +
+	"perIpBurst\"\xc8\x01\n" +
+	"\x13AnonymousDoorConfig\x12\x18\n" +
+	"\aenabled\x18\x01 \x01(\bR\aenabled\x12)\n" +
+	"\x10disabled_message\x18\x02 \x01(\tR\x0fdisabledMessage\x12/\n" +
+	"\x13banned_fingerprints\x18\x03 \x03(\tR\x12bannedFingerprints\x12;\n" +
+	"\x06limits\x18\x04 \x01(\v2#.containarium.v1.AnonymousBoxLimitsR\x06limits\"\x1f\n" +
+	"\x1dGetAnonymousDoorConfigRequest\"]\n" +
+	"\x1dSetAnonymousDoorConfigRequest\x12<\n" +
+	"\x06config\x18\x01 \x01(\v2$.containarium.v1.AnonymousDoorConfigR\x06config\"\x1b\n" +
+	"\x19ListAnonymousBoxesRequest\"\x86\x02\n" +
+	"\fAnonymousBox\x12\x19\n" +
+	"\bbox_name\x18\x01 \x01(\tR\aboxName\x12)\n" +
+	"\x10fingerprint_hash\x18\x02 \x01(\tR\x0ffingerprintHash\x12\x19\n" +
+	"\bssh_host\x18\x03 \x01(\tR\asshHost\x129\n" +
+	"\n" +
+	"created_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12@\n" +
+	"\x0ettl_expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\fttlExpiresAt\x12\x18\n" +
+	"\aclaimed\x18\x06 \x01(\bR\aclaimed\"Q\n" +
+	"\x1aListAnonymousBoxesResponse\x123\n" +
+	"\x05boxes\x18\x01 \x03(\v2\x1d.containarium.v1.AnonymousBoxR\x05boxes2\xcc\n" +
+	"\n" +
+	"\x13AnonymousBoxService\x12\x8e\x02\n" +
+	"\x12EnsureAnonymousBox\x12*.containarium.v1.EnsureAnonymousBoxRequest\x1a+.containarium.v1.EnsureAnonymousBoxResponse\"\x9e\x01\x92A{\n" +
+	"\fAnonymousBox\x12\x14Ensure anonymous box\x1aUResolve or create the anonymous VM for an SSH public key. Sentinel door / admin only.\x82\xd3\xe4\x93\x02\x1a:\x01*\"\x15/v1/anon/boxes:ensure\x12\x88\x02\n" +
+	"\x11ClaimAnonymousBox\x12).containarium.v1.ClaimAnonymousBoxRequest\x1a*.containarium.v1.ClaimAnonymousBoxResponse\"\x9b\x01\x92Ay\n" +
+	"\fAnonymousBox\x12\x13Claim anonymous box\x1aTBind an anonymous box to a tenant using its claim token. Admin / control plane only.\x82\xd3\xe4\x93\x02\x19:\x01*\"\x14/v1/anon/boxes:claim\x12\x85\x02\n" +
+	"\x16GetAnonymousDoorConfig\x12..containarium.v1.GetAnonymousDoorConfigRequest\x1a$.containarium.v1.AnonymousDoorConfig\"\x94\x01\x92A|\n" +
+	"\fAnonymousBox\x12\x19Get anonymous door config\x1aQKill switch, bans and the fixed per-box limits of the anonymous tier. Admin only.\x82\xd3\xe4\x93\x02\x0f\x12\r/v1/anon/door\x12\x87\x02\n" +
+	"\x16SetAnonymousDoorConfig\x12..containarium.v1.SetAnonymousDoorConfigRequest\x1a$.containarium.v1.AnonymousDoorConfig\"\x96\x01\x92Av\n" +
+	"\fAnonymousBox\x12\x19Set anonymous door config\x1aKEnable/disable the anonymous door and edit banned fingerprints. Admin only.\x82\xd3\xe4\x93\x02\x17:\x06config\x1a\r/v1/anon/door\x12\x86\x02\n" +
+	"\x12ListAnonymousBoxes\x12*.containarium.v1.ListAnonymousBoxesRequest\x1a+.containarium.v1.ListAnonymousBoxesResponse\"\x96\x01\x92A}\n" +
+	"\fAnonymousBox\x12\x14List anonymous boxes\x1aWEvery live anonymous box with its fingerprint hash, expiry and claim state. Admin only.\x82\xd3\xe4\x93\x02\x10\x12\x0e/v1/anon/boxesBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_anonbox_proto_rawDescOnce sync.Once
+	file_containarium_v1_anonbox_proto_rawDescData []byte
+)
+
+func file_containarium_v1_anonbox_proto_rawDescGZIP() []byte {
+	file_containarium_v1_anonbox_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_anonbox_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_anonbox_proto_rawDesc), len(file_containarium_v1_anonbox_proto_rawDesc)))
+	})
+	return file_containarium_v1_anonbox_proto_rawDescData
+}
+
+var file_containarium_v1_anonbox_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_containarium_v1_anonbox_proto_goTypes = []any{
+	(*EnsureAnonymousBoxRequest)(nil),     // 0: containarium.v1.EnsureAnonymousBoxRequest
+	(*EnsureAnonymousBoxResponse)(nil),    // 1: containarium.v1.EnsureAnonymousBoxResponse
+	(*ClaimAnonymousBoxRequest)(nil),      // 2: containarium.v1.ClaimAnonymousBoxRequest
+	(*ClaimAnonymousBoxResponse)(nil),     // 3: containarium.v1.ClaimAnonymousBoxResponse
+	(*AnonymousBoxLimits)(nil),            // 4: containarium.v1.AnonymousBoxLimits
+	(*AnonymousDoorConfig)(nil),           // 5: containarium.v1.AnonymousDoorConfig
+	(*GetAnonymousDoorConfigRequest)(nil), // 6: containarium.v1.GetAnonymousDoorConfigRequest
+	(*SetAnonymousDoorConfigRequest)(nil), // 7: containarium.v1.SetAnonymousDoorConfigRequest
+	(*ListAnonymousBoxesRequest)(nil),     // 8: containarium.v1.ListAnonymousBoxesRequest
+	(*AnonymousBox)(nil),                  // 9: containarium.v1.AnonymousBox
+	(*ListAnonymousBoxesResponse)(nil),    // 10: containarium.v1.ListAnonymousBoxesResponse
+	(*timestamppb.Timestamp)(nil),         // 11: google.protobuf.Timestamp
+}
+var file_containarium_v1_anonbox_proto_depIdxs = []int32{
+	11, // 0: containarium.v1.EnsureAnonymousBoxResponse.ttl_expires_at:type_name -> google.protobuf.Timestamp
+	4,  // 1: containarium.v1.AnonymousDoorConfig.limits:type_name -> containarium.v1.AnonymousBoxLimits
+	5,  // 2: containarium.v1.SetAnonymousDoorConfigRequest.config:type_name -> containarium.v1.AnonymousDoorConfig
+	11, // 3: containarium.v1.AnonymousBox.created_at:type_name -> google.protobuf.Timestamp
+	11, // 4: containarium.v1.AnonymousBox.ttl_expires_at:type_name -> google.protobuf.Timestamp
+	9,  // 5: containarium.v1.ListAnonymousBoxesResponse.boxes:type_name -> containarium.v1.AnonymousBox
+	0,  // 6: containarium.v1.AnonymousBoxService.EnsureAnonymousBox:input_type -> containarium.v1.EnsureAnonymousBoxRequest
+	2,  // 7: containarium.v1.AnonymousBoxService.ClaimAnonymousBox:input_type -> containarium.v1.ClaimAnonymousBoxRequest
+	6,  // 8: containarium.v1.AnonymousBoxService.GetAnonymousDoorConfig:input_type -> containarium.v1.GetAnonymousDoorConfigRequest
+	7,  // 9: containarium.v1.AnonymousBoxService.SetAnonymousDoorConfig:input_type -> containarium.v1.SetAnonymousDoorConfigRequest
+	8,  // 10: containarium.v1.AnonymousBoxService.ListAnonymousBoxes:input_type -> containarium.v1.ListAnonymousBoxesRequest
+	1,  // 11: containarium.v1.AnonymousBoxService.EnsureAnonymousBox:output_type -> containarium.v1.EnsureAnonymousBoxResponse
+	3,  // 12: containarium.v1.AnonymousBoxService.ClaimAnonymousBox:output_type -> containarium.v1.ClaimAnonymousBoxResponse
+	5,  // 13: containarium.v1.AnonymousBoxService.GetAnonymousDoorConfig:output_type -> containarium.v1.AnonymousDoorConfig
+	5,  // 14: containarium.v1.AnonymousBoxService.SetAnonymousDoorConfig:output_type -> containarium.v1.AnonymousDoorConfig
+	10, // 15: containarium.v1.AnonymousBoxService.ListAnonymousBoxes:output_type -> containarium.v1.ListAnonymousBoxesResponse
+	11, // [11:16] is the sub-list for method output_type
+	6,  // [6:11] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_anonbox_proto_init() }
+func file_containarium_v1_anonbox_proto_init() {
+	if File_containarium_v1_anonbox_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_anonbox_proto_rawDesc), len(file_containarium_v1_anonbox_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   11,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_anonbox_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_anonbox_proto_depIdxs,
+		MessageInfos:      file_containarium_v1_anonbox_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_anonbox_proto = out.File
+	file_containarium_v1_anonbox_proto_goTypes = nil
+	file_containarium_v1_anonbox_proto_depIdxs = nil
+}

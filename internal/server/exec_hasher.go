@@ -112,3 +112,118 @@ func (h *execHasher) Request(ev threatdetect.ExecEvent) {
 	case h.queue <- ev:
 	default:
 		if n := h.dropped.Add(1); n == 1 || n%100 == 0 {
+			log.Printf("[exec-hasher] queue full (cap %d): %d hash requests dropped so far", execHashQueue, n)
+		}
+	}
+}
+
+// Run hashes queued events until ctx ends.
+func (h *execHasher) Run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-h.queue:
+			h.process(ev)
+		}
+	}
+}
+
+func (h *execHasher) process(ev threatdetect.ExecEvent) {
+	sum, err := h.hashPinned(ev)
+	if err != nil {
+		// Mostly a process that already exited; log the first and every
+		// 100th so an operator relying on sha256 entries can see hashing
+		// is not happening.
+		if n := h.failed.Add(1); n == 1 || n%100 == 0 {
+			log.Printf("[exec-hasher] pid %d (%s): %v (%d failed so far)", ev.PID, ev.Container, err, n)
+		}
+		return
+	}
+	ev.SHA256 = sum
+	h.deliver(ev)
+}
+
+// errExecHashPIDMoved: the pid no longer holds the exec's process.
+var errExecHashPIDMoved = errors.New("pid no longer holds the exec's process")
+
+// hashPinned opens /proc/<pid>/exe, THEN confirms the pid still holds the
+// exec's process by its start time, then hashes the opened file or returns
+// its cached hash.
+func (h *execHasher) hashPinned(ev threatdetect.ExecEvent) (string, error) {
+	// #nosec G304 -- procRoot is a constant (or a test fixture) and pid a
+	// number from the kernel's exec record.
+	f, err := h.open(filepath.Join(h.procRoot, strconv.FormatUint(uint64(ev.PID), 10), "exe"))
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	cur, err := readProcStartTime(h.procRoot, ev.PID)
+	if err != nil {
+		return "", err
+	}
+	// An exec with no stamp (0: the boot clock could not be read) is refused
+	// here too: every tenant process started more than a tick after boot.
+	if startedAfterStamp(cur, ev.StartTime) {
+		h.pidMoved.Add(1)
+		return "", fmt.Errorf("started at %d ticks, after the exec was seen at %d: %w", cur, ev.StartTime, errExecHashPIDMoved)
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	id, cacheable := exeIdentityOf(st)
+	if cacheable {
+		if sum, ok := h.cache[id]; ok {
+			return sum, nil
+		}
+	}
+	h.hashed.Add(1)
+	sum, err := hashOpenFile(f, st.Size(), h.maxBytes, h.budget)
+	if err != nil {
+		return "", err
+	}
+	if cacheable {
+		if len(h.cache) >= h.cacheMax {
+			for k := range h.cache {
+				delete(h.cache, k)
+				break
+			}
+		}
+		h.cache[id] = sum
+	}
+	return sum, nil
+}
+
+// hashOpenFile hashes f (of size bytes; an opened /proc/<pid>/exe reads
+// through the kernel's link to the running image, so a binary deleted after
+// exec still hashes), capped at maxBytes and budget.
+func hashOpenFile(f *os.File, size, maxBytes int64, budget time.Duration) (string, error) {
+	if size > maxBytes {
+		return "", fmt.Errorf("%d bytes: %w", size, errExecHashTooLarge)
+	}
+	deadline := time.Now().Add(budget)
+	sum := sha256.New()
+	buf := make([]byte, 1<<20)
+	var total int64
+	for {
+		if time.Now().After(deadline) {
+			return "", errExecHashBudget
+		}
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			total += int64(n)
+			if total > maxBytes {
+				return "", errExecHashTooLarge
+			}
+			sum.Write(buf[:n])
+		}
+		if errors.Is(rerr, io.EOF) {
+			break
+		}
+		if rerr != nil {
+			return "", rerr
+		}
+	}
+	return hex.EncodeToString(sum.Sum(nil)), nil
+}

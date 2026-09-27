@@ -190,3 +190,100 @@ func runTrackerIssueList(cmd *cobra.Command, args []string) error {
 		h, err := client.NewHTTPClient(serverAddr, authToken)
 		if err != nil {
 			return err
+		}
+		defer func() { _ = h.Close() }()
+		if issues, err = h.ListTrackerIssues(req); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if issues, err = g.ListTrackerIssues(req); err != nil {
+			return err
+		}
+	}
+
+	if len(issues) == 0 {
+		fmt.Printf("(no issues match)\n")
+		return nil
+	}
+	fmt.Printf("%-8s %-8s %-24s %s\n", "NUMBER", "STATE", "LABELS", "TITLE")
+	for _, i := range issues {
+		fmt.Printf("%-8d %-8s %-24s %s\n", i.GetNumber(), trackerIssueStateLabel(i.GetState()), strings.Join(i.GetLabels(), ","), i.GetTitle())
+	}
+	return nil
+}
+
+func runTrackerChangeView(cmd *cobra.Command, args []string) error {
+	username, connection := args[0], args[1]
+	number, err := parseTrackerIssueNumber(args[2])
+	if err != nil {
+		return err
+	}
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for tracker commands")
+	}
+
+	req := &pb.GetTrackerChangeRequest{Username: username, Connection: connection, Number: number}
+	var change *pb.TrackerChange
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if change, err = h.GetTrackerChange(req); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if change, err = g.GetTrackerChange(req); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("#%d\n", change.GetNumber())
+	fmt.Printf("state:      %s\n", trackerIssueStateLabel(change.GetState()))
+	fmt.Printf("ci verdict: %s\n", trackerCiVerdictLabel(change.GetCiVerdict()))
+	if change.GetUrl() != "" {
+		fmt.Printf("url:        %s\n", change.GetUrl())
+	}
+	return nil
+}
+
+// trackerIssueStateLabel renders TrackerIssueState without its prefix.
+func trackerIssueStateLabel(s pb.TrackerIssueState) string {
+	switch s {
+	case pb.TrackerIssueState_TRACKER_ISSUE_STATE_OPEN:
+		return "open"
+	case pb.TrackerIssueState_TRACKER_ISSUE_STATE_CLOSED:
+		return "closed"
+	case pb.TrackerIssueState_TRACKER_ISSUE_STATE_MERGED:
+		return "merged"
+	default:
+		return "unspecified"
+	}
+}
+
+// trackerCiVerdictLabel renders TrackerCiVerdict without its prefix.
+func trackerCiVerdictLabel(v pb.TrackerCiVerdict) string {
+	switch v {
+	case pb.TrackerCiVerdict_TRACKER_CI_VERDICT_NONE:
+		return "none"
+	case pb.TrackerCiVerdict_TRACKER_CI_VERDICT_PENDING:
+		return "pending"
+	case pb.TrackerCiVerdict_TRACKER_CI_VERDICT_SUCCESS:
+		return "success"
+	case pb.TrackerCiVerdict_TRACKER_CI_VERDICT_FAILED:
+		return "failed"
+	default:
+		return "unspecified"
+	}
+}
