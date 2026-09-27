@@ -46,3 +46,52 @@ func TestVersionEndpoint_RequiresAuth(t *testing.T) {
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no-auth status = %d, want 401", rec.Code)
+	}
+}
+
+func TestVersionEndpoint_ReportsBehind(t *testing.T) {
+	// Latest is far ahead of whatever this build's version is, so behind=true.
+	mux, tok := newVersionMux(t, "v99.0.0")
+	req := httptest.NewRequest(http.MethodGet, "/v1/releases/latest", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var resp latestReleaseResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Current != version.GetVersion() {
+		t.Errorf("current = %q, want %q", resp.Current, version.GetVersion())
+	}
+	if resp.Latest != "v99.0.0" {
+		t.Errorf("latest = %q, want v99.0.0", resp.Latest)
+	}
+	if !resp.Behind {
+		t.Errorf("behind = false, want true (current %s < v99.0.0)", resp.Current)
+	}
+	if resp.CheckedAt == "" {
+		t.Error("checkedAt should be populated")
+	}
+}
+
+func TestVersionEndpoint_UpToDate(t *testing.T) {
+	// Latest equals this build's version → behind=false.
+	mux, tok := newVersionMux(t, version.GetVersion())
+	req := httptest.NewRequest(http.MethodGet, "/v1/releases/latest", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	var resp latestReleaseResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Behind {
+		t.Errorf("behind = true, want false when current == latest (%s)", resp.Current)
+	}
+}

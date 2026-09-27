@@ -155,3 +155,108 @@ func TestInboundDecision(t *testing.T) {
 		{name: "finding of a block kind",
 			resp: &pb.GuardrailScanResponse{EngineId: "e", Findings: []*pb.GuardrailFinding{finding(kindInjection), finding(kindUnsafe), finding(kindInjection)}},
 			want: InboundReasonFinding, blocked: true, kinds: []pb.GuardrailKind{kindUnsafe, kindInjection}, findings: 3},
+		{name: "finding of a non-block kind does not block",
+			resp: &pb.GuardrailScanResponse{EngineId: "e", Findings: []*pb.GuardrailFinding{finding(pb.GuardrailKind_GUARDRAIL_KIND_PII)}},
+			want: InboundReasonClean, kinds: []pb.GuardrailKind{pb.GuardrailKind_GUARDRAIL_KIND_PII}, findings: 1},
+		{name: "coverage gap",
+			resp: &pb.GuardrailScanResponse{EngineId: "e", Gaps: []*pb.GuardrailScanGap{{UnitId: "u", Detail: "unparseable"}}},
+			want: InboundReasonCoverageGap, blocked: true, gaps: 1},
+		{name: "engine error",
+			err:  status.Error(codes.Unavailable, "engine down"),
+			want: InboundReasonEngineError, blocked: true},
+		{name: "unsupported kind is an engine error",
+			err:  status.Error(codes.FailedPrecondition, "kind not supported"),
+			want: InboundReasonEngineError, blocked: true},
+		{name: "nil response without error is an engine error",
+			want: InboundReasonEngineError, blocked: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := DecideInbound(tc.resp, tc.err, blockInbound)
+			if d.Reason != tc.want || d.Blocked != tc.blocked {
+				t.Errorf("reason/blocked = %v/%v, want %v/%v", d.Reason, d.Blocked, tc.want, tc.blocked)
+			}
+			if !equalKinds(d.Kinds, tc.kinds) {
+				t.Errorf("kinds = %v, want %v (sorted)", d.Kinds, tc.kinds)
+			}
+			if d.Findings != tc.findings || d.Gaps != tc.gaps {
+				t.Errorf("findings/gaps = %d/%d, want %d/%d", d.Findings, d.Gaps, tc.findings, tc.gaps)
+			}
+			if tc.resp != nil && d.EngineID != tc.resp.GetEngineId() {
+				t.Errorf("engine id = %q, want %q", d.EngineID, tc.resp.GetEngineId())
+			}
+		})
+	}
+
+	// Conditions decided outside the engine call block with their reason.
+	for _, r := range []InboundReason{InboundReasonOverLimit, InboundReasonPolicyUnavailable, InboundReasonEngineError} {
+		if d := InboundBlocked(r); !d.Blocked || d.Reason != r {
+			t.Errorf("InboundBlocked(%v) = %+v", r, d)
+		}
+	}
+	// Every reason has a stable name for logs and audit details.
+	seen := map[string]bool{}
+	for r := InboundReasonClean; r <= InboundReasonPolicyUnavailable; r++ {
+		s := r.String()
+		if s == "" || seen[s] {
+			t.Errorf("reason %d has empty or duplicate name %q", r, s)
+		}
+		seen[s] = true
+	}
+}
+
+// TestInboundDecision_NoTextBearingField: the decision type must never be
+// able to carry the flagged span. Checked by reflection so a future field
+// of a text-bearing type fails here. EngineID is the one allowed string:
+// the engine's own identifier, never response content.
+func TestInboundDecision_NoTextBearingField(t *testing.T) {
+	allowedStrings := map[string]bool{"EngineID": true}
+	typ := reflect.TypeOf(InboundDecision{})
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		if allowedStrings[f.Name] && f.Type.Kind() == reflect.String {
+			continue
+		}
+		if canHoldText(f.Type) {
+			t.Errorf("InboundDecision.%s (%v) can hold text; the decision carries counts and kinds only", f.Name, f.Type)
+		}
+	}
+}
+
+// canHoldText reports whether a value of t could carry arbitrary text.
+func canHoldText(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return false
+	case reflect.Slice, reflect.Array:
+		if t.Elem().Kind() == reflect.Uint8 { // []byte
+			return true
+		}
+		return canHoldText(t.Elem())
+	default: // string, interface, map, pointer, struct, func, chan, ...
+		return true
+	}
+}
+
+// TestCanHoldText_CatchesTextFields proves the reflection check can fail.
+func TestCanHoldText_CatchesTextFields(t *testing.T) {
+	type bad struct {
+		Span  string
+		Raw   []byte
+		Any   interface{}
+		Spans []string
+		Msg   *pb.GuardrailFinding
+	}
+	typ := reflect.TypeOf(bad{})
+	for i := 0; i < typ.NumField(); i++ {
+		if !canHoldText(typ.Field(i).Type) {
+			t.Errorf("%s must be flagged as text-bearing", typ.Field(i).Name)
+		}
+	}
+	if canHoldText(reflect.TypeOf([]pb.GuardrailKind{})) || canHoldText(reflect.TypeOf(InboundReasonClean)) {
+		t.Error("enum slices and the reason enum are not text-bearing")
+	}
+}
