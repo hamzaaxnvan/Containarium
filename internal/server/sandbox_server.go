@@ -291,3 +291,297 @@ func (s *SandboxServer) SpawnSandbox(ctx context.Context, req *pb.SpawnSandboxRe
 
 // sandboxTTL resolves a request's idle_ttl_seconds to a concrete duration,
 // applying defaultSandboxIdleTTL when unset (<= 0).
+func sandboxTTL(idleTTLSeconds int32) time.Duration {
+	ttl := time.Duration(idleTTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = defaultSandboxIdleTTL
+	}
+	return ttl
+}
+
+// sandboxLabelSuffixes builds the (bare, unqualified) label keys every
+// sandbox carries once fully provisioned, regardless of which path
+// created it — shared by the cold path (via qualifyLabels, below) and
+// claimFromPool's post-claim SetLabels so the two constructions can't
+// drift into stamping different keys.
+//
+// Bare because that's SetLabels' own contract — it adds incus.LabelPrefix
+// itself, so passing an already-prefixed key double-prefixes it. This
+// deliberately does NOT include incus.TenantLabelKey: that key lives
+// outside the LabelPrefix namespace entirely (SetLabels can't touch it —
+// it only clears/rewrites LabelPrefix-prefixed keys), so it's set
+// separately via SetConfig everywhere it's needed.
+func sandboxLabelSuffixes(template pb.SandboxTemplate, ttl time.Duration) map[string]string {
+	return map[string]string{
+		sandboxKindLabelSuffix:  SandboxKindLabelValue,
+		"sandbox-template":      template.String(),
+		"sandbox-idle-ttl-secs": fmt.Sprintf("%d", int64(ttl.Seconds())),
+	}
+}
+
+// qualifyLabels prefixes each key with incus.LabelPrefix, for a caller
+// (the cold path's CreateContainer ExtraConfig) that needs fully-qualified
+// keys rather than SetLabels' bare ones.
+func qualifyLabels(suffixes map[string]string) map[string]string {
+	qualified := make(map[string]string, len(suffixes))
+	for k, v := range suffixes {
+		qualified[incus.LabelPrefix+k] = v
+	}
+	return qualified
+}
+
+// claimFromPool attempts to serve a spawn from the warm pool: claim a
+// ready member, then stamp its ownership — a warmed-but-unclaimed member
+// carries none of it, since the pool has no notion of tenant — so the
+// existing ownership/lookup path (lookupOwnedSandbox) recognizes it
+// exactly like a cold-path sandbox.
+//
+// Returns pool.ErrPoolExhausted unchanged when there is simply no ready
+// member; the caller (SpawnSandbox) decides whether that's RESOURCE_EXHAUSTED
+// or a signal to fall back to the cold path. Any OTHER error means a
+// member WAS claimed (removed from the ring) but setup failed after that —
+// claimFromPool destroys it via pool.Release before returning, rather than
+// leaking a claimed member with no sandbox_id a caller could ever use to
+// clean it up: unlabeled (lookupOwnedSandbox wouldn't recognize it as a
+// sandbox at all) or unowned (info.Tenant == "" fails the ownership check
+// for everyone but an admin, including the tenant who thinks they just
+// spawned it).
+//
+// Three Incus round trips on the claim path — SetConfig for the tenant key
+// and for the TTL-expiry key (both outside the label namespace, see
+// sandboxLabelSuffixes) plus SetLabels for kind/template/ttl — because no
+// existing incus.Backend primitive sets a batch of raw config keys and
+// labels in one call. This is real, and it's the piece of "two-digit ms"
+// this integration does not yet fully deliver on; a combined bulk-set
+// primitive is a legitimate follow-up once real latency numbers (Phase 3's
+// own exit criterion) show it's worth adding.
+func (s *SandboxServer) claimFromPool(template pb.SandboxTemplate, subject string, req *pb.SpawnSandboxRequest) (*pb.SpawnSandboxResponse, error) {
+	member, err := s.pool.Claim(template)
+	if err != nil {
+		return nil, err
+	}
+
+	ttl := sandboxTTL(req.IdleTtlSeconds)
+	now := time.Now()
+
+	if err := s.incus.SetConfig(member.ID, incus.TenantLabelKey, subject); err != nil {
+		s.releaseFailedClaim(member, "set tenant", err)
+		return nil, status.Errorf(codes.Internal, "claimed a warm sandbox but failed to set its owner: %v", err)
+	}
+	// Same key/format the cold path stamps via ExtraConfig and
+	// ttlsweeper.Decide reads — see stampTTL's doc comment in
+	// container_server_ttl.go.
+	if err := s.incus.SetConfig(member.ID, incus.TTLExpiresAtKey, now.Add(ttl).UTC().Format(time.RFC3339)); err != nil {
+		s.releaseFailedClaim(member, "set ttl expiry", err)
+		return nil, status.Errorf(codes.Internal, "claimed a warm sandbox but failed to set its expiry: %v", err)
+	}
+	if err := s.incus.SetLabels(member.ID, sandboxLabelSuffixes(template, ttl)); err != nil {
+		s.releaseFailedClaim(member, "set labels", err)
+		return nil, status.Errorf(codes.Internal, "claimed a warm sandbox but failed to label it: %v", err)
+	}
+
+	s.trackClaimed(member)
+
+	return &pb.SpawnSandboxResponse{
+		Sandbox: &pb.Sandbox{
+			SandboxId:  member.ID,
+			State:      pb.SandboxState_SANDBOX_STATE_RUNNING,
+			Template:   template,
+			ServedFrom: pb.ServedFrom_SERVED_FROM_POOL,
+			CreatedAt:  timestamppb.New(member.WarmedAt),
+			ExpiresAt:  timestamppb.New(now.Add(ttl)),
+		},
+	}, nil
+}
+
+// releaseFailedClaim destroys member after a post-claim setup step
+// (naming which one, for the log) failed, so a member that can never be
+// correctly reached or owned doesn't sit around leaked instead of going
+// back through the normal destroy-on-release path. Best-effort: if the
+// release ALSO fails, there is nothing left to do but say so loudly —
+// this member is now genuinely leaked and needs an operator, not a retry.
+func (s *SandboxServer) releaseFailedClaim(m *pool.Member, step string, causeErr error) {
+	if err := s.pool.Release(m); err != nil {
+		log.Printf("[sandbox] claim %s: %s failed (%v) AND cleanup failed (%v) — this member is now leaked", m.ID, step, causeErr, err)
+	}
+}
+
+// trackClaimed records that sandbox_id came from the pool, for
+// DeleteSandbox to find later.
+func (s *SandboxServer) trackClaimed(m *pool.Member) {
+	s.claimedMu.Lock()
+	s.claimed[m.ID] = m
+	s.claimedMu.Unlock()
+}
+
+// untrackClaimed removes and returns the tracked pool.Member for id, or
+// nil if id was never claimed from the pool (a cold-path sandbox, or an
+// id this server has no record of).
+func (s *SandboxServer) untrackClaimed(id string) *pool.Member {
+	s.claimedMu.Lock()
+	defer s.claimedMu.Unlock()
+	m := s.claimed[id]
+	delete(s.claimed, id)
+	return m
+}
+
+// lookupOwnedSandbox fetches sandbox id and enforces ownership in one step:
+// NotFound if it doesn't exist or isn't a sandbox, PermissionDenied if it
+// exists but belongs to a different tenant (admins bypass the comparison).
+// The ownership comparison happens immediately after the existence check,
+// in the same function, so no caller of this helper can accidentally skip
+// it or reorder it after some other early return — a cross-tenant
+// sandbox_id must always resolve to PermissionDenied, never NotFound (the
+// design note's own test list: "the ownership check must run before
+// existence leaks").
+func (s *SandboxServer) lookupOwnedSandbox(ctx context.Context, id string) (*incus.ContainerInfo, error) {
+	subject, roles, ok := auth.SubjectFromGRPCContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "no authenticated subject")
+	}
+
+	info, err := s.incus.GetContainer(id)
+	// ContainerInfo.Labels is already prefix-stripped (see
+	// extractLabelsFromConfig) — compare the suffix, not the
+	// ExtraConfig-qualified SandboxKindLabelKey.
+	if err != nil || info == nil || info.Labels[sandboxKindLabelSuffix] != SandboxKindLabelValue {
+		return nil, status.Errorf(codes.NotFound, "sandbox %q not found", id)
+	}
+
+	if !auth.HasRole(roles, auth.RoleAdmin) && info.Tenant != subject {
+		return nil, status.Errorf(codes.PermissionDenied, "sandbox %q belongs to a different tenant", id)
+	}
+
+	return info, nil
+}
+
+// ExecInSandbox runs one command inside the sandbox. The sandbox's only
+// access surface — there is no SSH.
+func (s *SandboxServer) ExecInSandbox(ctx context.Context, req *pb.ExecInSandboxRequest) (*pb.ExecInSandboxResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSandboxesWrite); err != nil {
+		return nil, err
+	}
+	if req.SandboxId == "" {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
+	}
+	if len(req.Command) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "command is required")
+	}
+	if _, err := s.lookupOwnedSandbox(ctx, req.SandboxId); err != nil {
+		return nil, err
+	}
+
+	stdout, stderr, exitCode, err := s.incus.ExecWithExitCode(req.SandboxId, req.Command)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "exec failed: %v", err)
+	}
+
+	return &pb.ExecInSandboxResponse{
+		Stdout:   stdout,
+		Stderr:   stderr,
+		ExitCode: safecast.I32(exitCode),
+	}, nil
+}
+
+// WriteFileInSandbox writes a file into the sandbox via the Incus file push
+// API — never through a shell, so file content can never be interpreted as
+// a command.
+func (s *SandboxServer) WriteFileInSandbox(ctx context.Context, req *pb.WriteFileInSandboxRequest) (*pb.WriteFileInSandboxResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSandboxesWrite); err != nil {
+		return nil, err
+	}
+	if req.SandboxId == "" || req.Path == "" {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_id and path are required")
+	}
+	if _, err := s.lookupOwnedSandbox(ctx, req.SandboxId); err != nil {
+		return nil, err
+	}
+
+	mode := req.Mode
+	if mode == "" {
+		mode = "0644"
+	}
+	if err := s.incus.WriteFile(req.SandboxId, req.Path, req.Content, mode); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to write file: %v", err)
+	}
+
+	return &pb.WriteFileInSandboxResponse{Message: fmt.Sprintf("wrote %d byte(s) to %s", len(req.Content), req.Path)}, nil
+}
+
+// ReadFileInSandbox reads a file back out of the sandbox.
+func (s *SandboxServer) ReadFileInSandbox(ctx context.Context, req *pb.ReadFileInSandboxRequest) (*pb.ReadFileInSandboxResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSandboxesRead); err != nil {
+		return nil, err
+	}
+	if req.SandboxId == "" || req.Path == "" {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_id and path are required")
+	}
+	if _, err := s.lookupOwnedSandbox(ctx, req.SandboxId); err != nil {
+		return nil, err
+	}
+
+	content, err := s.incus.ReadFile(req.SandboxId, req.Path)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to read file: %v", err)
+	}
+
+	return &pb.ReadFileInSandboxResponse{Content: content}, nil
+}
+
+// DeleteSandbox destroys the sandbox immediately. Sandboxes are never reset
+// and reused (see the design note's Isolation section) — delete always
+// means destroy, never "return to a pool". A pool-claimed sandbox routes
+// through pool.Release rather than destroy() directly, since Release also
+// frees the member's IPAM-allocated address — destroy() knows nothing
+// about IPAM and a cold-path sandbox never held an allocation to free.
+func (s *SandboxServer) DeleteSandbox(ctx context.Context, req *pb.DeleteSandboxRequest) (*pb.DeleteSandboxResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSandboxesWrite); err != nil {
+		return nil, err
+	}
+	if req.SandboxId == "" {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
+	}
+	if _, err := s.lookupOwnedSandbox(ctx, req.SandboxId); err != nil {
+		return nil, err
+	}
+
+	if member := s.untrackClaimed(req.SandboxId); member != nil {
+		if err := s.pool.Release(member); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to delete sandbox: %v", err)
+		}
+	} else if err := s.destroy(req.SandboxId); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to delete sandbox: %v", err)
+	}
+
+	return &pb.DeleteSandboxResponse{Message: fmt.Sprintf("sandbox %s deleted", req.SandboxId)}, nil
+}
+
+// GetPoolStatus reports the warm pool's per-template ready/warming counts
+// against the configured min_warm floor (#1488 Phase 4: "pool exhaustion
+// is visible"). Read-only, no ownership scoping — pool state isn't
+// per-tenant data, it's operator/observability visibility into the
+// daemon's own admission-control posture. Returns an empty templates list
+// when no pool is configured (s.pool == nil, today's production default;
+// see the type doc), rather than an error — "the pool feature isn't
+// configured" is a legitimate, expected response, not a failure.
+func (s *SandboxServer) GetPoolStatus(ctx context.Context, _ *pb.GetPoolStatusRequest) (*pb.GetPoolStatusResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSandboxesRead); err != nil {
+		return nil, err
+	}
+
+	if s.pool == nil {
+		return &pb.GetPoolStatusResponse{}, nil
+	}
+
+	statuses := s.pool.Status()
+	templates := make([]*pb.PoolTemplateStatus, 0, len(statuses))
+	for _, st := range statuses {
+		templates = append(templates, &pb.PoolTemplateStatus{
+			Template: st.Template,
+			Ready:    safecast.I32(st.Ready),
+			Warming:  safecast.I32(st.Warming),
+			MinWarm:  safecast.I32(st.MinWarm),
+		})
+	}
+	return &pb.GetPoolStatusResponse{Templates: templates}, nil
+}

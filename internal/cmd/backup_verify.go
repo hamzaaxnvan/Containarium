@@ -143,3 +143,52 @@ func runBackupVerify(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Restore-testing backup %q against target %q...\n", rec.Id, backupVerifyTarget)
 	resp, err := c.VerifyBackup(&pb.VerifyBackupRequest{
+		Id:             rec.Id,
+		TargetUsername: backupVerifyTarget,
+		AgeIdentity:    ageIdentity,
+		Connection: &pb.PgConnection{
+			User:     backupVerifyDBUser,
+			Password: backupVerifyDBPass,
+			Host:     backupVerifyDBHost,
+			Port:     backupVerifyDBPort,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	v := resp.Verification
+	if v == nil {
+		return fmt.Errorf("daemon returned no verification result")
+	}
+
+	fmt.Println()
+	for _, check := range v.Checks {
+		mark := "✓"
+		if !check.Passed {
+			mark = "✗"
+		}
+		fmt.Printf("  %s %-18s %s\n", mark, check.Name, check.Detail)
+	}
+	fmt.Printf("\n  target:  %s (scratch db %s, dropped)\n", v.TargetContainer, v.ScratchDatabase)
+	fmt.Printf("  when:    %s", v.VerifiedAt)
+	if v.VerifiedBy != "" {
+		fmt.Printf("  by %s", v.VerifiedBy)
+	}
+	fmt.Printf("\n  elapsed: %dms\n\n", v.DurationMs)
+
+	// A failed restore test is a real answer, not a broken command — but
+	// it must exit non-zero so a scheduled verification fails loudly
+	// instead of scrolling past in a log.
+	if v.Result != pb.VerificationResult_VERIFICATION_RESULT_PASSED {
+		fmt.Fprintf(os.Stderr, "✗ %s\n", resp.Message)
+		return errBackupVerificationFailed
+	}
+	fmt.Printf("✓ %s\n", resp.Message)
+	return nil
+}
+
+// errBackupVerificationFailed marks a completed-but-failed restore test.
+// Carried as a distinct value so the exit path is obvious at the call
+// site; cobra prints it and main exits non-zero.
+var errBackupVerificationFailed = fmt.Errorf("backup verification failed")
