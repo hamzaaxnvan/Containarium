@@ -12,3 +12,10 @@
 #     -f charts/containarium-k8s/values-devbox.yaml \
 #     --set daemon.jwtSecret="$(openssl rand -hex 24)"
 #
+# Security note: shell mode trades the forced-command blast-radius guarantee
+# (a key can only drive MCP, never a shell) for a general shell. Pair it with a
+# default-deny NetworkPolicy so the shell can't reach the cluster network, and
+# scope who can create boxes accordingly.
+
+agentBox:
+  mode: shell
