@@ -381,3 +381,387 @@ func (x *EnableResponse) ProtoReflect() protoreflect.Message {
 		if ms.LoadMessageInfo() == nil {
 			ms.StoreMessageInfo(mi)
 		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EnableResponse.ProtoReflect.Descriptor instead.
+func (*EnableResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_compose_autostart_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *EnableResponse) GetUnit() string {
+	if x != nil {
+		return x.Unit
+	}
+	return ""
+}
+
+func (x *EnableResponse) GetDir() string {
+	if x != nil {
+		return x.Dir
+	}
+	return ""
+}
+
+func (x *EnableResponse) GetComposeBin() string {
+	if x != nil {
+		return x.ComposeBin
+	}
+	return ""
+}
+
+func (x *EnableResponse) GetAlready() bool {
+	if x != nil {
+		return x.Already
+	}
+	return false
+}
+
+func (x *EnableResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+type DisableRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	Dir           string                 `protobuf:"bytes,2,opt,name=dir,proto3" json:"dir,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DisableRequest) Reset() {
+	*x = DisableRequest{}
+	mi := &file_containarium_v1_compose_autostart_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DisableRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DisableRequest) ProtoMessage() {}
+
+func (x *DisableRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_compose_autostart_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DisableRequest.ProtoReflect.Descriptor instead.
+func (*DisableRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_compose_autostart_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DisableRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *DisableRequest) GetDir() string {
+	if x != nil {
+		return x.Dir
+	}
+	return ""
+}
+
+type DisableResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Unit  string                 `protobuf:"bytes,1,opt,name=unit,proto3" json:"unit,omitempty"`
+	Dir   string                 `protobuf:"bytes,2,opt,name=dir,proto3" json:"dir,omitempty"`
+	// True when the unit wasn't enabled and nothing was disabled.
+	Already       bool   `protobuf:"varint,3,opt,name=already,proto3" json:"already,omitempty"`
+	Message       string `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DisableResponse) Reset() {
+	*x = DisableResponse{}
+	mi := &file_containarium_v1_compose_autostart_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DisableResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DisableResponse) ProtoMessage() {}
+
+func (x *DisableResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_compose_autostart_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DisableResponse.ProtoReflect.Descriptor instead.
+func (*DisableResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_compose_autostart_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *DisableResponse) GetUnit() string {
+	if x != nil {
+		return x.Unit
+	}
+	return ""
+}
+
+func (x *DisableResponse) GetDir() string {
+	if x != nil {
+		return x.Dir
+	}
+	return ""
+}
+
+func (x *DisableResponse) GetAlready() bool {
+	if x != nil {
+		return x.Already
+	}
+	return false
+}
+
+func (x *DisableResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+type StatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Username      string                 `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	Dir           string                 `protobuf:"bytes,2,opt,name=dir,proto3" json:"dir,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StatusRequest) Reset() {
+	*x = StatusRequest{}
+	mi := &file_containarium_v1_compose_autostart_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StatusRequest) ProtoMessage() {}
+
+func (x *StatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_compose_autostart_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
+func (*StatusRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_compose_autostart_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *StatusRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *StatusRequest) GetDir() string {
+	if x != nil {
+		return x.Dir
+	}
+	return ""
+}
+
+type StatusResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Single-stack status. Same shape as one entry from
+	// DiscoverResponse.stacks.
+	Stack         *ComposeStack `protobuf:"bytes,1,opt,name=stack,proto3" json:"stack,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StatusResponse) Reset() {
+	*x = StatusResponse{}
+	mi := &file_containarium_v1_compose_autostart_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StatusResponse) ProtoMessage() {}
+
+func (x *StatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_compose_autostart_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StatusResponse.ProtoReflect.Descriptor instead.
+func (*StatusResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_compose_autostart_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *StatusResponse) GetStack() *ComposeStack {
+	if x != nil {
+		return x.Stack
+	}
+	return nil
+}
+
+var File_containarium_v1_compose_autostart_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_compose_autostart_proto_rawDesc = "" +
+	"\n" +
+	"'containarium/v1/compose_autostart.proto\x12\x0fcontainarium.v1\x1a\x1cgoogle/api/annotations.proto\"\xc0\x02\n" +
+	"\fComposeStack\x12\x1f\n" +
+	"\vcompose_dir\x18\x01 \x01(\tR\n" +
+	"composeDir\x12!\n" +
+	"\fcompose_file\x18\x02 \x01(\tR\vcomposeFile\x12\x1f\n" +
+	"\vcompose_bin\x18\x03 \x01(\tR\n" +
+	"composeBin\x12.\n" +
+	"\x13compose_modified_at\x18\x04 \x01(\tR\x11composeModifiedAt\x12#\n" +
+	"\rrunning_count\x18\x05 \x01(\x05R\frunningCount\x12\x1f\n" +
+	"\vtotal_count\x18\x06 \x01(\x05R\n" +
+	"totalCount\x12+\n" +
+	"\x11autostart_enabled\x18\a \x01(\bR\x10autostartEnabled\x12(\n" +
+	"\x10unit_modified_at\x18\b \x01(\tR\x0eunitModifiedAt\"\x8b\x01\n" +
+	"\x0fDiscoverRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x12\n" +
+	"\x04root\x18\x02 \x01(\tR\x04root\x12\x1b\n" +
+	"\tmax_depth\x18\x03 \x01(\x05R\bmaxDepth\x12\x12\n" +
+	"\x04skip\x18\x04 \x03(\tR\x04skip\x12\x17\n" +
+	"\ano_skip\x18\x05 \x01(\bR\x06noSkip\"I\n" +
+	"\x10DiscoverResponse\x125\n" +
+	"\x06stacks\x18\x01 \x03(\v2\x1d.containarium.v1.ComposeStackR\x06stacks\"S\n" +
+	"\rEnableRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x10\n" +
+	"\x03dir\x18\x02 \x01(\tR\x03dir\x12\x14\n" +
+	"\x05force\x18\x03 \x01(\bR\x05force\"\x8b\x01\n" +
+	"\x0eEnableResponse\x12\x12\n" +
+	"\x04unit\x18\x01 \x01(\tR\x04unit\x12\x10\n" +
+	"\x03dir\x18\x02 \x01(\tR\x03dir\x12\x1f\n" +
+	"\vcompose_bin\x18\x03 \x01(\tR\n" +
+	"composeBin\x12\x18\n" +
+	"\aalready\x18\x04 \x01(\bR\aalready\x12\x18\n" +
+	"\amessage\x18\x05 \x01(\tR\amessage\">\n" +
+	"\x0eDisableRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x10\n" +
+	"\x03dir\x18\x02 \x01(\tR\x03dir\"k\n" +
+	"\x0fDisableResponse\x12\x12\n" +
+	"\x04unit\x18\x01 \x01(\tR\x04unit\x12\x10\n" +
+	"\x03dir\x18\x02 \x01(\tR\x03dir\x12\x18\n" +
+	"\aalready\x18\x03 \x01(\bR\aalready\x12\x18\n" +
+	"\amessage\x18\x04 \x01(\tR\amessage\"=\n" +
+	"\rStatusRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x10\n" +
+	"\x03dir\x18\x02 \x01(\tR\x03dir\"E\n" +
+	"\x0eStatusResponse\x123\n" +
+	"\x05stack\x18\x01 \x01(\v2\x1d.containarium.v1.ComposeStackR\x05stack2\x97\x04\n" +
+	"\x17ComposeAutostartService\x12\x83\x01\n" +
+	"\bDiscover\x12 .containarium.v1.DiscoverRequest\x1a!.containarium.v1.DiscoverResponse\"2\x82\xd3\xe4\x93\x02,:\x01*\"'/v1/tenants/{username}/compose/discover\x12{\n" +
+	"\x06Enable\x12\x1e.containarium.v1.EnableRequest\x1a\x1f.containarium.v1.EnableResponse\"0\x82\xd3\xe4\x93\x02*:\x01*\"%/v1/tenants/{username}/compose/enable\x12\x7f\n" +
+	"\aDisable\x12\x1f.containarium.v1.DisableRequest\x1a .containarium.v1.DisableResponse\"1\x82\xd3\xe4\x93\x02+:\x01*\"&/v1/tenants/{username}/compose/disable\x12x\n" +
+	"\x06Status\x12\x1e.containarium.v1.StatusRequest\x1a\x1f.containarium.v1.StatusResponse\"-\x82\xd3\xe4\x93\x02'\x12%/v1/tenants/{username}/compose/statusBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_compose_autostart_proto_rawDescOnce sync.Once
+	file_containarium_v1_compose_autostart_proto_rawDescData []byte
+)
+
+func file_containarium_v1_compose_autostart_proto_rawDescGZIP() []byte {
+	file_containarium_v1_compose_autostart_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_compose_autostart_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_compose_autostart_proto_rawDesc), len(file_containarium_v1_compose_autostart_proto_rawDesc)))
+	})
+	return file_containarium_v1_compose_autostart_proto_rawDescData
+}
+
+var file_containarium_v1_compose_autostart_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_containarium_v1_compose_autostart_proto_goTypes = []any{
+	(*ComposeStack)(nil),     // 0: containarium.v1.ComposeStack
+	(*DiscoverRequest)(nil),  // 1: containarium.v1.DiscoverRequest
+	(*DiscoverResponse)(nil), // 2: containarium.v1.DiscoverResponse
+	(*EnableRequest)(nil),    // 3: containarium.v1.EnableRequest
+	(*EnableResponse)(nil),   // 4: containarium.v1.EnableResponse
+	(*DisableRequest)(nil),   // 5: containarium.v1.DisableRequest
+	(*DisableResponse)(nil),  // 6: containarium.v1.DisableResponse
+	(*StatusRequest)(nil),    // 7: containarium.v1.StatusRequest
+	(*StatusResponse)(nil),   // 8: containarium.v1.StatusResponse
+}
+var file_containarium_v1_compose_autostart_proto_depIdxs = []int32{
+	0, // 0: containarium.v1.DiscoverResponse.stacks:type_name -> containarium.v1.ComposeStack
+	0, // 1: containarium.v1.StatusResponse.stack:type_name -> containarium.v1.ComposeStack
+	1, // 2: containarium.v1.ComposeAutostartService.Discover:input_type -> containarium.v1.DiscoverRequest
+	3, // 3: containarium.v1.ComposeAutostartService.Enable:input_type -> containarium.v1.EnableRequest
+	5, // 4: containarium.v1.ComposeAutostartService.Disable:input_type -> containarium.v1.DisableRequest
+	7, // 5: containarium.v1.ComposeAutostartService.Status:input_type -> containarium.v1.StatusRequest
+	2, // 6: containarium.v1.ComposeAutostartService.Discover:output_type -> containarium.v1.DiscoverResponse
+	4, // 7: containarium.v1.ComposeAutostartService.Enable:output_type -> containarium.v1.EnableResponse
+	6, // 8: containarium.v1.ComposeAutostartService.Disable:output_type -> containarium.v1.DisableResponse
+	8, // 9: containarium.v1.ComposeAutostartService.Status:output_type -> containarium.v1.StatusResponse
+	6, // [6:10] is the sub-list for method output_type
+	2, // [2:6] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_compose_autostart_proto_init() }
+func file_containarium_v1_compose_autostart_proto_init() {
+	if File_containarium_v1_compose_autostart_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_compose_autostart_proto_rawDesc), len(file_containarium_v1_compose_autostart_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   9,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_compose_autostart_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_compose_autostart_proto_depIdxs,
+		MessageInfos:      file_containarium_v1_compose_autostart_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_compose_autostart_proto = out.File
+	file_containarium_v1_compose_autostart_proto_goTypes = nil
+	file_containarium_v1_compose_autostart_proto_depIdxs = nil
+}
