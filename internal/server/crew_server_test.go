@@ -477,3 +477,243 @@ func TestValidateCrewTopology(t *testing.T) {
 		// Reverse direction: hello (leaf) -> relay is not in hello.allowed_peers.
 		crew := &pb.Crew{Id: "c", Topology: pb.CrewTopology_CREW_TOPOLOGY_PIPELINE, SkillIds: []string{"hello", "relay"}}
 		if err := validateCrewTopology(crew, get); err == nil {
+			t.Error("hello->relay is not allowed; want rejection, got nil")
+		}
+	})
+
+	t.Run("unknown skill", func(t *testing.T) {
+		crew := &pb.Crew{Id: "c", Topology: pb.CrewTopology_CREW_TOPOLOGY_PIPELINE, SkillIds: []string{"relay", "ghost"}}
+		if err := validateCrewTopology(crew, get); err == nil {
+			t.Error("unknown skill should be rejected")
+		}
+	})
+
+	t.Run("orchestrator coordinator must reach workers", func(t *testing.T) {
+		// relay is coordinator; relay->hello allowed, but relay->relay2 (absent peer) not.
+		crew := &pb.Crew{Id: "c", Topology: pb.CrewTopology_CREW_TOPOLOGY_ORCHESTRATOR, SkillIds: []string{"relay", "hello"}}
+		if err := validateCrewTopology(crew, get); err != nil {
+			t.Errorf("relay->hello permitted; want nil, got %v", err)
+		}
+	})
+
+	t.Run("freeform has no required edges", func(t *testing.T) {
+		crew := &pb.Crew{Id: "c", Topology: pb.CrewTopology_CREW_TOPOLOGY_FREEFORM, SkillIds: []string{"hello", "relay"}}
+		if err := validateCrewTopology(crew, get); err != nil {
+			t.Errorf("freeform implies no required edges; want nil, got %v", err)
+		}
+	})
+}
+
+// TestValidateCrewTopology_Roles pins the #2799 rule that the member which
+// produces the Proof Pack is never the coder: not the same skill, and so not
+// the same box (a skill's box is agent-<skill-id>).
+func TestValidateCrewTopology_Roles(t *testing.T) {
+	coder := &pb.AgentSkill{Id: "coder", AllowedPeers: []string{"reviewer"}}
+	reviewer := &pb.AgentSkill{Id: "reviewer"}
+	runner := &pb.AgentSkill{Id: "runner"}
+	get := skillSet(coder, reviewer, runner)
+
+	const (
+		C = pb.CrewRole_CREW_ROLE_CODER
+		P = pb.CrewRole_CREW_ROLE_PACK_PRODUCER
+		R = pb.CrewRole_CREW_ROLE_REVIEWER
+	)
+	pipeline := pb.CrewTopology_CREW_TOPOLOGY_PIPELINE
+	cases := []struct {
+		name     string
+		topology pb.CrewTopology
+		skills   []string
+		roles    []pb.CrewRole
+		wantErr  string // substring; "" = valid
+	}{
+		{name: "no roles declared", topology: pipeline, skills: []string{"coder", "reviewer"}},
+		// The producer is not an A2A peer: no reviewer->runner edge is needed.
+		{name: "independent producer last", topology: pipeline, skills: []string{"coder", "reviewer", "runner"}, roles: []pb.CrewRole{C, R, P}},
+		{name: "producer is the coder skill", topology: pipeline, skills: []string{"coder", "reviewer", "coder"}, roles: []pb.CrewRole{C, R, P}, wantErr: "same box"},
+		{name: "coder skill listed again as producer", topology: pipeline, skills: []string{"coder", "coder"}, roles: []pb.CrewRole{C, P}, wantErr: "same box"},
+		{name: "roles shorter than members", topology: pipeline, skills: []string{"coder", "reviewer", "runner"}, roles: []pb.CrewRole{C, R}, wantErr: "one role per member"},
+		{name: "producer without a coder", topology: pipeline, skills: []string{"reviewer", "runner"}, roles: []pb.CrewRole{R, P}, wantErr: "no CODER"},
+		{name: "two producers", topology: pipeline, skills: []string{"coder", "reviewer", "runner", "runner"}, roles: []pb.CrewRole{C, R, P, P}, wantErr: "more than one"},
+		{name: "producer before the reviewer", topology: pipeline, skills: []string{"coder", "runner", "reviewer"}, roles: []pb.CrewRole{C, P, R}, wantErr: "last member"},
+		{name: "producer outside a pipeline", topology: pb.CrewTopology_CREW_TOPOLOGY_FREEFORM, skills: []string{"coder", "reviewer", "runner"}, roles: []pb.CrewRole{C, R, P}, wantErr: "PIPELINE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			crew := &pb.Crew{Id: "c", Topology: tc.topology, SkillIds: tc.skills, Roles: tc.roles}
+			err := validateCrewTopology(crew, get)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("want valid, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestRunCrew_GitFieldsRoundTrip pins RunCrewRequest.git_source/git_ref/
+// git_credential and CrewRun.git_source/git_ref/git_commit against the
+// GENERATED pb types (cloud#1554), so a stale regeneration fails to compile
+// rather than passing quietly — same pattern
+// TestRunAgentSkill_GitFieldsRoundTrip uses for the single-agent request.
+func TestRunCrew_GitFieldsRoundTrip(t *testing.T) {
+	req := &pb.RunCrewRequest{
+		CrewId:        "freeform-crew",
+		GitSource:     "https://github.com/org/repo",
+		GitRef:        "abc123",
+		GitCredential: "ghs_secret",
+	}
+	if req.GetGitSource() != "https://github.com/org/repo" {
+		t.Errorf("GetGitSource() = %q, want the set value", req.GetGitSource())
+	}
+	if req.GetGitRef() != "abc123" {
+		t.Errorf("GetGitRef() = %q, want the set value", req.GetGitRef())
+	}
+	if req.GetGitCredential() != "ghs_secret" {
+		t.Errorf("GetGitCredential() = %q, want the set value", req.GetGitCredential())
+	}
+
+	empty := &pb.RunCrewRequest{CrewId: "freeform-crew"}
+	if empty.GetGitSource() != "" || empty.GetGitRef() != "" || empty.GetGitCredential() != "" {
+		t.Errorf("unset git fields must read as empty, got source=%q ref=%q credential=%q",
+			empty.GetGitSource(), empty.GetGitRef(), empty.GetGitCredential())
+	}
+
+	run := &pb.CrewRun{
+		Id:        "run-1",
+		GitSource: "https://github.com/org/repo",
+		GitRef:    "abc123",
+		GitCommit: "deadbeefcafe",
+	}
+	if run.GetGitSource() != "https://github.com/org/repo" || run.GetGitRef() != "abc123" || run.GetGitCommit() != "deadbeefcafe" {
+		t.Errorf("CrewRun git fields = source=%q ref=%q commit=%q, want the set values",
+			run.GetGitSource(), run.GetGitRef(), run.GetGitCommit())
+	}
+
+	emptyRun := &pb.CrewRun{Id: "run-1"}
+	if emptyRun.GetGitSource() != "" || emptyRun.GetGitRef() != "" || emptyRun.GetGitCommit() != "" {
+		t.Errorf("a run with no git_source must report empty git fields, got source=%q ref=%q commit=%q",
+			emptyRun.GetGitSource(), emptyRun.GetGitRef(), emptyRun.GetGitCommit())
+	}
+}
+
+// pipelineCrewCatalog builds a one-crew pipeline catalog over exactly the
+// given (ordered) skill ids, so RunCrew can be driven against a topology
+// that's actually valid for a provisioning-focused test — pipeline needs
+// >=2 skills, and each edge must be permitted by the earlier skill's
+// allowed_peers (checked at real Get-time against the real embedded skill
+// catalog, so the caller must pass ids that are really wired that way —
+// relay-agent -> hello-agent, same as the embedded hello-crew/freeform-crew).
+func pipelineCrewCatalog(t *testing.T, crewID string, skillIDs ...string) *crews.Manager {
+	t.Helper()
+	m := crews.New()
+	var b strings.Builder
+	fmt.Fprintf(&b, "crews:\n  - id: %s\n    name: Test Crew\n    topology: pipeline\n    skill_ids:\n", crewID)
+	for _, id := range skillIDs {
+		fmt.Fprintf(&b, "      - %s\n", id)
+	}
+	if err := m.LoadFromBytes([]byte(b.String())); err != nil {
+		t.Fatalf("LoadFromBytes: %v", err)
+	}
+	return m
+}
+
+// newSkillBoxHarnessForSkills is newSkillBoxHarness generalized to several
+// skills sharing one fake backend, each with its own pre-created container
+// so every one takes the "reuse" provisioning path and hits the SAME
+// deterministic seed-exec failure newSkillBoxHarness documents.
+func newSkillBoxHarnessForSkills(t *testing.T, store auth.RevocationStore, skillIDs ...string) (*AgentSkillServer, []*pb.AgentSkill) {
+	t.Helper()
+	tm, err := auth.NewTokenManager("test-secret-must-be-at-least-32-bytes-long-ok", "test")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	backend := newFakeSandboxBackend()
+	catalog := skills.GetDefault()
+	var out []*pb.AgentSkill
+	for _, id := range skillIDs {
+		skill, err := catalog.Get(id)
+		if err != nil {
+			t.Fatalf("catalog %s: %v", id, err)
+		}
+		if err := backend.CreateContainer(incus.ContainerConfig{Name: "agent-" + skill.Id + "-container"}); err != nil {
+			t.Fatalf("seed fake backend for %s: %v", id, err)
+		}
+		out = append(out, skill)
+	}
+	cs := &ContainerServer{manager: container.NewWithBackend(backend)}
+	s := &AgentSkillServer{
+		catalog: catalog,
+		recipes: NewRecipeServer(cs, nil),
+		tokens:  tm,
+		gateway: &gatewayProvisioning{engines: agentengine.Gateway{DefaultProvider: "anthropic"}, httpPort: 8080, secret: []byte("test-shared-secret")},
+	}
+	s.SetRevocationStore(store)
+	return s, out
+}
+
+// TestRunCrew_GitSourceThreadedToEveryMember is cloud#1554's core fix: a
+// crew run carrying git_source/git_ref must (a) not be rejected at the RPC
+// layer — it fails at the same provisioning step ("failed to seed agent
+// box") a git_source-less run would, proving the fields don't derail request
+// handling — and (b) have the CrewRun row echo git_source/git_ref even on
+// failure, the same way a failed skill run still records what it was asked
+// to fetch. What this test CANNOT observe from outside provisionSkillBox: a
+// unit test can't tell "the field reached provisionSkillBox but the fetch
+// never ran because seed failed first" (the design's own fetch-after-seed
+// ordering) apart from "the field was silently dropped" — both produce the
+// identical seed-exec failure. The threading itself is the same one-line
+// pattern RunAgentSkill already uses (req.GetGitSource()/GetGitRef()/
+// GetGitCredential() passed straight through, pinned by
+// TestRunCrew_GitFieldsRoundTrip); the happy-path fetch needs a real box and
+// is e2e territory, same limitation TestProvisionSkillBox_GitSourceSet_SeedFailsBeforeFetch
+// documents for the single-agent path.
+func TestRunCrew_GitSourceThreadedToEveryMember(t *testing.T) {
+	store := newFakeRevocationStore()
+	agents, _ := newSkillBoxHarnessForSkills(t, store, "relay-agent", "hello-agent")
+	s := &CrewServer{
+		catalog: pipelineCrewCatalog(t, "test-crew", "relay-agent", "hello-agent"),
+		skills:  skills.GetDefault(),
+		agents:  agents,
+		runs:    NewMemCrewRunStore(),
+	}
+	ctx := ctxAs("admin", true)
+
+	_, err := s.RunCrew(ctx, &pb.RunCrewRequest{
+		CrewId:    "test-crew",
+		RunId:     "run-git-crew",
+		GitSource: "https://github.com/org/repo",
+		GitRef:    "main",
+	})
+	if err == nil {
+		t.Fatal("expected an error — the harness's fake backend always fails the seed exec")
+	}
+	if status.Code(err) != codes.Internal {
+		t.Errorf("code = %v, want Internal (a provisioning failure, not a validation error)", status.Code(err))
+	}
+	if got := err.Error(); !strings.Contains(got, "failed to seed agent box") {
+		t.Errorf("error = %q, want it to name the seed step — a different error here would mean\n"+
+			"the git fields changed the failure path instead of just reaching provisionSkillBox", got)
+	}
+
+	// The CrewRun row must echo the request's git_source/git_ref even though
+	// the run failed — same as a failed skill run still recording what it
+	// was asked to fetch.
+	run, ok, gerr := s.runs.Get(ctx, "run-git-crew")
+	if gerr != nil {
+		t.Fatalf("Get: %v", gerr)
+	}
+	if !ok {
+		t.Fatal("expected the failed run to still be recorded")
+	}
+	if run.GetState() != pb.CrewRunState_CREW_RUN_STATE_FAILED {
+		t.Errorf("state = %v, want FAILED", run.GetState())
+	}
+	if run.GetGitSource() != "https://github.com/org/repo" || run.GetGitRef() != "main" {
+		t.Errorf("run git fields = source=%q ref=%q, want them echoed even on failure",
+			run.GetGitSource(), run.GetGitRef())
+	}
+}

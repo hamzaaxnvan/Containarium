@@ -147,3 +147,153 @@ func runBackendsList(cmd *cobra.Command, args []string) error {
 	case "json":
 		out, err := json.MarshalIndent(backendsListResponse{Backends: backends}, "", "  ")
 		if err != nil {
+			return err
+		}
+		fmt.Println(string(out))
+	case "table":
+		printBackendsTable(backends)
+	default:
+		return fmt.Errorf("unknown format: %s (use: table, json)", backendsListFormat)
+	}
+	return nil
+}
+
+func printBackendsTable(backends []backendInfo) {
+	if len(backends) == 0 {
+		fmt.Println("No backends registered (running standalone, no peers).")
+		return
+	}
+	fmt.Printf("%-40s %-8s %-10s %-25s %-8s %-10s %-10s %-6s %-6s %-12s %s\n",
+		"BACKEND ID", "TYPE", "HEALTH", "HOSTNAME", "INCUS", "CONTAINERS", "CPU LOAD", "MEM", "DISK", "STORAGE", "GPUS")
+	fmt.Println(strings.Repeat("-", 164))
+	for _, b := range backends {
+		health := "✓"
+		if !b.Healthy {
+			health = "✗"
+		}
+		gpus := "-"
+		if len(b.GPUs) > 0 {
+			parts := make([]string, 0, len(b.GPUs))
+			for _, g := range b.GPUs {
+				parts = append(parts, g.ModelName)
+			}
+			gpus = strings.Join(parts, ", ")
+		}
+		hostname := b.Hostname
+		if hostname == "" {
+			hostname = "-"
+		}
+		incusVer := b.IncusVersion
+		if incusVer == "" {
+			incusVer = "-"
+		}
+		fmt.Printf("%-40s %-8s %-10s %-25s %-8s %-10d %-10s %-6s %-6s %-12s %s\n",
+			b.ID, b.Type, health, hostname, incusVer, b.ContainerCount,
+			formatCPULoad(b.HostLoad),
+			formatUsedPercent(b.HostLoad, memoryUsage),
+			formatUsedPercent(b.HostLoad, diskUsage),
+			formatStorage(b.Storage),
+			gpus)
+	}
+	fmt.Printf("\nTotal: %d backend(s)\n", len(backends))
+
+	// The exposure is invisible until tenants are concurrently busy, and idle
+	// metrics on a shared-filesystem pool look BETTER than the alternatives.
+	// So say it outright rather than leaving a glyph in a column to be
+	// noticed. See #1206.
+	if n := sharedFilesystemBackends(backends); n > 0 {
+		fmt.Printf("\n⚠  %d backend(s) on a shared-filesystem storage pool (dir).\n", n)
+		fmt.Printf("   Every tenant rootfs shares one filesystem journal, so one tenant's\n")
+		fmt.Printf("   writeback can stall another tenant's fsync. Idle benchmarks will not\n")
+		fmt.Printf("   show this. See docs/BACKEND-STORAGE-DRIVER.md and issue #1206.\n")
+	}
+}
+
+// usageKind selects which of a host's two byte-usage pairs to render.
+type usageKind int
+
+const (
+	memoryUsage usageKind = iota
+	diskUsage
+)
+
+// formatCPULoad renders the 1-minute load average against the host's core
+// count ("6.50/8"), which is the only form in which a load average means
+// anything — the same number is idle on a 64-core host and saturated on a
+// 4-core one.
+//
+// "-" when the daemon had no usable sample. Deliberately not "0.00/0": an
+// unmeasured host must not read as an unloaded one, which is the failure
+// mode that made capacity decisions blind in the first place (cloud #966).
+func formatCPULoad(l *hostLoad) string {
+	if l == nil {
+		return "-"
+	}
+	if l.CPUCores <= 0 {
+		return fmt.Sprintf("%.2f", l.CPULoad1m)
+	}
+	return fmt.Sprintf("%.2f/%d", l.CPULoad1m, l.CPUCores)
+}
+
+// formatUsedPercent renders used-of-total as a whole-number percentage, or
+// "-" when there is no sample (or a zero total, which would divide by zero
+// and means the probe returned nothing usable anyway).
+func formatUsedPercent(l *hostLoad, kind usageKind) string {
+	if l == nil {
+		return "-"
+	}
+	used, total := l.MemoryUsedBytes, l.MemoryTotalBytes
+	if kind == diskUsage {
+		used, total = l.DiskUsedBytes, l.DiskTotalBytes
+	}
+	if total <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d%%", used*100/total)
+}
+
+// Isolation values as they arrive over protojson.
+const (
+	isolationPerContainer     = "STORAGE_ISOLATION_PER_CONTAINER"
+	isolationSharedFilesystem = "STORAGE_ISOLATION_SHARED_FILESYSTEM"
+	isolationUnknownDriver    = "STORAGE_ISOLATION_UNKNOWN_DRIVER"
+)
+
+// formatStorage renders the storage column: the driver name, flagged when the
+// pool does not isolate tenant volumes.
+//
+// "-" when the backend reported nothing. Deliberately not a driver guess: an
+// unmeasured pool must not read as a safe one, the same rule formatCPULoad
+// follows for an unmeasured host.
+func formatStorage(s *backendStorage) string {
+	if s == nil || s.DriverName == "" {
+		return "-"
+	}
+	switch s.Isolation {
+	case isolationSharedFilesystem:
+		return s.DriverName + " ⚠"
+	case isolationUnknownDriver:
+		// Read, but not a driver we classify — flag it as unverified rather
+		// than asserting the shared-journal mechanism we have not established
+		// for it.
+		return s.DriverName + " ?"
+	default:
+		return s.DriverName
+	}
+}
+
+// sharedFilesystemBackends counts backends positively known to be on a
+// shared-filesystem pool.
+//
+// Backends that reported nothing, and drivers we could not classify, are NOT
+// counted: "unknown" is not "exposed", and padding the count with unknowns
+// would make the warning something operators learn to ignore.
+func sharedFilesystemBackends(backends []backendInfo) int {
+	n := 0
+	for _, b := range backends {
+		if b.Storage != nil && b.Storage.Isolation == isolationSharedFilesystem {
+			n++
+		}
+	}
+	return n
+}
