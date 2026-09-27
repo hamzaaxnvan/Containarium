@@ -41,3 +41,46 @@ func TestReadOnlyRPCs_RequireSomeReadAuthority(t *testing.T) {
 		name string
 		call func(context.Context) error
 	}{
+		{"ContainerService.ListStacks", func(c context.Context) error {
+			_, err := cs.ListStacks(c, &pb.ListStacksRequest{})
+			return err
+		}},
+		{"ContainerService.GetMonitoringInfo", func(c context.Context) error {
+			_, err := cs.GetMonitoringInfo(c, &pb.GetMonitoringInfoRequest{})
+			return err
+		}},
+		{"ContainerService.GetAlertingInfo", func(c context.Context) error {
+			_, err := cs.GetAlertingInfo(c, &pb.GetAlertingInfoRequest{})
+			return err
+		}},
+		{"ContainerService.ListDefaultAlertRules", func(c context.Context) error {
+			_, err := cs.ListDefaultAlertRules(c, &pb.ListDefaultAlertRulesRequest{})
+			return err
+		}},
+		{"ThreatDetectionService.GetSentryStatus", func(c context.Context) error {
+			_, err := td.GetSentryStatus(c, &pb.GetSentryStatusRequest{})
+			return err
+		}},
+		{"ThreatDetectionService.ListBadDestinations", func(c context.Context) error {
+			_, err := td.ListBadDestinations(c, &pb.ListBadDestinationsRequest{})
+			return err
+		}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name+"/unauthenticated", func(t *testing.T) {
+			if err := c.call(context.Background()); err == nil {
+				t.Fatal("returned data to a caller with no authenticated subject")
+			}
+		})
+		t.Run(c.name+"/authenticated-wrong-scope", func(t *testing.T) {
+			err := c.call(wrongScopeCtx())
+			if err == nil {
+				t.Fatal("returned data to a caller holding only an unrelated scope")
+			}
+			if got := status.Code(err); got != codes.PermissionDenied {
+				t.Errorf("code = %v, want PermissionDenied (%v)", got, err)
+			}
+		})
+	}
+}
