@@ -311,3 +311,82 @@ export default function NetworkTopologyView({
           onTogglePassthroughRoute={onTogglePassthroughRoute}
         />
       </div>
+
+      {/* Add Route Dialog */}
+      <Modal
+        open={addRouteDialog}
+        onClose={() => setAddRouteDialog(false)}
+        title="Add Route"
+        size="md"
+        footer={
+          <>
+            <ModalBtn onClick={() => setAddRouteDialog(false)}>Cancel</ModalBtn>
+            <ModalBtn variant="primary" onClick={handleAddRoute} disabled={!newRoute.domain || !newRoute.targetIp || !newRoute.targetPort}>Add Route</ModalBtn>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-3">
+          <p className="text-xs text-[var(--text-muted)]">Map a domain to a container. For HTTP/gRPC, TLS is terminated at Caddy. For TLS Passthrough, raw TLS is forwarded via SNI routing (mTLS preserved).</p>
+          <FormField label="Domain" hint={baseDomain ? `Base domain: ${baseDomain}` : 'Enter the full domain name'}>
+            <>
+              <datalist id="domain-suggestions-list">
+                {domainSuggestions.map(s => <option key={s.fullDomain} value={s.fullDomain}>{s.subdomain}</option>)}
+              </datalist>
+              <input list="domain-suggestions-list" type="text" value={newRoute.domain} onChange={e => setNewRoute({ ...newRoute, domain: e.target.value })}
+                placeholder={baseDomain ? `subdomain.${baseDomain}` : 'test.example.com'} className={inputCls} />
+            </>
+          </FormField>
+          <FormField label="Protocol">
+            <select value={newRoute.protocol} onChange={e => setNewRoute({ ...newRoute, protocol: e.target.value as RouteProtocol })} className={selectCls}>
+              <option value="ROUTE_PROTOCOL_HTTP">HTTP (Web traffic)</option>
+              <option value="ROUTE_PROTOCOL_GRPC">gRPC (HTTP/2)</option>
+              <option value="ROUTE_PROTOCOL_TLS_PASSTHROUGH">TLS Passthrough (mTLS/SNI)</option>
+            </select>
+          </FormField>
+          {newRoute.protocol === 'ROUTE_PROTOCOL_TLS_PASSTHROUGH' && (
+            <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 p-3 text-[10px] text-[var(--c-blue)]">
+              TLS passthrough routes forward raw TLS traffic on :443 via SNI, preserving end-to-end mTLS. No additional firewall changes needed.
+            </div>
+          )}
+          <FormField label="Target IP" hint="Select a container or enter IP manually">
+            <>
+              <datalist id="container-ip-list">
+                {containerOptions.map(c => <option key={c.ip} value={c.ip}>{c.name}</option>)}
+              </datalist>
+              <input list="container-ip-list" type="text" value={newRoute.targetIp} onChange={e => setNewRoute({ ...newRoute, targetIp: e.target.value })}
+                placeholder="10.0.3.136" className={inputCls} />
+            </>
+          </FormField>
+          <FormField label="Target Port" hint="The port on the container">
+            <input type="number" value={newRoute.targetPort} onChange={e => setNewRoute({ ...newRoute, targetPort: e.target.value })}
+              placeholder="8080" className={inputCls} />
+          </FormField>
+        </div>
+      </Modal>
+
+      {/* Delete Proxy Route Dialog */}
+      <Modal open={deleteRouteDialog.open} onClose={() => setDeleteRouteDialog({ open: false, domain: '' })} title="Delete Proxy Route" size="sm"
+        footer={
+          <>
+            <ModalBtn onClick={() => setDeleteRouteDialog({ open: false, domain: '' })}>Cancel</ModalBtn>
+            <ModalBtn variant="danger" onClick={handleConfirmDeleteRoute}>Delete</ModalBtn>
+          </>
+        }>
+        <p className="text-sm text-[var(--text)]">Delete the route for <strong>{deleteRouteDialog.domain}</strong>?</p>
+        <p className="mt-1 text-xs text-[var(--text-muted)]">This will remove the proxy configuration for this domain.</p>
+      </Modal>
+
+      {/* Delete Passthrough Route Dialog */}
+      <Modal open={deletePassthroughDialog.open} onClose={() => setDeletePassthroughDialog({ open: false, externalPort: 0, protocol: 'ROUTE_PROTOCOL_TCP' })} title="Delete Passthrough Route" size="sm"
+        footer={
+          <>
+            <ModalBtn onClick={() => setDeletePassthroughDialog({ open: false, externalPort: 0, protocol: 'ROUTE_PROTOCOL_TCP' })}>Cancel</ModalBtn>
+            <ModalBtn variant="danger" onClick={handleConfirmDeletePassthrough}>Delete</ModalBtn>
+          </>
+        }>
+        <p className="text-sm text-[var(--text)]">Delete the passthrough route for port <strong>{deletePassthroughDialog.externalPort}</strong>?</p>
+        <p className="mt-1 text-xs text-[var(--text-muted)]">This will remove the TCP/UDP port forwarding rule from iptables.</p>
+      </Modal>
+    </div>
+  );
+}

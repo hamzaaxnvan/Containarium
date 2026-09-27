@@ -3,3 +3,7 @@
 # match the daemon's CONTAINARIUM_K8S_GATEWAY_NAMESPACE (default "agent-gateway").
 apiVersion: v1
 kind: Namespace
+metadata:
+  name: agent-gateway
+  labels:
+    app.kubernetes.io/part-of: containarium-agent-box
