@@ -883,3 +883,888 @@ func (m *Manager) installPackages(containerName string, enablePodman bool, stack
 	// NOPASSWD sudo is one `passwd` away from making that reachable. The
 	// managed drop-in sorts before every distro/cloud-init drop-in, so it
 	// wins under sshd's first-match rule. It is user-independent, so it
+	// lands in baked base images too; the posture reconciler
+	// (internal/security) re-asserts it on running boxes afterwards.
+	// Fatal on failure: a box this daemon cannot write a file into is not
+	// a box the rest of provisioning will succeed on either.
+	if err := m.incus.Exec(containerName, []string{"mkdir", "-p", sshdpolicy.DropInDir}); err != nil {
+		return fmt.Errorf("failed to create %s: %w", sshdpolicy.DropInDir, err)
+	}
+	if err := m.incus.WriteFile(containerName, sshdpolicy.DropInPath, sshdpolicy.DropInContent(), sshdpolicy.DropInMode); err != nil {
+		return fmt.Errorf("failed to write sshd policy drop-in: %w", err)
+	}
+
+	sshService := pkgMgr.SSHServiceName()
+	if err := m.incus.Exec(containerName, []string{"systemctl", "enable", sshService}); err != nil {
+		return fmt.Errorf("failed to enable %s: %w", sshService, err)
+	}
+	// restart, not start: an image that ships sshd already running would
+	// otherwise keep serving the pre-drop-in configuration.
+	if err := m.incus.Exec(containerName, []string{"systemctl", "restart", sshService}); err != nil {
+		return fmt.Errorf("failed to restart %s: %w", sshService, err)
+	}
+
+	// Run base scripts post-install commands as root
+	for _, bs := range baseScripts {
+		for _, cmd := range bs.GetPostInstallForFamily(familyStr) {
+			cmd = strings.ReplaceAll(cmd, "{{USERNAME}}", username)
+			_ = m.incus.Exec(containerName, []string{"bash", "-c", cmd})
+		}
+	}
+
+	// Run stack post-install commands as the user. Stack parameters are
+	// exported as CONTAINARIUM_STACK_<name> env vars (via su -c, which runs
+	// a shell that evaluates the export+command).
+	if stackID != "" {
+		stackMgr := stacks.GetDefault()
+		stack, err := stackMgr.GetStack(stackID)
+		if err == nil {
+			for _, cmd := range stack.GetPostInstallForFamily(familyStr) {
+				userCmd := []string{"su", "-", username, "-c", envPrefix + cmd}
+				_ = m.incus.Exec(containerName, userCmd)
+			}
+		}
+
+		// Add user to docker group if docker stack is selected
+		if stackID == "docker" || stackID == "gpu-docker" {
+			_ = m.incus.Exec(containerName, []string{"usermod", "-aG", "docker", username})
+		}
+	}
+
+	// Install cgroup wrappers so nested containers see LXC resource limits
+	isDockerStack := stackID == "docker" || stackID == "gpu-docker"
+	if err := m.installCgroupWrappers(containerName, enablePodman, isDockerStack); err != nil {
+		log.Printf("Warning: failed to install cgroup wrappers: %v", err)
+	}
+
+	// Install OCI runtime for Docker so Compose v2 and API-created containers
+	// also see LXC cgroup limits (CLI wrapper only catches docker CLI calls)
+	if isDockerStack {
+		if err := m.installDockerOCIRuntime(containerName); err != nil {
+			log.Printf("Warning: failed to install Docker OCI runtime: %v", err)
+		}
+		// Configure NVIDIA runtime for Docker if gpu-docker stack
+		if stackID == "gpu-docker" {
+			_ = m.incus.Exec(containerName, []string{"nvidia-ctk", "runtime", "configure", "--runtime=docker"})
+			_ = m.incus.Exec(containerName, []string{"systemctl", "restart", "docker"})
+		}
+	}
+
+	return nil
+}
+
+// enablePodmanRestartDurability makes podman workloads in a freshly-provisioned
+// tenant survive a host reboot/preemption. The LXC already auto-starts
+// (boot.autostart=true) and host boot → Incus → tenant systemd is in place; the
+// remaining link is restarting the podman containers themselves. This wires up
+// both podman runtimes:
+//
+//   - rootful: enable the system podman-restart.service, which on boot restarts
+//     every root-owned container created with --restart=always|unless-stopped.
+//   - rootless: enable-linger for the tenant user so their systemd --user
+//     manager starts at boot even with no login session, and enable the *user*
+//     podman-restart.service (installed by symlink so it doesn't depend on a
+//     live user bus at provision time) to do the same for their containers.
+//
+// All best-effort and non-fatal: a missing unit (older podman) or any failure
+// is logged, not propagated, so it never blocks container creation. It only
+// restarts containers that carry a restart policy — callers/tenants must still
+// create workloads with --restart=always (or a compose `restart: always`). See
+// issue #387.
+func (m *Manager) enablePodmanRestartDurability(containerName, username string) {
+	// Rootful: system-wide podman-restart.service.
+	if err := m.incus.Exec(containerName, []string{"systemctl", "enable", "podman-restart.service"}); err != nil {
+		log.Printf("Warning: failed to enable system podman-restart.service in %s: %v", containerName, err)
+	}
+
+	// Rootless: linger + user podman-restart.service for the tenant user.
+	if username == "" {
+		return
+	}
+	if err := m.incus.Exec(containerName, []string{"loginctl", "enable-linger", username}); err != nil {
+		log.Printf("Warning: failed to enable-linger for %s in %s: %v", username, containerName, err)
+	}
+	// Enable the user unit by creating the wants symlink directly. `systemctl
+	// --user enable` would need a live user bus (not guaranteed mid-provision),
+	// whereas the symlink is what enable produces and is picked up when the
+	// lingering user manager starts at boot. Idempotent (ln -sf). Resolves the
+	// home dir and the shipped unit path at run time so it works across distros.
+	const enableUserUnit = `set -e
+home=$(getent passwd "$1" | cut -d: -f6)
+unit=$(ls /usr/lib/systemd/user/podman-restart.service /lib/systemd/user/podman-restart.service 2>/dev/null | head -1)
+[ -n "$home" ] && [ -n "$unit" ] || { echo "podman-restart user unit or home not found; skipping" >&2; exit 0; }
+mkdir -p "$home/.config/systemd/user/default.target.wants"
+ln -sf "$unit" "$home/.config/systemd/user/default.target.wants/podman-restart.service"
+chown -R "$1:$1" "$home/.config"`
+	if err := m.incus.Exec(containerName, []string{"bash", "-c", enableUserUnit, "bash", username}); err != nil {
+		log.Printf("Warning: failed to enable user podman-restart.service for %s in %s: %v", username, containerName, err)
+	}
+}
+
+// timedExecer is the optional capability a Manager's incus backend can
+// offer: an Exec bounded by an explicit deadline instead of blocking
+// forever on a wedged operation. Detected via type assertion so a backend
+// that doesn't implement it (test doubles that predate it) falls back to
+// the ordinary, unbounded Exec — mirrors the compactSigner pattern in
+// containarium-cloud's internal/auth/metrics_token.go.
+type timedExecer interface {
+	ExecWithTimeout(containerName string, command []string, timeout time.Duration) error
+}
+
+// createUserTimeout bounds createUser's exec (cloud#1128): a wedged Incus
+// operation has previously hung this step forever, which pins the
+// container's reported state at CREATING with no terminal state ever
+// reached — the goroutine that would report ERROR never gets that far. A
+// var (not const) so tests can shrink it.
+var createUserTimeout = 60 * time.Second
+
+// createUser creates a user in the container with sudo access.
+//
+// The three account commands run as ONE `sh -c` exec, not three: each
+// in-guest Exec is a websocket-upgrading Incus operation at ~50-150ms
+// apiece, and this path is on every create (Finding 2 in
+// docs/architecture/two-digit-ms-sandbox-spawn.md). Every argv is
+// rendered through shellJoin, so nothing in it — username included —
+// is ever interpreted by the shell.
+func (m *Manager) createUser(containerName, username string, family ostype.OSFamily) error {
+	pkgMgr := ospkg.ForFamily(family)
+
+	script := shellJoin(pkgMgr.CreateUserCmd(username, "")) + // OS-aware: adduser on Debian, useradd on RHEL
+		" && " + shellJoin([]string{"usermod", "-aG", pkgMgr.SudoGroup(), username}) + // "sudo" on Debian, "wheel" on RHEL
+		// Podman typically runs rootless; group membership is best-effort
+		// (ignored when the group doesn't exist), as it always was.
+		" && { " + shellJoin([]string{"usermod", "-aG", "podman", username}) + " || true; }"
+
+	execFn := m.incus.Exec
+	if te, ok := m.incus.(timedExecer); ok {
+		execFn = func(name string, cmd []string) error {
+			return te.ExecWithTimeout(name, cmd, createUserTimeout)
+		}
+	}
+	if err := execFn(containerName, []string{"/bin/sh", "-c", script}); err != nil {
+		return fmt.Errorf("failed to create user: %w", err)
+	}
+
+	// Allow passwordless sudo
+	// SECURITY FIX: Use Incus file push API instead of shell echo
+	// This prevents potential shell injection if username validation is ever relaxed
+	sudoersLine := fmt.Sprintf("%s ALL=(ALL) NOPASSWD:ALL\n", username)
+	sudoersPath := fmt.Sprintf("/etc/sudoers.d/%s", username)
+
+	if err := m.incus.WriteFile(containerName, sudoersPath, []byte(sudoersLine), "0440"); err != nil {
+		return fmt.Errorf("failed to configure sudo: %w", err)
+	}
+
+	return nil
+}
+
+// SetAuthorizedKeys sets a user's authorized_keys to exactly the given set of
+// SSH public keys. It is the exported entry point for the box.BoxBackend seam
+// (pkg/core/box/lxc); it delegates to the same addSSHKeys path the create flow
+// uses, which overwrites authorized_keys via the Incus file push API. The
+// container name follows the create-time convention (<username>-container).
+func (m *Manager) SetAuthorizedKeys(username string, sshKeys []string) error {
+	return m.addSSHKeys(username+"-container", username, sshKeys)
+}
+
+// addSSHKeysStagingPath is where addSSHKeys stages the authorized_keys
+// content (via the file push API, root-owned 0600) before the placement
+// exec installs it into the user's home. Suffixed per-user so concurrent
+// seeding of different accounts can't collide.
+func addSSHKeysStagingPath(username string) string {
+	return "/run/containarium.authorized_keys." + username
+}
+
+// addSSHKeys sets the SSH public keys in a user's authorized_keys.
+// SECURITY: Uses Incus file push API to avoid shell injection vulnerabilities
+//
+// One WriteFile + one exec, not three execs around a write: the content
+// is staged via the file API (so key material still never passes through
+// a shell), then a single script creates the directory and installs the
+// file with the right mode and owner. Each in-guest Exec is a
+// websocket-upgrading Incus operation at ~50-150ms apiece (Finding 2 in
+// docs/architecture/two-digit-ms-sandbox-spawn.md). The username reaches
+// the script only as a positional parameter, never spliced into the
+// script text — same idiom as enablePodmanRestartDurability.
+func (m *Manager) addSSHKeys(containerName, username string, sshKeys []string) error {
+	sshDir := fmt.Sprintf("/home/%s/.ssh", username)
+
+	// Build authorized_keys content safely (no shell involved).
+	// Validate each key to prevent placeholder/template strings (e.g., "YOUR_KEY")
+	// from being written as if they were valid SSH keys.
+	var keysContent strings.Builder
+	for _, key := range sshKeys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if err := ValidateSSHPublicKey(key); err != nil {
+			return fmt.Errorf("invalid SSH key: %w", err)
+		}
+		keysContent.WriteString(key)
+		keysContent.WriteString("\n")
+	}
+
+	staging := addSSHKeysStagingPath(username)
+	if err := m.incus.WriteFile(containerName, staging, []byte(keysContent.String()), "0600"); err != nil {
+		return fmt.Errorf("failed to write authorized_keys: %w", err)
+	}
+
+	// $1 = .ssh dir, $2 = username, $3 = staged content.
+	const placeKeys = `set -e
+install -d -m 700 -o "$2" -g "$2" "$1"
+install -m 600 -o "$2" -g "$2" "$3" "$1/authorized_keys"
+rm -f "$3"`
+	if err := m.incus.Exec(containerName, []string{"/bin/sh", "-c", placeKeys, "sh", sshDir, username, staging}); err != nil {
+		return fmt.Errorf("failed to install authorized_keys: %w", err)
+	}
+
+	return nil
+}
+
+// List lists all containers
+func (m *Manager) List() ([]incus.ContainerInfo, error) {
+	return m.incus.ListContainers()
+}
+
+// Get gets information about a specific container
+// SetEnv sets an environment variable on an existing container.
+// Thin wrapper over the incus client's SetEnv so callers in the
+// internal/server layer don't need to import the incus package
+// directly. Used by AdoptMigratedContainer to re-stamp OTel env
+// vars at the destination's collector IP after a migration.
+func (m *Manager) SetEnv(containerName, key, value string) error {
+	// The Backend interface used in tests doesn't expose SetEnv, so
+	// we type-assert to the concrete client. Tests using the mock
+	// backend won't exercise this path (AdoptMigratedContainer is
+	// not in the unit test surface today).
+	if real, ok := m.incus.(*incus.Client); ok {
+		return real.SetEnv(containerName, key, value)
+	}
+	return fmt.Errorf("SetEnv not supported on this incus backend (mock?)")
+}
+
+// UnsetEnv removes an environment variable from an existing
+// container's Incus config (deletes the key rather than setting it
+// to empty — empty-string OTEL_* vars are treated as misconfigured
+// by some SDKs, so absence is the right "disabled" representation).
+// Idempotent. Used by ToggleMonitoring's disable path.
+func (m *Manager) UnsetEnv(containerName, key string) error {
+	if real, ok := m.incus.(*incus.Client); ok {
+		return real.UnsetEnv(containerName, key)
+	}
+	return fmt.Errorf("UnsetEnv not supported on this incus backend (mock?)")
+}
+
+// SetConfig writes an arbitrary Incus config key on a container.
+// Used by ToggleAutoSleep to persist the user.containarium.* keys
+// that Phase 2 and Phase 3 will read.
+func (m *Manager) SetConfig(containerName, key, value string) error {
+	return m.incus.SetConfig(containerName, key, value)
+}
+
+// UnsetConfig removes an arbitrary Incus config key from a container.
+// Used by SetContainerTTL's clear path (duration_seconds == 0) so the
+// "no TTL" state is represented by key absence — symmetric with
+// UnsetEnv for the OTel keys. Idempotent: missing keys are not an
+// error on the backend.
+func (m *Manager) UnsetConfig(containerName, key string) error {
+	return m.incus.UnsetConfig(containerName, key)
+}
+
+// GetContainerImageFingerprint returns the Incus-computed
+// fingerprint of the image the container was created from
+// (Phase 3.1 Phase-C). Thin delegate so the server-layer
+// digest verifier doesn't need a direct reference to the
+// incus backend.
+func (m *Manager) GetContainerImageFingerprint(containerName string) (string, error) {
+	return m.incus.GetContainerImageFingerprint(containerName)
+}
+
+// WriteFile writes a byte slice into the named container at
+// `path` with `mode` (e.g. "0400"). Used by the Phase 4.3
+// file-delivery secret stamper. Type-asserts to the concrete
+// client like SetEnv does; the mock backend used in tests
+// surfaces a descriptive error rather than silently
+// no-op'ing.
+func (m *Manager) WriteFile(containerName, path string, content []byte, mode string) error {
+	if real, ok := m.incus.(*incus.Client); ok {
+		return real.WriteFile(containerName, path, content, mode)
+	}
+	return fmt.Errorf("WriteFile not supported on this incus backend (mock?)")
+}
+
+// ReadFileStream retrieves a file without buffering it in host memory.
+func (m *Manager) ReadFileStream(containerName, path string) (io.ReadCloser, error) {
+	if real, ok := m.incus.(*incus.Client); ok {
+		return real.ReadFileStream(containerName, path)
+	}
+	return nil, fmt.Errorf("ReadFileStream not supported on this incus backend")
+}
+
+// WriteFileStream consumes a file stream, including any final read error.
+func (m *Manager) WriteFileStream(containerName, path string, content io.Reader, mode string) error {
+	if real, ok := m.incus.(*incus.Client); ok {
+		return real.WriteFileStream(containerName, path, content, mode)
+	}
+	return fmt.Errorf("WriteFileStream not supported on this incus backend")
+}
+
+// PushFile is WriteFile streamed from content instead of held in memory
+// (the guardrail deploy gate delivers whole datasets this way).
+func (m *Manager) PushFile(containerName, path string, content io.ReadSeeker, mode string) error {
+	if real, ok := m.incus.(*incus.Client); ok {
+		return real.PushFile(containerName, path, content, mode)
+	}
+	return fmt.Errorf("PushFile not supported on this incus backend (mock?)")
+}
+
+// Exec runs a command inside the container. Phase 4.3 uses
+// it to mkdir + chmod the /run/secrets directory once per
+// stamp; broader callers like AdoptMigratedContainer already
+// reach Exec directly via the incus.Client. Type-asserts to
+// the concrete client.
+func (m *Manager) Exec(containerName string, command []string) error {
+	if real, ok := m.incus.(*incus.Client); ok {
+		return real.Exec(containerName, command)
+	}
+	return fmt.Errorf("Exec not supported on this incus backend (mock?)")
+}
+
+// ExecWithOutput runs a command inside the container and returns its
+// stdout/stderr. Used by the backup server to surface pg_dump /
+// pg_restore diagnostics (which go to stderr) when the command fails.
+// Type-asserts to the concrete client.
+func (m *Manager) ExecWithOutput(containerName string, command []string) (string, string, error) {
+	if real, ok := m.incus.(*incus.Client); ok {
+		return real.ExecWithOutput(containerName, command)
+	}
+	return "", "", fmt.Errorf("ExecWithOutput not supported on this incus backend (mock?)")
+}
+
+// ExecWithExitCode runs a command inside the container and reports a
+// non-zero exit as data (exitCode) rather than folding it into err — the
+// caller needs to distinguish "ran and failed" (e.g. `id` reporting no
+// such user, #1487) from "couldn't run it at all" (transport/backend
+// error). Unlike ExecWithOutput, ExecWithExitCode is already part of the
+// incus.Backend interface, so this is a direct call, not a type-assertion
+// to the concrete client — it works against the mock backend in tests.
+func (m *Manager) ExecWithExitCode(containerName string, command []string) (stdout, stderr string, exitCode int, err error) {
+	return m.incus.ExecWithExitCode(containerName, command)
+}
+
+// ReadFile pulls a file from inside the container into host memory.
+// Used by the backup server to retrieve a pg_dump artifact written to
+// the container's /tmp before shipping it off-host. Suitable for
+// logical dumps (typically MBs); not for arbitrarily large files.
+// Type-asserts to the concrete client.
+func (m *Manager) ReadFile(containerName, path string) ([]byte, error) {
+	if real, ok := m.incus.(*incus.Client); ok {
+		return real.ReadFile(containerName, path)
+	}
+	return nil, fmt.Errorf("ReadFile not supported on this incus backend (mock?)")
+}
+
+// WriteOTelEnvFile drops the monitoring env vars as a dotenv file at
+// OTelEnvFilePath inside the container, so docker-compose / nested
+// docker apps can consume them via `env_file:` — they don't inherit
+// the LXC's Incus-config environment. See #370. Thin shim over the
+// shared WriteEnvFile delivery (#492).
+func (m *Manager) WriteOTelEnvFile(containerName string, env map[string]string) error {
+	return m.WriteEnvFile(containerName, OTelEnvFile, env)
+}
+
+// RemoveOTelEnvFile deletes the dotenv file written by
+// WriteOTelEnvFile. Used on the monitoring-disable path so a stale
+// endpoint doesn't linger. Best-effort by nature (rm -f); a missing
+// file is not an error. Thin shim over the shared RemoveEnvFile (#492).
+func (m *Manager) RemoveOTelEnvFile(containerName string) error {
+	return m.RemoveEnvFile(containerName, OTelEnvFile)
+}
+
+func (m *Manager) Get(username string) (*incus.ContainerInfo, error) {
+	containerName := username + "-container"
+	return m.incus.GetContainer(containerName)
+}
+
+// GetConsoleLog returns the container's boot-time console ring-buffer log.
+// See incus.Backend.GetConsoleLog.
+func (m *Manager) GetConsoleLog(username string) (string, error) {
+	containerName := username + "-container"
+	return m.incus.GetConsoleLog(containerName)
+}
+
+// Stop stops a running container
+func (m *Manager) Stop(username string, force bool) error {
+	containerName := username + "-container"
+	return m.incus.StopContainer(containerName, force)
+}
+
+// Start starts a stopped container
+func (m *Manager) Start(username string) error {
+	containerName := username + "-container"
+	return m.incus.StartContainer(containerName)
+}
+
+// StopIfRunning stops the container unless it is already stopped (#3242). A
+// stop request asks for an end state; when that state already holds the call
+// succeeds with changed=false and sends no action to the backend, so callers can
+// skip post-stop work (stamping stopped_at, dropping the key, emitting an
+// event). The state is re-read when the backend's stop fails: a concurrent stop
+// that won the race leaves the instance Stopped, which is success for this
+// caller too (changed=false). Any other failure, including a lookup that
+// reports the instance missing, is returned unchanged for the caller to
+// classify.
+func (m *Manager) StopIfRunning(username string, force bool) (changed bool, err error) {
+	return m.ensureState(username+"-container", "Stopped", func(n string) error { return m.incus.StopContainer(n, force) })
+}
+
+// StartIfStopped is the start counterpart of StopIfRunning: an instance that is
+// already Running is success with changed=false (#3242).
+func (m *Manager) StartIfStopped(username string) (changed bool, err error) {
+	return m.ensureState(username+"-container", "Running", m.incus.StartContainer)
+}
+
+func (m *Manager) ensureState(containerName, want string, act func(string) error) (bool, error) {
+	info, err := m.incus.GetContainer(containerName)
+	if err != nil {
+		return false, err
+	}
+	if info != nil && info.State == want {
+		return false, nil
+	}
+	if err := act(containerName); err != nil {
+		// Close the read-then-act race: someone else reached the end state.
+		if cur, gerr := m.incus.GetContainer(containerName); gerr == nil && cur != nil && cur.State == want {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// Delete deletes a container
+func (m *Manager) Delete(username string, force bool) error {
+	containerName := username + "-container"
+
+	// Get container state
+	info, err := m.incus.GetContainer(containerName)
+	if err != nil {
+		return fmt.Errorf("container not found: %w", err)
+	}
+
+	// Stop if running
+	if info.State == "Running" {
+		if err := m.incus.StopContainer(containerName, force); err != nil {
+			return fmt.Errorf("failed to stop container: %w", err)
+		}
+	}
+
+	// Delete
+	if err := m.incus.DeleteContainer(containerName); err != nil {
+		return fmt.Errorf("failed to delete container: %w", err)
+	}
+
+	return nil
+}
+
+// cleanup removes a container (used on creation failure)
+// jumpAccountJoinTimeout bounds how long a failing create waits for the
+// concurrent account creation (flock -w 30 and a few retries bound it already;
+// this is the backstop). A var so a test can shorten it.
+var jumpAccountJoinTimeout = 2 * time.Minute
+
+// abortCreate rolls back a Linux create that failed after step 3 started the
+// host jump-account goroutine, and returns cause (#2850). The container is
+// removed as before. Then, if the account goroutine is still in flight
+// (jumpAccountDone non-nil) it is waited for, so the account cannot be created
+// after the removal below; and an account that did not exist when this create
+// started is removed, because nothing else will: the daemon's delete path acts
+// on a box that exists, and this one is gone. An account that already existed
+// is not ours and is left alone.
+//
+// Best-effort and quiet: a failure to remove the account is logged and never
+// replaces cause, which is what the caller needs to see.
+func (m *Manager) abortCreate(containerName, username string, jumpAccountDone <-chan error, accountPreexisted bool, cause error) error {
+	_ = m.cleanup(containerName)
+	if jumpAccountDone != nil {
+		select {
+		case <-jumpAccountDone:
+		case <-time.After(jumpAccountJoinTimeout):
+			log.Printf("[create] %s: the jump-account step did not finish within %s; leaving the host account %q for the operator", containerName, jumpAccountJoinTimeout, username)
+			return cause
+		}
+	}
+	if accountPreexisted {
+		return cause
+	}
+	if err := deleteJumpServerAccountFn(username, false); err != nil {
+		log.Printf("[create] %s: could not remove the host account %q left by the failed create: %v", containerName, username, err)
+	}
+	return cause
+}
+
+func (m *Manager) cleanup(containerName string) error {
+	// Try to stop first (ignore errors)
+	_ = m.incus.StopContainer(containerName, true)
+
+	// Delete
+	return m.incus.DeleteContainer(containerName)
+}
+
+// GetServerInfo gets information about the Incus server
+func (m *Manager) GetServerInfo() (*incus.ServerInfo, error) {
+	server, err := m.incus.GetServerInfo()
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to our own type for easier use
+	info := &incus.ServerInfo{
+		Version:       server.Environment.ServerVersion,
+		KernelVersion: server.Environment.KernelVersion,
+	}
+
+	return info, nil
+}
+
+// getJumpServerSSHKey reads the jump server's SSH public key for ProxyJump support
+func getJumpServerSSHKey() (string, error) {
+	// First, try the systemd-accessible location (set up by startup script)
+	systemdKeyPath := "/etc/containarium/jump_server_key.pub"
+	if keyBytes, err := os.ReadFile(systemdKeyPath); err == nil {
+		key := strings.TrimSpace(string(keyBytes))
+		if key != "" {
+			return key, nil
+		}
+	}
+
+	// Fallback: Try common SSH public key locations
+	// Note: This won't work if ProtectHome=true in systemd service
+	// SECURITY FIX: Removed hardcoded developer username path
+	homeDirectories := []string{
+		os.Getenv("HOME"),
+		"/home/ubuntu", // Common on Ubuntu systems
+		"/home/admin",  // Common admin user
+		"/root",        // Fallback to root
+	}
+
+	keyTypes := []string{"id_ed25519.pub", "id_rsa.pub", "id_ecdsa.pub"}
+
+	for _, homeDir := range homeDirectories {
+		if homeDir == "" {
+			continue
+		}
+		for _, keyType := range keyTypes {
+			keyPath := homeDir + "/.ssh/" + keyType
+			if keyBytes, err := os.ReadFile(keyPath); err == nil {
+				key := strings.TrimSpace(string(keyBytes))
+				if key != "" {
+					return key, nil
+				}
+			}
+		}
+	}
+
+	// No SSH key found - this is OK, just means ProxyJump won't work automatically
+	return "", nil
+}
+
+// Resize dynamically adjusts container resources (CPU, memory, disk) without downtime
+func (m *Manager) Resize(containerName, cpu, memory, disk string, verbose bool) error {
+	if verbose {
+		fmt.Printf("Resizing container: %s\n", containerName)
+	}
+
+	// Check if container exists
+	_, err := m.incus.GetContainer(containerName)
+	if err != nil {
+		return fmt.Errorf("container not found: %w", err)
+	}
+
+	changed := false
+
+	// Resize Disk FIRST — if the container's disk is full, Incus cannot write
+	// its backup.yaml for any config change. Expanding disk must happen before
+	// CPU/memory changes so those updates can succeed.
+	if disk != "" {
+		if verbose {
+			fmt.Printf("  Setting disk size: %s\n", disk)
+		}
+		if err := m.incus.SetDeviceSize(containerName, "root", disk); err != nil {
+			return fmt.Errorf("failed to set disk size: %w", err)
+		}
+		changed = true
+	}
+
+	// Resize CPU
+	if cpu != "" {
+		if verbose {
+			fmt.Printf("  Setting CPU limit: %s\n", cpu)
+		}
+		if err := m.incus.SetCPULimit(containerName, cpu); err != nil {
+			if strings.Contains(err.Error(), "disk quota exceeded") || strings.Contains(err.Error(), "no space left") {
+				return fmt.Errorf("container disk is full. Include a larger disk size in the resize request, or clean up disk space first")
+			}
+			return fmt.Errorf("failed to set CPU limit: %w", err)
+		}
+		changed = true
+	}
+
+	// Resize Memory
+	if memory != "" {
+		if verbose {
+			fmt.Printf("  Setting memory limit: %s\n", memory)
+		}
+		if err := m.incus.SetConfig(containerName, "limits.memory", memory); err != nil {
+			if strings.Contains(err.Error(), "disk quota exceeded") || strings.Contains(err.Error(), "no space left") {
+				return fmt.Errorf("container disk is full. Include a larger disk size in the resize request, or clean up disk space first")
+			}
+			return fmt.Errorf("failed to set memory limit: %w", err)
+		}
+		changed = true
+	}
+
+	if !changed {
+		return fmt.Errorf("no resources specified to resize")
+	}
+
+	if verbose {
+		fmt.Println("  ✓ Resources updated successfully (no restart required)")
+	}
+
+	return nil
+}
+
+// CleanupDisk frees disk space inside a user's container
+func (m *Manager) CleanupDisk(username string) (string, int64, error) {
+	containerName := username + "-container"
+
+	// Verify container exists
+	_, err := m.incus.GetContainer(containerName)
+	if err != nil {
+		return "", 0, fmt.Errorf("container not found: %w", err)
+	}
+
+	return m.incus.CleanupDisk(containerName)
+}
+
+// InstallStack installs a stack or base script on a running container
+func (m *Manager) InstallStack(username, stackID string) error {
+	containerName := username + "-container"
+	effectiveUser := username
+
+	// Try username-container first; fall back to literal name (for core containers)
+	info, err := m.incus.GetContainer(containerName)
+	if err != nil {
+		// Try the name directly (e.g., "containarium-core-caddy")
+		info, err = m.incus.GetContainer(username)
+		if err != nil {
+			return fmt.Errorf("container not found: %w", err)
+		}
+		containerName = username
+		// For non-standard containers, fall back to "ubuntu" as the user
+		effectiveUser = "ubuntu"
+	}
+	if info.State != "Running" {
+		return fmt.Errorf("container is not running (state: %s)", info.State)
+	}
+
+	// Verify the effective user exists in the container; fall back to "ubuntu"
+	if err := m.incus.Exec(containerName, []string{"id", effectiveUser}); err != nil {
+		log.Printf("User %q not found in %s, falling back to ubuntu", effectiveUser, containerName)
+		effectiveUser = "ubuntu"
+	}
+
+	// Look up in both stacks and base_scripts
+	stackMgr := stacks.GetDefault()
+	stack, isBaseScript, err := stackMgr.GetStackOrBaseScript(stackID)
+	if err != nil {
+		return fmt.Errorf("unknown stack or base script: %s", stackID)
+	}
+
+	// Detect OS family from container label, or probe the container
+	var family ostype.OSFamily
+	if osLabel, ok := info.Labels[ostype.OSTypeLabelKey]; ok {
+		family = ostype.FamilyFromLabel(osLabel)
+	} else {
+		family = ostype.DetectFamily(m.incus, containerName)
+	}
+	pkgMgr := ospkg.ForFamily(family)
+	familyStr := string(family)
+
+	// Update package repos. A base script that installs no packages (the
+	// startup reconcile's timezone script) has nothing to refresh the index
+	// for; running the update anyway cost every running container a round of
+	// mirror traffic on each daemon start and failed outright on boxes without
+	// the package manager (#2617). Dev stacks keep the update: their
+	// pre-install steps may install packages themselves.
+	pkgs := stack.GetPackagesForFamily(familyStr)
+	if !isBaseScript || len(pkgs) > 0 {
+		if err := m.incus.Exec(containerName, pkgMgr.UpdateCmd()); err != nil {
+			return fmt.Errorf("package repo update failed: %w", err)
+		}
+	}
+
+	// Run pre-install commands as root
+	for _, cmd := range stack.GetPreInstallForFamily(familyStr) {
+		cmd = strings.ReplaceAll(cmd, "{{USERNAME}}", effectiveUser)
+		if err := m.incus.Exec(containerName, []string{"bash", "-c", cmd}); err != nil {
+			log.Printf("Warning: pre-install command failed: %v", err)
+		}
+	}
+
+	// Install packages
+	if len(pkgs) > 0 {
+		if err := m.incus.Exec(containerName, pkgMgr.InstallCmd(pkgs)); err != nil {
+			return fmt.Errorf("package install failed: %w", err)
+		}
+	}
+
+	// Run post-install commands
+	for _, cmd := range stack.GetPostInstallForFamily(familyStr) {
+		cmd = strings.ReplaceAll(cmd, "{{USERNAME}}", effectiveUser)
+		if isBaseScript {
+			// Base scripts: run as root
+			if err := m.incus.Exec(containerName, []string{"bash", "-c", cmd}); err != nil {
+				log.Printf("Warning: post-install command failed: %v", err)
+			}
+		} else {
+			// Dev stacks: run as user
+			userCmd := []string{"su", "-", effectiveUser, "-c", cmd}
+			_ = m.incus.Exec(containerName, userCmd)
+		}
+	}
+
+	// Record the stack so list/get report it (#2859). Single-valued: a second
+	// stack replaces the first, matching Container.stack. Base scripts are not
+	// stacks (the startup reconcile runs one in every box) and never record.
+	// A failure to record is logged, not returned: the install itself succeeded.
+	// One retry on any SetConfig error (no typed conflict error exists): the
+	// write is a read-modify-write that can lose an Incus ETag race to another
+	// config update on the same instance, and a second attempt re-reads.
+	if !isBaseScript {
+		err := m.incus.SetConfig(containerName, incus.StackKey, stackID)
+		if err != nil {
+			err = m.incus.SetConfig(containerName, incus.StackKey, stackID)
+		}
+		if err != nil {
+			log.Printf("Warning: installed stack %s in %s but could not record it: %v", stackID, containerName, err)
+		}
+	}
+
+	// Install cgroup wrapper for docker stack so nested containers see LXC limits
+	if stackID == "docker" {
+		if err := m.installCgroupWrappers(containerName, false, true); err != nil {
+			log.Printf("Warning: failed to install docker cgroup wrapper: %v", err)
+		}
+		if err := m.installDockerOCIRuntime(containerName); err != nil {
+			log.Printf("Warning: failed to install Docker OCI runtime: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// GetInfo returns detailed information about a container
+func (m *Manager) GetInfo(containerName string) (*incus.ContainerInfo, error) {
+	return m.incus.GetContainer(containerName)
+}
+
+// ContainerExists checks if a container exists
+func (m *Manager) ContainerExists(containerName string) bool {
+	_, err := m.incus.GetContainer(containerName)
+	return err == nil
+}
+
+// GetMetrics returns runtime metrics for a container
+func (m *Manager) GetMetrics(username string) (*incus.ContainerMetrics, error) {
+	containerName := username + "-container"
+	return m.incus.GetContainerMetrics(containerName)
+}
+
+// GetAllMetrics returns runtime metrics for all containers
+func (m *Manager) GetAllMetrics() ([]*incus.ContainerMetrics, error) {
+	containers, err := m.incus.ListContainers()
+	if err != nil {
+		return nil, err
+	}
+
+	var metrics []*incus.ContainerMetrics
+	for _, c := range containers {
+		m, err := m.incus.GetContainerMetrics(c.Name)
+		if err != nil {
+			continue // Skip containers that fail
+		}
+		metrics = append(metrics, m)
+	}
+
+	return metrics, nil
+}
+
+// SetLabels sets labels on a container, replacing all existing labels
+func (m *Manager) SetLabels(username string, labels map[string]string) error {
+	containerName := username + "-container"
+	return m.incus.SetLabels(containerName, labels)
+}
+
+// GetLabels retrieves labels from a container
+func (m *Manager) GetLabels(username string) (map[string]string, error) {
+	containerName := username + "-container"
+	return m.incus.GetLabels(containerName)
+}
+
+// SetTenant sets the container's explicit owning tenant
+// (incus.TenantLabelKey), which status/list report in place of the name
+// convention. Takes the container name, not a username: the whole point
+// is a box whose owner is not the name it was created under (#2199).
+func (m *Manager) SetTenant(containerName, tenant string) error {
+	if tenant == "" {
+		return fmt.Errorf("tenant is required")
+	}
+	return m.incus.UpdateContainerConfig(containerName, incus.TenantLabelKey, tenant)
+}
+
+// AddLabel adds or updates a single label on a container
+func (m *Manager) AddLabel(username, key, value string) error {
+	containerName := username + "-container"
+	return m.incus.AddLabel(containerName, key, value)
+}
+
+// RemoveLabel removes a single label from a container
+func (m *Manager) RemoveLabel(username, key string) error {
+	containerName := username + "-container"
+	return m.incus.RemoveLabel(containerName, key)
+}
+
+// ListWithLabels lists containers filtered by labels
+func (m *Manager) ListWithLabels(labelFilter map[string]string) ([]incus.ContainerInfo, error) {
+	containers, err := m.incus.ListContainers()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(labelFilter) == 0 {
+		return containers, nil
+	}
+
+	// Filter by labels
+	var filtered []incus.ContainerInfo
+	for _, c := range containers {
+		if incus.MatchLabels(c.Labels, labelFilter) {
+			filtered = append(filtered, c)
+		}
+	}
+
+	return filtered, nil
+}
+
+// markSSHDPolicy stamps the host-side marker that tells the sshd posture
+// reconciler this box was provisioned under the key-only policy. Best
+// effort: a box without the marker is still key-only, it just gets the
+// reconciler's silent first-pass backfill instead of tamper detection.
+func (m *Manager) markSSHDPolicy(containerName string) {
+	if err := m.incus.SetConfig(containerName, sshdpolicy.MarkerKey, sshdpolicy.MarkerValue); err != nil {
+		log.Printf("[sshd-policy] %s: set %s: %v", containerName, sshdpolicy.MarkerKey, err)
+	}
+}
