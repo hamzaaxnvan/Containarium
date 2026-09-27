@@ -98,3 +98,104 @@ func runSnapshotList(cmd *cobra.Command, args []string) error {
 		fmt.Printf("No snapshots for %s\n", args[0])
 		return nil
 	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "NAME\tUSED\tREFERENCED")
+	var total int64
+	for _, s := range resp.GetSnapshots() {
+		total += s.GetUsedBytes()
+		fmt.Fprintf(w, "%s\t%s\t%s\n", s.GetName(),
+			humanBytes(s.GetUsedBytes()), humanBytes(s.GetReferencedBytes()))
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	fmt.Printf("\n%d snapshot(s), holding %s that deleting them would free\n",
+		len(resp.GetSnapshots()), humanBytes(total))
+	return nil
+}
+
+func runSnapshotDelete(cmd *cobra.Command, args []string) error {
+	c, err := newSnapshotClientFn()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	resp, err := c.DeleteContainerSnapshot(&pb.DeleteContainerSnapshotRequest{
+		Username: args[0],
+		Name:     args[1],
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("✅ Snapshot %q deleted, freeing %s\n", args[1], humanBytes(resp.GetFreedBytes()))
+	return nil
+}
+
+var (
+	snapshotRollbackForce        bool
+	snapshotRollbackDestroyNewer bool
+)
+
+var snapshotRollbackCmd = &cobra.Command{
+	Use:   "rollback <username> <snapshot>",
+	Short: "Return a container's storage to the state captured by a snapshot",
+	Long: `Discard everything written since the snapshot.
+
+DESTRUCTIVE, and destructive twice over: every change made since the
+snapshot is gone, and any snapshot taken AFTER the target has to be
+destroyed too. Both are refused by default.
+
+  --force          stop the container first (it is left stopped, because
+                   the data underneath just changed)
+  --destroy-newer  accept losing the restore points taken after the target
+
+A container whose encryption key is unavailable is refused: the rollback
+would succeed, but the result would be ciphertext the daemon cannot open.
+
+  containarium snapshot rollback alice before-upgrade --force --server <host>`,
+	Args: cobra.ExactArgs(2),
+	RunE: runSnapshotRollback,
+}
+
+func init() {
+	snapshotCmd.AddCommand(snapshotRollbackCmd)
+	f := snapshotRollbackCmd.Flags()
+	f.BoolVar(&snapshotRollbackForce, "force", false,
+		"stop the container first if it is running (it is left stopped)")
+	f.BoolVar(&snapshotRollbackDestroyNewer, "destroy-newer", false,
+		"destroy snapshots taken after the target, which ZFS requires to roll back past them")
+}
+
+func runSnapshotRollback(cmd *cobra.Command, args []string) error {
+	c, err := newSnapshotClientFn()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	resp, err := c.RollbackContainerSnapshot(&pb.RollbackContainerSnapshotRequest{
+		Username:     args[0],
+		Name:         args[1],
+		Force:        snapshotRollbackForce,
+		DestroyNewer: snapshotRollbackDestroyNewer,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("✅ %s rolled back to %q\n", args[0], args[1])
+	if resp.GetContainerStopped() {
+		fmt.Printf("   The container was stopped to do this and is still stopped — "+
+			"start it with `containarium wake %s` when you have checked the data.\n", args[0])
+	}
+	// Named, not counted: these restore points no longer exist and nothing
+	// else records which they were.
+	if n := len(resp.GetDestroyedSnapshots()); n > 0 {
+		fmt.Printf("   Destroyed %d newer snapshot(s): %s\n", n,
+			strings.Join(resp.GetDestroyedSnapshots(), ", "))
+	}
+	return nil
+}

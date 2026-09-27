@@ -313,3 +313,318 @@ func TestCodeInstall_VerifyScript(t *testing.T) {
 			}
 			if !tc.absent && !got {
 				t.Errorf("verify script is missing %q:\n%s", tc.want, script)
+			}
+		})
+	}
+
+	if strings.Contains(claudeInstallScript, "--bare") {
+		t.Error("install script must never pass --bare")
+	}
+}
+
+// TestCodeInstall_BootstrapURLApplied covers the new --bootstrap-url: fetch a
+// tarball, unpack it into a temp dir, run its apply.sh as the box user.
+func TestCodeInstall_BootstrapURLApplied(t *testing.T) {
+	const url = "https://example.test/bundles/team.tar.gz"
+	runs, _, err := runInstall(t, "alice", map[string]string{"bootstrap-url": url})
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	scripts := allScripts(runs)
+	for _, want := range []string{url, "tar -xz", "apply.sh", "mktemp -d"} {
+		if !strings.Contains(scripts, want) {
+			t.Errorf("bootstrap step is missing %q:\n%s", want, scripts)
+		}
+	}
+	// The URL is caller-supplied and reaches a shell — it must be quoted.
+	if !strings.Contains(scripts, coderun.ShellQuoteSingle(url)) {
+		t.Errorf("bootstrap URL is not shell-quoted:\n%s", scripts)
+	}
+	// And it must not run as root: no sudo anywhere on this path.
+	if strings.Contains(scripts, "sudo") {
+		t.Errorf("bootstrap must run as the box user, not root:\n%s", scripts)
+	}
+}
+
+func TestCodeInstall_BootstrapURLSkippedWhenEmpty(t *testing.T) {
+	runs, _, err := runInstall(t, "alice", nil)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if scripts := allScripts(runs); strings.Contains(scripts, "apply.sh") {
+		t.Errorf("no --bootstrap-url was given but a bootstrap step ran:\n%s", scripts)
+	}
+}
+
+// TestCodeInstall_LandsAgentBox covers the #2030 AC that `code install` also
+// lands the agent-box helper (and mcp-server) on PATH, so code
+// run/attach/status/stop work on the same box rather than only on an
+// agent-runtime recipe box.
+func TestCodeInstall_LandsAgentBox(t *testing.T) {
+	runs, _, err := runInstall(t, "alice", map[string]string{"release": "v9.9.9"})
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	scripts := allScripts(runs)
+	for _, want := range []string{
+		"releases/download/v9.9.9/agent-box-linux-amd64",
+		"releases/download/v9.9.9/mcp-server-linux-amd64",
+		"$HOME/.local/bin",
+	} {
+		if !strings.Contains(scripts, want) {
+			t.Errorf("agent-box step is missing %q:\n%s", want, scripts)
+		}
+	}
+}
+
+// TestCodeInstall_DefaultReleaseIsVPrefixed pins the default for --release:
+// the CLI's own version, v-prefixed, because release TAGS carry the v and
+// pkg/version does not (see docs/RELEASE-PROCESS.md).
+func TestCodeInstall_DefaultReleaseIsVPrefixed(t *testing.T) {
+	got := defaultAgentBoxRelease()
+	if !strings.HasPrefix(got, "v") {
+		t.Errorf("default release %q must be v-prefixed to match the release tag", got)
+	}
+	if strings.HasPrefix(got, "vv") {
+		t.Errorf("default release %q double-prefixed", got)
+	}
+}
+
+// TestCodeInstall_ClaudeCodeVersionPinned covers --claude-code-version: the
+// installer line itself is unchanged, the version is passed to it as an
+// argument.
+func TestCodeInstall_ClaudeCodeVersionPinned(t *testing.T) {
+	runs, _, err := runInstall(t, "alice", map[string]string{"claude-code-version": "1.0.58"})
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	scripts := allScripts(runs)
+	// Quoted: the version is a flag value reaching a shell.
+	if !strings.Contains(scripts, claudeInstallScript+" -s "+coderun.ShellQuoteSingle("1.0.58")) {
+		t.Errorf("--claude-code-version not passed to the installer:\n%s", scripts)
+	}
+
+	unpinned, _, err := runInstall(t, "alice", nil)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if strings.Contains(allScripts(unpinned), " -s ") {
+		t.Error("an unpinned install must run the installer line verbatim")
+	}
+}
+
+// TestCodeInstall_PrintsBothSignInPaths is the user-facing half of the terms
+// change: after installing, the command has to say how to get a credential,
+// because it no longer provides one.
+func TestCodeInstall_PrintsBothSignInPaths(t *testing.T) {
+	_, out, err := runInstall(t, "alice", nil)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	for _, want := range []string{
+		"containarium connect alice",
+		"claude",
+		"ANTHROPIC_API_KEY",
+		"settings.json",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("post-install output never mentions %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "CLAUDE_CODE_OAUTH_TOKEN") {
+		t.Errorf("post-install output still names a Claude.ai OAuth token:\n%s", out)
+	}
+}
+
+// TestCodeInstallScripts_AreValidPOSIXShell runs every script `code install`
+// sends to a box through `sh -n`. They are built by string concatenation and
+// executed on a remote host, where a syntax error surfaces as an opaque exit
+// status hours after the typo.
+func TestCodeInstallScripts_AreValidPOSIXShell(t *testing.T) {
+	// #1727's scripts join this list. They carry JSON (models.json, code.json)
+	// and a bearer token through single-quoted shell words, which is exactly the
+	// kind of concatenation that produces a script that looks fine and is not.
+	piGateway, err := engine.For(engine.NamePi,
+		engine.Options{Credential: engine.GatewayCredential{Provider: "kafeido"}, Model: "kafeido-coder"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	piSecret, err := engine.For(engine.NamePi,
+		engine.Options{Credential: engine.SecretCredential{Name: "OPENAI_API_KEY"}, Model: "gpt-5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexSecret, err := engine.For(engine.NameCodex,
+		engine.Options{Credential: engine.SecretCredential{Name: "CODEX_API_KEY"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexGateway, err := engine.For(engine.NameCodex,
+		engine.Options{Credential: engine.GatewayCredential{Provider: "openai"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelsJSON, err := engine.RenderPiModelsJSON(engine.PiModelsParams{
+		Provider:    pb.GatewayProvider_GATEWAY_PROVIDER_KAFEIDO,
+		GatewayBase: "http://10.0.0.1:8866/v1/model/kafeido",
+		TokenEnvVar: engine.GatewayTokenEnvVar,
+		Model:       "kafeido-coder",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scripts := map[string]string{
+		"claude-install":      claudeInstallScriptFor("1.2.3"),
+		"claude-install-bare": claudeInstallScriptFor(""),
+		"agent-box":           agentBoxInstallScript("v0.89.0"),
+		"sdlc-skills":         sdlcSkillsInstallScript("v0.89.0", sdlcskills.SkillSets{}),
+		"bootstrap":           bootstrapScript("https://example.test/b.tar.gz"),
+		"verify":              claudeVerifyScript(),
+
+		"pi-install":        piGateway.InstallScript(engine.InstallOptions{Version: engine.PiVersion, ModelsJSON: string(modelsJSON)}),
+		"pi-verify-gateway": piGateway.VerifyScript(),
+		"pi-verify-secret":  piSecret.VerifyScript(),
+
+		"codex-install":        codexSecret.InstallScript(engine.InstallOptions{Version: "0.50.0"}),
+		"codex-install-bare":   codexSecret.InstallScript(engine.InstallOptions{}),
+		"codex-verify-secret":  codexSecret.VerifyScript(),
+		"codex-verify-gateway": codexGateway.VerifyScript(),
+		"claude-verify-gateway": mustEngine(t, engine.NameClaude,
+			engine.GatewayCredential{Provider: "anthropic"}).VerifyScript(),
+		// A token with quotes in it is the shape that breaks naive quoting.
+		"gateway-env": writeGatewayEnvScript("$HOME/.pi/gateway.env", &pb.MintGatewayTokenResponse{
+			BaseUrl: "http://10.0.0.1:8866/v1/model/kafeido",
+			Token:   `tok'with"quotes and $(subshell)`,
+		}),
+		"code-json": writeCodeConfigScript(engine.CodeConfig{
+			Version: 1, Engine: engine.NamePi, Credential: engine.KindGateway,
+			Provider: "kafeido", Model: "kafeido-coder",
+		}),
+	}
+	for name, script := range scripts {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name+".sh")
+			if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			out, err := exec.Command("/bin/sh", "-n", path).CombinedOutput()
+			if err != nil {
+				t.Errorf("sh -n rejected %s: %v\n%s\n--- script ---\n%s", name, err, out, script)
+			}
+		})
+	}
+}
+
+// runVerifyScript executes claudeVerifyScript() against a throwaway HOME with
+// a stub `claude` in place, so the script's actual behavior is tested — not
+// just the strings it contains.
+func runVerifyScript(t *testing.T, setup func(home string)) (string, string, error) {
+	t.Helper()
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".local", "bin"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	stub := "#!/bin/sh\necho '1.2.3 (Claude Code)'\n"
+	if err := os.WriteFile(filepath.Join(home, ".local", "bin", "claude"), []byte(stub), 0o700); err != nil { // #nosec G306 -- a stub the test then executes
+		t.Fatal(err)
+	}
+	if setup != nil {
+		setup(home)
+	}
+	path := filepath.Join(t.TempDir(), "verify.sh")
+	if err := os.WriteFile(path, []byte(claudeVerifyScript()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := exec.Command("/bin/sh", path) // #nosec G204 -- fixed interpreter, package-built script
+	c.Env = append(os.Environ(), "HOME="+home, "ANTHROPIC_API_KEY=sk-should-never-be-echoed", "CLAUDE_CODE_USE_BEDROCK=1")
+	var out, errBuf bytes.Buffer
+	c.Stdout = &out
+	c.Stderr = &errBuf
+	err := c.Run()
+	return out.String(), errBuf.String(), err
+}
+
+func writeClaudeFile(t *testing.T, home, name, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude", name), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCodeInstall_VerifyScriptReportsSourcesByName runs the script for real:
+// a user-placed API key is a SUPPORTED path (it used to be a hard failure),
+// and what gets reported is the key's NAME, never its value.
+func TestCodeInstall_VerifyScriptReportsSourcesByName(t *testing.T) {
+	stdout, stderr, err := runVerifyScript(t, func(home string) {
+		writeClaudeFile(t, home, "settings.json", `{"env": {"ANTHROPIC_API_KEY": "sk-user-placed-secret"}}`)
+	})
+	if err != nil {
+		t.Fatalf("verify failed although a user-placed API key is supported: %v\nstdout:%s\nstderr:%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "1.2.3") {
+		t.Errorf("version not reported:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "ANTHROPIC_API_KEY in the env block") {
+		t.Errorf("settings.json API key not reported as a source:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "CLAUDE_CODE_USE_BEDROCK") {
+		t.Errorf("3P inference provider not reported as a source:\n%s", stdout)
+	}
+	all := stdout + stderr
+	for _, secret := range []string{"sk-user-placed-secret", "sk-should-never-be-echoed"} {
+		if strings.Contains(all, secret) {
+			t.Errorf("a credential VALUE reached the output: %q\n%s", secret, all)
+		}
+	}
+}
+
+// TestCodeInstall_VerifyScriptFailsWhenInstallMintedCredentials is the terms
+// assertion: if a credentials file appears where the install step recorded
+// none, the platform has minted or stored a Claude.ai credential and that is a
+// hard failure.
+func TestCodeInstall_VerifyScriptFailsWhenInstallMintedCredentials(t *testing.T) {
+	stdout, stderr, err := runVerifyScript(t, func(home string) {
+		// The install step recorded "absent"...
+		state := filepath.Join(home, ".cache", "containarium")
+		if mkErr := os.MkdirAll(state, 0o750); mkErr != nil {
+			t.Fatal(mkErr)
+		}
+		if wErr := os.WriteFile(filepath.Join(state, "code-install-state"), []byte("absent\n"), 0o600); wErr != nil {
+			t.Fatal(wErr)
+		}
+		// ...and yet one exists now.
+		writeClaudeFile(t, home, ".credentials.json", `{"claudeAiOauth": {}}`)
+	})
+	if err == nil {
+		t.Fatalf("expected a failure when the install created a credentials file\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	if !strings.Contains(stderr, "never mints or stores") {
+		t.Errorf("failure does not explain itself:\n%s", stderr)
+	}
+}
+
+// TestCodeInstall_VerifyScriptAcceptsAPreExistingSignIn is the other side: a
+// user who signed in through Anthropic's own flow before re-running install
+// must not be treated as a violation — that sign-in is the documented path.
+func TestCodeInstall_VerifyScriptAcceptsAPreExistingSignIn(t *testing.T) {
+	stdout, stderr, err := runVerifyScript(t, func(home string) {
+		state := filepath.Join(home, ".cache", "containarium")
+		if mkErr := os.MkdirAll(state, 0o750); mkErr != nil {
+			t.Fatal(mkErr)
+		}
+		if wErr := os.WriteFile(filepath.Join(state, "code-install-state"), []byte("present\n"), 0o600); wErr != nil {
+			t.Fatal(wErr)
+		}
+		writeClaudeFile(t, home, ".credentials.json", `{"claudeAiOauth": {}}`)
+	})
+	if err != nil {
+		t.Fatalf("a pre-existing sign-in was rejected: %v\nstdout:%s\nstderr:%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "signed in through Anthropic's own flow") {
+		t.Errorf("pre-existing sign-in not reported as the credential source:\n%s", stdout)
+	}
+}
