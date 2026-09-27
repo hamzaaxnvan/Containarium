@@ -94,3 +94,67 @@ func TestRetentionTransports_Agree(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GetRetentionPolicy: %v", err)
 			}
+			if w := p.GetPolicy().GetWindows()[2]; w.GetClass() != pb.RetentionClass_RETENTION_CLASS_GATEWAY_LOGS || w.GetDays() != 120 {
+				t.Fatalf("gateway logs window = %v, want 120 days", w)
+			}
+			// An org id with a space and a plus proves the path escaping round-trips.
+			const org = "org a+b"
+			if _, err := c.SetLegalHold(&pb.SetLegalHoldRequest{OrgId: org, Reason: "case 7"}); err != nil {
+				t.Fatalf("SetLegalHold: %v", err)
+			}
+			holds, err := c.ListLegalHolds()
+			if err != nil || len(holds.GetHolds()) != 1 || holds.GetHolds()[0].GetOrgId() != org || holds.GetHolds()[0].GetReason() != "case 7" {
+				t.Fatalf("ListLegalHolds = (%v, %v), want the hold on %q", holds, err, org)
+			}
+			if r, err := c.ReleaseLegalHold(org); err != nil || r.GetHold().GetOrgId() != org {
+				t.Fatalf("ReleaseLegalHold = (%v, %v)", r, err)
+			}
+			if _, err := c.ReleaseLegalHold(org); err == nil {
+				t.Fatal("releasing a released hold succeeded")
+			}
+		})
+	}
+}
+
+func TestRetentionTransports_ReportAgrees(t *testing.T) {
+	for name, c := range retentionTransports(t) {
+		t.Run(name, func(t *testing.T) {
+			for _, refresh := range []bool{false, true} {
+				resp, err := c.GetRetentionReport(refresh)
+				if err != nil {
+					t.Fatalf("GetRetentionReport(refresh=%v): %v", refresh, err)
+				}
+				rep := resp.GetReport()
+				if rep.GetMode() != pb.RetentionMode_RETENTION_MODE_DRY_RUN || len(rep.GetStores()) != 3 {
+					t.Fatalf("report = %v, want DRY_RUN with the 3 not-swept entries", rep)
+				}
+				for _, st := range rep.GetStores() {
+					if st.GetStatus() != pb.RetentionSweepStatus_RETENTION_SWEEP_STATUS_NOT_SWEPT || st.GetNote() == "" {
+						t.Errorf("store %v/%s = %v, want NOT_SWEPT with a note", st.GetClass(), st.GetStore(), st)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRetentionTransports_ModeAgrees(t *testing.T) {
+	for name, c := range retentionTransports(t) {
+		t.Run(name, func(t *testing.T) {
+			got, err := c.GetRetentionMode()
+			if err != nil || got.GetState().GetMode() != pb.RetentionMode_RETENTION_MODE_DRY_RUN {
+				t.Fatalf("fresh GetRetentionMode = (%v, %v), want DRY_RUN", got, err)
+			}
+			if _, err := c.SetRetentionMode(&pb.SetRetentionModeRequest{Mode: pb.RetentionMode_RETENTION_MODE_ENFORCE}); err != nil {
+				t.Fatalf("SetRetentionMode: %v", err)
+			}
+			got, err = c.GetRetentionMode()
+			if err != nil || got.GetState().GetMode() != pb.RetentionMode_RETENTION_MODE_ENFORCE {
+				t.Fatalf("GetRetentionMode after set = (%v, %v), want ENFORCE", got, err)
+			}
+			if _, err := c.SetRetentionMode(&pb.SetRetentionModeRequest{Mode: pb.RetentionMode_RETENTION_MODE_UNSPECIFIED}); err == nil {
+				t.Fatal("setting UNSPECIFIED succeeded")
+			}
+		})
+	}
+}

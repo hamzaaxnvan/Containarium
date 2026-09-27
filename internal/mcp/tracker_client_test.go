@@ -111,3 +111,117 @@ func TestMCPClient_CommentOnTrackerIssue(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, http.MethodPost, sawMethod)
 	assert.Equal(t, "/v1/tracker/connections/alice/default/issues/7/comments", sawPath)
+	assert.Equal(t, "hello", sawBody["body"])
+	assert.NotContains(t, sawBody, "username", "path-bound fields must not also ride in the body")
+	assert.Equal(t, "agent-bot", comment.Author)
+}
+
+func TestMCPClient_ClaimTrackerIssue(t *testing.T) {
+	var sawPath string
+	var sawBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&sawBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"claimed":true,"assigned":true}`)
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "tok")
+	result, err := c.ClaimTrackerIssue(ClaimTrackerIssueRequest{
+		Username: "alice", Connection: "default", Number: 9, StaleAfterSeconds: 3600,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "/v1/tracker/connections/alice/default/issues/9/claim", sawPath)
+	assert.Equal(t, float64(3600), sawBody["staleAfterSeconds"])
+	assert.True(t, result.Claimed)
+	assert.True(t, result.Assigned)
+}
+
+func TestMCPClient_ClaimTrackerIssue_AlreadyClaimed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"claimed":false,"alreadyClaimedByRunId":"run-other"}`)
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "tok")
+	result, err := c.ClaimTrackerIssue(ClaimTrackerIssueRequest{Username: "alice", Connection: "default", Number: 9})
+	require.NoError(t, err)
+	assert.False(t, result.Claimed)
+	assert.Equal(t, "run-other", result.AlreadyClaimedByRunID)
+}
+
+func TestMCPClient_SetTrackerIssueLabels(t *testing.T) {
+	var sawPath string
+	var sawBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&sawBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"message":"labels updated"}`)
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "tok")
+	err := c.SetTrackerIssueLabels(SetTrackerIssueLabelsRequest{
+		Username: "alice", Connection: "default", Number: 3,
+		AddLabels: []string{"triaged"}, RemoveLabels: []string{"needs-triage"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "/v1/tracker/connections/alice/default/issues/3/labels", sawPath)
+	assert.Equal(t, []any{"triaged"}, sawBody["addLabels"])
+	assert.Equal(t, []any{"needs-triage"}, sawBody["removeLabels"])
+}
+
+func TestMCPClient_SubmitTrackerChange(t *testing.T) {
+	var sawPath, sawMethod string
+	var sawBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath, sawMethod = r.URL.Path, r.Method
+		_ = json.NewDecoder(r.Body).Decode(&sawBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"change":{"number":"6","state":"TRACKER_ISSUE_STATE_OPEN","url":"https://example.com/pr/6","branch":"agent/run-1/1-x"}}`)
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "tok")
+	change, err := c.SubmitTrackerChange(SubmitTrackerChangeRequest{
+		Username: "alice", Connection: "default", Issue: 1, Title: "My change", Description: "does the thing",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, http.MethodPost, sawMethod)
+	assert.Equal(t, "/v1/tracker/connections/alice/default/changes", sawPath)
+	assert.Equal(t, "My change", sawBody["title"])
+	assert.NotContains(t, sawBody, "username", "path-bound fields must not also ride in the body")
+	assert.Equal(t, int64(6), change.Number)
+	assert.Equal(t, "agent/run-1/1-x", change.Branch)
+}
+
+func TestMCPClient_CreateTrackerIssue(t *testing.T) {
+	var sawPath, sawMethod string
+	var sawBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath, sawMethod = r.URL.Path, r.Method
+		_ = json.NewDecoder(r.Body).Decode(&sawBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"issue":{"number":"7","title":"follow-up","state":"TRACKER_ISSUE_STATE_OPEN","labels":["scope:architecture","agent:needs-approval"]}}`)
+	}))
+	defer server.Close()
+
+	c := NewClient(server.URL, "tok")
+	issue, err := c.CreateTrackerIssue(CreateTrackerIssueRequest{
+		Username: "alice", Connection: "default",
+		Title: "follow-up", Body: "child body", Labels: []string{"scope:architecture"}, ParentNumber: 42,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, http.MethodPost, sawMethod)
+	assert.Equal(t, "/v1/tracker/connections/alice/default/issues", sawPath)
+	assert.Equal(t, "follow-up", sawBody["title"])
+	assert.Equal(t, "child body", sawBody["body"])
+	assert.Equal(t, []any{"scope:architecture"}, sawBody["labels"])
+	// int64 rides as a JSON string on the wire, per wire_format_test.go.
+	assert.Equal(t, "42", sawBody["parentNumber"])
+	assert.EqualValues(t, 7, issue.Number)
+	assert.Equal(t, []string{"scope:architecture", "agent:needs-approval"}, issue.Labels)
+}
