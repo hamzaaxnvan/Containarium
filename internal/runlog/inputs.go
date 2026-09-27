@@ -157,3 +157,83 @@ func AnswerShown(api RunInputs, box, run string, shown *pb.RunInput, a pb.RunInp
 // no longer the one the answering party saw.
 var ErrRequestChanged = errors.New("the request changed")
 
+// OpenRequest returns request id when it is open on run, else nil.
+func OpenRequest(api RunInputs, box, run, id string) (*pb.RunInput, error) {
+	list, err := api.ListRunInputs(&pb.ListRunInputsRequest{Username: box, RunName: run})
+	if err != nil {
+		return nil, fmt.Errorf("read the permission requests of run %s: %w", run, err)
+	}
+	for _, in := range list.GetOpen() {
+		if in.GetRequestId() == id {
+			return in, nil
+		}
+	}
+	return nil, nil
+}
+
+// Answer answers request id for seen, the request as the answering party saw
+// it (what `code answer` printed and had confirmed, or the input the MCP
+// caller got from code_pending); seen is nil when it was not open. It re-reads
+// the request first: if it is open with another tool or input now, nothing is
+// sent and the error wraps ErrRequestChanged. A request that is not open is
+// closed, expired or unknown: the daemon reports which without writing
+// anything.
+func Answer(api RunInputs, box, run, id string, seen *pb.RunInput, a pb.RunInputAnswer) (AnswerResult, error) {
+	current, err := OpenRequest(api, box, run, id)
+	if err != nil {
+		return AnswerResult{}, err
+	}
+	if current != nil && (seen == nil || current.GetTool() != seen.GetTool() || current.GetInput() != seen.GetInput()) {
+		var b strings.Builder
+		_ = WriteRequest(&b, current) // a strings.Builder does not fail
+		return AnswerResult{}, fmt.Errorf("%w; nothing was sent. It is now:\n%s", ErrRequestChanged, strings.TrimRight(b.String(), "\n"))
+	}
+	if current == nil {
+		seen = &pb.RunInput{RequestId: id}
+	}
+	res, err := AnswerShown(api, box, run, seen, a)
+	if err != nil {
+		return AnswerResult{}, err
+	}
+	if current == nil {
+		res.Shown = nil
+	}
+	return res, nil
+}
+
+// WriteAnswerResult prints r and returns ErrNotAnswered unless the run
+// reported taking the answer (its journal showed a response; the journal is
+// the agent's to write, so that is a report, not proof).
+func WriteAnswerResult(w io.Writer, r AnswerResult) error {
+	id := coderun.PlainText(r.RequestID)
+	switch r.Resp.GetOutcome() {
+	case pb.RunInputAnswerOutcome_RUN_INPUT_ANSWER_OUTCOME_ANSWERED:
+		_, err := fmt.Fprintf(w, "%s %s: %s\n", pastTense(r.Resp.GetClosedAnswer()), id, coderun.PlainText(r.Shown.GetPrompt()))
+		return err
+	case pb.RunInputAnswerOutcome_RUN_INPUT_ANSWER_OUTCOME_ALREADY_CLOSED:
+		fmt.Fprintf(w, "%s was already closed: %s (%s)%s; nothing changed\n", id,
+			answerWord(r.Resp.GetClosedAnswer()), closeReasonWord(r.Resp.GetCloseReason()), atTime(r.Resp))
+	case pb.RunInputAnswerOutcome_RUN_INPUT_ANSWER_OUTCOME_EXPIRED:
+		fmt.Fprintf(w, "%s has expired (it is denied); nothing changed\n", id)
+	case pb.RunInputAnswerOutcome_RUN_INPUT_ANSWER_OUTCOME_NOT_CONFIRMED:
+		fmt.Fprintf(w, "%s %s was sent for: %s\nbut the run has not reported taking it. It may have been refused because that is not the tool call the run asked; the request stays open until answered or expired.\n",
+			answerWord(r.Answer), id, coderun.PlainText(r.Shown.GetPrompt()))
+	default:
+		fmt.Fprintf(w, "%s: unexpected outcome %v\n", id, r.Resp.GetOutcome())
+	}
+	return ErrNotAnswered
+}
+
+func pastTense(a pb.RunInputAnswer) string {
+	if a == pb.RunInputAnswer_RUN_INPUT_ANSWER_ALLOW {
+		return "allowed"
+	}
+	return "denied"
+}
+
+func atTime(r *pb.AnswerRunInputResponse) string {
+	if r.GetClosedAt() == nil {
+		return ""
+	}
+	return " at " + r.GetClosedAt().AsTime().UTC().Format(time.RFC3339)
+}
