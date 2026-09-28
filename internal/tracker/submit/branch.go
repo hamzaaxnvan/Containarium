@@ -36,3 +36,42 @@ var nonSlugRun = regexp.MustCompile(`[^a-z0-9]+`)
 // slug's leading hyphen rather than calling this on a title that isn't
 // there.
 func slugify(s string) string {
+	s = strings.ToLower(s)
+	s = nonSlugRun.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if len(s) > slugMaxLen {
+		s = strings.Trim(s[:slugMaxLen], "-")
+	}
+	return s
+}
+
+// runIDShort truncates runID to runIDShortLen, same rule as
+// internal/tracker.Stamp.
+func runIDShort(runID string) string {
+	if len(runID) > runIDShortLen {
+		return runID[:runIDShortLen]
+	}
+	return runID
+}
+
+// BranchName returns the daemon-chosen branch a submit pushes to:
+// agent/<run-id-short>/<issue>-<slug>. It is a pure function of values
+// the daemon already trusts (the verified run id and the issue number
+// SubmitTrackerChange resolved against the connection) plus the
+// human-supplied title, which only ever contributes a cosmetic slug —
+// title cannot influence the run-id or issue segments, and slugify
+// strips every character that would let it break out of the ref
+// shape. This is what makes "the agent cannot name a ref" true: no
+// caller of this package ever has a way to pass a raw branch string
+// through to GitPusher.PushBundle.
+func BranchName(runID string, issueNumber int64, title string) string {
+	if issueNumber < 0 {
+		issueNumber = 0
+	}
+	slug := slugify(title)
+	base := runIDShort(runID) + "/" + strconv.FormatInt(issueNumber, 10)
+	if slug == "" {
+		return "agent/" + base
+	}
+	return "agent/" + base + "-" + slug
+}
