@@ -121,3 +121,44 @@ func TestListAgentEngines_AdminSeesGlobalView(t *testing.T) {
 		t.Fatalf("ListAgentEngines: %v", err)
 	}
 	if resp.GetKeyOwner() != "" {
+		t.Errorf("key_owner = %q, want empty (admin/global view)", resp.GetKeyOwner())
+	}
+	claude := statusFor(resp.GetEngines(), pb.AgentEngine_AGENT_ENGINE_CLAUDE)
+	if claude.GetReadiness() != pb.AgentEngineReadiness_AGENT_ENGINE_READINESS_READY || !claude.GetIsDefault() {
+		t.Errorf("claude: readiness=%v is_default=%v, want READY/true", claude.GetReadiness(), claude.GetIsDefault())
+	}
+	codex := statusFor(resp.GetEngines(), pb.AgentEngine_AGENT_ENGINE_CODEX)
+	if codex.GetReadiness() != pb.AgentEngineReadiness_AGENT_ENGINE_READINESS_NOT_READY {
+		t.Errorf("codex: readiness = %v, want NOT_READY — alice's key must not leak into the admin/global view", codex.GetReadiness())
+	}
+	for _, call := range resolver.calls {
+		if call == "user:alice|openai" {
+			t.Error("the owner-key resolver was consulted for alice's owner on an admin/global request")
+		}
+	}
+}
+
+func TestListAgentEngines_RequiresScope(t *testing.T) {
+	s := &AgentSkillServer{catalog: enginesFixtureCatalog(t)}
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(), "alice", nil, []string{"containers:read"})
+	if _, err := s.ListAgentEngines(ctx, &pb.ListAgentEnginesRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("no agents:read scope: got %v, want PermissionDenied", err)
+	}
+}
+
+// fakeOwnerKeyResolverForEngines mirrors agent_gateway_keyowner_test.go's
+// ownerKeyResolver — a distinct name here since that one lives in a
+// different test file in the same package.
+type fakeOwnerKeyResolverForEngines struct {
+	has   map[string]bool
+	calls []string
+}
+
+func (f *fakeOwnerKeyResolverForEngines) KeyFor(_ context.Context, keyOwner, provider string) (string, bool) {
+	key := keyOwner + "|" + provider
+	f.calls = append(f.calls, key)
+	if f.has[key] {
+		return "fake-key", true
+	}
+	return "", false
+}
