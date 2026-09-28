@@ -217,3 +217,77 @@ security findings list
 security findings resolve
 security miner-signatures add
 security miner-signatures list
+security miner-signatures remove
+security process-policy get
+security process-policy release
+security process-policy set
+security scan-opt-in allow
+security scan-opt-in list
+security scan-opt-in refuse
+security sentry status
+security-findings
+security-remediate
+security-scan
+sessions terminate
+sleep
+snapshot create
+snapshot delete
+snapshot list
+snapshot rollback
+sprint board
+sprint list
+ssh list
+ssh propagate
+ssh remove
+ssh rotate
+ssh setup
+ssh-config show
+ssh-config sync
+ssh-keys set
+sync
+token delegate
+token generate
+token inspect
+token list-revoked
+token refresh
+token revoke
+token unscoped-report
+tool-access clear
+tool-access get
+tool-access run-user
+tool-access set
+tracker change submit
+tracker change submit-files
+tracker change view
+tracker connect
+tracker disconnect
+tracker dispatch
+tracker dispatches
+tracker issue claim
+tracker issue comment
+tracker issue create
+tracker issue label
+tracker issue list
+tracker issue view
+tracker list
+tracker route delete
+tracker route list
+tracker route set
+tracker status
+traffic connections
+traffic find
+traffic history
+traffic summary
+ttl get
+ttl set
+ttl unset
+unprotect
+version
+volume attach
+volume create
+volume delete
+volume detach
+volume list
+wake
+whoami
+zap-install
