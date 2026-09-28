@@ -121,3 +121,249 @@ func TestReconcileBox_ImageDefaultIsBackfilledSilently(t *testing.T) {
 	}
 }
 
+func TestReconcileBox_CompliantBoxIsUntouched(t *testing.T) {
+	box := newFakeBox(map[string]string{
+		sshdpolicy.MainConfigPath: imageDefaultMain,
+		sshdpolicy.DropInPath:     managed,
+	}, true)
+	sink := &fakeSink{}
+	out, err := NewSSHDPostureReconciler(box.backend(), sink, 0).ReconcileBox(context.Background(), "alice-container")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Compliant || out.Remediated || out.Finding != nil {
+		t.Fatalf("want untouched, got %+v", out)
+	}
+	if len(box.writes) != 0 || len(box.execs) != 0 || len(box.setCfg) != 0 {
+		t.Errorf("compliant box must see no writes/execs/config: %v %v %v", box.writes, box.execs, box.setCfg)
+	}
+}
+
+// A fresh create wrote the drop-in but no marker yet: the first pass only
+// sets the marker.
+func TestReconcileBox_FreshCreateGetsMarked(t *testing.T) {
+	box := newFakeBox(map[string]string{
+		sshdpolicy.MainConfigPath: imageDefaultMain,
+		sshdpolicy.DropInPath:     managed,
+	}, false)
+	if _, err := NewSSHDPostureReconciler(box.backend(), nil, 0).ReconcileBox(context.Background(), "alice-container"); err != nil {
+		t.Fatal(err)
+	}
+	if box.setCfg[sshdpolicy.MarkerKey] != sshdpolicy.MarkerValue || len(box.writes) != 0 {
+		t.Errorf("want marker only, got writes=%v cfg=%v", box.writes, box.setCfg)
+	}
+}
+
+func TestReconcileBox_DeletedDropInIsRewrittenAndRecorded(t *testing.T) {
+	box := newFakeBox(map[string]string{sshdpolicy.MainConfigPath: imageDefaultMain}, true)
+	sink := &fakeSink{}
+	r := NewSSHDPostureReconciler(box.backend(), sink, 0)
+	r.SetBackendID("backend-a")
+
+	out, err := r.ReconcileBox(context.Background(), "alice-container")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Remediated || !out.Compliant || out.Backfilled || out.Finding == nil {
+		t.Fatalf("want remediate+finding, got %+v", out)
+	}
+	if box.writes[sshdpolicy.DropInPath] != managed {
+		t.Errorf("drop-in not re-asserted")
+	}
+	if len(sink.findings) != 1 {
+		t.Fatalf("want 1 finding, got %d", len(sink.findings))
+	}
+	f := sink.findings[0]
+	if f.Rule != pb.ThreatRuleId_THREAT_RULE_ID_BOX_SSHD_PASSWORD_AUTH {
+		t.Errorf("rule = %v", f.Rule)
+	}
+	if f.Severity != pb.ThreatSeverity_THREAT_SEVERITY_MEDIUM {
+		t.Errorf("closed-in-pass tampering should be MEDIUM, got %v", f.Severity)
+	}
+	if f.TenantID != "alice" || f.Container != "alice-container" || f.Subject != "alice-container" || f.BackendID != "backend-a" {
+		t.Errorf("attribution: %+v", f)
+	}
+	var sawPassword, sawDropIn bool
+	for _, c := range f.Evidence.Configs {
+		switch c.Directive {
+		case "PasswordAuthentication":
+			sawPassword = true
+			if c.Value != "yes" || !c.Remediated || !strings.Contains(c.Path, "sshd default") {
+				t.Errorf("password evidence: %+v", c)
+			}
+		case "ManagedDropIn":
+			sawDropIn = true
+			if !c.Remediated || c.Note != "managed drop-in missing" {
+				t.Errorf("drop-in evidence: %+v", c)
+			}
+		}
+	}
+	if !sawPassword || !sawDropIn {
+		t.Errorf("evidence incomplete: %+v", f.Evidence.Configs)
+	}
+}
+
+// The tenant cannot be beaten lexically: a drop-in sorting before ours wins
+// under first-match. The pass cannot close that, so it is HIGH and the
+// evidence names the tenant's file.
+func TestReconcileBox_EarlierDropInOverridesIsHighAndAttributed(t *testing.T) {
+	box := newFakeBox(map[string]string{
+		sshdpolicy.MainConfigPath:           imageDefaultMain,
+		sshdpolicy.DropInPath:               managed,
+		sshdpolicy.DropInDir + "/00-0.conf": "PasswordAuthentication yes\n",
+	}, true)
+	sink := &fakeSink{}
+	out, err := NewSSHDPostureReconciler(box.backend(), sink, 0).ReconcileBox(context.Background(), "alice-container")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Compliant || out.Remediated || out.Finding == nil {
+		t.Fatalf("want open HIGH finding without rewrite (drop-in intact), got %+v", out)
+	}
+	f := sink.findings[0]
+	if f.Severity != pb.ThreatSeverity_THREAT_SEVERITY_HIGH {
+		t.Errorf("still-permissive box must be HIGH, got %v", f.Severity)
+	}
+	if len(f.Evidence.Configs) != 1 || f.Evidence.Configs[0].Path != sshdpolicy.DropInDir+"/00-0.conf" || f.Evidence.Configs[0].Remediated {
+		t.Errorf("evidence must point at the tenant's file, unremediated: %+v", f.Evidence.Configs)
+	}
+}
+
+func TestReconcileBox_AlteredDropInNoteAndMainFileAttribution(t *testing.T) {
+	box := newFakeBox(map[string]string{
+		sshdpolicy.MainConfigPath: imageDefaultMain + "PasswordAuthentication yes\n",
+		sshdpolicy.DropInPath:     "# edited\nPasswordAuthentication yes\n",
+	}, true)
+	sink := &fakeSink{}
+	if _, err := NewSSHDPostureReconciler(box.backend(), sink, 0).ReconcileBox(context.Background(), "bob-container"); err != nil {
+		t.Fatal(err)
+	}
+	f := sink.findings[0]
+	for _, c := range f.Evidence.Configs {
+		if c.Directive == "ManagedDropIn" && c.Note != "managed drop-in altered" {
+			t.Errorf("note = %q", c.Note)
+		}
+		if c.Directive == "PasswordAuthentication" && c.Path != sshdpolicy.DropInPath {
+			t.Errorf("the altered drop-in sets it first; path = %q", c.Path)
+		}
+	}
+	if box.files[sshdpolicy.DropInPath] != managed {
+		t.Error("altered drop-in not restored")
+	}
+}
+
+func TestReconcileBox_NoSSHDIsSkipped(t *testing.T) {
+	box := newFakeBox(map[string]string{}, false)
+	sink := &fakeSink{}
+	out, err := NewSSHDPostureReconciler(box.backend(), sink, 0).ReconcileBox(context.Background(), "minimal-container")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Skipped == "" || len(box.writes) != 0 || len(box.setCfg) != 0 || len(sink.findings) != 0 {
+		t.Errorf("box without sshd must be skipped untouched: %+v writes=%v cfg=%v", out, box.writes, box.setCfg)
+	}
+}
+
+func TestReconcileBox_NilSinkStillRemediates(t *testing.T) {
+	box := newFakeBox(map[string]string{sshdpolicy.MainConfigPath: imageDefaultMain}, true)
+	out, err := NewSSHDPostureReconciler(box.backend(), nil, 0).ReconcileBox(context.Background(), "alice-container")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Remediated || out.Finding == nil || box.writes[sshdpolicy.DropInPath] != managed {
+		t.Errorf("remediation must not depend on a sink: %+v", out)
+	}
+}
+
+func TestReconcileBox_WriteFailureIsAnError(t *testing.T) {
+	box := newFakeBox(map[string]string{sshdpolicy.MainConfigPath: imageDefaultMain}, true)
+	box.writeErr = errors.New("push failed")
+	if _, err := NewSSHDPostureReconciler(box.backend(), &fakeSink{}, 0).ReconcileBox(context.Background(), "alice-container"); err == nil {
+		t.Fatal("a failed re-assert must surface as an error, not a silent pass")
+	}
+}
+
+func TestReconcileAll_OnlyRunningUserBoxes(t *testing.T) {
+	box := newFakeBox(map[string]string{sshdpolicy.MainConfigPath: imageDefaultMain}, false)
+	m := box.backend()
+	m.ListContainersFunc = func() ([]incus.ContainerInfo, error) {
+		return []incus.ContainerInfo{
+			{Name: "alice-container", State: "Running"},
+			{Name: "bob-container", State: "Stopped"},
+			{Name: "containarium-core-postgres", State: "Running", Role: incus.RolePostgres},
+		}, nil
+	}
+	s := NewSSHDPostureReconciler(m, &fakeSink{}, 0).ReconcileAll(context.Background())
+	if s.Boxes != 1 || s.Backfilled != 1 || s.Errors != 0 {
+		t.Errorf("summary = %s", s)
+	}
+}
+
+func TestNewSSHDPostureReconciler_DefaultInterval(t *testing.T) {
+	if r := NewSSHDPostureReconciler(incustest.NewMockBackend(), nil, 0); r.interval != DefaultSSHDPostureInterval {
+		t.Errorf("interval = %v", r.interval)
+	}
+	if r := NewSSHDPostureReconciler(incustest.NewMockBackend(), nil, time.Minute); r.interval != time.Minute {
+		t.Errorf("interval = %v", r.interval)
+	}
+}
+
+func containsPrefix(list []string, prefix string) bool {
+	for _, s := range list {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// A marker that cannot be stamped on an already-compliant box is an error
+// the pass reports (and retries next time), not a log line.
+func TestReconcileBox_MarkFailureOnCompliantBoxIsAnError(t *testing.T) {
+	box := newFakeBox(map[string]string{
+		sshdpolicy.MainConfigPath: imageDefaultMain,
+		sshdpolicy.DropInPath:     managed,
+	}, false)
+	box.setCfgErr = errors.New("incus unavailable")
+	out, err := NewSSHDPostureReconciler(box.backend(), nil, 0).ReconcileBox(context.Background(), "alice-container")
+	if err == nil || !strings.Contains(err.Error(), sshdpolicy.MarkerKey) {
+		t.Fatalf("want a marker error, got %v", err)
+	}
+	if !out.Compliant {
+		t.Errorf("box is compliant regardless of the marker: %+v", out)
+	}
+}
+
+// If the marker cannot be stamped, the backfill exemption does not apply:
+// the next pass would read the box as never-managed again, so a missing
+// drop-in found now is reported, not assumed to be the image default.
+func TestReconcileBox_MarkFailureDisablesSilentBackfill(t *testing.T) {
+	box := newFakeBox(map[string]string{sshdpolicy.MainConfigPath: imageDefaultMain}, false)
+	box.setCfgErr = errors.New("incus unavailable")
+	sink := &fakeSink{}
+	out, err := NewSSHDPostureReconciler(box.backend(), sink, 0).ReconcileBox(context.Background(), "alice-container")
+	if err == nil || !strings.Contains(err.Error(), sshdpolicy.MarkerKey) {
+		t.Fatalf("want a marker error, got %v", err)
+	}
+	if out.Backfilled || out.Finding == nil || len(sink.findings) != 1 {
+		t.Fatalf("want a finding and no backfill, got %+v (findings=%d)", out, len(sink.findings))
+	}
+	if !out.Remediated || !out.Compliant || box.writes[sshdpolicy.DropInPath] != managed {
+		t.Errorf("the drop-in must still be re-asserted: %+v writes=%v", out, box.writes)
+	}
+}
+
+// The pass tallies a box's remediation and finding even when marking it
+// also failed, and counts the failure.
+func TestReconcileAll_CountsMarkFailureAndStillTalliesOutcome(t *testing.T) {
+	box := newFakeBox(map[string]string{sshdpolicy.MainConfigPath: imageDefaultMain}, false)
+	box.setCfgErr = errors.New("incus unavailable")
+	m := box.backend()
+	m.ListContainersFunc = func() ([]incus.ContainerInfo, error) {
+		return []incus.ContainerInfo{{Name: "alice-container", State: "Running"}}, nil
+	}
+	s := NewSSHDPostureReconciler(m, &fakeSink{}, 0).ReconcileAll(context.Background())
+	if s.Errors != 1 || s.Remediated != 1 || s.Findings != 1 || s.Backfilled != 0 {
+		t.Fatalf("summary = %s", s)
+	}
+}
