@@ -54,3 +54,18 @@ func TestConfigFromEnv_Populated(t *testing.T) {
 // clearEnv unsets all distro-relevant env vars for the duration of t.
 // t.Setenv handles cleanup; t.Helper signals this isn't a test step.
 func clearEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+		"OTEL_SERVICE_NAME",
+		"OTEL_RESOURCE_ATTRIBUTES",
+		"OTEL_EXPORTER_OTLP_HEADERS",
+		"OTEL_EXPORTER_OTLP_PROTOCOL",
+		"CONTAINARIUM_CONTAINER_ID",
+		"CONTAINARIUM_BACKEND_ID",
+		"CONTAINARIUM_TENANT_ID",
+		"SERVICE_VERSION",
+	} {
+		t.Setenv(k, "")
+	}
+}
