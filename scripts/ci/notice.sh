@@ -45,3 +45,50 @@ case "$mode" in
 generate)
   cat <<'HEADER'
 Containarium
+Copyright 2025-2026 FootprintAI
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+The names Containarium and Containarium Cloud are not licensed under it; see
+TRADEMARKS.md.
+
+This product includes software developed by third parties. Their licences are
+recorded per module by the dependency licence check
+(docs/security/DEPENDENCY-LICENSES.md). The notices below are the ones those
+projects ask redistributors to carry. The npm packages bundled into the web UI
+are attributed in web-ui/THIRD-PARTY-LICENSES.txt, which ships with the web UI.
+
+================================================================================
+Vendored protocol definitions (third_party/proto)
+================================================================================
+
+third_party/proto/externalgrpc is the cluster-autoscaler external gRPC provider
+contract, vendored from github.com/kubernetes/autoscaler (cluster-autoscaler
+1.33.0), and third_party/proto/k8s.io holds the Kubernetes API protos it imports.
+Code generated from them is in pkg/pb/thirdparty.
+
+  Copyright The Kubernetes Authors.
+  Licensed under the Apache License, Version 2.0.
+  http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+Notices from Go dependencies linked into the shipped programs
+================================================================================
+HEADER
+  with_notice | while read -r p v f; do
+    printf '\n== %s %s ==\n\n' "$p" "$v"
+    cat "$f"
+    printf '\n'
+  done
+  ;;
+check)
+  [ -f NOTICE ] || { echo "::error::NOTICE is missing; run scripts/ci/notice.sh generate > NOTICE" >&2; exit 1; }
+  missing=0
+  while read -r p v _; do
+    grep -qF "== $p " NOTICE || { echo "::error::NOTICE has no section for $p $v, which ships a NOTICE file" >&2; missing=1; }
+  done < <(with_notice)
+  [ "$missing" -eq 0 ] || { echo "regenerate: scripts/ci/notice.sh generate > NOTICE" >&2; exit 1; }
+  echo "NOTICE ok: $(with_notice | wc -l | tr -d ' ') module notices present"
+  ;;
+*)
+  echo "usage: notice.sh generate|check" >&2; exit 2 ;;
+esac
