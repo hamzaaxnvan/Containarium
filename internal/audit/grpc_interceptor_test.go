@@ -131,3 +131,137 @@ func TestRequestIDFromMD_RejectsMalformedInbound(t *testing.T) {
 		t.Run(in, func(t *testing.T) {
 			md := metadata.Pairs(RequestIDHeader, in)
 			got := requestIDFromMD(md)
+			if got == in {
+				t.Fatalf("malformed inbound %q should have been replaced", in)
+			}
+			if len(got) != 32 {
+				t.Fatalf("generated ID = %q (len %d), want 32-char hex", got, len(got))
+			}
+		})
+	}
+}
+
+func TestRequestIDFromMD_GeneratesWhenAbsent(t *testing.T) {
+	got := requestIDFromMD(metadata.MD{})
+	if len(got) != 32 {
+		t.Fatalf("generated ID = %q (len %d), want 32-char hex", got, len(got))
+	}
+}
+
+// fakeAuditLogger stands in for *Store — GRPCInterceptor only ever needs
+// Log(ctx, *AuditEntry), so a fake satisfying just that lets this test run
+// without a Postgres connection.
+type fakeAuditLogger struct {
+	mu      sync.Mutex
+	entries []*AuditEntry
+}
+
+func (f *fakeAuditLogger) Log(_ context.Context, e *AuditEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries = append(f.entries, e)
+	return nil
+}
+
+func (f *fakeAuditLogger) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.entries)
+}
+
+func (f *fakeAuditLogger) first() *AuditEntry {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.entries) == 0 {
+		return nil
+	}
+	return f.entries[0]
+}
+
+// waitForCount polls (no long sleep, bounded deadline) since the writer
+// goroutine consumes entryCh asynchronously — same shape production
+// accepts as a latency trade-off, see GRPCInterceptor's doc comment.
+func waitForCount(t *testing.T, f *fakeAuditLogger, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if f.count() >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d entries, got %d", want, f.count())
+}
+
+func TestGRPCInterceptor_Unary_NoStoreIsNoop(t *testing.T) {
+	g := NewGRPCInterceptor() // store never attached
+	called := false
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		called = true
+		return "ok", nil
+	}
+	resp, err := g.Unary()(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/x/Y"}, handler)
+	if err != nil || resp != "ok" {
+		t.Fatalf("unexpected result: resp=%v err=%v", resp, err)
+	}
+	if !called {
+		t.Fatal("handler was not called")
+	}
+}
+
+func TestGRPCInterceptor_Unary_WritesEntryWhenArmed(t *testing.T) {
+	g := NewGRPCInterceptor()
+	fake := &fakeAuditLogger{}
+	g.setLogger(fake)
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(auth.MDKeyUsername, "alice"))
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return "ok", nil
+	}
+	_, err := g.Unary()(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/containarium.v1.SecretsService/GetSecret"}, handler)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	waitForCount(t, fake, 1)
+	entry := fake.first()
+	if entry.Username != "alice" {
+		t.Errorf("Username = %q, want alice", entry.Username)
+	}
+	if entry.ResourceID != "/containarium.v1.SecretsService/GetSecret" {
+		t.Errorf("ResourceID = %q, want the FullMethod", entry.ResourceID)
+	}
+}
+
+func TestGRPCInterceptor_Unary_SkipsGatewayForwarded(t *testing.T) {
+	g := NewGRPCInterceptor()
+	fake := &fakeAuditLogger{}
+	g.setLogger(fake)
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(
+		auth.MDKeyUsername, "alice",
+		GatewayForwardMDKey, "1",
+	))
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return "ok", nil
+	}
+	if _, err := g.Unary()(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/x/Y"}, handler); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Give the (non-existent) write a moment it doesn't need, then assert
+	// nothing landed — there is no positive signal to wait for here.
+	time.Sleep(20 * time.Millisecond)
+	if got := fake.count(); got != 0 {
+		t.Fatalf("count = %d, want 0 (gateway-forwarded call must not double-log)", got)
+	}
+}
+
+// auth strips reserved identity keys from external callers and cannot import
+// audit, so it carries its own copy of the gateway-forward marker; this pins
+// the two so a rename here can't silently make the marker spoofable.
+func TestGatewayForwardMDKeyIsReservedByAuth(t *testing.T) {
+	if !auth.IsReservedIdentityMetadataKey(GatewayForwardMDKey) {
+		t.Fatalf("%q must be in auth.ReservedIdentityMetadataKeys", GatewayForwardMDKey)
+	}
+}
