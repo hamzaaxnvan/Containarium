@@ -191,3 +191,391 @@ func TestRunCommand(t *testing.T) {
 			continues:  true,
 			model:      "kafeido-coder",
 			want:       piGatewayPrefix + `~/.local/bin/pi -p 'fix the bug' --session 'sess-9' --model 'kafeido-coder'`,
+		},
+
+		// ---- #2273: codex, the third engine. `codex exec` takes the prompt
+		// POSITIONAL (no -p), resume is its only continuation mechanism (no
+		// bare --continue), and --json/--model come before the prompt — see
+		// codex.go's doc comment for the docs these are checked against.
+		{
+			name:       "codex/secret/plain",
+			engine:     NameCodex,
+			credential: SecretCredential{Name: "CODEX_API_KEY"},
+			want:       secretPrefix + `~/.local/bin/codex exec 'fix the bug'`,
+		},
+		{
+			name:       "codex/secret/streamJSON+continue+model",
+			engine:     NameCodex,
+			credential: SecretCredential{Name: "CODEX_API_KEY"},
+			model:      "gpt-5-codex",
+			streamJSON: true,
+			continues:  true,
+			want:       secretPrefix + `~/.local/bin/codex exec resume --last --json --model 'gpt-5-codex' 'fix the bug'`,
+		},
+		{
+			name:       "codex/gateway/plain",
+			engine:     NameCodex,
+			credential: GatewayCredential{Provider: "openai"},
+			want:       codexGatewayPrefix + `~/.local/bin/codex exec 'fix the bug'`,
+		},
+		{
+			// Same priority rule as claude/pi: a specific session id wins over
+			// --continue, and both flags land before the prompt.
+			name:       "codex/gateway/session takes priority over continue, before --json and --model",
+			engine:     NameCodex,
+			credential: GatewayCredential{Provider: "openai"},
+			sessionID:  "sess-9",
+			continues:  true,
+			streamJSON: true,
+			model:      "gpt-5-codex",
+			want:       codexGatewayPrefix + `~/.local/bin/codex exec resume 'sess-9' --json --model 'gpt-5-codex' 'fix the bug'`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e, err := For(tc.engine, Options{Credential: tc.credential, Model: tc.model})
+			if err != nil {
+				t.Fatalf("For(%q): %v", tc.engine, err)
+			}
+			got := e.RunCommand(prompt, tc.streamJSON, tc.continues, tc.sessionID)
+			if got != tc.want {
+				t.Errorf("RunCommand mismatch\n got: %s\nwant: %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunCommand_PromptQuotingSurvivesARealShell is the injection half of the
+// AC's "shell quoting pinned". The prompt is the one caller-supplied value in
+// the command, and it lands inside `/bin/sh -c` on the box — so it must come
+// back out of a real shell byte-for-byte for BOTH engines, including for the
+// shapes that try to terminate the quoted string early.
+func TestRunCommand_PromptQuotingSurvivesARealShell(t *testing.T) {
+	prompts := []string{
+		"plain text",
+		"it's got an apostrophe",
+		"'; touch /tmp/pwned; echo '",
+		"$(rm -rf /) and `also this`",
+		`back\slash and "double" quotes`,
+	}
+
+	for _, name := range []Name{NameClaude, NamePi, NameCodex} {
+		for _, prompt := range prompts {
+			t.Run(string(name)+"/"+prompt, func(t *testing.T) {
+				e, err := For(name, Options{Credential: SecretCredential{}})
+				if err != nil {
+					t.Fatalf("For(%q): %v", name, err)
+				}
+				cmd := e.RunCommand(prompt, false, false, "")
+
+				// The quoted prompt must appear verbatim in the command...
+				quoted := coderun.ShellQuoteSingle(prompt)
+				if !strings.Contains(cmd, quoted) {
+					t.Fatalf("command does not carry the quoted prompt %s:\n%s", quoted, cmd)
+				}
+				// ...and a real shell must hand it back unchanged.
+				// #nosec G204 -- fixed "sh -c" with one literal-quoted
+				// argument produced by the quoter under test; this IS the
+				// injection check, not a caller-reachable path.
+				out, err := exec.Command("/bin/sh", "-c", "printf '%s' "+quoted).Output()
+				if err != nil {
+					t.Fatalf("shell rejected %q (quoted %s): %v", prompt, quoted, err)
+				}
+				if string(out) != prompt {
+					t.Errorf("round-trip = %q, want %q", out, prompt)
+				}
+			})
+		}
+	}
+}
+
+// TestClaudeSecretRunCommand_IsByteIdenticalToTheShippedBuilder is the
+// regression guard for the refactor itself: introducing the Engine seam must
+// not change one byte of what the Claude + tenant-secret path has been
+// dispatching since #1674. If this fails, existing boxes changed behaviour.
+func TestClaudeSecretRunCommand_IsByteIdenticalToTheShippedBuilder(t *testing.T) {
+	for _, streamJSON := range []bool{false, true} {
+		e, err := For(NameClaude, Options{Credential: SecretCredential{}})
+		if err != nil {
+			t.Fatalf("For(claude): %v", err)
+		}
+		got := e.RunCommand("do the thing", streamJSON, false, "")
+		want := coderun.BuildClaudeRunCommand("do the thing", streamJSON)
+		if got != want {
+			t.Errorf("streamJSON=%v: engine seam changed the shipped command\n got: %s\nwant: %s",
+				streamJSON, got, want)
+		}
+	}
+}
+
+// TestParseName_DefaultsAndRejections pins the vocabulary of --engine. An
+// unknown value must name the valid ones rather than silently falling back to
+// a default, which would run the wrong agent on someone's box.
+func TestParseName(t *testing.T) {
+	for _, in := range []string{"claude", "CLAUDE", " claude ", "Claude"} {
+		got, err := ParseName(in)
+		if err != nil || got != NameClaude {
+			t.Errorf("ParseName(%q) = %q, %v; want claude, nil", in, got, err)
+		}
+	}
+	for _, in := range []string{"pi", "PI", " pi "} {
+		got, err := ParseName(in)
+		if err != nil || got != NamePi {
+			t.Errorf("ParseName(%q) = %q, %v; want pi, nil", in, got, err)
+		}
+	}
+	// #2273: codex is now a real, accepted engine — parallel to claude and pi,
+	// not the rejected value docs/product/agent-router.md's P1 list named.
+	for _, in := range []string{"codex", "CODEX", " codex "} {
+		got, err := ParseName(in)
+		if err != nil || got != NameCodex {
+			t.Errorf("ParseName(%q) = %q, %v; want codex, nil", in, got, err)
+		}
+	}
+	for _, in := range []string{"", "codexx", "cluade", "claude-code"} {
+		_, err := ParseName(in)
+		if err == nil {
+			t.Errorf("ParseName(%q) should be an error, not a silent default", in)
+		}
+		if err != nil && !strings.Contains(err.Error(), "claude") {
+			t.Errorf("ParseName(%q) error should list the valid engines, got: %v", in, err)
+		}
+	}
+}
+
+func TestParseCredentialSourceKind(t *testing.T) {
+	for _, in := range []string{"secret", "SECRET", " secret "} {
+		got, err := ParseCredentialKind(in)
+		if err != nil || got != KindSecret {
+			t.Errorf("ParseCredentialKind(%q) = %q, %v; want secret", in, got, err)
+		}
+	}
+	for _, in := range []string{"gateway", "GATEWAY"} {
+		got, err := ParseCredentialKind(in)
+		if err != nil || got != KindGateway {
+			t.Errorf("ParseCredentialKind(%q) = %q, %v; want gateway", in, got, err)
+		}
+	}
+	for _, in := range []string{"", "token", "oauth"} {
+		if _, err := ParseCredentialKind(in); err == nil {
+			t.Errorf("ParseCredentialKind(%q) should be an error", in)
+		}
+	}
+}
+
+// TestPreflight pins which install-time check each credential source demands.
+// The cmd layer switches on this, so getting it wrong means install validates
+// the wrong thing (or nothing).
+func TestPreflight(t *testing.T) {
+	if got := (SecretCredential{Name: "X"}).Preflight(); got != PreflightSecretMetadata {
+		t.Errorf("secret source Preflight = %v, want PreflightSecretMetadata", got)
+	}
+	if got := (GatewayCredential{Provider: "kafeido"}).Preflight(); got != PreflightGatewayDryRun {
+		t.Errorf("gateway source Preflight = %v, want PreflightGatewayDryRun", got)
+	}
+}
+
+// TestGatewayEnvPath pins the 0600 file each engine's run sources, because the
+// CLI writes that exact path over SSH before process_start — a mismatch is a
+// run with no credential at all.
+func TestGatewayEnvPath(t *testing.T) {
+	tests := []struct {
+		engine Name
+		want   string
+	}{
+		{NamePi, "$HOME/.pi/gateway.env"},
+		{NameClaude, "$HOME/.claude/gateway.env"},
+		{NameCodex, "$HOME/.codex/gateway.env"},
+	}
+	for _, tc := range tests {
+		e, err := For(tc.engine, Options{Credential: GatewayCredential{Provider: "kafeido"}})
+		if err != nil {
+			t.Fatalf("For(%q): %v", tc.engine, err)
+		}
+		if got := e.GatewayEnvPath(); got != tc.want {
+			t.Errorf("%s GatewayEnvPath = %q, want %q", tc.engine, got, tc.want)
+		}
+	}
+}
+
+// TestInstallScript_PiIsVersionPinnedAndNonInteractive is the gap-2 decision
+// made testable: pi's own install.sh takes no version argument and needs a
+// TTY, so install goes through npm with an explicit version. The install runs
+// over `ssh` with no TTY, so anything interactive here is a hang on a box.
+func TestInstallScript_PiIsVersionPinnedAndNonInteractive(t *testing.T) {
+	e, err := For(NamePi, Options{Credential: GatewayCredential{Provider: "kafeido"}})
+	if err != nil {
+		t.Fatalf("For(pi): %v", err)
+	}
+	script := e.InstallScript(InstallOptions{Version: "0.87.1", ModelsJSON: `{"providers":{}}`})
+
+	for _, want := range []string{
+		"@earendil-works/pi-coding-agent@0.87.1", // the pin itself
+		"--ignore-scripts",                       // pi.md's documented npm line
+		"npm config set prefix",                  // user-level, no sudo
+		"$HOME/.local",
+		"umask 077",       // before the write, not chmod after
+		"$HOME/.pi/agent", // the config dir docs/configuration.md pins
+		"models.json",
+		"22.19.0", // the Node floor npm would otherwise fail on obscurely
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("pi install script is missing %q:\n%s", want, script)
+		}
+	}
+	for _, banned := range []string{
+		"pi.dev/install.sh", // TTY-bound and unpinnable — gap 2
+		"sudo",              // user-level install, same as the claude path
+		"/dev/tty",
+	} {
+		if strings.Contains(script, banned) {
+			t.Errorf("pi install script must not contain %q:\n%s", banned, script)
+		}
+	}
+	// An unpinned install would make TestPiModelsJSON's fixture meaningless.
+	if strings.Contains(script, "pi-coding-agent\n") || strings.Contains(script, "pi-coding-agent ") {
+		t.Errorf("pi install script installs an unpinned version:\n%s", script)
+	}
+}
+
+// TestVerifyScript_Pi covers the AC's verification step: `pi -p "print the
+// current working directory" --mode json`, run on a short-lived token.
+func TestVerifyScript_Pi(t *testing.T) {
+	e, err := For(NamePi, Options{Credential: GatewayCredential{Provider: "kafeido"}})
+	if err != nil {
+		t.Fatalf("For(pi): %v", err)
+	}
+	script := e.VerifyScript()
+	for _, want := range []string{
+		"--version",
+		"print the current working directory",
+		"--mode json",
+		"$HOME/.pi/gateway.env",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("pi verify script is missing %q:\n%s", want, script)
+		}
+	}
+	// Same rule as the Claude path: presence, never a value. A verify script
+	// that echoed the token would put it in the operator's scrollback.
+	for _, banned := range []string{
+		"$CONTAINARIUM_GATEWAY_TOKEN\"",
+		"echo $CONTAINARIUM_GATEWAY_TOKEN",
+		"cat \"$HOME/.pi/gateway.env\"",
+	} {
+		if strings.Contains(script, banned) {
+			t.Errorf("pi verify script must never expand the token (%q):\n%s", banned, script)
+		}
+	}
+}
+
+// TestInstallScript_CodexIsNpmInstalledWithScriptsEnabled is the #2273 gap
+// made testable: codex's npm package (@openai/codex) needs its postinstall
+// script to fetch the platform-specific binary — the OPPOSITE of pi, whose
+// --ignore-scripts this must NOT copy, or the install would leave a binary
+// that cannot run.
+func TestInstallScript_CodexIsNpmInstalledWithScriptsEnabled(t *testing.T) {
+	e, err := For(NameCodex, Options{Credential: SecretCredential{Name: "CODEX_API_KEY"}})
+	if err != nil {
+		t.Fatalf("For(codex): %v", err)
+	}
+	script := e.InstallScript(InstallOptions{Version: "0.50.0"})
+
+	for _, want := range []string{
+		"@openai/codex@0.50.0", // the pin itself
+		"npm config set prefix",
+		"$HOME/.local",
+		"16", // the Node floor (lower than pi's)
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("codex install script is missing %q:\n%s", want, script)
+		}
+	}
+	for _, banned := range []string{
+		"--ignore-scripts", // pi's flag — codex's postinstall MUST run
+		"sudo",
+		"/dev/tty",
+	} {
+		if strings.Contains(script, banned) {
+			t.Errorf("codex install script must not contain %q:\n%s", banned, script)
+		}
+	}
+}
+
+// TestInstallScript_CodexNoVersionOmitsThePin mirrors Claude's own installer
+// behaviour (empty Version = "whatever the installer considers current"),
+// not pi's hard pin — codex has no models.json-shaped fixture this repo owns
+// that an unpinned install could silently invalidate.
+func TestInstallScript_CodexNoVersionOmitsThePin(t *testing.T) {
+	e, err := For(NameCodex, Options{Credential: SecretCredential{Name: "CODEX_API_KEY"}})
+	if err != nil {
+		t.Fatalf("For(codex): %v", err)
+	}
+	script := e.InstallScript(InstallOptions{})
+	if strings.Contains(script, "@openai/codex@") {
+		t.Errorf("an empty Version must not pin a version:\n%s", script)
+	}
+	if !strings.Contains(script, "npm install -g --no-fund --no-audit '@openai/codex'") {
+		t.Errorf("unpinned install should install the bare package name:\n%s", script)
+	}
+}
+
+// TestVerifyScript_Codex covers the #2273 AC's verification step: `codex
+// exec --json "print the current working directory"`, run on whatever
+// credential the box now has, never expanding it.
+func TestVerifyScript_Codex(t *testing.T) {
+	e, err := For(NameCodex, Options{Credential: GatewayCredential{Provider: "openai"}})
+	if err != nil {
+		t.Fatalf("For(codex): %v", err)
+	}
+	script := e.VerifyScript()
+	for _, want := range []string{
+		"--version",
+		"codex exec --json",
+		"print the current working directory",
+		"$HOME/.codex/gateway.env",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("codex verify script is missing %q:\n%s", want, script)
+		}
+	}
+	for _, banned := range []string{
+		"$CONTAINARIUM_GATEWAY_TOKEN\"",
+		"echo $CONTAINARIUM_GATEWAY_TOKEN",
+		"cat \"$HOME/.codex/gateway.env\"",
+	} {
+		if strings.Contains(script, banned) {
+			t.Errorf("codex verify script must never expand the token (%q):\n%s", banned, script)
+		}
+	}
+}
+
+// TestVerifyScript_Codex_SecretReportsSourcesByNameOnly pins the secret-path
+// branch: the delivery files and codex's own auth.json are reported by NAME,
+// matching the "report credential source by name only, never a value" rule
+// #2273 carries over from the Claude path (#2030).
+func TestVerifyScript_Codex_SecretReportsSourcesByNameOnly(t *testing.T) {
+	e, err := For(NameCodex, Options{Credential: SecretCredential{Name: "CODEX_API_KEY"}})
+	if err != nil {
+		t.Fatalf("For(codex): %v", err)
+	}
+	script := e.VerifyScript()
+	for _, want := range []string{"secrets.env", "/run/secrets", "auth.json", "codex login"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("codex verify script (secret) missing %q:\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, "$CODEX_API_KEY") || strings.Contains(script, "$OPENAI_API_KEY") {
+		t.Errorf("codex verify script must never expand a key value:\n%s", script)
+	}
+}
+
+// TestClaudeStructuredOutputFlag pins the flag appended for structured runs:
+// `json` (one result object), not stream-json, which `claude -p` rejects
+// without --verbose.
+func TestClaudeStructuredOutputFlag(t *testing.T) {
+	if ClaudeStructuredOutputFlag != " --output-format json" {
+		t.Errorf("ClaudeStructuredOutputFlag = %q", ClaudeStructuredOutputFlag)
+	}
+}
