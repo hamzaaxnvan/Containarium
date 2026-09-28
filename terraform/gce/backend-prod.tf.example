@@ -7,3 +7,12 @@
 #   vim backend.tf  # Update bucket name
 #   terraform init
 
+terraform {
+  backend "gcs" {
+    bucket = "your-project-id-terraform-state"  # UPDATE THIS
+    prefix = "containarium/production"
+
+    # Optional: Enable encryption with customer-managed key
+    # encryption_key = "projects/PROJECT_ID/locations/LOCATION/keyRings/KEYRING/cryptoKeys/KEY"
+  }
+}
