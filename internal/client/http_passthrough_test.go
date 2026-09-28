@@ -107,3 +107,77 @@ func TestHTTPListPassthroughRoutes(t *testing.T) {
 					"protocol": "ROUTE_PROTOCOL_TCP",
 					"active": true,
 					"containerName": "alice-container"
+				}
+			],
+			"totalCount": 1
+		}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	routes, total, err := c.ListPassthroughRoutes()
+	if err != nil {
+		t.Fatalf("ListPassthroughRoutes: %v", err)
+	}
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q; want GET", gotMethod)
+	}
+	if gotPath != "/v1/network/passthrough" {
+		t.Errorf("path = %q; want /v1/network/passthrough", gotPath)
+	}
+	if total != 1 {
+		t.Errorf("total = %d; want 1", total)
+	}
+	if len(routes) != 1 || routes[0].GetExternalPort() != 9443 {
+		t.Fatalf("routes = %+v; want one route with externalPort 9443", routes)
+	}
+}
+
+func TestHTTPDeletePassthroughRoute(t *testing.T) {
+	var gotPath, gotMethod, gotProtocol string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		gotProtocol = r.URL.Query().Get("protocol")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"message":"Passthrough route removed: tcp:9443 (will sync to iptables)"}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	if err := c.DeletePassthroughRoute(9443, pb.RouteProtocol_ROUTE_PROTOCOL_TCP); err != nil {
+		t.Fatalf("DeletePassthroughRoute: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %q; want DELETE", gotMethod)
+	}
+	if gotPath != "/v1/network/passthrough/9443" {
+		t.Errorf("path = %q; want /v1/network/passthrough/9443", gotPath)
+	}
+	if gotProtocol != "ROUTE_PROTOCOL_TCP" {
+		t.Errorf("protocol query = %q; want ROUTE_PROTOCOL_TCP", gotProtocol)
+	}
+}
+
+func TestHTTPDeletePassthroughRoute_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	err = c.DeletePassthroughRoute(9443, pb.RouteProtocol_ROUTE_PROTOCOL_TCP)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
