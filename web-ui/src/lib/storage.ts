@@ -57,3 +57,43 @@ export function addServer(name: string, endpoint: string, token: string): Server
     token,
     addedAt: Date.now(),
   };
+
+  servers.push(newServer);
+  saveServers(servers);
+
+  return newServer;
+}
+
+/**
+ * Remove a server by ID
+ */
+export function removeServer(id: string): void {
+  const servers = getServers();
+  const filtered = servers.filter(s => s.id !== id);
+  saveServers(filtered);
+}
+
+/**
+ * Update a server
+ */
+export function updateServer(id: string, updates: Partial<Omit<Server, 'id' | 'addedAt'>>): Server | null {
+  const servers = getServers();
+  const index = servers.findIndex(s => s.id === id);
+
+  if (index === -1) {
+    return null;
+  }
+
+  servers[index] = { ...servers[index], ...updates };
+  saveServers(servers);
+
+  return servers[index];
+}
+
+/**
+ * Get a server by ID
+ */
+export function getServerById(id: string): Server | undefined {
+  const servers = getServers();
+  return servers.find(s => s.id === id);
+}
