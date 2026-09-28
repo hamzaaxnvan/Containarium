@@ -49,3 +49,21 @@ func runPassthroughRemove() error {
 	if passthroughRemoveProtocol != "tcp" && passthroughRemoveProtocol != "udp" {
 		return fmt.Errorf("protocol must be 'tcp' or 'udp'")
 	}
+
+	// Check if iptables is available
+	if !network.CheckIPTablesAvailable() {
+		return fmt.Errorf("iptables not available on this system")
+	}
+
+	// Create passthrough manager
+	pm := network.NewPassthroughManager(passthroughRemoveNetworkCIDR)
+
+	// Remove the route
+	if err := pm.RemoveRoute(passthroughRemovePort, passthroughRemoveProtocol); err != nil {
+		return fmt.Errorf("failed to remove passthrough route: %w", err)
+	}
+
+	fmt.Printf("✓ Passthrough route removed: %s:%d\n", passthroughRemoveProtocol, passthroughRemovePort)
+
+	return nil
+}
