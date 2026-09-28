@@ -67,3 +67,142 @@ PermitEmptyPasswords no
 func DropInContent() []byte { return []byte(dropInContent) }
 
 // DropIn is one file from DropInDir.
+type DropIn struct {
+	Name    string // base name, e.g. "50-cloud-init.conf"
+	Content string
+}
+
+// Merge assembles the configuration text in the order sshd reads it: the
+// *.conf drop-ins in lexical order (sshd globs them that way) and then the
+// main file. Modern distros place the Include at the top of sshd_config, so
+// under first-match-wins (see Directive) the drop-ins override the main
+// file; get this order backwards and a hardened host reads as unhardened,
+// or the reverse. Non-.conf entries are ignored, as sshd ignores them.
+func Merge(main string, dropIns []DropIn) string {
+	names := make([]DropIn, 0, len(dropIns))
+	for _, d := range dropIns {
+		if strings.HasSuffix(d.Name, ".conf") {
+			names = append(names, d)
+		}
+	}
+	sort.Slice(names, func(i, j int) bool { return names[i].Name < names[j].Name })
+	var b strings.Builder
+	for _, d := range names {
+		b.WriteString(d.Content)
+		b.WriteString("\n")
+	}
+	b.WriteString(main)
+	return b.String()
+}
+
+// Directive returns the effective value of key in config, or def if unset.
+//
+// FIRST occurrence wins — that is OpenSSH's rule for these keywords, and
+// it is the opposite of the "last wins" most config formats use. Match
+// blocks are ignored: a directive inside `Match` is conditional, and
+// treating it as global would misreport. Anything after the first Match
+// line is skipped. Keys compare case-insensitively, as sshd does.
+func Directive(config, key, def string) string {
+	for _, line := range strings.Split(config, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if strings.EqualFold(fields[0], "Match") {
+			break // conditional territory; stop reading globals
+		}
+		if strings.EqualFold(fields[0], key) && len(fields) >= 2 {
+			return fields[1]
+		}
+	}
+	return def
+}
+
+// Violation is one directive whose effective value permits password login.
+type Violation struct {
+	Directive string
+	Value     string
+}
+
+func (v Violation) String() string { return v.Directive + "=" + v.Value }
+
+// Result is Evaluate's verdict on one merged configuration.
+type Result struct {
+	// Violations is empty when the configuration refuses password login.
+	Violations []Violation
+	// PasswordAuthentication, KbdInteractiveAuthentication and
+	// PermitEmptyPasswords are the effective values (sshd defaults applied).
+	PasswordAuthentication       string
+	KbdInteractiveAuthentication string
+	PermitEmptyPasswords         string
+}
+
+// Compliant reports whether the configuration refuses password login.
+func (r Result) Compliant() bool { return len(r.Violations) == 0 }
+
+// Evaluate judges a merged configuration (see Merge) against the policy.
+// The sshd defaults are applied where a directive is absent, which is why a
+// bare, image-default sshd_config evaluates as non-compliant: sshd's own
+// default for PasswordAuthentication is yes.
+func Evaluate(merged string) Result {
+	r := Result{
+		PasswordAuthentication:       Directive(merged, "PasswordAuthentication", "yes"),
+		KbdInteractiveAuthentication: Directive(merged, "KbdInteractiveAuthentication", "yes"),
+		PermitEmptyPasswords:         Directive(merged, "PermitEmptyPasswords", "no"),
+	}
+	if !strings.EqualFold(r.PasswordAuthentication, "no") {
+		r.Violations = append(r.Violations, Violation{"PasswordAuthentication", r.PasswordAuthentication})
+	}
+	if !strings.EqualFold(r.KbdInteractiveAuthentication, "no") {
+		r.Violations = append(r.Violations, Violation{"KbdInteractiveAuthentication", r.KbdInteractiveAuthentication})
+	}
+	if !strings.EqualFold(r.PermitEmptyPasswords, "no") {
+		r.Violations = append(r.Violations, Violation{"PermitEmptyPasswords", r.PermitEmptyPasswords})
+	}
+	return r
+}
+
+// ManagedDropInIntact reports whether dropIns contains the managed file
+// with exactly the expected content.
+func ManagedDropInIntact(dropIns []DropIn) bool {
+	for _, d := range dropIns {
+		if d.Name == DropInName {
+			return d.Content == dropInContent
+		}
+	}
+	return false
+}
+
+// DefaultPort is the port sshd listens on when the configuration declares
+// none.
+const DefaultPort = 22
+
+// Ports returns every port the merged configuration tells sshd to listen
+// on. Unlike most directives, Port is additive: every `Port` line counts,
+// not just the first. Globals only (reading stops at the first Match), and
+// the default applies only when no Port line is present at all.
+func Ports(config string) []int {
+	var ports []int
+	for _, line := range strings.Split(config, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		if strings.EqualFold(fields[0], "Match") {
+			break
+		}
+		if strings.EqualFold(fields[0], "Port") && len(fields) >= 2 {
+			if n, err := strconv.Atoi(fields[1]); err == nil && n > 0 && n < 65536 {
+				ports = append(ports, n)
+			}
+		}
+	}
+	if len(ports) == 0 {
+		return []int{DefaultPort}
+	}
+	return ports
+}
