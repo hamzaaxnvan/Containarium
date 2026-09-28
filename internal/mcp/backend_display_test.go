@@ -74,3 +74,22 @@ func TestDeleteContainer_ShowsBackend(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out, "deleted")
 	assert.Contains(t, out, "Backend: tunnel-gpu-node-a")
+}
+
+// The GET pre-fetch is best-effort: if it fails, delete still succeeds (just
+// without the backend line).
+func TestDeleteContainer_LookupFailureIsNonFatal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(`{"message":"container cld-1 deleted","containerName":"cld-1"}`))
+	}))
+	defer server.Close()
+
+	out, err := handleDeleteContainer(NewClient(server.URL, "t"), map[string]interface{}{"username": "cld-1"})
+	require.NoError(t, err)
+	assert.Contains(t, out, "deleted")
+	assert.False(t, strings.Contains(out, "Backend:"), "no backend line when lookup failed")
+}
