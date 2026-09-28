@@ -11,3 +11,8 @@ package hostcheck
 // Linux-only.
 const PlatformCPUWeight = 1000
 
+// PlatformCPUUnits are the systemd units that must carry PlatformCPUWeight:
+// incusd (installed from the distro / Zabbly package, so its weight lands as
+// a drop-in) and the containarium daemon (whose generated unit carries it
+// inline). Order is the order `doctor` reports them in.
+var PlatformCPUUnits = []string{"incus.service", "containarium.service"}
