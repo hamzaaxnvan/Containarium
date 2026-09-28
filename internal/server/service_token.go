@@ -36,3 +36,42 @@ type serviceTokenSource struct {
 	token  string
 	expiry time.Time
 }
+
+// newServiceTokenSource builds a source that mints tokens of lifetime ttl and
+// renews them once less than renewBefore remains. mint is expected to request a
+// token of (at least) ttl; the source assumes the minted token is good for ttl
+// from now.
+func newServiceTokenSource(mint func() (string, error), ttl, renewBefore time.Duration) *serviceTokenSource {
+	return &serviceTokenSource{
+		mint:        mint,
+		ttl:         ttl,
+		renewBefore: renewBefore,
+		now:         time.Now,
+	}
+}
+
+// Token returns a currently-valid token, minting a fresh one when the cache is
+// empty or within renewBefore of expiry. If a re-mint fails but the cached
+// token is still valid (not yet expired), the cached token is returned so a
+// transient signer hiccup doesn't break internal calls; only an empty cache
+// surfaces the mint error.
+func (s *serviceTokenSource) Token() (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.now()
+	if s.token != "" && now.Before(s.expiry.Add(-s.renewBefore)) {
+		return s.token, nil
+	}
+
+	tok, err := s.mint()
+	if err != nil {
+		if s.token != "" && now.Before(s.expiry) {
+			return s.token, nil // fall back to the still-valid cached token
+		}
+		return "", err
+	}
+	s.token = tok
+	s.expiry = now.Add(s.ttl)
+	return tok, nil
+}
