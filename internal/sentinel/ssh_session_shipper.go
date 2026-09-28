@@ -47,3 +47,52 @@ func (f FileAuditIngestTokens) Backends() ([]string, error) {
 }
 
 // ShipperBackendURL is the REST base URL of a backend's daemon, the same
+// address keysync polls (backend IP + the sentinel's health port, where the
+// daemon's gateway also serves /v1/...). The shipper's client is built from it
+// in internal/cmd, not here: this package must not import internal/client
+// (internal/client's tests import internal/server, which imports this
+// package — an import cycle in the test build).
+func (m *Manager) ShipperBackendURL(backendID string) (string, error) {
+	b := m.backends.Get(backendID)
+	if b == nil {
+		return "", fmt.Errorf("backend %q is not in the sentinel's pool", backendID)
+	}
+	return fmt.Sprintf("http://%s:%d", b.IP, m.config.HealthPort), nil
+}
+
+// SSHSessionBackendResolver maps a record's login to the backend sshpiper
+// routed it to, by keysync's own rule.
+func (m *Manager) SSHSessionBackendResolver() sshsession.BackendResolver {
+	return keyStoreResolver{ks: m.keyStore, pool: m.backends}
+}
+
+// keyStoreResolver adds routing readiness to the key store: a login is only
+// known to be unroutable once every healthy backend has synced its users.
+type keyStoreResolver struct {
+	ks   *KeyStore
+	pool *BackendPool
+}
+
+func (r keyStoreResolver) BackendForLogin(login string) (string, bool) {
+	return r.ks.BackendForLogin(login)
+}
+
+func (r keyStoreResolver) RoutingReady() bool {
+	if r.pool == nil {
+		return true // no backends to wait for
+	}
+	r.ks.mu.RLock()
+	defer r.ks.mu.RUnlock()
+	for _, b := range r.pool.Healthy() {
+		if bk, ok := r.ks.backends[b.ID]; !ok || bk.lastSync.IsZero() {
+			return false
+		}
+	}
+	return true
+}
+
+// AuditIngestTokens is the shipper's token source: the register-token store,
+// re-read on every call.
+func (m *Manager) AuditIngestTokens() sshsession.TokenSource {
+	return FileAuditIngestTokens{Path: m.AuditIngestTokenStorePath()}
+}

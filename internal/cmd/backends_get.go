@@ -59,3 +59,34 @@ func runBackendsGet(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("request %s: %w", url, err)
 	}
 	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var parsed backendsListResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	for i := range parsed.Backends {
+		if parsed.Backends[i].ID == id {
+			switch backendsListFormat {
+			case "json":
+				out, err := json.MarshalIndent(parsed.Backends[i], "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Println(string(out))
+			case "table":
+				printBackendsTable([]backendInfo{parsed.Backends[i]})
+			default:
+				return fmt.Errorf("unknown format: %s (use: table, json)", backendsListFormat)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("backend %q not found (got %d backend(s) total)", id, len(parsed.Backends))
+}
