@@ -49,3 +49,55 @@ func deleteBox(username string, force bool) error {
 		fmt.Printf("Deleting container: %s\n", containerName)
 		if force {
 			fmt.Println("Force delete enabled")
+		}
+	}
+
+	// Delete container - use remote or local mode
+	var err error
+	if httpMode && serverAddr != "" {
+		// Remote mode via HTTP
+		err = deleteRemoteHTTP(username, force)
+	} else if serverAddr != "" {
+		// Remote mode via gRPC
+		err = deleteRemote(username, force)
+	} else {
+		// Local mode via Incus
+		err = deleteLocal(username, force)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to delete container: %w", err)
+	}
+
+	fmt.Printf("✓ Container %s deleted successfully\n", containerName)
+
+	// Delete jump server account (only in local mode)
+	// This removes the proxy-only user account from the jump server
+	if serverAddr == "" {
+		deleteJumpServerAccountLocal(username, verbose)
+	}
+
+	return nil
+}
+
+// deleteRemote deletes a container using remote gRPC server
+func deleteRemote(username string, force bool) error {
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = grpcClient.Close() }()
+
+	return grpcClient.DeleteContainer(username, force)
+}
+
+// deleteRemoteHTTP deletes a container using remote HTTP API
+func deleteRemoteHTTP(username string, force bool) error {
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	return httpClient.DeleteContainer(username, force)
+}
