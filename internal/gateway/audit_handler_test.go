@@ -90,3 +90,143 @@ func TestAuditEndpoint_RejectsMalformedAuthHeader(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAuditEndpoint_RejectsInvalidToken(t *testing.T) {
+	mux, _, _ := newAuditTestMux(t)
+	req := httptest.NewRequest("GET", "/v1/audit/logs", nil)
+	req.Header.Set("Authorization", "Bearer garbage.not-a-jwt.signature")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid token must be rejected; got %d", rec.Code)
+	}
+}
+
+// #621 — the audit log is sensitive (who-did-what across tenants), so a
+// valid-but-non-admin token without an explicit audit:read scope is now
+// forbidden (was: any valid token could read). The auth/scope check runs
+// before the store, so this exercises the gate with a nil store. The
+// allowed paths (admin role, or audit:read scope) reach handleAuditQuery
+// and need a live store — covered in the audit store integration test.
+func TestAuditEndpoint_RejectsValidNonAdminWithoutScope(t *testing.T) {
+	tm, err := auth.NewTokenManager(auditTestSecret, "containarium")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	// Valid token, non-admin role, an unrelated scope — no audit:read.
+	tok, err := tm.GenerateToken("alice", []string{"user"}, time.Hour, auth.ScopeContainersRead)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerAuditEndpoint(mux, nil, auth.NewAuthMiddleware(tm))
+
+	req := httptest.NewRequest("GET", "/v1/audit/logs", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin without audit:read must be forbidden; got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "audit:read") {
+		t.Fatalf("error should name the required scope: %s", rec.Body.String())
+	}
+}
+
+// Note: a positive test that a valid token actually serves an
+// audit-log response requires a live Postgres connection (the
+// audit store). That coverage lives in
+// internal/audit/store_integration_test.go. Here we only confirm
+// that the auth-layer behaves correctly.
+
+// --- /v1/audit/health (Trenyx audit finding #4, 2026-09-16) ------------
+//
+// Unlike /v1/audit/logs, this endpoint never touches the store — it only
+// reads audit.GetPersistFailureReport() — so the full 200 OK path is
+// testable here without a live Postgres connection.
+
+func TestAuditHealthEndpoint_RejectsMissingAuth(t *testing.T) {
+	mux, _, _ := newAuditTestMux(t)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/audit/health", nil))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestAuditHealthEndpoint_RejectsNonAdminWithoutScope(t *testing.T) {
+	tm, err := auth.NewTokenManager(auditTestSecret, "containarium")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	tok, err := tm.GenerateToken("alice", []string{"user"}, time.Hour, auth.ScopeContainersRead)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerAuditEndpoint(mux, nil, auth.NewAuthMiddleware(tm))
+
+	req := httptest.NewRequest("GET", "/v1/audit/health", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin without audit:read: status = %d, want 403, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAuditHealthEndpoint_AdminReportsZeroWhenNoFailures(t *testing.T) {
+	audit.ResetPersistFailuresForTest()
+	mux, _, tok := newAuditTestMux(t)
+
+	req := httptest.NewRequest("GET", "/v1/audit/health", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var got auditHealthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, rec.Body.String())
+	}
+	if got.PersistFailureCount != 0 {
+		t.Fatalf("PersistFailureCount = %d, want 0", got.PersistFailureCount)
+	}
+	if got.PersistFailureSince != "" {
+		t.Fatalf("PersistFailureSince = %q, want empty when count is 0", got.PersistFailureSince)
+	}
+}
+
+func TestAuditHealthEndpoint_ReportsRecordedFailures(t *testing.T) {
+	audit.ResetPersistFailuresForTest()
+	t.Cleanup(audit.ResetPersistFailuresForTest)
+	audit.RecordPersistFailureForTest()
+	audit.RecordPersistFailureForTest()
+
+	mux, _, tok := newAuditTestMux(t)
+	req := httptest.NewRequest("GET", "/v1/audit/health", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var got auditHealthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, rec.Body.String())
+	}
+	if got.PersistFailureCount != 2 {
+		t.Fatalf("PersistFailureCount = %d, want 2 — the report must surface real recorded failures", got.PersistFailureCount)
+	}
+	if got.PersistFailureSince == "" {
+		t.Fatal("PersistFailureSince is empty, want an RFC3339 timestamp once a failure has been recorded")
+	}
+}
