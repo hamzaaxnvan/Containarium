@@ -50,3 +50,160 @@ enum EventType {
 
   // System events (30-39)
   // Metrics update
+  EVENT_TYPE_METRICS_UPDATE = 30;
+
+  // Traffic events (40-49)
+  // Traffic/connection update
+  EVENT_TYPE_TRAFFIC_UPDATE = 40;
+
+  // Security events (50-59)
+  // A security finding was created or updated by the threat-detection engine
+  EVENT_TYPE_SECURITY_FINDING = 50;
+
+  // Anonymous-box funnel (#2201, docs/architecture/ssh-new-anonymous-box.md).
+  // One event per step of the `ssh new.<domain>` journey, keyed by the
+  // sha256 of the key fingerprint (Event.fingerprint_hash) — never the key.
+  // Counters containarium_anon_<step>_total mirror them one-for-one.
+  EVENT_TYPE_ANON_CONNECT = 60;            // a key knocked (before any decision)
+  EVENT_TYPE_ANON_SHELL_READY = 61;        // a new box was created and provisioned (carries time-to-shell)
+  EVENT_TYPE_ANON_RECONNECT = 62;          // an existing box was handed back
+  EVENT_TYPE_ANON_CLAIM_LINK_ISSUED = 63;  // the claim-url was written into the guest
+  EVENT_TYPE_ANON_CLAIM_COMPLETED = 64;    // ClaimAnonymousBox succeeded
+  EVENT_TYPE_ANON_EXPIRED = 65;            // a box is gone after its TTL
+  EVENT_TYPE_ANON_KILLED_ABUSE = 66;       // a box is gone BEFORE its TTL (operator deleted it)
+  EVENT_TYPE_ANON_REJECTED_CAPACITY = 67;  // refused: global cap
+  EVENT_TYPE_ANON_REJECTED_RATELIMIT = 68; // refused: per-key / per-IP rate limit
+  EVENT_TYPE_ANON_REJECTED_DOOR = 69;      // refused: door closed or key banned (#2200)
+  EVENT_TYPE_ANON_LOST_PREEMPTION = 70;    // the anon-pool host was preempted (emitted by the sentinel's spot watcher, not the daemon)
+  EVENT_TYPE_ANON_REMINDER_OPTIN = 71;     // the user asked for an expiry reminder (containarium remind-me), picked up by the warner
+}
+
+// ResourceType identifies which resource type an event pertains to
+enum ResourceType {
+  // Unspecified resource type
+  RESOURCE_TYPE_UNSPECIFIED = 0;
+  // Container resource
+  RESOURCE_TYPE_CONTAINER = 1;
+  // App resource
+  RESOURCE_TYPE_APP = 2;
+  // Route resource
+  RESOURCE_TYPE_ROUTE = 3;
+  // Metrics resource
+  RESOURCE_TYPE_METRICS = 4;
+  // Traffic resource
+  RESOURCE_TYPE_TRAFFIC = 5;
+  // Security finding resource
+  RESOURCE_TYPE_SECURITY_FINDING = 6;
+  RESOURCE_TYPE_ANON_BOX = 7;
+}
+
+// ContainerEvent contains container-specific event data
+message ContainerEvent {
+  // The container that was affected
+  Container container = 1;
+
+  // Previous state (for state change events)
+  ContainerState previous_state = 2;
+}
+
+// AppEvent contains app-specific event data
+message AppEvent {
+  // The app that was affected
+  App app = 1;
+
+  // Previous state (for state change events)
+  AppState previous_state = 2;
+}
+
+// RouteEvent contains route-specific event data
+message RouteEvent {
+  // The route that was affected
+  ProxyRoute route = 1;
+}
+
+// MetricsEvent contains metrics update data
+message MetricsEvent {
+  // Metrics for all containers
+  repeated ContainerMetrics metrics = 1;
+}
+
+// SecurityFindingEvent contains a security finding raised or updated by the
+// threat-detection engine.
+// AnonEvent is the payload of every EVENT_TYPE_ANON_* event (#2201).
+message AnonEvent {
+  // Instance name, e.g. anon-1a2b3c4d-container. Empty on a rejection
+  // that never reached a box.
+  string box_name = 1;
+  // sha256 hex of the SSH key fingerprint. Never the fingerprint or key.
+  string fingerprint_hash = 2;
+  // Human-readable reason for a rejection / kill, empty otherwise.
+  string reason = 3;
+  // SHELL_READY only: seconds from the key knocking to the box being
+  // provisioned (the PRD's time-to-shell).
+  double seconds = 4;
+}
+
+message SecurityFindingEvent {
+  Finding finding = 1;
+}
+
+// Event is the top-level event message sent to clients
+message Event {
+  // Unique event ID for deduplication
+  string id = 1;
+
+  // Type of event
+  EventType type = 2;
+
+  // Resource type affected
+  ResourceType resource_type = 3;
+
+  // Resource identifier (container name, app ID, route domain)
+  string resource_id = 4;
+
+  // When the event occurred
+  google.protobuf.Timestamp timestamp = 5;
+
+  // Event-specific payload (exactly one should be set)
+  oneof payload {
+    ContainerEvent container_event = 10;
+    AppEvent app_event = 11;
+    RouteEvent route_event = 12;
+    MetricsEvent metrics_event = 13;
+    TrafficEvent traffic_event = 14;
+    SecurityFindingEvent security_finding_event = 15;
+    AnonEvent anon_event = 16;
+  }
+
+  // sha256 hex of the SSH key fingerprint for EVENT_TYPE_ANON_* events
+  // (#2201); empty for every other type. Top-level so subscribers can
+  // correlate a key's journey without opening the payload.
+  string fingerprint_hash = 6;
+}
+
+// SubscribeEventsRequest configures the event subscription
+message SubscribeEventsRequest {
+  // Filter by resource types (empty = all types)
+  repeated ResourceType resource_types = 1;
+
+  // Include metrics events (can be noisy, default false)
+  bool include_metrics = 2;
+
+  // Metrics interval in seconds (default: 5, min: 1, max: 60)
+  int32 metrics_interval_seconds = 3;
+}
+
+// EventService provides real-time event streaming
+service EventService {
+  // SubscribeEvents opens a streaming connection for real-time events
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream Event) {
+    option (google.api.http) = {
+      get: "/v1/events/subscribe"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Subscribe to real-time events";
+      description: "Opens a Server-Sent Events stream for real-time resource updates. Filter by resource types using query parameters.";
+      tags: "Events";
+    };
+  }
+}
