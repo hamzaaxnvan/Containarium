@@ -28,3 +28,33 @@ func TestPassthroughRuleArgs(t *testing.T) {
 	out := passthroughOutputArgs(36443, "10.166.0.9", 6443, "tcp")
 	oj := strings.Join(out, " ")
 	if !strings.Contains(oj, "OUTPUT") || !strings.Contains(oj, "DNAT") {
+		t.Fatalf("output args are not a DNAT rule: %v", out)
+	}
+	if !strings.Contains(oj, "10.166.0.9:6443") {
+		t.Errorf("output rule does not target the route's destination: %v", out)
+	}
+	// Scoped to locally-destined traffic: without this the rule would
+	// hijack every locally-originated connection to that port, whatever
+	// its destination.
+	if !strings.Contains(oj, "--dst-type") || !strings.Contains(oj, "LOCAL") {
+		t.Errorf("output rule is not scoped to local destinations: %v", out)
+	}
+}
+
+// Removal must undo both chains; leaving an OUTPUT rule behind would
+// silently redirect a later, unrelated connection on that port.
+func TestPassthroughRemovalCoversBothChains(t *testing.T) {
+	chains := map[string]bool{}
+	for _, args := range passthroughDeleteArgs(36443, "tcp") {
+		for i, a := range args {
+			if a == "-D" && i+1 < len(args) {
+				chains[args[i+1]] = true
+			}
+		}
+	}
+	for _, want := range []string{"PREROUTING", "OUTPUT"} {
+		if !chains[want] {
+			t.Errorf("removal does not delete the %s rule: %v", want, chains)
+		}
+	}
+}

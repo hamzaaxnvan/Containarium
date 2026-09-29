@@ -211,3 +211,75 @@ func TestGetPolicy_Authorization(t *testing.T) {
 				t.Errorf("Get = %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+// codeEgressAuditDetail mirrors what the server writes, so the test reads it
+// as a typed value.
+type codeEgressAuditDetailForTest struct {
+	PreviousRevision int64  `json:"previous_revision"`
+	Revision         int64  `json:"revision"`
+	Mode             string `json:"mode"`
+	CIDRCount        int    `json:"cidr_count"`
+	DomainCount      int    `json:"domain_count"`
+}
+
+func TestCodeEgressPolicy_AuditEntryPerChange(t *testing.T) {
+	s, a := newTestCodeEgressServer()
+	first, err := s.SetCodingToolEgressPolicy(ceAdminCtx(), setReq("alice", pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE,
+		[]string{"192.0.2.0/24", "198.51.100.0/24"}, []string{"api.example.com"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.SetCodingToolEgressPolicy(ceAdminCtx(), setReq("alice", pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY, nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteCodingToolEgressPolicy(ceAdminCtx(), &pb.DeleteCodingToolEgressPolicyRequest{Tenant: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	// A read is not a change.
+	if _, err := s.GetCodingToolEgressPolicy(ceAdminCtx(), &pb.GetCodingToolEgressPolicyRequest{Tenant: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(a.entries) != 3 {
+		t.Fatalf("want one audit entry per change (3), got %d: %+v", len(a.entries), a.entries)
+	}
+	want := []struct {
+		action string
+		detail codeEgressAuditDetailForTest
+	}{
+		{"code_egress_policy.set", codeEgressAuditDetailForTest{0, first.GetPolicy().GetRevision(), "NETWORK_POLICY_MODE_ENFORCE", 2, 1}},
+		{"code_egress_policy.set", codeEgressAuditDetailForTest{first.GetPolicy().GetRevision(), second.GetPolicy().GetRevision(), "NETWORK_POLICY_MODE_LOG_ONLY", 0, 0}},
+		{"code_egress_policy.delete", codeEgressAuditDetailForTest{PreviousRevision: second.GetPolicy().GetRevision()}},
+	}
+	for i, e := range a.entries {
+		if e.Action != want[i].action || e.ResourceType != "coding_tool_egress_policy" || e.ResourceID != "alice" || e.Username != "root-admin" {
+			t.Errorf("entry %d = %+v", i, e)
+		}
+		var got codeEgressAuditDetailForTest
+		if err := json.Unmarshal([]byte(e.Detail), &got); err != nil {
+			t.Fatalf("entry %d detail is not JSON: %q", i, e.Detail)
+		}
+		if got != want[i].detail {
+			t.Errorf("entry %d detail = %+v, want %+v", i, got, want[i].detail)
+		}
+		// Revisions and counts only: never the destinations themselves.
+		for _, leak := range []string{"192.0.2", "198.51.100", "example.com"} {
+			if strings.Contains(e.Detail, leak) {
+				t.Errorf("entry %d detail carries a destination (%q): %s", i, leak, e.Detail)
+			}
+		}
+	}
+}
+
+func TestCodeEgressPolicy_ClusterDefaultAuditResourceID(t *testing.T) {
+	s, a := newTestCodeEgressServer()
+	if _, err := s.SetCodingToolEgressPolicy(ceAdminCtx(), setReq("", pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE, nil, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.entries) != 1 || a.entries[0].ResourceID != codeEgressClusterDefaultResourceID {
+		t.Fatalf("cluster default audit entry = %+v", a.entries)
+	}
+}
