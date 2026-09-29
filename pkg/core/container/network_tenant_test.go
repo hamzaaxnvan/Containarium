@@ -46,3 +46,51 @@ func TestNetworkTenantFailsClosedWithoutRequiredHook(t *testing.T) {
 			t.Fatalf("wanted closed failure, got %v", err)
 		}
 		if b.started || b.deleteCalls != 1 {
+			t.Fatal("failed guard left a runnable resource")
+		}
+	}
+}
+
+type failingGuardCleanup struct {
+	*guardBackend
+	deleteErr error
+	configErr error
+}
+
+func (b *failingGuardCleanup) DeleteContainer(string) error { b.deleteCalls++; return b.deleteErr }
+func (b *failingGuardCleanup) SetConfig(name, key, value string) error {
+	if key == "boot.autostart" && b.configErr != nil {
+		return b.configErr
+	}
+	return b.stagesBackend.SetConfig(name, key, value)
+}
+func TestNetworkTenantCleanupFailureKeepsStoppedIdentityAndCauses(t *testing.T) {
+	cleanupErr := errors.New("delete refused")
+	b := &failingGuardCleanup{guardBackend: &guardBackend{stagesBackend: &stagesBackend{}}, deleteErr: cleanupErr}
+	m := NewWithBackend(b)
+	m.SetNICGuard(requiredGuard{check: func(string, string) error { return errors.New("ACL refused") }})
+	opts := stagesOpts()
+	opts.NetworkTenant = "team-a"
+	opts.AutoStart = true
+	_, err := m.Create(opts)
+	if !errors.Is(err, ErrNICGuard) || !errors.Is(err, cleanupErr) || !strings.Contains(err.Error(), opts.Username+"-container") {
+		t.Fatalf("missing original failure/cleanup identity: %v", err)
+	}
+	if b.started || b.createdConfig.AutoStart || b.deleteCalls != 1 {
+		t.Fatal("unguarded instance became startable")
+	}
+}
+func TestNetworkTenantAutostartFailureDoesNotStart(t *testing.T) {
+	b := &failingGuardCleanup{guardBackend: &guardBackend{stagesBackend: &stagesBackend{}}, configErr: errors.New("config refused")}
+	m := NewWithBackend(b)
+	m.SetNICGuard(requiredGuard{check: func(string, string) error { return nil }})
+	opts := stagesOpts()
+	opts.NetworkTenant = "team-a"
+	opts.AutoStart = true
+	if _, err := m.Create(opts); !errors.Is(err, ErrNICGuard) {
+		t.Fatalf("wanted precondition error: %v", err)
+	}
+	if b.started || b.deleteCalls != 1 {
+		t.Fatal("autostart config failure started box")
+	}
+}
