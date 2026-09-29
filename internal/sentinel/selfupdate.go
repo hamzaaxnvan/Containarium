@@ -117,3 +117,122 @@ func fetchAndInstallRelease(ctx context.Context, tag, binaryPath string) error {
 	if err := downloadReleaseBinary(ctx, binURL, tmpPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("download %s binary: %w", tag, err)
+	}
+
+	// 3. Verify checksum. checksumFile is defined in autoupdate.go (server pkg)
+	// — here we inline the same logic to keep the sentinel package self-contained.
+	actualHash, err := checksumFileSentinel(tmpPath)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("checksum new binary: %w", err)
+	}
+	if actualHash != expectedHash {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("checksum mismatch (got %.12s, want %.12s)", actualHash, expectedHash)
+	}
+
+	// 4. Make executable and smoke-test.
+	if err := os.Chmod(tmpPath, 0755); err != nil { // #nosec G302 -- executable binary requires 0755
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("chmod new binary: %w", err)
+	}
+	smokeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	out, smokeErr := exec.CommandContext(smokeCtx, tmpPath, "version").CombinedOutput() // #nosec G204 -- tmpPath derived from trusted binaryPath config
+	cancel()
+	if smokeErr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("smoke test failed: %w; output: %s", smokeErr, strings.TrimSpace(string(out)))
+	}
+
+	// 5. Atomic swap: current → .old, new → current.
+	oldPath := binaryPath + ".old"
+	_ = os.Remove(oldPath)
+	if err := os.Rename(binaryPath, oldPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("save old binary: %w", err)
+	}
+	if err := os.Rename(tmpPath, binaryPath); err != nil {
+		_ = os.Rename(oldPath, binaryPath) // restore on failure
+		return fmt.Errorf("install new binary: %w", err)
+	}
+
+	log.Printf("[sentinel-selfupdate] binary swapped to %s (sha256: %.12s…)", tag, actualHash)
+	return nil
+}
+
+// fetchExpectedHash downloads SHA256SUMS.txt from url and returns the hash
+// for the given filename.
+func fetchExpectedHash(ctx context.Context, sumsURL, filename string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sumsURL, nil)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d from %s", resp.StatusCode, sumsURL)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	// SHA256SUMS.txt format: "<hash>  <filename>" (two spaces, GNU sha256sum style)
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		name := strings.TrimPrefix(fields[1], "./")
+		if name == filename {
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("%q not found in SHA256SUMS.txt", filename)
+}
+
+// downloadReleaseBinary downloads the binary at url to dest.
+func downloadReleaseBinary(ctx context.Context, url, dest string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d from %s", resp.StatusCode, url)
+	}
+	f, err := os.Create(dest) // #nosec G304 -- dest is binaryPath+".new", derived from trusted config
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// checksumFileSentinel computes the SHA-256 hex digest of path.
+// Mirrors server.checksumFile; kept here so the sentinel package doesn't
+// import the server package.
+func checksumFileSentinel(path string) (string, error) {
+	f, err := os.Open(path) // #nosec G304 -- path is binaryPath+".new"
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}

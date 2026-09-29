@@ -53,3 +53,58 @@ func (c *GRPCClient) DeleteNotifyChannel(req *pb.DeleteNotifyChannelRequest) (*p
 	return c.notify().DeleteNotifyChannel(ctx, req)
 }
 
+func (c *GRPCClient) TestNotifyChannel(req *pb.TestNotifyChannelRequest) (*pb.TestNotifyChannelResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	defer cancel()
+	return c.notify().TestNotifyChannel(ctx, req)
+}
+
+// ---------- HTTP ----------
+
+// notifyQuery is the ?username= query the GET and DELETE mappings take.
+func notifyQuery(username string) string {
+	if username == "" {
+		return NotifyChannelPath
+	}
+	return NotifyChannelPath + "?" + url.Values{"username": {username}}.Encode()
+}
+
+func (c *HTTPClient) SetNotifyChannel(req *pb.SetNotifyChannelRequest) (*pb.SetNotifyChannelResponse, error) {
+	body, err := protojson.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+	out := &pb.SetNotifyChannelResponse{}
+	if err := c.trackerDoTimeout(notifyTimeout, http.MethodPut, NotifyChannelPath, "set notification channel", body, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) GetNotifyChannel(req *pb.GetNotifyChannelRequest) (*pb.GetNotifyChannelResponse, error) {
+	out := &pb.GetNotifyChannelResponse{}
+	if err := c.trackerDoTimeout(notifyTimeout, http.MethodGet, notifyQuery(req.GetUsername()), "get notification channel", nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) DeleteNotifyChannel(req *pb.DeleteNotifyChannelRequest) (*pb.DeleteNotifyChannelResponse, error) {
+	out := &pb.DeleteNotifyChannelResponse{}
+	if err := c.trackerDoTimeout(notifyTimeout, http.MethodDelete, notifyQuery(req.GetUsername()), "delete notification channel", nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) TestNotifyChannel(req *pb.TestNotifyChannelRequest) (*pb.TestNotifyChannelResponse, error) {
+	body, err := protojson.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+	out := &pb.TestNotifyChannelResponse{}
+	if err := c.trackerDoTimeout(notifyTimeout, http.MethodPost, NotifyChannelPath+"/test", "send test notification", body, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
