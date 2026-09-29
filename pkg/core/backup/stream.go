@@ -151,3 +151,157 @@ func (m *Manager) stageDump(src io.Reader, id, ext string, recipients []string, 
 	}
 	if n == 0 {
 		return "", 0, "", fmt.Errorf("dump produced an empty archive (backup hook produced no output)")
+	}
+	if encrypted != nil {
+		if err := encrypted.Close(); err != nil {
+			return "", 0, "", fmt.Errorf("encrypt dump: %w", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return "", 0, "", err
+	}
+	name := filepath.Join(m.dir, id+ext)
+	if err := os.Rename(f.Name(), name); err != nil {
+		return "", 0, "", err
+	}
+	return name, dst.n, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+type fetchedDump struct {
+	*os.File
+	size   int64
+	remove bool
+}
+
+func (f *fetchedDump) Close() error {
+	err := f.File.Close()
+	if f.remove {
+		_ = os.Remove(f.Name())
+	}
+	return err
+}
+
+// fetchDump hashes a bounded stream, then rewinds the same open file.
+// No bytes reach the target until the entire stored checksum is verified.
+// GCS uses a unique temporary file, removed on both success and failure.
+func (m *Manager) fetchDump(r *Record) (*fetchedDump, error) {
+	if r.SizeBytes < 0 || r.SizeBytes > m.maxDumpBytes {
+		return nil, fmt.Errorf("%w: recorded size %d (limit %d)", ErrDumpTooLarge, r.SizeBytes, m.maxDumpBytes)
+	}
+	name := r.Location
+	remove := false
+	if r.Destination == DestGCS {
+		if m.uploader == nil {
+			return nil, fmt.Errorf("cannot read GCS backup: no object-store uploader configured")
+		}
+		tmp, err := os.CreateTemp(m.dir, ".restore-*.tmp")
+		if err != nil {
+			return nil, err
+		}
+		name = tmp.Name()
+		dst := &boundedWriter{w: tmp, limit: m.maxDumpBytes}
+		downloadErr := m.uploader.DownloadStream(r.Location, dst)
+		closeErr := tmp.Close()
+		if dst.err != nil {
+			downloadErr = dst.err
+		}
+		if downloadErr == nil {
+			downloadErr = closeErr
+		}
+		if downloadErr != nil {
+			_ = os.Remove(name)
+			return nil, fmt.Errorf("failed to download %s: %w", r.Location, downloadErr)
+		}
+		remove = true
+	}
+	f, err := os.Open(name) // #nosec G304 -- persisted backup location or private staging file
+	if err != nil {
+		if remove {
+			_ = os.Remove(name)
+		}
+		return nil, fmt.Errorf("failed to read dump %s: %w", name, err)
+	}
+	dump := &fetchedDump{File: f, remove: remove}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = dump.Close()
+		}
+	}()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("backup dump is not a regular file")
+	}
+	if info.Size() > m.maxDumpBytes {
+		return nil, fmt.Errorf("%w (%d bytes)", ErrDumpTooLarge, m.maxDumpBytes)
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, &boundedReader{r: f, limit: m.maxDumpBytes})
+	if err != nil {
+		return nil, fmt.Errorf("read dump: %w", err)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != r.SHA256 {
+		return nil, fmt.Errorf("dump integrity check failed: sha256 %s != recorded %s (corruption or tampering)", got, r.SHA256)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	dump.size, ok = n, true
+	return dump, nil
+}
+
+type decryptionError struct{ err error }
+
+func (e *decryptionError) Error() string { return "age decrypt: " + e.err.Error() }
+func (e *decryptionError) Unwrap() error { return e.err }
+
+type decryptReader struct{ io.Reader }
+
+func (r decryptReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err != nil && err != io.EOF {
+		err = &decryptionError{err}
+	}
+	return n, err
+}
+
+// writeDump authenticates encrypted content through EOF before the caller
+// runs pg_restore. Only the target container sees plaintext; host staging
+// contains ciphertext exclusively. Failed uploads are removed here; the
+// caller removes successful staging after use.
+func (m *Manager) writeDump(container, path string, src io.Reader, encrypted bool, identity string) (int64, error) {
+	if encrypted {
+		id, err := age.ParseX25519Identity(strings.TrimSpace(identity))
+		if err != nil {
+			return 0, &decryptionError{err}
+		}
+		r, err := age.Decrypt(src, id)
+		if err != nil {
+			return 0, &decryptionError{err}
+		}
+		src = decryptReader{r}
+	}
+	in := &boundedReader{r: src, limit: m.maxDumpBytes}
+	complete := false
+	defer func() {
+		if !complete {
+			_ = m.ops.Exec(container, []string{"rm", "-f", path})
+		}
+	}()
+	err := m.ops.WriteFileStream(container, path, in, "0600")
+	n, readErr, eof := in.result()
+	if readErr != nil {
+		return n, readErr
+	}
+	if err != nil {
+		return n, err
+	}
+	if !eof {
+		return n, fmt.Errorf("container file upload did not consume the complete dump")
+	}
+	complete = true
+	return n, nil
+}
