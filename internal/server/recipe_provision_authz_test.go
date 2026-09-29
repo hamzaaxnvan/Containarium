@@ -34,3 +34,40 @@ func agentsRunOnly(name string) context.Context {
 // check. Before the fix this returned PermissionDenied "scope required:
 // containers:write".
 func TestRecipeInnerCreate_DoesNotRecheckCallerForContainersWrite(t *testing.T) {
+	boxes := containerServerBoxes{&ContainerServer{}}
+	mustPassScope(t, "inner create with agents:run only", func() error {
+		_, err := boxes.CreateContainer(agentsRunOnly("cloud-org-dogfood"), &pb.CreateContainerRequest{
+			Username: "agent-issue-implementer",
+			Image:    recipeBaseImage,
+		})
+		return err
+	})
+}
+
+// The wire-facing RPC keeps its gate: agents:run buys nothing there.
+func TestCreateContainer_StillRequiresContainersWrite(t *testing.T) {
+	srv := &ContainerServer{}
+	_, err := srv.CreateContainer(agentsRunOnly("alice"), &pb.CreateContainerRequest{Username: "alice"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("CreateContainer with agents:run only: want PermissionDenied, got %v", err)
+	}
+}
+
+// DeployRecipe authorises at its own entry, and still with containers:write.
+func TestDeployRecipe_StillRequiresContainersWrite(t *testing.T) {
+	srv := &RecipeServer{}
+	_, err := srv.DeployRecipe(agentsRunOnly("alice"), &pb.DeployRecipeRequest{RecipeId: "some-recipe", Name: "alice"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("DeployRecipe with agents:run only: want PermissionDenied, got %v", err)
+	}
+}
+
+// With the inner create no longer checking the caller, deploy itself is the
+// last line: a context with no authenticated subject must not provision.
+func TestRecipeDeploy_RefusesUnauthenticatedContext(t *testing.T) {
+	srv := &RecipeServer{}
+	_, err := srv.deploy(context.Background(), &pb.DeployRecipeRequest{RecipeId: "some-recipe", Name: "alice"})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("deploy with no subject: want Unauthenticated, got %v", err)
+	}
+}
