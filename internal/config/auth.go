@@ -8,3 +8,14 @@ package config
 const EnvStrictScopes = "CONTAINARIUM_STRICT_SCOPES"
 
 // Auth is the typed view of the auth-related CONTAINARIUM_* namespace.
+type Auth struct {
+	// StrictScopes arms rejection of unscoped tokens (EnvStrictScopes).
+	StrictScopes bool
+}
+
+// LoadAuth reads the auth-related CONTAINARIUM_* namespace once.
+func LoadAuth() Auth {
+	return Auth{
+		StrictScopes: getBool(EnvStrictScopes),
+	}
+}
