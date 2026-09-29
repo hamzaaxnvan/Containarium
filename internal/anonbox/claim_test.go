@@ -150,3 +150,41 @@ func TestClaim_Rejections(t *testing.T) {
 		{"bad hmac", strings.TrimSuffix(token, parts[5]) + strings.Repeat("0", 64), 0, ErrClaimInvalid, nil},
 		{"malformed", "v1.nope", 0, ErrClaimInvalid, nil},
 		{"token id mismatch (box re-minted)", token, 0, ErrClaimInvalid, func() {
+			st, _ := h.m.findByName(context.Background(), boxName)
+			st.Labels[LabelClaimTokenID] = "ffffffffffffffffffffffffffffffff"
+		}},
+		{"box gone", token, 0, ErrClaimNotFound, func() { h.boxes.boxes = nil }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.mut != nil {
+				tt.mut()
+			}
+			saved := h.now
+			h.now = saved.Add(tt.now)
+			_, err := h.m.Claim(context.Background(), ClaimRequest{Token: tt.token, Tenant: "qa"})
+			h.now = saved
+			if !errors.Is(err, tt.want) {
+				t.Errorf("err = %v, want %v", err, tt.want)
+			}
+			if st, _ := h.m.findByName(context.Background(), boxName); st != nil && st.Labels[LabelClaimedAt] != "" {
+				t.Errorf("a rejected claim must not mark the box claimed")
+			}
+		})
+	}
+}
+
+func TestClaim_InvalidTenantOrDisabled(t *testing.T) {
+	h, _, content := claimHarness(t, "")
+	token := tokenFromClaimFile(t, content)
+	for _, tenant := range []string{"", "Alice", "9x", "a.b", strings.Repeat("a", 40)} {
+		var inv InvalidRequestError
+		if _, err := h.m.Claim(context.Background(), ClaimRequest{Token: token, Tenant: tenant}); !errors.As(err, &inv) {
+			t.Errorf("tenant %q: err = %v, want InvalidRequestError", tenant, err)
+		}
+	}
+	off := newHarness(t, func(c *Config) { c.ClaimSecret = nil })
+	if _, err := off.m.Claim(context.Background(), ClaimRequest{Token: token, Tenant: "qa"}); err == nil || !strings.Contains(err.Error(), "not enabled") {
+		t.Errorf("claims disabled: err = %v", err)
+	}
+}

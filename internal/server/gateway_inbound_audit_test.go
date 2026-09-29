@@ -45,3 +45,50 @@ func TestGatewayInboundAudit_WritesTypedDetailWithoutContent(t *testing.T) {
 func TestGatewayInboundAudit_DetectionRecordsRuleKindAction(t *testing.T) {
 	log := &captureAuditLog{}
 	err := gatewayInboundAudit{log: log}.RecordInboundDetection(context.Background(), modelgateway.InboundDetection{
+		Tenant: "tenant-a", SkillID: "s1", Provider: "anthropic", Model: "m",
+		RuleID: guardrail.BaselineRulePEMPrivateKey, Kind: pb.GuardrailKind_GUARDRAIL_KIND_SECRET,
+		Action: guardrail.BaselineActionLog, Matches: 1,
+	})
+	if err != nil || len(log.entries) != 1 {
+		t.Fatalf("err=%v entries=%d", err, len(log.entries))
+	}
+	e := log.entries[0]
+	if e.Action != modelGatewayInboundDetectionAction || e.Username != "tenant-a" || e.ResourceID != "tenant-a" || e.ResourceType != "model_gateway" {
+		t.Errorf("entry attribution wrong: %+v", e)
+	}
+	var d inboundDetectionAuditDetail
+	if err := json.Unmarshal([]byte(e.Detail), &d); err != nil {
+		t.Fatal(err)
+	}
+	want := inboundDetectionAuditDetail{
+		Skill: "s1", Provider: "anthropic", Model: "m", Policy: "baseline",
+		RuleID: "baseline.pem_private_key", Kind: "GUARDRAIL_KIND_SECRET", Action: "log", Matches: 1,
+	}
+	if d != want {
+		t.Errorf("detail = %+v, want %+v", d, want)
+	}
+}
+
+func TestNewGatewayInboundAudit_NilStoreIsNilInterface(t *testing.T) {
+	if s := newGatewayInboundAudit(nil); s != nil {
+		t.Errorf("nil store produced a non-nil sink: %#v", s)
+	}
+}
+
+func TestGuardrailPolicyServer_OnChangeRunsOnlyAfterASuccessfulSet(t *testing.T) {
+	s := NewGuardrailPolicyServer(guardrailpolicy.NewMemoryStore())
+	called := 0
+	s.SetOnChange(func() { called++ })
+	if _, err := s.SetGuardrailPolicy(gpUserCtx(), gpRequest(0, gpSigner(1))); err == nil {
+		t.Fatal("non-admin Set succeeded")
+	}
+	if called != 0 {
+		t.Errorf("hook ran for a refused Set: %d", called)
+	}
+	if _, err := s.SetGuardrailPolicy(gpAdminCtx(), gpRequest(0, gpSigner(1))); err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 {
+		t.Errorf("hook ran %d times after a successful Set, want 1", called)
+	}
+}

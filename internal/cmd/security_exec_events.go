@@ -149,3 +149,105 @@ func streamExecEvents(ctx context.Context, rawURL string, w io.Writer, jsonOut b
 		if len(chunk.Result) == 0 {
 			continue
 		}
+		if jsonOut {
+			// One ExecEvent object per line: the server's bytes, unwrapped
+			// from the StreamExecEventsResponse envelope.
+			var env struct {
+				Event json.RawMessage `json:"event"`
+			}
+			if err := json.Unmarshal(chunk.Result, &env); err != nil {
+				return fmt.Errorf("decode stream chunk: %w", err)
+			}
+			if len(env.Event) > 0 {
+				fmt.Fprintln(w, string(env.Event))
+			}
+			continue
+		}
+		var msg pb.StreamExecEventsResponse
+		if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(chunk.Result, &msg); err != nil {
+			return fmt.Errorf("decode exec event: %w", err)
+		}
+		if msg.GetEvent() == nil {
+			continue
+		}
+		fmt.Fprintln(w, formatExecEvent(msg.GetEvent()))
+	}
+	if err := sc.Err(); err != nil && ctx.Err() == nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("read stream: %w", err)
+	}
+	return nil
+}
+
+// gatewayErrorMessage pulls the message out of a grpc-gateway error body,
+// falling back to the trimmed body.
+func gatewayErrorMessage(body []byte) string {
+	var e struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &e) == nil && e.Message != "" {
+		return e.Message
+	}
+	msg := strings.TrimSpace(string(body))
+	if len(msg) > 512 {
+		msg = msg[:512]
+	}
+	return msg
+}
+
+// formatExecEvent renders one event on one line:
+//
+//	2026-10-19T05:07:18Z  box-a  pid=4242 ppid=4100 uid=1000  /tmp/.x/xmrig  ./xmrig -o pool:3333  [argv truncated]
+//
+// filename and argv are tenant-controlled bytes (the tenant has root in the
+// box); control characters are escaped so a crafted argv cannot rewrite or
+// spoof lines of a --follow terminal. --json passes the raw event through.
+func formatExecEvent(ev *pb.ExecEvent) string {
+	at := ""
+	if ev.GetAt() != nil {
+		at = ev.GetAt().AsTime().UTC().Format(time.RFC3339)
+	}
+	x := ev.GetExec()
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s  %s  pid=%d ppid=%d uid=%d  %s", at, escapeControl(ev.GetContainer()), x.GetPid(), x.GetPpid(), x.GetUid(), escapeControl(x.GetFilename()))
+	if argv := x.GetArgv(); argv != "" {
+		fmt.Fprintf(&b, "  %s", escapeControl(argv))
+	}
+	if x.GetArgvTruncated() {
+		b.WriteString("  [argv truncated]")
+	}
+	return b.String()
+}
+
+// escapeControl replaces every non-printable rune (ESC, CR, LF, TAB, DEL,
+// C1 controls, invalid UTF-8 …) with its Go escape (`\x1b`, `\r`, …) and
+// leaves printable text, including non-ASCII, untouched.
+func escapeControl(s string) string {
+	clean := true
+	for _, r := range s {
+		if !unicode.IsPrint(r) && r != ' ' {
+			clean = false
+			break
+		}
+	}
+	if clean && utf8.ValidString(s) {
+		return s
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if (unicode.IsPrint(r) || r == ' ') && r != utf8.RuneError {
+			b.WriteRune(r)
+			continue
+		}
+		q := strconv.QuoteToASCII(string(r)) // "" with surrounding quotes
+		b.WriteString(q[1 : len(q)-1])
+	}
+	return b.String()
+}
+
+func init() {
+	securityExecEventsCmd.Flags().StringVar(&execEventsContainer, "container", "", "Only this container's execs (default: every watched box)")
+	securityExecEventsCmd.Flags().StringVar(&execEventsSince, "since", "5m", "Replay the daemon's recent-event buffer for this window first (0 = no replay)")
+	securityExecEventsCmd.Flags().BoolVar(&execEventsFollow, "follow", false, "Keep the stream open and print new execs as they happen (Ctrl-C to stop)")
+	securityExecEventsCmd.Flags().BoolVar(&execEventsJSONOut, "json", false, "Print one ExecEvent JSON object per line instead of the formatted line")
+	securityCmd.AddCommand(securityExecEventsCmd)
+}
