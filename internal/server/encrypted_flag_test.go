@@ -41,3 +41,47 @@ func TestCreateContainer_RefusesEncryptedRatherThanIgnoringIt(t *testing.T) {
 		Encrypted: true,
 	})
 	if err == nil {
+		t.Fatal("a create asking for encryption succeeded — the container would be on the " +
+			"pool-wide key and the caller would never know")
+	}
+
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition — the proto names that code specifically, "+
+			"so a client can tell 'not available here' from 'your request was malformed'", got)
+	}
+	// The caller has to be able to act on this, which means knowing it is a
+	// daemon capability gap rather than something they got wrong.
+	msg := err.Error()
+	if !strings.Contains(msg, "KeyProvider") || !strings.Contains(msg, "none is configured") {
+		t.Errorf("the error does not identify the missing daemon capability: %v", err)
+	}
+	// And it must still promise the thing #1294 was filed for.
+	if !strings.Contains(msg, "refusing rather than creating an unencrypted container") {
+		t.Errorf("the error no longer says it refuses rather than falling back to plaintext: %v", err)
+	}
+}
+
+// The refusal must not preempt basic request validation: a malformed request
+// should still be told what is malformed, not handed a capability error that
+// sends the caller looking in the wrong place.
+//
+// (The mirror case — an unencrypted create being unaffected — is not
+// assertable here: a bare ContainerServer panics further down the create
+// path, so reaching that point needs a wired backend. Stated rather than
+// silently omitted.)
+func TestCreateContainer_EncryptionRefusalDoesNotPreemptValidation(t *testing.T) {
+	s := &ContainerServer{}
+
+	_, err := s.CreateContainer(tenantWithScopes("alice", auth.ScopeContainersWrite),
+		&pb.CreateContainerRequest{Username: "", Encrypted: true})
+	if err == nil {
+		t.Fatal("a request with no username succeeded")
+	}
+	// Assert against the refusal that actually exists. The old assertion
+	// looked for "per-container encryption", a phrase #1341 deleted — it
+	// could no longer fail, so it proved nothing about ordering.
+	if strings.Contains(err.Error(), "KeyProvider") {
+		t.Errorf("a request missing its username was refused for encryption instead: %v — the "+
+			"caller would go looking at daemon capabilities for a typo", err)
+	}
+}
