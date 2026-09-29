@@ -316,3 +316,215 @@ func (s *Store) FailDispatch(ctx context.Context, id string, from pb.TrackerDisp
 	if err != nil {
 		return false, err
 	}
+	failureStr, err := dispatchFailureToString(failure)
+	if err != nil {
+		return false, err
+	}
+	const q = `
+		UPDATE tracker_dispatches SET state = 'failed', ended_at = $3, failure_reason = $4, failure = $5, labels_pending = true
+		WHERE id = $1 AND state = $2
+	`
+	tag, err := s.pool.Exec(ctx, q, id, fromStr, at, reason, failureStr)
+	if err != nil {
+		return false, fmt.Errorf("fail tracker dispatch: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// SetDispatchLabelsPending records whether the forge still lags the
+// row's state.
+func (s *Store) SetDispatchLabelsPending(ctx context.Context, id string, pending bool) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE tracker_dispatches SET labels_pending = $2 WHERE id = $1`, id, pending)
+	if err != nil {
+		return fmt.Errorf("set tracker dispatch labels_pending: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrDispatchNotFound
+	}
+	return nil
+}
+
+const dispatchColumns = `id, username, connection, issue_number, scope, skill_id, run_id, depth, state,
+	failure_reason, failure, labels_pending, created_at, started_at, ended_at, change_url, change_number`
+
+func scanDispatch(row pgx.Row) (*Dispatch, error) {
+	var d Dispatch
+	var state, failure string
+	var startedAt, endedAt *time.Time
+	if err := row.Scan(&d.ID, &d.Username, &d.Connection, &d.IssueNumber, &d.Scope, &d.SkillID, &d.RunID, &d.Depth,
+		&state, &d.FailureReason, &failure, &d.LabelsPending, &d.CreatedAt, &startedAt, &endedAt, &d.ChangeURL, &d.ChangeNumber); err != nil {
+		return nil, err
+	}
+	d.State = dispatchStateFromString(state)
+	d.Failure = dispatchFailureFromString(failure)
+	if startedAt != nil {
+		d.StartedAt = *startedAt
+	}
+	if endedAt != nil {
+		d.EndedAt = *endedAt
+	}
+	return &d, nil
+}
+
+// RecordDispatchChange records the change request a run submitted on the
+// dispatch row that started the run (#3001), matched by run id. Returns
+// false (no error) when no row names runID — a run the dispatcher did not
+// start (an operator-started run, a run from another daemon instance) has
+// nothing to annotate, and the submit itself already succeeded. The newest
+// row for the run id wins if a run id were ever reused.
+func (s *Store) RecordDispatchChange(ctx context.Context, runID, changeURL string, changeNumber int64) (bool, error) {
+	if runID == "" {
+		return false, nil
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE tracker_dispatches SET change_url = $2, change_number = $3
+		WHERE id = (SELECT id FROM tracker_dispatches WHERE run_id = $1 ORDER BY seq DESC LIMIT 1)`,
+		runID, changeURL, changeNumber)
+	if err != nil {
+		return false, fmt.Errorf("record tracker dispatch change: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// GetDispatch returns one row by id, or ErrDispatchNotFound.
+func (s *Store) GetDispatch(ctx context.Context, id string) (*Dispatch, error) {
+	d, err := scanDispatch(s.pool.QueryRow(ctx, `SELECT `+dispatchColumns+` FROM tracker_dispatches WHERE id = $1`, id))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrDispatchNotFound
+		}
+		return nil, fmt.Errorf("select tracker dispatch: %w", err)
+	}
+	return d, nil
+}
+
+// ListDispatches returns a connection's dispatch rows, newest first.
+// UNSPECIFIED state matches every state.
+func (s *Store) ListDispatches(ctx context.Context, username, connection string, state pb.TrackerDispatchState) ([]Dispatch, error) {
+	if username == "" {
+		return nil, errors.New("tracker: username is required")
+	}
+	var stateFilter *string
+	if state != pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED {
+		str, err := dispatchStateToString(state)
+		if err != nil {
+			return nil, err
+		}
+		stateFilter = &str
+	}
+	q := `SELECT ` + dispatchColumns + ` FROM tracker_dispatches
+		WHERE username = $1 AND connection = $2 AND ($3::text IS NULL OR state = $3)
+		ORDER BY seq DESC`
+	rows, err := s.pool.Query(ctx, q, username, connection, stateFilter)
+	if err != nil {
+		return nil, fmt.Errorf("list tracker dispatches: %w", err)
+	}
+	defer rows.Close()
+	var out []Dispatch
+	for rows.Next() {
+		d, err := scanDispatch(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan tracker dispatch row: %w", err)
+		}
+		out = append(out, *d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tracker dispatch rows: %w", err)
+	}
+	return out, nil
+}
+
+// ListLabelsPendingDispatches returns the connection's terminal rows
+// whose projection has not landed (labels_pending), newest first — only
+// rows that are still their issue's latest: a newer generation owns the
+// issue's labels, so an older row is never projected over it.
+func (s *Store) ListLabelsPendingDispatches(ctx context.Context, username, connection string) ([]Dispatch, error) {
+	q := `SELECT ` + dispatchColumns + ` FROM tracker_dispatches d
+		WHERE d.username = $1 AND d.connection = $2 AND d.labels_pending AND d.state IN ('done', 'failed')
+		  AND NOT EXISTS (
+			SELECT 1 FROM tracker_dispatches n
+			WHERE n.username = d.username AND n.connection = d.connection
+			  AND n.issue_number = d.issue_number AND n.seq > d.seq)
+		ORDER BY d.seq DESC`
+	rows, err := s.pool.Query(ctx, q, username, connection)
+	if err != nil {
+		return nil, fmt.Errorf("list labels-pending tracker dispatches: %w", err)
+	}
+	defer rows.Close()
+	var out []Dispatch
+	for rows.Next() {
+		d, err := scanDispatch(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan tracker dispatch row: %w", err)
+		}
+		out = append(out, *d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tracker dispatch rows: %w", err)
+	}
+	return out, nil
+}
+
+// PriorDispatchLabelsPending reports whether the issue's newest row
+// other than excludeID is terminal with labels_pending — the tick's
+// check, after it won the insert, that the previous generation's state
+// has actually reached the forge (#2047, #2052).
+func (s *Store) PriorDispatchLabelsPending(ctx context.Context, username, connection string, issue int64, excludeID string) (bool, error) {
+	const q = `
+		SELECT state IN ('done', 'failed') AND labels_pending FROM tracker_dispatches
+		WHERE username = $1 AND connection = $2 AND issue_number = $3 AND id <> $4
+		ORDER BY seq DESC LIMIT 1
+	`
+	var pending bool
+	if err := s.pool.QueryRow(ctx, q, username, connection, issue, excludeID).Scan(&pending); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read prior tracker dispatch: %w", err)
+	}
+	return pending, nil
+}
+
+// RecordDispatchWarning records that the unrouted-scope warning for
+// (issue, scope) is being posted. Returns true only the first time —
+// the caller posts the comment only then, so an issue gets one warning
+// ever, not one per tick. Concurrent dispatchers are safe: the primary
+// key admits one inserter.
+func (s *Store) RecordDispatchWarning(ctx context.Context, username, connection string, issue int64, scope string) (bool, error) {
+	const q = `
+		INSERT INTO tracker_dispatch_warnings (username, connection, issue_number, scope)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT DO NOTHING
+	`
+	tag, err := s.pool.Exec(ctx, q, username, connection, issue, scope)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgForeignKeyViolation {
+			return false, ErrNotFound
+		}
+		return false, fmt.Errorf("record tracker dispatch warning: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ForgetDispatchWarning undoes RecordDispatchWarning when the comment
+// could not be posted, so the next tick tries again.
+func (s *Store) ForgetDispatchWarning(ctx context.Context, username, connection string, issue int64, scope string) error {
+	const q = `DELETE FROM tracker_dispatch_warnings WHERE username = $1 AND connection = $2 AND issue_number = $3 AND scope = $4`
+	if _, err := s.pool.Exec(ctx, q, username, connection, issue, scope); err != nil {
+		return fmt.Errorf("forget tracker dispatch warning: %w", err)
+	}
+	return nil
+}
+
+// DeleteQueuedDispatch removes a QUEUED row whose run was never started
+// — the tick's post-insert re-read (#2023) found the issue no longer
+// dispatchable (a peer finished it after this tick's list, or a human
+// changed its labels). Only a QUEUED row can be removed; a row that
+// moved on returns (false, nil).
+func (s *Store) DeleteQueuedDispatch(ctx context.Context, id string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM tracker_dispatches WHERE id = $1 AND state = 'queued'`, id)
+	if err != nil {
+		return false, fmt.Errorf("delete queued tracker dispatch: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
