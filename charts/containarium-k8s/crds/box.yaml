@@ -70,3 +70,111 @@ spec:
                   type: string
                 image:
                   description: >-
+                    agent-box image to run. Empty uses the daemon's configured
+                    default.
+                  type: string
+                mode:
+                  description: >-
+                    SSH session behavior: "mcp" (default) pins every session to
+                    the forced-command MCP server; "shell" gives an interactive
+                    login shell.
+                  type: string
+                  enum:
+                    - mcp
+                    - shell
+                sshKeys:
+                  description: Authorized public keys for this box's tenant.
+                  type: array
+                  items:
+                    type: string
+                resources:
+                  description: Requested CPU/memory/disk for the box.
+                  type: object
+                  properties:
+                    cpu:
+                      type: string
+                    memory:
+                      type: string
+                    disk:
+                      type: string
+                    storageClass:
+                      type: string
+                stack:
+                  description: Optional provisioning stack (e.g. "nodejs").
+                  type: string
+                stackParams:
+                  type: object
+                  additionalProperties:
+                    type: string
+                gitSource:
+                  type: string
+                gitRef:
+                  type: string
+                workspacePath:
+                  type: string
+                labels:
+                  type: object
+                  additionalProperties:
+                    type: string
+                autoStart:
+                  description: >-
+                    Run the box immediately. Defaults to true; false creates the
+                    box suspended (no pod) until started.
+                  type: boolean
+                ttlSeconds:
+                  description: >-
+                    Expire the box this many seconds after creation, when set.
+                  type: integer
+                  minimum: 0
+            status:
+              description: BoxStatus is the observed state of a Box.
+              type: object
+              properties:
+                phase:
+                  description: High-level lifecycle summary.
+                  type: string
+                podName:
+                  type: string
+                endpoint:
+                  description: SSH connect target (<tenant>@<gateway>).
+                  type: string
+                observedGeneration:
+                  type: integer
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    properties:
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      message:
+                        type: string
+                        maxLength: 32768
+                      observedGeneration:
+                        type: integer
+                        minimum: 0
+                      reason:
+                        type: string
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                      type:
+                        type: string
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                  x-kubernetes-list-map-keys:
+                    - type
+                  x-kubernetes-list-type: map
