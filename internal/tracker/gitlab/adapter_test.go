@@ -132,3 +132,138 @@ func TestDescribeCredential_InactiveToken_ReturnsErrCredentialInvalid(t *testing
 }
 
 func TestDescribeCredential_Unauthorized_ReturnsErrCredentialInvalid(t *testing.T) {
+	srv := gitlabFixtureServer(t,
+		`{"message":"401 Unauthorized"}`, http.StatusUnauthorized,
+		``, http.StatusOK,
+	)
+	defer srv.Close()
+
+	a := New(nil)
+	_, err := a.DescribeCredential(context.Background(), tracker.Conn{
+		BaseURL:    srv.URL,
+		Credential: "glpat-bad",
+	})
+	if !errors.Is(err, tracker.ErrCredentialInvalid) {
+		t.Fatalf("err = %v, want ErrCredentialInvalid", err)
+	}
+}
+
+func TestDescribeCredential_UserCallFails_StillSucceedsWithUnspecifiedBreadth(t *testing.T) {
+	srv := gitlabFixtureServer(t,
+		`{"active":true,"revoked":false,"scopes":["read_api"],"expires_at":"2027-01-01"}`, http.StatusOK,
+		`{"message":"insufficient scope"}`, http.StatusForbidden,
+	)
+	defer srv.Close()
+
+	a := New(nil)
+	info, err := a.DescribeCredential(context.Background(), tracker.Conn{
+		BaseURL:    srv.URL,
+		Credential: "glpat-narrowscope",
+	})
+	if err != nil {
+		t.Fatalf("DescribeCredential should succeed even if the breadth probe fails: %v", err)
+	}
+	if info.Breadth != tracker.BreadthUnspecified {
+		t.Errorf("Breadth = %v, want BreadthUnspecified", info.Breadth)
+	}
+	if len(info.Scopes) != 1 || info.Scopes[0] != "read_api" {
+		t.Errorf("Scopes = %v, want [read_api] (should not be discarded by the failed breadth probe)", info.Scopes)
+	}
+}
+
+func TestDescribeCredential_NoExpiry_LeavesExpiresAtZero(t *testing.T) {
+	srv := gitlabFixtureServer(t,
+		`{"active":true,"revoked":false,"scopes":["api"],"expires_at":null}`, http.StatusOK,
+		`{"username":"alice","bot":false}`, http.StatusOK,
+	)
+	defer srv.Close()
+
+	a := New(nil)
+	info, err := a.DescribeCredential(context.Background(), tracker.Conn{
+		BaseURL:    srv.URL,
+		Credential: "glpat-noexpiry",
+	})
+	if err != nil {
+		t.Fatalf("DescribeCredential: %v", err)
+	}
+	if !info.ExpiresAt.IsZero() {
+		t.Errorf("ExpiresAt = %v, want zero", info.ExpiresAt)
+	}
+}
+
+func TestDescribeCredential_Unreachable_ReturnsErrUnreachable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	a := New(nil)
+	_, err := a.DescribeCredential(context.Background(), tracker.Conn{
+		BaseURL:    url,
+		Credential: "glpat-sometoken",
+	})
+	if !errors.Is(err, tracker.ErrUnreachable) {
+		t.Fatalf("err = %v, want ErrUnreachable", err)
+	}
+}
+
+func TestDescribeCredential_BaseURLGetsAPIv4Suffix(t *testing.T) {
+	var gotPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPaths = append(gotPaths, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"active":true,"revoked":false,"scopes":["api"],"username":"alice","bot":false}`))
+	}))
+	defer srv.Close()
+
+	a := New(nil)
+	// BaseURL given WITHOUT /api/v4, as a self-managed instance's site
+	// root would be — the adapter must append it, matching how
+	// gitlab.com's default (also site-root-shaped) is handled. Checks
+	// BOTH calls DescribeCredential makes (self, then the breadth
+	// probe's /user), not just the first.
+	if _, err := a.DescribeCredential(context.Background(), tracker.Conn{
+		BaseURL:    srv.URL,
+		Credential: "glpat-selfmanaged",
+	}); err != nil {
+		t.Fatalf("DescribeCredential: %v", err)
+	}
+	want := []string{"/api/v4/personal_access_tokens/self", "/api/v4/user"}
+	if len(gotPaths) != len(want) {
+		t.Fatalf("paths hit = %v, want %v", gotPaths, want)
+	}
+	for i, p := range want {
+		if gotPaths[i] != p {
+			t.Errorf("call %d path = %q, want %q", i, gotPaths[i], p)
+		}
+	}
+}
+
+func TestDescribeCredential_Kind(t *testing.T) {
+	const self = `{"active":true,"revoked":false,"scopes":["api"],"expires_at":"2027-01-01"}`
+	tests := []struct {
+		name       string
+		userBody   string
+		userStatus int
+		wantKind   tracker.CredentialKind
+	}{
+		{"project bot", `{"username":"project_123_bot_abc","bot":true}`, http.StatusOK, tracker.KindProject},
+		{"group bot", `{"username":"group_456_bot_xyz","bot":true}`, http.StatusOK, tracker.KindGroup},
+		{"personal account", `{"username":"alice","bot":false}`, http.StatusOK, tracker.KindPersonal},
+		{"unrecognized bot shape is not guessed", `{"username":"svc_bot","bot":true}`, http.StatusOK, tracker.KindUnspecified},
+		{"user probe forbidden", `{"message":"insufficient scope"}`, http.StatusForbidden, tracker.KindUnspecified},
+		{"user probe malformed body", `not json`, http.StatusOK, tracker.KindUnspecified},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := gitlabFixtureServer(t, self, http.StatusOK, tt.userBody, tt.userStatus)
+			defer srv.Close()
+			info, err := New(nil).DescribeCredential(context.Background(), tracker.Conn{BaseURL: srv.URL, Credential: "glpat-x"})
+			if err != nil {
+				t.Fatalf("DescribeCredential: %v", err)
+			}
+			if info.Kind != tt.wantKind {
+				t.Errorf("Kind = %v, want %v", info.Kind, tt.wantKind)
+			}
+		})
+	}
+}
