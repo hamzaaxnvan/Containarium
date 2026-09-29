@@ -62,3 +62,68 @@ func TestScanBaseline_SumsAcrossUnits(t *testing.T) {
 		{UnitId: "text/0", Text: fakeAWSKeyID},
 		{UnitId: "tool/0/0", Text: `{"k":"` + fakeAWSKeyID + `"}`},
 	})
+	want := []BaselineDetection{{RuleID: BaselineRuleAWSAccessKeyID, Kind: pb.GuardrailKind_GUARDRAIL_KIND_SECRET, Matches: 2}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ScanBaseline = %+v, want %+v", got, want)
+	}
+}
+
+// The baseline is its own table: stable ids, unique, and the set is exactly
+// the accepted one. Widening it is a reviewed change to this test.
+func TestBaselineRules_StableIDs(t *testing.T) {
+	var ids []BaselineRuleID
+	for _, r := range BaselineRules() {
+		ids = append(ids, r.ID)
+		if r.Kind != pb.GuardrailKind_GUARDRAIL_KIND_SECRET {
+			t.Errorf("rule %s kind = %v, want SECRET", r.ID, r.Kind)
+		}
+	}
+	want := []BaselineRuleID{"baseline.pem_private_key", "baseline.aws_access_key_id", "baseline.google_api_key", "baseline.azure_storage_account_key"}
+	if !reflect.DeepEqual(ids, want) {
+		t.Errorf("baseline rule ids = %v, want %v", ids, want)
+	}
+}
+
+// A detection carries counts and ids only; no field can hold matched text.
+func TestBaselineDetection_NoTextBearingField(t *testing.T) {
+	typ := reflect.TypeOf(BaselineDetection{})
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		if f.Type == reflect.TypeOf("") || f.Type.Kind() == reflect.Slice {
+			t.Errorf("BaselineDetection.%s is a plain string; only typed ids and counts are allowed", f.Name)
+		}
+	}
+}
+
+// The literal prefilter only skips text that cannot match: ScanBaseline must
+// find exactly what the bare patterns find, on hits, near-misses and text
+// with the literal but no match.
+func TestScanBaseline_PrefilterKeepsMatches(t *testing.T) {
+	corpus := []string{
+		fakePEMHeader, fakeOpenSSHKey, "-----BEGIN " + "PGP PRIVATE KEY BLOCK-----", "PRIVATE KEY but no header",
+		fakeAWSKeyID, "ASIA" + "FAKEFAKEFAKEFAKE", "xAKIAFAKEFAKEFAKEFAKE", "AKIA too short", "AKIA" + "FAKEFAKEFAKEFAKEX",
+		fakeGoogleKey, "AIza short", "_" + fakeGoogleKey,
+		fakeAzureKey, "AccountKey=short==",
+		"no literal at all", strings.Repeat("filler ", 100) + fakeAWSKeyID + " " + fakePEMHeader,
+	}
+	for _, text := range corpus {
+		got := map[BaselineRuleID]int{}
+		for _, d := range ScanBaseline([]*pb.GuardrailTextUnit{{UnitId: "u", Text: text}}) {
+			got[d.RuleID] = d.Matches
+		}
+		for _, r := range BaselineRules() {
+			if want := len(r.pattern.FindAllStringIndex(text, -1)); got[r.ID] != want {
+				t.Errorf("%q: rule %s matches = %d, bare pattern finds %d", text, r.ID, got[r.ID], want)
+			}
+		}
+	}
+}
+
+func TestBaselineAction_String(t *testing.T) {
+	if s := BaselineActionLog.String(); s != "log" {
+		t.Errorf("BaselineActionLog = %q, want log", s)
+	}
+	if s := BaselineAction(0).String(); s != "unknown" {
+		t.Errorf("zero action = %q, want unknown", s)
+	}
+}
