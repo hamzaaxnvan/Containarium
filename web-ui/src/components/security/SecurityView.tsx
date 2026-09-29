@@ -225,3 +225,79 @@ function ClamavView({ server }: SecurityViewProps) {
 
       {/* Export */}
       <div className="flex flex-wrap items-end gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] p-4">
+        <p className="w-full text-xs font-medium text-[var(--text)]">Download Scan Reports</p>
+        <div className="flex flex-col gap-1">
+          <label className="text-[10px] text-[var(--text-muted)]">Start Date</label>
+          <input type="date" value={exportFrom} onChange={e => setExportFrom(e.target.value)} className={inputCls} />
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-[10px] text-[var(--text-muted)]">End Date</label>
+          <input type="date" value={exportTo} onChange={e => setExportTo(e.target.value)} className={inputCls} />
+        </div>
+        <button onClick={() => { const client = getClient(server); window.open(client.getClamavReportExportUrl(exportFrom, exportTo), '_blank'); }}
+          className="flex items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 py-1.5 text-xs text-white hover:bg-[var(--accent-hover)]">
+          <Download size={12} /> Download CSV
+        </button>
+      </div>
+
+      {/* Container Table */}
+      <div className="overflow-x-auto rounded-xl border border-[var(--border-subtle)]">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="border-b border-[var(--border-subtle)] bg-[var(--surface)]">
+              {['Container', 'Node', 'Username', 'Last Scan', 'Status', 'Findings', 'Total Scans', ''].map((h, i) => (
+                <th key={h} className={`px-3 py-2.5 text-xs font-medium text-[var(--text-secondary)] whitespace-nowrap ${i >= 5 ? 'text-right' : 'text-left'}`}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {sortedContainers.length === 0 ? (
+              <tr><td colSpan={8} className="py-10 text-center text-[var(--text-muted)]">No containers found. The security scanner runs every 24 hours.</td></tr>
+            ) : (
+              sortedContainers.map(container => (
+                <ContainerRow key={container.containerName} container={container} server={server} onScan={handleScanContainer} scanStatus={scanStatus} />
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {summary?.lastCollectionAt && (
+        <p className="text-[10px] text-[var(--text-muted)]">Summary generated at: {formatDate(summary.lastCollectionAt)}</p>
+      )}
+
+      {snackMessage && (
+        <div onClick={() => setSnackMessage(null)} className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 cursor-pointer rounded-lg border border-[var(--border)] bg-[var(--surface-2)] px-4 py-2.5 text-xs text-[var(--text)] shadow-xl">
+          {snackMessage}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function SecurityView({ server }: SecurityViewProps) {
+  const [securityTab, setSecurityTab] = useState(0);
+
+  const TABS = [
+    { label: 'Malware Scan', icon: <Shield size={13} /> },
+    { label: 'Pentest', icon: <Bug size={13} /> },
+    { label: 'ZAP Scan', icon: <Scan size={13} /> },
+  ];
+
+  return (
+    <div className="p-6">
+      {/* Sub-tabs */}
+      <div className="mb-6 flex border-b border-[var(--border-subtle)]">
+        {TABS.map((tab, i) => (
+          <button key={tab.label} onClick={() => setSecurityTab(i)}
+            className={`-mb-px flex items-center gap-1.5 px-4 py-2 text-xs font-medium transition-colors ${securityTab === i ? 'border-b-2 border-[var(--accent)] text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)]'}`}>
+            {tab.icon}{tab.label}
+          </button>
+        ))}
+      </div>
+      {securityTab === 0 && <ClamavView server={server} />}
+      {securityTab === 1 && <PentestView server={server} />}
+      {securityTab === 2 && <ZapView server={server} />}
+    </div>
+  );
+}
