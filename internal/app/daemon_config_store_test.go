@@ -191,3 +191,52 @@ func TestDaemonConfigStore_SetAllRollsBackAPartialBatch(t *testing.T) {
 		batch[key] = "after"
 	}
 	batch[prefix+"poison"] = "bad\x00value" // PostgreSQL rejects NUL in TEXT
+
+	if err := store.SetAll(ctx, batch); err == nil {
+		t.Fatal("SetAll accepted a value PostgreSQL cannot store — the induced failure did not " +
+			"happen, so this test proves nothing about rollback")
+	}
+
+	after, err := store.GetAll(ctx)
+	if err != nil {
+		t.Fatalf("GetAll: %v", err)
+	}
+	for key := range batch {
+		if key == prefix+"poison" {
+			if _, present := after[key]; present {
+				t.Errorf("the poison key %q was committed despite the batch failing", key)
+			}
+			continue
+		}
+		if after[key] != "before" {
+			t.Errorf("%q = %q after a failed batch, want the original %q — the transaction did "+
+				"not roll back, so the daemon now holds half of one configuration and half of "+
+				"another with nothing reporting it", key, after[key], "before")
+		}
+	}
+}
+
+// The schema initialiser runs on every daemon start, so it has to be safe to
+// run against a database that already has the table.
+func TestDaemonConfigStore_SchemaInitIsRepeatable(t *testing.T) {
+	ctx := context.Background()
+	store, prefix := newDaemonConfigStoreForTest(t)
+	key := prefix + "survivor"
+
+	if err := store.Set(ctx, key, "value"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	// A second store over the same database, as a restart produces.
+	if _, err := NewDaemonConfigStore(ctx, store.pool); err != nil {
+		t.Fatalf("re-initialising the schema failed: %v — the daemon would not start twice", err)
+	}
+
+	got, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("Get after re-init: %v", err)
+	}
+	if got != "value" {
+		t.Errorf("value = %q after re-initialising the schema, want %q — a re-init that dropped "+
+			"data would erase the config the daemon restarted to recover", got, "value")
+	}
+}
