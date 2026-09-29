@@ -68,3 +68,39 @@ func TestMinerSignature_PerContainerStores(t *testing.T) {
 							t.Errorf("repeat %s: %v", box, err)
 						}
 					})
+				}
+			}
+			wg.Wait()
+			for _, f := range []*Finding{a, b} {
+				got, err := store.Get(ctx, f.ID)
+				if err != nil || got.Count != 9 || got.Container != f.Container {
+					t.Fatalf("repeat count/owner = %+v, %v", got, err)
+				}
+				if _, err := store.SetResponse(ctx, f.ID, FindingResponse{Action: pb.ProcessAction_PROCESS_ACTION_THROTTLE,
+					State: pb.ResponseState_RESPONSE_STATE_APPLIED, Container: f.Container}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			now := time.Now()
+			release := func(f *Finding) {
+				out, err := store.ResolveWithResponse(ctx, f.ID, FindingResponse{Action: pb.ProcessAction_PROCESS_ACTION_THROTTLE,
+					State: pb.ResponseState_RESPONSE_STATE_RELEASED, Container: f.Container, ReleasedAt: now, ReleasedBy: ReleasedByOperator})
+				if err != nil || out.State != FindingStateResolved {
+					t.Fatalf("release = %+v, %v", out, err)
+				}
+			}
+			release(a)
+			got, err := store.Get(ctx, b.ID)
+			if err != nil || got.State != FindingStateOpen || got.Response.State != pb.ResponseState_RESPONSE_STATE_APPLIED || got.Response.Container != "box-b" {
+				t.Fatalf("B after A release = %+v, %v", got, err)
+			}
+			release(b)
+			if got, err := store.Get(ctx, legacy.ID); err != nil || got.Count != 1 || got.State != FindingStateOpen {
+				t.Fatalf("legacy finding modified = %+v, %v", got, err)
+			}
+			if len(n.queue) != 6 {
+				t.Fatalf("deliveries = %d, want two new, two applies, two releases", len(n.queue))
+			}
+		})
+	}
+}
