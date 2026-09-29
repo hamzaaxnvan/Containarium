@@ -32,3 +32,38 @@ func (s *ContainerServer) storagePoolCapacities() []*pb.StoragePoolCapacity {
 		out = append(out, &pb.StoragePoolCapacity{
 			Pool:       p.Name,
 			Driver:     storageDriverToProto(incus.StorageDriver(p.Driver)),
+			UsedBytes:  p.UsedBytes,
+			TotalBytes: p.TotalBytes,
+			Level:      storagePoolLevelToProto(p.Level),
+			ObservedAt: timestamppb.New(snap.At),
+		})
+	}
+	return out
+}
+
+func storagePoolLevelToProto(l poolcapacity.Level) pb.StoragePoolCapacityLevel {
+	switch l {
+	case poolcapacity.LevelOK:
+		return pb.StoragePoolCapacityLevel_STORAGE_POOL_CAPACITY_LEVEL_OK
+	case poolcapacity.LevelWarning:
+		return pb.StoragePoolCapacityLevel_STORAGE_POOL_CAPACITY_LEVEL_WARNING
+	case poolcapacity.LevelCritical:
+		return pb.StoragePoolCapacityLevel_STORAGE_POOL_CAPACITY_LEVEL_CRITICAL
+	default:
+		return pb.StoragePoolCapacityLevel_STORAGE_POOL_CAPACITY_LEVEL_UNSPECIFIED
+	}
+}
+
+// storagePoolUsagesFromProto turns a peer's reported pools back into usage
+// values for the metrics collector.
+func storagePoolUsagesFromProto(pools []*pb.StoragePoolCapacity) []incus.StoragePoolUsage {
+	out := make([]incus.StoragePoolUsage, 0, len(pools))
+	for _, p := range pools {
+		driver := ""
+		if p.GetDriver() != pb.StorageDriver_STORAGE_DRIVER_UNSPECIFIED {
+			driver = strings.ToLower(strings.TrimPrefix(p.GetDriver().String(), "STORAGE_DRIVER_"))
+		}
+		out = append(out, incus.StoragePoolUsage{Name: p.GetPool(), Driver: driver, UsedBytes: p.GetUsedBytes(), TotalBytes: p.GetTotalBytes()})
+	}
+	return out
+}
