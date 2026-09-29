@@ -37,3 +37,13 @@ func TestSafeAnchor(t *testing.T) {
 		{"an empty bucket means nothing is safe yet", stubSink{cp: 40, root: "f40", ok: true}, stubSink{}, PurgeAnchor{}, false, false},
 		{"a bucket failure is an error, never no anchor", stubSink{cp: 40, root: "f40", ok: true}, stubSink{err: errors.New("403")}, PurgeAnchor{}, false, true},
 		{"a file failure is an error", stubSink{err: errors.New("io")}, nil, PurgeAnchor{}, false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok, err := SafeAnchor(context.Background(), tc.file, tc.external)
+			if (err != nil) != tc.wantErr || ok != tc.wantOK || got != tc.want {
+				t.Fatalf("SafeAnchor = %+v ok=%v err=%v, want %+v ok=%v err=%v", got, ok, err, tc.want, tc.wantOK, tc.wantErr)
+			}
+		})
+	}
+}

@@ -150,3 +150,156 @@ func runTTLSet(cmd *cobra.Command, args []string) error {
 	}
 	if err != nil {
 		return fmt.Errorf("failed to set TTL: %w", err)
+	}
+
+	fmt.Printf("✓ TTL set on %s: expires in %s (at %s)\n", username, d, expiresAt.Format(time.RFC3339))
+	return nil
+}
+
+func runTTLGet(cmd *cobra.Command, args []string) error {
+	username := args[0]
+
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (ttl scheduling is a server-side feature)")
+	}
+
+	expiresAt, ok, err := ttlClientGet(username)
+	if isUnimplemented(err) {
+		fmt.Printf("⚠ TTL not yet supported by this server (containarium daemon does not implement GetContainerTTL).\n")
+		fmt.Printf("  See the TODO at the top of internal/cmd/ttl.go for the server-side gap.\n")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get TTL: %w", err)
+	}
+
+	if !ok {
+		fmt.Printf("no TTL set on %s\n", username)
+		return nil
+	}
+
+	remaining := time.Until(expiresAt).Round(time.Second)
+	if remaining <= 0 {
+		fmt.Printf("TTL on %s has expired (was due at %s); awaiting sweeper.\n", username, expiresAt.UTC().Format(time.RFC3339))
+		return nil
+	}
+	fmt.Printf("expires in %s (at %s)\n", remaining, expiresAt.UTC().Format(time.RFC3339))
+	return nil
+}
+
+func runTTLUnset(cmd *cobra.Command, args []string) error {
+	username := args[0]
+
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (ttl scheduling is a server-side feature)")
+	}
+
+	err := ttlClientUnset(username)
+	if isUnimplemented(err) {
+		fmt.Printf("⚠ TTL not yet supported by this server (containarium daemon does not implement ClearContainerTTL); nothing to clear.\n")
+		fmt.Printf("  See the TODO at the top of internal/cmd/ttl.go for the server-side gap.\n")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to clear TTL: %w", err)
+	}
+
+	fmt.Printf("✓ TTL cleared on %s\n", username)
+	return nil
+}
+
+// isUnimplemented returns true if err carries the gRPC Unimplemented
+// status code. We treat that as a soft failure (print a warning,
+// exit 0) rather than a hard error, so callers like the
+// containarium-run Action can wire `containarium ttl set` into their
+// failure path today without breaking when running against an older
+// daemon.
+func isUnimplemented(err error) bool {
+	if err == nil {
+		return false
+	}
+	if s, ok := status.FromError(err); ok && s.Code() == codes.Unimplemented {
+		return true
+	}
+	return false
+}
+
+// isAlreadyExists reports whether err is a gRPC AlreadyExists (a 409 from the
+// REST surface, see sshHTTPClient.doJSON). Callers use it to treat a duplicate
+// create — e.g. re-registering an SSH key already on file — as idempotent
+// success rather than a hard failure.
+func isAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	s, ok := status.FromError(err)
+	return ok && s.Code() == codes.AlreadyExists
+}
+
+// ttlClientSet / ttlClientGet / ttlClientUnset are thin wrappers over the
+// transport client (grpc or http per the global httpMode flag), mirroring
+// how scale_down.go's toggleAutoSleepViaServer dispatches.
+//
+// set/unset call the SetContainerTTL RPC (unset = duration 0 = clear). get
+// reads ttl_expires_at off the container via GetContainer — there is no
+// separate GetContainerTTL RPC; the field is part of the container view. A
+// daemon too old to implement SetContainerTTL surfaces codes.Unimplemented
+// (gRPC) or HTTP 404 mapped to Unimplemented (REST), which runTTLSet/Unset
+// degrade to a friendly no-op via isUnimplemented.
+
+func ttlClientSet(username string, d time.Duration) error {
+	return setContainerTTLViaServer(username, int64(d.Seconds()))
+}
+
+func ttlClientUnset(username string) error {
+	return setContainerTTLViaServer(username, 0)
+}
+
+func setContainerTTLViaServer(username string, durationSeconds int64) error {
+	if httpMode {
+		hc, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = hc.Close() }()
+		_, err = hc.SetContainerTTL(username, durationSeconds)
+		return err
+	}
+	gc, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = gc.Close() }()
+	_, err = gc.SetContainerTTL(username, durationSeconds)
+	return err
+}
+
+// ttlClientGet reads the container's current TTL via GetContainer. A zero
+// expiry means "no TTL set" (ok == false). GetContainer is a long-standing
+// RPC, so no Unimplemented degradation is needed here.
+func ttlClientGet(username string) (time.Time, bool, error) {
+	var info *incus.ContainerInfo
+	var err error
+	if httpMode {
+		hc, e := client.NewHTTPClient(serverAddr, authToken)
+		if e != nil {
+			return time.Time{}, false, e
+		}
+		defer func() { _ = hc.Close() }()
+		info, err = hc.GetContainer(username)
+	} else {
+		gc, e := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if e != nil {
+			return time.Time{}, false, e
+		}
+		defer func() { _ = gc.Close() }()
+		info, err = gc.GetContainer(username)
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if info == nil || info.TTLExpiresAt.IsZero() {
+		return time.Time{}, false, nil
+	}
+	return info.TTLExpiresAt, true, nil
+}
