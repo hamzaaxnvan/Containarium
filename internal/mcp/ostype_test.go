@@ -25,3 +25,31 @@ func TestCreateContainer_OSTypePassthrough(t *testing.T) {
 	defer server.Close()
 
 	_, err := handleCreateContainer(NewClient(server.URL, "t"), map[string]interface{}{
+		"username": "cld-1",
+		"os_type":  "rocky9",
+	})
+	require.NoError(t, err)
+	assert.Contains(t, body, `"osType":"OS_TYPE_ROCKY_9"`)
+
+	body = ""
+	_, err = handleCreateContainer(NewClient(server.URL, "t"), map[string]interface{}{
+		"username": "cld-1",
+	})
+	require.NoError(t, err)
+	assert.False(t, strings.Contains(body, `"osType"`), "absent argument must not be sent: %s", body)
+}
+
+func TestCreateContainer_OSTypeInvalid(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("daemon must not be called for an invalid os_type value")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	_, err := handleCreateContainer(NewClient(server.URL, "t"), map[string]interface{}{
+		"username": "cld-1",
+		"os_type":  "bogus-os",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "os_type")
+}
