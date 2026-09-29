@@ -46,3 +46,52 @@ func TestDeciderRecordsManagedIdentities(t *testing.T) {
 	decide(keyReq("erin", "SHA256:eee"), allowAs(""))
 
 	if got, want := ids.Logins("cp-user-1"), []string{"alice", "bob-container-alice"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Logins(cp-user-1) = %v, want %v", got, want)
+	}
+	if got, want := ids.Logins("cp-user-2"), []string{"carol"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Logins(cp-user-2) = %v, want %v", got, want)
+	}
+	if got := ids.Logins("never-seen"); len(got) != 0 {
+		t.Errorf("Logins(never-seen) = %v, want none", got)
+	}
+
+	// The same key on the same login later allowed for another user moves
+	// the record: the login no longer resolves for the first user.
+	decide(keyReq("carol", "SHA256:ccc"), allowAs("cp-user-3"))
+	if got := ids.Logins("cp-user-2"); len(got) != 0 {
+		t.Errorf("Logins(cp-user-2) after reassignment = %v, want none", got)
+	}
+	if got, want := ids.Logins("cp-user-3"), []string{"carol"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Logins(cp-user-3) = %v, want %v", got, want)
+	}
+}
+
+// A certificate login is recorded too, keyed by its CA and key id.
+func TestManagedIdentitiesCertificate(t *testing.T) {
+	ids := NewManagedIdentities()
+	req := &pb.AuthorizeSSHRequest{
+		Login: "alice",
+		Credential: &pb.SSHCredential{Kind: &pb.SSHCredential_Certificate{
+			Certificate: &pb.SSHCertificateCredential{KeyId: "k1", CaFingerprintSha256: "SHA256:ca"},
+		}},
+	}
+	d := &Decider{Local: &fakeFacts{ok: true}, Cloud: &fakeCloud{resp: allowAs("cp-user-1")}, Managed: true, Identities: ids}
+	if _, err := d.Decide(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ids.Logins("cp-user-1"), []string{"alice"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Logins = %v, want %v", got, want)
+	}
+}
+
+// A nil record is allowed (self-host wiring, older tests) and records nothing.
+func TestDeciderNilIdentities(t *testing.T) {
+	d := &Decider{Local: &fakeFacts{ok: true}, Cloud: &fakeCloud{resp: allowAs("cp-user-1")}, Managed: true}
+	if _, err := d.Decide(context.Background(), keyReq("alice", "SHA256:aaa")); err != nil {
+		t.Fatal(err)
+	}
+	var ids *ManagedIdentities
+	if got := ids.Logins("cp-user-1"); got != nil {
+		t.Errorf("nil Logins = %v", got)
+	}
+}
