@@ -362,3 +362,368 @@ func argStringSlice(args map[string]any, key string) []string {
 	for _, v := range raw {
 		if s, ok := v.(string); ok && s != "" {
 			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// composeFileNames is the set we look for in each directory.
+// Order matters: later entries override earlier ones if both
+// exist (compose.yml beats docker-compose.yml, matching docker
+// compose v2's own resolution order).
+var composeFileNames = []string{
+	"docker-compose.yaml",
+	"docker-compose.yml",
+	"compose.yaml",
+	"compose.yml",
+}
+
+func hasComposeFile(dir string) bool {
+	_, ok := findComposeFile(dir)
+	return ok
+}
+
+func findComposeFile(dir string) (string, bool) {
+	var found string
+	for _, name := range composeFileNames {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			found = p
+		}
+	}
+	return found, found != ""
+}
+
+// discoverStacks walks `root` up to `maxDepth` levels deep,
+// skipping any directory whose basename is in `skip`, and
+// returns one ComposeStack per directory containing a
+// compose file. The returned slice is sorted by ComposeDir
+// for stable output.
+func discoverStacks(root string, maxDepth int, skip map[string]struct{}) ([]ComposeStack, error) {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	var found []ComposeStack
+
+	walkErr := filepath.WalkDir(rootAbs, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Permission errors on subdirs are common (e.g. ./root-owned).
+			// Skip the offender rather than aborting the whole walk.
+			if errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
+			return nil // best-effort traversal
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		// Depth check: count separators in the relative path.
+		rel, rerr := filepath.Rel(rootAbs, path)
+		if rerr == nil && rel != "." {
+			depth := strings.Count(rel, string(os.PathSeparator)) + 1
+			if depth > maxDepth {
+				return fs.SkipDir
+			}
+		}
+		// Skip-list check on the basename.
+		if _, blocked := skip[filepath.Base(path)]; blocked {
+			return fs.SkipDir
+		}
+		// Compose file in this directory?
+		if cf, ok := findComposeFile(path); ok {
+			stack := ComposeStack{
+				ComposeDir:  path,
+				ComposeFile: cf,
+			}
+			if info, err := os.Stat(cf); err == nil {
+				stack.ComposeModifiedAt = info.ModTime().UTC().Format(time.RFC3339)
+			}
+			found = append(found, stack)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	sort.Slice(found, func(i, j int) bool {
+		return found[i].ComposeDir < found[j].ComposeDir
+	})
+	return found, nil
+}
+
+// resolveComposeBin picks the first available compose runtime
+// on PATH. Order: podman-compose (most common with podman),
+// docker compose (v2 plugin), podman compose (4.x+ builtin).
+// Returns "" when none are usable.
+//
+// The returned string is the bin token (possibly two words like
+// "docker compose") to be invoked as a shell command.
+func resolveComposeBin() string {
+	if _, err := exec.LookPath("podman-compose"); err == nil {
+		return "podman-compose"
+	}
+	if _, err := exec.LookPath("docker"); err == nil {
+		// `docker compose version` exits 0 when the plugin is
+		// installed, non-zero otherwise.
+		if err := exec.Command("docker", "compose", "version").Run(); err == nil {
+			return "docker compose"
+		}
+	}
+	if _, err := exec.LookPath("podman"); err == nil {
+		if err := exec.Command("podman", "compose", "version").Run(); err == nil {
+			return "podman compose"
+		}
+	}
+	return ""
+}
+
+// composeServiceCounts runs `<bin> ps` in `dir` and returns
+// (running, total) service counts. Best-effort: failures yield
+// (0, 0) rather than an error, since discovery should keep
+// going even if one stack's compose-cli is broken.
+//
+// We prefer the JSON output format; fall back to counting `Up`
+// patterns in plain output if the runtime doesn't support
+// `--format json`.
+func composeServiceCounts(bin, dir string) (running, total int) {
+	cmd := composeExec(bin, dir, "ps", "--format", "json")
+	out, err := cmd.Output()
+	if err == nil && len(out) > 0 {
+		// Docker compose v2 emits a JSON array OR newline-
+		// delimited objects depending on version. Try both.
+		if running, total, ok := parseComposeJSON(out); ok {
+			return running, total
+		}
+	}
+	// Fallback: plain `ps` output, count lines that look "Up".
+	cmd = composeExec(bin, dir, "ps")
+	out, err = cmd.Output()
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "NAME") ||
+			strings.HasPrefix(line, "CONTAINER") ||
+			strings.HasPrefix(line, "Name ") {
+			continue
+		}
+		total++
+		if strings.Contains(line, "Up") || strings.Contains(line, "running") {
+			running++
+		}
+	}
+	return running, total
+}
+
+// composeExec builds the right exec.Cmd for `bin` (one or two
+// tokens) running in `dir`. Splits the bin into argv to handle
+// "docker compose" / "podman compose" sub-command forms.
+//
+// Both `bin` (one of the three hardcoded strings returned by
+// resolveComposeBin) and `args` (hardcoded "ps" / "--format" /
+// "json" at every call site) are entirely under the agent-box
+// binary's control — no agent-supplied input reaches argv here.
+func composeExec(bin, dir string, args ...string) *exec.Cmd {
+	parts := strings.Fields(bin)
+	all := append(parts[1:], args...)
+	cmd := exec.Command(parts[0], all...) // #nosec G204 -- bin from resolveComposeBin (hardcoded set), args hardcoded at all call sites
+	cmd.Dir = dir
+	return cmd
+}
+
+// parseComposeJSON tries both shapes: an array of service
+// objects, or newline-delimited JSON objects. Returns the
+// counts and ok=true if either parsed successfully.
+func parseComposeJSON(b []byte) (running, total int, ok bool) {
+	type svc struct {
+		State  string `json:"State"`
+		Status string `json:"Status"`
+	}
+	trimmed := strings.TrimSpace(string(b))
+	if trimmed == "" {
+		return 0, 0, false
+	}
+	// Array form
+	if trimmed[0] == '[' {
+		var arr []svc
+		if err := json.Unmarshal(b, &arr); err == nil {
+			for _, s := range arr {
+				total++
+				if s.State == "running" || strings.HasPrefix(s.Status, "Up") {
+					running++
+				}
+			}
+			return running, total, true
+		}
+	}
+	// NDJSON form
+	parsed := false
+	for _, line := range strings.Split(trimmed, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var s svc
+		if err := json.Unmarshal([]byte(line), &s); err == nil {
+			parsed = true
+			total++
+			if s.State == "running" || strings.HasPrefix(s.Status, "Up") {
+				running++
+			}
+		}
+	}
+	return running, total, parsed
+}
+
+// stackSlug derives the systemd template instance name from
+// an absolute compose directory. Uses the last two path
+// components to reduce collisions when multiple stacks share a
+// basename ("proj-a/deploy" vs "proj-b/deploy"). Sanitizes to
+// the systemd-instance-safe charset.
+func stackSlug(dir string) string {
+	dir = filepath.Clean(dir)
+	parts := strings.Split(dir, string(os.PathSeparator))
+	var tail []string
+	for i := len(parts) - 1; i >= 0 && len(tail) < 2; i-- {
+		if parts[i] == "" {
+			continue
+		}
+		tail = append([]string{parts[i]}, tail...)
+	}
+	raw := strings.Join(tail, "-")
+	return sanitizeSlug(raw)
+}
+
+// sanitizeSlug lowercases + replaces anything outside
+// [a-z0-9.-] with '-'. Collapses runs of '-' to one.
+func sanitizeSlug(s string) string {
+	var b strings.Builder
+	prevDash := false
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.':
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	// Trim both leading/trailing dashes AND dots so inputs
+	// that boil down to "." or "..-" don't yield a slug that's
+	// just a dot. Dots are still preserved in the interior
+	// (v1.2.3 stays v1.2.3).
+	out := strings.Trim(b.String(), "-.")
+	if out == "" {
+		out = "default"
+	}
+	return out
+}
+
+// fillAutostartStatus populates UnitName / AutostartEnabled /
+// UnitModifiedAt on the stack from on-disk state.
+func fillAutostartStatus(stack *ComposeStack) {
+	slug := stackSlug(stack.ComposeDir)
+	unit := "containarium-compose@" + slug + ".service"
+	stack.UnitName = unit
+	stack.AutostartEnabled = unitEnabled(unit)
+	// The template file's mtime stands in for "when was
+	// autostart last touched on this box." It's the same file
+	// for every instance, so this isn't per-stack — but it's
+	// the best signal available without inspecting the
+	// systemd `is-enabled` timestamp, which isn't exposed.
+	if info, err := os.Stat(filepath.Join(homeDir(), composeUnitPath)); err == nil {
+		stack.UnitModifiedAt = info.ModTime().UTC().Format(time.RFC3339)
+	}
+}
+
+// unitEnabled returns true when `systemctl --user is-enabled
+// <unit>` reports enabled / static / generated.
+//
+// `unit` is always constructed as "containarium-compose@<slug>.service"
+// where <slug> is the output of sanitizeSlug (restricted to [a-z0-9.-]),
+// so no agent input reaches argv unsanitized.
+func unitEnabled(unit string) bool {
+	out, err := exec.Command("systemctl", "--user", "is-enabled", unit).Output() // #nosec G204 -- unit is "containarium-compose@<sanitizedSlug>.service"
+	if err != nil {
+		return false
+	}
+	state := strings.TrimSpace(string(out))
+	return state == "enabled" || state == "static" || state == "generated"
+}
+
+// installComposeUnit writes the template unit file under
+// ~/.config/systemd/user/. The unit references `bin` directly
+// (no wrapper layer in v1; if the operator changes their
+// compose runtime, re-run enable to refresh).
+func installComposeUnit(bin string, force bool) error {
+	dst := filepath.Join(homeDir(), composeUnitPath)
+	if !force {
+		if _, err := os.Stat(dst); err == nil {
+			return nil
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	contents := fmt.Sprintf(`# Containarium compose autostart — Phase B.
+# Managed by agent-box; do not edit by hand. Re-run
+# compose_autostart_enable to refresh.
+[Unit]
+Description=Containarium compose autostart: %%i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%%h/%%i
+ExecStart=/bin/sh -c '%s up -d'
+ExecStop=/bin/sh -c '%s down'
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+`, bin, bin)
+	return os.WriteFile(dst, []byte(contents), 0o600)
+}
+
+// enableLinger asks loginctl to keep the user-systemd
+// instance alive across logouts (and therefore start at host
+// boot). Requires root in most distros — best-effort here; a
+// non-root agent-box can still benefit from autostart while
+// it's logged in.
+//
+// Resolves the current username via os/user (passwd lookup) rather
+// than os.Getenv("USER") — env vars are caller-controlled in some
+// invocation modes; the passwd entry isn't, and is the canonical
+// source for the running uid's name.
+func enableLinger() error {
+	u, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("resolve current user: %w", err)
+	}
+	if u.Username == "" {
+		return fmt.Errorf("current user has empty username")
+	}
+	return exec.Command("loginctl", "enable-linger", u.Username).Run() // #nosec G204 -- u.Username from os/user passwd lookup (uid-derived, not env)
+}
+
+// systemctlUser runs `systemctl --user <args>` and returns
+// the error verbatim (with output included on failure).
+//
+// Every call site supplies hardcoded subcommands ("daemon-reload",
+// "enable", "--now", "disable") OR a sanitized unit instance name
+// (see unitEnabled comment). No agent-supplied input reaches argv.
+func systemctlUser(args ...string) error {
+	cmd := exec.Command("systemctl", append([]string{"--user"}, args...)...) // #nosec G204 -- args hardcoded at all call sites or sanitized unit-instance names
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
