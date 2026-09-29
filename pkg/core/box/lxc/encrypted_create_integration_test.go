@@ -215,3 +215,58 @@ func TestIntegrationIncus_InstanceInheritsEncryptionFromThePoolRoot(t *testing.T
 	defer cancel()
 
 	// The tenant's encryptionroot, created by the production CreateEncrypted
+	// exactly as PreCreate would.
+	tenantRoot := fmt.Sprintf("incus-local/tenant%d", os.Getpid())
+	if err := zfs.CreateEncrypted(ctx, tenantRoot, newTestKey(t)); err != nil {
+		t.Fatalf("create the tenant encryptionroot %s: %v", tenantRoot, err)
+	}
+	t.Cleanup(func() { _ = zfs.Destroy(context.Background(), tenantRoot) })
+
+	// A storage pool sourced at it. Everything Incus creates for this pool —
+	// images and instances alike — lands under the encryptionroot.
+	pool := fmt.Sprintf("tenantpool%d", os.Getpid())
+	incusenv.CreateZFSPool(t, pool, tenantRoot)
+
+	name := fmt.Sprintf("tnt%d", os.Getpid())
+	instance := name + "-container"
+	t.Cleanup(func() { incusenv.DeleteInstance(t, instance) })
+
+	// Point the daemon's create at that pool. A disk size is required for
+	// the root device to name a pool at all — without one the container
+	// inherits the default profile's root disk.
+	client.SetStoragePool(pool)
+	t.Cleanup(func() { client.SetStoragePool(incus.DefaultStoragePool) })
+
+	st, err := New(container.NewWithBackend(client)).Create(ctx, box.BoxSpec{
+		Ref:       box.BoxRef{Tenant: name},
+		Image:     incusenv.BoxImage(),
+		OSType:    pb.OSType_OS_TYPE_UBUNTU_2404,
+		AutoStart: true,
+		Resources: box.ResourceLimits{Disk: "5GB"},
+	})
+	if err != nil {
+		t.Fatalf("create on a pool rooted at an encrypted dataset: %v\n"+
+			"If this is where per-tenant encryption fails, the pool-per-tenant alternative is "+
+			"out too and #1199 needs a different approach entirely.", err)
+	}
+	if st.State != pb.ContainerState_CONTAINER_STATE_RUNNING {
+		t.Fatalf("container state = %v, want RUNNING", st.State)
+	}
+
+	landed := incusenv.DatasetFor(t, instance)
+	if landed == "" {
+		t.Fatalf("instance %s has no dataset", instance)
+	}
+	root, err := zfs.EncryptionRoot(ctx, landed)
+	if err != nil {
+		t.Fatalf("read encryptionroot of %s: %v", landed, err)
+	}
+	if root != tenantRoot {
+		t.Fatalf("instance dataset %s has encryptionroot %q, want the tenant's root %q — "+
+			"the container is NOT under the tenant key, so a pool per tenant would not deliver "+
+			"per-tenant encryption either", landed, root, tenantRoot)
+	}
+	t.Logf("a container created through the daemon's own path on a pool rooted at %s is encrypted "+
+		"under that tenant's encryptionroot: instance dataset %s, encryptionroot %s",
+		tenantRoot, landed, root)
+}

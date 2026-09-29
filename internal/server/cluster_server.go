@@ -151,3 +151,309 @@ var stateToProto = map[cluster.State]pb.ClusterState{
 	cluster.StateDeleting:     pb.ClusterState_CLUSTER_STATE_DELETING,
 	cluster.StateError:        pb.ClusterState_CLUSTER_STATE_ERROR,
 }
+
+var eventKindToProto = map[cluster.EventKind]pb.ScaleEventKind{
+	cluster.EventScaleUp:      pb.ScaleEventKind_SCALE_EVENT_KIND_SCALE_UP,
+	cluster.EventScaleDown:    pb.ScaleEventKind_SCALE_EVENT_KIND_SCALE_DOWN,
+	cluster.EventRefused:      pb.ScaleEventKind_SCALE_EVENT_KIND_REFUSED,
+	cluster.EventNodeReplaced: pb.ScaleEventKind_SCALE_EVENT_KIND_NODE_REPLACED,
+}
+
+func clusterToProto(c *cluster.Cluster) *pb.Cluster {
+	out := &pb.Cluster{
+		Name:        c.Name,
+		Owner:       c.Owner,
+		State:       stateToProto[c.State],
+		StateReason: c.StateReason,
+		K3SVersion:  c.K3sVersion,
+		ApiEndpoint: c.APIEndpoint,
+		// Resolved on the way out too, so a row written before the
+		// column existed still reads as a definite class (#1428).
+		NodeIsolation: isolationToProto[c.NodeIsolation.OrDefault()],
+		CreatedAt:     timestamppb.New(c.CreatedAt),
+	}
+	for _, g := range c.NodeGroups {
+		out.NodeGroups = append(out.NodeGroups, groupToProto(g))
+	}
+	return out
+}
+
+var nodeRoleToProto = map[string]pb.ClusterNodeRole{
+	cluster.RoleControlPlane: pb.ClusterNodeRole_CLUSTER_NODE_ROLE_CONTROL_PLANE,
+	cluster.RoleWorker:       pb.ClusterNodeRole_CLUSTER_NODE_ROLE_WORKER,
+}
+
+var nodeStateToProto = map[cluster.NodeState]pb.ClusterNodeState{
+	cluster.NodeStateProvisioning: pb.ClusterNodeState_CLUSTER_NODE_STATE_PROVISIONING,
+	cluster.NodeStateReady:        pb.ClusterNodeState_CLUSTER_NODE_STATE_READY,
+	cluster.NodeStateDraining:     pb.ClusterNodeState_CLUSTER_NODE_STATE_DRAINING,
+}
+
+func nodeToProto(n *cluster.Node) *pb.ClusterNode {
+	// Unknown role/state map to UNSPECIFIED — drift between the store
+	// and the API surfaces as an explicit "unspecified", not as a
+	// silently-defaulted worker.
+	return &pb.ClusterNode{
+		VmName:    n.VMName,
+		Role:      nodeRoleToProto[n.Role],
+		NodeGroup: n.Group,
+		State:     nodeStateToProto[n.State],
+		CreatedAt: timestamppb.New(n.CreatedAt),
+	}
+}
+
+func (s *ClusterServer) CreateCluster(ctx context.Context, req *pb.CreateClusterRequest) (*pb.CreateClusterResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeClustersWrite); err != nil {
+		return nil, err
+	}
+	owner, err := resolveOwner(ctx, req.Owner)
+	if err != nil {
+		return nil, err
+	}
+	if err := cluster.ValidateName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Isolation is decided before anything is recorded: a refused class
+	// leaves no row behind, and the refusal names the flag the operator
+	// would have to set.
+	isolation, err := s.enforceIsolation(req.NodeIsolation)
+	if err != nil {
+		return nil, err
+	}
+	if s.nodeCapable != nil {
+		if err := s.nodeCapable(isolation); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+	}
+	groups, err := groupsFromProto(req.NodeGroups)
+	if err != nil {
+		return nil, err
+	}
+	if len(groups) == 0 {
+		groups = cluster.DefaultNodeGroups()
+	}
+	if err := cluster.ValidateNodeGroups(groups); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := s.enforceCaps(ctx, owner, req.Name, groups, false); err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	c := &cluster.Cluster{
+		ID:            uuid.NewString(),
+		Owner:         owner,
+		Name:          req.Name,
+		State:         cluster.StateProvisioning,
+		NodeGroups:    groups,
+		NodeIsolation: isolation,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	if err := s.store.Create(ctx, c); err != nil {
+		return nil, storeErr(err)
+	}
+	log.Printf("[cluster] created owner=%s name=%s groups=%d isolation=%s", owner, req.Name, len(groups), isolation)
+	return &pb.CreateClusterResponse{
+		Cluster: clusterToProto(c),
+		Message: "cluster recorded; provisioning runs asynchronously",
+	}, nil
+}
+
+func (s *ClusterServer) ListClusters(ctx context.Context, req *pb.ListClustersRequest) (*pb.ListClustersResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeClustersRead); err != nil {
+		return nil, err
+	}
+	owner := req.Owner
+	if owner != "" {
+		// An explicit filter must pass tenant isolation.
+		if err := auth.AuthorizeTenant(ctx, owner); err != nil {
+			return nil, err
+		}
+	} else {
+		username, roles, ok := auth.SubjectFromGRPCContext(ctx)
+		if !ok {
+			return nil, status.Error(codes.Unauthenticated, "no authenticated subject")
+		}
+		if !auth.HasRole(roles, auth.RoleAdmin) {
+			owner = username // non-admins list their own; admins list all
+		}
+	}
+	clusters, err := s.store.List(ctx, owner)
+	if err != nil {
+		return nil, storeErr(err)
+	}
+	resp := &pb.ListClustersResponse{}
+	for _, c := range clusters {
+		resp.Clusters = append(resp.Clusters, clusterToProto(c))
+	}
+	return resp, nil
+}
+
+func (s *ClusterServer) GetCluster(ctx context.Context, req *pb.GetClusterRequest) (*pb.GetClusterResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeClustersRead); err != nil {
+		return nil, err
+	}
+	owner, err := resolveOwner(ctx, req.Owner)
+	if err != nil {
+		return nil, err
+	}
+	c, err := s.store.Get(ctx, owner, req.Name)
+	if err != nil {
+		return nil, storeErr(err)
+	}
+	return &pb.GetClusterResponse{Cluster: clusterToProto(c)}, nil
+}
+
+func (s *ClusterServer) DeleteCluster(ctx context.Context, req *pb.DeleteClusterRequest) (*pb.DeleteClusterResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeClustersWrite); err != nil {
+		return nil, err
+	}
+	owner, err := resolveOwner(ctx, req.Owner)
+	if err != nil {
+		return nil, err
+	}
+	if s.asyncDelete {
+		// The reconciler owns teardown: flip to DELETING and let it
+		// drain VMs, the endpoint, and finally the rows.
+		if _, err := s.store.Get(ctx, owner, req.Name); err != nil {
+			return nil, storeErr(err)
+		}
+		if err := s.store.SetState(ctx, owner, req.Name, cluster.StateDeleting, ""); err != nil {
+			return nil, storeErr(err)
+		}
+		log.Printf("[cluster] deletion requested owner=%s name=%s", owner, req.Name)
+		return &pb.DeleteClusterResponse{Message: "cluster deletion in progress: " + req.Name}, nil
+	}
+	// No reconciler wired → nothing can have provisioned VMs, so
+	// removing rows IS the whole teardown.
+	if err := s.store.Delete(ctx, owner, req.Name); err != nil {
+		return nil, storeErr(err)
+	}
+	log.Printf("[cluster] deleted owner=%s name=%s", owner, req.Name)
+	return &pb.DeleteClusterResponse{Message: "cluster deleted: " + req.Name}, nil
+}
+
+func (s *ClusterServer) GetClusterKubeconfig(ctx context.Context, req *pb.GetClusterKubeconfigRequest) (*pb.GetClusterKubeconfigResponse, error) {
+	// Deliberately clusters:write, not read: the kubeconfig is
+	// cluster-admin material — holding it mutates the cluster's
+	// workloads — so an inspection-only token must not obtain it.
+	if err := auth.RequireScope(ctx, auth.ScopeClustersWrite); err != nil {
+		return nil, err
+	}
+	owner, err := resolveOwner(ctx, req.Owner)
+	if err != nil {
+		return nil, err
+	}
+	c, err := s.store.Get(ctx, owner, req.Name)
+	if err != nil {
+		return nil, storeErr(err)
+	}
+	if c.State != cluster.StateReady {
+		return nil, status.Errorf(codes.FailedPrecondition, "cluster is %s; kubeconfig is available once READY", c.State)
+	}
+	if s.kubeconfig == nil {
+		return nil, status.Error(codes.Unimplemented, "cluster provisioner not wired yet (#1414)")
+	}
+	kc, err := s.kubeconfig.ReadKubeconfig(ctx, c)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read kubeconfig: %v", err)
+	}
+	return &pb.GetClusterKubeconfigResponse{Kubeconfig: kc}, nil
+}
+
+const (
+	defaultEventsLimit = 20
+	maxEventsLimit     = 1000 // house precedent: audit/traffic stores clamp both ends
+)
+
+// clampEventsLimit bounds a client-supplied events limit: non-positive
+// values take the default, and the ceiling stops a tenant turning the
+// append-only event history into a memory amplification per call.
+func clampEventsLimit(v int32) int {
+	if v <= 0 {
+		return defaultEventsLimit
+	}
+	if v > maxEventsLimit {
+		return maxEventsLimit
+	}
+	return int(v)
+}
+
+func (s *ClusterServer) GetClusterStatus(ctx context.Context, req *pb.GetClusterStatusRequest) (*pb.GetClusterStatusResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeClustersRead); err != nil {
+		return nil, err
+	}
+	owner, err := resolveOwner(ctx, req.Owner)
+	if err != nil {
+		return nil, err
+	}
+	c, err := s.store.Get(ctx, owner, req.Name)
+	if err != nil {
+		return nil, storeErr(err)
+	}
+	nodes, err := s.store.ListNodes(ctx, owner, req.Name)
+	if err != nil {
+		return nil, storeErr(err)
+	}
+	events, err := s.store.ListEvents(ctx, owner, req.Name, clampEventsLimit(req.EventsLimit))
+	if err != nil {
+		return nil, storeErr(err)
+	}
+
+	resp := &pb.GetClusterStatusResponse{Cluster: clusterToProto(c)}
+	perGroup := make(map[string]int32)
+	for _, n := range nodes {
+		resp.Nodes = append(resp.Nodes, nodeToProto(n))
+		if n.Group != "" {
+			perGroup[n.Group]++
+		}
+	}
+	for _, g := range c.NodeGroups {
+		resp.Groups = append(resp.Groups, &pb.NodeGroupStatus{
+			Group:        groupToProto(g),
+			CurrentNodes: perGroup[g.Name],
+		})
+	}
+	for _, e := range events {
+		resp.Events = append(resp.Events, &pb.ScaleEvent{
+			At:        timestamppb.New(e.At),
+			Kind:      eventKindToProto[e.Kind],
+			NodeGroup: e.Group,
+			Reason:    e.Reason,
+		})
+	}
+	return resp, nil
+}
+
+func (s *ClusterServer) UpdateClusterNodePool(ctx context.Context, req *pb.UpdateClusterNodePoolRequest) (*pb.UpdateClusterNodePoolResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeClustersWrite); err != nil {
+		return nil, err
+	}
+	owner, err := resolveOwner(ctx, req.Owner)
+	if err != nil {
+		return nil, err
+	}
+	groups, err := groupsFromProto(req.NodeGroups)
+	if err != nil {
+		return nil, err
+	}
+	if err := cluster.ValidateNodeGroups(groups); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := s.enforceCaps(ctx, owner, req.Name, groups, true); err != nil {
+		return nil, err
+	}
+	if err := s.store.UpdateNodeGroups(ctx, owner, req.Name, groups); err != nil {
+		return nil, storeErr(err)
+	}
+	c, err := s.store.Get(ctx, owner, req.Name)
+	if err != nil {
+		return nil, storeErr(err)
+	}
+	log.Printf("[cluster] node pool updated owner=%s name=%s groups=%d", owner, req.Name, len(groups))
+	return &pb.UpdateClusterNodePoolResponse{
+		Cluster: clusterToProto(c),
+		Message: "node pool updated; the reconciler converges counts asynchronously",
+	}, nil
+}
