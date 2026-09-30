@@ -51,3 +51,39 @@ func TestBackendsProfileDaemonJSON(t *testing.T) {
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = w.Write(body)
 				}))
+				defer srv.Close()
+				oldServer, oldToken := serverAddr, authToken
+				oldGet, oldFormat, oldSkip := profileBackendGet, profileBackendFormat, profileBackendSkipGPU
+				t.Cleanup(func() {
+					serverAddr, authToken = oldServer, oldToken
+					profileBackendGet, profileBackendFormat, profileBackendSkipGPU = oldGet, oldFormat, oldSkip
+				})
+				serverAddr, authToken = srv.URL, ""
+				profileBackendGet, profileBackendFormat, profileBackendSkipGPU = get, mode, true
+				var out bytes.Buffer
+				cmd := &cobra.Command{}
+				cmd.SetOut(&out)
+				if err := runBackendsProfile(cmd, []string{"peer-test"}); err != nil {
+					t.Fatalf("read daemon profile: %v", err)
+				}
+				if mode == "json" {
+					if out.String() != string(body)+"\n" {
+						t.Fatalf("JSON output changed: %s", out.String())
+					}
+					return
+				}
+				if mode == "unprofiled" {
+					if !strings.Contains(out.String(), "no capability profile recorded for peer-test yet") {
+						t.Fatalf("missing profile must remain explicit: %s", out.String())
+					}
+					return
+				}
+				for _, want := range []string{"Capability profile for peer-test:", humanBytes(16 << 30), humanBytes(128 << 30), "CPU 123456 ops/s", humanBytes(2<<30) + "/s (300ms)", "cpu-small", "consistent"} {
+					if !strings.Contains(out.String(), want) {
+						t.Errorf("output missing %q: %s", want, out.String())
+					}
+				}
+			})
+		}
+	}
+}
