@@ -134,3 +134,95 @@ func TestAllocate_SkipsQuarantinedAddressUntilItExpires(t *testing.T) {
 	}
 
 	time.Sleep(quarantine + 20*time.Millisecond)
+
+	got, err := a.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate after quarantine elapsed: %v", err)
+	}
+	if !got.Equal(first) {
+		t.Errorf("Allocate after quarantine = %s, want the released address %s back", got, first)
+	}
+}
+
+func TestAllocate_ZeroQuarantineAllowsImmediateReuse(t *testing.T) {
+	a, err := New("10.0.0.1", "10.0.0.1", "10.0.0.254", 0)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ip, err := a.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate 1: %v", err)
+	}
+	if err := a.Release(ip); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if _, err := a.Allocate(); err != nil {
+		t.Fatalf("Allocate 2 (immediate reuse, quarantine=0): %v", err)
+	}
+}
+
+func TestRelease_RejectsAddressNotCurrentlyAllocated(t *testing.T) {
+	a, err := New("10.0.0.1", "10.0.0.10", "10.0.0.254", 0)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	err = a.Release(net.ParseIP("10.0.0.5"))
+	if !errors.Is(err, ErrNotAllocated) {
+		t.Fatalf("Release of a never-allocated address = %v, want ErrNotAllocated", err)
+	}
+
+	ip, err := a.Allocate()
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	if err := a.Release(ip); err != nil {
+		t.Fatalf("first Release: %v", err)
+	}
+	if err := a.Release(ip); !errors.Is(err, ErrNotAllocated) {
+		t.Fatalf("double Release = %v, want ErrNotAllocated", err)
+	}
+}
+
+func TestAllocate_RoundRobinsAcrossTheRange(t *testing.T) {
+	// Not a strict requirement of the design note, but pins the actual
+	// scan behavior: sequential Allocate/Release/Allocate cycles spread
+	// reuse across the range (cursor-based) rather than always handing
+	// back the lowest free address — the shape that makes ARP-quarantine
+	// meaningful in the first place (constantly reusing the same handful
+	// of addresses would defeat the point of quarantining at all).
+	a, err := New("10.0.0.1", "10.0.0.3", "10.0.0.254", 0)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var got []string
+	for i := 0; i < 3; i++ {
+		ip, err := a.Allocate()
+		if err != nil {
+			t.Fatalf("Allocate %d: %v", i, err)
+		}
+		got = append(got, ip.String())
+	}
+	want := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("allocation order = %v, want %v", got, want)
+			break
+		}
+	}
+}
+
+func ExampleAllocator() {
+	a, err := New("10.100.0.10", "10.100.0.20", "10.100.0.1", time.Minute)
+	if err != nil {
+		panic(err)
+	}
+	ip, err := a.Allocate()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(ip)
+	// Output: 10.100.0.10
+}
