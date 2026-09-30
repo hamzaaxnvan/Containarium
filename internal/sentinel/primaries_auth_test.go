@@ -55,3 +55,60 @@ func doPrimaries(t *testing.T, srv *httptest.Server, method, path, secret string
 	return resp.StatusCode, string(respBody)
 }
 
+func TestPrimariesHandler_UnsignedRequestRejected(t *testing.T) {
+	srv := newPrimariesTestServer(t, testPrimariesSecret)
+
+	for _, tc := range []struct {
+		method, path string
+	}{
+		{http.MethodGet, "/sentinel/primaries"},
+		{http.MethodPost, "/sentinel/primaries"},
+		{http.MethodPut, "/sentinel/primaries/some-pool"},
+		{http.MethodDelete, "/sentinel/primaries/some-pool"},
+	} {
+		code, body := doPrimaries(t, srv, tc.method, tc.path, "", false, nil)
+		if code != http.StatusUnauthorized {
+			t.Errorf("%s %s: status = %d, body = %q; want 401 unsigned", tc.method, tc.path, code, body)
+		}
+	}
+}
+
+func TestPrimariesHandler_WrongSecretRejected(t *testing.T) {
+	srv := newPrimariesTestServer(t, testPrimariesSecret)
+	code, body := doPrimaries(t, srv, http.MethodGet, "/sentinel/primaries", "wrong-secret-but-still-32-bytes!!", true, nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %q; want 401 wrong secret", code, body)
+	}
+}
+
+func TestPrimariesHandler_SignedRequestSucceeds(t *testing.T) {
+	srv := newPrimariesTestServer(t, testPrimariesSecret)
+
+	code, body := doPrimaries(t, srv, http.MethodGet, "/sentinel/primaries", testPrimariesSecret, true, nil)
+	if code != http.StatusOK {
+		t.Fatalf("GET: status = %d, body = %q; want 200 signed", code, body)
+	}
+
+	reqBody := `{"pool":"p1","hostname":"h1.example.com","ip":"10.0.0.1","port":443}`
+	code, body = doPrimaries(t, srv, http.MethodPost, "/sentinel/primaries", testPrimariesSecret, true, strings.NewReader(reqBody))
+	if code != http.StatusCreated {
+		t.Fatalf("POST: status = %d, body = %q; want 201 signed", code, body)
+	}
+
+	code, body = doPrimaries(t, srv, http.MethodDelete, "/sentinel/primaries/p1", testPrimariesSecret, true, nil)
+	if code != http.StatusNoContent {
+		t.Fatalf("DELETE: status = %d, body = %q; want 204 signed", code, body)
+	}
+}
+
+// TestPrimariesHandler_UnconfiguredSecretFailsClosed matches
+// TestPeerProxy_UnconfiguredAdminSecretFailsClosed's reasoning for the sibling
+// route: a Manager started with no HMAC secret configured must refuse every
+// request rather than silently passing them through unauthenticated.
+func TestPrimariesHandler_UnconfiguredSecretFailsClosed(t *testing.T) {
+	srv := newPrimariesTestServer(t, "")
+	code, _ := doPrimaries(t, srv, http.MethodGet, "/sentinel/primaries", testPrimariesSecret, true, nil)
+	if code != http.StatusUnauthorized {
+		t.Fatalf("status = %d; want 401 when no secret is configured, even signed", code)
+	}
+}
