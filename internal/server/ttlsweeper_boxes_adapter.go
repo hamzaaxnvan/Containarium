@@ -22,3 +22,28 @@ import (
 // suffix-strip recovers the username exactly as it does for LXC boxes.
 type ttlsweeperBoxAdapter struct {
 	bb box.BoxBackend
+}
+
+func (a *ttlsweeperBoxAdapter) ListContainers() ([]ttlsweeper.ContainerView, error) {
+	// The sweeper interface is synchronous; bound the backend call so a hung
+	// apiserver can't wedge the tick loop forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	boxes, err := a.bb.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ttlsweeper.ContainerView, 0, len(boxes))
+	for i := range boxes {
+		b := boxes[i]
+		v := ttlsweeper.ContainerView{Name: b.Ref.Tenant + "-container"}
+		if raw := b.Labels["ttl_expires_at"]; raw != "" {
+			if t, perr := time.Parse(time.RFC3339, raw); perr == nil {
+				v.TTLExpiresAt = &t
+			}
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
