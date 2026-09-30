@@ -93,3 +93,27 @@ func TestPrimaryNetworkInterface_NoGlobalInetAddressReturnsEmpty(t *testing.T) {
 		"eth0": {Addresses: []api.InstanceStateNetworkAddress{
 			{Family: "inet6", Scope: "link", Address: "fe80::1"},
 		}},
+	}
+	got := primaryNetworkInterface(network)
+	if got != "" {
+		t.Fatalf("primaryNetworkInterface() = %q, want empty when no global inet address exists", got)
+	}
+}
+
+// TestPrimaryNetworkInterface_VMPredictableNamePrefixes covers the other
+// systemd predictable-name prefixes VMs commonly get, alongside a bridge,
+// pinning that pass 1 matches by prefix, not just the exact "eth0" name.
+func TestPrimaryNetworkInterface_VMPredictableNamePrefixes(t *testing.T) {
+	for _, name := range []string{"enp5s0", "ens3", "eno1"} {
+		t.Run(name, func(t *testing.T) {
+			network := map[string]api.InstanceStateNetwork{
+				"cni0": {Addresses: globalInet("10.42.0.1")},
+				name:   {Addresses: globalInet("10.232.21.100")},
+			}
+			got := primaryNetworkInterface(network)
+			if got != "10.232.21.100" {
+				t.Fatalf("primaryNetworkInterface() = %q, want %s's 10.232.21.100", got, name)
+			}
+		})
+	}
+}
