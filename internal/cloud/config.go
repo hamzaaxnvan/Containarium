@@ -115,3 +115,82 @@ func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path) // #nosec G304 -- path is operator-provided config location
 	if err != nil {
 		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read cloud config: %w", err)
+	}
+	if len(b) == 0 {
+		return nil, nil
+	}
+	var c Config
+	if err := yaml.Unmarshal(b, &c); err != nil {
+		return nil, fmt.Errorf("parse cloud config %s: %w", path, err)
+	}
+	return &c, nil
+}
+
+// Validate reports whether the config has the fields the client needs.
+func (c *Config) Validate() error {
+	if c == nil {
+		return fmt.Errorf("nil cloud config")
+	}
+	var missing []string
+	if strings.TrimSpace(c.ControlPlane) == "" {
+		missing = append(missing, "control_plane")
+	}
+	if strings.TrimSpace(c.HostID) == "" {
+		missing = append(missing, "host_id")
+	}
+	if strings.TrimSpace(c.Token) == "" {
+		missing = append(missing, "token")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("cloud config missing: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// Save writes the config to path atomically at mode 0600 (it holds a bearer
+// token). Creates the parent dir at 0700.
+func Save(path string, c *Config) error {
+	if c == nil {
+		return fmt.Errorf("nil cloud config")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create cloud config dir %s: %w", dir, err)
+	}
+	b, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("marshal cloud config: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".cloud-*.yaml.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp cloud config: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }() // no-op if the rename succeeded
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp cloud config: %w", err)
+	}
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp cloud config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp cloud config: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename cloud config into place: %w", err)
+	}
+	return nil
+}
+
+// Delete removes the config (logout). Missing file is not an error.
+func Delete(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove cloud config: %w", err)
+	}
+	return nil
+}
