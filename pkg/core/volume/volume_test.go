@@ -98,3 +98,54 @@ func TestCreate_BuildsCommandAndResolvesPool(t *testing.T) {
 	}
 }
 
+func TestAttachArgs_RWAndRO(t *testing.T) {
+	rw := attachArgs("alice-container", DeviceName("ds"), "shared", "ds", "/mnt/shared", false)
+	wantRW := "config device add alice-container vol-ds disk pool=shared source=ds path=/mnt/shared"
+	if strings.Join(rw, " ") != wantRW {
+		t.Errorf("rw attach = %q, want %q", strings.Join(rw, " "), wantRW)
+	}
+	ro := attachArgs("alice-container", DeviceName("ds"), "shared", "ds", "/mnt/shared", true)
+	if !strings.HasSuffix(strings.Join(ro, " "), "readonly=true") {
+		t.Errorf("ro attach should end with readonly=true: %q", strings.Join(ro, " "))
+	}
+}
+
+func TestAttach_Validation(t *testing.T) {
+	m := NewManager(&fakeRunner{storage: cephfsCSV})
+	if err := m.Attach("", "shared", "alice", "/mnt", false); err == nil {
+		t.Error("empty volume should be rejected")
+	}
+	if err := m.Attach("ds", "shared", "alice", "", false); err == nil {
+		t.Error("empty mount_path should be rejected")
+	}
+}
+
+func TestDetach_UsesDeterministicDevice(t *testing.T) {
+	f := &fakeRunner{storage: cephfsCSV}
+	m := NewManager(f)
+	if err := m.Detach("ds", "alice-container"); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	want := "config device remove alice-container vol-ds"
+	if got := strings.Join(f.lastCall(), " "); got != want {
+		t.Errorf("detach argv = %q, want %q", got, want)
+	}
+}
+
+func TestList_ParsesCustomVolumes(t *testing.T) {
+	f := &fakeRunner{
+		storage: cephfsCSV,
+		volList: "container,alice,,filesystem,1\ncustom,dataset,,filesystem,2\ncustom,cache,,filesystem,0\n",
+	}
+	m := NewManager(f)
+	vols, err := m.List("shared")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(vols) != 2 {
+		t.Fatalf("expected 2 custom volumes, got %d (%+v)", len(vols), vols)
+	}
+	if vols[0].Name != "dataset" || vols[0].Pool != "shared" {
+		t.Errorf("unexpected first volume: %+v", vols[0])
+	}
+}
