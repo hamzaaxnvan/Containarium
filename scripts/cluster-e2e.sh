@@ -143,3 +143,148 @@ cleanup() {
     # 15 that verdict sat ~200 lines above the tail window, so a lane
     # that failed on a missing scale-up could not answer "was the
     # autoscaler ever enabled?" from its own log.
+    echo "---- daemon log: cluster/autoscaler lines (whole run) ----"
+    grep -E '\[cluster\]|autoscaler|[Pp]assthrough|Managed-cluster' "$DAEMON_LOG" || echo "(none)"
+    echo "---- daemon log (last 200 lines) ----"
+    tail -200 "$DAEMON_LOG"
+  fi
+  # The daemon runs under sudo and creates root-owned trees here (the
+  # cluster CA PKI dir among them), so an unprivileged rm leaves them
+  # behind and prints a permission error that looks like a real
+  # failure. Remove as root, matching who created it.
+  sudo rm -rf "$WORKDIR" 2>/dev/null || rm -rf "$WORKDIR"
+  exit $status
+}
+trap cleanup EXIT
+
+# --- postgres: real, per the design's real-vs-faked table ---------------
+if [ -z "${CONTAINARIUM_POSTGRES_URL:-}" ]; then
+  CONTAINER_RUNTIME="$(command -v docker || command -v podman || true)"
+  [ -n "$CONTAINER_RUNTIME" ] || fail "set CONTAINARIUM_POSTGRES_URL or install docker/podman for a throwaway postgres"
+  PG_PORT="$(( (RANDOM % 1000) + 15432 ))"
+  PG_CONTAINER="cluster-e2e-pg-$$"
+  log "starting throwaway postgres on :$PG_PORT"
+  "$CONTAINER_RUNTIME" run -d --name "$PG_CONTAINER" \
+    -e POSTGRES_USER=containarium -e POSTGRES_PASSWORD=e2e -e POSTGRES_DB=containarium \
+    -p "127.0.0.1:${PG_PORT}:5432" postgres:16-alpine >/dev/null
+  export CONTAINARIUM_POSTGRES_URL="postgres://containarium:e2e@127.0.0.1:${PG_PORT}/containarium?sslmode=disable"
+  # Probe over TCP (-h 127.0.0.1), never the Unix socket (#1514).
+  #
+  # The postgres entrypoint starts TWO servers: a temporary one for the
+  # init phase, run with listen_addresses='"'"''"'"' so it is reachable only
+  # over the Unix socket, and then -- after CREATE DATABASE and any init
+  # scripts -- it SHUTS THAT ONE DOWN and starts the real server, which
+  # is the first to listen on TCP. A default probe answers "ready"
+  # about the temporary one, so this loop broke early, the entrypoint
+  # shut that server down, and the confirming check below landed in the
+  # shutdown window: red seven seconds into a ninety-second bound.
+  #
+  # The bound was previously raised 30s -> 90s against this symptom, on
+  # the reading that a cold runner'"'"'s image pull plus initdb needed
+  # longer. It could not help: the loop never reached its bound. 90s is
+  # kept because a cold pull genuinely is slow, but the flake was never
+  # a duration problem -- it was a check that answered about the wrong
+  # server.
+  for _ in $(seq 1 90); do
+    "$CONTAINER_RUNTIME" exec "$PG_CONTAINER" pg_isready -h 127.0.0.1 -U containarium >/dev/null 2>&1 && break
+    sleep 1
+  done
+  if ! "$CONTAINER_RUNTIME" exec "$PG_CONTAINER" pg_isready -h 127.0.0.1 -U containarium >/dev/null 2>&1; then
+    # Say why, rather than just that. Without this the failure is
+    # indistinguishable between "still starting", "crashed on startup"
+    # and "port already bound".
+    echo "---- postgres container state ----"
+    "$CONTAINER_RUNTIME" ps -a --filter "name=$PG_CONTAINER" 2>&1 || true
+    echo "---- postgres container log ----"
+    "$CONTAINER_RUNTIME" logs "$PG_CONTAINER" 2>&1 | tail -40 || true
+    fail "postgres did not become ready"
+  fi
+else
+  CONTAINER_RUNTIME=""
+fi
+
+# --- build the system under test ----------------------------------------
+log "building containariumd"
+# #1773: cmd/containarium is now the client-only build (//go:build
+# containarium_client); the full daemon this lane drives lives at
+# cmd/containariumd, untagged, unchanged from what this script always ran.
+go build -o "$BIN" ./cmd/containariumd
+
+# --- daemon environment --------------------------------------------------
+JWT_SECRET="${CONTAINARIUM_JWT_SECRET:-$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+ADVERTISE_HOST="${CONTAINARIUM_E2E_ADVERTISE_HOST:-$(ip -4 route get 1.1.1.1 | sed -n 's/.*src \([0-9.]*\).*/\1/p')}"
+[ -n "$ADVERTISE_HOST" ] || fail "could not determine the host's advertise address; set CONTAINARIUM_E2E_ADVERTISE_HOST"
+
+log "starting daemon (grpc :$GRPC_PORT http :$HTTP_PORT advertise $ADVERTISE_HOST isolation $ISOLATION)"
+sudo env \
+  CONTAINARIUM_JWT_SECRET="$JWT_SECRET" \
+  CONTAINARIUM_POSTGRES_URL="$CONTAINARIUM_POSTGRES_URL" \
+  CONTAINARIUM_CLUSTER_ALLOW_CONTAINER_NODES="${CONTAINARIUM_CLUSTER_ALLOW_CONTAINER_NODES:-}" \
+  CONTAINARIUM_CLUSTER_ADVERTISE_ADDR="$ADVERTISE_HOST" \
+  CONTAINARIUM_CLUSTER_CA_ADVERTISE="$ADVERTISE_HOST:36442" \
+  CONTAINARIUM_CLUSTER_CA_PKI_DIR="$WORKDIR/cluster-ca" \
+  CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_DELAY_AFTER_ADD="${CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_DELAY_AFTER_ADD:-}" \
+  CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_UNNEEDED_TIME="${CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_UNNEEDED_TIME:-}" \
+  "$BIN" daemon --port "$GRPC_PORT" --http-port "$HTTP_PORT" \
+  >"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+
+# Readiness: any HTTP answer on the gateway port means the REST surface
+# is up. Authenticated calls are the Go test's job — it mints its own
+# tenant token from the same secret.
+#
+# The bound is 6 minutes, not the 2 it used to be: on a COLD host (an
+# ephemeral GitHub-hosted runner, as opposed to a warm self-hosted one)
+# the daemon spends up to 2 minutes waiting for core containers that
+# have never existed before proceeding without them, and the old bound
+# declared that a dead daemon. A warm host still answers in seconds, so
+# nothing changes for the KVM lane except how long a genuinely stuck
+# daemon takes to be reported.
+DAEMON_WAIT_TRIES="${CONTAINARIUM_E2E_DAEMON_WAIT_TRIES:-180}"
+log "waiting for the daemon's HTTP gateway (up to $((DAEMON_WAIT_TRIES * 2))s)"
+for i in $(seq 1 "$DAEMON_WAIT_TRIES"); do
+  if ! sudo kill -0 "$DAEMON_PID" 2>/dev/null; then
+    fail "daemon exited during startup"
+  fi
+  if daemon_is_ready "$HTTP_PORT" /v1/clusters; then
+    break
+  fi
+  [ "$i" = "$DAEMON_WAIT_TRIES" ] && fail "daemon HTTP gateway not answering after $((DAEMON_WAIT_TRIES * 2))s"
+  sleep 2
+done
+
+# When the workflow asked for shortened autoscaler scale-down timers, prove
+# the daemon took them. A green run does not print the daemon log, and a
+# silent fall back to the stock 10m + 10m timers would only show up as the
+# lane quietly getting ~8 minutes slower again. The daemon logs the line when
+# it wires the reconciler; allow a short bound in case the gateway answered
+# first.
+if [ -n "${CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_DELAY_AFTER_ADD:-}${CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_UNNEEDED_TIME:-}" ]; then
+  override_line=""
+  for _ in $(seq 1 15); do
+    override_line="$(grep -m1 'autoscaler scale-down timers overridden' "$DAEMON_LOG" || true)"
+    [ -n "$override_line" ] && break
+    sleep 2
+  done
+  [ -n "$override_line" ] || fail "scale-down timers were requested (delay-after-add='${CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_DELAY_AFTER_ADD:-}', unneeded-time='${CONTAINARIUM_CLUSTER_CA_SCALE_DOWN_UNNEEDED_TIME:-}') but the daemon never logged applying them"
+  log "$override_line"
+fi
+
+# --- run the lane --------------------------------------------------------
+log "running the six-step journey (isolation: $ISOLATION, sabotage: ${CONTAINARIUM_E2E_SABOTAGE:-none})"
+sudo env \
+  PATH="$PATH" HOME="$HOME" GOFLAGS="${GOFLAGS:-}" GOCACHE="$(go env GOCACHE)" GOMODCACHE="$(go env GOMODCACHE)" \
+  CONTAINARIUM_REQUIRE_INCUS=1 \
+  CONTAINARIUM_E2E_CLI="$BIN" \
+  CONTAINARIUM_E2E_SERVER="127.0.0.1:$HTTP_PORT" \
+  CONTAINARIUM_E2E_ADVERTISE_HOST="$ADVERTISE_HOST" \
+  CONTAINARIUM_JWT_SECRET="$JWT_SECRET" \
+  CONTAINARIUM_E2E_SABOTAGE="${CONTAINARIUM_E2E_SABOTAGE:-}" \
+  CONTAINARIUM_E2E_ISOLATION="$ISOLATION" \
+  CONTAINARIUM_E2E_OFFHOST_PROBE="${CONTAINARIUM_E2E_OFFHOST_PROBE:-}" \
+  CONTAINARIUM_E2E_READY_TIMEOUT="${CONTAINARIUM_E2E_READY_TIMEOUT:-}" \
+  CONTAINARIUM_E2E_SCALEUP_TIMEOUT="${CONTAINARIUM_E2E_SCALEUP_TIMEOUT:-}" \
+  CONTAINARIUM_E2E_VPA_TIMEOUT="${CONTAINARIUM_E2E_VPA_TIMEOUT:-}" \
+  CONTAINARIUM_E2E_SCALEDOWN_TIMEOUT="${CONTAINARIUM_E2E_SCALEDOWN_TIMEOUT:-}" \
+  CONTAINARIUM_E2E_DELETE_TIMEOUT="${CONTAINARIUM_E2E_DELETE_TIMEOUT:-}" \
+  go test -tags 'incus cluster_e2e' -count=1 -timeout "$GO_TIMEOUT" -v ./test/e2e/cluster/
