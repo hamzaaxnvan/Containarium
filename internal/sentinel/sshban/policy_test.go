@@ -202,3 +202,140 @@ func TestInvalidConfigurationAndInputsFailClosed(t *testing.T) {
 		func(c *Config) { c.Listener = 0 }, func(c *Config) { c.IgnoreCIDRs = []string{"bad-prefix"} },
 	} {
 		c := Config{Listener: mainListener, MaxFailures: 2, Duration: time.Minute, MaxEntries: 10}
+		change(&c)
+		if _, err := New(c); err == nil {
+			t.Errorf("accepted invalid config: %+v", c)
+		}
+	}
+	g, _ := fixture(t, nil)
+	if err := g.Check("bad-address"); err == nil {
+		t.Error("accepted malformed source")
+	}
+	for _, r := range []*pb.GetSSHBanRequest{{Listener: mainListener, Ip: "192.0.2.0/24"}, {Listener: 0, Ip: "192.0.2.1"}, {Listener: pb.SSHBanListener_SSH_BAN_LISTENER_ANONYMOUS, Ip: "192.0.2.1"}} {
+		if _, err := g.GetSSHBan(context.Background(), r); err == nil {
+			t.Errorf("accepted invalid request: %v", r)
+		}
+	}
+}
+
+// TestEventsAreBoundedAndUnbanKeepsTheOperatorReason verifies operational
+// evidence cannot turn retry traffic into an unbounded journal flood.
+func TestEventsAreBoundedAndUnbanKeepsTheOperatorReason(t *testing.T) {
+	var events []Event
+	g, now := fixture(t, func(c *Config) { c.Emit = func(e Event) { events = append(events, e) } })
+	if err := g.Check("192.0.2.1:22"); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		g.Fail("192.0.2.1:22", "auth_failure")
+	}
+	for range 100 {
+		_ = g.Check("192.0.2.1:22")
+		g.Fail("192.0.2.1:22", "pipe_create_error")
+	}
+	if _, err := g.UnbanSSHSource(context.Background(), &pb.UnbanSSHSourceRequest{Listener: mainListener, Ip: "192.0.2.1", Reason: "repaired deploy key"}); err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for _, e := range events {
+		counts[e.Kind]++
+		if e.Kind == "unban" && e.Reason != "repaired deploy key" {
+			t.Fatal("operator reason was lost")
+		}
+	}
+	if counts["ban"] != 1 || counts["blocked"] != 1 || len(events) > 6 {
+		t.Fatalf("unexpected transition/log counts: %v", counts)
+	}
+	events = nil
+	if err := g.Check("192.0.2.2:22"); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(5 * time.Minute)
+	_ = snapshot(t, g, "192.0.2.2")
+	if len(events) != 0 {
+		t.Fatal("successful-source expiry should not spam ban events")
+	}
+}
+
+// A window that ends with failures short of the budget reports them once
+// (#2419); a quiet sentinel still reports them via Sweep, and a banned window
+// is reported by its ban event, not also as a window summary.
+func TestWindowFailuresAreReportedOnceAndBannedWindowsAreNot(t *testing.T) {
+	var events []Event
+	g, now := fixture(t, func(c *Config) { c.Emit = func(e Event) { events = append(events, e) } }) // MaxFailures 2
+	kinds := func() []string {
+		var k []string
+		for _, e := range events {
+			k = append(k, e.Kind)
+		}
+		return k
+	}
+
+	// 1.1.1.1: one failure, below the budget.
+	_ = g.Check("203.0.113.1:1000")
+	g.Fail("203.0.113.1:1000", "auth_failure")
+	// 2.2.2.2: reaches the budget and is banned.
+	_ = g.Check("203.0.113.2:1000")
+	g.Fail("203.0.113.2:1000", "auth_failure")
+	g.Fail("203.0.113.2:1000", "auth_failure")
+	// 3.3.3.3: connects and never fails.
+	_ = g.Check("203.0.113.3:1000")
+
+	*now = now.Add(10 * time.Minute)
+	g.Sweep() // no callback arrives; Sweep must still end the windows
+
+	var window []Event
+	for _, e := range events {
+		if e.Kind == EventWindowFailures {
+			window = append(window, e)
+		}
+	}
+	if len(window) != 1 || window[0].IP != "203.0.113.1" || window[0].Failures != 1 {
+		t.Fatalf("window_failures events = %+v (all: %v), want exactly one for 203.0.113.1 with 1 failure", window, kinds())
+	}
+
+	g.Sweep()
+	n := 0
+	for _, e := range events {
+		if e.Kind == EventWindowFailures {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("a second Sweep re-reported the window: %d window_failures events", n)
+	}
+}
+
+func TestTrySweepSkipsBusyGuardAndReportsOnNextPass(t *testing.T) {
+	var summaries []Event
+	g, now := fixture(t, func(c *Config) {
+		c.Emit = func(e Event) {
+			if e.Kind == EventWindowFailures {
+				summaries = append(summaries, e)
+			}
+		}
+	})
+	if err := g.Check("203.0.113.1:22"); err != nil {
+		t.Fatal(err)
+	}
+	g.Fail("203.0.113.1:22", "auth_failure")
+	*now = now.Add(10 * time.Minute)
+	g.mu.Lock()
+	done := make(chan struct{})
+	go func() { g.TrySweep(); close(done) }()
+	select {
+	case <-done: // a busy periodic pass must not wait for the policy mutex
+	case <-time.After(2 * time.Second):
+		g.mu.Unlock()
+		<-done
+		t.Fatal("busy periodic sweep blocked on the policy mutex")
+	}
+	g.mu.Unlock()
+	if len(summaries) != 0 {
+		t.Fatalf("busy sweep reported a window: %+v", summaries)
+	}
+	g.TrySweep()
+	if len(summaries) != 1 || summaries[0].IP != "203.0.113.1" || summaries[0].Failures != 1 {
+		t.Fatalf("next sweep summaries = %+v, want one failure", summaries)
+	}
+}
