@@ -3,3 +3,8 @@ terraform.tfstate
 terraform.tfstate.backup
 terraform.tfstate.*.backup
 .terraform/
+.terraform.lock.hcl
+
+# Local secrets — only the .example version is tracked.
+terraform.tfvars
+*.auto.tfvars
