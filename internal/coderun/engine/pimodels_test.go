@@ -115,3 +115,121 @@ func TestPiProviderMapping_EveryGatewayProviderIsMapped(t *testing.T) {
 			continue
 		}
 		shape, err := PiProviderShape(p)
+		if err != nil {
+			t.Errorf("%s has no pi provider shape: %v", name, err)
+			continue
+		}
+		if shape.API == "" {
+			t.Errorf("%s maps to an empty pi api", name)
+		}
+		if !knownPiAPIs[shape.API] {
+			t.Errorf("%s maps to api %q, which is not in pi-ai's KnownApi union", name, shape.API)
+		}
+	}
+}
+
+// TestPiProviderShape pins each provider's api + base-URL suffix. These are
+// not guesses:
+//   - the /v1 rule for OpenAI-shaped upstreams is spelled out in
+//     pkg/core/recipes/recipes.yaml ("the base must carry the upstream's own
+//     /v1");
+//   - gemini-openai's /v1beta/openai is pinned by
+//     internal/modelgateway/gateway_test.go's proxy tests;
+//   - anthropic and gemini take a bare base because their own SDKs append
+//     /v1/messages and /v1beta/models respectively.
+func TestPiProviderShape(t *testing.T) {
+	tests := []struct {
+		provider   pb.GatewayProvider
+		wantAPI    string
+		wantSuffix string
+	}{
+		{pb.GatewayProvider_GATEWAY_PROVIDER_ANTHROPIC, "anthropic-messages", ""},
+		{pb.GatewayProvider_GATEWAY_PROVIDER_OPENAI, "openai-completions", "/v1"},
+		{pb.GatewayProvider_GATEWAY_PROVIDER_GEMINI, "google-generative-ai", ""},
+		{pb.GatewayProvider_GATEWAY_PROVIDER_GEMINI_OPENAI, "openai-completions", "/v1beta/openai"},
+		{pb.GatewayProvider_GATEWAY_PROVIDER_KAFEIDO, "openai-completions", "/v1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.provider.String(), func(t *testing.T) {
+			shape, err := PiProviderShape(tc.provider)
+			if err != nil {
+				t.Fatalf("PiProviderShape: %v", err)
+			}
+			if shape.API != tc.wantAPI {
+				t.Errorf("api = %q, want %q", shape.API, tc.wantAPI)
+			}
+			if shape.BaseURLSuffix != tc.wantSuffix {
+				t.Errorf("suffix = %q, want %q", shape.BaseURLSuffix, tc.wantSuffix)
+			}
+		})
+	}
+}
+
+// TestRenderPiModelsJSON_RequiresAModel: pi's /model picker only lists models
+// it can resolve, and the gateway token's allowed_models ceiling is
+// [model] — so an empty model would mint a token for nothing.
+func TestRenderPiModelsJSON_Rejections(t *testing.T) {
+	base := PiModelsParams{
+		Provider:    pb.GatewayProvider_GATEWAY_PROVIDER_KAFEIDO,
+		GatewayBase: "http://10.0.0.1:8866/v1/model/kafeido",
+		TokenEnvVar: GatewayTokenEnvVar,
+		Model:       "kafeido-coder",
+	}
+
+	noModel := base
+	noModel.Model = ""
+	if _, err := RenderPiModelsJSON(noModel); err == nil {
+		t.Error("an empty model should be rejected")
+	}
+
+	noBase := base
+	noBase.GatewayBase = ""
+	if _, err := RenderPiModelsJSON(noBase); err == nil {
+		t.Error("an empty gateway base should be rejected")
+	}
+
+	unspecified := base
+	unspecified.Provider = pb.GatewayProvider_GATEWAY_PROVIDER_UNSPECIFIED
+	if _, err := RenderPiModelsJSON(unspecified); err == nil {
+		t.Error("an unspecified provider should be rejected")
+	}
+}
+
+// TestRenderPiModelsJSON_ProviderBaseURLOverride covers --provider-base-url:
+// an operator pointing pi at an endpoint directly instead of at the gateway.
+// The override replaces the whole base, suffix included, because the operator
+// gave a complete URL.
+func TestRenderPiModelsJSON_ProviderBaseURLOverride(t *testing.T) {
+	got, err := RenderPiModelsJSON(PiModelsParams{
+		Provider:        pb.GatewayProvider_GATEWAY_PROVIDER_KAFEIDO,
+		GatewayBase:     "http://10.0.0.1:8866/v1/model/kafeido",
+		BaseURLOverride: "https://api.example.test/v1",
+		TokenEnvVar:     GatewayTokenEnvVar,
+		Model:           "kafeido-coder",
+	})
+	if err != nil {
+		t.Fatalf("RenderPiModelsJSON: %v", err)
+	}
+	if !strings.Contains(string(got), `"baseUrl": "https://api.example.test/v1"`) {
+		t.Errorf("--provider-base-url override not honoured:\n%s", got)
+	}
+	if strings.Contains(string(got), "10.0.0.1") {
+		t.Errorf("override should replace the gateway base entirely:\n%s", got)
+	}
+}
+
+// knownPiAPIs is pi-ai's KnownApi union (@earendil-works/pi-ai@0.87.1,
+// dist/types.d.ts). Kept in the test rather than in production code: it exists
+// to catch us inventing an api value, not to validate operator input.
+var knownPiAPIs = map[string]bool{
+	"openai-completions":      true,
+	"mistral-conversations":   true,
+	"openai-responses":        true,
+	"azure-openai-responses":  true,
+	"openai-codex-responses":  true,
+	"anthropic-messages":      true,
+	"bedrock-converse-stream": true,
+	"google-generative-ai":    true,
+	"google-vertex":           true,
+	"pi-messages":             true,
+}
