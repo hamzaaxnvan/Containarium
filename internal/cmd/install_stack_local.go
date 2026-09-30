@@ -16,3 +16,8 @@ func installStackLocal(username, stackID string) error {
 
 	if err := mgr.InstallStack(username, stackID); err != nil {
 		return fmt.Errorf("failed to install stack: %w", err)
+	}
+
+	fmt.Printf("\n✓ Stack %q installed successfully on %s-container\n", stackID, username)
+	return nil
+}
