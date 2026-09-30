@@ -453,3 +453,231 @@ func runSentinel(cmd *cobra.Command, args []string) error {
 			CheckInterval:             sentinelCheckInterval,
 			HTTPPort:                  sentinelHTTPPort,
 			HTTPSPort:                 sentinelHTTPSPort,
+			ForwardedPorts:            ports,
+			HealthyThreshold:          sentinelHealthyThreshold,
+			UnhealthyThreshold:        sentinelUnhealthyThreshold,
+			FailbackChecks:            sentinelFailbackChecks,
+			SelfCheckFailureThreshold: sentinelSelfCheckFailThreshold,
+			BinaryPort:                sentinelBinaryPort,
+			RecoveryTimeout:           sentinelRecoveryTimeout,
+			RecoveryBackoffInitial:    sentinelRecoveryBackoffInitial,
+			RecoveryBackoffMax:        sentinelRecoveryBackoffMax,
+			CertSyncInterval:          sentinelCertSyncInterval,
+			InFleetCertScope:          inFleetCertScope,
+			KeySyncInterval:           sentinelKeySyncInterval,
+			SSHAuthzSocket:            sentinelSSHAuthzSocket,
+			TunnelMode:                true,
+			ProxyProtocol:             sentinelProxyProtocol,
+			AlertWebhookURL:           sentinelAlertWebhookURL,
+		}
+
+		manager := sentinel.NewManager(config, provider)
+
+		watchCleanup, werr := wireWatchOnlyBackends(ctx, manager)
+		defer watchCleanup()
+		if werr != nil {
+			return werr
+		}
+
+		// Start ConnMux on port 443 — multiplexes tunnel handshakes and HTTPS
+		// on the same port. No extra firewall port needed.
+		muxAddr := fmt.Sprintf(":%d", sentinelHTTPSPort)
+		connMux, err := sentinel.NewConnMux(muxAddr)
+		if err != nil {
+			return fmt.Errorf("failed to start ConnMux on %s: %w", muxAddr, err)
+		}
+		defer func() { _ = connMux.Close() }()
+
+		// Wire up: tunnel connections → tunnel server, HTTPS → manager
+		tunnelPolicy, polErr := sentinel.PolicyFromCLI(tunnelToken, sentinelTunnelTokenPolicies)
+		if polErr != nil {
+			return polErr
+		}
+		loadPersistedTunnelTokens(tunnelPolicy)
+		tunnelServer := sentinel.NewTunnelServer("", tunnelPolicy, registry, sentinelHTTPSPort)
+		if _, err := configureTunnelTransport(tunnelServer, sentinelTunnelTLSIdentity); err != nil {
+			return err
+		}
+		if err := applyTunnelAPIBindAddr(tunnelServer, sentinelTunnelAPIBindAddr); err != nil {
+			return err
+		}
+		tunnelServer.OnConnect = manager.OnTunnelConnect
+		tunnelServer.OnDisconnect = manager.OnTunnelDisconnect
+		manager.SetTunnelRegistry(registry)
+		manager.InitBYOCRoutes(sentinel.DefaultBYOCRouteStorePath)
+		manager.SetTunnelPolicy(tunnelPolicy)
+		manager.SetHTTPSListener(connMux.HTTPSChanListener())
+		if err := maybeStartConsoleRouter(ctx, registry); err != nil {
+			return err
+		}
+
+		// Graceful shutdown on signals
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+		go func() {
+			sig := <-sigChan
+			log.Printf("[sentinel] received signal: %v", sig)
+			cancel()
+		}()
+
+		// Start ConnMux, tunnel server, and manager
+		go connMux.Run()
+		go func() {
+			if err := tunnelServer.Serve(ctx, connMux.TunnelListener()); err != nil {
+				log.Printf("[sentinel] tunnel server error: %v", err)
+			}
+		}()
+
+		defer startSentinelMetricsExport(ctx, manager)()
+		defer startSSHSessionShipper(ctx, manager)()
+		return manager.Run(ctx)
+
+	default:
+		return fmt.Errorf("unknown provider: %q (supported: gcp, none, tunnel)", sentinelProvider)
+	}
+
+	config := sentinel.Config{
+		SSHUpstreamPolicy: sentinelUpstreamPolicy, SSHUpstreamState: sentinelUpstreamState, SSHUpstreamSocket: sentinelUpstreamSocket,
+		HealthPort:                sentinelHealthPort,
+		CheckInterval:             sentinelCheckInterval,
+		HTTPPort:                  sentinelHTTPPort,
+		HTTPSPort:                 sentinelHTTPSPort,
+		ForwardedPorts:            ports,
+		HealthyThreshold:          sentinelHealthyThreshold,
+		UnhealthyThreshold:        sentinelUnhealthyThreshold,
+		FailbackChecks:            sentinelFailbackChecks,
+		SelfCheckFailureThreshold: sentinelSelfCheckFailThreshold,
+		BinaryPort:                sentinelBinaryPort,
+		RecoveryTimeout:           sentinelRecoveryTimeout,
+		RecoveryBackoffInitial:    sentinelRecoveryBackoffInitial,
+		RecoveryBackoffMax:        sentinelRecoveryBackoffMax,
+		CertSyncInterval:          sentinelCertSyncInterval,
+		InFleetCertScope:          inFleetCertScope,
+		KeySyncInterval:           sentinelKeySyncInterval,
+		SSHAuthzSocket:            sentinelSSHAuthzSocket,
+		ProxyProtocol:             sentinelProxyProtocol,
+		AlertWebhookURL:           sentinelAlertWebhookURL,
+	}
+
+	manager := sentinel.NewManager(config, provider)
+
+	watchCleanup, werr := wireWatchOnlyBackends(ctx, manager)
+	defer watchCleanup()
+	if werr != nil {
+		return werr
+	}
+
+	// Graceful shutdown on signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("[sentinel] received signal: %v", sig)
+		cancel()
+	}()
+
+	defer startSentinelMetricsExport(ctx, manager)()
+	defer startSSHSessionShipper(ctx, manager)()
+	return manager.Run(ctx)
+}
+
+// startSSHSessionShipper runs the SSH session shipper (#2415) for the life of
+// the sentinel: it needs this process's backend pool, keysync routing and
+// token store. Returns the stop func to defer (it waits for the loop to exit).
+// A no-op when disabled.
+func startSSHSessionShipper(ctx context.Context, m *sentinel.Manager) func() {
+	if !sentinelShipSSHSessions {
+		return func() {}
+	}
+	host, _ := os.Hostname()
+	opts := sentinelShipperOptions{
+		RecordsFile:    sentinelSSHSessionsFile,
+		CheckpointFile: sentinelSSHSessionsCkpt,
+		SentinelID:     host,
+		DefaultBackend: sentinelSSHSessionsDefaultBE,
+	}
+	cfg := inProcessShipConfig(shipperSources{
+		Resolver:   m.SSHSessionBackendResolver(),
+		Tokens:     m.AuditIngestTokens(),
+		BackendURL: m.ShipperBackendURL,
+	}, opts)
+
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		log.Printf("[sentinel] ssh-session-shipper started (records=%s checkpoint=%s interval=%s)",
+			opts.RecordsFile, opts.CheckpointFile, sentinelSSHSessionsInterval)
+		if err := sshsession.Ship(ctx, cfg, sentinelSSHSessionsInterval); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[sentinel] ssh-session-shipper stopped: %v", err)
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// maybeStartConsoleRouter starts the console router (#1756) in the
+// background if --console-router-addr is set, using registry — the same
+// TunnelRegistry the tunnel server just populated. Opt-in: with no
+// --console-router-addr this is a silent no-op, so an existing sentinel
+// deployment doesn't need to configure anything new to keep working.
+func maybeStartConsoleRouter(ctx context.Context, registry *sentinel.TunnelRegistry) error {
+	if sentinelConsoleRouterAddr == "" {
+		return nil
+	}
+
+	token := sentinelConsoleRouterToken
+	if token == "" {
+		token = os.Getenv("CONTAINARIUM_CONSOLE_ROUTER_TOKEN")
+	}
+	if token == "" {
+		return fmt.Errorf("--console-router-token or CONTAINARIUM_CONSOLE_ROUTER_TOKEN is required when --console-router-addr is set")
+	}
+
+	router := sentinel.NewConsoleRouter(sentinelConsoleRouterAddr, sentinel.NewConsoleRouterPolicy(token), registry)
+	go func() {
+		if err := router.Run(ctx); err != nil {
+			log.Printf("[sentinel] console router error: %v", err)
+		}
+	}()
+	return nil
+}
+
+func parseForwardedPorts(s string) ([]int, error) {
+	parts := strings.Split(s, ",")
+	ports := make([]int, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		port, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port %q: %w", p, err)
+		}
+		if port < 1 || port > 65535 {
+			return nil, fmt.Errorf("port %d out of range (1-65535)", port)
+		}
+		ports = append(ports, port)
+	}
+	if len(ports) == 0 {
+		return nil, fmt.Errorf("at least one port is required")
+	}
+	return ports, nil
+}
+
+// inFleetCertScopeFromFlags builds the in-fleet backend's certificate scope
+// from --backend-hostname, --backend-alias and --backend-base-domain, and
+// rejects malformed names so the sentinel fails to start rather than run
+// with a scope that silently matches nothing.
+func inFleetCertScopeFromFlags(hostname string, aliases, baseDomains []string) (sentinel.CertScope, error) {
+	scope := sentinel.CertScope{Hostname: hostname, Aliases: aliases, BaseDomains: baseDomains}
+	if err := scope.Validate(); err != nil {
+		return sentinel.CertScope{}, fmt.Errorf("invalid in-fleet backend domains (--backend-hostname / --backend-alias / --backend-base-domain): %w", err)
+	}
+	return scope, nil
+}
