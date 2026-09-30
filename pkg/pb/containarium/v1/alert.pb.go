@@ -1190,3 +1190,401 @@ func (x *WebhookDelivery) ProtoReflect() protoreflect.Message {
 		return ms
 	}
 	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WebhookDelivery.ProtoReflect.Descriptor instead.
+func (*WebhookDelivery) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *WebhookDelivery) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *WebhookDelivery) GetTimestamp() string {
+	if x != nil {
+		return x.Timestamp
+	}
+	return ""
+}
+
+func (x *WebhookDelivery) GetAlertName() string {
+	if x != nil {
+		return x.AlertName
+	}
+	return ""
+}
+
+func (x *WebhookDelivery) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *WebhookDelivery) GetWebhookUrl() string {
+	if x != nil {
+		return x.WebhookUrl
+	}
+	return ""
+}
+
+func (x *WebhookDelivery) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *WebhookDelivery) GetHttpStatus() int32 {
+	if x != nil {
+		return x.HttpStatus
+	}
+	return 0
+}
+
+func (x *WebhookDelivery) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *WebhookDelivery) GetPayloadSize() int32 {
+	if x != nil {
+		return x.PayloadSize
+	}
+	return 0
+}
+
+func (x *WebhookDelivery) GetDurationMs() int32 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
+// ListWebhookDeliveriesRequest lists webhook delivery history
+type ListWebhookDeliveriesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Limit         int32                  `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"`
+	Offset        int32                  `protobuf:"varint,2,opt,name=offset,proto3" json:"offset,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListWebhookDeliveriesRequest) Reset() {
+	*x = ListWebhookDeliveriesRequest{}
+	mi := &file_containarium_v1_alert_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListWebhookDeliveriesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListWebhookDeliveriesRequest) ProtoMessage() {}
+
+func (x *ListWebhookDeliveriesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_alert_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListWebhookDeliveriesRequest.ProtoReflect.Descriptor instead.
+func (*ListWebhookDeliveriesRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ListWebhookDeliveriesRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+func (x *ListWebhookDeliveriesRequest) GetOffset() int32 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+// ListWebhookDeliveriesResponse returns webhook delivery history
+type ListWebhookDeliveriesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Deliveries    []*WebhookDelivery     `protobuf:"bytes,1,rep,name=deliveries,proto3" json:"deliveries,omitempty"`
+	TotalCount    int32                  `protobuf:"varint,2,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListWebhookDeliveriesResponse) Reset() {
+	*x = ListWebhookDeliveriesResponse{}
+	mi := &file_containarium_v1_alert_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListWebhookDeliveriesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListWebhookDeliveriesResponse) ProtoMessage() {}
+
+func (x *ListWebhookDeliveriesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_alert_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListWebhookDeliveriesResponse.ProtoReflect.Descriptor instead.
+func (*ListWebhookDeliveriesResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_alert_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ListWebhookDeliveriesResponse) GetDeliveries() []*WebhookDelivery {
+	if x != nil {
+		return x.Deliveries
+	}
+	return nil
+}
+
+func (x *ListWebhookDeliveriesResponse) GetTotalCount() int32 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+var File_containarium_v1_alert_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_alert_proto_rawDesc = "" +
+	"\n" +
+	"\x1bcontainarium/v1/alert.proto\x12\x0fcontainarium.v1\"\xff\x03\n" +
+	"\tAlertRule\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
+	"\x04expr\x18\x03 \x01(\tR\x04expr\x12\x1a\n" +
+	"\bduration\x18\x04 \x01(\tR\bduration\x12\x1a\n" +
+	"\bseverity\x18\x05 \x01(\tR\bseverity\x12 \n" +
+	"\vdescription\x18\x06 \x01(\tR\vdescription\x12>\n" +
+	"\x06labels\x18\a \x03(\v2&.containarium.v1.AlertRule.LabelsEntryR\x06labels\x12M\n" +
+	"\vannotations\x18\b \x03(\v2+.containarium.v1.AlertRule.AnnotationsEntryR\vannotations\x12\x18\n" +
+	"\aenabled\x18\t \x01(\bR\aenabled\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\n" +
+	" \x01(\x03R\tcreatedAt\x12\x1d\n" +
+	"\n" +
+	"updated_at\x18\v \x01(\x03R\tupdatedAt\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +
+	"\x10AnnotationsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd8\x03\n" +
+	"\x16CreateAlertRuleRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
+	"\x04expr\x18\x02 \x01(\tR\x04expr\x12\x1a\n" +
+	"\bduration\x18\x03 \x01(\tR\bduration\x12\x1a\n" +
+	"\bseverity\x18\x04 \x01(\tR\bseverity\x12 \n" +
+	"\vdescription\x18\x05 \x01(\tR\vdescription\x12K\n" +
+	"\x06labels\x18\x06 \x03(\v23.containarium.v1.CreateAlertRuleRequest.LabelsEntryR\x06labels\x12Z\n" +
+	"\vannotations\x18\a \x03(\v28.containarium.v1.CreateAlertRuleRequest.AnnotationsEntryR\vannotations\x12\x18\n" +
+	"\aenabled\x18\b \x01(\bR\aenabled\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +
+	"\x10AnnotationsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"I\n" +
+	"\x17CreateAlertRuleResponse\x12.\n" +
+	"\x04rule\x18\x01 \x01(\v2\x1a.containarium.v1.AlertRuleR\x04rule\"%\n" +
+	"\x13GetAlertRuleRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"F\n" +
+	"\x14GetAlertRuleResponse\x12.\n" +
+	"\x04rule\x18\x01 \x01(\v2\x1a.containarium.v1.AlertRuleR\x04rule\"\x17\n" +
+	"\x15ListAlertRulesRequest\"J\n" +
+	"\x16ListAlertRulesResponse\x120\n" +
+	"\x05rules\x18\x01 \x03(\v2\x1a.containarium.v1.AlertRuleR\x05rules\"\xf9\x03\n" +
+	"\x16UpdateAlertRuleRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
+	"\x04expr\x18\x03 \x01(\tR\x04expr\x12\x1a\n" +
+	"\bduration\x18\x04 \x01(\tR\bduration\x12\x1a\n" +
+	"\bseverity\x18\x05 \x01(\tR\bseverity\x12 \n" +
+	"\vdescription\x18\x06 \x01(\tR\vdescription\x12K\n" +
+	"\x06labels\x18\a \x03(\v23.containarium.v1.UpdateAlertRuleRequest.LabelsEntryR\x06labels\x12Z\n" +
+	"\vannotations\x18\b \x03(\v28.containarium.v1.UpdateAlertRuleRequest.AnnotationsEntryR\vannotations\x12\x1d\n" +
+	"\aenabled\x18\t \x01(\bH\x00R\aenabled\x88\x01\x01\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +
+	"\x10AnnotationsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\n" +
+	"\n" +
+	"\b_enabled\"I\n" +
+	"\x17UpdateAlertRuleResponse\x12.\n" +
+	"\x04rule\x18\x01 \x01(\v2\x1a.containarium.v1.AlertRuleR\x04rule\"(\n" +
+	"\x16DeleteAlertRuleRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x19\n" +
+	"\x17DeleteAlertRuleResponse\"\x18\n" +
+	"\x16GetAlertingInfoRequest\"\xac\x02\n" +
+	"\x17GetAlertingInfoResponse\x12\x18\n" +
+	"\aenabled\x18\x01 \x01(\bR\aenabled\x12%\n" +
+	"\x0evmalert_status\x18\x02 \x01(\tR\rvmalertStatus\x12/\n" +
+	"\x13alertmanager_status\x18\x03 \x01(\tR\x12alertmanagerStatus\x12\x1f\n" +
+	"\vwebhook_url\x18\x04 \x01(\tR\n" +
+	"webhookUrl\x12\x1f\n" +
+	"\vtotal_rules\x18\x05 \x01(\x05R\n" +
+	"totalRules\x12!\n" +
+	"\fcustom_rules\x18\x06 \x01(\x05R\vcustomRules\x12:\n" +
+	"\x19webhook_secret_configured\x18\a \x01(\bR\x17webhookSecretConfigured\"\x1e\n" +
+	"\x1cListDefaultAlertRulesRequest\"Q\n" +
+	"\x1dListDefaultAlertRulesResponse\x120\n" +
+	"\x05rules\x18\x01 \x03(\v2\x1a.containarium.v1.AlertRuleR\x05rules\"v\n" +
+	"\x1bUpdateAlertingConfigRequest\x12\x1f\n" +
+	"\vwebhook_url\x18\x01 \x01(\tR\n" +
+	"webhookUrl\x126\n" +
+	"\x17generate_webhook_secret\x18\x02 \x01(\bR\x15generateWebhookSecret\"\x80\x01\n" +
+	"\x1cUpdateAlertingConfigResponse\x12\x1f\n" +
+	"\vwebhook_url\x18\x01 \x01(\tR\n" +
+	"webhookUrl\x12\x18\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\x12%\n" +
+	"\x0ewebhook_secret\x18\x03 \x01(\tR\rwebhookSecret\"\x14\n" +
+	"\x12TestWebhookRequest\"j\n" +
+	"\x13TestWebhookResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1f\n" +
+	"\vstatus_code\x18\x02 \x01(\x05R\n" +
+	"statusCode\x12\x18\n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\"\xbb\x02\n" +
+	"\x0fWebhookDelivery\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x1c\n" +
+	"\ttimestamp\x18\x02 \x01(\tR\ttimestamp\x12\x1d\n" +
+	"\n" +
+	"alert_name\x18\x03 \x01(\tR\talertName\x12\x16\n" +
+	"\x06source\x18\x04 \x01(\tR\x06source\x12\x1f\n" +
+	"\vwebhook_url\x18\x05 \x01(\tR\n" +
+	"webhookUrl\x12\x18\n" +
+	"\asuccess\x18\x06 \x01(\bR\asuccess\x12\x1f\n" +
+	"\vhttp_status\x18\a \x01(\x05R\n" +
+	"httpStatus\x12#\n" +
+	"\rerror_message\x18\b \x01(\tR\ferrorMessage\x12!\n" +
+	"\fpayload_size\x18\t \x01(\x05R\vpayloadSize\x12\x1f\n" +
+	"\vduration_ms\x18\n" +
+	" \x01(\x05R\n" +
+	"durationMs\"L\n" +
+	"\x1cListWebhookDeliveriesRequest\x12\x14\n" +
+	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
+	"\x06offset\x18\x02 \x01(\x05R\x06offset\"\x82\x01\n" +
+	"\x1dListWebhookDeliveriesResponse\x12@\n" +
+	"\n" +
+	"deliveries\x18\x01 \x03(\v2 .containarium.v1.WebhookDeliveryR\n" +
+	"deliveries\x12\x1f\n" +
+	"\vtotal_count\x18\x02 \x01(\x05R\n" +
+	"totalCountBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_alert_proto_rawDescOnce sync.Once
+	file_containarium_v1_alert_proto_rawDescData []byte
+)
+
+func file_containarium_v1_alert_proto_rawDescGZIP() []byte {
+	file_containarium_v1_alert_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_alert_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_alert_proto_rawDesc), len(file_containarium_v1_alert_proto_rawDesc)))
+	})
+	return file_containarium_v1_alert_proto_rawDescData
+}
+
+var file_containarium_v1_alert_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
+var file_containarium_v1_alert_proto_goTypes = []any{
+	(*AlertRule)(nil),                     // 0: containarium.v1.AlertRule
+	(*CreateAlertRuleRequest)(nil),        // 1: containarium.v1.CreateAlertRuleRequest
+	(*CreateAlertRuleResponse)(nil),       // 2: containarium.v1.CreateAlertRuleResponse
+	(*GetAlertRuleRequest)(nil),           // 3: containarium.v1.GetAlertRuleRequest
+	(*GetAlertRuleResponse)(nil),          // 4: containarium.v1.GetAlertRuleResponse
+	(*ListAlertRulesRequest)(nil),         // 5: containarium.v1.ListAlertRulesRequest
+	(*ListAlertRulesResponse)(nil),        // 6: containarium.v1.ListAlertRulesResponse
+	(*UpdateAlertRuleRequest)(nil),        // 7: containarium.v1.UpdateAlertRuleRequest
+	(*UpdateAlertRuleResponse)(nil),       // 8: containarium.v1.UpdateAlertRuleResponse
+	(*DeleteAlertRuleRequest)(nil),        // 9: containarium.v1.DeleteAlertRuleRequest
+	(*DeleteAlertRuleResponse)(nil),       // 10: containarium.v1.DeleteAlertRuleResponse
+	(*GetAlertingInfoRequest)(nil),        // 11: containarium.v1.GetAlertingInfoRequest
+	(*GetAlertingInfoResponse)(nil),       // 12: containarium.v1.GetAlertingInfoResponse
+	(*ListDefaultAlertRulesRequest)(nil),  // 13: containarium.v1.ListDefaultAlertRulesRequest
+	(*ListDefaultAlertRulesResponse)(nil), // 14: containarium.v1.ListDefaultAlertRulesResponse
+	(*UpdateAlertingConfigRequest)(nil),   // 15: containarium.v1.UpdateAlertingConfigRequest
+	(*UpdateAlertingConfigResponse)(nil),  // 16: containarium.v1.UpdateAlertingConfigResponse
+	(*TestWebhookRequest)(nil),            // 17: containarium.v1.TestWebhookRequest
+	(*TestWebhookResponse)(nil),           // 18: containarium.v1.TestWebhookResponse
+	(*WebhookDelivery)(nil),               // 19: containarium.v1.WebhookDelivery
+	(*ListWebhookDeliveriesRequest)(nil),  // 20: containarium.v1.ListWebhookDeliveriesRequest
+	(*ListWebhookDeliveriesResponse)(nil), // 21: containarium.v1.ListWebhookDeliveriesResponse
+	nil,                                   // 22: containarium.v1.AlertRule.LabelsEntry
+	nil,                                   // 23: containarium.v1.AlertRule.AnnotationsEntry
+	nil,                                   // 24: containarium.v1.CreateAlertRuleRequest.LabelsEntry
+	nil,                                   // 25: containarium.v1.CreateAlertRuleRequest.AnnotationsEntry
+	nil,                                   // 26: containarium.v1.UpdateAlertRuleRequest.LabelsEntry
+	nil,                                   // 27: containarium.v1.UpdateAlertRuleRequest.AnnotationsEntry
+}
+var file_containarium_v1_alert_proto_depIdxs = []int32{
+	22, // 0: containarium.v1.AlertRule.labels:type_name -> containarium.v1.AlertRule.LabelsEntry
+	23, // 1: containarium.v1.AlertRule.annotations:type_name -> containarium.v1.AlertRule.AnnotationsEntry
+	24, // 2: containarium.v1.CreateAlertRuleRequest.labels:type_name -> containarium.v1.CreateAlertRuleRequest.LabelsEntry
+	25, // 3: containarium.v1.CreateAlertRuleRequest.annotations:type_name -> containarium.v1.CreateAlertRuleRequest.AnnotationsEntry
+	0,  // 4: containarium.v1.CreateAlertRuleResponse.rule:type_name -> containarium.v1.AlertRule
+	0,  // 5: containarium.v1.GetAlertRuleResponse.rule:type_name -> containarium.v1.AlertRule
+	0,  // 6: containarium.v1.ListAlertRulesResponse.rules:type_name -> containarium.v1.AlertRule
+	26, // 7: containarium.v1.UpdateAlertRuleRequest.labels:type_name -> containarium.v1.UpdateAlertRuleRequest.LabelsEntry
+	27, // 8: containarium.v1.UpdateAlertRuleRequest.annotations:type_name -> containarium.v1.UpdateAlertRuleRequest.AnnotationsEntry
+	0,  // 9: containarium.v1.UpdateAlertRuleResponse.rule:type_name -> containarium.v1.AlertRule
+	0,  // 10: containarium.v1.ListDefaultAlertRulesResponse.rules:type_name -> containarium.v1.AlertRule
+	19, // 11: containarium.v1.ListWebhookDeliveriesResponse.deliveries:type_name -> containarium.v1.WebhookDelivery
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_alert_proto_init() }
+func file_containarium_v1_alert_proto_init() {
+	if File_containarium_v1_alert_proto != nil {
+		return
+	}
+	file_containarium_v1_alert_proto_msgTypes[7].OneofWrappers = []any{}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_alert_proto_rawDesc), len(file_containarium_v1_alert_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   28,
+			NumExtensions: 0,
+			NumServices:   0,
+		},
+		GoTypes:           file_containarium_v1_alert_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_alert_proto_depIdxs,
+		MessageInfos:      file_containarium_v1_alert_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_alert_proto = out.File
+	file_containarium_v1_alert_proto_goTypes = nil
+	file_containarium_v1_alert_proto_depIdxs = nil
+}

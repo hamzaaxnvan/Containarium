@@ -103,3 +103,38 @@ func TestAppliedFromPass_MarksEgressIncomplete(t *testing.T) {
 	got := appliedFromPass(views, plan, loaded, policies, map[uint32]bool{1: true}, map[uint32]string{1: "acme"})
 
 	if !got["acme"].EgressIncomplete {
+		t.Errorf("acme = %+v, want EgressIncomplete", got["acme"])
+	}
+	if got["bob"].EgressIncomplete {
+		t.Errorf("bob = %+v, must not be marked", got["bob"])
+	}
+}
+
+// The status says so: the tenant's boxes are loaded, but the allow-list in the
+// kernel is not what the policy says, and the uncovered path names that.
+func TestBuildPolicyStatus_EgressIncompleteIsAnUncoveredPath(t *testing.T) {
+	const incomplete = pb.NetworkPolicyUncoveredPath_NETWORK_POLICY_UNCOVERED_PATH_EGRESS_ALLOWLIST_INCOMPLETE
+	has := func(st *pb.NetworkPolicyStatus) bool {
+		for _, p := range st.GetUncoveredPaths() {
+			if p == incomplete {
+				return true
+			}
+		}
+		return false
+	}
+	base := tenantApplied{Mode: netbpf.ModeEnforce, BoxesLoaded: 1}
+
+	bad := base
+	bad.EgressIncomplete = true
+	st := npStatusFor(t, fakeAppliedSource{fresh(bad)}, true, "acme")
+	if !has(st) {
+		t.Errorf("uncovered paths = %v, want %v", st.GetUncoveredPaths(), incomplete)
+	}
+	if st.GetState() != pb.NetworkPolicyAppliedState_NETWORK_POLICY_APPLIED_STATE_LOADED {
+		t.Errorf("state = %v: the boxes are loaded, the gap is reported as an uncovered path", st.GetState())
+	}
+
+	if st := npStatusFor(t, fakeAppliedSource{fresh(base)}, true, "acme"); has(st) {
+		t.Errorf("a complete allow-list must not report %v: %v", incomplete, st.GetUncoveredPaths())
+	}
+}
