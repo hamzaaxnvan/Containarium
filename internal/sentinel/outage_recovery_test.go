@@ -61,3 +61,25 @@ func TestBackendOutage_SameIPReregisterWithRotatedTLS(t *testing.T) {
 	check := func(marker string) {
 		resp, err := client.Get("https://" + hostname)
 		require.NoError(t, err)
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, marker, string(body))
+		require.Equal(t, []string{marker}, resp.TLS.PeerCertificates[0].Subject.Organization)
+	}
+	check("before")
+	require.NoError(t, before.Close())
+	clock.Add(int64(8 * time.Hour))
+	require.Nil(t, m.primaries.LookupByHostname(hostname))
+	exits := 0
+	m.exitFn = func() { exits++ }
+	for range m.config.SelfCheckFailureThreshold + 1 {
+		failures, triggered := m.selfCheckOnce(0)
+		require.Zero(t, failures)
+		require.False(t, triggered)
+	}
+	startBackend("after")
+	m.primaries.Register(p)
+	check("after")
+	require.Zero(t, exits)
+}

@@ -21,3 +21,39 @@ metadata:
     scenario: nested-incus-pod
 spec:
   restartPolicy: Never
+  containers:
+    - name: nested-incus
+      image: ubuntu:24.04
+      command: ["/bin/bash", "/scripts/start.sh"]
+      env:
+        - name: CONTAINARIUM_VERSION
+          value: __CONTAINARIUM_VERSION__
+        - name: CONTAINARIUM_BINARY_URL
+          value: __CONTAINARIUM_BINARY_URL__
+      securityContext:
+        privileged: true
+      resources:
+        requests:
+          cpu: __POD_CPU__
+          memory: __POD_MEM__
+        limits:
+          cpu: __POD_CPU__
+          memory: __POD_MEM__
+      volumeMounts:
+        - name: incus-data
+          mountPath: /var/lib/incus
+        - name: start-script
+          mountPath: /scripts
+      readinessProbe:
+        exec:
+          command: ["cat", "/tmp/ready"]
+        periodSeconds: 5
+        failureThreshold: 200 # apt+incus-init+image-bake all run at startup
+  volumes:
+    - name: incus-data
+      emptyDir:
+        sizeLimit: 150Gi
+    - name: start-script
+      configMap:
+        name: nested-incus-pod-start
+        defaultMode: 0755
