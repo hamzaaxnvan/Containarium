@@ -388,3 +388,393 @@ func init() {
 	var rate, secs int
 	if _, err := fmt.Sscanf(v, "%d:%d", &rate, &secs); err != nil || rate <= 0 || secs <= 0 {
 		fmt.Fprintf(os.Stderr, "loadgen: bad %s=%q\n", execLoadGenEnv, v)
+		os.Exit(2)
+	}
+	execs, skipped := runExecLoadGen(rate, time.Duration(secs)*time.Second)
+	fmt.Printf("loadgen execs=%d skipped=%d\n", execs, skipped)
+	os.Exit(0)
+}
+
+// runExecLoadGen fork+execs /bin/true at a steady `rate` for d: four workers,
+// each on its own fixed schedule offset by one period, so execs arrive
+// evenly spaced (one every 1 ms at 1,000/s) rather than in bursts — the shape
+// in which a per-event-wakeup consumer is woken once per event. A worker that
+// falls more than one slot behind skips the missed slots instead of
+// bursting to catch up; skipped counts them.
+func runExecLoadGen(rate int, d time.Duration) (execs, skipped int64) {
+	const workers = 4
+	period := time.Second / time.Duration(rate)
+	step := period * workers
+	start := time.Now()
+	end := start.Add(d)
+	var n, skip atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			next := start.Add(time.Duration(w) * period)
+			for next.Before(end) {
+				if wait := time.Until(next); wait > 0 {
+					time.Sleep(wait)
+				}
+				if exec.Command("/bin/true").Run() == nil {
+					n.Add(1)
+				}
+				next = next.Add(step)
+				if behind := time.Since(next); behind > step {
+					missed := int64(behind / step)
+					skip.Add(missed)
+					next = next.Add(time.Duration(missed) * step)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	return n.Load(), skip.Load()
+}
+
+// procCPU is this process's CPU time and context switches (all threads).
+type procCPU struct {
+	cpu           time.Duration
+	nvcsw, nivcsw int64
+}
+
+func selfUsage(t *testing.T) procCPU {
+	t.Helper()
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		t.Fatalf("getrusage: %v", err)
+	}
+	tv := func(v syscall.Timeval) time.Duration {
+		return time.Duration(v.Sec)*time.Second + time.Duration(v.Usec)*time.Microsecond
+	}
+	return procCPU{cpu: tv(ru.Utime) + tv(ru.Stime), nvcsw: ru.Nvcsw, nivcsw: ru.Nivcsw}
+}
+
+// runLoadGenProcess runs the generator as a child process inside cg (so every
+// /bin/true it forks is in the watched cgroup) and returns how many execs it
+// completed. The caller samples its own CPU around this call.
+func runLoadGenProcess(t *testing.T, cg *testCgroup, rate int, d time.Duration) uint64 {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(self, "-test.run=^$") // #nosec G204 -- re-exec of this test binary
+	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%d:%d", execLoadGenEnv, rate, int(d/time.Second)))
+	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: cg.fd}
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("load generator: %v\n%s", err, out)
+	}
+	var execs, skipped uint64
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "loadgen execs=%d skipped=%d", &execs, &skipped); err != nil {
+		t.Fatalf("load generator output %q: %v", out, err)
+	}
+	if skipped > 0 {
+		t.Logf("overhead: generator skipped %d slots (could not keep the pace)", skipped)
+	}
+	return execs
+}
+
+// daemonShapedSink does per event roughly what ExecWatcher.OnExecEvent does
+// in the daemon (internal/server can't be imported here): take a mutex, look
+// the cgroup up in a map, append to a bounded replay ring, build the engine's
+// argv string. It also counts drains (ExecDrainObserver).
+type daemonShapedSink struct {
+	mu      sync.Mutex
+	targets map[uint64]string
+	ring    []ExecEvent
+	head    int
+	events  uint64
+	argvLen int
+	drains  uint64
+	drained uint64
+}
+
+func newDaemonShapedSink(cgroupID uint64) *daemonShapedSink {
+	return &daemonShapedSink{targets: map[uint64]string{cgroupID: "box"}, ring: make([]ExecEvent, 0, 4096)}
+}
+
+func (s *daemonShapedSink) OnExecEvent(_ context.Context, ev ExecEvent) {
+	s.mu.Lock()
+	if _, ok := s.targets[ev.CgroupID]; ok {
+		if len(s.ring) < cap(s.ring) {
+			s.ring = append(s.ring, ev)
+		} else {
+			s.ring[s.head] = ev
+			s.head = (s.head + 1) % cap(s.ring)
+		}
+		s.events++
+	}
+	s.mu.Unlock()
+	s.argvLen += len(ev.ArgvString())
+}
+
+func (s *daemonShapedSink) OnExecDrain(n int) {
+	s.mu.Lock()
+	s.drains++
+	s.drained += uint64(max(n, 0))
+	s.mu.Unlock()
+}
+
+func (s *daemonShapedSink) counts() (events, drains, drained uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.events, s.drains, s.drained
+}
+
+// loadAttachedPerRecordWakeup is loadAttached with exec_wakeup_per_record
+// set at load time (.rodata): the program submits with the default wakeup,
+// as before #2774.
+func loadAttachedPerRecordWakeup(t *testing.T) *ExecWatch {
+	t.Helper()
+	spec, err := ebpf.LoadCollectionSpec(ebpfLoadExecObjPath)
+	if err != nil {
+		t.Fatalf("LoadCollectionSpec: %v", err)
+	}
+	v, ok := spec.Variables["exec_wakeup_per_record"]
+	if !ok {
+		t.Fatalf("object has no exec_wakeup_per_record variable (rebuild execwatch.bpf.o)")
+	}
+	if err := v.Set(uint8(1)); err != nil {
+		t.Fatalf("set exec_wakeup_per_record: %v", err)
+	}
+	w, err := newExecWatchFromSpec(spec)
+	if err != nil {
+		t.Fatalf("load with exec_wakeup_per_record=1: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	if err := w.Attach(); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	return w
+}
+
+// consumePerEvent is the pre-#2774 consumer: block in the reader (no
+// deadline) and handle each record as its wakeup delivers it. Kept here only
+// as the comparison point for the overhead measurement.
+func consumePerEvent(ctx context.Context, rd *ringbuf.Reader, sink ExecEventSink) {
+	var rec ringbuf.Record
+	for ctx.Err() == nil {
+		if err := rd.ReadInto(&rec); err != nil {
+			return
+		}
+		if ev, err := ParseExecEvent(rec.RawSample); err == nil {
+			sink.OnExecEvent(ctx, ev)
+		}
+	}
+}
+
+// overheadPhase is one measured window.
+type overheadPhase struct {
+	name           string
+	execs          uint64
+	selfCPU        time.Duration
+	csw            int64 // voluntary + involuntary context switches of this process
+	progRuntime    time.Duration
+	progRuns       uint64
+	emitted, lost  uint64
+	events, drains uint64
+	drained        uint64
+	secs           float64
+}
+
+// measurePhase runs the generator for d with w attached (nil = baseline, no
+// program) and a daemon-shaped consumer draining w's ring through
+// ConsumeExecEvents — the exact loop the daemon's ExecWatcher runs — or,
+// with perEvent, through the pre-#2774 blocking loop; then closes w.
+func measurePhase(t *testing.T, name string, w *ExecWatch, perEvent bool, cg *testCgroup, rate int, d time.Duration) overheadPhase {
+	t.Helper()
+	ph := overheadPhase{name: name, secs: d.Seconds()}
+	var sink *daemonShapedSink
+	var stop func()
+	if w != nil {
+		if err := w.WatchCgroup(cg.id, 1); err != nil {
+			t.Fatalf("WatchCgroup: %v", err)
+		}
+		rd, err := w.NewExecReader()
+		if err != nil {
+			t.Fatalf("NewExecReader: %v", err)
+		}
+		sink = newDaemonShapedSink(cg.id)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if perEvent {
+				consumePerEvent(ctx, rd, sink)
+				return
+			}
+			ConsumeExecEvents(ctx, rd, sink, func(err error) { t.Logf("consumer: %v", err) })
+		}()
+		stop = func() {
+			cancel()
+			if perEvent {
+				// The old loop blocks in the reader; only Close (which the
+				// reader makes safe against its own locked ReadInto) ends it.
+				_ = rd.Close()
+				<-done
+				return
+			}
+			// ConsumeExecEvents returns within one tick of cancel. Close only
+			// after it has: its AvailableBytes is unlocked and Close unmaps
+			// the ring.
+			<-done
+			_ = rd.Close()
+		}
+		time.Sleep(200 * time.Millisecond) // consumer parked in its first wait
+	}
+	var st0 *ebpf.ProgramStats
+	if w != nil {
+		var err error
+		if st0, err = w.coll.Programs[progExecWatch].Stats(); err != nil {
+			t.Fatalf("program stats: %v", err)
+		}
+	}
+	u0 := selfUsage(t)
+	ph.execs = runLoadGenProcess(t, cg, rate, d)
+	u1 := selfUsage(t)
+	ph.selfCPU = u1.cpu - u0.cpu
+	ph.csw = (u1.nvcsw + u1.nivcsw) - (u0.nvcsw + u0.nivcsw)
+	if w != nil {
+		st1, err := w.coll.Programs[progExecWatch].Stats()
+		if err != nil {
+			t.Fatalf("program stats: %v", err)
+		}
+		ph.progRuntime = st1.Runtime - st0.Runtime
+		ph.progRuns = st1.RunCount - st0.RunCount
+		// Wait for the last batch: every record the kernel emitted delivered,
+		// bounded generously so a stalled runner fails here, not flakily.
+		if ph.emitted, ph.lost, err = w.Stats(); err != nil {
+			t.Fatalf("Stats: %v", err)
+		}
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			if ev, _, _ := sink.counts(); ev >= ph.emitted {
+				break
+			}
+		}
+		stop()
+		ph.events, ph.drains, ph.drained = sink.counts()
+		// Detach now, so the next window runs with exactly one program.
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+	return ph
+}
+
+func (ph overheadPhase) rate() float64 { return float64(ph.execs) / ph.secs }
+
+// TestExecWatch_OverheadMeasurement measures the exec telemetry's cost at the
+// acceptance load (1,000 execs/s for 60 s from a separate, steadily paced
+// process; EBPF_LOAD_OVERHEAD_SECONDS overrides the duration) in three
+// windows: a baseline with no program, the shipped batched path, and — for
+// comparison — the per-event shape #2774 replaced (the object with
+// exec_wakeup_per_record set, read by the old blocking consumer loop). Cost = the program's own run time
+// (BPF_STATS_RUN_TIME) + this process's CPU above the baseline window (the
+// consumer goroutine draining and decoding through ConsumeExecEvents into a
+// daemon-shaped sink), reported per core and as a share of every CPU on the
+// host. The bar (#2711, restated on #2774) is < 1 % of host CPU at 1,000
+// execs/s; the lane asserts it on the batched path along with the batching
+// itself (records per drain, context switches against the per-event shape),
+// and that no watched exec goes unreported.
+func TestExecWatch_OverheadMeasurement(t *testing.T) {
+	d := 60 * time.Second
+	if v := os.Getenv("EBPF_LOAD_OVERHEAD_SECONDS"); v != "" {
+		var secs int
+		if _, err := fmt.Sscanf(v, "%d", &secs); err == nil && secs > 0 {
+			d = time.Duration(secs) * time.Second
+		}
+	}
+	// The comparison window only has to show the gap, not meet a bar.
+	dCmp := d / 3
+	if dCmp < 10*time.Second {
+		dCmp = 10 * time.Second
+	}
+	const rate = 1000
+	nproc := runtime.NumCPU()
+	cg := newTestCgroup(t, "load")
+
+	statsOff, err := ebpf.EnableStats(uint32(unix.BPF_STATS_RUN_TIME))
+	if err != nil {
+		t.Fatalf("EnableStats(BPF_STATS_RUN_TIME): %v", err)
+	}
+	defer func() { _ = statsOff.Close() }()
+
+	base := measurePhase(t, "baseline", nil, false, cg, rate, d)
+	batched := measurePhase(t, "batched", loadAttached(t), false, cg, rate, d)
+	perEvent := measurePhase(t, "per-event", loadAttachedPerRecordWakeup(t), true, cg, rate, dCmp)
+
+	baseSelfPerSec := base.selfCPU.Seconds() / base.secs
+	cost := func(ph overheadPhase) (kernelPct, consumerPct, totalPct, hostPct float64) {
+		kernelPct = ph.progRuntime.Seconds() / ph.secs * 100
+		consumerPct = (ph.selfCPU.Seconds()/ph.secs - baseSelfPerSec) * 100
+		if consumerPct < 0 {
+			consumerPct = 0
+		}
+		totalPct = kernelPct + consumerPct
+		return kernelPct, consumerPct, totalPct, totalPct / float64(nproc)
+	}
+	t.Logf("overhead: nproc=%d target=%d execs/s drain-interval=%s", nproc, rate, ExecDrainInterval)
+	t.Logf("overhead: baseline   %5.0fs execs=%d (%.0f/s) self-cpu=%s csw/s=%.0f",
+		base.secs, base.execs, base.rate(), base.selfCPU.Round(time.Millisecond), float64(base.csw)/base.secs)
+	for _, ph := range []overheadPhase{batched, perEvent} {
+		k, c, tot, host := cost(ph)
+		perRun := time.Duration(0)
+		if ph.progRuns > 0 {
+			perRun = time.Duration(float64(ph.progRuntime) / float64(ph.progRuns))
+		}
+		recsPerDrain := 0.0
+		if ph.drains > 0 {
+			recsPerDrain = float64(ph.drained) / float64(ph.drains)
+		}
+		t.Logf("overhead: %-10s %5.0fs execs=%d (%.0f/s) prog runs=%d run_time=%s (%s/run) self-cpu=%s csw/s=%.0f drains/s=%.1f records/drain=%.1f emitted=%d lost=%d delivered=%d",
+			ph.name, ph.secs, ph.execs, ph.rate(), ph.progRuns, ph.progRuntime.Round(time.Microsecond), perRun, ph.selfCPU.Round(time.Millisecond),
+			float64(ph.csw)/ph.secs, float64(ph.drains)/ph.secs, recsPerDrain, ph.emitted, ph.lost, ph.events)
+		t.Logf("overhead: RESULT %-10s kernel=%.3f%% consumer=%.3f%% total=%.3f%% of one core = %.3f%% of host CPU (%d CPUs) at %.0f execs/s",
+			ph.name, k, c, tot, host, nproc, ph.rate())
+	}
+
+	// No watched exec goes unreported: emitted or counted lost, and every
+	// emitted record reaches the sink.
+	for _, ph := range []overheadPhase{batched, perEvent} {
+		if ph.emitted+ph.lost < ph.execs {
+			t.Errorf("%s: emitted+lost=%d < execs=%d: watched execs went unreported without being counted lost", ph.name, ph.emitted+ph.lost, ph.execs)
+		}
+		if ph.lost != 0 {
+			t.Errorf("%s: %d events lost at a steady %.0f execs/s (acceptance: exec_events_lost = 0)", ph.name, ph.lost, ph.rate())
+		}
+		// emitted is cumulative per object; each phase has its own object.
+		if ph.events != ph.emitted {
+			t.Errorf("%s: delivered %d events, kernel emitted %d", ph.name, ph.events, ph.emitted)
+		}
+	}
+	if batched.rate() < rate/2 {
+		t.Fatalf("generator reached only %.0f execs/s (want ~%d): the runner cannot carry the load, the numbers above do not answer the bar", batched.rate(), rate)
+	}
+
+	// The batching itself — structural, not timing-sensitive: at ~1,000
+	// execs/s and a 50 ms drain, a drain carries tens of records, and the
+	// consumer process switches context several times less than when every
+	// record wakes it.
+	if batched.drains > 0 {
+		if per := float64(batched.drained) / float64(batched.drains); per < 10 {
+			t.Errorf("batched: %.1f records per drain, want >= 10 at %.0f execs/s (is the consumer still draining per tick?)", per, batched.rate())
+		}
+	} else {
+		t.Errorf("batched: no drains observed")
+	}
+	// Above the baseline window's own rate (Go's sysmon and the wait on the
+	// generator switch too).
+	baseCsw := float64(base.csw) / base.secs
+	if b, p := float64(batched.csw)/batched.secs-baseCsw, float64(perEvent.csw)/perEvent.secs-baseCsw; b*3 > p {
+		t.Errorf("batched: %.0f context switches/s above baseline vs %.0f/s with a wakeup per record; want at least 3x fewer", b, p)
+	}
+
+	// The bar: < 1 % of host CPU at ~1,000 execs/s, on the batched path.
+	if _, _, _, host := cost(batched); host >= 1.0 {
+		t.Errorf("batched: exec telemetry costs %.3f%% of host CPU at %.0f execs/s, bar is < 1%%", host, batched.rate())
+	}
+}

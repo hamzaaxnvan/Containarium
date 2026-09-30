@@ -219,3 +219,77 @@ func formatAnonBoxes(boxes []*pb.AnonymousBox) string {
 		if b.GetClaimed() {
 			claimed = "yes"
 		}
+		fmt.Fprintf(&sb, "%-28s %-16s %-16s %-20s %s\n", b.GetBoxName(), fp, b.GetSshHost(), exp, claimed)
+	}
+	fmt.Fprintf(&sb, "Total: %d\n", len(boxes))
+	return sb.String()
+}
+
+func init() {
+	rootCmd.AddCommand(anonCmd)
+	anonCmd.AddCommand(anonClaimCmd, anonEnableCmd, anonDisableCmd, anonStatusCmd, anonBanCmd, anonUnbanCmd, anonListCmd)
+	anonDisableCmd.Flags().StringVar(&anonDoorMessage, "message", "the anonymous door is closed for maintenance", "What a refused caller is told while the door is closed")
+	anonClaimCmd.Flags().StringVar(&anonClaimTenant, "tenant", "", "Username that will own the box (required)")
+	anonClaimCmd.Flags().StringArrayVar(&anonClaimKeys, "key", nil, "authorized_keys line to add for the tenant (repeatable; a value starting with @ is read from that file)")
+	_ = anonClaimCmd.MarkFlagRequired("tenant")
+}
+
+func runAnonClaim(cmd *cobra.Command, args []string) error {
+	keys, err := resolveAnonClaimKeys(anonClaimKeys)
+	if err != nil {
+		return err
+	}
+	req := &pb.ClaimAnonymousBoxRequest{ClaimToken: strings.TrimSpace(args[0]), Tenant: strings.TrimSpace(anonClaimTenant), AuthorizedKeys: keys}
+
+	var resp *pb.ClaimAnonymousBoxResponse
+	if httpMode {
+		hc, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = hc.Close() }()
+		resp, err = hc.ClaimAnonymousBox(req)
+		if err != nil {
+			return err
+		}
+	} else {
+		gc, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = gc.Close() }()
+		resp, err = gc.ClaimAnonymousBox(req)
+		if err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "✅ %s is now owned by %s (TTL cleared, egress limits lifted, %d key(s) added). It stays reachable through the door with the claiming key.\n",
+		resp.GetBoxName(), resp.GetTenant(), len(keys))
+	return nil
+}
+
+// resolveAnonClaimKeys expands "@path" entries into file contents (one key
+// per non-empty line) and drops blanks.
+func resolveAnonClaimKeys(in []string) ([]string, error) {
+	var out []string
+	for _, k := range in {
+		k = strings.TrimSpace(k)
+		switch {
+		case k == "":
+			continue
+		case strings.HasPrefix(k, "@"):
+			raw, err := os.ReadFile(k[1:])
+			if err != nil {
+				return nil, fmt.Errorf("read key file %s: %w", k[1:], err)
+			}
+			for _, line := range strings.Split(string(raw), "\n") {
+				if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+					out = append(out, line)
+				}
+			}
+		default:
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}
