@@ -311,3 +311,316 @@ func (p *Policy) Check(info RequestInfo) Decision {
 	}
 
 	baselineDue := p.cfg.Anomaly.Enabled && now.Sub(ts.lastBaselineAt) >= p.cfg.Anomaly.BaselineWindow
+
+	quota := p.cfg.Quota.evaluate(ts.rateWindow.sum(now))
+	signals := p.cfg.Anomaly.evaluate(ts, now)
+	sc := score(signals)
+
+	// Fold the finished measurement period into the baseline — but only after
+	// evaluating it, and only if it looked normal.
+	//
+	// Order matters more than it appears. Learning before evaluating lets the
+	// spike being judged raise the very baseline it is judged against, and with
+	// any reasonable EWMA weight that is enough to hide a 100x burst. Learning
+	// from a window that fired signals, or one where the tenant was already off
+	// StateObserve, has the same effect spread over a few windows: the detector
+	// gradually accepts the attack as this tenant's new normal. So a window
+	// teaches the baseline only if it was quiet.
+	if baselineDue {
+		if ts.state == StateObserve && len(signals) == 0 {
+			ts.baseline.observe(ts.rateWindow.rate(now))
+		}
+		ts.lastBaselineAt = now
+	}
+
+	ts.lastScore, ts.lastQuota, ts.lastSignals = sc, quota.fraction, signals
+
+	want, reason := p.target(quota, sc)
+	p.transition(ts, info, want, reason, now, signals)
+
+	return p.admit(ts, now, quota, signals)
+}
+
+// target maps the current measurements onto the rung they justify, with the
+// reason that got them there.
+func (p *Policy) target(q quotaUsage, sc float64) (PolicyState, string) {
+	state, reason := StateObserve, ""
+
+	if !p.cfg.Quota.IsZero() {
+		switch {
+		case q.exceeded != "":
+			state, reason = StateCircuitBreak, "quota exceeded: "+p.cfg.Quota.describe(q)
+		case q.fraction >= p.cfg.ThrottleAtQuota:
+			state, reason = StateThrottle, "approaching quota: "+p.cfg.Quota.describe(q)
+		}
+	}
+
+	if p.cfg.Anomaly.Enabled {
+		var as PolicyState
+		switch {
+		case p.cfg.RevokeAt > 0 && sc >= p.cfg.RevokeAt:
+			as = StateRevoke
+		case sc >= p.cfg.BreakAt:
+			as = StateCircuitBreak
+		case sc >= p.cfg.AlertAt:
+			as = StateAlert
+		}
+		if as > state {
+			state, reason = as, fmt.Sprintf("anomaly score %.2f", sc)
+		}
+	}
+	return state, reason
+}
+
+// transition moves the tenant onto want, applying immediate escalation and
+// damped de-escalation.
+func (p *Policy) transition(ts *tenantState, info RequestInfo, want PolicyState, reason string, now time.Time, sigs []Signal) {
+	// Revocation outranks everything and never expires on its own — however it
+	// was reached. Gating this on manualReason instead of the state itself
+	// would leave an automatic revocation (RevokeAt) non-sticky: the
+	// de-escalation case below would walk it back a rung per cooldown, so a
+	// token revoked for a high anomaly score would regain access simply by
+	// going quiet for five minutes. Only Clear leaves this state.
+	if ts.state == StateRevoke {
+		return
+	}
+
+	if want > StateObserve {
+		ts.lastTrigger = now
+	}
+
+	switch {
+	case want > ts.state:
+		from := ts.state
+		ts.state, ts.stateSince = want, now
+		if want == StateCircuitBreak {
+			ts.breakUntil = now.Add(p.cfg.CircuitBreakFor)
+		}
+		p.emit(ts, info, from, want, reason, now, sigs)
+
+	case ts.state == StateCircuitBreak && now.After(ts.breakUntil):
+		// A break is time-boxed: step down to alert and let the next
+		// evaluation decide whether the condition is still live. Without this
+		// a tenant that tripped once would stay broken until an operator
+		// looked, which is the outage the ladder exists to avoid.
+		//
+		// Still-live conditions extend the break instead of stepping down, so a
+		// tenant sitting over its budget stays broken quietly rather than
+		// flapping break→alert→break and paging on every cycle.
+		if want >= StateCircuitBreak {
+			ts.breakUntil = now.Add(p.cfg.CircuitBreakFor)
+			return
+		}
+		from := ts.state
+		ts.state, ts.stateSince = StateAlert, now
+		p.emit(ts, info, from, ts.state, "circuit-break elapsed; re-evaluating", now, sigs)
+
+	case want < ts.state && now.Sub(ts.lastTrigger) >= p.cfg.Cooldown:
+		from := ts.state
+		ts.state, ts.stateSince = ts.state-1, now // one rung at a time
+		p.emit(ts, info, from, ts.state, "cooldown elapsed", now, sigs)
+	}
+}
+
+// admit applies the current rung to this request.
+func (p *Policy) admit(ts *tenantState, now time.Time, q quotaUsage, sigs []Signal) Decision {
+	d := Decision{State: ts.state, Allow: true, Signals: sigs}
+
+	switch ts.state {
+	case StateObserve:
+		ts.lastAdmitted = now
+		return d
+
+	case StateThrottle, StateAlert:
+		// A hard budget overrun is never merely slowed — target() will have
+		// raised the rung, but a tenant sitting at exactly the limit while
+		// de-escalating must still be stopped.
+		if q.exceeded != "" {
+			d.Allow, d.Status = false, http.StatusTooManyRequests
+			d.Reason = "quota exceeded: " + p.cfg.Quota.describe(q)
+			d.RetryAfter = p.cfg.Quota.Window
+			ts.rateWindow.add(now, counts{policyDenials: 1})
+			return d
+		}
+		if wait := p.cfg.ThrottleMinInterval - now.Sub(ts.lastAdmitted); wait > 0 && !ts.lastAdmitted.IsZero() {
+			d.Allow, d.Status = false, http.StatusTooManyRequests
+			d.Reason = "throttled"
+			d.RetryAfter = wait
+			ts.rateWindow.add(now, counts{policyDenials: 1})
+			return d
+		}
+		ts.lastAdmitted = now
+		return d
+
+	case StateCircuitBreak:
+		d.Allow, d.Status = false, http.StatusServiceUnavailable
+		d.Reason = "circuit open"
+		d.RetryAfter = ts.breakUntil.Sub(now)
+		if d.RetryAfter < 0 {
+			d.RetryAfter = 0
+		}
+		ts.rateWindow.add(now, counts{policyDenials: 1})
+		return d
+
+	case StateRevoke:
+		d.Allow, d.Status = false, http.StatusForbidden
+		d.Reason = "revoked"
+		if ts.manualReason != "" {
+			d.Reason = "revoked: " + ts.manualReason
+		}
+		ts.rateWindow.add(now, counts{policyDenials: 1})
+		return d
+	}
+	return d
+}
+
+func (p *Policy) emit(ts *tenantState, info RequestInfo, from, to PolicyState, reason string, now time.Time, sigs []Signal) {
+	if p.cfg.Alerts == nil || from == to {
+		return
+	}
+	p.cfg.Alerts.PolicyTransition(PolicyEvent{
+		Tenant:   info.Tenant,
+		Skill:    info.Skill,
+		Provider: info.Provider,
+		From:     from,
+		To:       to,
+		Score:    ts.lastScore,
+		Quota:    ts.lastQuota,
+		Reason:   reason,
+		Signals:  sigs,
+		At:       now,
+	})
+}
+
+// RecordUsage folds a completed call's token usage into the tenant's window, so
+// the next Check sees what this one actually cost. Called after the response is
+// metered — a request's own tokens are not known until it finishes, which is why
+// a token budget is enforced one call late by construction.
+func (p *Policy) RecordUsage(tenant string, u Usage) {
+	if tenant == "" {
+		return
+	}
+	now := p.cfg.Now()
+	ts := p.state(tenant)
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.rateWindow.add(now, counts{
+		calls:        1,
+		inputTokens:  u.InputTokens,
+		outputTokens: u.OutputTokens,
+		cachedTokens: u.CachedTokens,
+	})
+}
+
+// RecordDenial records a request rejected before it reached the provider —
+// an unknown provider for the token, a model outside its allowed set. These
+// feed the auth-failure-ratio signal: a token being probed rather than used.
+func (p *Policy) RecordDenial(tenant string) {
+	if tenant == "" {
+		return
+	}
+	now := p.cfg.Now()
+	ts := p.state(tenant)
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	ts.rateWindow.add(now, counts{authDenials: 1})
+}
+
+// Revoke puts a tenant on the sticky rung until Clear. The operator escape
+// hatch behind the issue's "instantly revocable" requirement: it takes effect on
+// the tenant's next call with no token re-issue and no box restart.
+func (p *Policy) Revoke(tenant, reason string) {
+	if tenant == "" {
+		return
+	}
+	now := p.cfg.Now()
+	ts := p.state(tenant)
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	from := ts.state
+	ts.state, ts.stateSince, ts.manualReason = StateRevoke, now, reason
+	p.emit(ts, RequestInfo{Tenant: tenant}, from, StateRevoke, "operator revoked: "+reason, now, nil)
+}
+
+// Clear returns a tenant to StateObserve, including from a manual revocation.
+func (p *Policy) Clear(tenant string) {
+	if tenant == "" {
+		return
+	}
+	now := p.cfg.Now()
+	ts := p.state(tenant)
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	from := ts.state
+	ts.state, ts.stateSince, ts.manualReason = StateObserve, now, ""
+	ts.breakUntil = time.Time{}
+	ts.lastTrigger = time.Time{}
+	p.emit(ts, RequestInfo{Tenant: tenant}, from, StateObserve, "operator cleared", now, nil)
+}
+
+// TenantStatus is the ops readout for one tenant.
+type TenantStatus struct {
+	Tenant string      `json:"tenant"`
+	State  PolicyState `json:"state"`
+	Since  time.Time   `json:"since"`
+	Score  float64     `json:"anomaly_score"`
+	Quota  float64     `json:"quota_fraction"`
+	Calls  int64       `json:"calls_in_window"`
+	Tokens int64       `json:"tokens_in_window"`
+	// AuthDenials are token-authorization failures; PolicyDenials are this
+	// ladder's own refusals. Reported apart because conflating them is what
+	// made enforcement self-amplifying — see counts in window.go.
+	AuthDenials   int64    `json:"auth_denials_in_window"`
+	PolicyDenials int64    `json:"policy_denials_in_window"`
+	Baseline      float64  `json:"baseline_tokens_per_sec"`
+	Samples       int      `json:"baseline_samples"`
+	Models        []string `json:"models,omitempty"`
+	SourceNets    []string `json:"source_nets,omitempty"`
+	Signals       []Signal `json:"signals,omitempty"`
+	RevokeCause   string   `json:"revoke_cause,omitempty"`
+}
+
+// Status snapshots every known tenant, worst rung first, for /__gateway/policy.
+func (p *Policy) Status() []TenantStatus {
+	now := p.cfg.Now()
+	p.mu.Lock()
+	names := make([]string, 0, len(p.tenants))
+	states := make([]*tenantState, 0, len(p.tenants))
+	for n, ts := range p.tenants {
+		names = append(names, n)
+		states = append(states, ts)
+	}
+	p.mu.Unlock()
+
+	out := make([]TenantStatus, 0, len(names))
+	for i, ts := range states {
+		ts.mu.Lock()
+		w := ts.rateWindow.sum(now)
+		base, samples := ts.baseline.get()
+		out = append(out, TenantStatus{
+			Tenant:        names[i],
+			State:         ts.state,
+			Since:         ts.stateSince,
+			Score:         ts.lastScore,
+			Quota:         ts.lastQuota,
+			Calls:         w.calls,
+			Tokens:        w.totalTokens(),
+			AuthDenials:   w.authDenials,
+			PolicyDenials: w.policyDenials,
+			Baseline:      base,
+			Samples:       samples,
+			Models:        ts.models.values(now),
+			SourceNets:    ts.sourceNets.values(now),
+			Signals:       ts.lastSignals,
+			RevokeCause:   ts.manualReason,
+		})
+		ts.mu.Unlock()
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].State != out[j].State {
+			return out[i].State > out[j].State
+		}
+		return out[i].Tenant < out[j].Tenant
+	})
+	return out
+}
