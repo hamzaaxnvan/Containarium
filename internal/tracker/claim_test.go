@@ -205,3 +205,210 @@ func TestClaim_IdempotentForSameRun(t *testing.T) {
 	provider.appendRaw(Comment{Author: "bot", CreatedAt: clock.Now(), Body: Stamp(Identity{RunID: "my-run", SkillID: "s"}, KindClaim)})
 
 	result, err := ClaimTrackerIssue(context.Background(), provider, Conn{}, 1, Identity{RunID: "my-run", SkillID: "s"},
+		fakeResolver{}, clock, time.Hour)
+	if err != nil {
+		t.Fatalf("ClaimTrackerIssue: %v", err)
+	}
+	if !result.Claimed {
+		t.Error("Claimed = false, want true — re-claiming our own existing claim")
+	}
+	if len(provider.comments) != 1 {
+		t.Errorf("posted %d comments, want 0 new ones (idempotent)", len(provider.comments)-1)
+	}
+}
+
+func TestClaim_NeverReplacesAssignee(t *testing.T) {
+	clock := newFakeClock()
+	provider := &fakeClaimProvider{clock: clock, assignee: "someone-else"}
+
+	result, err := ClaimTrackerIssue(context.Background(), provider, Conn{}, 1, Identity{RunID: "my-run", SkillID: "s"},
+		fakeResolver{}, clock, time.Hour)
+	if err != nil {
+		t.Fatalf("ClaimTrackerIssue: %v", err)
+	}
+	if !result.Claimed {
+		t.Error("Claimed = false, want true — no existing CLAIM marker, only an unrelated assignee")
+	}
+	if result.Assigned {
+		t.Error("Assigned = true, want false — the issue already had an assignee")
+	}
+	if provider.assignee != "someone-else" {
+		t.Errorf("assignee = %q, want unchanged someone-else", provider.assignee)
+	}
+}
+
+// TestClaim_YieldsWhenEarlierClaimAppearsOnReread simulates the
+// cross-daemon race the design note's step 4 exists for: between this
+// call's initial read (which saw no claim) and its own post, a
+// DIFFERENT daemon's concurrent ClaimTrackerIssue call for the same
+// issue posted its claim first (earlier timestamp). The re-read must
+// notice it and yield.
+func TestClaim_YieldsWhenEarlierClaimAppearsOnReread(t *testing.T) {
+	clock := newFakeClock()
+	provider := &fakeClaimProvider{clock: clock}
+	provider.onComment = func() {
+		// Pretend a foreign claim landed a minute before ours, then
+		// advance back past it so our own post gets a later timestamp.
+		clock.Advance(-1 * time.Minute)
+		provider.appendRaw(Comment{Author: "bot", CreatedAt: clock.Now(), Body: Stamp(Identity{RunID: "other-daemons-run", SkillID: "s"}, KindClaim)})
+		clock.Advance(2 * time.Minute)
+	}
+
+	result, err := ClaimTrackerIssue(context.Background(), provider, Conn{}, 1, Identity{RunID: "my-run", SkillID: "s"},
+		fakeResolver{"other-daemons-run": true}, clock, time.Hour)
+	if err != nil {
+		t.Fatalf("ClaimTrackerIssue: %v", err)
+	}
+	if result.Claimed {
+		t.Error("Claimed = true, want false — an earlier foreign claim appeared on re-read")
+	}
+	if result.AlreadyClaimedByRunID != "other-daemons-run" {
+		t.Errorf("AlreadyClaimedByRunID = %q, want other-daemons-run", result.AlreadyClaimedByRunID)
+	}
+	// A yield comment should have been posted (in addition to our own
+	// claim and the injected foreign one): 3 comments total.
+	if len(provider.comments) != 3 {
+		t.Errorf("comments = %d, want 3 (foreign claim, our claim, our yield)", len(provider.comments))
+	}
+}
+
+// TestClaim_SupersededClaimIsNotSelectedByLaterCalls reproduces a real
+// bug found in code review of the design note PR (#1924): a losing
+// run's own kind=claim marker is chronologically NEWER than the
+// winner's (the loser read before the winner's claim was visible, so
+// its own post landed later) and is never retracted or edited — it
+// just sits there. A naive "find the newest kind=claim marker" scan
+// (latestClaim's original implementation) would hand that stale,
+// superseded marker back as the current holder on every call after the
+// race resolved — including to the WINNER's own idempotent re-claim
+// check, which would then be wrongly told a different run holds its
+// own claim.
+func TestClaim_SupersededClaimIsNotSelectedByLaterCalls(t *testing.T) {
+	clock := newFakeClock()
+	provider := &fakeClaimProvider{clock: clock}
+	provider.onComment = func() {
+		// Pretend "winner"'s claim landed a minute before "loser"'s own
+		// read, so it's chronologically earliest even though "loser"
+		// posts (and is told about it) after.
+		clock.Advance(-1 * time.Minute)
+		provider.appendRaw(Comment{Author: "bot", CreatedAt: clock.Now(), Body: Stamp(Identity{RunID: "winner", SkillID: "s"}, KindClaim)})
+		clock.Advance(2 * time.Minute)
+	}
+
+	loserResult, err := ClaimTrackerIssue(context.Background(), provider, Conn{}, 1, Identity{RunID: "loser", SkillID: "s"},
+		fakeResolver{"winner": true}, clock, time.Hour)
+	if err != nil {
+		t.Fatalf("ClaimTrackerIssue (loser): %v", err)
+	}
+	if loserResult.Claimed || loserResult.AlreadyClaimedByRunID != "winner" {
+		t.Fatalf("loser result = %+v, want Claimed=false AlreadyClaimedByRunID=winner", loserResult)
+	}
+	// Comments are now, oldest first: [winner-claim, loser-claim, loser-yield].
+	// loser-claim is chronologically NEWER than winner-claim.
+
+	winnerRecheck, err := ClaimTrackerIssue(context.Background(), provider, Conn{}, 1, Identity{RunID: "winner", SkillID: "s"},
+		fakeResolver{"winner": true}, clock, time.Hour)
+	if err != nil {
+		t.Fatalf("ClaimTrackerIssue (winner re-check): %v", err)
+	}
+	if !winnerRecheck.Claimed {
+		t.Errorf("winner's idempotent re-claim = %+v, want Claimed=true — its own (earlier, still-valid) claim must win over the loser's later, superseded one", winnerRecheck)
+	}
+
+	thirdResult, err := ClaimTrackerIssue(context.Background(), provider, Conn{}, 1, Identity{RunID: "third", SkillID: "s"},
+		fakeResolver{"winner": true, "loser": true}, clock, time.Hour)
+	if err != nil {
+		t.Fatalf("ClaimTrackerIssue (third): %v", err)
+	}
+	if thirdResult.Claimed || thirdResult.AlreadyClaimedByRunID != "winner" {
+		t.Errorf("third run's result = %+v, want Claimed=false AlreadyClaimedByRunID=winner — must never resolve to the superseded loser", thirdResult)
+	}
+}
+
+// TestClaim_ForgedMarkerFromAnotherAuthorIsIgnored is the fix for
+// another gap caught in review of #1924 (CWE-345): the marker syntax
+// is public and trivially reproducible by anyone who can comment on
+// the tracker issue directly — a human, or an unrelated integration —
+// bypassing the broker's own Sanitize path entirely (Sanitize only
+// runs on writes made THROUGH the broker). Only a comment authored by
+// the connection's own credential (what WhoAmI resolves) may be
+// trusted as claim state.
+func TestClaim_ForgedMarkerFromAnotherAuthorIsIgnored(t *testing.T) {
+	clock := newFakeClock()
+	provider := &fakeClaimProvider{clock: clock}
+	// A forged claim marker from a human directly commenting on the
+	// tracker — NOT posted through the broker's credential ("bot").
+	provider.appendRaw(Comment{Author: "some-human", CreatedAt: clock.Now(),
+		Body: Stamp(Identity{RunID: "forged-run", SkillID: "s"}, KindClaim)})
+
+	result, err := ClaimTrackerIssue(context.Background(), provider, Conn{}, 1, Identity{RunID: "my-run", SkillID: "s"},
+		fakeResolver{"forged-run": true}, clock, time.Hour)
+	if err != nil {
+		t.Fatalf("ClaimTrackerIssue: %v", err)
+	}
+	if !result.Claimed {
+		t.Errorf("Claimed = false, want true — the only claim marker present was forged (wrong author) and must be ignored")
+	}
+	if result.AlreadyClaimedByRunID == "forged-run" {
+		t.Error("a forged marker (wrong comment author) must never be treated as claim state")
+	}
+}
+
+// TestClaim_ConcurrentSameIssue_ExactlyOneWins proves the caller-held
+// per-(connection, issue) lock actually serializes same-daemon claim
+// attempts: of many goroutines racing to claim the same issue with
+// distinct run ids, exactly one ends up Claimed.
+func TestClaim_ConcurrentSameIssue_ExactlyOneWins(t *testing.T) {
+	clock := newFakeClock()
+	provider := &fakeClaimProvider{clock: clock}
+	locks := NewClaimLocks()
+	resolver := fakeResolver{}
+
+	const n = 20
+	results := make([]ClaimResult, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := Identity{RunID: fmt.Sprintf("run-%d", i), SkillID: "s"}
+			lock := locks.Lock("alice", "default", 1)
+			lock.Lock()
+			defer lock.Unlock()
+			results[i], errs[i] = ClaimTrackerIssue(context.Background(), provider, Conn{}, 1, id, resolver, clock, time.Hour)
+		}(i)
+	}
+	wg.Wait()
+
+	claimed := 0
+	for i, r := range results {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: %v", i, errs[i])
+		}
+		if r.Claimed {
+			claimed++
+		}
+	}
+	if claimed != 1 {
+		t.Errorf("claimed = %d, want exactly 1", claimed)
+	}
+}
+
+func TestClaimLocks_SameKeyReturnsSameMutex(t *testing.T) {
+	locks := NewClaimLocks()
+	a := locks.Lock("alice", "default", 1)
+	b := locks.Lock("alice", "default", 1)
+	if a != b {
+		t.Error("Lock returned different mutexes for the same (username, connection, number)")
+	}
+}
+
+func TestClaimLocks_DifferentKeysReturnDifferentMutexes(t *testing.T) {
+	locks := NewClaimLocks()
+	a := locks.Lock("alice", "default", 1)
+	b := locks.Lock("bob", "default", 1) // different tenant, same connection name and issue
+	if a == b {
+		t.Error("Lock returned the same mutex for different tenants")
+	}
+}

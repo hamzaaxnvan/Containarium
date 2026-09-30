@@ -38,3 +38,166 @@ type Options struct {
 	// mode, boxes without a daemon-reported SSHHost use it as a jump
 	// server, with the daemon-reported Username as the jump account.
 	JumpHost string
+	// SentinelPort is the SSH port on the sentinel. Default 22.
+	SentinelPort int
+	// IdentityFile, if non-empty, is rendered as IdentityFile in every
+	// Host block. Leave empty to let the user manage keys via the
+	// agent / global config.
+	IdentityFile string
+	// User overrides the per-Host User. If empty: when Sentinel is set,
+	// User=container-name (sshpiper routes); otherwise User="ubuntu".
+	User string
+	// IncludeStopped emits Host blocks for stopped containers too. Off
+	// by default — if the container can't accept connections, an entry
+	// just produces confusing timeouts.
+	IncludeStopped bool
+}
+
+// Generated is the rendered config plus metadata for the caller (the CLI
+// uses Count / SkippedNoAddr in user-facing output).
+type Generated struct {
+	Content        string
+	Count          int
+	SkippedNoAddr  int
+	SkippedStopped int
+}
+
+// Header / footer markers delimit the section we own. If anyone ever
+// needs to merge into an existing file, scanning between these is the
+// supported way to find our block. Keep them stable.
+const (
+	beginMarker = "# >>> containarium ssh-config (managed) >>>"
+	endMarker   = "# <<< containarium ssh-config (managed) <<<"
+)
+
+// Generate renders a self-contained ssh_config from the given containers.
+// The output always includes the begin/end markers so callers writing
+// into a larger file can locate and replace just our block.
+func Generate(containers []incus.ContainerInfo, opts Options) Generated {
+	if opts.SentinelPort == 0 {
+		opts.SentinelPort = 22
+	}
+
+	var b strings.Builder
+	g := Generated{}
+
+	fmt.Fprintln(&b, beginMarker)
+	fmt.Fprintf(&b, "# generated %s by `containarium ssh-config sync`\n",
+		time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintln(&b, "# do not edit by hand — re-run sync to update")
+	fmt.Fprintln(&b)
+
+	// Sort by name so the file is stable across runs (avoids spurious
+	// diffs in users who track this file in dotfiles).
+	sorted := make([]incus.ContainerInfo, len(containers))
+	copy(sorted, containers)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+
+	// Reserve every destination before choosing jump aliases, including
+	// destinations that sort after their jump's owner. Also reserve each
+	// allocated jump alias so all Host blocks remain distinct.
+	aliases := make(map[string]bool, len(sorted))
+	for _, c := range sorted {
+		aliases[strings.ToLower(c.Name)] = true
+	}
+
+	for _, c := range sorted {
+		// State spelling depends on the transport, so normalize rather
+		// than compare against one of them (cloud#1851): a local incus
+		// listing says "Running", but both remote clients surface the
+		// protobuf enum identifier -- the HTTP client copies protojson's
+		// "CONTAINER_STATE_RUNNING" through verbatim and the gRPC client
+		// calls State.String(). Comparing to "Running" alone meant every
+		// box on a hosted control plane was classified stopped and sync
+		// wrote an ssh_config with zero Host blocks.
+		if !opts.IncludeStopped && !connectcore.IsRunning(c.State) {
+			g.SkippedStopped++
+			continue
+		}
+		if opts.Sentinel == "" && c.IPAddress == "" && c.SSHHost == "" {
+			g.SkippedNoAddr++
+			continue
+		}
+		jumpAlias := ""
+		if opts.Sentinel == "" && c.SSHHost == "" && opts.JumpHost != "" {
+			jumpAlias = c.Name + "-jump"
+			for suffix := 2; aliases[strings.ToLower(jumpAlias)]; suffix++ {
+				jumpAlias = fmt.Sprintf("%s-jump-%d", c.Name, suffix)
+			}
+			aliases[strings.ToLower(jumpAlias)] = true
+		}
+		writeHost(&b, c, opts, jumpAlias)
+		g.Count++
+	}
+
+	fmt.Fprintln(&b, endMarker)
+	g.Content = b.String()
+	return g
+}
+
+func writeHost(b *strings.Builder, c incus.ContainerInfo, opts Options, jumpAlias string) {
+	fmt.Fprintf(b, "Host %s\n", c.Name)
+
+	if opts.Sentinel != "" {
+		host, port := hostport.Split(opts.Sentinel, opts.SentinelPort)
+		fmt.Fprintf(b, "    HostName %s\n", host)
+		fmt.Fprintf(b, "    Port %d\n", port)
+		user := opts.User
+		if user == "" {
+			user = c.Name
+		}
+		fmt.Fprintf(b, "    User %s\n", user)
+	} else {
+		// Resolve the target the same way `containarium connect` does so
+		// the two never disagree about how to reach a box (#2239): the
+		// daemon-reported ssh_host and SSH username win; the container IP
+		// and "ubuntu" are only the fallback for a local Incus listing,
+		// which reports neither.
+		ct := connectcore.Container{Username: c.Username, SshHost: c.SSHHost}
+		ct.Network.IpAddress = c.IPAddress
+		t, err := connectcore.BuildTarget(&ct, opts.User, "", 22)
+		if err != nil {
+			// Only reachable with no --user and no daemon-reported
+			// username (local Incus): the historical in-box login.
+			t, _ = connectcore.BuildTarget(&ct, "ubuntu", "", 22)
+		}
+		fmt.Fprintf(b, "    HostName %s\n", t.Host)
+		fmt.Fprintf(b, "    Port %d\n", t.Port)
+		fmt.Fprintf(b, "    User %s\n", t.User)
+	}
+	if jumpAlias != "" {
+		fmt.Fprintf(b, "    ProxyJump %s\n", jumpAlias)
+	}
+
+	if opts.IdentityFile != "" {
+		fmt.Fprintf(b, "    IdentityFile %s\n", opts.IdentityFile)
+	}
+	// IdentitiesOnly stops ssh offering every key the agent holds before
+	// the right one: sshpiper's failtoban counts each rejected offer
+	// toward its ban budget, so a user with a full agent can lock
+	// themselves out before the correct key is tried. Same reason
+	// `connect` and the MCP ssh hints pass -o IdentitiesOnly=yes. With no
+	// IdentityFile the default ~/.ssh identities still apply — only keys
+	// that live solely in the agent are excluded. Unconditional, not just
+	// alongside --identity (#2089, folded in from #2220's review).
+	fmt.Fprintln(b, "    IdentitiesOnly yes")
+
+	if c.BackendID != "" {
+		fmt.Fprintf(b, "    # backend: %s\n", c.BackendID)
+	}
+	fmt.Fprintln(b)
+	if jumpAlias != "" {
+		// ProxyJump does not inherit the destination's IdentityFile. A
+		// separate Host block pins the same key on both SSH connections.
+		host, port := hostport.Split(opts.JumpHost, 22)
+		fmt.Fprintf(b, "Host %s\n", jumpAlias)
+		fmt.Fprintf(b, "    HostName %s\n", host)
+		fmt.Fprintf(b, "    Port %d\n", port)
+		fmt.Fprintf(b, "    User %s\n", c.Username)
+		if opts.IdentityFile != "" {
+			fmt.Fprintf(b, "    IdentityFile %s\n", opts.IdentityFile)
+		}
+		fmt.Fprintln(b, "    IdentitiesOnly yes")
+		fmt.Fprintln(b)
+	}
+}
