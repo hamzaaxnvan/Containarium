@@ -10,3 +10,10 @@ metadata:
     app.kubernetes.io/name: sshpiper
 spec:
   type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: sshpiper
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: 2222
+      protocol: TCP
