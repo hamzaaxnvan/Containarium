@@ -93,3 +93,99 @@ curl -fsSL "${ARTIFACT_BASE_URL}/sdlc-skills.tar.gz.sha256" -o "$tmp/sdlc-skills
 
 want="$(cut -d' ' -f1 "$tmp/sdlc-skills.tar.gz.sha256" | head -n1)"
 [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { echo "install-sdlc-skills: malformed .sha256 file" >&2; exit 1; }
+if command -v sha256sum >/dev/null 2>&1; then got="$(sha256sum "$tmp/sdlc-skills.tar.gz" | cut -d' ' -f1)"
+else got="$(shasum -a 256 "$tmp/sdlc-skills.tar.gz" | cut -d' ' -f1)"; fi
+if [[ "$got" != "$want" ]]; then
+  echo "install-sdlc-skills: sha256 mismatch (asset $got, expected $want); nothing installed" >&2
+  exit 1
+fi
+
+# Refuse anything that could write outside SKILLS_DIR before extracting a byte.
+while IFS= read -r entry; do
+  case "$entry" in
+    /*|*..*) echo "install-sdlc-skills: unsafe path in archive: $entry; nothing installed" >&2; exit 1 ;;
+  esac
+done < <(tar -tzf "$tmp/sdlc-skills.tar.gz")
+mkdir -p "$tmp/x"
+
+if [[ "${#sets[@]}" -eq 0 ]]; then
+  tar -xzf "$tmp/sdlc-skills.tar.gz" -C "$tmp/x"
+else
+  # Resolve set ids to namespaces through the lock that pins THIS bundle, then
+  # extract only those namespaces' entries (plus _shared/).
+  lock_url="${SDLC_SKILLS_LOCK_URL:-}"
+  if [[ -z "$lock_url" ]]; then
+    [[ -n "$RELEASE" ]] || { echo "install-sdlc-skills: set SDLC_SKILLS_LOCK_URL to select skill sets without RELEASE; nothing installed" >&2; exit 2; }
+    lock_url="https://raw.githubusercontent.com/${REPO}/${RELEASE}/pkg/core/sdlcskills/sdlc-skills.lock"
+  fi
+  if ! curl -fsSL "$lock_url" -o "$tmp/sdlc-skills.lock" </dev/null; then
+    echo "install-sdlc-skills: cannot read the skill-set lock at $lock_url (a release that predates skill sets cannot honour SKILL_SETS=$SKILL_SETS); nothing installed" >&2
+    exit 1
+  fi
+  # The current lock has one [source] section per release asset. Read the
+  # digest for sdlc-skills.tar.gz from [sdlc], while accepting the earlier flat
+  # lock during the compatibility window.
+  lock_sha="$(awk -F= '
+    /^\[/ { in_sdlc = ($0 == "[sdlc]"); saw_section = 1; next }
+    $1 == "sha256" && in_sdlc { print $2; found = 1; exit }
+    $1 == "sha256" && !saw_section && legacy == "" { legacy = $2 }
+    END { if (!found && legacy != "") print legacy }
+  ' "$tmp/sdlc-skills.lock")"
+  if [[ "$lock_sha" != "$got" ]]; then
+    echo "install-sdlc-skills: the lock does not pin the downloaded bundle (lock ${lock_sha:-none}, bundle $got); nothing installed" >&2
+    exit 1
+  fi
+  known="$(sed -n 's/^set\.\([a-z0-9-][a-z0-9-]*\)=.*/\1/p' "$tmp/sdlc-skills.lock" | paste -sd, - | sed 's/,/, /g')"
+  nss=()
+  for s in "${sets[@]}"; do
+    line="$(sed -n "s/^set\.${s}=//p" "$tmp/sdlc-skills.lock" | head -n1)"
+    if [[ -z "$line" ]]; then
+      echo "install-sdlc-skills: unknown skill set '$s'; known skill sets: ${known:-(none defined)}; nothing installed" >&2
+      exit 1
+    fi
+    IFS=',' read -r -a more <<< "$line"
+    for ns in "${more[@]}"; do
+      [[ "$ns" =~ ^[a-z0-9-]+$ ]] || { echo "install-sdlc-skills: bad namespace '$ns' in set '$s'; nothing installed" >&2; exit 1; }
+      nss+=("$ns")
+    done
+  done
+  : > "$tmp/members"
+  while IFS= read -r entry; do
+    top="${entry%%/*}"
+    take=0
+    [[ "$top" == _shared ]] && take=1
+    for ns in "${nss[@]}"; do [[ "$top" == "$ns"-* ]] && take=1; done
+    [[ "$take" == 1 ]] && printf '%s\n' "$entry" >> "$tmp/members"
+  done < <(tar -tzf "$tmp/sdlc-skills.tar.gz")
+  tar -xzf "$tmp/sdlc-skills.tar.gz" -C "$tmp/x" -T "$tmp/members"
+fi
+
+new=()
+for d in "$tmp/x"/*/; do [[ -d "$d" ]] || continue; new+=("$(basename "$d")"); done
+[[ "${#new[@]}" -gt 0 ]] || { echo "install-sdlc-skills: archive holds no skills for SKILL_SETS=$SKILL_SETS; nothing installed" >&2; exit 1; }
+
+prune_dropped
+
+for n in "${new[@]}"; do
+  rm -rf "${SKILLS_DIR:?}/$n"
+  cp -R "$tmp/x/$n" "$SKILLS_DIR/$n"
+done
+printf '%s\n' "${new[@]}" > "$manifest"
+printf 'release=%s sha256=%s installed=%s\n' "${RELEASE:-custom}" "$want" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SKILLS_DIR/.sdlc-skills-version"
+
+if [[ -n "$OVERLAY" ]]; then
+  if [[ -d "$OVERLAY" ]]; then
+    for d in "$OVERLAY"/*/; do
+      [[ -d "$d" ]] || continue
+      n="$(basename "$d")"
+      [[ "$n" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+      rm -rf "${SKILLS_DIR:?}/$n"
+      cp -R "$d" "$SKILLS_DIR/$n"
+    done
+    echo "==> applied overlay from $OVERLAY"
+  else
+    echo "install-sdlc-skills: overlay dir not found, skipped: $OVERLAY" >&2
+  fi
+fi
+
+echo "==> installed ${#new[@]} SDLC skill entries into $SKILLS_DIR"
