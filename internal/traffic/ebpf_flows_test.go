@@ -124,3 +124,66 @@ func TestClosedFlows_DetectsDisappeared(t *testing.T) {
 	next := map[string]*pb.Connection{
 		"ebpf-a": mk("ebpf-a"),
 		"ebpf-d": mk("ebpf-d"), // new
+	}
+
+	closed := closedFlows(prev, next)
+	if len(closed) != 2 {
+		t.Fatalf("closedFlows returned %d, want 2", len(closed))
+	}
+	got := map[string]bool{}
+	for _, c := range closed {
+		got[c.Id] = true
+	}
+	if !got["ebpf-b"] || !got["ebpf-c"] {
+		t.Errorf("closed = %v, want ebpf-b + ebpf-c", got)
+	}
+	if got["ebpf-a"] {
+		t.Error("still-active flow ebpf-a must not be reported closed")
+	}
+}
+
+// TestClosedFlows_FirstPollEmpty: nothing closes on the first ingest (no prior).
+func TestClosedFlows_FirstPollEmpty(t *testing.T) {
+	next := map[string]*pb.Connection{"ebpf-a": {Id: "ebpf-a"}}
+	if c := closedFlows(map[string]*pb.Connection{}, next); len(c) != 0 {
+		t.Errorf("first poll should close nothing, got %d", len(c))
+	}
+}
+
+// TestEBPFFlows_SuppressedWhenConntrackOwns guards #643: once conntrack has
+// attributed a container, the eBPF copies of that container's flows are NOT
+// shown in the live view (conntrack already lists them) — but a container
+// conntrack never attributed (docker-in-LXC) still surfaces via eBPF.
+func TestEBPFFlows_SuppressedWhenConntrackOwns(t *testing.T) {
+	c := newTestCollector()
+	// conntrack attributed "web-container" but never "lxc-container".
+	c.conntrackSeen["web-container"] = true
+
+	c.IngestEBPFFlows([]EBPFFlow{
+		{ContainerName: "web-container", SrcIP: "10.100.0.42", DstIP: "1.1.1.1", Protocol: "tcp", Bytes: 1},
+		{ContainerName: "lxc-container", SrcIP: "10.100.0.50", DstIP: "8.8.8.8", Protocol: "udp", Bytes: 2},
+	})
+
+	all := c.GetConnections("")
+	if len(all) != 1 {
+		t.Fatalf("GetConnections = %d, want 1 (web suppressed, lxc shown)", len(all))
+	}
+	if all[0].ContainerName != "lxc-container" {
+		t.Errorf("surfaced %q, want lxc-container (conntrack-owned web suppressed)", all[0].ContainerName)
+	}
+	// Explicit filter for a conntrack-owned container yields nothing from eBPF.
+	if n := len(c.GetConnections("web-container")); n != 0 {
+		t.Errorf("GetConnections(web-container) = %d, want 0 (conntrack owns it)", n)
+	}
+}
+
+func TestConntrackOwns(t *testing.T) {
+	c := newTestCollector()
+	if c.conntrackOwns("x") {
+		t.Error("unseen container should not be owned")
+	}
+	c.conntrackSeen["x"] = true
+	if !c.conntrackOwns("x") {
+		t.Error("seen container should be owned")
+	}
+}
