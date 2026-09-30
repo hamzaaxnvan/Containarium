@@ -308,3 +308,314 @@ func TestClearTenantKMSKey_LeavesExistingRowsOnTheirOwnKeyAndIsIdempotent(t *tes
 		var kekID string
 		if err := pool.QueryRow(ctx,
 			`SELECT kek_id FROM secrets WHERE username = $1 AND name = $2`, user, name,
+		).Scan(&kekID); err != nil {
+			t.Fatalf("query kek_id for %s: %v", name, err)
+		}
+		return kekID
+	}
+
+	if got := kekIDOf("API_KEY"); got != wantTenantKekID {
+		t.Fatalf("kek_id before clear = %q, want the tenant key %q", got, wantTenantKekID)
+	}
+
+	if err := store.ClearTenantKMSKey(ctx, user); err != nil {
+		t.Fatalf("ClearTenantKMSKey: %v", err)
+	}
+	// Idempotent — clearing an already-cleared tenant must not error.
+	if err := store.ClearTenantKMSKey(ctx, user); err != nil {
+		t.Fatalf("second ClearTenantKMSKey: %v", err)
+	}
+
+	// The pre-clear secret must still decrypt correctly RIGHT NOW — the
+	// tenant's dedicated GCP key is still alive in this test (only the
+	// cloud side ever calls GCP KMS destroy). But its kek_id must be
+	// UNCHANGED, not moved to the shared key: that's the whole point.
+	_, value, err := store.Get(ctx, user, "API_KEY")
+	if err != nil {
+		t.Fatalf("Get after clear: %v", err)
+	}
+	if value != "under-tenant-key" {
+		t.Fatalf("value after clear = %q, want %q", value, "under-tenant-key")
+	}
+	if got := kekIDOf("API_KEY"); got != wantTenantKekID {
+		t.Fatalf("kek_id after clear = %q, want UNCHANGED tenant key %q (clear must not rewrap)", got, wantTenantKekID)
+	}
+
+	var stillOverridden int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM tenant_kms_keys WHERE username = $1`, user,
+	).Scan(&stillOverridden); err != nil {
+		t.Fatalf("query tenant_kms_keys: %v", err)
+	}
+	if stillOverridden != 0 {
+		t.Fatal("tenant_kms_keys row should be gone after clear")
+	}
+
+	// A NEW write after clear must route to the shared key — the
+	// override is gone, so this is the shared fallback, unrelated to the
+	// pre-clear row above.
+	if _, err := store.Set(ctx, user, "NEW_AFTER_CLEAR", "new-value", ""); err != nil {
+		t.Fatalf("Set after clear: %v", err)
+	}
+	wantSharedKekID := corecrypto.GCPKEKPrefix + "projects/p/locations/l/keyRings/r/cryptoKeys/shared/cryptoKeyVersions/1"
+	if got := kekIDOf("NEW_AFTER_CLEAR"); got != wantSharedKekID {
+		t.Fatalf("kek_id of a write after clear = %q, want the shared key %q", got, wantSharedKekID)
+	}
+}
+
+func TestSetTenantKMSKey_RejectsWhenNoTenantFactoryConfigured(t *testing.T) {
+	store, pool := newIntegrationStore(t, nil)
+	_ = pool
+	if err := store.SetTenantKMSKey(context.Background(), "someone", "projects/p/locations/l/keyRings/r/cryptoKeys/k"); err == nil {
+		t.Fatal("expected an error when the daemon has no per-tenant KMS factory configured")
+	}
+}
+
+func TestLoadTenantKEKCache_SurvivesRestart(t *testing.T) {
+	fk := &fakeMultiKeyGCPKMS{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(fk.handle))
+	defer srv.Close()
+	factory := newFakeTenantKMSFactory(t, srv)
+
+	store, pool := newIntegrationStore(t, factory)
+	ctx := context.Background()
+	const user = "tenant-kms-user-restart"
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1", user)
+		_, _ = pool.Exec(ctx, "DELETE FROM tenant_kms_keys WHERE username = $1", user)
+	})
+	_, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1", user)
+	_, _ = pool.Exec(ctx, "DELETE FROM tenant_kms_keys WHERE username = $1", user)
+
+	tenantKey := "projects/p/locations/l/keyRings/r/cryptoKeys/" + user
+	if err := store.SetTenantKMSKey(ctx, user, tenantKey); err != nil {
+		t.Fatalf("SetTenantKMSKey: %v", err)
+	}
+
+	// Simulate a daemon restart: build a brand-new *Store against the
+	// same pool. Its in-memory tenantKEK cache must be re-populated
+	// from tenant_kms_keys, not start empty.
+	key := make([]byte, corecrypto.MasterKeySize)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	cph, err := corecrypto.NewCipher(key)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	shared, err := factory("projects/p/locations/l/keyRings/r/cryptoKeys/shared")
+	if err != nil {
+		t.Fatalf("build shared client: %v", err)
+	}
+	restarted, err := NewStore(ctx, pool, cph, WithKMS(shared), WithTenantKMSFactory(factory))
+	if err != nil {
+		t.Fatalf("NewStore (restart): %v", err)
+	}
+
+	if _, err := restarted.Set(ctx, user, "POST_RESTART", "value", ""); err != nil {
+		t.Fatalf("Set after restart: %v", err)
+	}
+	var kekID string
+	if err := pool.QueryRow(ctx,
+		`SELECT kek_id FROM secrets WHERE username = $1 AND name = $2`, user, "POST_RESTART",
+	).Scan(&kekID); err != nil {
+		t.Fatalf("query kek_id: %v", err)
+	}
+	if kekID != corecrypto.GCPKEKPrefix+tenantKey+"/cryptoKeyVersions/1" {
+		t.Fatalf("kek_id after restart = %q, want %q — the tenant override did not survive the restart", kekID, corecrypto.GCPKEKPrefix+tenantKey+"/cryptoKeyVersions/1")
+	}
+}
+
+// TestTryRewrapAtVersion_StaleVersionIsNoOp is the deterministic
+// regression test for the CodeRabbit finding on #1631: a rewrap attempt
+// targeting a version that's no longer current must affect zero rows
+// and must NOT touch the row that a concurrent write already produced.
+func TestTryRewrapAtVersion_StaleVersionIsNoOp(t *testing.T) {
+	fk := &fakeMultiKeyGCPKMS{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(fk.handle))
+	defer srv.Close()
+
+	store, pool := newIntegrationStore(t, newFakeTenantKMSFactory(t, srv))
+	ctx := context.Background()
+	const user, name = "tenant-kms-user-race", "API_KEY"
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1", user) })
+	_, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1", user)
+
+	meta1, err := store.Set(ctx, user, name, "v1", "")
+	if err != nil {
+		t.Fatalf("initial Set: %v", err)
+	}
+	if meta1.Version != 1 {
+		t.Fatalf("meta1.Version = %d, want 1", meta1.Version)
+	}
+
+	// Simulate rewrapOne having read version 1, then — before it can
+	// write — a real concurrent SetSecret lands, advancing the row to
+	// version 2 with a genuinely new value.
+	if _, err := store.Set(ctx, user, name, "v2-from-concurrent-writer", ""); err != nil {
+		t.Fatalf("concurrent Set: %v", err)
+	}
+
+	// Now attempt the stale rewrap write — as if rewrapOne's read had
+	// happened before the concurrent Set above. It must be rejected
+	// (0 rows affected), not silently applied over the newer value.
+	staleNonce, staleCT, staleWrapped, staleKekID, err := store.encryptForStorage(ctx, user, name, []byte("v1"))
+	if err != nil {
+		t.Fatalf("encryptForStorage: %v", err)
+	}
+	ok, err := store.tryRewrapAtVersion(ctx, user, name, staleNonce, staleCT, staleWrapped, staleKekID, meta1.Version)
+	if err != nil {
+		t.Fatalf("tryRewrapAtVersion: %v", err)
+	}
+	if ok {
+		t.Fatal("tryRewrapAtVersion succeeded against a stale version — it should have been rejected")
+	}
+
+	// The row must still hold the concurrent writer's value, untouched.
+	meta2, value, err := store.Get(ctx, user, name)
+	if err != nil {
+		t.Fatalf("Get after stale attempt: %v", err)
+	}
+	if value != "v2-from-concurrent-writer" {
+		t.Fatalf("value = %q, want the concurrent writer's value — a stale rewrap silently overwrote it", value)
+	}
+	if meta2.Version != 2 {
+		t.Fatalf("version = %d, want 2 — untouched by the rejected rewrap attempt", meta2.Version)
+	}
+}
+
+// TestRewrapOne_HappyPathConvergesWithoutVersionBump proves the
+// uncontended case: with no concurrent writer, rewrapOne's first
+// attempt succeeds and produces a correctly re-encrypted row under the
+// NEW key, and — since a rewrap isn't a value change — without bumping
+// version. TestRewrapOne_RetriesPastAStaleFirstAttempt below is the
+// companion that actually exercises the retry branch.
+func TestRewrapOne_HappyPathConvergesWithoutVersionBump(t *testing.T) {
+	fk := &fakeMultiKeyGCPKMS{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(fk.handle))
+	defer srv.Close()
+
+	factory := newFakeTenantKMSFactory(t, srv)
+	store, pool := newIntegrationStore(t, factory)
+	ctx := context.Background()
+	const user, name = "tenant-kms-user-race2", "API_KEY"
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1", user)
+		_, _ = pool.Exec(ctx, "DELETE FROM tenant_kms_keys WHERE username = $1", user)
+	})
+	_, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1", user)
+	_, _ = pool.Exec(ctx, "DELETE FROM tenant_kms_keys WHERE username = $1", user)
+
+	if _, err := store.Set(ctx, user, name, "steady-value", ""); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	tenantKey := "projects/p/locations/l/keyRings/r/cryptoKeys/" + user
+	if err := store.SetTenantKMSKey(ctx, user, tenantKey); err != nil {
+		t.Fatalf("SetTenantKMSKey: %v", err)
+	}
+
+	meta, value, err := store.Get(ctx, user, name)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if value != "steady-value" {
+		t.Fatalf("value = %q, want steady-value", value)
+	}
+	if meta.Version != 1 {
+		t.Fatalf("version = %d, want 1 — a successful rewrap must not bump version (it's not a value change)", meta.Version)
+	}
+
+	var kekID string
+	if err := pool.QueryRow(ctx,
+		`SELECT kek_id FROM secrets WHERE username = $1 AND name = $2`, user, name,
+	).Scan(&kekID); err != nil {
+		t.Fatalf("query kek_id: %v", err)
+	}
+	if kekID != corecrypto.GCPKEKPrefix+tenantKey+"/cryptoKeyVersions/1" {
+		t.Fatalf("kek_id = %q, want %q", kekID, corecrypto.GCPKEKPrefix+tenantKey+"/cryptoKeyVersions/1")
+	}
+}
+
+// TestRewrapOne_RetriesPastAStaleFirstAttempt is the direct regression
+// test CodeRabbit asked for on #1631: it forces rewrapOne's FIRST
+// attempt to lose the race (via rewrapOneTestHook, which fires a real
+// concurrent Set between rewrapOne's read and its conditional write)
+// and asserts it correctly retries rather than giving up or clobbering
+// the concurrent writer's value. TestTryRewrapAtVersion_StaleVersionIsNoOp
+// proves the primitive a stale write is rejected; this test proves
+// rewrapOne's loop actually notices that and reads again — a bug that
+// silently accepted the rejection (e.g. returned nil on ok==false
+// instead of retrying) would pass every other test in this file but
+// fail this one, since the tenant's secret would be left un-rewrapped.
+func TestRewrapOne_RetriesPastAStaleFirstAttempt(t *testing.T) {
+	fk := &fakeMultiKeyGCPKMS{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(fk.handle))
+	defer srv.Close()
+
+	factory := newFakeTenantKMSFactory(t, srv)
+	store, pool := newIntegrationStore(t, factory)
+	ctx := context.Background()
+	const user, name = "tenant-kms-user-race3", "API_KEY"
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1", user)
+		_, _ = pool.Exec(ctx, "DELETE FROM tenant_kms_keys WHERE username = $1", user)
+	})
+	_, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1", user)
+	_, _ = pool.Exec(ctx, "DELETE FROM tenant_kms_keys WHERE username = $1", user)
+
+	if _, err := store.Set(ctx, user, name, "before-race", ""); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	raced := false
+	var raceAttempts []int
+	rewrapOneTestHook = func(hookUser, hookName string, attempt int) {
+		if hookUser != user || hookName != name {
+			return
+		}
+		raceAttempts = append(raceAttempts, attempt)
+		if raced {
+			return // only race the very first attempt
+		}
+		raced = true
+		// A real concurrent write, landing after rewrapOne's read
+		// (which just happened) and before its conditional write
+		// (about to happen) — bumps the row to version 2 with a
+		// genuinely different value.
+		if _, err := store.Set(ctx, user, name, "raced-in-value", ""); err != nil {
+			t.Fatalf("concurrent Set inside hook: %v", err)
+		}
+	}
+	t.Cleanup(func() { rewrapOneTestHook = nil })
+
+	tenantKey := "projects/p/locations/l/keyRings/r/cryptoKeys/" + user
+	if err := store.SetTenantKMSKey(ctx, user, tenantKey); err != nil {
+		t.Fatalf("SetTenantKMSKey: %v", err)
+	}
+
+	if len(raceAttempts) < 2 {
+		t.Fatalf("expected rewrapOne to make at least 2 attempts (one rejected, one that succeeded); hook fired for attempts %v", raceAttempts)
+	}
+
+	meta, value, err := store.Get(ctx, user, name)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if value != "raced-in-value" {
+		t.Fatalf("value = %q, want %q — the retry must have picked up the concurrent writer's value, not the stale one", value, "raced-in-value")
+	}
+	if meta.Version != 2 {
+		t.Fatalf("version = %d, want 2 — the concurrent Set's version, unchanged by the eventual successful rewrap", meta.Version)
+	}
+
+	var kekID string
+	if err := pool.QueryRow(ctx,
+		`SELECT kek_id FROM secrets WHERE username = $1 AND name = $2`, user, name,
+	).Scan(&kekID); err != nil {
+		t.Fatalf("query kek_id: %v", err)
+	}
+	if kekID != corecrypto.GCPKEKPrefix+tenantKey+"/cryptoKeyVersions/1" {
+		t.Fatalf("kek_id = %q, want %q — the secret must still end up under the tenant's new key despite the race", kekID, corecrypto.GCPKEKPrefix+tenantKey+"/cryptoKeyVersions/1")
+	}
+}
