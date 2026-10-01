@@ -106,3 +106,39 @@ if command -v journalctl >/dev/null 2>&1; then
   fi
 else
   skip "journalctl unavailable — verify the network_policy.signature_match audit row via your log path"
+fi
+
+# 2. Drop semantics.
+if [ "$ARMED" = yes ]; then
+  if [ "$(listener_saw_data)" = no ]; then
+    pass "ENFORCE: exploit request was DROPPED — the in-container listener received nothing"
+  else
+    fail "ENFORCE: listener received the exploit payload — it was not dropped"
+  fi
+else
+  if [ "$(listener_saw_data)" = yes ]; then
+    info "observe-only: payload reached the listener (expected — nothing drops); match was logged above"
+    skip "drop not asserted (enforcement not armed)"
+  else
+    skip "drop not asserted (enforcement not armed); listener saw no data — check the listener/probe"
+  fi
+fi
+
+# 3. A benign request is unaffected (no false-positive drop).
+phase "Benign request still passes"
+cleanup
+incus exec "$CONTAINER" -- sh -c "rm -f /tmp/benign_seen; (nc -l -p $LISTEN_PORT >/tmp/benign_seen 2>/dev/null &)" </dev/null
+sleep 1
+printf 'GET /health HTTP/1.0\r\n\r\n' | timeout 5 nc -w2 "$IP" "$LISTEN_PORT" >/dev/null 2>&1 || true
+sleep "$SETTLE"
+if incus exec "$CONTAINER" -- sh -c "[ -s /tmp/benign_seen ] && echo yes || echo no" </dev/null 2>/dev/null | grep -q yes; then
+  pass "benign request reached the listener (no false-positive drop)"
+else
+  fail "benign request did NOT reach the listener — possible over-broad drop"
+fi
+incus exec "$CONTAINER" -- rm -f /tmp/sig_seen /tmp/benign_seen </dev/null >/dev/null 2>&1 || true
+
+phase "Result"
+printf 'PASS=%d  FAIL=%d  SKIP=%d   (enforcement armed: %s)\n' "$PASS" "$FAIL" "$SKIP" "$ARMED"
+echo "Record the outcome (anonymised) on the Tier 2 PR; on a clean armed pass, mark it ready."
+[ "$FAIL" -eq 0 ]
