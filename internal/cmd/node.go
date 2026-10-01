@@ -106,3 +106,112 @@ func parseGPUPCI(v string) string {
 
 func newNodeManager() (*nodevm.Manager, error) {
 	runner, err := nodevm.NewCLIRunner()
+	if err != nil {
+		return nil, err
+	}
+	bin := nodeBinary
+	if bin == "" {
+		if self, err := os.Executable(); err == nil {
+			bin = self
+		}
+	}
+	return nodevm.NewManager(runner, bin), nil
+}
+
+func runNodeProvision(cmd *cobra.Command, args []string) error {
+	spec := nodevm.Spec{
+		Name:        nodeName,
+		Kind:        nodevm.Kind(nodeKind),
+		Pool:        nodePool,
+		CPU:         nodeCPU,
+		Memory:      nodeMemory,
+		Disk:        nodeDisk,
+		Image:       nodeImage,
+		GPUPCI:      parseGPUPCI(nodeGPU),
+		Sentinel:    nodeSentinel,
+		TunnelToken: nodeTunnelToken,
+	}
+	if err := spec.Validate(); err != nil {
+		return err
+	}
+	if spec.TunnelToken == "" {
+		return fmt.Errorf("a tunnel token is required (set CONTAINARIUM_TUNNEL_TOKEN or --tunnel-token) so the node can register")
+	}
+	m, err := newNodeManager()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Provisioning %s node %q (pool=%s, %d vCPU, %s)...\n", spec.Kind, spec.Name, spec.Pool, spec.CPU, spec.Memory)
+	n, err := m.Provision(spec)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ node %q %s — registering with the sentinel as spot-id %q (pool %q)\n", n.Name, n.State, spec.SpotID(), spec.Pool)
+	fmt.Printf("  verify:  containarium backends list   (look for %s)\n", spec.SpotID())
+	return nil
+}
+
+func runNodePrepareGPU(cmd *cobra.Command, args []string) error {
+	pci := parseGPUPCI(nodeGPU)
+	if pci == "" {
+		return fmt.Errorf("--gpu pci=<addr> is required")
+	}
+	fmt.Printf(`One-time VFIO prep to pass GPU %s into a node-VM.
+⚠  REBOOT-CLASS and DESTRUCTIVE: this binds the GPU to vfio-pci, so the
+   host (and any host-side GPU containers) LOSE the card until reversed.
+
+Run as root, after reviewing:
+
+  # 1. resolve the GPU's vendor:device IDs (and its audio function)
+  lspci -nns %s
+
+  # 2. enable IOMMU + reserve the GPU for vfio-pci
+  sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt /' /etc/default/grub
+  echo "options vfio-pci ids=<vendor:device>,<audio vendor:device>" > /etc/modprobe.d/vfio.conf
+  printf 'vfio\nvfio_pci\nvfio_iommu_type1\n' > /etc/modules-load.d/vfio.conf
+  update-grub && update-initramfs -u
+
+  # 3. reboot, then verify the GPU is on vfio-pci:
+  reboot
+  lspci -nnk -s %s   # → "Kernel driver in use: vfio-pci"
+
+Then: containarium node provision --kind gpu --gpu pci=%s ...
+`, pci, pci, pci, pci)
+	return nil
+}
+
+func runNodeList(cmd *cobra.Command, args []string) error {
+	m, err := newNodeManager()
+	if err != nil {
+		return err
+	}
+	nodes, err := m.List()
+	if err != nil {
+		return err
+	}
+	if len(nodes) == 0 {
+		fmt.Println("No node-VMs on this host.")
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tSTATE")
+	for _, n := range nodes {
+		fmt.Fprintf(w, "%s\t%s\n", n.Name, n.State)
+	}
+	return w.Flush()
+}
+
+func runNodeDestroy(cmd *cobra.Command, args []string) error {
+	if nodeName == "" {
+		return fmt.Errorf("--name is required")
+	}
+	m, err := newNodeManager()
+	if err != nil {
+		return err
+	}
+	if err := m.Destroy(nodeName); err != nil {
+		return err
+	}
+	fmt.Printf("✓ node-VM %q destroyed\n", nodeName)
+	return nil
+}
