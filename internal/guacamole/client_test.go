@@ -98,3 +98,53 @@ func TestCreateConnection(t *testing.T) {
 	connID, err := client.CreateConnection("test-token", ConnectionConfig{
 		Name:     "wintest-container",
 		Hostname: "10.100.0.50",
+		Port:     "3389",
+		Username: "Administrator",
+		Password: "secret123",
+	})
+	if err != nil {
+		t.Fatalf("CreateConnection() error = %v", err)
+	}
+	if connID != "42" {
+		t.Errorf("CreateConnection() id = %q, want %q", connID, "42")
+	}
+}
+
+func TestDeleteConnection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		token := r.URL.Query().Get("token")
+		if token != "test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := New(server.URL)
+
+	err := client.DeleteConnection("test-token", "42")
+	if err != nil {
+		t.Fatalf("DeleteConnection() error = %v", err)
+	}
+
+	// Wrong token should fail
+	err = client.DeleteConnection("wrong-token", "42")
+	if err == nil {
+		t.Error("DeleteConnection() with bad token should fail")
+	}
+}
+
+func TestGetConnectionURL(t *testing.T) {
+	url := GetConnectionURL("42")
+	want := "/#/client/42"
+	if url != want {
+		t.Errorf("GetConnectionURL(\"42\") = %q, want %q", url, want)
+	}
+}
