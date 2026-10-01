@@ -120,3 +120,44 @@ func renderCheckoutSweep(box string, resp *pb.SweepBoxRunCheckoutsResponse, dryR
 	if !resp.GetPlatformRuns() {
 		fmt.Fprintf(&b, "%s: no platform-started run on this box; nothing is swept\n", box)
 		return b.String()
+	}
+	verb, target := "Removed", pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_REMOVED
+	if dryRun {
+		verb, target = "Would remove", pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_WOULD_REMOVE
+	}
+	line := func(c *pb.BoxRunCheckout, note string) {
+		mod := "-"
+		if c.GetNewestModification() != nil {
+			mod = c.GetNewestModification().AsTime().UTC().Format(time.RFC3339)
+		}
+		fmt.Fprintf(&b, "  %s:~/work/%s  %s  modified %s", c.GetUser(), c.GetName(), humanBytes(c.GetSizeBytes()), mod)
+		if note != "" {
+			fmt.Fprintf(&b, "  (%s)", note)
+		}
+		b.WriteString("\n")
+	}
+	var n int
+	var total int64
+	for _, c := range resp.GetCheckouts() {
+		if c.GetDisposition() == target {
+			n++
+			total += c.GetSizeBytes()
+		}
+	}
+	fmt.Fprintf(&b, "%s %d per-run checkout(s) on %s, %s (older than %s):\n", verb, n, box, humanBytes(total), resp.GetMaxAge().AsDuration())
+	for _, c := range resp.GetCheckouts() {
+		if c.GetDisposition() == target {
+			line(c, "")
+		}
+	}
+	for _, c := range resp.GetCheckouts() {
+		d := c.GetDisposition()
+		if d == target {
+			continue
+		}
+		if all || d == pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_REMOVE_FAILED {
+			line(c, checkoutKeptReason(d))
+		}
+	}
+	return b.String()
+}
