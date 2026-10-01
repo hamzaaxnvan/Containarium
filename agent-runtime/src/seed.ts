@@ -101,3 +101,38 @@ export function parseOutputSchema(raw: string): Record<string, unknown> {
     obj = JSON.parse(raw);
   } catch (e) {
     throw new Error(`agent-card.json: output_schema_json is not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) {
+    throw new Error("agent-card.json: output_schema_json must be a JSON Schema object");
+  }
+  return obj as Record<string, unknown>;
+}
+
+// loadSeed reads the seed directory the daemon populated at launch. Missing
+// files degrade gracefully (empty prompt, "{}" input) so a partially-seeded
+// box still runs rather than crashing.
+export function loadSeed(dir: string = process.env.AGENT_SEED_DIR ?? DEFAULT_SEED_DIR): Seed {
+  const systemPrompt = readIfPresent(dir, "system_prompt.txt").trim();
+  const inputJson = readIfPresent(dir, "input.json").trim() || "{}";
+
+  let agentCard: AgentCard | null = null;
+  const cardRaw = readIfPresent(dir, "agent-card.json").trim();
+  if (cardRaw) {
+    try {
+      agentCard = JSON.parse(cardRaw) as AgentCard;
+    } catch {
+      agentCard = null; // a malformed card is non-fatal; discovery just degrades
+    }
+  }
+
+  const tokenFile = join(dir, "token");
+  const tokenPath = existsSync(tokenFile) ? tokenFile : null;
+
+  const mcpRaw = readIfPresent(dir, "platform_mcp.json").trim();
+  const platformMcp = mcpRaw ? parsePlatformMcp(mcpRaw) : null;
+
+  const schemaRaw = typeof agentCard?.outputSchemaJson === "string" ? agentCard.outputSchemaJson.trim() : "";
+  const outputSchema = schemaRaw ? parseOutputSchema(schemaRaw) : null;
+
+  return { systemPrompt, inputJson, agentCard, tokenPath, platformMcp, outputSchema };
+}
