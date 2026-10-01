@@ -121,3 +121,126 @@ export default function TrafficView({
           ) : (
             <div className="flex flex-col gap-2">
               {allRoutesWithTraffic.map(({ type, route, traffic }) => {
+                const isProxy = type === 'proxy';
+                const proxyRoute = isProxy ? (route as ProxyRoute) : null;
+                const passthroughRoute = !isProxy ? (route as PassthroughRoute) : null;
+                const requests = traffic?.requestsPerMin || 0;
+                const percentage = maxTraffic > 0 ? (requests / maxTraffic) * 100 : 0;
+                const routeKey = isProxy ? proxyRoute?.fullDomain : `${passthroughRoute?.externalPort}-${passthroughRoute?.protocol}`;
+                const label = isProxy
+                  ? (isGRPCRoute(proxyRoute?.protocol) ? 'gRPC' : 'HTTP')
+                  : getRouteProtocolName(passthroughRoute?.protocol);
+
+                return (
+                  <div key={routeKey} className={`rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] p-3 ${!route.active ? 'opacity-50' : ''}`}>
+                    <div className="mb-1.5 flex items-center gap-2">
+                      {isProxy
+                        ? <Globe size={13} className="shrink-0 text-[var(--accent)]" />
+                        : <Network size={13} className="shrink-0 text-[var(--c-violet)]" />}
+                      <span className={`flex-1 truncate font-mono text-xs font-medium text-[var(--text)] ${!route.active ? 'line-through' : ''}`}>
+                        {isProxy ? proxyRoute?.fullDomain : `:${passthroughRoute?.externalPort}`}
+                      </span>
+                      <span className={`rounded-full border px-2 py-0.5 text-[10px] ${isProxy ? 'border-blue-500/30 bg-blue-500/10 text-[var(--c-blue)]' : 'border-violet-500/30 bg-violet-500/10 text-[var(--c-violet)]'}`}>
+                        {label}
+                      </span>
+                      <span className="text-[10px] text-[var(--text-muted)]">
+                        {requests > 0 ? `${formatTraffic(requests)} req/min` : 'No traffic'}
+                      </span>
+                    </div>
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--surface-2)]">
+                      <div className={`h-1.5 rounded-full transition-all ${route.active ? (isProxy ? 'bg-[var(--accent)]' : 'bg-violet-500') : 'bg-[var(--border)]'}`} style={{ width: `${percentage}%` }} />
+                    </div>
+                    <div className="mt-1 flex justify-between text-[10px] text-[var(--text-muted)]">
+                      <span>
+                        → {isProxy ? `${proxyRoute?.containerIp}:${proxyRoute?.port}` : `${passthroughRoute?.targetIp}:${passthroughRoute?.targetPort}`}
+                        {(isProxy ? proxyRoute?.appName : passthroughRoute?.containerName) && (
+                          <span> ({isProxy ? proxyRoute?.appName : passthroughRoute?.containerName})</span>
+                        )}
+                      </span>
+                      {traffic && traffic.bytesPerMin > 0 && <span>{formatBytes(traffic.bytesPerMin)}/min</span>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Container Connections Tab */}
+      {activeTab === 1 && (
+        <div className="flex flex-col gap-4">
+          {/* Controls */}
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] p-4">
+            <select value={selectedContainer} onChange={e => setSelectedContainer(e.target.value)} className={selectCls} style={{ minWidth: 250 }}>
+              <option value="">Select a container</option>
+              {runningContainers.map(c => <option key={c.name} value={c.name}>{c.name} ({c.ipAddress})</option>)}
+            </select>
+            <div className="flex items-center gap-2">
+              <span className={`rounded-full border px-2 py-0.5 text-[10px] ${eventStatus === 'connected' ? 'border-emerald-500/30 bg-emerald-500/10 text-[var(--c-emerald)]' : 'border-[var(--border-subtle)] bg-[var(--surface-2)] text-[var(--text-muted)]'}`}>
+                {eventStatus === 'connected' ? 'Live' : eventStatus}
+              </span>
+              <button onClick={toggleAutoRefresh} title={autoRefresh ? 'Pause auto-refresh' : 'Enable auto-refresh'} className="rounded p-1.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)]">
+                {autoRefresh ? <Pause size={13} /> : <Play size={13} />}
+              </button>
+              <button onClick={refresh} disabled={!selectedContainer} title="Refresh now" className="rounded p-1.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)] disabled:opacity-40">
+                <RefreshCw size={13} />
+              </button>
+            </div>
+          </div>
+
+          {!selectedContainer && (
+            <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 p-3 text-xs text-[var(--c-blue)]">
+              Select a running container to view its network connections.
+            </div>
+          )}
+
+          {error && selectedContainer && (
+            <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-[var(--c-red)]">
+              Failed to load traffic data: {error.message || 'Unknown error'}
+            </div>
+          )}
+
+          {selectedContainer && (
+            <>
+              {summary && (
+                <div className="flex flex-wrap gap-6 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] px-5 py-3">
+                  {[
+                    { label: 'Active Connections', value: summary.activeConnections },
+                    { label: 'TCP', value: summary.tcpConnections },
+                    { label: 'UDP', value: summary.udpConnections },
+                    { label: 'Total Sent', value: formatBytes(summary.totalBytesSent) },
+                    { label: 'Total Received', value: formatBytes(summary.totalBytesReceived) },
+                  ].map(s => (
+                    <div key={s.label} className="flex flex-col">
+                      <span className="text-[10px] text-[var(--text-muted)]">{s.label}</span>
+                      <span className="text-lg font-semibold text-[var(--text)]">{s.value}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] p-4">
+                <p className="mb-3 text-xs font-medium text-[var(--text)]">Active Connections ({connections.length})</p>
+                <ConnectionsTable connections={connections} isLoading={isLoading} />
+              </div>
+
+              {summary?.topDestinations && summary.topDestinations.length > 0 && (
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface)] p-4">
+                  <p className="mb-3 text-xs font-medium text-[var(--text)]">Top Destinations</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {summary.topDestinations.slice(0, 10).map(dest => (
+                      <span key={dest.destIp} className="rounded-full border border-[var(--border-subtle)] bg-[var(--surface-2)] px-2 py-0.5 text-[10px] text-[var(--text-secondary)]">
+                        {dest.destIp} ({dest.connectionCount} conn, {formatBytes(dest.bytesTotal)})
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
