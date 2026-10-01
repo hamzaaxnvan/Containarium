@@ -50,3 +50,55 @@ func TestScopesFromGRPCContext_EmptyClaimIsPresentNotAbsent(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			ctx := metadata.NewIncomingContext(context.Background(), c.md)
+			got, present := ScopesFromGRPCContext(ctx)
+			if present != c.wantPresent {
+				t.Errorf("present = %v, want %v", present, c.wantPresent)
+			}
+			if len(got) != c.wantLen {
+				t.Errorf("scopes = %v (len %d), want len %d", got, len(got), c.wantLen)
+			}
+		})
+	}
+}
+
+// The consequence that matters: an explicit empty grant must be DENIED, not
+// waved through as unrestricted.
+func TestRequireScope_DeniesAnExplicitEmptyGrant(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs(MDKeyUsername, "alice", MDKeyRoles, "user", MDKeyScopes, ""))
+
+	if err := RequireScope(ctx, ScopeContainersRead); err == nil {
+		t.Fatal("a caller holding an explicit empty grant was allowed — " +
+			"an empty grant is being read as unrestricted")
+	}
+}
+
+// The backward-compatible case must NOT change: a token with no scopes claim
+// stays unrestricted until strict mode is armed (#1679). Flipping this would
+// reject every pre-scopes token in the fleet.
+func TestRequireScope_AbsentClaimStaysUnrestricted(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs(MDKeyUsername, "alice", MDKeyRoles, "user"))
+
+	if err := RequireScope(ctx, ScopeContainersRead); err != nil {
+		t.Fatalf("an absent scopes claim was denied: %v — this would reject "+
+			"every token minted before scopes existed", err)
+	}
+}
+
+// Both transports must agree. The same logical credential arriving as a
+// context value or as metadata cannot get opposite answers.
+func TestScopeTransports_AgreeOnAnEmptyGrant(t *testing.T) {
+	viaMetadata := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs(MDKeyUsername, "alice", MDKeyScopes, ""))
+	viaContextValue := context.WithValue(context.Background(), ContextKeyScopes, []string{})
+
+	_, mdPresent := ScopesFromGRPCContext(viaMetadata)
+	_, cvPresent := ScopesFromGRPCContext(viaContextValue)
+
+	if mdPresent != cvPresent {
+		t.Errorf("metadata present=%v but context-value present=%v — the same "+
+			"credential gets different authority depending on which hop it arrived through",
+			mdPresent, cvPresent)
+	}
+}
