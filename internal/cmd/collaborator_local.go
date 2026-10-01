@@ -56,3 +56,61 @@ func addCollaboratorLocal(ownerUsername, collaboratorUsername string, sshPublicK
 }
 
 func removeCollaboratorLocal(ownerUsername, collaboratorUsername string) error {
+	// Create container manager
+	containerMgr, err := container.New()
+	if err != nil {
+		return fmt.Errorf("failed to connect to Incus: %w (is Incus running?)", err)
+	}
+
+	// Create collaborator store
+	collaboratorStore, err := collaborator.NewStore(context.Background(), getPostgresConnString())
+	if err != nil {
+		return fmt.Errorf("failed to connect to collaborator database: %w\n(Is PostgreSQL running? Set CONTAINARIUM_POSTGRES_URL if using non-default location)", err)
+	}
+	defer collaboratorStore.Close()
+
+	// Create collaborator manager
+	collaboratorMgr := container.NewCollaboratorManager(containerMgr, collaboratorStore)
+
+	// Remove collaborator
+	if err := collaboratorMgr.RemoveCollaborator(ownerUsername, collaboratorUsername); err != nil {
+		return fmt.Errorf("failed to remove collaborator: %w", err)
+	}
+
+	fmt.Printf("Collaborator %s removed from %s-container\n", collaboratorUsername, ownerUsername)
+	return nil
+}
+
+// listCollaboratorsLocal returns []collaboratorRow, not []collaborator.Collaborator
+// — the dispatcher (collaborator_list.go, no build tag) needs a signature
+// that also exists under containarium_client (local_stubs_client.go's
+// stub), and internal/collaborator imports pgx, which the client build
+// must never link in. collaboratorRow is a plain cmd-package type with no
+// such dependency.
+func listCollaboratorsLocal(ownerUsername string) ([]collaboratorRow, error) {
+	containerName := ownerUsername + "-container"
+
+	// Create collaborator store
+	collaboratorStore, err := collaborator.NewStore(context.Background(), getPostgresConnString())
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to collaborator database: %w\n(Is PostgreSQL running? Set CONTAINARIUM_POSTGRES_URL if using non-default location)", err)
+	}
+	defer collaboratorStore.Close()
+
+	// List collaborators
+	collaborators, err := collaboratorStore.List(context.Background(), containerName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list collaborators: %w", err)
+	}
+
+	rows := make([]collaboratorRow, 0, len(collaborators))
+	for _, c := range collaborators {
+		rows = append(rows, collaboratorRow{
+			CollaboratorUsername: c.CollaboratorUsername,
+			AccountName:          c.AccountName,
+			CreatedAt:            c.CreatedAt,
+			CreatedBy:            c.CreatedBy,
+		})
+	}
+	return rows, nil
+}
