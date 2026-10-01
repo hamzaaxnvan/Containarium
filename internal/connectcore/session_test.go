@@ -73,3 +73,79 @@ func TestBuildSessionExecArgs(t *testing.T) {
 		t.Errorf("bash -s should follow the destination: %q", joined)
 	}
 }
+
+func TestBuildAttachArgs(t *testing.T) {
+	args := BuildAttachArgs(Target{User: "alice", Host: "10.0.0.5", Port: 2222}, "/k/id", "work")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"-t", "-p 2222", "alice@10.0.0.5", "tmux new-session -A -s work"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("attach args %q missing %q", joined, want)
+		}
+	}
+	if args[0] != "-t" {
+		t.Errorf("first arg = %q, want -t (force PTY)", args[0])
+	}
+}
+
+func TestParseSessionResult_Success(t *testing.T) {
+	m := "deadbeef"
+	raw := "CNTR_RC_" + m + "=0\nCNTR_OUT_BEGIN_" + m + "\n/app\n\nCNTR_OUT_END_" + m + "\n"
+	out, code, err := ParseSessionResult(raw, m)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 0 {
+		t.Errorf("code = %d, want 0", code)
+	}
+	if out != "/app\n" {
+		t.Errorf("out = %q, want %q", out, "/app\n")
+	}
+}
+
+func TestParseSessionResult_NonZeroExit(t *testing.T) {
+	m := "cafe1234"
+	raw := "CNTR_RC_" + m + "=2\nCNTR_OUT_BEGIN_" + m + "\nboom\n\nCNTR_OUT_END_" + m + "\n"
+	out, code, err := ParseSessionResult(raw, m)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if code != 2 {
+		t.Errorf("code = %d, want 2", code)
+	}
+	if !strings.Contains(out, "boom") {
+		t.Errorf("out = %q, want it to contain boom", out)
+	}
+}
+
+func TestParseSessionResult_NoTmux(t *testing.T) {
+	m := "aaaa1111"
+	if _, _, err := ParseSessionResult("CNTR_NO_TMUX_"+m+"\n", m); !errors.Is(err, ErrNoTmux) {
+		t.Fatalf("err = %v, want ErrNoTmux", err)
+	}
+}
+
+func TestParseSessionResult_Timeout(t *testing.T) {
+	m := "bbbb2222"
+	raw := "CNTR_RC_" + m + "=timeout\nCNTR_OUT_BEGIN_" + m + "\npartial\nCNTR_OUT_END_" + m + "\n"
+	out, _, err := ParseSessionResult(raw, m)
+	if !errors.Is(err, ErrSessionTimeout) {
+		t.Fatalf("err = %v, want ErrSessionTimeout", err)
+	}
+	if !strings.Contains(out, "partial") {
+		t.Errorf("timeout should still return partial output, got %q", out)
+	}
+}
+
+// Command output that happens to contain a delimiter-looking string must
+// not break parsing, because the real delimiters carry the random marker.
+func TestParseSessionResult_OutputCannotSpoofDelimiter(t *testing.T) {
+	m := "9f9f9f9f"
+	raw := "CNTR_RC_" + m + "=0\nCNTR_OUT_BEGIN_" + m + "\nfake CNTR_OUT_END_other line\n\nCNTR_OUT_END_" + m + "\n"
+	out, code, err := ParseSessionResult(raw, m)
+	if err != nil || code != 0 {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if !strings.Contains(out, "fake CNTR_OUT_END_other") {
+		t.Errorf("output with a non-matching delimiter should survive: %q", out)
+	}
+}
