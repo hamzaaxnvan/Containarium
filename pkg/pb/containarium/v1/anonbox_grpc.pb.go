@@ -153,3 +153,159 @@ type AnonymousBoxServiceServer interface {
 type UnimplementedAnonymousBoxServiceServer struct{}
 
 func (UnimplementedAnonymousBoxServiceServer) EnsureAnonymousBox(context.Context, *EnsureAnonymousBoxRequest) (*EnsureAnonymousBoxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureAnonymousBox not implemented")
+}
+func (UnimplementedAnonymousBoxServiceServer) ClaimAnonymousBox(context.Context, *ClaimAnonymousBoxRequest) (*ClaimAnonymousBoxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ClaimAnonymousBox not implemented")
+}
+func (UnimplementedAnonymousBoxServiceServer) GetAnonymousDoorConfig(context.Context, *GetAnonymousDoorConfigRequest) (*AnonymousDoorConfig, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetAnonymousDoorConfig not implemented")
+}
+func (UnimplementedAnonymousBoxServiceServer) SetAnonymousDoorConfig(context.Context, *SetAnonymousDoorConfigRequest) (*AnonymousDoorConfig, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetAnonymousDoorConfig not implemented")
+}
+func (UnimplementedAnonymousBoxServiceServer) ListAnonymousBoxes(context.Context, *ListAnonymousBoxesRequest) (*ListAnonymousBoxesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListAnonymousBoxes not implemented")
+}
+func (UnimplementedAnonymousBoxServiceServer) mustEmbedUnimplementedAnonymousBoxServiceServer() {}
+func (UnimplementedAnonymousBoxServiceServer) testEmbeddedByValue()                             {}
+
+// UnsafeAnonymousBoxServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to AnonymousBoxServiceServer will
+// result in compilation errors.
+type UnsafeAnonymousBoxServiceServer interface {
+	mustEmbedUnimplementedAnonymousBoxServiceServer()
+}
+
+func RegisterAnonymousBoxServiceServer(s grpc.ServiceRegistrar, srv AnonymousBoxServiceServer) {
+	// If the following call panics, it indicates UnimplementedAnonymousBoxServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&AnonymousBoxService_ServiceDesc, srv)
+}
+
+func _AnonymousBoxService_EnsureAnonymousBox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureAnonymousBoxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AnonymousBoxServiceServer).EnsureAnonymousBox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AnonymousBoxService_EnsureAnonymousBox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AnonymousBoxServiceServer).EnsureAnonymousBox(ctx, req.(*EnsureAnonymousBoxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AnonymousBoxService_ClaimAnonymousBox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClaimAnonymousBoxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AnonymousBoxServiceServer).ClaimAnonymousBox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AnonymousBoxService_ClaimAnonymousBox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AnonymousBoxServiceServer).ClaimAnonymousBox(ctx, req.(*ClaimAnonymousBoxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AnonymousBoxService_GetAnonymousDoorConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetAnonymousDoorConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AnonymousBoxServiceServer).GetAnonymousDoorConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AnonymousBoxService_GetAnonymousDoorConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AnonymousBoxServiceServer).GetAnonymousDoorConfig(ctx, req.(*GetAnonymousDoorConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AnonymousBoxService_SetAnonymousDoorConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetAnonymousDoorConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AnonymousBoxServiceServer).SetAnonymousDoorConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AnonymousBoxService_SetAnonymousDoorConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AnonymousBoxServiceServer).SetAnonymousDoorConfig(ctx, req.(*SetAnonymousDoorConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AnonymousBoxService_ListAnonymousBoxes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListAnonymousBoxesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AnonymousBoxServiceServer).ListAnonymousBoxes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AnonymousBoxService_ListAnonymousBoxes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AnonymousBoxServiceServer).ListAnonymousBoxes(ctx, req.(*ListAnonymousBoxesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// AnonymousBoxService_ServiceDesc is the grpc.ServiceDesc for AnonymousBoxService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var AnonymousBoxService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.AnonymousBoxService",
+	HandlerType: (*AnonymousBoxServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "EnsureAnonymousBox",
+			Handler:    _AnonymousBoxService_EnsureAnonymousBox_Handler,
+		},
+		{
+			MethodName: "ClaimAnonymousBox",
+			Handler:    _AnonymousBoxService_ClaimAnonymousBox_Handler,
+		},
+		{
+			MethodName: "GetAnonymousDoorConfig",
+			Handler:    _AnonymousBoxService_GetAnonymousDoorConfig_Handler,
+		},
+		{
+			MethodName: "SetAnonymousDoorConfig",
+			Handler:    _AnonymousBoxService_SetAnonymousDoorConfig_Handler,
+		},
+		{
+			MethodName: "ListAnonymousBoxes",
+			Handler:    _AnonymousBoxService_ListAnonymousBoxes_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/anonbox.proto",
+}
