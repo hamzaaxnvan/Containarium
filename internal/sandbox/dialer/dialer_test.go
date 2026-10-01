@@ -168,3 +168,89 @@ func TestDialer_RespectsCallerDeadlineAgainstUnreachableSocket(t *testing.T) {
 
 	socketPath := filepath.Join(t.TempDir(), "nothing-listening.sock")
 	client, err := d.Client(socketPath)
+	if err != nil {
+		t.Fatalf("Client: %v", err) // dialing itself is lazy and must not fail here
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, execErr := client.Exec(ctx, &pb.AgentExecRequest{Command: "true"})
+	elapsed := time.Since(start)
+
+	if execErr == nil {
+		t.Fatal("Exec against an unreachable socket unexpectedly succeeded")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Exec took %s to fail, want well under the caller's ~500ms deadline budget (a wedged/unreachable member must not consume more than that)", elapsed)
+	}
+}
+
+func TestDialer_Forget_ClosesAndEvicts(t *testing.T) {
+	d := New()
+	t.Cleanup(func() { _ = d.Close() })
+
+	socketPath := filepath.Join(t.TempDir(), "spawn.sock")
+	srv, err := agentbox.StartSpawnListener(socketPath)
+	if err != nil {
+		t.Fatalf("StartSpawnListener: %v", err)
+	}
+	t.Cleanup(srv.GracefulStop)
+
+	if _, err := d.Client(socketPath); err != nil {
+		t.Fatalf("Client: %v", err)
+	}
+	if err := d.Forget(socketPath); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+
+	d.mu.Lock()
+	_, stillCached := d.conns[socketPath]
+	d.mu.Unlock()
+	if stillCached {
+		t.Error("connection still cached after Forget")
+	}
+
+	// Forgetting an already-forgotten (or never-dialed) path is a no-op,
+	// not an error — a caller destroying a pool member shouldn't have to
+	// track whether it ever actually claimed a connection.
+	if err := d.Forget(socketPath); err != nil {
+		t.Errorf("Forget on an absent entry returned %v, want nil", err)
+	}
+}
+
+func TestDialer_Close_ClosesAllAndResets(t *testing.T) {
+	d := New()
+
+	pathA := filepath.Join(t.TempDir(), "a.sock")
+	pathB := filepath.Join(t.TempDir(), "b.sock")
+	srvA, err := agentbox.StartSpawnListener(pathA)
+	if err != nil {
+		t.Fatalf("StartSpawnListener a: %v", err)
+	}
+	t.Cleanup(srvA.GracefulStop)
+	srvB, err := agentbox.StartSpawnListener(pathB)
+	if err != nil {
+		t.Fatalf("StartSpawnListener b: %v", err)
+	}
+	t.Cleanup(srvB.GracefulStop)
+
+	if _, err := d.Client(pathA); err != nil {
+		t.Fatalf("Client a: %v", err)
+	}
+	if _, err := d.Client(pathB); err != nil {
+		t.Fatalf("Client b: %v", err)
+	}
+
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	d.mu.Lock()
+	got := len(d.conns)
+	d.mu.Unlock()
+	if got != 0 {
+		t.Errorf("cached connections after Close = %d, want 0", got)
+	}
+}
