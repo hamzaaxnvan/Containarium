@@ -62,3 +62,19 @@ func TestDoorStore_MalformedFileFailsClosed(t *testing.T) {
 	}
 	// A deliberate Set repairs it.
 	if err := s.Set(DefaultDoorConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if s.Err() != nil || !s.Get().Enabled {
+		t.Errorf("Set must clear the poison: err=%v cfg=%+v", s.Err(), s.Get())
+	}
+}
+
+func TestDoorStore_InMemoryOnly(t *testing.T) {
+	s := NewDoorStore("")
+	if err := s.Set(DoorConfig{Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if s.Get().Enabled {
+		t.Error("in-memory set not applied")
+	}
+}
