@@ -355,3 +355,361 @@ func TestIntegrationIncus_StoppingTheLastContainerUnloadsTheTenantKey(t *testing
 //     would stay green against a layout ZFS does not have — which is exactly
 //     how #1336 shipped a dataset name with a doubled path segment, defended
 //     by unit tests, for months.
+//
+//  2. That the lifecycle works with the key UNLOADED. ZFS documents this and
+//     zfscrypt asserts it directly; what is unproven until here is that the
+//     daemon's path — pool lookup, dataset resolution, the RPC — does not
+//     introduce a key dependency of its own along the way.
+func TestIntegrationIncus_SnapshotsAnEncryptedContainerWithTheKeyUnloaded(t *testing.T) {
+	s, _, tenantRoot := encTestEnv(t)
+	zfs := zfscrypt.NewManager(zfscrypt.ExecRunner{})
+	ctx := context.Background()
+
+	tenant := fmt.Sprintf("snp%d", os.Getpid())
+	t.Cleanup(func() { _ = zfs.Destroy(context.Background(), tenantRoot+"/"+tenant) })
+
+	instance := createEncrypted(t, s, tenant)
+	root := tenantRoot + "/" + tenant
+	writeCtx := tenantWithScopes(tenant, auth.ScopeContainersRead, auth.ScopeContainersWrite)
+
+	// (1) A snapshot while the container runs, and the proof that it landed on
+	// the container's ACTUAL dataset rather than a plausible-looking name.
+	if _, err := s.CreateContainerSnapshot(writeCtx, &pb.CreateContainerSnapshotRequest{
+		Username: tenant, Name: "running",
+	}); err != nil {
+		t.Fatalf("CreateContainerSnapshot on a running encrypted container: %v", err)
+	}
+
+	dataset := incusenv.DatasetFor(t, instance)
+	if dataset == "" {
+		t.Fatalf("instance %s has no ZFS dataset", instance)
+	}
+	onDisk, err := zfs.ListSnapshots(ctx, dataset)
+	if err != nil {
+		t.Fatalf("list snapshots of %s directly: %v", dataset, err)
+	}
+	// Asked of ZFS about the dataset Incus reports for the instance — not of
+	// the daemon, which would answer from the same resolution being tested.
+	want := dataset + "@running"
+	found := false
+	for _, s := range onDisk {
+		if s == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ZFS reports %v under the instance's real dataset %s, and %q is not among them.\n\n"+
+			"The daemon resolved some other dataset — on a tenant pool that means either another "+
+			"tenant's storage or nothing at all, and the snapshot an operator believes they took "+
+			"does not exist", onDisk, dataset, want)
+	}
+
+	// (2) Now unload the key the way the daemon does, and prove the whole
+	// lifecycle still works. Blocking here would mean a key-custody outage
+	// silently suppresses the backup window — the one time backups matter.
+	if err := s.boxes().Stop(ctx, box.BoxRef{Tenant: tenant}, true); err != nil {
+		t.Fatalf("stopping %s: %v", instance, err)
+	}
+	s.encryption.PostStop(ctx, instance)
+
+	if status, err := zfs.KeyStatus(ctx, root); err != nil {
+		t.Fatalf("KeyStatus(%s): %v", root, err)
+	} else if status != zfscrypt.KeyUnavailable {
+		t.Fatalf("precondition: the key is %q after stopping the last container, want %q — the "+
+			"rest of this test would prove nothing about an unkeyed dataset", status, zfscrypt.KeyUnavailable)
+	}
+
+	if _, err := s.CreateContainerSnapshot(writeCtx, &pb.CreateContainerSnapshotRequest{
+		Username: tenant, Name: "unkeyed",
+	}); err != nil {
+		t.Fatalf("snapshotting with the key unloaded failed: %v — a key-custody outage would then "+
+			"silently stop backups", err)
+	}
+
+	list, err := s.ListContainerSnapshots(writeCtx, &pb.ListContainerSnapshotsRequest{Username: tenant})
+	if err != nil {
+		t.Fatalf("ListContainerSnapshots with the key unloaded: %v", err)
+	}
+	names := map[string]bool{}
+	for _, snap := range list.GetSnapshots() {
+		names[snap.GetName()] = true
+	}
+	if !names["running"] || !names["unkeyed"] {
+		t.Fatalf("list returned %v, want both snapshots — names are metadata and readable without "+
+			"the key", list.GetSnapshots())
+	}
+
+	if _, err := s.DeleteContainerSnapshot(writeCtx, &pb.DeleteContainerSnapshotRequest{
+		Username: tenant, Name: "unkeyed",
+	}); err != nil {
+		t.Fatalf("deleting with the key unloaded failed: %v — retention would stall exactly when "+
+			"custody is down, turning an outage into unbounded growth", err)
+	}
+
+	after, err := zfs.ListSnapshots(ctx, dataset)
+	if err != nil {
+		t.Fatalf("list snapshots after the delete: %v", err)
+	}
+	for _, s := range after {
+		if s == dataset+"@unkeyed" {
+			t.Fatalf("the snapshot survived a successful-looking delete: %v", after)
+		}
+	}
+	t.Logf("snapshot lifecycle works on %s with the key unloaded; remaining: %v", dataset, after)
+}
+
+// Rollback against a real encrypted container (#1160b).
+//
+// Two claims the unit tests cannot make, because both are properties of ZFS
+// rather than of the daemon:
+//
+//  1. A rollback actually restores the data. The fake asserts that `zfs
+//     rollback` was invoked; only a real pool can show that a file written
+//     after the snapshot is gone afterwards, and one written before survives.
+//  2. The key guard fires on a genuinely unkeyed dataset. The unit test feeds
+//     the fake a canned "unavailable"; here the key is really unloaded, so
+//     the guard is proven against ZFS's real keystatus rather than against a
+//     string this test chose.
+func TestIntegrationIncus_RollbackRestoresDataAndRefusesWithoutTheKey(t *testing.T) {
+	s, _, tenantRoot := encTestEnv(t)
+	zfs := zfscrypt.NewManager(zfscrypt.ExecRunner{})
+	ctx := context.Background()
+
+	tenant := fmt.Sprintf("rbk%d", os.Getpid())
+	t.Cleanup(func() { _ = zfs.Destroy(context.Background(), tenantRoot+"/"+tenant) })
+
+	instance := createEncrypted(t, s, tenant)
+	root := tenantRoot + "/" + tenant
+	rbCtx := tenantWithScopes(tenant, auth.ScopeContainersRead, auth.ScopeContainersWrite)
+
+	exec, ok := s.boxes().(box.ExecCapable)
+	if !ok {
+		t.Fatalf("the box backend cannot exec, so this test cannot show that rollback restores " +
+			"anything; it would degrade to asserting that a command ran")
+	}
+	run := func(what string, cmd ...string) string {
+		t.Helper()
+		stdout, stderr, err := exec.Exec(ctx, box.BoxRef{Tenant: tenant}, cmd)
+		if err != nil {
+			t.Fatalf("%s: %v (stderr: %s)", what, err, stderr)
+		}
+		return stdout
+	}
+
+	// A file that exists at snapshot time, and must survive the rollback.
+	run("seed the container", "sh", "-c", "echo before > /root/marker")
+	if _, err := s.CreateContainerSnapshot(rbCtx, &pb.CreateContainerSnapshotRequest{
+		Username: tenant, Name: "restorepoint",
+	}); err != nil {
+		t.Fatalf("CreateContainerSnapshot: %v", err)
+	}
+	// ...and a change made after it, which must not.
+	run("dirty the container", "sh", "-c", "echo after > /root/marker")
+
+	// Guard 1, against a really-running container.
+	if _, err := s.RollbackContainerSnapshot(rbCtx, &pb.RollbackContainerSnapshotRequest{
+		Username: tenant, Name: "restorepoint",
+	}); err == nil {
+		t.Fatal("rolled back a running container without force — ZFS refuses a busy dataset, so " +
+			"this either failed obscurely or operated on something that was not mounted")
+	}
+
+	// Forced: the daemon stops it, rolls back, and leaves it stopped.
+	resp, ferr := s.RollbackContainerSnapshot(rbCtx, &pb.RollbackContainerSnapshotRequest{
+		Username: tenant, Name: "restorepoint", Force: true,
+	})
+	if ferr != nil {
+		t.Fatalf("forced rollback: %v", ferr)
+	}
+	if !resp.GetContainerStopped() {
+		t.Error("the response does not report stopping a container that was running")
+	}
+
+	// The data claim. Start it again and read the marker back.
+	if err := s.boxes().Start(ctx, box.BoxRef{Tenant: tenant}); err != nil {
+		t.Fatalf("restarting %s after the rollback: %v", instance, err)
+	}
+	out := run("read the marker back", "cat", "/root/marker")
+	if strings.TrimSpace(out) != "before" {
+		t.Fatalf("marker = %q after rolling back, want %q — the rollback ran without restoring "+
+			"anything, which is the outcome an operator would discover during an incident",
+			strings.TrimSpace(out), "before")
+	}
+
+	// Guard 3, against a genuinely unloaded key rather than a canned string.
+	if err := s.boxes().Stop(ctx, box.BoxRef{Tenant: tenant}, true); err != nil {
+		t.Fatalf("stopping %s: %v", instance, err)
+	}
+	s.encryption.PostStop(ctx, instance)
+	if st, err := zfs.KeyStatus(ctx, root); err != nil {
+		t.Fatalf("KeyStatus(%s): %v", root, err)
+	} else if st != zfscrypt.KeyUnavailable {
+		t.Fatalf("precondition: keystatus is %q, want %q — the guard below would prove nothing",
+			st, zfscrypt.KeyUnavailable)
+	}
+
+	_, err := s.RollbackContainerSnapshot(rbCtx, &pb.RollbackContainerSnapshotRequest{
+		Username: tenant, Name: "restorepoint",
+	})
+	if err == nil {
+		t.Fatal("rolled back to a snapshot the daemon cannot read — the operator would believe " +
+			"they had restored data that is ciphertext to them")
+	}
+	if !strings.Contains(err.Error(), "key") {
+		t.Errorf("the refusal does not name key custody, so it reads like corruption: %v", err)
+	}
+	t.Logf("rollback restored the data, and is refused with the key unloaded: %v", err)
+}
+
+// What Incus names ITS ZFS snapshots, and what the tenant snapshot API does
+// with them (#1390).
+//
+// The daemon now snapshots two ways on one dataset:
+//
+//   - `incus snapshot <container> <name>` — Incus-managed, recorded in Incus's
+//     own database, used by MoveContainer for its sync points.
+//   - `zfs snapshot <dataset>@<name>` — the tenant-facing API shipped in
+//     #1160a.
+//
+// `zfscrypt.ListSnapshots` runs `zfs list -t snapshot -r <dataset>`
+// UNFILTERED, so it returns both. Nothing in the repo records what Incus names
+// its snapshots, and that detail decides the fix: a distinct prefix means
+// filter and refuse by name; no distinguishable prefix means list through
+// Incus instead.
+//
+// This test establishes the fact rather than guessing it — the ordering that
+// turned #1160c's premise from plausible into disproved (#1384).
+//
+// It began as a characterization test pinning the leak, and was converted to
+// the positive assertion when the fix landed — which is what it asked its
+// reader to do. It is kept rather than retired because the underlying
+// condition has not gone away: two mechanisms still write snapshots to one
+// dataset, and only the filtering in between is new. If Incus changes the
+// prefix it uses, incusSnapshotPrefix silently stops matching and every guard
+// built on it opens; this is the test that notices.
+func TestIntegrationIncus_TenantSnapshotAPISeesIncusOwnSnapshots(t *testing.T) {
+	s, _, _ := encTestEnv(t)
+	ctx := context.Background()
+
+	tenant := fmt.Sprintf("reg%d", os.Getpid())
+	instance := tenant + "-container"
+	t.Cleanup(func() { incusenv.DeleteInstance(t, instance) })
+
+	rpcCtx, cancel := context.WithTimeout(
+		tenantWithScopes(tenant, auth.ScopeContainersRead, auth.ScopeContainersWrite), 25*time.Minute)
+	defer cancel()
+
+	// An ordinary unencrypted container: this defect has nothing to do with
+	// encryption, and using the plain path keeps that clear.
+	if _, err := s.CreateContainer(rpcCtx, &pb.CreateContainerRequest{
+		Username:  tenant,
+		Image:     incusenv.BoxImage(),
+		OsType:    pb.OSType_OS_TYPE_UBUNTU_2404,
+		Resources: &pb.ResourceLimits{Disk: "5GB"},
+	}); err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+
+	// Take an Incus-level snapshot, the way MoveContainer means to.
+	//
+	// NOT through incus.ExecRunner.Snapshot, which is what MoveContainer
+	// actually calls: this test's first run showed that shells out to
+	// `incus snapshot <c> <name>`, and Incus 6.0.0 rejects it because
+	// `incus snapshot` is a command GROUP there. That is a separate defect in
+	// production migration code — see
+	// TestIntegrationIncus_MigrationRunnerCLISurface, which establishes the
+	// whole surface, and the issue filed from it.
+	//
+	// Both forms are tried here so this test survives whichever Incus the lane
+	// runs, and so it keeps working after ExecRunner is fixed.
+	const incusSnap = "containarium-move-sync0"
+	snapArgv := probeCandidates(t, "snapshot", [][]string{
+		{"snapshot", "create", instance, incusSnap},
+		{"snapshot", instance, incusSnap},
+	})
+	if snapArgv == nil {
+		t.Fatal("could not create an Incus-level snapshot by any known syntax, so the leak this " +
+			"test exists to pin cannot be produced")
+	}
+	// `incus snapshot delete`, not `incus delete <c>/<snap>` — the latter is
+	// what #1392 established this Incus rejects.
+	t.Cleanup(func() { _, _ = incusRun("snapshot", "delete", instance, incusSnap) })
+
+	// And a tenant-facing one through the shipped API, so the listing below
+	// has one of each to tell apart.
+	if _, err := s.CreateContainerSnapshot(rpcCtx, &pb.CreateContainerSnapshotRequest{
+		Username: tenant, Name: "tenant-taken",
+	}); err != nil {
+		t.Fatalf("CreateContainerSnapshot: %v", err)
+	}
+
+	// THE FACT: what ZFS actually calls Incus's snapshot.
+	dataset := incusenv.DatasetFor(t, instance)
+	if dataset == "" {
+		t.Fatalf("instance %s has no ZFS dataset", instance)
+	}
+	zfs := zfscrypt.NewManager(zfscrypt.ExecRunner{})
+	onDisk, err := zfs.ListSnapshots(ctx, dataset)
+	if err != nil {
+		t.Fatalf("list snapshots of %s: %v", dataset, err)
+	}
+	t.Logf("FACT for #1390: ZFS snapshots on %s after one `incus snapshot %s` and one "+
+		"CreateContainerSnapshot: %v", dataset, incusSnap, onDisk)
+
+	// The tenant-facing listing, which is where the defect shows.
+	resp, err := s.ListContainerSnapshots(rpcCtx, &pb.ListContainerSnapshotsRequest{Username: tenant})
+	if err != nil {
+		t.Fatalf("ListContainerSnapshots: %v", err)
+	}
+	var names []string
+	for _, snap := range resp.GetSnapshots() {
+		names = append(names, snap.GetName())
+	}
+	t.Logf("FACT for #1390: ListContainerSnapshots reports %v", names)
+
+	// The tenant's own snapshot must be there — otherwise the rest says
+	// nothing, because an empty listing would also contain no Incus snapshot.
+	tenantVisible := false
+	for _, n := range names {
+		if n == "tenant-taken" {
+			tenantVisible = true
+		}
+	}
+	if !tenantVisible {
+		t.Fatalf("the tenant's own snapshot is missing from %v — this test cannot say anything "+
+			"about leakage until the listing is known to work", names)
+	}
+
+	// Which of the reported names corresponds to Incus's snapshot? Matched by
+	// substring rather than by an assumed prefix, precisely because the prefix
+	// is the unknown this test exists to record.
+	leaked := ""
+	for _, n := range names {
+		if strings.Contains(n, incusSnap) {
+			leaked = n
+		}
+	}
+	// THE assertion, now positive (#1390 fixed).
+	//
+	// This block used to be a characterization assertion pinning the leak,
+	// with instructions to convert it once the filter landed. It has been
+	// converted rather than deleted: the leak is a property of two mechanisms
+	// sharing one dataset, which is still true — only the filtering is new.
+	if leaked != "" {
+		t.Fatalf("the tenant snapshot API reports Incus's own snapshot as %q.\n\n"+
+			"ZFS shows %v on this dataset, and the tenant listing must contain the tenant's "+
+			"snapshots and nothing else. During a migration these are live sync points, and a "+
+			"tenant deleting a row they do not recognise destroys one — leaving Incus's database "+
+			"referencing a snapshot that no longer exists.\n\n"+
+			"If Incus has changed the prefix it gives its ZFS snapshots, incusSnapshotPrefix in "+
+			"container_snapshot.go is now wrong and every guard built on it is silently open.",
+			leaked, onDisk)
+	}
+
+	// And the filter must not have swallowed everything: an empty listing
+	// would satisfy the assertion above while breaking the feature. Already
+	// checked via tenantVisible before this point, so this only records the
+	// shape for whoever reads the log.
+	t.Logf("#1390 holds: ZFS shows %d snapshot(s) on the dataset, the tenant API reports %v — "+
+		"Incus's %q is present on disk and correctly hidden", len(onDisk), names, incusSnap)
+}
