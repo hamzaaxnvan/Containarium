@@ -181,3 +181,65 @@ func TestNetworkPolicy_InstallDurableStoreEndsRejectionWithoutRestart(t *testing
 	s.InstallDurableStore(durable)
 
 	if !s.Durable() {
+		t.Fatal("InstallDurableStore did not flip Durable()")
+	}
+	if s.Store() != NetworkPolicyStore(durable) {
+		t.Fatal("InstallDurableStore did not install the store")
+	}
+	if _, err := s.SetNetworkPolicy(ctx, req); err != nil {
+		t.Fatalf("after attach: %v", err)
+	}
+	if _, err := durable.Get(ctx, "bob"); err != nil {
+		t.Fatalf("write did not reach the attached store: %v", err)
+	}
+}
+
+// The decision on #3131 keeps the daemon's own writers live while degraded:
+// rejecting them would drop an enforcement effect (a quarantined tenant's
+// egress block, an agent box's egress restriction) for the whole window.
+func TestNetworkPolicy_DegradedInProcessWritersNotRejected(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("cloud policy sync", func(t *testing.T) {
+		s := newDegradedNPServer(t)
+		if err := newCloudPolicySink(s).SyncNetworkPolicies(ctx, []*cloudv1.NetworkPolicy{{OrgId: "org-1"}}); err != nil {
+			t.Fatalf("cloud sync rejected while degraded: %v", err)
+		}
+		if _, err := s.Store().Get(ctx, "org-1"); err != nil {
+			t.Fatalf("cloud policy not in the fallback store: %v", err)
+		}
+	})
+
+	t.Run("agent-skill launch policy", func(t *testing.T) {
+		s := newDegradedNPServer(t)
+		p := &pb.NetworkPolicy{
+			Tenant:    "agent-tenant",
+			DenyRules: []*pb.NetworkPolicyDenyRule{{Cidr: "10.0.0.5/32", Note: a2aDenyNote}},
+		}
+		if err := storeAgentSkillPolicy(ctx, s.Store(), p); err != nil {
+			t.Fatalf("agent-skill policy rejected while degraded: %v", err)
+		}
+		got, err := s.Store().Get(ctx, "agent-tenant")
+		if err != nil || len(got.GetDenyRules()) != 1 {
+			t.Fatalf("agent-skill policy not in the fallback store: %v, %v", got, err)
+		}
+	})
+
+	t.Run("auto-quarantine", func(t *testing.T) {
+		s := newDegradedNPServer(t)
+		NewAutoQuarantine(s.Store()).OnScanResult("alice-box", "alice", "infected")
+		got, err := s.Store().Get(ctx, "alice")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		found := false
+		for _, r := range got.GetDenyRules() {
+			if r.GetCidr() == quarantineCIDR && strings.Contains(r.GetNote(), "quarantine") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("quarantine deny rule not written while degraded: %v", got.GetDenyRules())
+		}
+	})
+}
