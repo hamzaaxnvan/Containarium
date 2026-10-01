@@ -40,3 +40,24 @@ func TestCheckParentLoginGrace(t *testing.T) {
 			CheckParentLoginGrace(func() ([]byte, error) { return tc.cmdline, tc.err }, func(f string, a ...any) {
 				warns = append(warns, strings.TrimSpace(fmt.Sprintf(f, a...)))
 			})
+			var got []string
+			for _, w := range warns {
+				if strings.HasPrefix(w, "WARN") {
+					got = append(got, w)
+				}
+			}
+			if (len(got) > 0) != tc.wantWarn {
+				t.Fatalf("warn=%v want %v; logs=%q", len(got) > 0, tc.wantWarn, warns)
+			}
+			if tc.wantLog != "" && !strings.Contains(strings.Join(got, "\n"), tc.wantLog) {
+				t.Fatalf("warning missing %q: %q", tc.wantLog, got)
+			}
+		})
+	}
+}
+
+func TestMinLoginGraceIsCapPlusMargin(t *testing.T) {
+	if MinLoginGrace != MaxApprovalWait+LoginGraceMargin {
+		t.Fatalf("MinLoginGrace %v", MinLoginGrace)
+	}
+}
