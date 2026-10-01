@@ -70,3 +70,76 @@ func TestMemStore_DenyRulesPersistAndSetPreserves(t *testing.T) {
 		t.Fatalf("Set #2: %v", err)
 	}
 	got, _ = s.Get(ctx, "acme")
+	if len(got.GetDenyRules()) != 1 {
+		t.Fatalf("set wiped deny rules; want them preserved, got %+v", got.GetDenyRules())
+	}
+	if len(got.GetEgressCidrs()) != 1 || got.GetEgressCidrs()[0] != "10.0.0.0/8" {
+		t.Errorf("set should have updated the allow-list: %+v", got.GetEgressCidrs())
+	}
+}
+
+// TestEncodeDecodeDenyRules round-trips the JSONB persistence shape.
+func TestEncodeDecodeDenyRules(t *testing.T) {
+	in := []*pb.NetworkPolicyDenyRule{
+		{Cidr: "1.2.3.4/32", Port: 6379, Proto: "tcp", Note: "CVE-1", ExpiresAt: "2026-07-01T00:00:00Z"},
+		{Cidr: "10.0.0.0/8"},
+	}
+	b, err := encodeDenyRules(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	out, err := decodeDenyRules(b)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(out) != 2 || out[0].GetCidr() != "1.2.3.4/32" || out[0].GetPort() != 6379 || out[0].GetProto() != "tcp" || out[0].GetExpiresAt() != "2026-07-01T00:00:00Z" {
+		t.Fatalf("round-trip mismatch: %+v", out)
+	}
+	// Empty/`[]`/nil all decode to nil (no rules).
+	for _, b := range [][]byte{nil, []byte("[]"), []byte("")} {
+		if got, err := decodeDenyRules(b); err != nil || got != nil {
+			t.Errorf("decodeDenyRules(%q) = (%v, %v), want (nil, nil)", b, got, err)
+		}
+	}
+}
+
+// allow_from_tenants (#2359) round-trips through the in-memory store and is
+// copied, not aliased, so a caller mutating its slice cannot change stored
+// state.
+func TestMemStore_AllowFromTenantsRoundTrip(t *testing.T) {
+	s := NewMemNetworkPolicyStore()
+	in := []string{"bob", "carol"}
+	if err := s.Set(context.Background(), &pb.NetworkPolicy{Tenant: "alice", AllowFromTenants: in}); err != nil {
+		t.Fatal(err)
+	}
+	in[0] = "mallory"
+	got, err := s.Get(context.Background(), "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.AllowFromTenants) != 2 || got.AllowFromTenants[0] != "bob" || got.AllowFromTenants[1] != "carol" {
+		t.Errorf("AllowFromTenants = %v, want [bob carol]", got.AllowFromTenants)
+	}
+	list, err := s.List(context.Background())
+	if err != nil || len(list) != 1 || len(list[0].AllowFromTenants) != 2 {
+		t.Errorf("List = %v, %v", list, err)
+	}
+}
+
+func TestMemStore_EgressModeRoundTrip(t *testing.T) {
+	s := NewMemNetworkPolicyStore()
+	if err := s.Set(context.Background(), &pb.NetworkPolicy{
+		Tenant:     "alice",
+		Mode:       pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE,
+		EgressMode: pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(context.Background(), "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetEgressMode() != pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY {
+		t.Errorf("EgressMode = %v, want LOG_ONLY", got.GetEgressMode())
+	}
+}
