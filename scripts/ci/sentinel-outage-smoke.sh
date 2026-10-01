@@ -55,3 +55,60 @@ cleanup() {
   trap - EXIT
   if "$needs_start"; then
     echo "Restoring backend after failure" >&2
+    start_backend || rc=1
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+baseline="$(identity)" || fail "cannot read sentinel identity"
+grep -Eq '^MainPID=[1-9][0-9]*$' <<< "$baseline" || fail "sentinel service is not running"
+initial_ip="$(backend_ip)"
+[[ -n "$initial_ip" ]] || fail "backend has no internal IP"
+probe_ssh || fail "SSH baseline failed"
+probe_https || fail "HTTPS baseline failed"
+backend_ready || fail "backend health baseline failed"
+assert_sentinel_alive() {
+  local current
+  current="$(identity)" || fail "sentinel became unreachable"
+  [[ "$current" == "$baseline" ]] || fail "sentinel restarted"
+}
+
+echo "Starting outage: $(date -u +%FT%TZ); requested duration=${OUTAGE_SECONDS}s"
+# Set before stopping: even an ambiguous stop failure must attempt recovery.
+needs_start=true
+gcloud compute instances stop "$BACKEND_VM" --project "$GCP_PROJECT" --zone "$GCP_ZONE" --quiet
+outage_start=$SECONDS
+if probe_ssh; then fail "SSH still works with the backend stopped; check the test target"; fi
+if probe_https; then fail "HTTPS still works with the backend stopped; check the test target"; fi
+while (( SECONDS - outage_start < OUTAGE_SECONDS )); do
+  assert_sentinel_alive
+  sleep 1
+done
+assert_sentinel_alive
+start_backend
+needs_start=false
+[[ "$(backend_ip)" == "$initial_ip" ]] || fail "backend IP changed"
+boot_start=$SECONDS
+until backend_ready; do
+  assert_sentinel_alive
+  (( SECONDS - boot_start < BOOT_TIMEOUT_SECONDS )) || fail "backend did not become ready"
+  sleep 1
+done
+# Measure re-registration/forwarding recovery from backend readiness, not from
+# the cloud operation completing while the VM is still booting.
+recovery_start=$SECONDS
+while (( SECONDS - recovery_start < RECOVERY_SECONDS )); do
+  assert_sentinel_alive
+  if probe_ssh && probe_https; then
+    assert_sentinel_alive
+    elapsed=$(( SECONDS - recovery_start ))
+    (( elapsed <= RECOVERY_SECONDS )) || fail "forwarding recovered outside the allowed interval"
+    echo "PASS: same-IP SSH and HTTPS recovered in ${elapsed}s; sentinel PID/start time/restart count unchanged"
+    exit 0
+  fi
+  sleep 1
+done
+fail "forwarding did not recover within ${RECOVERY_SECONDS}s"

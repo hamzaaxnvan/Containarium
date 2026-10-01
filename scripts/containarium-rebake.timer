@@ -18,3 +18,8 @@ RandomizedDelaySec=1800
 # on the next boot rather than staying stale until the following Sunday.
 Persistent=true
 
+# Minute granularity is fine for a weekly job.
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target
