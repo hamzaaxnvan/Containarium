@@ -68,3 +68,21 @@ func TestPeersHandler_WrongSecretTreatedAsUnsigned(t *testing.T) {
 }
 
 func TestPeersHandler_UnconfiguredSecretNeverTrustsSignature(t *testing.T) {
+	m := newManagerForPeersTest("")
+	raw, _ := peersCall(t, m, "", "") // no secret: nobody can be signed
+	if strings.Contains(raw, "pool") {
+		t.Fatalf("leaks pool: %s", raw)
+	}
+}
+
+func TestPeersHandler_SignedSeesPoolAndFilter(t *testing.T) {
+	m := newManagerForPeersTest(peersTestSecret)
+	_, all := peersCall(t, m, "", peersTestSecret)
+	if len(all) != 2 || all[0].Pool != "prod" {
+		t.Fatalf("signed caller should see pool: %+v", all)
+	}
+	_, none := peersCall(t, m, "?pool=ghost", peersTestSecret)
+	if len(none) != 0 {
+		t.Fatalf("signed ?pool= filter must still work: %+v", none)
+	}
+}
