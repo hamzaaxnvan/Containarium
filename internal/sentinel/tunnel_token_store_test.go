@@ -140,3 +140,39 @@ func TestRemoveTunnelTokenEntriesByPrefix_DropsEveryMatch(t *testing.T) {
 	}
 }
 
+// TestRemoveTunnelTokenEntriesByPrefix_IsALiteralPrefixMatch documents that
+// this helper is a plain strings.HasPrefix match with no opinion about a
+// trailing "." — "abc" DOES match "abcd.xyz" at this layer. The #1963
+// footgun ("abc" must not wrongly match "abcd.xyz") is guarded one layer
+// up, by TunnelTokenDeregisterHandler rejecting any token_prefix that
+// doesn't end with "." before it ever reaches this function (see
+// TestTunnelTokenDeregisterHandler_400OnPrefixWithoutTrailingDot).
+func TestRemoveTunnelTokenEntriesByPrefix_IsALiteralPrefixMatch(t *testing.T) {
+	entries := []TunnelTokenEntry{{Token: "abcd.xyz", Pools: []Pool{PoolAny}}}
+	got := removeTunnelTokenEntriesByPrefix(entries, "abc")
+	if len(got) != 0 {
+		t.Errorf("expected the entry to be removed by a plain prefix match, got %+v", got)
+	}
+}
+
+func TestRemoveTunnelTokenEntriesByPrefix_UnknownPrefixIsANoOp(t *testing.T) {
+	entries := []TunnelTokenEntry{{Token: "host-a.secret1", Pools: []Pool{PoolAny}}}
+	got := removeTunnelTokenEntriesByPrefix(entries, "host-z.")
+	if len(got) != 1 || got[0].Token != "host-a.secret1" {
+		t.Errorf("removing an unmatched prefix changed the set: %+v", got)
+	}
+}
+
+func TestSaveTunnelTokenStore_FileMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tunnel-tokens.json")
+	if err := SaveTunnelTokenStore(path, []TunnelTokenEntry{{Token: "tok-a", Pools: []Pool{PoolAny}}}); err != nil {
+		t.Fatalf("SaveTunnelTokenStore: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("tunnel token store mode = %o, want 0600 (each entry is a bearer-equivalent secret)", info.Mode().Perm())
+	}
+}
