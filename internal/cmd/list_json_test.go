@@ -36,3 +36,41 @@ func TestListJSONShape(t *testing.T) {
 		}
 	}
 	if len(got) != 2 {
+		t.Errorf("`list --json` emits %d keys, want exactly 2: %v", len(got), keysOfRaw(got))
+	}
+}
+
+func TestGroupedListJSONShape(t *testing.T) {
+	out := groupedListJSON{
+		GroupBy:    "env",
+		Groups:     map[string][]incus.ContainerInfo{"prod": {{Name: "alice-container"}}},
+		GroupCount: 1,
+		TotalCount: 1,
+	}
+
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"group_by", "groups", "group_count", "total_count"} {
+		if _, ok := got[key]; !ok {
+			t.Errorf("`list --group-by --json` no longer emits %q", key)
+		}
+	}
+	if len(got) != 4 {
+		t.Errorf("emits %d keys, want exactly 4: %v", len(got), keysOfRaw(got))
+	}
+}
+
+func keysOfRaw(m map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}

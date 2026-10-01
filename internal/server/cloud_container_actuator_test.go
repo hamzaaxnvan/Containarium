@@ -73,3 +73,22 @@ func TestTenantLabelStale(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			if got := tenantLabelStale(c.orgID, c.currentTenant); got != c.want {
+				t.Errorf("tenantLabelStale(%q, %q) = %v, want %v", c.orgID, c.currentTenant, got, c.want)
+			}
+		})
+	}
+}
+
+func TestBuildContainerConfig_MinimalOmitsDevices(t *testing.T) {
+	cfg := buildContainerConfig(cloud.ContainerSpec{LocalName: "cld-x", Image: "alpine"}, "default")
+	if cfg.Memory != "" {
+		t.Errorf("no RAM → memory unset, got %q", cfg.Memory)
+	}
+	if cfg.Disk != nil {
+		t.Errorf("no disk → Disk nil, got %+v", cfg.Disk)
+	}
+	if len(cfg.GPUs) != 0 {
+		t.Errorf("no GPU → GPUs empty, got %+v", cfg.GPUs)
+	}
+}
