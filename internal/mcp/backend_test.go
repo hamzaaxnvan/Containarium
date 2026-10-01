@@ -71,3 +71,22 @@ func TestCloudBackend_HostOnlyOpsSuppressedWithoutNetwork(t *testing.T) {
 
 // A SHARED operation on the cloud backend still passes through to the server
 // (inherited from *Client) — proving only host-level ops are suppressed, not
+// the whole surface.
+func TestCloudBackend_SharedOpsPassThrough(t *testing.T) {
+	t.Setenv("CONTAINARIUM_MCP_ALLOW_INSECURE", "true")
+	var hit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"containers":[]}`)
+	}))
+	defer srv.Close()
+
+	cb := cloudClient{NewClient(srv.URL, "ctnr_test.tok")}
+	if _, err := cb.ListContainers(); err != nil {
+		t.Fatalf("ListContainers on the cloud backend: %v", err)
+	}
+	if !hit {
+		t.Fatal("a shared op (ListContainers) must still reach the server on the cloud backend")
+	}
+}
