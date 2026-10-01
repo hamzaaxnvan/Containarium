@@ -101,3 +101,315 @@ func TestEnsureTLSSubjects_WildcardCoversDirectChild(t *testing.T) {
 
 	p := NewProxyManager(srv.URL, "example.com")
 	before := fc.puts
+
+	if err := p.EnsureTLSSubjects([]string{"app.example.com"}); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+
+	if fc.puts != before {
+		t.Fatalf("wildcard *.example.com already covers app.example.com; adding an explicit "+
+			"subject burns ACME budget on a redundant cert (#378). Writes: %d", fc.puts-before)
+	}
+}
+
+// A wildcard is exactly one label deep — `*.example.com` does NOT cover
+// `a.b.example.com`. Treating it as covered would leave the deeper host with
+// no certificate and no signal, reintroducing #1584 for multi-label hosts.
+func TestEnsureTLSSubjects_WildcardDoesNotCoverDeeperLabel(t *testing.T) {
+	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"*.example.com"},
+		[]CaddyTLSIssuer{NewACMEIssuer()},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+
+	if err := p.EnsureTLSSubjects([]string{"a.b.example.com"}); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+
+	policies := readPolicies(t, fc)
+	if !hasSubject(policies, "a.b.example.com") {
+		t.Fatalf("*.example.com does not cover a.b.example.com, so it must be added explicitly; "+
+			"subjects: %v", subjectsOf(policies))
+	}
+}
+
+// Several routes can be missing subjects at once — after a Caddy config
+// rebuild, or on a host that hit #1585 repeatedly. One write, not N.
+func TestEnsureTLSSubjects_BatchesMissingSubjectsIntoOneWrite(t *testing.T) {
+	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"kept.example.com"},
+		[]CaddyTLSIssuer{NewACMEIssuer()},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+	before := fc.puts
+
+	want := []string{"a.example.com", "b.example.com", "c.example.com"}
+	if err := p.EnsureTLSSubjects(want); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+
+	if got := fc.puts - before; got != 1 {
+		t.Errorf("want exactly 1 batched write for 3 missing subjects, got %d", got)
+	}
+
+	policies := readPolicies(t, fc)
+	for _, w := range want {
+		if !hasSubject(policies, w) {
+			t.Errorf("subject %q missing after batch reconcile; subjects: %v", w, subjectsOf(policies))
+		}
+	}
+	if !hasSubject(policies, "kept.example.com") {
+		t.Error("reconciliation dropped a pre-existing subject — it must only add")
+	}
+}
+
+// A host whose TLS app has no policies at all (fresh Caddy, or one that just
+// reverted to the stub Caddyfile per #400) must still get its subjects.
+func TestEnsureTLSSubjects_CreatesPolicyWhenNoneExist(t *testing.T) {
+	srv, fc := newRWFakeCaddy(nil)
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+
+	if err := p.EnsureTLSSubjects([]string{"app.example.com"}); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+
+	policies := readPolicies(t, fc)
+	if !hasSubject(policies, "app.example.com") {
+		t.Fatalf("no policy existed and none was created; subjects: %v", subjectsOf(policies))
+	}
+	if len(policies) == 0 || len(policies[0].Issuers) == 0 {
+		t.Fatal("created policy has no issuers — Caddy would never attempt the certificate")
+	}
+}
+
+// A policy that predates DNS-01 carries issuers that cannot solve a wildcard
+// (#1066). Reconciliation appends to that same policy, so it must repair the
+// issuers the way ProvisionTLS does — otherwise the reconciled subject sits
+// there unissued, which is the very symptom #1584 is about.
+func TestEnsureTLSSubjects_RepairsIssuersWhenAppending(t *testing.T) {
+	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"other.example.com"},
+		[]CaddyTLSIssuer{NewACMEIssuer(), NewZeroSSLIssuer()},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com").WithDNSChallenge(testDNSChallenge())
+
+	if err := p.EnsureTLSSubjects([]string{"app.example.com"}); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+
+	policies := readPolicies(t, fc)
+	if len(policies) != 1 {
+		t.Fatalf("want 1 policy, got %d", len(policies))
+	}
+	assertAllIssuersSolveDNS(t, policies[0])
+}
+
+// Empty input must not touch Caddy — a host with no routes yet reconciles on
+// every tick too.
+func TestEnsureTLSSubjects_EmptyInputIsNoOp(t *testing.T) {
+	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"app.example.com"},
+		[]CaddyTLSIssuer{NewACMEIssuer()},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+	before := fc.puts
+
+	if err := p.EnsureTLSSubjects(nil); err != nil {
+		t.Fatalf("EnsureTLSSubjects(nil): %v", err)
+	}
+	if fc.puts != before {
+		t.Fatalf("empty input wrote to Caddy %d time(s)", fc.puts-before)
+	}
+}
+
+// The same domain appearing twice (two routes, one hostname) must not produce
+// a duplicate subject entry.
+func TestEnsureTLSSubjects_DeduplicatesInput(t *testing.T) {
+	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"kept.example.com"},
+		[]CaddyTLSIssuer{NewACMEIssuer()},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+
+	if err := p.EnsureTLSSubjects([]string{"app.example.com", "app.example.com"}); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+
+	var count int
+	for _, s := range subjectsOf(readPolicies(t, fc)) {
+		if s == "app.example.com" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("want subject exactly once, got %d occurrences", count)
+	}
+}
+
+// --- CodeRabbit review findings on PR #1589 ---
+
+// A non-200 on the policies GET left `policies` empty, and the code then fell
+// through to the "no policies exist" branch and POSTed a fresh one. POST to a
+// Caddy array path APPENDS, so a transient admin-API failure would graft a
+// duplicate policy alongside the real ones — and this reconciler runs every
+// tick, so a flapping admin API would accumulate them. Fail instead.
+func TestEnsureTLSSubjects_ErrorsOnUnexpectedPolicyGetStatus(t *testing.T) {
+	var wrote bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		// ensureTLSApp's probe: report the app as present so we reach the
+		// policies GET rather than short-circuiting into createTLSApp.
+		case r.URL.Path == "/config/apps/tls" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"automation":{"policies":[]}}`))
+		case r.URL.Path == "/config/apps/tls/automation/policies" && r.Method == http.MethodGet:
+			http.Error(w, "boom", http.StatusInternalServerError)
+		default:
+			wrote = true
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+
+	err := p.EnsureTLSSubjects([]string{"app.example.com"})
+	if err == nil {
+		t.Fatal("want an error when the policies GET returns an unexpected status, got nil — " +
+			"falling through would POST a duplicate policy")
+	}
+	if wrote {
+		t.Fatal("must not write configuration after a failed policies read")
+	}
+}
+
+// The wildcard-coverage shortcut can reintroduce #1066 one level up: a policy
+// holding `*.example.com` with pre-DNS-01 issuers covers app.example.com on
+// paper, but those issuers categorically cannot solve a wildcard, so the cert
+// is never issued and the host has no certificate — exactly the #1584 symptom,
+// reached by skipping the repair ProvisionTLS would have done.
+func TestEnsureTLSSubjects_RepairsIssuersOfCoveringWildcardPolicy(t *testing.T) {
+	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"*.example.com"},
+		[]CaddyTLSIssuer{NewACMEIssuer(), NewZeroSSLIssuer()}, // no DNS-01
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com").WithDNSChallenge(testDNSChallenge())
+
+	if err := p.EnsureTLSSubjects([]string{"app.example.com"}); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+
+	policies := readPolicies(t, fc)
+	if len(policies) != 1 {
+		t.Fatalf("want 1 policy, got %d", len(policies))
+	}
+	assertAllIssuersSolveDNS(t, policies[0])
+
+	// Still no redundant per-host subject — the wildcard genuinely covers it
+	// once its issuers can solve it.
+	if hasSubject(policies, "app.example.com") {
+		t.Error("wildcard covers this host; an explicit subject burns ACME budget (#378)")
+	}
+}
+
+// Repairing covering policies must stay silent when there is nothing to repair,
+// or the every-tick reconciler churns Caddy's config forever.
+func TestEnsureTLSSubjects_NoWriteWhenCoveringWildcardIssuersAlreadySolveDNS(t *testing.T) {
+	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"*.example.com"},
+		issuersFor(testDNSChallenge()),
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com").WithDNSChallenge(testDNSChallenge())
+	before := fc.puts
+
+	if err := p.EnsureTLSSubjects([]string{"app.example.com"}); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+	if fc.puts != before {
+		t.Fatalf("issuers already solve DNS-01; want no write, got %d", fc.puts-before)
+	}
+}
+
+// captureLog redirects the shared log.Default() output to a buffer for the
+// duration of the test and restores it after — this package's tests never
+// run in parallel, so a global redirect is safe here.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	original := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(original) })
+	return &buf
+}
+
+// TestEnsureTLSSubjects_WarnsWhenNewSubjectsZoneIsUncovered (#1739's
+// remaining "zones sufficient" half): adding a brand-new subject whose zone
+// the DNS-01 credential can't see must warn distinctly from either "no
+// credential" (#1738) or "credential rejected" (#1740) — this is the case
+// where the token IS valid, just scoped to the wrong zones.
+func TestEnsureTLSSubjects_WarnsWhenNewSubjectsZoneIsUncovered(t *testing.T) {
+	srv, _ := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"other.example.com"},
+		[]CaddyTLSIssuer{NewACMEIssuer()},
+	))
+	defer srv.Close()
+
+	zonesSrv := fakeCloudflareZones(t, "scoped-token", []string{"covered-elsewhere.com"}, 50)
+	withFakeCloudflareZonesURL(t, zonesSrv.URL)
+	t.Setenv("CONTAINARIUM_ACME_DNS_PROVIDER", "cloudflare")
+	t.Setenv("CF_API_TOKEN", "scoped-token")
+
+	buf := captureLog(t)
+
+	p := NewProxyManager(srv.URL, "example.com").WithDNSChallenge(testDNSChallenge())
+	if err := p.EnsureTLSSubjects([]string{"app.example.com"}); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+
+	got := buf.String()
+	if !strings.Contains(got, "app.example.com") || !strings.Contains(got, "no zone covering") {
+		t.Fatalf("expected a zone-coverage warning naming app.example.com, got log output: %q", got)
+	}
+}
+
+// A fully-covering credential must stay silent — the reconciler runs on
+// every tick that adds a subject, and noise there would bury the cases that
+// actually need attention.
+func TestEnsureTLSSubjects_NoZoneWarningWhenCovered(t *testing.T) {
+	srv, _ := newRWFakeCaddy(tlsConfigWithPolicy(
+		[]string{"other.example.com"},
+		[]CaddyTLSIssuer{NewACMEIssuer()},
+	))
+	defer srv.Close()
+
+	zonesSrv := fakeCloudflareZones(t, "good-token", []string{"example.com"}, 50)
+	withFakeCloudflareZonesURL(t, zonesSrv.URL)
+	t.Setenv("CONTAINARIUM_ACME_DNS_PROVIDER", "cloudflare")
+	t.Setenv("CF_API_TOKEN", "good-token")
+
+	buf := captureLog(t)
+
+	p := NewProxyManager(srv.URL, "example.com").WithDNSChallenge(testDNSChallenge())
+	if err := p.EnsureTLSSubjects([]string{"app.example.com"}); err != nil {
+		t.Fatalf("EnsureTLSSubjects: %v", err)
+	}
+
+	if strings.Contains(buf.String(), "no zone covering") {
+		t.Fatalf("credential's zone covers the new subject; want no zone-coverage warning, got: %q", buf.String())
+	}
+}
