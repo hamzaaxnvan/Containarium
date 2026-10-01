@@ -97,3 +97,202 @@ func apiCall(method, path string, body any) (map[string]any, error) {
 		return nil, fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, raw)
 	}
 	if len(raw) == 0 {
+		return nil, nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("%s %s: decode response: %w\n%s", method, path, err, raw)
+	}
+	return out, nil
+}
+
+// e2eAPI wraps apiCall for use inside a test: any error fails the test
+// immediately, since every caller here is fixture setup or a ground-truth
+// read that the test's own assertions depend on.
+func e2eAPI(t testing.TB, method, path string, body any) map[string]any {
+	t.Helper()
+	out, err := apiCall(method, path, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestMain(m *testing.M) {
+	e2eBaseURL = strings.TrimSuffix(os.Getenv("GITLAB_E2E_URL"), "/")
+	e2eToken = os.Getenv("GITLAB_E2E_TOKEN")
+	if e2eBaseURL == "" || e2eToken == "" {
+		// Let the individual tests fail loudly via e2eRequire rather than
+		// silently skipping the whole binary here.
+		os.Exit(m.Run())
+	}
+
+	name := fmt.Sprintf("e2e-%d", time.Now().UnixNano())
+	proj, err := apiCall(http.MethodPost, "/projects", map[string]any{
+		"name": name, "path": name, "visibility": "private",
+		"initialize_with_readme": false,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gitlab e2e: create project:", err)
+		os.Exit(1)
+	}
+	if proj == nil {
+		fmt.Fprintln(os.Stderr, "gitlab e2e: project creation returned no body")
+		os.Exit(1)
+	}
+	e2eProjectID = int(proj["id"].(float64))
+	e2eProject = proj["path_with_namespace"].(string)
+
+	code := m.Run()
+
+	if _, err := apiCall(http.MethodDelete, fmt.Sprintf("/projects/%d", e2eProjectID), nil); err != nil {
+		fmt.Fprintln(os.Stderr, "gitlab e2e: cleanup: delete project:", err)
+	}
+	os.Exit(code)
+}
+
+func e2eConn(t testing.TB) tracker.Conn {
+	t.Helper()
+	e2eRequire(t, "GITLAB_E2E_URL")
+	e2eRequire(t, "GITLAB_E2E_TOKEN")
+	if e2eProject == "" {
+		t.Fatal("gitlab e2e: no project (TestMain did not run — env was set after the binary started?)")
+	}
+	return tracker.Conn{BaseURL: e2eBaseURL, Project: e2eProject, Credential: e2eToken}
+}
+
+func e2eCreateIssue(t testing.TB, title string) int64 {
+	t.Helper()
+	resp := e2eAPI(t, http.MethodPost, fmt.Sprintf("/projects/%s/issues", url.PathEscape(e2eProject)),
+		map[string]any{"title": title})
+	return int64(resp["iid"].(float64))
+}
+
+func e2eIssueState(t testing.TB, iid int64) string {
+	t.Helper()
+	resp := e2eAPI(t, http.MethodGet, fmt.Sprintf("/projects/%s/issues/%d", url.PathEscape(e2eProject), iid), nil)
+	return resp["state"].(string)
+}
+
+func e2eIssueAssigneeID(t testing.TB, iid int64) (int64, bool) {
+	t.Helper()
+	resp := e2eAPI(t, http.MethodGet, fmt.Sprintf("/projects/%s/issues/%d", url.PathEscape(e2eProject), iid), nil)
+	a, ok := resp["assignee"].(map[string]any)
+	if !ok || a == nil {
+		return 0, false
+	}
+	return int64(a["id"].(float64)), true
+}
+
+func e2eSetIssueState(t testing.TB, iid int64, event string) {
+	t.Helper()
+	e2eAPI(t, http.MethodPut, fmt.Sprintf("/projects/%s/issues/%d", url.PathEscape(e2eProject), iid),
+		map[string]any{"state_event": event})
+}
+
+func e2ePostRawComment(t testing.TB, iid int64, body string) {
+	t.Helper()
+	e2eAPI(t, http.MethodPost, fmt.Sprintf("/projects/%s/issues/%d/notes", url.PathEscape(e2eProject), iid),
+		map[string]any{"body": body})
+}
+
+// TestGitLabE2E_QuickActionSanitization is the property a recorded fixture
+// cannot prove: that tracker.Sanitize's transformation of an agent-supplied
+// "/close" defeats GitLab's OWN quick-action parser, not just some assumption
+// about how it works.
+func TestGitLabE2E_QuickActionSanitization(t *testing.T) {
+	conn := e2eConn(t)
+	adapter := trackergitlab.New(nil)
+	ctx := context.Background()
+
+	iid := e2eCreateIssue(t, "sanitization baseline")
+
+	// Baseline: an UNSANITIZED "/close" posted directly (bypassing our
+	// adapter entirely) really does close the issue on this GitLab version.
+	// If this assertion ever starts failing, the sanitizer isn't protecting
+	// against anything real any more and the test itself needs to be revisited
+	// — not silently left green.
+	e2ePostRawComment(t, iid, "/close")
+	if got := e2eIssueState(t, iid); got != "closed" {
+		t.Fatalf("baseline: unsanitized /close did not close the issue (state=%q) — GitLab's quick-action behavior changed; this test's premise needs revisiting", got)
+	}
+	e2eSetIssueState(t, iid, "reopen")
+
+	// The real assertion: through our adapter, with tracker.Sanitize applied
+	// (exactly what internal/server/tracker_write_server.go does before
+	// calling Comment), the same text must NOT close the issue.
+	sanitized := tracker.Sanitize("/close")
+	if sanitized == "/close" {
+		t.Fatal("tracker.Sanitize did not transform /close — nothing to test")
+	}
+	comment, err := adapter.Comment(ctx, conn, iid, sanitized)
+	if err != nil {
+		t.Fatalf("Comment: %v", err)
+	}
+	if got := e2eIssueState(t, iid); got != "opened" {
+		t.Errorf("issue state = %q after a sanitized /close comment, want opened — GitLab executed a quick action our sanitizer was supposed to defeat", got)
+	}
+	issue, err := adapter.GetIssue(ctx, conn, iid)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if issue.State == pb.TrackerIssueState_TRACKER_ISSUE_STATE_CLOSED {
+		t.Error("adapter's own GetIssue also reports the issue closed")
+	}
+	found := false
+	for _, c := range issue.Comments {
+		if c.Body == comment.Body {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("sanitized comment not present in GetIssue's own comment list")
+	}
+}
+
+// TestGitLabE2E_SingleAssigneeBehavior proves AssignIfUnassigned's contract
+// against GitLab's actual single-assignee model (GitLab Free/CE): it assigns
+// once, and a second call is a true no-op rather than an error or a silent
+// reassignment.
+func TestGitLabE2E_SingleAssigneeBehavior(t *testing.T) {
+	conn := e2eConn(t)
+	adapter := trackergitlab.New(nil)
+	ctx := context.Background()
+
+	iid := e2eCreateIssue(t, "single assignee")
+	if _, ok := e2eIssueAssigneeID(t, iid); ok {
+		t.Fatal("freshly created issue already has an assignee")
+	}
+
+	self, err := adapter.WhoAmI(ctx, conn)
+	if err != nil {
+		t.Fatalf("WhoAmI: %v", err)
+	}
+	if self == "" {
+		t.Fatal("WhoAmI returned an empty login")
+	}
+
+	assigned, err := adapter.AssignIfUnassigned(ctx, conn, iid)
+	if err != nil {
+		t.Fatalf("AssignIfUnassigned (first call): %v", err)
+	}
+	if !assigned {
+		t.Fatal("AssignIfUnassigned on an unassigned issue returned false")
+	}
+	gotID, ok := e2eIssueAssigneeID(t, iid)
+	if !ok {
+		t.Fatal("issue has no assignee after AssignIfUnassigned reported true")
+	}
+
+	assigned, err = adapter.AssignIfUnassigned(ctx, conn, iid)
+	if err != nil {
+		t.Fatalf("AssignIfUnassigned (second call): %v", err)
+	}
+	if assigned {
+		t.Error("AssignIfUnassigned on an already-assigned issue returned true — never replaces an existing assignee")
+	}
+	stillID, ok := e2eIssueAssigneeID(t, iid)
+	if !ok || stillID != gotID {
+		t.Errorf("assignee changed across the second call: was %d, now %d (ok=%v)", gotID, stillID, ok)
+	}
+}
