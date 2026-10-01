@@ -79,3 +79,84 @@ func TestSkillRunModel(t *testing.T) {
 
 	if got := withSkillModel(named, "m-1"); got.GetModel() != "m-1" || named.GetModel() != "pinned-model" {
 		t.Errorf("override = %q, catalog skill = %q: want the copy overridden and the shared skill untouched", got.GetModel(), named.GetModel())
+	}
+	if withSkillModel(named, "") != named {
+		t.Error("no model must return the skill itself")
+	}
+}
+
+func modelGraph(skillIDs ...string) *pb.TaskGraph {
+	g := &pb.TaskGraph{Goal: "g"}
+	for i, id := range skillIDs {
+		g.Nodes = append(g.Nodes, skillNode(string(rune('a'+i)), id))
+	}
+	return g
+}
+
+// A graph run with an override reports that model for the node and the default
+// for the other, and hands the node's request the overrides.
+func TestRunCrewGraph_ModelOverrides(t *testing.T) {
+	newReq := func(ov map[string]string) *pb.RunCrewRequest {
+		return &pb.RunCrewRequest{CrewId: "freeform-crew", Graph: modelGraph("hello-agent-claude", "hello-agent-codex"), ModelOverrides: ov}
+	}
+
+	t.Run("override is reported in member_models", func(t *testing.T) {
+		var got map[string]string
+		resp, err := NewCrewServer(nil).runCrewGraph(ctxAs("admin", true),
+			newReq(map[string]string{"hello-agent-claude": "m-override"}), graphCrew(), "graph-model-ok",
+			func(_ context.Context, node *pb.TaskNode, _, _ string, child *pb.RunCrewRequest) (string, error) {
+				if node.GetSkillId() == "hello-agent-claude" {
+					got = child.GetModelOverrides()
+				}
+				return "{}", nil
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got["hello-agent-claude"] != "m-override" {
+			t.Errorf("node request overrides = %v", got)
+		}
+		if m := resp.Run.GetMemberModels()["hello-agent-claude"]; m != "m-override" {
+			t.Errorf("member_models = %v, want the override for the node", resp.Run.GetMemberModels())
+		}
+		if m, ok := resp.Run.GetMemberModels()["hello-agent-codex"]; ok {
+			t.Errorf("the node without an override or pin reported model %q", m)
+		}
+	})
+
+	t.Run("absent override is unchanged", func(t *testing.T) {
+		resp, err := NewCrewServer(nil).runCrewGraph(ctxAs("admin", true), newReq(nil), graphCrew(), "graph-model-none",
+			func(context.Context, *pb.TaskNode, string, string, *pb.RunCrewRequest) (string, error) {
+				return "{}", nil
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Run.GetMemberModels()) != 0 {
+			t.Errorf("member_models = %v, want none", resp.Run.GetMemberModels())
+		}
+	})
+}
+
+// RunCrew refuses a bad override before any node starts (no agent runtime is
+// wired here, so a request that got past validation could not return the code).
+func TestRunCrew_GraphModelOverrideRefusedUpFront(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		graph *pb.TaskGraph
+		ov    map[string]string
+		want  codes.Code
+	}{
+		{"invalid id", modelGraph("hello-agent-claude"), map[string]string{"hello-agent-claude": "bad id"}, codes.InvalidArgument},
+		{"skill no node uses", modelGraph("hello-agent-claude"), map[string]string{"hello-agent-codex": "m-1"}, codes.InvalidArgument},
+		{"node with no named engine", modelGraph("code-review"), map[string]string{"code-review": "m-1"}, codes.FailedPrecondition},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewCrewServer(nil).RunCrew(ctxAs("admin", true),
+				&pb.RunCrewRequest{CrewId: "freeform-crew", Graph: tc.graph, ModelOverrides: tc.ov})
+			if status.Code(err) != tc.want {
+				t.Fatalf("code = %v (%v), want %v", status.Code(err), err, tc.want)
+			}
+		})
+	}
+}
