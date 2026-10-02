@@ -44,3 +44,50 @@ func TestPlantedBucketCheckpointBelowTheChainBase_NotInTheLocalFileFails(t *test
 	// cannot contradict it (those rows are gone), so only the local file can.
 	if err := f.bucket.PublishRoot(ctx, 3, "forged-root"); err != nil {
 		t.Fatalf("plant: %v", err)
+	}
+
+	r, err = VerifyAnchorsAgainstBucket(ctx, s, f.file, f.bucket)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if r.OK() {
+		t.Fatalf("a checkpoint planted below the chain base passed verify-anchor silently; warnings=%v", findingKinds(r.Warnings))
+	}
+	if !hasFinding(r.Failures, FindingMissingLocally, 3) {
+		t.Fatalf("want a missing-locally failure at the planted checkpoint 3, got %v", findingKinds(r.Failures))
+	}
+}
+
+func TestPlantedBucketCheckpointBelowTheChainBase_ForgedRootAtAnAnchoredCheckpointFails(t *testing.T) {
+	ctx := context.Background()
+	s := auditTestStore(t)
+	logN(t, s, 40)
+	f := newAnchorFixture(t, 0)
+
+	// The attacker wins the race for checkpoint 5: the forged object is in the
+	// bucket first, so the daemon's own create-only upload would get a 412 and
+	// the bucket never holds the real root. The local file still gets it.
+	if err := f.bucket.PublishRoot(ctx, 5, "forged-root"); err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+	h, found, err := s.RowHashAt(ctx, 5)
+	if err != nil || !found {
+		t.Fatalf("no row 5: found=%v err=%v", found, err)
+	}
+	if err := f.file.PublishRoot(ctx, 5, h); err != nil {
+		t.Fatal(err)
+	}
+	publishReal(t, s, f, 10, 20, 30, 40)
+	simulatePurge(t, s, 15) // checkpoint 5 is now below the base
+
+	r, err := VerifyAnchorsAgainstBucket(ctx, s, f.file, f.bucket)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if r.OK() {
+		t.Fatalf("a forged bucket root below the chain base passed verify-anchor silently; warnings=%v", findingKinds(r.Warnings))
+	}
+	if !hasFinding(r.Failures, FindingLocalRootDiffers, 5) {
+		t.Fatalf("want a local-root-differs failure at checkpoint 5, got %v", findingKinds(r.Failures))
+	}
+}

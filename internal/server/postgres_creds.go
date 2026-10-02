@@ -33,3 +33,110 @@ import (
 // bit triggers a startup error. That keeps the audit
 // contract from C-HIGH-7 consistent: anywhere we read a
 // credential from disk, we refuse the world-readable
+// case.
+
+const (
+	envPostgresURL          = "CONTAINARIUM_POSTGRES_URL"
+	envPostgresURLFile      = "CONTAINARIUM_POSTGRES_URL_FILE"
+	envPostgresPassword     = "CONTAINARIUM_POSTGRES_PASSWORD"
+	envPostgresPasswordFile = "CONTAINARIUM_POSTGRES_PASSWORD_FILE"
+)
+
+// ResolvePostgresURL returns the full DSN to use. Search
+// order:
+//  1. CONTAINARIUM_POSTGRES_URL_FILE (perm-checked file
+//     with a single-line DSN)
+//  2. CONTAINARIUM_POSTGRES_URL (env var)
+//  3. empty string (caller falls back to auto-detect)
+//
+// An unset / empty result is normal — the daemon's
+// auto-detect path then assembles a DSN from the
+// discovered Postgres container + a password resolved by
+// ResolvePostgresPassword.
+//
+// Returns the DSN and a label for the audit log message
+// ("file", "env", "auto-detect").
+func ResolvePostgresURL() (dsn string, source string, err error) {
+	if path := strings.TrimSpace(os.Getenv(envPostgresURLFile)); path != "" {
+		b, err := readSecretFile(path, envPostgresURLFile)
+		if err != nil {
+			return "", "", err
+		}
+		return strings.TrimSpace(string(b)), "file:" + path, nil
+	}
+	if url := strings.TrimSpace(os.Getenv(envPostgresURL)); url != "" {
+		return url, "env", nil
+	}
+	return "", "auto-detect", nil
+}
+
+// ResolvePostgresPassword returns the password to embed in
+// an auto-assembled DSN. Search order:
+//  1. CONTAINARIUM_POSTGRES_PASSWORD_FILE
+//  2. CONTAINARIUM_POSTGRES_PASSWORD
+//  3. DefaultPostgresPassword (with a WARNING log — the
+//     compiled-in default is dev-only).
+//
+// Returns (password, source) so the caller can log the
+// active source without leaking the password itself.
+func ResolvePostgresPassword() (password string, source string, err error) {
+	password, source, err = resolvePostgresPasswordQuiet()
+	if err == nil && source == "default" {
+		log.Printf("WARNING: Postgres password defaulting to the compiled-in dev value (%q). Set %s or %s for production.",
+			DefaultPostgresPassword, envPostgresPassword, envPostgresPasswordFile)
+	}
+	return password, source, err
+}
+
+// resolvePostgresPasswordQuiet is ResolvePostgresPassword without the
+// default-value warning. NewCoreServices is built several times per start and
+// must resolve the same password the daemon's own connection uses (#2091)
+// without repeating a warning the daemon already logs once.
+func resolvePostgresPasswordQuiet() (password string, source string, err error) {
+	if path := strings.TrimSpace(os.Getenv(envPostgresPasswordFile)); path != "" {
+		b, err := readSecretFile(path, envPostgresPasswordFile)
+		if err != nil {
+			return "", "", err
+		}
+		return strings.TrimSpace(string(b)), "file:" + path, nil
+	}
+	if pw := os.Getenv(envPostgresPassword); pw != "" {
+		return pw, "env", nil
+	}
+	return DefaultPostgresPassword, "default", nil
+}
+
+// PostgresDSN builds the connection URL the daemon uses for the core Postgres.
+// User and password go through url.UserPassword, so a character that is
+// meaningful in a URL (@ / : # ? %) is escaped instead of corrupting the host
+// or database (#2091). For the usual alphanumeric values the result is the same
+// string the daemon has always produced, so existing hosts see no change.
+func PostgresDSN(user, password, host string, port int, database string) string {
+	u := &url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(user, password),
+		Host:     net.JoinHostPort(host, strconv.Itoa(port)),
+		Path:     "/" + database,
+		RawQuery: "sslmode=disable",
+	}
+	return u.String()
+}
+
+// readSecretFile reads a credential file with the same
+// perm contract as auth's readToken (PR #245 audit
+// C-HIGH-7): mode must be ≤ 0600 (no non-owner bits).
+// Returns the trimmed contents.
+func readSecretFile(path, envName string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s=%s: stat: %w", envName, path, err)
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return nil, fmt.Errorf("%s=%s has insecure permissions %#o (any non-owner read/write bit set); chmod 0600 it", envName, path, mode)
+	}
+	b, err := os.ReadFile(path) // #nosec G304 -- path is operator config, already perm-checked
+	if err != nil {
+		return nil, fmt.Errorf("%s=%s: read: %w", envName, path, err)
+	}
+	return b, nil
+}
