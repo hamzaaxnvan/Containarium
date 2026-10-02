@@ -95,3 +95,199 @@ func processPolicyTools() []Tool {
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
+					"container": map[string]interface{}{
+						"type":        "string",
+						"description": "Container to release.",
+					},
+				},
+				"required": []string{"container"},
+			},
+			Handler: handleSecurityProcessPolicyRelease,
+		},
+	}
+}
+
+// processPolicySetInput is the typed shape of security_process_policy_set's
+// arguments, decoded once at the JSON-RPC boundary.
+type processPolicySetInput struct {
+	Action            string `json:"action"`
+	ThrottleAllowance string `json:"throttle_allowance"`
+	TTL               string `json:"ttl"`
+	Container         string `json:"container"`
+	ClearOverride     bool   `json:"clear_override"`
+	// KillProcess is a pointer so "omitted" (inherit) differs from false.
+	KillProcess *bool `json:"kill_process"`
+}
+
+// parseProcessAction maps the tool's spelling (alert|throttle|freeze, any
+// case, with or without the PROCESS_ACTION_ prefix) to the proto enum.
+func parseProcessAction(s string) (pb.ProcessAction, error) {
+	name := strings.ToUpper(strings.TrimSpace(s))
+	name = strings.TrimPrefix(name, "PROCESS_ACTION_")
+	switch name {
+	case "ALERT":
+		return pb.ProcessAction_PROCESS_ACTION_ALERT, nil
+	case "THROTTLE":
+		return pb.ProcessAction_PROCESS_ACTION_THROTTLE, nil
+	case "FREEZE":
+		return pb.ProcessAction_PROCESS_ACTION_FREEZE, nil
+	}
+	return pb.ProcessAction_PROCESS_ACTION_UNSPECIFIED,
+		fmt.Errorf("invalid action %q: allowed values are ALERT, THROTTLE, FREEZE", s)
+}
+
+// buildSetProcessPolicyRequest validates in and builds the request the CLI's
+// `process-policy set` would send.
+func buildSetProcessPolicyRequest(in processPolicySetInput) (*pb.SetProcessPolicyRequest, error) {
+	req := &pb.SetProcessPolicyRequest{Container: in.Container}
+	if in.ClearOverride {
+		if in.Container == "" {
+			return nil, fmt.Errorf("clear_override requires container (only overrides can be cleared)")
+		}
+		if in.Action != "" || in.ThrottleAllowance != "" || in.TTL != "" || in.KillProcess != nil {
+			return nil, fmt.Errorf("clear_override cannot be combined with policy fields")
+		}
+		req.ClearOverride = true
+		return req, nil
+	}
+	pol := &pb.ProcessPolicy{}
+	set := false
+	if in.Action != "" {
+		a, err := parseProcessAction(in.Action)
+		if err != nil {
+			return nil, err
+		}
+		pol.Action, set = a, true
+	}
+	if in.ThrottleAllowance != "" {
+		pol.ThrottleAllowance, set = in.ThrottleAllowance, true // validated by the daemon
+	}
+	if in.TTL != "" {
+		d, err := time.ParseDuration(in.TTL)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("invalid ttl %q: want a positive duration such as 24h or 5m", in.TTL)
+		}
+		pol.Ttl, set = durationpb.New(d), true
+	}
+	if in.KillProcess != nil {
+		pol.KillProcess, set = in.KillProcess, true
+	}
+	if !set {
+		return nil, fmt.Errorf("nothing to set: give action, throttle_allowance, ttl, kill_process or clear_override")
+	}
+	req.Policy = pol
+	return req, nil
+}
+
+func handleSecurityProcessPolicyGet(client API, args map[string]interface{}) (string, error) {
+	resp, err := client.GetProcessPolicy(getStringArg(args, "container", ""))
+	if err != nil {
+		return "", fmt.Errorf("get process policy: %w", err)
+	}
+	return marshalProto(resp)
+}
+
+func handleSecurityProcessPolicySet(client API, args map[string]interface{}) (string, error) {
+	raw, err := json.Marshal(args)
+	if err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+	var in processPolicySetInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+	req, err := buildSetProcessPolicyRequest(in)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.SetProcessPolicy(req)
+	if err != nil {
+		return "", fmt.Errorf("set process policy: %w", err)
+	}
+	return marshalProto(resp)
+}
+
+func handleSecurityProcessPolicyRelease(client API, args map[string]interface{}) (string, error) {
+	container := getStringArg(args, "container", "")
+	if container == "" {
+		return "", fmt.Errorf("container is required")
+	}
+	resp, err := client.ReleaseProcessAction(container)
+	if err != nil {
+		return "", fmt.Errorf("release process action: %w", err)
+	}
+	body, err := marshalProto(resp)
+	if err != nil {
+		return "", err
+	}
+	return releasedFindingNote(resp) + "\n" + body, nil
+}
+
+// releasedFindingNote is the result's first line: what the release did to
+// the finding. A miner-signature finding shared with another box of the
+// tenant that still has an action open or a response queued is kept open
+// (#2766); otherwise it is resolved. Same wording as the CLI.
+func releasedFindingNote(resp *pb.ReleaseProcessActionResponse) string {
+	if resp.GetFindingKeptOpen() {
+		return fmt.Sprintf("Finding #%d kept open: another box still has a response.", resp.GetFinding().GetId())
+	}
+	return fmt.Sprintf("Finding #%d resolved.", resp.GetFinding().GetId())
+}
+
+func marshalProto(m proto.Message) (string, error) {
+	b, err := protojson.MarshalOptions{Multiline: true}.Marshal(m)
+	if err != nil {
+		return "", fmt.Errorf("marshal response: %w", err)
+	}
+	return string(b), nil
+}
+
+func (c *Client) processPolicyRoundTrip(method, path string, req, out proto.Message) error {
+	var body interface{}
+	if req != nil {
+		b, err := protojson.Marshal(req)
+		if err != nil {
+			return fmt.Errorf("failed to marshal request: %w", err)
+		}
+		body = b // []byte is passed through as already-encoded JSON
+	}
+	respBody, err := c.doRequest(method, path, body)
+	if err != nil {
+		return err
+	}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(respBody, out); err != nil {
+		return fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return nil
+}
+
+// GetProcessPolicy reads GET /v1/security/process-policy[?container=].
+func (c *Client) GetProcessPolicy(container string) (*pb.GetProcessPolicyResponse, error) {
+	path := processPolicyPath
+	if container != "" {
+		path += "?" + url.Values{"container": {container}}.Encode()
+	}
+	out := &pb.GetProcessPolicyResponse{}
+	if err := c.processPolicyRoundTrip("GET", path, nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetProcessPolicy writes PUT /v1/security/process-policy.
+func (c *Client) SetProcessPolicy(req *pb.SetProcessPolicyRequest) (*pb.SetProcessPolicyResponse, error) {
+	out := &pb.SetProcessPolicyResponse{}
+	if err := c.processPolicyRoundTrip("PUT", processPolicyPath, req, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ReleaseProcessAction posts POST /v1/security/process-policy/release.
+func (c *Client) ReleaseProcessAction(container string) (*pb.ReleaseProcessActionResponse, error) {
+	out := &pb.ReleaseProcessActionResponse{}
+	if err := c.processPolicyRoundTrip("POST", processPolicyPath+"/release", &pb.ReleaseProcessActionRequest{Container: container}, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
