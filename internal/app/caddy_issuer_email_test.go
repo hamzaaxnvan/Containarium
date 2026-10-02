@@ -124,3 +124,87 @@ func TestEnsureIssuerEmail_NoOpWhenAlreadySet(t *testing.T) {
 
 // With nothing configured there is nothing to repair. Critically it must not
 // blank an email an operator set by hand outside the daemon.
+func TestEnsureIssuerEmail_LeavesPolicyAloneWhenUnset(t *testing.T) {
+	t.Setenv("CONTAINARIUM_ACME_EMAIL", "")
+	p := NewProxyManager("http://127.0.0.1:1", "example.com")
+
+	policy := CaddyTLSAutomationPolicy{
+		Issuers: []CaddyTLSIssuer{{Module: "acme", Email: "set-by-hand@example.com"}},
+	}
+	if p.ensureIssuerEmail(&policy) {
+		t.Error("reported a change when no email is configured")
+	}
+	if policy.Issuers[0].Email != "set-by-hand@example.com" {
+		t.Errorf("clobbered an operator-set email: %q", policy.Issuers[0].Email)
+	}
+}
+
+// The decision to omit ZeroSSL without an email has to reach hosts that are
+// already running, not just newly-created policies — otherwise every host in
+// the fleet keeps the dead issuer it has today and goes on paying a
+// guaranteed-failed issuance attempt per certificate (#1616).
+func TestEnsureIssuerEmail_DropsUnregisterableZeroSSLWhenUnset(t *testing.T) {
+	t.Setenv("CONTAINARIUM_ACME_EMAIL", "")
+	p := NewProxyManager("http://127.0.0.1:1", "example.com")
+
+	policy := CaddyTLSAutomationPolicy{
+		Subjects: []string{"app.example.com"},
+		Issuers:  []CaddyTLSIssuer{{Module: "acme"}, {Module: "acme", CA: zeroSSLDirectory}},
+	}
+
+	if !p.ensureIssuerEmail(&policy) {
+		t.Fatal("expected the unregisterable ZeroSSL issuer to be dropped")
+	}
+	if len(policy.Issuers) != 1 || policy.Issuers[0].CA == zeroSSLDirectory {
+		t.Fatalf("want only the Let's Encrypt issuer left, got %+v", policy.Issuers)
+	}
+	// Idempotent — this runs on every reconcile tick.
+	if p.ensureIssuerEmail(&policy) {
+		t.Error("second pass reported a change; every tick would write to Caddy")
+	}
+}
+
+// A ZeroSSL issuer carrying an address an operator set by hand through Caddy's
+// admin API can register perfectly well. Dropping it because the daemon's own
+// env is unset would delete a working fallback.
+func TestEnsureIssuerEmail_KeepsZeroSSLThatHasItsOwnEmail(t *testing.T) {
+	t.Setenv("CONTAINARIUM_ACME_EMAIL", "")
+	p := NewProxyManager("http://127.0.0.1:1", "example.com")
+
+	policy := CaddyTLSAutomationPolicy{
+		Issuers: []CaddyTLSIssuer{
+			{Module: "acme", Email: "set-by-hand@example.com"},
+			{Module: "acme", CA: zeroSSLDirectory, Email: "set-by-hand@example.com"},
+		},
+	}
+	if p.ensureIssuerEmail(&policy) {
+		t.Error("reported a change against issuers that are already registerable")
+	}
+	if len(policy.Issuers) != 2 {
+		t.Fatalf("dropped a ZeroSSL issuer that has its own contact address: %+v", policy.Issuers)
+	}
+}
+
+// Dropping the dead issuer must never empty the list: `issuers` is
+// `omitempty`, so an empty array disappears from the emitted JSON and Caddy
+// silently falls back to its own defaults — reinstating the very ZeroSSL
+// issuer we just removed.
+func TestEnsureIssuerEmail_NeverLeavesAPolicyWithNoIssuers(t *testing.T) {
+	t.Setenv("CONTAINARIUM_ACME_EMAIL", "")
+	p := NewProxyManager("http://127.0.0.1:1", "example.com")
+
+	policy := CaddyTLSAutomationPolicy{
+		Subjects: []string{"app.example.com"},
+		Issuers:  []CaddyTLSIssuer{{Module: "acme", CA: zeroSSLDirectory}},
+	}
+
+	p.ensureIssuerEmail(&policy)
+	if len(policy.Issuers) == 0 {
+		t.Fatal("policy left with no issuers — Caddy would fall back to its defaults")
+	}
+	for _, is := range policy.Issuers {
+		if is.CA == zeroSSLDirectory {
+			t.Errorf("unregisterable ZeroSSL issuer survived: %+v", is)
+		}
+	}
+}
