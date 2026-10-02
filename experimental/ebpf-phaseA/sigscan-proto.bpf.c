@@ -55,3 +55,118 @@ struct {
 } signatures SEC(".maps");
 
 // Per-CPU scratch for the copied payload window. Per-CPU so concurrent packets on
+// different CPUs don't clobber each other; a single entry is enough.
+struct scratch {
+    __u8 buf[SCAN_WINDOW];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, struct scratch);
+    __uint(max_entries, 1);
+} scan_buf SEC(".maps");
+
+struct scan_ctx {
+    __u32 n;        // valid bytes in the window
+    __u32 match_id; // out: matched signature id, or 0
+};
+
+// match_at is the bpf_loop callback. idx flattens (signature, offset): the high
+// bits select the signature slot, the low log2(SCAN_WINDOW) bits the start offset.
+static long match_at(__u32 idx, void *vctx) {
+    struct scan_ctx *c = vctx;
+    if (c->match_id)
+        return 1; // already matched — stop the loop
+
+    __u32 si = idx / SCAN_WINDOW;          // signature slot
+    __u32 i  = idx & (SCAN_WINDOW - 1);    // start offset in the window
+
+    struct signature *s = bpf_map_lookup_elem(&signatures, &si);
+    if (!s || !s->enabled)
+        return 0;
+    __u32 slen = s->len;
+    if (slen == 0 || slen > SIG_MAX_LEN || i + slen > c->n)
+        return 0; // empty slot, or the pattern can't fit at this offset
+
+    __u32 zero = 0;
+    struct scratch *sc = bpf_map_lookup_elem(&scan_buf, &zero);
+    if (!sc)
+        return 1;
+
+    int miss = 0;
+#pragma clang loop unroll(full)
+    for (__u32 j = 0; j < SIG_MAX_LEN; j++) {
+        if (j < slen) {
+            __u32 k = (i + j) & (SCAN_WINDOW - 1); // static bound; i+slen<=n<=WINDOW so never wraps a real compare
+            if (sc->buf[k] != s->pat[j])
+                miss = 1;
+        }
+    }
+    if (!miss) {
+        c->match_id = s->id;
+        return 1;
+    }
+    return 0;
+}
+
+// scan_window copies up to SCAN_WINDOW payload bytes and searches for any enabled
+// signature. Returns the matched id, or 0.
+static __always_inline __u32 scan_window(struct __sk_buff *skb, __u32 off, __u32 avail) {
+    __u32 zero = 0;
+    struct scratch *sc = bpf_map_lookup_elem(&scan_buf, &zero);
+    if (!sc)
+        return 0;
+    // v1 uses a CONSTANT-size load: clang kept re-deriving a variable length
+    // straight from the skb arithmetic (bypassing every guard) and the verifier
+    // rejected the possibly-zero size. A constant size is verifier-trivial. The
+    // cost is that only packets carrying a full SCAN_WINDOW of payload are scanned
+    // — acceptable for a best-effort cleartext pre-filter (a real WAF is Tier 3),
+    // and revisited when porting (a tiered set of constant loads can cover short
+    // packets without a variable length).
+    if (avail < SCAN_WINDOW)
+        return 0;
+    if (bpf_skb_load_bytes(skb, off, sc->buf, SCAN_WINDOW) < 0)
+        return 0;
+
+    struct scan_ctx ctx = {.n = SCAN_WINDOW, .match_id = 0};
+    bpf_loop(SIG_MAX_COUNT * SCAN_WINDOW, match_at, &ctx, 0);
+    return ctx.match_id;
+}
+
+SEC("classifier/sigscan")
+int sigscan(struct __sk_buff *skb) {
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return TC_ACT_OK;
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return TC_ACT_OK;
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return TC_ACT_OK;
+    if (ip->protocol != IPPROTO_TCP)
+        return TC_ACT_OK;
+    struct tcphdr *tcp = (void *)ip + sizeof(*ip); // assumes ihl=5 (no IP options)
+    if ((void *)(tcp + 1) > data_end)
+        return TC_ACT_OK;
+
+    __u32 tcp_hlen = tcp->doff * 4;
+    if (tcp_hlen < sizeof(*tcp))
+        return TC_ACT_OK;
+    __u32 payload_off = sizeof(*eth) + sizeof(*ip) + tcp_hlen;
+    __u32 skb_len = skb->len;
+    if (payload_off >= skb_len)
+        return TC_ACT_OK; // no payload
+
+    __u32 id = scan_window(skb, payload_off, skb_len - payload_off);
+    // Prototype: prove it verifies; never actually drop. (Production wires id != 0
+    // into the would-deny path.)
+    if (id)
+        return TC_ACT_OK;
+    return TC_ACT_OK;
+}
+
+char LICENSE[] SEC("license") = "Dual MIT/GPL";

@@ -279,3 +279,74 @@ REG_TOKEN=$(curl -sX POST \
 if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = "null" ]; then
   echo "Failed to mint registration token — check GH_PAT scope (this is a ${GH_SCOPE_PATH%%/*} target, which needs '${GH_PAT_SCOPE}')" >&2
   echo "GH_API_BASE in use: ${GH_API_BASE}" >&2
+  exit 1
+fi
+
+# Clear any stale local registration left by a previous ephemeral job whose
+# run.sh exited UNcleanly (box restart, OOM-kill, SIGKILL): config.sh aborts
+# with "Cannot configure ... already configured" whenever .runner exists, and
+# --replace does NOT bypass that local guard — it only resolves a server-side
+# name collision. Without this cleanup the service crash-loops forever on
+# "already configured" and never reaches run.sh, so the runner silently drops
+# offline and CI jobs queue indefinitely. Removing these is safe: --replace
+# below re-claims the name on GitHub's side.
+rm -f .runner .credentials .credentials_rsaparams
+
+# Optional organization runner group (#1217). An env file written before
+# runner groups existed has no RUNNER_GROUP line, hence the default.
+RUNNER_GROUP_ARGS=()
+if [ -n "${RUNNER_GROUP:-}" ]; then
+  RUNNER_GROUP_ARGS=(--runnergroup "$RUNNER_GROUP")
+fi
+
+# Register, run ONE job, exit. --replace overwrites any stale
+# registration with the same name. --ephemeral makes run.sh exit
+# after the first job completes (success or failure).
+./config.sh \
+  --url "${GH_BASE_URL}/${GH_REPO}" \
+  --token "$REG_TOKEN" \
+  --name "$RUNNER_NAME" \
+  --labels "$RUNNER_LABELS" \
+  "${RUNNER_GROUP_ARGS[@]}" \
+  --ephemeral --replace --unattended
+
+./run.sh
+EOF
+
+# ---- systemd unit ----
+cat > /etc/systemd/system/containarium-runner.service <<EOF
+[Unit]
+Description=Containarium ephemeral GitHub Actions runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${RUNNER_USER}
+WorkingDirectory=${RUNNER_HOME}
+ExecStart=/usr/local/bin/containarium-runner-loop
+# Respawn on exit — each iteration is one job. RestartSec=2 buffers a
+# tiny gap so we don't hot-loop if GitHub is rejecting registrations.
+Restart=always
+RestartSec=2
+# Capture stdout/stderr in the journal for easy debugging.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ---- enable + start ----
+systemctl daemon-reload
+systemctl enable --now containarium-runner.service
+
+echo
+echo "================================================================"
+echo "  Runner '${RUNNER_NAME}' is registering with ${GH_REPO}."
+echo "  GitHub server: ${GH_BASE_URL}"
+echo "  Verify at: ${GH_BASE_URL}/${GH_REPO}/settings/actions/runners"
+echo
+echo "  Service: containarium-runner.service"
+echo "  Logs:    journalctl -u containarium-runner -f"
+echo "================================================================"
