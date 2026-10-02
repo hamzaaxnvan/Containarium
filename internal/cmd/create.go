@@ -1,0 +1,794 @@
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/footprintai/containarium/internal/client"
+	"github.com/footprintai/containarium/pkg/core/incus"
+	"github.com/footprintai/containarium/pkg/core/ostype"
+	"github.com/footprintai/containarium/pkg/core/stacks"
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+	"github.com/spf13/cobra"
+)
+
+var createNetworkTenant string
+
+var (
+	sshKeyPath               string
+	noSSHKey                 bool
+	cpuLimit                 string
+	memoryLimit              string
+	diskLimit                string
+	staticIP                 string
+	containerImage           string
+	enablePodman             bool
+	labels                   []string
+	forceRecreate            bool
+	stackID                  string
+	gpuDevices               []string
+	osTypeStr                string
+	isolationStr             string
+	monitoring               bool
+	createEncrypted          bool
+	createTenantID           string
+	createPool               string
+	createBackendID          string
+	createRegion             string
+	createAutoRestartCompose string
+	createGitSource          string
+	createGitRef             string
+	createGitCredentialFile  string
+	createWorkspacePath      string
+	createTTL                string
+	createIdleStop           string
+	createNoAutoSleep        bool
+	createDeleteAfterStopped string
+	createStorageClass       string
+	createMemoryRequest      string
+	createCPURequest         string
+	createWait               bool
+	createWaitTimeout        time.Duration
+)
+
+var createCmd = &cobra.Command{
+	Use:   "create <username>",
+	Short: "Create a new LXC container for a user",
+	Long: `Create a new LXC container with Ubuntu + Podman support for the specified user.
+
+The container will be created with:
+  - Ubuntu 24.04 LTS (or specified image)
+  - Podman and podman-compose installed
+  - SSH server configured
+  - User account with sudo privileges
+  - Configurable resource limits
+  - Optional software stack (see --stack for the available ids and what each one is)
+
+Examples:
+  # Create container with default settings
+  containarium create alice --ssh-key ~/.ssh/id_rsa.pub
+
+  # Create with custom resources and SSH key
+  containarium create bob --ssh-key ~/.ssh/bob.pub --cpu 8 --memory 8GB --disk 100GB
+
+  # Create with Node.js development stack
+  containarium create charlie --ssh-key ~/.ssh/id_rsa.pub --stack nodejs
+
+  # Create with full stack web development tools
+  containarium create dave --ssh-key ~/.ssh/id_rsa.pub --stack fullstack
+
+  # Create a platform-managed service tenant with NO SSH key (access via
+  # incus exec / the daemon only — no private key needs to exist)
+  containarium create cloud-cp --no-ssh-key --podman
+
+  # Create with labels
+  containarium create charlie --ssh-key ~/.ssh/id_rsa.pub --labels team=dev,project=web
+
+  # Force recreate if container already exists
+  containarium create alice --ssh-key ~/.ssh/id_rsa.pub --force
+
+Note on --cpu (LXC backend, --server/daemon mode): it sets a ceiling this
+box may not exceed, not automatically a guaranteed floor. On a host without
+the CPU admission gate enabled and enforced (the default), a declared --cpu
+can go unmet under contention from other boxes — see
+docs/CPU-CAPACITY-ADMISSION.md for when it becomes a real guarantee and how
+to configure it. Local mode (no --server) talks to Incus directly and never
+goes through the daemon, so this gate does not apply there regardless of
+configuration. On the K8s backend,
+--cpu-request (a separate flag, mirrored on resize) is the mechanism for a
+scheduling reservation instead — Kubernetes uses it for placement and
+relative CPU weighting under contention, not as a hard runtime floor
+(--cpu / resources.limits.cpu remains the runtime ceiling either way).`,
+	Args: cobra.ExactArgs(1),
+	RunE: runCreate,
+}
+
+// stackFlagUsage builds the --stack usage string from the live stack catalog,
+// rendering each id with its human name: "database (Database Clients)".
+//
+// Two reasons not to hard-code the list. It drifts -- the previous literal named
+// eight stacks while the catalog shipped fifteen, so docker, the gpu variants,
+// android and kind-kubeflow were undiscoverable from the CLI. And an id alone can
+// actively mislead: "database" reads as "give this container a database" when the
+// stack installs PostgreSQL/MySQL/Redis *clients* and no server, which is silent
+// until something in the container reaches for a server that was never part of the
+// deal (#1128). The name disambiguates it at the point of use.
+//
+// Reads through stacks.GetDefault(), so an operator's /etc/containarium/stacks.yaml
+// is reflected too rather than the compiled-in default being asserted over it.
+func stackFlagUsage() string {
+	all := stacks.GetDefault().GetAllStacks()
+	if len(all) == 0 {
+		// Catalog unreadable (malformed override with no embedded fallback);
+		// a usable flag with a vague description beats a panic in init().
+		return "Software stack to install"
+	}
+	parts := make([]string, 0, len(all))
+	for _, s := range all {
+		if s.Name == "" || s.Name == s.ID {
+			parts = append(parts, s.ID)
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s)", s.ID, s.Name))
+	}
+	return "Software stack to install: " + strings.Join(parts, ", ")
+}
+
+func init() {
+	rootCmd.AddCommand(createCmd)
+
+	createCmd.Flags().StringVar(&sshKeyPath, "ssh-key", "", "Path to SSH public key file (required unless --no-ssh-key)")
+	createCmd.Flags().BoolVar(&noSSHKey, "no-ssh-key", false,
+		"Create a platform-managed service tenant with NO SSH key seeded into "+
+			"authorized_keys. Access is via the platform only (incus exec / daemon "+
+			"RPCs), so no private key needs to exist anywhere. Mutually exclusive "+
+			"with --ssh-key; one of the two is required.")
+	// --ssh-key is required for human dev boxes, but a service tenant opts out
+	// with --no-ssh-key. Enforce "exactly one of the two" in runCreate (cobra's
+	// MarkFlagRequired can't express the either/or).
+	createCmd.MarkFlagsMutuallyExclusive("ssh-key", "no-ssh-key")
+	createCmd.Flags().StringVar(&cpuLimit, "cpu", "4", "CPU limit (number of cores). LXC backend: a ceiling, not automatically a floor — see docs/CPU-CAPACITY-ADMISSION.md for when it's actually guaranteed. K8s backend: pair with --cpu-request for a scheduling reservation (not a runtime floor).")
+	createCmd.Flags().StringVar(&memoryLimit, "memory", "4GB", "Memory limit (e.g., 4GB, 2048MB)")
+	createCmd.Flags().StringVar(&diskLimit, "disk", "50GB", "Disk limit (e.g., 50GB, 100GB)")
+	createCmd.Flags().StringVar(&staticIP, "static-ip", "", "Static IP address (e.g., 10.100.0.100) - empty for DHCP")
+	createCmd.Flags().StringVar(&containerImage, "image", "images:ubuntu/24.04", "Container image to use")
+	createCmd.Flags().BoolVar(&enablePodman, "podman", true, "Enable Podman support (nesting)")
+	createCmd.Flags().StringVar(&stackID, "stack", "", stackFlagUsage())
+	createCmd.Flags().StringSliceVar(&gpuDevices, "gpu", nil, "GPU device(s) for passthrough — index ('0') or PCI address. Repeat or comma-separate for multiple GPUs (e.g., --gpu 0 --gpu 1 or --gpu 0,1)")
+	createCmd.Flags().StringSliceVar(&labels, "labels", []string{}, "Labels in key=value format (can be specified multiple times)")
+	createCmd.Flags().BoolVar(&forceRecreate, "force", false, "Delete and recreate if container already exists")
+	createCmd.Flags().StringVar(&osTypeStr, "os-type", "", "Container OS type: ubuntu, rocky9, rhel9 (overrides --image)")
+	createCmd.Flags().StringVar(&isolationStr, "isolation", "", "Isolation: container (LXC, shared kernel) or vm (QEMU/KVM, own kernel; needs a KVM-capable backend). Default: vm for Windows, container otherwise.")
+	createCmd.Flags().BoolVar(&monitoring, "monitoring", false, "Opt into application-emitted OpenTelemetry. When set, the daemon stamps the container with OTEL_EXPORTER_OTLP_ENDPOINT etc. pointing at the platform's OTel collector, so any OTel SDK inside the container ships telemetry without app-side config. Default off.")
+	createCmd.Flags().BoolVar(&createEncrypted, "encrypted", false, "Encrypt the container's ZFS dataset with a tenant-scoped key instead of the pool-wide key. Requires the daemon to have a KeyProvider configured; the request is refused rather than silently creating an unencrypted container. Default off.")
+	createCmd.Flags().StringVar(&createNetworkTenant, "network-tenant", "", "Native network Tenant (admin, local Linux LXC, guarded before first Start); independent of encryption --tenant")
+	createCmd.Flags().StringVar(&createTenantID, "tenant", "", "Tenant that owns the container, scoping its encryption key. A single-tenant daemon accepts only an empty value or \"default\".")
+	createCmd.Flags().StringVar(&createPool, "pool", "", "Place the container on any healthy backend tagged with this pool (e.g., 'demo', 'lab'). Empty means the local/primary backend. Mutually exclusive with --backend-id unless the chosen backend is in the named pool.")
+	createCmd.Flags().StringVar(&createBackendID, "backend-id", "", "Place the container on a specific backend by ID (e.g., 'tunnel-node-a-gpu'). Use 'containarium backends' to list available backend IDs.")
+	createCmd.Flags().StringVar(&createRegion, "region", "", "Place the container in this region on a multi-region hosted control plane (e.g., 'us-east'). Ignored by a standalone/single-region daemon — nothing changes for it either way. Required on a control plane that serves more than one region and has no configured default.")
+	createCmd.Flags().StringVar(&createAutoRestartCompose, "auto-restart-compose", "",
+		"Path to a compose directory inside the new container; after create, "+
+			"enable the systemd-user autostart unit for that stack so it "+
+			"survives host reboots. Same as running "+
+			"'containarium compose enable <username> --dir <path>' after "+
+			"create. Requires --server (the daemon's ComposeAutostartService "+
+			"backs the call). Best-effort — a failure to enable autostart "+
+			"surfaces a warning but does NOT fail the overall create.")
+	createCmd.Flags().StringVar(&createGitSource, "git-source", "", "Git clone URL to provision into the box's workspace at create time (e.g. https://github.com/org/repo). The daemon fetches it via incus exec — no SSH back to the box. Empty = no source provisioning.")
+	createCmd.Flags().StringVar(&createGitRef, "git-ref", "", "Exact ref to check out for --git-source: full SHA (preferred), branch, tag, or refs/pull/N/merge. Empty = the remote's default branch.")
+	createCmd.Flags().StringVar(&createGitCredentialFile, "git-credential-file", "", "Path to a file holding a bearer token for a private --git-source. Used daemon-side for one fetch; never written to the box's .git/config.")
+	createCmd.Flags().StringVar(&createWorkspacePath, "workspace-path", "", "Where --git-source lands inside the box. Empty defaults to /workspace.")
+	createCmd.Flags().StringVar(&createTTL, "ttl", "", "Birth TTL — auto-delete the box this long after creation (Go duration: '30m', '1h', '24h'; max 168h/7 days). The death date is stamped atomically at create, so the box is reaped even if the client dies right after — no separate 'ttl set' needed (#523). Empty = no TTL.")
+	createCmd.Flags().StringVar(&createIdleStop, "idle-stop", "", "Birth idle-stop — auto-STOP the box (free CPU/RAM, keep disk; wakes on access) after this long with no activity (Go duration: '20m', '1h'). Enables auto-sleep atomically at create, so a crashed/cancelled job still releases compute — no separate 'toggle_auto_sleep' needed (#524). An active SSH/exec session counts as activity, so a box being debugged is never stopped mid-session. Empty = no auto-sleep on a self-hosted daemon; on the hosted platform an org billed per seat defaults to 30 minutes when this is empty (an explicit value above zero is honoured).")
+	createCmd.Flags().BoolVar(&createNoAutoSleep, "no-auto-sleep", false, "Create the box with NO auto-sleep timer. Needed on the hosted platform, where an org billed per seat otherwise defaults to a 30-minute idle-stop; a self-hosted daemon already defaults to no auto-sleep and ignores it. Cannot be combined with --idle-stop.")
+	createCmd.Flags().StringVar(&createDeleteAfterStopped, "delete-after-stopped", "", "Birth stopped→delete — auto-DELETE the box (reclaim disk) once it has been STOPPED this long (Go duration: '6h', '24h'). The second timer of the two-phase lifecycle: pair with --idle-stop to free CPU/RAM fast, then disk after a debug window (#525). The clock resets when the box is woken, so a box you keep investigating is never reaped. Separate opt-in from --idle-stop. Empty = never delete on stop.")
+	createCmd.Flags().StringVar(&createStorageClass, "storage-class", "", "K8s StorageClass for the box's data PVC (K8s backend only). Empty = use the cluster's default StorageClass. Example: 'fast-nvme', 'standard', 'ceph-block'. Ignored on the LXC backend.")
+	createCmd.Flags().StringVar(&createMemoryRequest, "memory-request", "", "K8s memory *request* (K8s backend only), separate from --memory which is always applied as the limit (e.g. '128Mi'). Empty = request equals --memory (today's default, Guaranteed QoS). Set this lower than --memory for Burstable QoS. Ignored on the LXC backend.")
+	createCmd.Flags().StringVar(&createCPURequest, "cpu-request", "", "K8s CPU *request* (K8s backend only), separate from --cpu which is always applied as the limit. Same defaulting and K8s-only scope as --memory-request.")
+	createCmd.Flags().BoolVar(&createWait, "wait", false, "Block until the box finishes provisioning (remote mode). A remote create is async: the daemon returns CREATING immediately and provisions for minutes — SSH only works once the state reaches RUNNING. --wait polls the daemon until then (or --wait-timeout), exiting non-zero if provisioning fails. Local mode provisions synchronously; --wait is a no-op there.")
+	createCmd.Flags().DurationVar(&createWaitTimeout, "wait-timeout", 5*time.Minute, "How long --wait polls before giving up (Go duration).")
+}
+
+// validateStackLocal rejects an unknown --stack before anything is changed,
+// notably before --force deletes the existing box (#2860). Only in local mode:
+// with a server address the daemon's own catalog decides, so a stack defined
+// only in its stacks.yaml is not refused here. Against a daemon, --force asks
+// the daemon to validate the create before it deletes (#2925).
+func validateStackLocal(serverAddr, stackID string) error {
+	if serverAddr != "" {
+		return nil
+	}
+	return stacks.GetDefault().CheckStackID(stackID)
+}
+
+// validateSSHKeyMode enforces "exactly one of --ssh-key / --no-ssh-key".
+// cobra's MarkFlagsMutuallyExclusive also rejects setting both at parse time;
+// this is the authoritative rule and additionally covers the neither case
+// (which a required flag can't express once --no-ssh-key exists). See #388.
+func validateSSHKeyMode(noSSHKey bool, sshKeyPath string) error {
+	if noSSHKey && sshKeyPath != "" {
+		return fmt.Errorf("--ssh-key and --no-ssh-key are mutually exclusive")
+	}
+	if !noSSHKey && sshKeyPath == "" {
+		return fmt.Errorf("--ssh-key is required (or pass --no-ssh-key for a platform-managed service tenant accessed only via incus exec / the daemon)")
+	}
+	return nil
+}
+
+func runCreate(cmd *cobra.Command, args []string) error {
+	if createNetworkTenant != "" && serverAddr == "" {
+		return fmt.Errorf("--network-tenant requires a daemon with the enforced local LXC guard; direct Incus mode is unsupported")
+	}
+	username := args[0]
+
+	// --pool / --backend-id are placement directives that only the
+	// daemon's PeerPool can act on. Local mode (no --server) doesn't
+	// have a peer pool — fail fast rather than silently dropping them.
+	if (createPool != "" || createBackendID != "") && serverAddr == "" {
+		return fmt.Errorf("--pool and --backend-id require --server (cluster mode); they are not supported in local Incus mode")
+	}
+
+	// Parse labels from key=value format
+	parsedLabels := parseLabels(labels)
+
+	// Birth TTL (#523): parse the optional --ttl with the SAME parser +
+	// cap as `containarium ttl set` (parseTTL), so create and set agree on
+	// format and the 7-day bound. Empty = no TTL (today's behavior).
+	var ttlSeconds int64
+	if createTTL != "" {
+		d, err := parseTTL(createTTL)
+		if err != nil {
+			return err
+		}
+		ttlSeconds = int64(d.Seconds())
+	}
+
+	// Birth idle-stop (#524): parse the optional --idle-stop duration into the
+	// minute-resolution idle threshold auto-sleep uses. A positive sub-minute
+	// value rounds up to 1 minute (the smallest threshold the daemon stores).
+	if createNoAutoSleep && createIdleStop != "" {
+		return fmt.Errorf("--no-auto-sleep and --idle-stop are contradictory: pick one")
+	}
+	disableAutoSleep := createNoAutoSleep
+	var idleStopMinutes int32
+	if createIdleStop != "" {
+		d, err := time.ParseDuration(createIdleStop)
+		if err != nil {
+			return fmt.Errorf("invalid --idle-stop %q: %w (expected Go duration like '20m', '1h')", createIdleStop, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("--idle-stop must be positive, got %s", createIdleStop)
+		}
+		idleStopMinutes = int32(d.Minutes())
+		if idleStopMinutes < 1 {
+			idleStopMinutes = 1
+		}
+	}
+
+	// Birth stopped→delete (#525): parse the optional --delete-after-stopped
+	// into seconds (the wire/config unit).
+	var deleteAfterStoppedSeconds int64
+	if createDeleteAfterStopped != "" {
+		d, err := time.ParseDuration(createDeleteAfterStopped)
+		if err != nil {
+			return fmt.Errorf("invalid --delete-after-stopped %q: %w (expected Go duration like '6h', '24h')", createDeleteAfterStopped, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("--delete-after-stopped must be positive, got %s", createDeleteAfterStopped)
+		}
+		deleteAfterStoppedSeconds = int64(d.Seconds())
+	}
+
+	fmt.Printf("Creating container for user: %s\n", username)
+	if verbose {
+		fmt.Printf("  CPU: %s\n", cpuLimit)
+		fmt.Printf("  Memory: %s\n", memoryLimit)
+		fmt.Printf("  Disk: %s\n", diskLimit)
+		if staticIP != "" {
+			fmt.Printf("  Static IP: %s\n", staticIP)
+		} else {
+			fmt.Printf("  IP: DHCP\n")
+		}
+		fmt.Printf("  Image: %s\n", containerImage)
+		fmt.Printf("  Podman enabled: %v\n", enablePodman)
+		if stackID != "" {
+			fmt.Printf("  Stack: %s\n", stackID)
+		}
+		if len(gpuDevices) > 0 {
+			fmt.Printf("  GPU: %s\n", strings.Join(gpuDevices, ", "))
+		}
+		if ttlSeconds > 0 {
+			fmt.Printf("  TTL: %s (auto-delete at create+TTL)\n", createTTL)
+		}
+		if idleStopMinutes > 0 {
+			fmt.Printf("  Idle-stop: %dm (auto-sleep when idle)\n", idleStopMinutes)
+		}
+		if deleteAfterStoppedSeconds > 0 {
+			fmt.Printf("  Delete-after-stopped: %s (reclaim disk once stopped)\n", createDeleteAfterStopped)
+		}
+		if len(parsedLabels) > 0 {
+			fmt.Printf("  Labels:\n")
+			for k, v := range parsedLabels {
+				fmt.Printf("    %s=%s\n", k, v)
+			}
+		}
+	}
+
+	// Resolve the SSH key, unless this is a keyless (platform-managed) service
+	// tenant. Exactly one of --ssh-key / --no-ssh-key must be supplied.
+	if err := validateStackLocal(serverAddr, stackID); err != nil {
+		return err
+	}
+	if err := validateSSHKeyMode(noSSHKey, sshKeyPath); err != nil {
+		return err
+	}
+
+	var sshKey string
+	var sshKeys []string
+	if noSSHKey {
+		// Service tenant: seed no authorized_keys. The manager still adds the
+		// platform's jump-server key for daemon/ProxyJump reachability — no
+		// per-user private key is created or stored anywhere.
+		if verbose {
+			fmt.Println("  Keyless mode (--no-ssh-key): no SSH key will be seeded; access via platform only")
+		}
+	} else {
+		// Expand home directory
+		expandedPath := sshKeyPath
+		if len(sshKeyPath) >= 2 && sshKeyPath[:2] == "~/" {
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				return fmt.Errorf("failed to get home directory: %w", err)
+			}
+			expandedPath = filepath.Join(homeDir, sshKeyPath[2:])
+		}
+
+		if verbose {
+			fmt.Printf("  Reading SSH key from: %s\n", expandedPath)
+		}
+
+		// #nosec G304 -- operator-supplied --ssh-key path; reading it is the
+		// documented purpose of the flag (same trust as --git-credential-file).
+		keyBytes, err := os.ReadFile(expandedPath)
+		if err != nil {
+			return fmt.Errorf("failed to read SSH key from %s: %w\nPlease ensure the file exists and is readable", expandedPath, err)
+		}
+		sshKey = string(keyBytes)
+		sshKeys = []string{sshKey}
+	}
+
+	// Parse the flags that can still fail BEFORE --force deletes anything: a
+	// bad --isolation or an unreadable git credential file used to be found
+	// only after the existing box was gone (#2925).
+	osType := ostype.OSTypeFromString(osTypeStr)
+	isolation, err := ostype.ParseIsolation(isolationStr)
+	if err != nil {
+		return err
+	}
+
+	// Resolve optional git-source provisioning from flags (reads the
+	// credential file if one was given). Empty Source = no-op.
+	gitOpts, err := resolveGitSourceOpts()
+	if err != nil {
+		return err
+	}
+
+	// Handle --force flag: delete existing container if it exists
+	if forceRecreate {
+		if verbose {
+			fmt.Println()
+			fmt.Println("Checking if container already exists...")
+		}
+
+		// Check if container exists
+		var containerExists bool
+		if httpMode && serverAddr != "" {
+			// Remote mode via HTTP
+			httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+			if err != nil {
+				return fmt.Errorf("failed to create HTTP client: %w", err)
+			}
+			defer func() { _ = httpClient.Close() }()
+
+			_, err = httpClient.GetContainer(username)
+			containerExists = (err == nil)
+		} else if serverAddr != "" {
+			// Remote mode via gRPC
+			grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+			if err != nil {
+				return fmt.Errorf("failed to connect to remote server: %w", err)
+			}
+			defer func() { _ = grpcClient.Close() }()
+
+			_, err = grpcClient.GetContainer(username)
+			containerExists = (err == nil)
+		} else {
+			// Local mode via Incus
+			var existsErr error
+			containerExists, existsErr = containerExistsLocal(username)
+			if existsErr != nil {
+				return existsErr
+			}
+		}
+
+		if containerExists {
+			// Against a daemon, ask it to validate the create BEFORE deleting
+			// (#2925): its stack catalog, TTL bounds, image policy and capacity
+			// are not knowable here, and a rejected create after the delete
+			// would leave the user with no box at all. Local mode was already
+			// checked above against the host's own catalog.
+			if serverAddr != "" {
+				preflight := client.NewCreateContainerRequest(username, containerImage, cpuLimit, memoryLimit, diskLimit, sshKeys, enablePodman, stackID, gpuDevices, osType, isolation, monitoring, createPool, createBackendID, gitOpts, ttlSeconds, idleStopMinutes, disableAutoSleep, deleteAfterStoppedSeconds, createStorageClass, client.EncryptionOpts{Encrypted: createEncrypted, TenantID: createTenantID}, createMemoryRequest, createCPURequest, createRegion, parsedLabels, createNetworkTenant)
+				if err := validateCreateRemote(preflight); err != nil {
+					return fmt.Errorf("%w\nThe existing container for '%s' was NOT deleted", err, username)
+				}
+			}
+			fmt.Printf("Container for user '%s' already exists, deleting due to --force flag...\n", username)
+
+			// Delete the container
+			if httpMode && serverAddr != "" {
+				// Remote mode via HTTP
+				httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+				if err != nil {
+					return fmt.Errorf("failed to create HTTP client: %w", err)
+				}
+				defer func() { _ = httpClient.Close() }()
+
+				if err := httpClient.DeleteContainer(username, true); err != nil {
+					return fmt.Errorf("failed to delete existing container: %w", err)
+				}
+			} else if serverAddr != "" {
+				// Remote mode via gRPC
+				grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+				if err != nil {
+					return fmt.Errorf("failed to connect to remote server: %w", err)
+				}
+				defer func() { _ = grpcClient.Close() }()
+
+				if err := grpcClient.DeleteContainer(username, true); err != nil {
+					return fmt.Errorf("failed to delete existing container: %w", err)
+				}
+			} else {
+				// Local mode via Incus
+				if err := deleteLocal(username, true); err != nil {
+					return fmt.Errorf("failed to delete existing container: %w", err)
+				}
+			}
+
+			fmt.Println("✓ Existing container deleted")
+			if verbose {
+				fmt.Println()
+			}
+		} else if verbose {
+			fmt.Println("Container does not exist, proceeding with creation...")
+		}
+	}
+
+	// Create jump server account (only in local mode, and only when a key was
+	// provided). This creates a proxy-only user account with /usr/sbin/nologin
+	// shell — it allows SSH ProxyJump but prevents direct shell access. A
+	// keyless service tenant has no SSH path, so there's no jump account to seed.
+	if serverAddr == "" && !noSSHKey {
+		if verbose {
+			fmt.Println()
+			fmt.Println("Setting up jump server access...")
+		}
+
+		if err := createJumpServerAccountLocal(username, sshKey, verbose); err != nil {
+			return err
+		}
+
+		if verbose {
+			fmt.Println()
+		}
+	}
+
+	// Create container - use remote or local mode
+	var info *incus.ContainerInfo
+
+	if httpMode && serverAddr != "" {
+		// Remote mode via HTTP
+		info, err = createRemoteHTTP(username, containerImage, cpuLimit, memoryLimit, diskLimit, sshKeys, enablePodman, stackID, gpuDevices, osType, isolation, monitoring, createPool, createBackendID, gitOpts, ttlSeconds, idleStopMinutes, disableAutoSleep, deleteAfterStoppedSeconds, createStorageClass, client.EncryptionOpts{Encrypted: createEncrypted, TenantID: createTenantID}, createMemoryRequest, createCPURequest, createRegion, parsedLabels, createNetworkTenant)
+		if err != nil {
+			return fmt.Errorf("failed to create container via HTTP API: %w", err)
+		}
+	} else if serverAddr != "" {
+		// Remote mode via gRPC
+		info, err = createRemote(username, containerImage, cpuLimit, memoryLimit, diskLimit, sshKeys, enablePodman, stackID, gpuDevices, osType, isolation, monitoring, createPool, createBackendID, gitOpts, ttlSeconds, idleStopMinutes, disableAutoSleep, deleteAfterStoppedSeconds, createStorageClass, client.EncryptionOpts{Encrypted: createEncrypted, TenantID: createTenantID}, createMemoryRequest, createCPURequest, createRegion, parsedLabels, createNetworkTenant)
+		if err != nil {
+			return fmt.Errorf("failed to create container via remote server: %w", err)
+		}
+	} else {
+		// Local mode via Incus.
+		//
+		// Per-tenant encryption is a daemon feature: the KeyProvider and
+		// the lifecycle hooks live server-side, so this path has no way
+		// to honour --encrypted. Refuse rather than create an
+		// unencrypted container while the caller believes otherwise
+		// (#1198) — the same fail-closed posture the daemon takes when
+		// no KeyProvider is configured.
+		if createEncrypted {
+			return fmt.Errorf("--encrypted requires a daemon (--server): local Incus creates cannot resolve a tenant key, " +
+				"and creating an unencrypted container here would silently ignore the flag")
+		}
+		if createTenantID != "" {
+			return fmt.Errorf("--tenant requires a daemon (--server): local Incus creates are single-tenant by construction")
+		}
+		if verbose {
+			fmt.Println("Creating container...")
+		}
+		info, err = createLocal(username, containerImage, cpuLimit, memoryLimit, diskLimit, staticIP, sshKeys, parsedLabels, enablePodman, stackID, gpuDevices, osType, isolation, monitoring, gitOpts, ttlSeconds, idleStopMinutes, deleteAfterStoppedSeconds, createStorageClass)
+		if err != nil {
+			// Cleanup jump server account on failure
+			cleanupJumpServerAccountLocal(username)
+			return fmt.Errorf("failed to create container: %w", err)
+		}
+	}
+
+	// --wait (#1036): a remote create is async — the daemon returns CREATING
+	// immediately and provisions (package install, key setup) for minutes.
+	// Poll until the box settles so scripts/agents get blocking ergonomics
+	// without a long-held server connection, and so the summary below prints
+	// the settled state + IP instead of CREATING. Local mode provisions
+	// synchronously inside createLocal, so there is nothing to wait for.
+	if createWait && serverAddr != "" {
+		getFn, closeFn, cerr := containerGetter()
+		if cerr != nil {
+			return cerr
+		}
+		defer closeFn()
+		final, werr := waitForContainerReady(getFn, username, createWaitTimeout)
+		if werr != nil {
+			return werr
+		}
+		if final != nil {
+			info = final
+		}
+	} else if createWait && verbose {
+		fmt.Println("  --wait: local create is synchronous; nothing to wait for")
+	}
+
+	// Success!
+	fmt.Println()
+	fmt.Printf("✓ Container %s created successfully!\n", info.Name)
+	if serverAddr == "" && !noSSHKey {
+		fmt.Printf("✓ Jump server account: %s (proxy-only, no shell access)\n", username)
+	}
+	fmt.Println()
+	fmt.Println("Container Information:")
+	fmt.Printf("  Name:         %s\n", info.Name)
+	fmt.Printf("  Username:     %s\n", username)
+	fmt.Printf("  IP Address:   %s\n", info.IPAddress)
+	fmt.Printf("  State:        %s\n", info.State)
+	fmt.Printf("  CPU:          %s cores\n", info.CPU)
+	fmt.Printf("  Memory:       %s\n", info.Memory)
+	fmt.Printf("  Podman:       %v\n", enablePodman)
+	if info.GPU != "" {
+		fmt.Printf("  GPU:          %s\n", info.GPU)
+	}
+	fmt.Printf("  Auto-start:   enabled\n")
+	if len(info.Labels) > 0 {
+		fmt.Printf("  Labels:\n")
+		for k, v := range info.Labels {
+			fmt.Printf("    %s=%s\n", k, v)
+		}
+	}
+	fmt.Println()
+
+	if noSSHKey {
+		fmt.Println("Platform-managed service tenant (--no-ssh-key):")
+		fmt.Println("  No SSH key was seeded. Operate this tenant via the platform:")
+		fmt.Printf("    incus exec %s -- <command>\n", info.Name)
+		fmt.Println("  (or the daemon RPCs / containarium subcommands). No private key exists.")
+		fmt.Println()
+	} else if info.IPAddress != "" {
+		fmt.Println("SSH Access (via ProxyJump):")
+		fmt.Println()
+		fmt.Println("Add to your ~/.ssh/config:")
+		fmt.Println()
+		fmt.Println("  Host containarium-jump")
+		fmt.Println("      HostName <jump-server-ip>")
+		fmt.Printf("      User %s\n", username)
+		fmt.Println("      IdentityFile ~/.ssh/<your-private-key>")
+		fmt.Println()
+		fmt.Printf("  Host %s-dev\n", username)
+		fmt.Printf("      HostName %s\n", info.IPAddress)
+		fmt.Printf("      User %s\n", username)
+		fmt.Println("      IdentityFile ~/.ssh/<your-private-key>")
+		fmt.Println("      ProxyJump containarium-jump")
+		fmt.Println()
+		fmt.Printf("Then connect with: ssh %s-dev\n", username)
+		fmt.Println()
+		fmt.Println("Note: Your jump server account is proxy-only (no shell access).")
+		fmt.Println("      This allows SSH ProxyJump while preventing direct access to the jump server.")
+		fmt.Println()
+	}
+
+	// Phase D: --auto-restart-compose enables the systemd-user
+	// autostart unit for a compose stack inside the new container.
+	// Best-effort — print a warning on failure but do NOT fail the
+	// overall create (the container is up and useful regardless).
+	//
+	// Requires --server: the call goes to the daemon's
+	// ComposeAutostartService, which in turn execs `agent-box compose
+	// enable` inside the LXC. Local mode (`createLocal`) talks to
+	// Incus directly and has no such service; surface that as a
+	// warning and skip rather than silently no-op.
+	if createAutoRestartCompose != "" {
+		if serverAddr == "" {
+			fmt.Println("Warning: --auto-restart-compose is set but no --server provided; skipping (compose autostart requires the daemon RPC).")
+		} else if err := enableAutoRestartCompose(username, createAutoRestartCompose); err != nil {
+			fmt.Printf("Warning: container created but compose-autostart enable failed: %v\n", err)
+			fmt.Printf("  Re-run later with: containarium compose enable %s --dir %s --server %s\n",
+				username, createAutoRestartCompose, serverAddr)
+		}
+	}
+
+	return nil
+}
+
+// enableAutoRestartCompose dials the daemon's ComposeAutostartService
+// and Enables the autostart unit for the given dir inside `username`'s
+// container. Returns nil on success OR on "already enabled" (which
+// the daemon flags via Already=true; semantically a no-op, not a
+// failure).
+func enableAutoRestartCompose(username, dir string) error {
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return fmt.Errorf("connect to %s: %w", serverAddr, err)
+	}
+	defer func() { _ = grpcClient.Close() }()
+
+	c := pb.NewComposeAutostartServiceClient(grpcClient.Conn())
+	resp, err := c.Enable(context.Background(), &pb.EnableRequest{
+		Username: username,
+		Dir:      dir,
+		// Force false — first-time provision; if the unit already
+		// exists (rare for a fresh box), respect it.
+	})
+	if err != nil {
+		return err
+	}
+	if resp.GetAlready() {
+		fmt.Printf("✓ Compose autostart: %s (already enabled)\n", resp.GetUnit())
+	} else {
+		fmt.Printf("✓ Compose autostart enabled: %s (compose=%s)\n", resp.GetUnit(), resp.GetComposeBin())
+	}
+	return nil
+}
+
+// resolveGitSourceOpts builds the git-source options from the create
+// flags, reading the credential file if one was supplied. Returns the
+// zero value (Source == "") when --git-source wasn't set.
+func resolveGitSourceOpts() (client.GitSourceOpts, error) {
+	if createGitSource == "" {
+		return client.GitSourceOpts{}, nil
+	}
+	opts := client.GitSourceOpts{
+		Source:        createGitSource,
+		Ref:           createGitRef,
+		WorkspacePath: createWorkspacePath,
+	}
+	if createGitCredentialFile != "" {
+		// #nosec G304 -- operator-supplied path; reading it is the documented
+		// purpose of --git-credential-file (same trust as reading an SSH key file).
+		data, err := os.ReadFile(createGitCredentialFile)
+		if err != nil {
+			return client.GitSourceOpts{}, fmt.Errorf("failed to read --git-credential-file: %w", err)
+		}
+		opts.Credential = strings.TrimSpace(string(data))
+	}
+	return opts, nil
+}
+
+// parseLabels parses labels from key=value format
+// containerGetter builds a GetContainer function against the configured
+// remote (HTTP or gRPC, same mode selection as the create itself), plus a
+// close function for the underlying client. Used by --wait.
+func containerGetter() (func(string) (*incus.ContainerInfo, error), func(), error) {
+	if httpMode {
+		httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create HTTP client: %w", err)
+		}
+		return httpClient.GetContainer, func() { _ = httpClient.Close() }, nil
+	}
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to remote server: %w", err)
+	}
+	return grpcClient.GetContainer, func() { _ = grpcClient.Close() }, nil
+}
+
+// waitForContainerReady polls getFn until the box reaches a settled state
+// (#1036). Both clients report the proto enum name ("CONTAINER_STATE_RUNNING",
+// "...PROVISIONING", ...); normalize by trimming the prefix. Transient get
+// errors are tolerated (the box can briefly 404 between the daemon's pending
+// bookkeeping and incus visibility) — only the deadline or an explicit ERROR
+// state ends the wait early.
+func waitForContainerReady(getFn func(string) (*incus.ContainerInfo, error), username string, timeout time.Duration) (*incus.ContainerInfo, error) {
+	const pollInterval = 5 * time.Second
+	deadline := time.Now().Add(timeout)
+	lastState := ""
+	fmt.Printf("Waiting for provisioning to finish (timeout %s)...\n", timeout)
+	for {
+		info, err := getFn(username)
+		if err == nil {
+			state := strings.TrimPrefix(info.State, "CONTAINER_STATE_")
+			if state != lastState {
+				fmt.Printf("  state: %s\n", state)
+				lastState = state
+			}
+			switch state {
+			case "RUNNING", "STOPPED":
+				return info, nil
+			case "ERROR":
+				return nil, fmt.Errorf("provisioning failed for %s: daemon reports ERROR (see the daemon log for the cause)", username)
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out after %s waiting for %s to finish provisioning (last state: %s); the box may still come up — check with 'containarium list'", timeout, username, lastState)
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+func parseLabels(labelSlice []string) map[string]string {
+	result := make(map[string]string)
+	for _, label := range labelSlice {
+		parts := strings.SplitN(label, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			if key != "" {
+				result[key] = value
+			}
+		}
+	}
+	return result
+}
+
+// createRemote creates a container using remote gRPC server
+func createRemote(username, image, cpu, memory, disk string, sshKeys []string, enablePodman bool, stack string, gpus []string, osType pb.OSType, isolation pb.IsolationType, monitoring bool, pool, backendID string, git client.GitSourceOpts, ttlSeconds int64, idleStopMinutes int32, disableAutoSleep bool, deleteAfterStoppedSeconds int64, storageClass string, enc client.EncryptionOpts, memoryRequest, cpuRequest, region string, labels map[string]string, networkTenant ...string) (*incus.ContainerInfo, error) {
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = grpcClient.Close() }()
+
+	return grpcClient.CreateContainer(username, image, cpu, memory, disk, sshKeys, enablePodman, stack, gpus, osType, isolation, monitoring, pool, backendID, git, ttlSeconds, idleStopMinutes, disableAutoSleep, deleteAfterStoppedSeconds, storageClass, enc, memoryRequest, cpuRequest, region, labels, networkTenant...)
+}
+
+// validateCreateRemote runs the daemon's pre-flight checks for req without
+// creating anything (#2925), over whichever transport the CLI was told to use.
+func validateCreateRemote(req *pb.CreateContainerRequest) error {
+	if httpMode {
+		httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return fmt.Errorf("failed to create HTTP client: %w", err)
+		}
+		defer func() { _ = httpClient.Close() }()
+		return httpClient.ValidateCreate(req)
+	}
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return fmt.Errorf("failed to connect to remote server: %w", err)
+	}
+	defer func() { _ = grpcClient.Close() }()
+	return grpcClient.ValidateCreate(req)
+}
+
+// createRemoteHTTP creates a container using remote HTTP API
+func createRemoteHTTP(username, image, cpu, memory, disk string, sshKeys []string, enablePodman bool, stack string, gpus []string, osType pb.OSType, isolation pb.IsolationType, monitoring bool, pool, backendID string, git client.GitSourceOpts, ttlSeconds int64, idleStopMinutes int32, disableAutoSleep bool, deleteAfterStoppedSeconds int64, storageClass string, enc client.EncryptionOpts, memoryRequest, cpuRequest, region string, labels map[string]string, networkTenant ...string) (*incus.ContainerInfo, error) {
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	return httpClient.CreateContainer(username, image, cpu, memory, disk, sshKeys, enablePodman, stack, gpus, osType, isolation, monitoring, pool, backendID, git, ttlSeconds, idleStopMinutes, disableAutoSleep, deleteAfterStoppedSeconds, storageClass, enc, memoryRequest, cpuRequest, region, labels, networkTenant...)
+}
