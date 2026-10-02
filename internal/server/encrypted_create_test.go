@@ -97,3 +97,37 @@ func TestCreateContainer_EncryptedWithoutAResolvedPoolFails(t *testing.T) {
 		t.Errorf("the error does not mention the storage pool, so nobody can act on it: %v", err)
 	}
 }
+
+// A create that asks for encryption on a daemon with no key custody is still
+// refused, and still with FAILED_PRECONDITION — the OSS default is unchanged
+// by this wiring. #1294's unconditional refusal is gone because the create
+// path now does provision encrypted storage; validateEncryption's
+// provider-nil refusal is what keeps the promise honest until #1342.
+func TestCreateContainer_StillRefusesEncryptedWithNoKeyProvider(t *testing.T) {
+	s := &ContainerServer{}
+
+	_, err := s.CreateContainer(tenantWithScopes("alice", auth.ScopeContainersWrite),
+		&pb.CreateContainerRequest{Username: "alice", Encrypted: true})
+	if err == nil {
+		t.Fatal("an encrypted create succeeded on a daemon with no KeyProvider")
+	}
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition — a client distinguishes 'not available "+
+			"here' from 'your request was malformed' by this code", got)
+	}
+	if !strings.Contains(err.Error(), "KeyProvider") {
+		t.Errorf("the error does not name the missing capability: %v", err)
+	}
+}
+
+// stubProvider is a KeyProvider that exists but is never expected to be
+// called — it is here to get past validateEncryption, not to mint keys.
+type stubProvider struct{}
+
+func (stubProvider) Wrap(context.Context, string) (zfskey.Key, zfskey.KeyRef, error) {
+	return zfskey.Key{}, zfskey.KeyRef{}, errors.New("stubProvider.Wrap should not be reached")
+}
+
+func (stubProvider) Load(context.Context, zfskey.KeyRef) (zfskey.Key, error) {
+	return zfskey.Key{}, errors.New("stubProvider.Load should not be reached")
+}

@@ -110,3 +110,115 @@ func TestLogBatch_MixedBatchKeepsChainLinear(t *testing.T) {
 		if outs[i] != want[i] {
 			t.Fatalf("outcome[%d] = %v, want %v (all: %v)", i, outs[i], want[i], outs)
 		}
+	}
+	if got := rowCount(t, s); got != 5 {
+		t.Fatalf("rows = %d, want 5", got)
+	}
+	mustVerify(t, s)
+}
+
+func TestLogBatch_DuplicateWithinSameBatch(t *testing.T) {
+	s := auditTestStore(t)
+	b := batchEntries(1, 0)
+	b = append(b, b[0])
+	outs, err := s.LogBatch(context.Background(), b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outs[0] != BatchInserted || outs[1] != BatchDuplicate {
+		t.Fatalf("outcomes = %v, want [Inserted Duplicate]", outs)
+	}
+	mustVerify(t, s)
+}
+
+// Any storage error must roll the whole batch back.
+func TestLogBatch_FailureCommitsNothing(t *testing.T) {
+	s := auditTestStore(t)
+	b := batchEntries(5, 0)
+	// A NUL byte is rejected by Postgres TEXT, failing the 4th insert.
+	b[3].Entry.Detail = "bad\x00detail"
+	if _, err := s.LogBatch(context.Background(), b); err == nil {
+		t.Fatal("expected an error from the poisoned entry")
+	}
+	if got := rowCount(t, s); got != 0 {
+		t.Fatalf("rows = %d, want 0 (batch must be atomic)", got)
+	}
+	// And the keys must be reusable afterwards.
+	if _, err := s.LogBatch(context.Background(), batchEntries(5, 0)); err != nil {
+		t.Fatalf("clean retry after rollback: %v", err)
+	}
+	mustVerify(t, s)
+}
+
+func TestLogBatch_EmptyBatch(t *testing.T) {
+	s := auditTestStore(t)
+	outs, err := s.LogBatch(context.Background(), nil)
+	if err != nil || len(outs) != 0 {
+		t.Fatalf("empty batch: outs=%v err=%v", outs, err)
+	}
+}
+
+func TestLogBatch_ConcurrentWithLogDoesNotFork(t *testing.T) {
+	s := auditTestStore(t)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for w := 0; w < 4; w++ {
+		wg.Add(2)
+		go func(w int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 5; i++ {
+				_, _ = s.LogBatch(context.Background(), batchEntries(5, w*1000+i*10))
+			}
+		}(w)
+		go func(w int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 10; i++ {
+				_ = s.Log(context.Background(), &AuditEntry{Username: "u", Action: "x", ResourceID: fmt.Sprintf("%d-%d", w, i)})
+			}
+		}(w)
+	}
+	close(start)
+	wg.Wait()
+	mustVerify(t, s)
+}
+
+func TestDedupeKey_LogWritesNullAndIdenticalRowsDoNotCollide(t *testing.T) {
+	s := auditTestStore(t)
+	e := AuditEntry{Username: "a", Action: "x", ResourceID: "same", Timestamp: time.Unix(1_700_000_000, 0)}
+	for i := 0; i < 3; i++ {
+		c := e
+		if err := s.Log(context.Background(), &c); err != nil {
+			t.Fatalf("plain Log #%d: %v", i, err)
+		}
+	}
+	var nonNull int
+	if err := s.pool.QueryRow(context.Background(), `SELECT count(*) FROM audit_logs WHERE dedupe_key IS NOT NULL`).Scan(&nonNull); err != nil {
+		t.Fatal(err)
+	}
+	if nonNull != 0 {
+		t.Fatalf("Log wrote %d non-NULL dedupe_key rows, want 0", nonNull)
+	}
+	mustVerify(t, s)
+}
+
+// Upgrading a table that already has chained rows must leave them verifiable.
+func TestDedupeKey_MigrationOnExistingRows(t *testing.T) {
+	s := auditTestStore(t)
+	logN(t, s, 5)
+	if _, err := s.pool.Exec(context.Background(), `DROP INDEX IF EXISTS idx_audit_logs_dedupe_key; ALTER TABLE audit_logs DROP COLUMN dedupe_key`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.initSchema(context.Background()); err != nil {
+		t.Fatalf("re-running initSchema on a populated table: %v", err)
+	}
+	if err := s.initSchema(context.Background()); err != nil {
+		t.Fatalf("initSchema must be idempotent: %v", err)
+	}
+	mustVerify(t, s)
+	if _, err := s.LogBatch(context.Background(), batchEntries(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	mustVerify(t, s)
+}
