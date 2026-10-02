@@ -153,3 +153,159 @@ func (s *Store) Save(ctx context.Context, app *v1.App) error {
 
 // GetByID retrieves an app by its ID
 func (s *Store) GetByID(ctx context.Context, id string) (*v1.App, error) {
+	var jsonData []byte
+
+	query := "SELECT data FROM apps WHERE id = $1"
+	err := s.pool.QueryRow(ctx, query, id).Scan(&jsonData)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to get app: %w", err)
+	}
+
+	app := &v1.App{}
+	if err := protojson.Unmarshal(jsonData, app); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal app: %w", err)
+	}
+
+	return app, nil
+}
+
+// GetByName retrieves an app by username and app name
+func (s *Store) GetByName(ctx context.Context, username, name string) (*v1.App, error) {
+	var jsonData []byte
+
+	query := "SELECT data FROM apps WHERE username = $1 AND name = $2"
+	err := s.pool.QueryRow(ctx, query, username, name).Scan(&jsonData)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to get app: %w", err)
+	}
+
+	app := &v1.App{}
+	if err := protojson.Unmarshal(jsonData, app); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal app: %w", err)
+	}
+
+	return app, nil
+}
+
+// List retrieves all apps for a username, optionally filtered by state
+func (s *Store) List(ctx context.Context, username string, stateFilter v1.AppState) ([]*v1.App, error) {
+	var query string
+	var args []interface{}
+
+	if username == "" {
+		// List all apps (admin)
+		if stateFilter == v1.AppState_APP_STATE_UNSPECIFIED {
+			query = "SELECT data FROM apps ORDER BY created_at DESC"
+		} else {
+			query = "SELECT data FROM apps WHERE state = $1 ORDER BY created_at DESC"
+			args = append(args, stateFilter.String())
+		}
+	} else {
+		// List apps for specific user
+		if stateFilter == v1.AppState_APP_STATE_UNSPECIFIED {
+			query = "SELECT data FROM apps WHERE username = $1 ORDER BY created_at DESC"
+			args = append(args, username)
+		} else {
+			query = "SELECT data FROM apps WHERE username = $1 AND state = $2 ORDER BY created_at DESC"
+			args = append(args, username, stateFilter.String())
+		}
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list apps: %w", err)
+	}
+	defer rows.Close()
+
+	var apps []*v1.App
+	for rows.Next() {
+		var jsonData []byte
+		if err := rows.Scan(&jsonData); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		app := &v1.App{}
+		if err := protojson.Unmarshal(jsonData, app); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal app: %w", err)
+		}
+
+		apps = append(apps, app)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return apps, nil
+}
+
+// Delete removes an app from the database
+func (s *Store) Delete(ctx context.Context, id string) error {
+	query := "DELETE FROM apps WHERE id = $1"
+	result, err := s.pool.Exec(ctx, query, id)
+
+	if err != nil {
+		return fmt.Errorf("failed to delete app: %w", err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+
+	return nil
+}
+
+// DeleteByName removes an app by username and name
+func (s *Store) DeleteByName(ctx context.Context, username, name string) error {
+	query := "DELETE FROM apps WHERE username = $1 AND name = $2"
+	result, err := s.pool.Exec(ctx, query, username, name)
+
+	if err != nil {
+		return fmt.Errorf("failed to delete app: %w", err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+
+	return nil
+}
+
+// Count returns the total number of apps, optionally filtered by username and state
+func (s *Store) Count(ctx context.Context, username string, stateFilter v1.AppState) (int32, error) {
+	var query string
+	var args []interface{}
+
+	if username == "" {
+		if stateFilter == v1.AppState_APP_STATE_UNSPECIFIED {
+			query = "SELECT COUNT(*) FROM apps"
+		} else {
+			query = "SELECT COUNT(*) FROM apps WHERE state = $1"
+			args = append(args, stateFilter.String())
+		}
+	} else {
+		if stateFilter == v1.AppState_APP_STATE_UNSPECIFIED {
+			query = "SELECT COUNT(*) FROM apps WHERE username = $1"
+			args = append(args, username)
+		} else {
+			query = "SELECT COUNT(*) FROM apps WHERE username = $1 AND state = $2"
+			args = append(args, username, stateFilter.String())
+		}
+	}
+
+	var count int32
+	err := s.pool.QueryRow(ctx, query, args...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count apps: %w", err)
+	}
+
+	return count, nil
+}

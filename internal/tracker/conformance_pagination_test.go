@@ -72,3 +72,78 @@ func TestProviderConformance_ListIssuesRefusesCrossHostNextLink(t *testing.T) {
 		escapedPath string
 		issueJSON   func(int) string
 	}{
+		{"github", trackergithub.New(nil), "/repos/acme/widgets/issues", githubIssueJSON},
+		{"gitlab", trackergitlab.New(nil), "/api/v4/projects/acme%2Fwidgets/issues", gitlabIssueJSON},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var decoyHits atomic.Int32
+			decoy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				decoyHits.Add(1)
+				if r.Header.Get("Authorization") != "" || r.Header.Get("PRIVATE-TOKEN") != "" {
+					t.Errorf("%s: credential header reached the cross-host decoy", tc.name)
+				}
+				writeJSON(w, "[]")
+			}))
+			t.Cleanup(decoy.Close)
+
+			baseURL := newPaginatedFixture(t, tc.escapedPath, decoy.URL, tc.issueJSON)
+			_, err := tc.provider.ListIssues(context.Background(), tracker.Conn{BaseURL: baseURL, Project: "acme/widgets", Credential: "secret"}, tracker.IssueFilter{})
+			if got := decoyHits.Load(); got != 0 {
+				t.Fatalf("%s ListIssues sent %d request(s) to the cross-host next link, want 0", tc.name, got)
+			}
+			if !errors.Is(err, tracker.ErrCrossOriginNextLink) {
+				t.Fatalf("%s ListIssues err = %v, want tracker.ErrCrossOriginNextLink", tc.name, err)
+			}
+		})
+	}
+}
+
+func githubIssueJSON(n int) string {
+	return fmt.Sprintf(`{"number": %d, "title": "issue %d", "state": "open", "labels": [{"name": "scope:engineer"}], "assignee": null}`, n, n)
+}
+
+func gitlabIssueJSON(n int) string {
+	return fmt.Sprintf(`{"iid": %d, "title": "issue %d", "state": "opened", "labels": ["scope:engineer"], "assignee": null}`, n, n)
+}
+
+// newPaginatedFixture serves paginatedIssueCount issues, 100 per page,
+// at escapedPath, linking each page to the next with a Link header.
+// nextHost, when set, replaces the server's own origin in that link.
+func newPaginatedFixture(t *testing.T, escapedPath, nextHost string, issueJSON func(int) string) string {
+	t.Helper()
+	const perPage = 100
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != escapedPath {
+			t.Errorf("paginated fixture: unexpected request %s %q", r.Method, r.URL.EscapedPath())
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		page := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			page, _ = strconv.Atoi(p)
+		}
+		first := (page-1)*perPage + 1
+		last := page * perPage
+		if last > paginatedIssueCount {
+			last = paginatedIssueCount
+		}
+		if last < paginatedIssueCount {
+			q := r.URL.Query()
+			q.Set("page", strconv.Itoa(page+1))
+			origin := srv.URL
+			if nextHost != "" {
+				origin = nextHost
+			}
+			next := origin + escapedPath + "?" + q.Encode()
+			w.Header().Set("Link", fmt.Sprintf(`<%s>; rel="next", <%s>; rel="last"`, next, next))
+		}
+		items := make([]string, 0, perPage)
+		for n := first; n <= last; n++ {
+			items = append(items, issueJSON(n))
+		}
+		writeJSON(w, "["+strings.Join(items, ",")+"]")
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
