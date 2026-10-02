@@ -27,3 +27,32 @@ func RotateIdentity(content, identityFile string) (Generated, error) {
 			}
 			inside, began = true, true
 		case endMarker:
+			if !inside {
+				return Generated{}, fmt.Errorf("invalid managed SSH configuration markers")
+			}
+			inside, ended = false, true
+		}
+		if inside {
+			fields := strings.Fields(line)
+			if len(fields) > 0 {
+				switch strings.ToLower(fields[0]) {
+				case "identityfile":
+					continue
+				case "match":
+					return Generated{}, fmt.Errorf("managed SSH configuration contains a Match block; re-run containarium ssh-config sync")
+				case "host":
+					out.WriteString(line)
+					fmt.Fprintf(&out, "    IdentityFile %s\n", identity)
+					g.Count++
+					continue
+				}
+			}
+		}
+		out.WriteString(line)
+	}
+	if !began || !ended || g.Count == 0 {
+		return Generated{}, fmt.Errorf("no complete managed SSH hosts to rotate; run containarium ssh-config sync first")
+	}
+	g.Content = out.String()
+	return g, nil
+}

@@ -99,3 +99,105 @@ func runPrimaryRegistration(ctx context.Context, cfg PrimaryRegisterConfig) {
 					log.Printf("[primary-register] deregister failed: %v", err)
 				} else {
 					log.Printf("[primary-register] deregistered: pool=%q", cfg.Pool)
+				}
+				cancel()
+				return
+			case <-ticker.C:
+				if err := putRequest(ctx, client, heartbeatURL, nil, cfg.Secret); err != nil {
+					// 404 means the sentinel doesn't know us — re-register.
+					var notFound bool
+					if hErr, ok := err.(*httpStatusError); ok && hErr.code == http.StatusNotFound {
+						notFound = true
+					}
+					if notFound {
+						if err2 := postJSON(ctx, client, registerURL, body, cfg.Secret); err2 != nil {
+							log.Printf("[primary-register] re-registration failed: %v", err2)
+						} else {
+							log.Printf("[primary-register] re-registered after sentinel restart: pool=%q", cfg.Pool)
+						}
+					} else {
+						log.Printf("[primary-register] heartbeat failed: %v", err)
+					}
+				}
+			}
+		}
+	}()
+}
+
+type httpStatusError struct {
+	code int
+	body string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("status=%d body=%q", e.code, e.body)
+}
+
+func postJSON(ctx context.Context, client *http.Client, url string, body any, secret []byte) error {
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	auth.SignSentinelRequest(req, secret)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return &httpStatusError{code: resp.StatusCode, body: string(bodyBytes)}
+	}
+	return nil
+}
+
+func putRequest(ctx context.Context, client *http.Client, url string, body any, secret []byte) error {
+	var reader *bytes.Reader
+	if body != nil {
+		buf, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(buf)
+	} else {
+		reader = bytes.NewReader(nil)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, reader)
+	if err != nil {
+		return err
+	}
+	auth.SignSentinelRequest(req, secret)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return &httpStatusError{code: resp.StatusCode, body: string(bodyBytes)}
+	}
+	return nil
+}
+
+func deleteRequest(ctx context.Context, client *http.Client, url string, secret []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return err
+	}
+	auth.SignSentinelRequest(req, secret)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return &httpStatusError{code: resp.StatusCode, body: string(bodyBytes)}
+	}
+	return nil
+}
