@@ -46,3 +46,51 @@ func runLabelSet(cmd *cobra.Command, args []string) error {
 		parts := strings.SplitN(arg, "=", 2)
 		if len(parts) != 2 {
 			return fmt.Errorf("invalid label format: %q (expected key=value)", arg)
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if key == "" {
+			return fmt.Errorf("empty label key in: %q", arg)
+		}
+		labels[key] = value
+	}
+
+	if len(labels) == 0 {
+		return fmt.Errorf("no valid labels provided")
+	}
+
+	// Set labels - use remote or local mode
+	if httpMode && serverAddr != "" {
+		return setLabelsRemoteHTTP(username, labels)
+	} else if serverAddr != "" {
+		return fmt.Errorf("label operations not yet supported via gRPC - use --http mode")
+	}
+
+	return setLabelsLocal(username, labels)
+}
+
+func setLabelsRemoteHTTP(username string, labels map[string]string) error {
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	// Get container first to verify it exists
+	_, err = httpClient.GetContainer(username)
+	if err != nil {
+		return fmt.Errorf("container %q not found: %w", username, err)
+	}
+
+	// Set labels via HTTP API
+	if err := httpClient.SetLabels(username, labels); err != nil {
+		return fmt.Errorf("failed to set labels: %w", err)
+	}
+
+	for key, value := range labels {
+		fmt.Printf("Set label: %s=%s\n", key, value)
+	}
+
+	fmt.Printf("\nLabels set on container %s-container\n", username)
+	return nil
+}

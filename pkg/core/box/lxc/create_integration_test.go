@@ -61,3 +61,66 @@ func TestIntegrationIncus_CreateThroughTheDaemonsOwnPath(t *testing.T) {
 		// per-container dataset, so there is nothing for #1199 to encrypt
 		// and the lane would prove nothing about the encrypted path while
 		// still going green.
+		t.Fatalf("storage pool %q is on the %q driver, want %q — an Incus lane on a non-ZFS pool "+
+			"cannot exercise the encrypted create path #1199 needs",
+			client.StoragePool(), driver, incus.StorageDriverZFS)
+	}
+
+	// AC2 — through the daemon's Create(), not `incus launch`.
+	backend := New(container.NewWithBackend(client))
+	name := tenant()
+	instance := name + "-container"
+	t.Cleanup(func() { incusenv.DeleteInstance(t, instance) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	defer cancel()
+
+	st, err := backend.Create(ctx, box.BoxSpec{
+		Ref:       box.BoxRef{Tenant: name},
+		Image:     incusenv.BoxImage(),
+		OSType:    pb.OSType_OS_TYPE_UBUNTU_2404,
+		AutoStart: true,
+		// No SSH keys on purpose: seeding them creates a jump-server
+		// account on the HOST, which is a side effect this lane has no
+		// business having and which #1199 does not need.
+	})
+	if err != nil {
+		t.Fatalf("the daemon's create path failed against a real Incus: %v", err)
+	}
+	if st == nil {
+		t.Fatal("create reported success and returned no status")
+	}
+	if st.State != pb.ContainerState_CONTAINER_STATE_RUNNING {
+		t.Fatalf("container state = %v, want RUNNING — #1199's hooks run around a create that "+
+			"actually starts the box, so a created-but-not-running container is not the path it wires into",
+			st.State)
+	}
+	if st.Ref.Name != instance {
+		t.Errorf("instance name = %q, want %q", st.Ref.Name, instance)
+	}
+
+	// The box seam has to agree with Incus after the fact, not only in the
+	// value Create happened to return.
+	got, err := backend.Get(ctx, box.BoxRef{Tenant: name})
+	if err != nil {
+		t.Fatalf("reading back the container the daemon just created: %v", err)
+	}
+	if got == nil {
+		t.Fatal("the container the daemon reported creating is not there when read back")
+	}
+	if got.State != pb.ContainerState_CONTAINER_STATE_RUNNING {
+		t.Errorf("read-back state = %v, want RUNNING", got.State)
+	}
+
+	// The answer #1199 needs from this lane: the container has a ZFS dataset
+	// of its own, and it is nameable from the container's name. That mapping
+	// is exactly what encryptionHooks' datasetResolver has to provide before
+	// the instance exists, so a lane where it cannot be resolved would not
+	// unblock #1199 even with a green create above.
+	dataset := incusenv.DatasetFor(t, instance)
+	if dataset == "" {
+		t.Fatalf("no ZFS dataset for instance %s — the pool reports the zfs driver but the "+
+			"container did not get a dataset of its own, so there is nothing for #1199 to encrypt", instance)
+	}
+	t.Logf("instance %s is backed by dataset %s", instance, dataset)
+}
