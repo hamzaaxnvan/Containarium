@@ -178,3 +178,183 @@ func TestIntegrationIncusExportImport(t *testing.T) {
 			t.Errorf("%s missing from the imported instance: %v", p, err)
 			continue
 		}
+		if digest(got) != digest(files[p]) {
+			t.Errorf("%s digest %s after the round trip, want %s", p, digest(got), digest(files[p]))
+		}
+	}
+	if _, err := client.ReadFile(dst, runProbe); err == nil {
+		t.Logf("TARBALL: %s present in the imported rootfs", runProbe)
+	} else {
+		t.Logf("TARBALL: %s absent from the imported rootfs (%v)", runProbe, err)
+	}
+
+	// And the import is a box that boots, not just a dataset.
+	if err := client.StartContainer(dst); err != nil {
+		t.Fatalf("start the imported %s: %v", dst, err)
+	}
+	if out, _, err := client.ExecWithOutput(dst, []string{"sha256sum", "/root/containarium-2801a/blob.bin"}); err != nil {
+		t.Errorf("exec in the imported box: %v", err)
+	} else if !strings.HasPrefix(out, digest(big)) {
+		t.Errorf("in-box sha256sum = %q, want prefix %s", out, digest(big))
+	}
+}
+
+// exportTo streams the export to path and returns its size.
+func exportTo(t *testing.T, client *incus.Client, name, path string) int64 {
+	t.Helper()
+	rc, err := client.ExportInstance(name)
+	if err != nil {
+		t.Fatalf("ExportInstance(%s): %v", name, err)
+	}
+	out, err := os.Create(path) // #nosec G304 -- test temp file
+	if err != nil {
+		t.Fatalf("create %s: %v", path, err)
+	}
+	n, copyErr := io.Copy(out, rc)
+	closeErr := rc.Close()
+	fileErr := out.Close()
+	if copyErr != nil || closeErr != nil || fileErr != nil {
+		t.Fatalf("export %s: copy=%v close=%v file=%v", name, copyErr, closeErr, fileErr)
+	}
+	return n
+}
+
+// inspectArchive logs the tarball's layout and, for each probe path, whether
+// the rootfs in it carries the file.
+func inspectArchive(t *testing.T, path string, probes []string) {
+	t.Helper()
+	f, err := os.Open(path) // #nosec G304 -- test temp file
+	if err != nil {
+		t.Fatalf("open archive: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	br := bufio.NewReader(f)
+	magic, _ := br.Peek(4)
+	var r io.Reader = br
+	switch {
+	case bytes.HasPrefix(magic, []byte{0x1f, 0x8b}):
+		t.Logf("TARBALL: gzip-compressed tar")
+		gz, err := gzip.NewReader(br)
+		if err != nil {
+			t.Fatalf("gzip: %v", err)
+		}
+		r = gz
+	case bytes.Equal(magic, []byte{0x28, 0xb5, 0x2f, 0xfd}):
+		t.Logf("TARBALL: zstd-compressed; layout not inspected (no zstd in the standard library)")
+		return
+	default:
+		t.Logf("TARBALL: uncompressed (magic %x)", magic)
+	}
+
+	tr := tar.NewReader(r)
+	layout := map[string]int{}
+	var meta []string
+	found := map[string]string{}
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar: %v", err)
+		}
+		name := strings.TrimPrefix(h.Name, "./")
+		parts := strings.SplitN(name, "/", 4)
+		if len(parts) >= 3 {
+			layout[strings.Join(parts[:3], "/")]++
+		} else {
+			layout[name]++
+		}
+		if !strings.Contains(name, "/rootfs/") && h.Typeflag == tar.TypeReg {
+			meta = append(meta, fmt.Sprintf("%s (%d bytes)", name, h.Size))
+		}
+		for _, p := range probes {
+			if strings.HasSuffix(name, "/rootfs"+p) {
+				found[p] = name
+			}
+		}
+	}
+	keys := make([]string, 0, len(layout))
+	for k := range layout {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		t.Logf("TARBALL layout: %s (%d entries)", k, layout[k])
+	}
+	for _, m := range meta {
+		t.Logf("TARBALL metadata file: %s", m)
+	}
+	for _, p := range probes {
+		if at, ok := found[p]; ok {
+			t.Logf("TARBALL: %s INCLUDED as %s", p, at)
+		} else {
+			t.Logf("TARBALL: %s NOT in the archive", p)
+		}
+	}
+}
+
+// waitForBoot blocks until the box's systemd has finished booting.
+//
+// A probe written while the box is still booting can be deleted under the
+// test: systemd-tmpfiles-setup runs at boot with --remove, and Ubuntu's
+// tmp.conf marks /tmp with "D", so a /tmp file written before it runs is
+// gone by the export (/var/tmp is not "D" and survives). That race made
+// TestIntegrationIncusExportImport report "/tmp probe NOT in the archive"
+// on one lane run and "INCLUDED" on the next.
+//
+// It polls `systemctl is-system-running` (no --wait) once a second for up
+// to three minutes. An empty answer is retried: right after StartContainer
+// the exec can reach the box before systemd's bus is up, and the first lane
+// run of a single `--wait` call got exactly that (state "").
+func waitForBoot(t *testing.T, client *incus.Client, name string) {
+	t.Helper()
+	const timeout = 3 * time.Minute
+	deadline := time.Now().Add(timeout)
+	var stdout, stderr string
+	var err error
+	for attempt := 1; ; attempt++ {
+		stdout, stderr, err = client.ExecWithOutput(name, []string{"systemctl", "is-system-running"})
+		switch bootState(stdout) {
+		case bootDone:
+			state := strings.TrimSpace(stdout)
+			if state == "degraded" {
+				// Common in a container (a unit that needs real hardware);
+				// the boot jobs, tmpfiles included, have still finished.
+				out, _, _ := client.ExecWithOutput(name, []string{"systemctl", "--failed", "--no-legend", "--plain"})
+				t.Logf("%s booted degraded after %d checks; failed units: %s", name, attempt, strings.TrimSpace(out))
+			} else {
+				t.Logf("%s booted (systemd %s) after %d checks", name, state, attempt)
+			}
+			return
+		case bootFailed:
+			t.Fatalf("%s is not booting: systemd state %q (stderr %q, err %v)", name, strings.TrimSpace(stdout), strings.TrimSpace(stderr), err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not finish booting within %s: last systemd state %q, stderr %q, err %v",
+				name, timeout, strings.TrimSpace(stdout), strings.TrimSpace(stderr), err)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func run(t *testing.T, name string, args ...string) {
+	t.Helper()
+	if out, err := exec.Command(name, args...).CombinedOutput(); err != nil { // #nosec G204 -- test-controlled args
+		t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+	}
+}
+
+func digest(b []byte) string {
+	s := sha256.Sum256(b)
+	return hex.EncodeToString(s[:])
+}
+
+func sortedKeys(m map[string][]byte) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
