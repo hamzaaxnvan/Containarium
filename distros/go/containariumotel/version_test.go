@@ -22,3 +22,27 @@ func TestVersion_LooksLikeVersion(t *testing.T) {
 	}
 }
 
+func TestVersion_TrimmedOfTrailingNewline(t *testing.T) {
+	// The embedded VERSION file ships with a trailing newline (POSIX
+	// text-file convention). The trimming step in version.go should
+	// produce a clean version with no whitespace.
+	if version != trimTest(version) {
+		t.Errorf("version %q has untrimmed whitespace", version)
+	}
+}
+
+func trimTest(s string) string {
+	// Mirror of strings.TrimSpace's behavior; deliberate to detect
+	// regressions in version.go's trim logic without re-importing.
+	for len(s) > 0 && isSpace(s[0]) {
+		s = s[1:]
+	}
+	for len(s) > 0 && isSpace(s[len(s)-1]) {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
