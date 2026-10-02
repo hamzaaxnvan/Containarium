@@ -253,3 +253,67 @@ func TestStreamExecEvents_FollowUntilClientGone(t *testing.T) {
 
 // A subscriber the watcher dropped (closed channel) ends the stream with
 // RESOURCE_EXHAUSTED instead of hanging or returning success.
+func TestStreamExecEvents_DroppedSubscriberIsResourceExhausted(t *testing.T) {
+	live := make(chan ExecEventRecord)
+	close(live)
+	src := &fakeExecSource{status: "ok", live: live}
+	s := NewThreatDetectionServer(threatdetect.NewEngine(&fakeFindingSink{}, "b", false, nil, nil), true, true, "")
+	s.SetExecTelemetry(src)
+	err := s.StreamExecEvents(&pb.StreamExecEventsRequest{Follow: true}, &fakeExecStream{ctx: execAdminCtx()})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("err = %v, want ResourceExhausted", err)
+	}
+}
+
+// A send failure (client gone mid-replay) surfaces as the error and still
+// releases the subscription.
+func TestStreamExecEvents_SendErrorReleases(t *testing.T) {
+	src := &fakeExecSource{status: "ok", live: make(chan ExecEventRecord), replay: []ExecEventRecord{rec("box-a", 1, time.Now())}}
+	s := NewThreatDetectionServer(threatdetect.NewEngine(&fakeFindingSink{}, "b", false, nil, nil), true, true, "")
+	s.SetExecTelemetry(src)
+	boom := errors.New("transport closed")
+	err := s.StreamExecEvents(&pb.StreamExecEventsRequest{Since: durationpb.New(time.Minute)}, &fakeExecStream{ctx: execAdminCtx(), err: boom})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the send error", err)
+	}
+	if src.cancelled != 1 {
+		t.Fatalf("cancelled = %d, want 1", src.cancelled)
+	}
+}
+
+// An open --follow stream must end when exec telemetry stops (daemon
+// shutdown), with UNAVAILABLE, instead of holding up GracefulStop until the
+// client disconnects.
+func TestStreamExecEvents_FollowReturnsAfterStop(t *testing.T) {
+	w := NewExecWatcher(nil)
+	w.setStatus(execTelemetryOK)
+	s := NewThreatDetectionServer(threatdetect.NewEngine(&fakeFindingSink{}, "b", false, nil, nil), true, true, "")
+	s.SetExecTelemetry(w)
+	done := make(chan error, 1)
+	go func() {
+		done <- s.StreamExecEvents(&pb.StreamExecEventsRequest{Follow: true}, &fakeExecStream{ctx: execAdminCtx()})
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		w.mu.Lock()
+		n := len(w.subs)
+		w.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("stream never subscribed")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	w.Stop()
+	select {
+	case err := <-done:
+		if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), execTelemetryStoppedStatus) {
+			t.Fatalf("follow returned %v after Stop, want UNAVAILABLE %q", err, execTelemetryStoppedStatus)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("follow stream still open after the watcher stopped (would hold up GracefulStop)")
+	}
+}
