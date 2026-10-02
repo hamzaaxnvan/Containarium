@@ -89,3 +89,186 @@ func TestProviderConformance(t *testing.T) {
 			}
 			if comment.Author != "reviewer" || comment.Body != "conformance comment" {
 				t.Errorf("%s Comment = %+v, want author=reviewer body=%q", tc.name, comment, "conformance comment")
+			}
+		})
+
+		t.Run(tc.name+"/AssignIfUnassigned_onUnassignedIssue", func(t *testing.T) {
+			assigned, err := tc.provider.AssignIfUnassigned(context.Background(), tc.conn, 4)
+			if err != nil {
+				t.Fatalf("AssignIfUnassigned: %v", err)
+			}
+			if !assigned {
+				t.Errorf("%s AssignIfUnassigned(unassigned issue) = false, want true", tc.name)
+			}
+		})
+
+		t.Run(tc.name+"/AssignIfUnassigned_neverReplaces", func(t *testing.T) {
+			assigned, err := tc.provider.AssignIfUnassigned(context.Background(), tc.conn, 1) // issue #1 is already assigned to "agent"
+			if err != nil {
+				t.Fatalf("AssignIfUnassigned: %v", err)
+			}
+			if assigned {
+				t.Errorf("%s AssignIfUnassigned(already-assigned issue) = true, want false", tc.name)
+			}
+		})
+
+		t.Run(tc.name+"/SetLabels", func(t *testing.T) {
+			if err := tc.provider.SetLabels(context.Background(), tc.conn, 5, []string{"triaged"}, []string{"needs-triage"}); err != nil {
+				t.Errorf("%s SetLabels: %v", tc.name, err)
+			}
+		})
+
+		t.Run(tc.name+"/CreateIssue", func(t *testing.T) {
+			// #2024's GitHub+GitLab parity proof: the same NewIssue is
+			// normalized into the same Issue by both adapters, over
+			// fixtures for each provider's own create-response shape
+			// (GitHub number + label objects; GitLab iid + label strings).
+			issue, err := tc.provider.CreateIssue(context.Background(), tc.conn, tracker.NewIssue{
+				Title:  "follow-up",
+				Body:   "child body\n\nParent: #1",
+				Labels: []string{"scope:architecture", "agent:needs-approval"},
+			})
+			if err != nil {
+				t.Fatalf("CreateIssue: %v", err)
+			}
+			want := tracker.Issue{
+				Number: 7,
+				Title:  "follow-up",
+				Body:   "child body\n\nParent: #1",
+				State:  pb.TrackerIssueState_TRACKER_ISSUE_STATE_OPEN,
+				Labels: []string{"scope:architecture", "agent:needs-approval"},
+			}
+			if !reflect.DeepEqual(issue, want) {
+				t.Errorf("%s CreateIssue = %+v, want %+v", tc.name, issue, want)
+			}
+		})
+
+		t.Run(tc.name+"/OpenChange", func(t *testing.T) {
+			change, err := tc.provider.OpenChange(context.Background(), tc.conn, tracker.OpenChangeRequest{
+				HeadBranch:  "agent/run-1/6-conformance-change",
+				BaseBranch:  "main",
+				Title:       "Conformance change",
+				Description: "Closes #6\n\n— conformance-suite via Containarium",
+			})
+			if err != nil {
+				t.Fatalf("OpenChange: %v", err)
+			}
+			// URL is legitimately provider-specific — not compared, same
+			// convention as GetChange above.
+			if change.Number != 6 {
+				t.Errorf("%s OpenChange.Number = %d, want 6", tc.name, change.Number)
+			}
+			if change.State != pb.TrackerIssueState_TRACKER_ISSUE_STATE_OPEN {
+				t.Errorf("%s OpenChange.State = %v, want OPEN", tc.name, change.State)
+			}
+			if change.CIVerdict != pb.TrackerCiVerdict_TRACKER_CI_VERDICT_NONE {
+				t.Errorf("%s OpenChange.CIVerdict = %v, want NONE (no CI has run yet)", tc.name, change.CIVerdict)
+			}
+			if change.Branch != "agent/run-1/6-conformance-change" {
+				t.Errorf("%s OpenChange.Branch = %q, want the head branch echoed back, not resolved from the provider's response", tc.name, change.Branch)
+			}
+		})
+	}
+}
+
+// newGitHubFixture serves the GitHub-shaped equivalent of the shared
+// conformance scenario: issue #1 (open, labeled "bug", assigned to
+// "agent", one comment from "reviewer"), a PR masquerading in the issues
+// list (filtered out by ListIssues), and PR #2 (merged, CI success).
+func newGitHubFixture(t *testing.T, fixedTime time.Time) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/acme/widgets/issues/1" && r.Method == http.MethodGet:
+			writeJSON(w, `{
+				"number": 1, "title": "conformance issue", "body": "same body on every provider",
+				"state": "open", "labels": [{"name": "bug"}], "assignee": {"login": "agent"}
+			}`)
+		case r.URL.Path == "/repos/acme/widgets/issues/1/comments":
+			writeJSON(w, `[{"user": {"login": "reviewer"}, "created_at": "`+fixedTime.Format(time.RFC3339)+`", "body": "lgtm"}]`)
+		case r.URL.Path == "/repos/acme/widgets/issues" && r.Method == http.MethodGet:
+			writeJSON(w, `[
+				{"number": 1, "title": "conformance issue", "body": "same body on every provider", "state": "open", "labels": [{"name": "bug"}], "assignee": {"login": "agent"}},
+				{"number": 2, "title": "a pull request", "state": "open", "labels": [], "pull_request": {}}
+			]`)
+		case r.URL.Path == "/repos/acme/widgets/pulls/2":
+			writeJSON(w, `{"number": 2, "state": "closed", "merged": true, "html_url": "https://github.com/acme/widgets/pull/2", "head": {"sha": "deadbeef"}}`)
+		case r.URL.Path == "/repos/acme/widgets/commits/deadbeef/status":
+			writeJSON(w, `{"state": "success", "total_count": 1}`)
+		case r.URL.Path == "/repos/acme/widgets/issues/3/comments" && r.Method == http.MethodPost:
+			writeJSON(w, `{"user": {"login": "reviewer"}, "created_at": "`+fixedTime.Format(time.RFC3339)+`", "body": "conformance comment"}`)
+		case r.URL.Path == "/repos/acme/widgets/issues/4" && r.Method == http.MethodGet:
+			writeJSON(w, `{"number": 4, "title": "unassigned", "state": "open", "labels": [], "assignee": null}`)
+		case r.URL.Path == "/user":
+			writeJSON(w, `{"login": "agent-bot"}`)
+		case r.URL.Path == "/repos/acme/widgets/issues/4/assignees" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+		case r.URL.Path == "/repos/acme/widgets/issues/5/labels" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/acme/widgets/issues/5/labels/"):
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/repos/acme/widgets/issues" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"number": 7, "title": "follow-up", "body": "child body\n\nParent: #1", "state": "open", "labels": [{"name": "scope:architecture"}, {"name": "agent:needs-approval"}], "assignee": null}`))
+		case r.URL.Path == "/repos/acme/widgets/pulls" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"number": 6, "state": "open", "merged": false, "html_url": "https://github.com/acme/widgets/pull/6"}`))
+		default:
+			t.Errorf("github fixture: unexpected request %s %q", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func writeJSON(w http.ResponseWriter, body string) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(body))
+}
+
+// newGitLabFixture serves the GitLab-shaped equivalent of the same
+// scenario.
+func newGitLabFixture(t *testing.T, fixedTime time.Time) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/issues/1" && r.Method == http.MethodGet:
+			writeJSON(w, `{
+				"iid": 1, "title": "conformance issue", "description": "same body on every provider",
+				"state": "opened", "labels": ["bug"], "assignee": {"username": "agent"}
+			}`)
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/issues/1/notes":
+			writeJSON(w, `[{"author": {"username": "reviewer"}, "created_at": "`+fixedTime.Format(time.RFC3339)+`", "body": "lgtm", "system": false}]`)
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/issues" && r.Method == http.MethodGet:
+			// GitLab has no "issue that is secretly a change" concept —
+			// its issues and merge_requests are always separate
+			// resources, so there's nothing to filter here. Returning
+			// just issue #1 keeps the two fixtures' ListIssues result
+			// identical without needing a GitLab-side equivalent of
+			// GitHub's pull_request-in-issues-list quirk.
+			writeJSON(w, `[{"iid": 1, "title": "conformance issue", "description": "same body on every provider", "state": "opened", "labels": ["bug"], "assignee": {"username": "agent"}}]`)
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/merge_requests/2":
+			writeJSON(w, `{"iid": 2, "state": "merged", "web_url": "https://gitlab.com/acme/widgets/-/merge_requests/2", "head_pipeline": {"status": "success"}}`)
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/issues/3/notes" && r.Method == http.MethodPost:
+			writeJSON(w, `{"author": {"username": "reviewer"}, "created_at": "`+fixedTime.Format(time.RFC3339)+`", "body": "conformance comment"}`)
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/issues/4" && r.Method == http.MethodGet:
+			writeJSON(w, `{"iid": 4, "title": "unassigned", "state": "opened", "labels": [], "assignee": null}`)
+		case r.URL.EscapedPath() == "/api/v4/user":
+			writeJSON(w, `{"id": 99, "username": "agent-bot", "bot": true}`)
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/issues/4" && r.Method == http.MethodPut:
+			writeJSON(w, `{}`)
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/issues/5" && r.Method == http.MethodPut:
+			writeJSON(w, `{}`)
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/issues" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id": 9999, "iid": 7, "title": "follow-up", "description": "child body\n\nParent: #1", "state": "opened", "labels": ["scope:architecture", "agent:needs-approval"], "assignee": null}`))
+		case r.URL.EscapedPath() == "/api/v4/projects/acme%2Fwidgets/merge_requests" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"iid": 6, "state": "opened", "web_url": "https://gitlab.com/acme/widgets/-/merge_requests/6", "head_pipeline": null}`))
+		default:
+			t.Errorf("gitlab fixture: unexpected request %s %q", r.Method, r.URL.EscapedPath())
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}

@@ -154,3 +154,81 @@ func TestIsTrustedSource_AllowlistMatches(t *testing.T) {
 	}
 }
 
+func TestIsTrustedSource_UnparseableRemoteAddrFailsClosed(t *testing.T) {
+	// Loopback always-allow happens before the parse, so use a
+	// genuinely unparseable RemoteAddr (no host part, no IP).
+	allow := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	if isTrustedSource(mkReq("garbage"), allow) {
+		t.Fatal("unparseable RemoteAddr must fail closed")
+	}
+}
+
+func TestIsTrustedSource_HostOnlyRemoteAddr(t *testing.T) {
+	// SplitHostPort fails when there's no port — the code falls
+	// back to using the whole RemoteAddr as the host. Make sure
+	// that path still parses real IPs correctly.
+	allow := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+	if !isTrustedSource(mkReq("10.0.0.5"), allow) {
+		t.Fatal("host-only RemoteAddr should still be parsed and matched")
+	}
+}
+
+// TestServeHTTP_RejectsUntrustedSource validates that the gate
+// short-circuits ServeHTTP with 403 before any route lookup or
+// wake side-effect. Uses the same fake harness as proxy_test.go;
+// the test runs with an allowlist that excludes RemoteAddr.
+func TestServeHTTP_RejectsUntrustedSource(t *testing.T) {
+	const fullDomain = "alice-web.example.test"
+	proxy := NewWakeProxy(
+		&fakeStarter{ready: true},
+		&fakeLookup{fullDomain: fullDomain, containerName: "alice-container"},
+		&fakeRouteStore{},
+		nil,
+		nil,
+		1*time.Second,
+	)
+	// Allowlist contains only 10.0.0.0/8; httptest.NewRequest's
+	// default RemoteAddr is 192.0.2.1 (TEST-NET-1), which won't
+	// match and isn't loopback.
+	proxy.SetTrustedProxies([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+
+	req := httptest.NewRequest(http.MethodGet, "http://"+fullDomain+"/", nil)
+	req.Host = fullDomain
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("untrusted source: got %d, want 403; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestServeHTTP_AcceptsLoopbackEvenWithAllowlist confirms the
+// loopback exemption — production deployments have Caddy on the
+// same host as the daemon, so 127.0.0.1 must always work even
+// when operators have set a strict allowlist that doesn't
+// include loopback.
+func TestServeHTTP_AcceptsLoopbackEvenWithAllowlist(t *testing.T) {
+	const fullDomain = "alice-web.example.test"
+	proxy := NewWakeProxy(
+		&fakeStarter{ready: false, err: nil}, // wake will time-out → 503
+		&fakeLookup{fullDomain: fullDomain, containerName: "alice-container"},
+		&fakeRouteStore{},
+		nil,
+		nil,
+		10*time.Millisecond,
+	)
+	proxy.SetTrustedProxies([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+
+	req := httptest.NewRequest(http.MethodGet, "http://"+fullDomain+"/", nil)
+	req.Host = fullDomain
+	req.RemoteAddr = "127.0.0.1:54321"
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	// Loopback should pass the gate. Past the gate, the
+	// (failing) wake takes over — anything other than 403 means
+	// the gate let us through.
+	if rec.Code == http.StatusForbidden {
+		t.Fatalf("loopback should bypass the gate even with strict allowlist; got 403 body=%q", rec.Body.String())
+	}
+}
