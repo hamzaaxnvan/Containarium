@@ -25,3 +25,17 @@ const (
 	// EnvGatewayQuotaTokens caps input+output+cached tokens per tenant per window.
 	EnvGatewayQuotaTokens = "CONTAINARIUM_GATEWAY_QUOTA_TOKENS" // #nosec G101 -- env var name, not a credential value
 	// EnvGatewayQuotaOutputTokens caps generated tokens per tenant per window.
+	EnvGatewayQuotaOutputTokens = "CONTAINARIUM_GATEWAY_QUOTA_OUTPUT_TOKENS" // #nosec G101 -- env var name, not a credential value
+
+	// EnvGatewayAnomalyEnabled turns the per-tenant anomaly detectors on ("1").
+	// Off by default: the detectors are advisory input to the response ladder,
+	// and an operator should choose to act on heuristics rather than inherit
+	// them in a patch release.
+	EnvGatewayAnomalyEnabled = "CONTAINARIUM_GATEWAY_ANOMALY"
+
+	// EnvGatewayAnomalyRevokeAt is the anomaly score (0..1] at which a tenant is
+	// revoked automatically. Unset ⇒ never: revocation needs a human to undo,
+	// so it is not something a heuristic should reach on its own unless the
+	// operator has explicitly asked for that.
+	EnvGatewayAnomalyRevokeAt = "CONTAINARIUM_GATEWAY_ANOMALY_REVOKE_AT"
+)
