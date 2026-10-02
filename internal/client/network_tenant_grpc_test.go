@@ -56,3 +56,62 @@ func TestNativeTenantGRPCClientAndUnsupportedProviderNoWrite(t *testing.T) {
 }
 func TestNativeTenantWireCompatibilityWithBaseDescriptor(t *testing.T) {
 	// Model exactly the pre-feature descriptor: keep every published field,
+	// including dry_run=29 and Container.tool_access=30, and remove only additions.
+	current := (&pb.CreateContainerRequest{}).ProtoReflect().Descriptor().ParentFile()
+	old := protodesc.ToFileDescriptorProto(current)
+	for _, msg := range old.MessageType {
+		fields := msg.Field[:0]
+		for _, field := range msg.Field {
+			if (msg.GetName() == "CreateContainerRequest" && field.GetNumber() == 30) || (msg.GetName() == "Container" && (field.GetNumber() == 31 || field.GetNumber() == 32)) {
+				continue
+			}
+			fields = append(fields, field)
+		}
+		msg.Field = fields
+	}
+	enums := old.EnumType[:0]
+	for _, e := range old.EnumType {
+		if e.GetName() != "NetworkTenantSource" {
+			enums = append(enums, e)
+		}
+	}
+	old.EnumType = enums
+	descriptor, err := protodesc.NewFile(old, protoregistry.GlobalFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := dynamicpb.NewMessage(descriptor.Messages().ByName("CreateContainerRequest"))
+	request := &pb.CreateContainerRequest{Username: "workload", TenantId: "default", DryRun: true, NetworkTenant: "team-a"}
+	raw, err := proto.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.Unmarshal(raw, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if !legacy.Get(legacy.Descriptor().Fields().ByName("dry_run")).Bool() {
+		t.Fatal("dry_run wire field changed")
+	}
+	raw, err = proto.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundtrip := &pb.CreateContainerRequest{}
+	if err := proto.Unmarshal(raw, roundtrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundtrip.NetworkTenant != "team-a" || roundtrip.TenantId != "default" || !roundtrip.DryRun {
+		t.Fatal(roundtrip)
+	}
+	omitted := &pb.CreateContainerRequest{Username: "workload"}
+	raw, err = proto.Marshal(omitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.Unmarshal(raw, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.GetUnknown()) != 0 {
+		t.Fatal("omitted option changed legacy wire payload")
+	}
+}
