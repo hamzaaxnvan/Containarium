@@ -37,3 +37,30 @@ func TestPlugin_SkipUnobserved(t *testing.T) {
 				for k, v := range deferredMeta(t, up) {
 					conn.Metadata[k] = v
 				}
+			}
+			cfg.PipeStartCallback(conn)
+			cfg.PipeErrorCallback(conn, nil)
+			cfg.PipeStartCallback(&libplugin.ConnMeta{UserName: "boxuser", FromAddr: "203.0.113.7:2", UniqId: "s2", Metadata: conn.Metadata})
+			p.Shutdown()
+			if len(rec.recs) != tt.want {
+				t.Fatalf("records = %+v, want %d", rec.recs, tt.want)
+			}
+		})
+	}
+}
+
+// CredentialMeta is the metadata publicKeyCallback stashes, so a plugin that
+// writes the records itself attributes them exactly as this one would.
+func TestCredentialMetaMatchesPublicKeyCallback(t *testing.T) {
+	ca := newTestCA(t)
+	cert, key := newTestUserCert(t, ca, "alice", 7)
+	for _, wire := range [][]byte{cert.Marshal(), key.Marshal(), []byte("bad")} {
+		up, err := (&Plugin{}).Config().PublicKeyCallback(&libplugin.ConnMeta{}, wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := CredentialMeta(wire), deferredMeta(t, up); !reflect.DeepEqual(got, want) {
+			t.Fatalf("CredentialMeta = %v, publicKeyCallback stashed %v", got, want)
+		}
+	}
+}
