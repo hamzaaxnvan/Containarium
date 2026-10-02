@@ -46,3 +46,16 @@ func runAgentCall(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Delegating task to peer %q...\n", toPeer)
 	art, err := c.SendAgentTask(agentCallFrom, toPeer, agentCallInput)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\n✓ task %s — %s\n", art.TaskId, art.State)
+	if art.Error != "" {
+		fmt.Printf("  error: %s\n", art.Error)
+	}
+	if art.OutputJson != "" {
+		fmt.Printf("\nArtifact:\n%s\n", art.OutputJson)
+	}
+	return nil
+}
