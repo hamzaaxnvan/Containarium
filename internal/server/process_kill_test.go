@@ -550,3 +550,371 @@ func TestProcessResponder_KillProcess(t *testing.T) {
 		if f.Response == nil || f.Response.ProcessKilled || f.Response.KillSkipReason != pb.KillSkipReason_KILL_SKIP_REASON_PID_REUSED {
 			t.Fatalf("response = %+v, want not killed, PID_REUSED", f.Response)
 		}
+		if d := auditDetails(fx.audit, "kill-skipped"); len(d) != 1 || !strings.Contains(d[0], "pid reused") {
+			t.Fatalf("audit kill-skipped = %v", d)
+		}
+	})
+	t.Run("no start time is skipped as START_TIME_UNKNOWN", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{err: fmt.Errorf("pid 4242: %w", errKillStartTimeUnknown)}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 4242)
+		if f.Response == nil || f.Response.ProcessKilled || f.Response.KillSkipReason != pb.KillSkipReason_KILL_SKIP_REASON_START_TIME_UNKNOWN {
+			t.Fatalf("response = %+v, want not killed, START_TIME_UNKNOWN", f.Response)
+		}
+		if d := auditDetails(fx.audit, "kill-skipped"); len(d) != 1 || !strings.Contains(d[0], "start time unknown") {
+			t.Fatalf("audit kill-skipped = %v", d)
+		}
+	})
+	t.Run("non-Incus runtime is skipped as RUNTIME_UNSUPPORTED (#2768)", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{err: fmt.Errorf("container box-a init cgroup %q: %w", "/init.scope", errKillRuntimeUnsupported)}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 4242)
+		if f.Response == nil || f.Response.ProcessKilled || f.Response.KillSkipReason != pb.KillSkipReason_KILL_SKIP_REASON_RUNTIME_UNSUPPORTED {
+			t.Fatalf("response = %+v, want not killed, RUNTIME_UNSUPPORTED", f.Response)
+		}
+		d := auditDetails(fx.audit, "kill-skipped")
+		if len(d) != 1 || !strings.Contains(d[0], "kill_process is Incus-only") || strings.Contains(d[0], "pid reused") {
+			t.Fatalf("audit kill-skipped = %v, want the Incus-only reason, not pid reused", d)
+		}
+	})
+	t.Run("mining-behavior never kills", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		fx.fire(t, "box-a", ruleMiningBehavior, pb.ThreatSeverity_THREAT_SEVERITY_HIGH)
+		if len(k.calls) != 0 {
+			t.Fatalf("kills = %v", k.calls)
+		}
+	})
+	t.Run("degraded backend never kills", func(t *testing.T) {
+		fx := newResponderFixture(t, true)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		fx.fireSignature(t, "box-a", 4242)
+		if len(k.calls) != 0 {
+			t.Fatalf("kills = %v", k.calls)
+		}
+	})
+}
+
+func TestHashProcExe(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "4242")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "exe"), []byte("hello"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hash := func(maxBytes int64) (string, error) {
+		f, err := os.Open(filepath.Join(dir, "exe"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+		return hashOpenFile(f, 5, maxBytes, time.Second)
+	}
+	sum, err := hash(1 << 20)
+	if err != nil || sum != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
+		t.Fatalf("sum=%q err=%v", sum, err)
+	}
+	if _, err := hash(3); !errors.Is(err, errExecHashTooLarge) {
+		t.Fatalf("size cap: err = %v", err)
+	}
+
+	// The worker redelivers with SHA256 set; a gone process is dropped. The
+	// event's start time pins the pid (#2768; TestExecHasher_* in
+	// exec_hasher_test.go cover the pin, the cache and the drop count).
+	writeStat(t, root, 4242, "proc", fakeStart(4242))
+	var got []threatdetect.ExecEvent
+	h := newExecHasher(func(ev threatdetect.ExecEvent) { got = append(got, ev) })
+	h.procRoot = root
+	h.process(threatdetect.ExecEvent{PID: 4242, StartTime: fakeStart(4242), Container: "box-a"})
+	h.process(threatdetect.ExecEvent{PID: 9999, StartTime: fakeStart(9999)})
+	if len(got) != 1 || got[0].SHA256 != sum || got[0].Container != "box-a" {
+		t.Fatalf("redelivered %+v", got)
+	}
+}
+
+// #2775 review: the kill facts a webhook post carries stay true across
+// respawns, a second exec while an action is open, and a release.
+func TestProcessResponder_KillFactsAcrossRespawns(t *testing.T) {
+	ctx := context.Background()
+	stored := func(t *testing.T, fx *responderFixture, id int64) *threatdetect.FindingResponse {
+		t.Helper()
+		g, err := fx.findings.Get(ctx, id)
+		if err != nil || g.Response == nil {
+			t.Fatalf("get finding %d: %v %+v", id, err, g)
+		}
+		return g.Response
+	}
+	t.Run("a second distinct skip under ALERT is written, the same kind is not", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{err: fmt.Errorf("pid 1: %w", errKillPIDReused)}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 1)
+		if got := stored(t, fx, f.ID).KillSkipReason; got != pb.KillSkipReason_KILL_SKIP_REASON_PID_REUSED {
+			t.Fatalf("first skip = %s", got)
+		}
+		k.err = fmt.Errorf("pid 2: %w", errKillProcessGone)
+		fx.fireSignature(t, "box-a", 2)
+		if got := stored(t, fx, f.ID).KillSkipReason; got != pb.KillSkipReason_KILL_SKIP_REASON_PROCESS_GONE {
+			t.Fatalf("second, different skip = %s, want PROCESS_GONE", got)
+		}
+	})
+	t.Run("a skip while an action is open is recorded", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_THROTTLE, "10%", time.Hour)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 1)
+		k.err = fmt.Errorf("pid 2: %w", errKillContainerInit)
+		fx.fireSignature(t, "box-a", 2)
+		r := stored(t, fx, f.ID)
+		if r.KillSkipReason != pb.KillSkipReason_KILL_SKIP_REASON_CONTAINER_INIT || r.State != pb.ResponseState_RESPONSE_STATE_APPLIED || r.KilledPID != 1 {
+			t.Fatalf("response = %+v, want APPLIED, pid 1 kept, skip CONTAINER_INIT", r)
+		}
+	})
+	t.Run("a release after later kills names the latest pid and the count", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_THROTTLE, "10%", time.Hour)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 1)
+		fx.fireSignature(t, "box-a", 2)
+		fx.fireSignature(t, "box-a", 3)
+		if r := stored(t, fx, f.ID); r.KilledPID != 3 || r.Kills != 3 {
+			t.Fatalf("before release: pid=%d kills=%d, want 3 and 3", r.KilledPID, r.Kills)
+		}
+		if _, _, err := fx.r.Release(ctx, "box-a"); err != nil {
+			t.Fatal(err)
+		}
+		r := stored(t, fx, f.ID)
+		if r.State != pb.ResponseState_RESPONSE_STATE_RELEASED || !r.ProcessKilled || r.KilledPID != 3 || r.Kills != 3 {
+			t.Fatalf("released response = %+v, want RELEASED with pid 3, kills 3", r)
+		}
+	})
+}
+
+// #2775 x #2766: two boxes of a tenant share one finding; each has a kill
+// recorded. Releasing either box writes the finding's current kill facts (the
+// latest pid, the count), never a pid of 0 and never the released box's first
+// pid. The other box is still throttled, so the finding keeps showing its
+// APPLIED record with the same kill facts (#2820), and the release record
+// (what the webhook gets) names the released box.
+func TestProcessResponder_SharedFindingReleaseCarriesCurrentKill(t *testing.T) {
+	ctx := context.Background()
+	for _, released := range []string{"box-a", "box-b"} {
+		t.Run("release "+released, func(t *testing.T) {
+			fx := newResponderFixture(t, false)
+			fx.r.SetProcessKiller(&fakeKiller{})
+			fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_THROTTLE, "10%", time.Hour)
+			fx.setKill(t, "", true)
+			f := fx.fireSignature(t, "box-a", 11)
+			g := fx.fireSignature(t, "box-b", 22)
+			if f.ID != g.ID {
+				t.Fatalf("finding ids %d and %d: the boxes must share one finding", f.ID, g.ID)
+			}
+			if _, _, err := fx.r.Release(ctx, released); err != nil {
+				t.Fatal(err)
+			}
+			cur, err := fx.findings.Get(ctx, f.ID)
+			if err != nil || cur.Response == nil {
+				t.Fatalf("get: %v", err)
+			}
+			other := map[string]string{"box-a": "box-b", "box-b": "box-a"}[released]
+			r := cur.Response
+			if r.State != pb.ResponseState_RESPONSE_STATE_APPLIED || r.Container != other || !r.ProcessKilled || r.KilledPID != 22 || r.Kills != 2 {
+				t.Fatalf("response after releasing %s = %+v, want %s's APPLIED, killed, pid 22, kills 2", released, r, other)
+			}
+			w := fx.findings.lastWrite()
+			if w.State != pb.ResponseState_RESPONSE_STATE_RELEASED || w.Container != released {
+				t.Fatalf("release record = %+v, want RELEASED on %s", w, released)
+			}
+			if w.KeepKillOf(cur.Response); !w.ProcessKilled || w.KilledPID != 22 || w.Kills != 2 {
+				t.Fatalf("release record as delivered = %+v, want killed, pid 22, kills 2", w)
+			}
+		})
+	}
+}
+
+// #2772 x #2775: box-b killed nothing; releasing it must not blank or
+// duplicate box-a's kill on the shared finding.
+func TestProcessResponder_SharedFindingReleaseOfNonKillerKeepsKill(t *testing.T) {
+	ctx := context.Background()
+	fx := newResponderFixture(t, false)
+	fx.r.SetProcessKiller(&fakeKiller{})
+	fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_THROTTLE, "10%", time.Hour)
+	fx.setKill(t, "", true)
+	f := fx.fireSignature(t, "box-a", 11) // killed on box-a
+	fx.setKill(t, "", false)
+	fx.fireSignature(t, "box-b", 22) // throttled, nothing killed
+	if _, _, err := fx.r.Release(ctx, "box-b"); err != nil {
+		t.Fatal(err)
+	}
+	if w := fx.findings.lastWrite(); w.ProcessKilled || w.KilledPID != 0 {
+		t.Fatalf("box-b's release record = %+v, want no kill of its own", w)
+	}
+	cur, err := fx.findings.Get(ctx, f.ID)
+	if err != nil || cur.Response == nil {
+		t.Fatalf("get: %v", err)
+	}
+	if r := cur.Response; !r.ProcessKilled || r.KilledPID != 11 || r.Kills != 1 {
+		t.Fatalf("finding after box-b's release = %+v, want box-a's kill whole: pid 11, kills 1", r)
+	}
+}
+
+// #2775 review: a re-fire that adds nothing to the kill facts on record is
+// not rewritten. Every SetResponse on the real stores emits the finding and
+// hands it to the webhook notifier, so an unchanged write is a Postgres
+// UPDATE plus a webhook attempt for nothing; the fake records every write.
+func TestProcessResponder_RecordKillWritesOnlyNews(t *testing.T) {
+	writes := func(fx *responderFixture) int {
+		fx.findings.mu.Lock()
+		defer fx.findings.mu.Unlock()
+		return len(fx.findings.writes)
+	}
+	t.Run("while a throttle stands", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_THROTTLE, "10%", time.Hour)
+		fx.setKill(t, "", true)
+		fx.fireSignature(t, "box-a", 1) // throttled, pid 1 killed
+		if n := writes(fx); n != 1 {
+			t.Fatalf("writes after the first kill = %d, want 1", n)
+		}
+		// The miner respawns and exits before the signal: the skip is news
+		// once.
+		k.err = fmt.Errorf("pid 2: %w", errKillProcessGone)
+		fx.fireSignature(t, "box-a", 2)
+		if n := writes(fx); n != 2 {
+			t.Fatalf("writes after the first skip = %d, want 2", n)
+		}
+		if w := fx.findings.lastWrite(); !w.ProcessKilled || w.KilledPID != 1 || w.Kills != 1 || w.KillSkipReason != pb.KillSkipReason_KILL_SKIP_REASON_PROCESS_GONE {
+			t.Fatalf("skip write = %+v, want pid 1 kept, kills 1, PROCESS_GONE", w)
+		}
+		fx.fireSignature(t, "box-a", 3) // the same skip again: nothing new
+		fx.fireSignature(t, "box-a", 4)
+		if n := writes(fx); n != 2 {
+			t.Fatalf("writes after repeated PROCESS_GONE skips = %d, want 2: nothing changed", n)
+		}
+		// The operator turns kill_process off: no attempt, nothing to record.
+		k.err = nil
+		fx.setKill(t, "", false)
+		fx.fireSignature(t, "box-a", 5)
+		if n := writes(fx); n != 2 || len(k.calls) != 4 {
+			t.Fatalf("writes after a re-fire with kill_process off = %d (kill calls %d), want 2 and 4", n, len(k.calls))
+		}
+		// A kill is always news: it raises the count.
+		fx.setKill(t, "", true)
+		fx.fireSignature(t, "box-a", 6)
+		if n := writes(fx); n != 3 {
+			t.Fatalf("writes after another kill = %d, want 3", n)
+		}
+		if w := fx.findings.lastWrite(); w.KilledPID != 6 || w.Kills != 2 || w.KillSkipReason != pb.KillSkipReason_KILL_SKIP_REASON_UNSPECIFIED {
+			t.Fatalf("kill write = %+v, want pid 6, kills 2, skip cleared", w)
+		}
+	})
+	t.Run("under ALERT", func(t *testing.T) {
+		fx := newResponderFixture(t, false)
+		k := &fakeKiller{}
+		fx.r.SetProcessKiller(k)
+		fx.setKill(t, "", true)
+		fx.fireSignature(t, "box-a", 1)
+		fx.setKill(t, "", false)
+		fx.fireSignature(t, "box-a", 2)
+		fx.fireSignature(t, "box-a", 3)
+		if n := writes(fx); n != 1 {
+			t.Fatalf("writes = %d, want 1: re-fires with kill_process off add nothing", n)
+		}
+	})
+}
+
+// orphanListStore lists every open action as orphaned, so the sweep reaps a
+// row the fixture confirmed (as if the daemon had died before confirming it).
+type orphanListStore struct{ threatdetect.ActionStore }
+
+func (s orphanListStore) ListOrphaned(ctx context.Context, _ time.Time) ([]*threatdetect.SecurityAction, error) {
+	row, err := s.Open(ctx, "box-a")
+	if err != nil {
+		return nil, err
+	}
+	return []*threatdetect.SecurityAction{row}, nil
+}
+
+// #2775 review: a recorded skip reason survives the release, expiry and
+// orphan-sweep writes. A box whose kill was refused has no kill of its own
+// on its action row (#2772: the record is per box), but the reason on record
+// is the finding's current state and is carried, not blanked.
+func TestProcessResponder_ReleaseKeepsSkipReason(t *testing.T) {
+	ctx := context.Background()
+	const initSkip = pb.KillSkipReason_KILL_SKIP_REASON_CONTAINER_INIT
+	setup := func(t *testing.T) (*responderFixture, int64) {
+		t.Helper()
+		fx := newResponderFixture(t, false)
+		fx.r.SetProcessKiller(&fakeKiller{err: fmt.Errorf("pid 1: %w", errKillContainerInit)})
+		fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_THROTTLE, "10%", time.Hour)
+		fx.setKill(t, "", true)
+		f := fx.fireSignature(t, "box-a", 1)
+		if f.Response == nil || f.Response.State != pb.ResponseState_RESPONSE_STATE_APPLIED || f.Response.ProcessKilled || f.Response.KillSkipReason != initSkip {
+			t.Fatalf("after the refused kill: %+v, want APPLIED with CONTAINER_INIT", f.Response)
+		}
+		return fx, f.ID
+	}
+	t.Run("operator release", func(t *testing.T) {
+		fx, _ := setup(t)
+		if _, _, err := fx.r.Release(ctx, "box-a"); err != nil {
+			t.Fatal(err)
+		}
+		if w := fx.findings.lastWrite(); w.State != pb.ResponseState_RESPONSE_STATE_RELEASED || w.ProcessKilled || w.KillSkipReason != initSkip {
+			t.Fatalf("release write = %+v, want RELEASED, not killed, CONTAINER_INIT kept", w)
+		}
+	})
+	t.Run("ttl expiry", func(t *testing.T) {
+		fx, _ := setup(t)
+		if n := fx.r.SweepExpired(ctx, fx.clock.Add(2*time.Hour)); n != 1 {
+			t.Fatalf("expired = %d, want 1", n)
+		}
+		if w := fx.findings.lastWrite(); w.State != pb.ResponseState_RESPONSE_STATE_EXPIRED || w.ProcessKilled || w.KillSkipReason != initSkip {
+			t.Fatalf("expiry write = %+v, want EXPIRED, not killed, CONTAINER_INIT kept", w)
+		}
+	})
+	t.Run("orphan sweep", func(t *testing.T) { // #2816 item 5: the third writer
+		fx, _ := setup(t)
+		fx.r.actions = orphanListStore{fx.actions}
+		if n := fx.r.SweepExpired(ctx, fx.clock.Add(time.Second)); n != 1 {
+			t.Fatalf("swept = %d, want 1", n)
+		}
+		if w := fx.findings.lastWrite(); w.State != pb.ResponseState_RESPONSE_STATE_RELEASED || w.ReleasedBy != threatdetect.ReleasedByOrphanSweep ||
+			w.ProcessKilled || w.KillSkipReason != initSkip {
+			t.Fatalf("orphan-sweep write = %+v, want RELEASED by the sweep, not killed, CONTAINER_INIT kept", w)
+		}
+	})
+	t.Run("the row is the fallback when the finding is gone", func(t *testing.T) {
+		fx, id := setup(t)
+		fx.findings.mu.Lock()
+		delete(fx.findings.rows, id)
+		fx.findings.mu.Unlock()
+		row, err := fx.actions.Open(ctx, "box-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fx.r.releaseKill(ctx, row); got != (killNote{}) {
+			t.Fatalf("releaseKill with no finding and no row pid = %+v, want nothing", got)
+		}
+		row.KilledPID = 7
+		if got := fx.r.releaseKill(ctx, row); got != (killNote{killed: true, pid: 7, count: 1}) {
+			t.Fatalf("releaseKill from the row = %+v, want pid 7, one kill", got)
+		}
+	})
+}

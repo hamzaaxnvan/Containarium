@@ -69,3 +69,147 @@ func TestCountLiveRunners(t *testing.T) {
 
 // -----------------------------------------------------------------
 // Provision cap enforcement
+// -----------------------------------------------------------------
+
+// helper: build deps whose box listing reports `existing` live
+// runner boxes (names that do NOT collide with the ones Provision
+// will generate, so the requested runners are all net-new).
+func capDeps(liveNames []string) (Deps, *fakeBoxes) {
+	boxes := &fakeBoxes{existing: map[string]bool{}, listOut: liveNames}
+	return Deps{
+		Boxes:  boxes,
+		SSH:    &fakeInstaller{alreadyInstalled: map[string]bool{}},
+		GitHub: &fakeGitHub{registerOnAttempt: map[string]int{}},
+		Clock:  newFakeClock(),
+	}, boxes
+}
+
+func filledNames(prefix string, n int) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		// Names distinct from the generated "ci-runner-<i>" set so
+		// requested runners are net-new (use a letter suffix).
+		out = append(out, fmt.Sprintf("%s-x%d", prefix, i))
+	}
+	return out
+}
+
+func TestProvisionRespectsCap_ClampsToHeadroom(t *testing.T) {
+	// 18 live runner boxes, cap 20 → headroom 2. Request 5 → 2
+	// created, 3 deferred/queued.
+	deps, boxes := capDeps(filledNames("ci-runner", 18))
+	opts := Options{
+		Repo:                "owner/repo",
+		PAT:                 "ghp_x",
+		Count:               5,
+		MaxTotal:            20,
+		RegistrationTimeout: 1 * time.Second,
+	}
+	res, err := Provision(context.Background(), deps, opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Deferred != 3 {
+		t.Errorf("expected Deferred=3, got %d", res.Deferred)
+	}
+	if res.PartialFailure {
+		t.Errorf("deferral is backpressure, must not set PartialFailure")
+	}
+	if len(boxes.created) != 2 {
+		t.Errorf("expected exactly 2 boxes created (headroom), got %d (%v)", len(boxes.created), boxes.created)
+	}
+	queued := 0
+	for _, r := range res.Runners {
+		if r.State == "queued" {
+			queued++
+		}
+	}
+	if queued != 3 {
+		t.Errorf("expected 3 queued rows, got %d", queued)
+	}
+}
+
+func TestProvisionAtCap_DefersAllNotError(t *testing.T) {
+	// Already at the ceiling → zero creates, all requested deferred,
+	// no Go error, no PartialFailure.
+	deps, boxes := capDeps(filledNames("ci-runner", 20))
+	opts := Options{
+		Repo:                "owner/repo",
+		PAT:                 "ghp_x",
+		Count:               3,
+		MaxTotal:            20,
+		RegistrationTimeout: 1 * time.Second,
+	}
+	res, err := Provision(context.Background(), deps, opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(boxes.created) != 0 {
+		t.Errorf("expected zero creates at cap, got %d", len(boxes.created))
+	}
+	if res.Deferred != 3 {
+		t.Errorf("expected Deferred=3, got %d", res.Deferred)
+	}
+	if res.PartialFailure {
+		t.Errorf("at-cap is not a failure")
+	}
+	for _, r := range res.Runners {
+		if r.State != "queued" {
+			t.Errorf("expected all rows queued, got %s for %s", r.State, r.Name)
+		}
+	}
+}
+
+func TestProvisionCapIgnoresNonPrefixBoxes(t *testing.T) {
+	// 19 non-runner boxes + 1 runner box, cap 20. Only the single
+	// ci-runner* box counts → headroom 19. Request 3 → all created.
+	live := append([]string{"ci-runner-x0"}, filledNamesPlain("tenant", 19)...)
+	deps, boxes := capDeps(live)
+	opts := Options{
+		Repo:                "owner/repo",
+		PAT:                 "ghp_x",
+		Count:               3,
+		MaxTotal:            20,
+		RegistrationTimeout: 1 * time.Second,
+	}
+	res, err := Provision(context.Background(), deps, opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Deferred != 0 {
+		t.Errorf("non-runner boxes must not consume headroom; Deferred=%d", res.Deferred)
+	}
+	if len(boxes.created) != 3 {
+		t.Errorf("expected 3 creates, got %d", len(boxes.created))
+	}
+}
+
+func filledNamesPlain(prefix string, n int) []string {
+	out := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, fmt.Sprintf("%s-%d", prefix, i))
+	}
+	return out
+}
+
+func TestProvisionCapDefaultsFromEnv(t *testing.T) {
+	// With MaxTotal unset on Options, applyDefaults pulls the env.
+	t.Setenv("MAX_RUNNERS_TOTAL", "1")
+	deps, boxes := capDeps(nil)
+	opts := Options{
+		Repo:                "owner/repo",
+		PAT:                 "ghp_x",
+		Count:               3, // env cap of 1 → only 1 created
+		RegistrationTimeout: 1 * time.Second,
+	}
+	res, err := Provision(context.Background(), deps, opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(boxes.created) != 1 {
+		t.Errorf("expected 1 create under env cap of 1, got %d", len(boxes.created))
+	}
+	if res.Deferred != 2 {
+		t.Errorf("expected Deferred=2, got %d", res.Deferred)
+	}
+}

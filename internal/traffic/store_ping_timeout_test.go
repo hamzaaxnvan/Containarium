@@ -34,3 +34,13 @@ func TestNewStore_PingIsBoundedOnBlackholePostgres(t *testing.T) {
 	go func() {
 		_, err := NewStore(context.Background(), dsn)
 		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("NewStore succeeded against a blackhole Postgres")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("NewStore still blocked after 15s against a blackhole Postgres (unbounded ping)")
+	}
+}
