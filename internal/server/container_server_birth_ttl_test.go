@@ -90,3 +90,96 @@ func TestStampBirthAutoSleep_EnablesWithThreshold(t *testing.T) {
 	s.stampBirthAutoSleep("alice-container", 20)
 
 	if len(*calls) != 2 {
+		t.Fatalf("expected 2 SetConfig calls (enable + threshold), got %d: %+v", len(*calls), *calls)
+	}
+	enable, thresh := (*calls)[0], (*calls)[1]
+	if enable.key != incus.AutoSleepEnabledKey || enable.value != "true" {
+		t.Errorf("first call = %+v, want %s=true", enable, incus.AutoSleepEnabledKey)
+	}
+	if thresh.key != incus.IdleThresholdMinutesKey || thresh.value != "20" {
+		t.Errorf("second call = %+v, want %s=20", thresh, incus.IdleThresholdMinutesKey)
+	}
+}
+
+// TestStampBirthDeleteAfterStopped_PersistsWindow — #525: a create-time
+// stopped→delete window is persisted under the Incus key the two-phase reaper
+// reads, so the box is born with its disk-reclaim timer (the clock starts only
+// when it actually stops).
+func TestStampBirthDeleteAfterStopped_PersistsWindow(t *testing.T) {
+	s, calls, _ := newTTLTestServer(t, map[string]*incus.ContainerInfo{
+		"alice-container": {Name: "alice-container", State: "Running"},
+	})
+	s.stampBirthDeleteAfterStopped("alice-container", 21600) // 6h
+
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 SetConfig call, got %d: %+v", len(*calls), *calls)
+	}
+	c := (*calls)[0]
+	if c.key != incus.DeleteAfterStoppedSecondsKey || c.value != "21600" {
+		t.Errorf("call = %+v, want %s=21600", c, incus.DeleteAfterStoppedSecondsKey)
+	}
+}
+
+// TestToProtoContainer_SurfacesStoppedDeleteStatus — #525/#264: the daemon's
+// container→proto projection surfaces the two-phase reaping status
+// (stopped_at + delete_after_stopped_seconds) read from the Incus config, so a
+// reader sees the full lifecycle without host access. stopped_at is omitted
+// (nil) when the box isn't stopped; the window passes through as-is.
+func TestToProtoContainer_SurfacesStoppedDeleteStatus(t *testing.T) {
+	stoppedAt := time.Now().Add(-15 * time.Minute).UTC().Truncate(time.Second)
+	pc := toProtoContainer(&box.BoxStatus{
+		Ref:                       box.BoxRef{Name: "alice-container"},
+		State:                     pb.ContainerState_CONTAINER_STATE_STOPPED,
+		StoppedAt:                 stoppedAt,
+		DeleteAfterStoppedSeconds: 86400,
+	})
+	if pc.GetDeleteAfterStoppedSeconds() != 86400 {
+		t.Errorf("DeleteAfterStoppedSeconds = %d, want 86400", pc.GetDeleteAfterStoppedSeconds())
+	}
+	if pc.GetStoppedAt() == nil || !pc.GetStoppedAt().AsTime().Equal(stoppedAt) {
+		t.Errorf("StoppedAt = %v, want %s", pc.GetStoppedAt(), stoppedAt)
+	}
+
+	// Running box (zero StoppedAt) → no stopped_at on the wire.
+	running := toProtoContainer(&box.BoxStatus{Ref: box.BoxRef{Name: "bob-container"}, State: pb.ContainerState_CONTAINER_STATE_RUNNING})
+	if running.GetStoppedAt() != nil {
+		t.Errorf("running box should have no stopped_at, got %v", running.GetStoppedAt())
+	}
+	if running.GetDeleteAfterStoppedSeconds() != 0 {
+		t.Errorf("unset window should be 0, got %d", running.GetDeleteAfterStoppedSeconds())
+	}
+}
+
+// TestValidateTTLSeconds — the bound shared by create and set. Zero is valid
+// (no TTL / clear); negative and over-cap are rejected; the 7-day boundary is
+// inclusive. Keeps the two entry points rejecting identical input identically.
+func TestValidateTTLSeconds(t *testing.T) {
+	cases := []struct {
+		name    string
+		seconds int64
+		wantErr bool
+	}{
+		{"zero is valid (no TTL)", 0, false},
+		{"one hour", 3600, false},
+		{"exactly 7 days (inclusive)", maxTTLSeconds, false},
+		{"negative rejected", -1, true},
+		{"over 7 days rejected", maxTTLSeconds + 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTTLSeconds(tc.seconds)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("validateTTLSeconds(%d) = nil, want error", tc.seconds)
+				}
+				if st, ok := status.FromError(err); !ok || st.Code() != codes.InvalidArgument {
+					t.Errorf("error = %v, want InvalidArgument status", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("validateTTLSeconds(%d) = %v, want nil", tc.seconds, err)
+			}
+		})
+	}
+}

@@ -20,3 +20,25 @@ func TestIngestSSHAuthorizationAttribution(t *testing.T) {
 			}
 			store := &fakeBatchLogger{}
 			_, err := NewAuditServer(store).IngestSSHSessionRecords(ingestCtx(), &pb.IngestSSHSessionRecordsRequest{Records: []*pb.SSHSessionRecord{record}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Drive the exact row mapper used by ingestion, including audit-only DENY.
+			rec, err := sshsession.FromProto(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row, err := sshSessionBatchEntry(rec, "sentinel", "jti")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var detail SSHSessionDetail
+			if err := json.Unmarshal([]byte(row.Entry.Detail), &detail); err != nil {
+				t.Fatal(err)
+			}
+			if row.Entry.Action != "ssh_session_open" || detail.UserID != "person" || detail.AuthzDecision != rec.AuthzDecision || detail.DenyReason != rec.DenyReason || detail.Enforced {
+				t.Fatalf("audit row lost attribution: %+v", row)
+			}
+		})
+	}
+}
