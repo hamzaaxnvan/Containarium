@@ -112,3 +112,462 @@ func (c *networkPolicyServiceClient) SetNetworkPolicy(ctx context.Context, in *S
 	}
 	return out, nil
 }
+
+func (c *networkPolicyServiceClient) GetNetworkPolicy(ctx context.Context, in *GetNetworkPolicyRequest, opts ...grpc.CallOption) (*GetNetworkPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNetworkPolicyResponse)
+	err := c.cc.Invoke(ctx, NetworkPolicyService_GetNetworkPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkPolicyServiceClient) ListNetworkPolicies(ctx context.Context, in *ListNetworkPoliciesRequest, opts ...grpc.CallOption) (*ListNetworkPoliciesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListNetworkPoliciesResponse)
+	err := c.cc.Invoke(ctx, NetworkPolicyService_ListNetworkPolicies_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkPolicyServiceClient) DeleteNetworkPolicy(ctx context.Context, in *DeleteNetworkPolicyRequest, opts ...grpc.CallOption) (*DeleteNetworkPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteNetworkPolicyResponse)
+	err := c.cc.Invoke(ctx, NetworkPolicyService_DeleteNetworkPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkPolicyServiceClient) PatchNetworkPolicyDenyRules(ctx context.Context, in *PatchNetworkPolicyDenyRulesRequest, opts ...grpc.CallOption) (*SetNetworkPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetNetworkPolicyResponse)
+	err := c.cc.Invoke(ctx, NetworkPolicyService_PatchNetworkPolicyDenyRules_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkPolicyServiceClient) PlanNetworkPolicy(ctx context.Context, in *PlanNetworkPolicyRequest, opts ...grpc.CallOption) (*PlanNetworkPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PlanNetworkPolicyResponse)
+	err := c.cc.Invoke(ctx, NetworkPolicyService_PlanNetworkPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkPolicyServiceClient) GetNetworkPolicyStatus(ctx context.Context, in *GetNetworkPolicyStatusRequest, opts ...grpc.CallOption) (*GetNetworkPolicyStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNetworkPolicyStatusResponse)
+	err := c.cc.Invoke(ctx, NetworkPolicyService_GetNetworkPolicyStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkPolicyServiceClient) SetNetworkPolicySignature(ctx context.Context, in *SetNetworkPolicySignatureRequest, opts ...grpc.CallOption) (*SetNetworkPolicySignatureResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetNetworkPolicySignatureResponse)
+	err := c.cc.Invoke(ctx, NetworkPolicyService_SetNetworkPolicySignature_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkPolicyServiceClient) ListNetworkPolicySignatures(ctx context.Context, in *ListNetworkPolicySignaturesRequest, opts ...grpc.CallOption) (*ListNetworkPolicySignaturesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListNetworkPolicySignaturesResponse)
+	err := c.cc.Invoke(ctx, NetworkPolicyService_ListNetworkPolicySignatures_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkPolicyServiceClient) DeleteNetworkPolicySignature(ctx context.Context, in *DeleteNetworkPolicySignatureRequest, opts ...grpc.CallOption) (*DeleteNetworkPolicySignatureResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteNetworkPolicySignatureResponse)
+	err := c.cc.Invoke(ctx, NetworkPolicyService_DeleteNetworkPolicySignature_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// NetworkPolicyServiceServer is the server API for NetworkPolicyService service.
+// All implementations must embed UnimplementedNetworkPolicyServiceServer
+// for forward compatibility.
+//
+// NetworkPolicyService — the control-plane CRUD for per-tenant network
+// isolation policies (Phase A of the eBPF network-isolation design, #315).
+//
+// This is the policy *store* surface: operators (and the cloud control plane)
+// set/get/list/delete a tenant's NetworkPolicy here; the per-veth TC_INGRESS
+// BPF loader (a later increment) consumes the stored policies and programs the
+// kernel. Admin-only — policies are fleet-shaping config, not tenant-editable.
+type NetworkPolicyServiceServer interface {
+	// Atomically edits destination ingress sources; all revisions must match.
+	PatchTenantAccess(context.Context, *PatchTenantAccessRequest) (*PatchTenantAccessResponse, error)
+	// SetNetworkPolicy creates or replaces a tenant's policy (upsert by tenant).
+	// The policy is validated + normalized; the stored form is echoed back.
+	SetNetworkPolicy(context.Context, *SetNetworkPolicyRequest) (*SetNetworkPolicyResponse, error)
+	// GetNetworkPolicy returns a tenant's policy, or NotFound if none is set.
+	GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error)
+	// ListNetworkPolicies returns every tenant's policy.
+	ListNetworkPolicies(context.Context, *ListNetworkPoliciesRequest) (*ListNetworkPoliciesResponse, error)
+	// DeleteNetworkPolicy removes a tenant's policy. Idempotent — deleting a
+	// missing policy is not an error.
+	DeleteNetworkPolicy(context.Context, *DeleteNetworkPolicyRequest) (*DeleteNetworkPolicyResponse, error)
+	// PatchNetworkPolicyDenyRules atomically adds/removes a tenant's virtual-patch
+	// deny rules (#660) under a store-side lock, so concurrent edits don't lose
+	// updates and `SetNetworkPolicy` (the allow-policy) never has to round-trip
+	// through the client to preserve them. Echoes the normalized stored policy.
+	PatchNetworkPolicyDenyRules(context.Context, *PatchNetworkPolicyDenyRulesRequest) (*SetNetworkPolicyResponse, error)
+	// PlanNetworkPolicy reports which destinations a tenant's boxes reached
+	// that the tenant's policy denied (log-only) or dropped (enforce) in a recent
+	// window, aggregated by destination, so an allow-list can be written from
+	// what the tenant actually does and checked before it is armed (#2440).
+	// Read-only; it changes nothing.
+	PlanNetworkPolicy(context.Context, *PlanNetworkPolicyRequest) (*PlanNetworkPolicyResponse, error)
+	// GetNetworkPolicyStatus reports what THIS daemon has actually loaded into
+	// the kernel for a tenant: the effective modes after the host's enforce
+	// guard, when it was last reconciled, whether enforcement is armed here, and the
+	// traffic the eBPF program does not cover. It reads the applied BPF state,
+	// not the stored policy, and says unknown when it cannot tell. Read-only.
+	GetNetworkPolicyStatus(context.Context, *GetNetworkPolicyStatusRequest) (*GetNetworkPolicyStatusResponse, error)
+	// SetNetworkPolicySignature creates or replaces a global operator exploit
+	// signature (#661 Tier 2, upsert by name). Validated + normalized; the stored
+	// form (with its assigned id) is echoed back.
+	SetNetworkPolicySignature(context.Context, *SetNetworkPolicySignatureRequest) (*SetNetworkPolicySignatureResponse, error)
+	// ListNetworkPolicySignatures returns every operator-managed signature (the
+	// built-in curated set is implicit and not listed here).
+	ListNetworkPolicySignatures(context.Context, *ListNetworkPolicySignaturesRequest) (*ListNetworkPolicySignaturesResponse, error)
+	// DeleteNetworkPolicySignature removes an operator signature by name.
+	// Idempotent.
+	DeleteNetworkPolicySignature(context.Context, *DeleteNetworkPolicySignatureRequest) (*DeleteNetworkPolicySignatureResponse, error)
+	mustEmbedUnimplementedNetworkPolicyServiceServer()
+}
+
+// UnimplementedNetworkPolicyServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedNetworkPolicyServiceServer struct{}
+
+func (UnimplementedNetworkPolicyServiceServer) PatchTenantAccess(context.Context, *PatchTenantAccessRequest) (*PatchTenantAccessResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PatchTenantAccess not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) SetNetworkPolicy(context.Context, *SetNetworkPolicyRequest) (*SetNetworkPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetNetworkPolicy not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) GetNetworkPolicy(context.Context, *GetNetworkPolicyRequest) (*GetNetworkPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNetworkPolicy not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) ListNetworkPolicies(context.Context, *ListNetworkPoliciesRequest) (*ListNetworkPoliciesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListNetworkPolicies not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) DeleteNetworkPolicy(context.Context, *DeleteNetworkPolicyRequest) (*DeleteNetworkPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteNetworkPolicy not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) PatchNetworkPolicyDenyRules(context.Context, *PatchNetworkPolicyDenyRulesRequest) (*SetNetworkPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PatchNetworkPolicyDenyRules not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) PlanNetworkPolicy(context.Context, *PlanNetworkPolicyRequest) (*PlanNetworkPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PlanNetworkPolicy not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) GetNetworkPolicyStatus(context.Context, *GetNetworkPolicyStatusRequest) (*GetNetworkPolicyStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNetworkPolicyStatus not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) SetNetworkPolicySignature(context.Context, *SetNetworkPolicySignatureRequest) (*SetNetworkPolicySignatureResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetNetworkPolicySignature not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) ListNetworkPolicySignatures(context.Context, *ListNetworkPolicySignaturesRequest) (*ListNetworkPolicySignaturesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListNetworkPolicySignatures not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) DeleteNetworkPolicySignature(context.Context, *DeleteNetworkPolicySignatureRequest) (*DeleteNetworkPolicySignatureResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteNetworkPolicySignature not implemented")
+}
+func (UnimplementedNetworkPolicyServiceServer) mustEmbedUnimplementedNetworkPolicyServiceServer() {}
+func (UnimplementedNetworkPolicyServiceServer) testEmbeddedByValue()                              {}
+
+// UnsafeNetworkPolicyServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to NetworkPolicyServiceServer will
+// result in compilation errors.
+type UnsafeNetworkPolicyServiceServer interface {
+	mustEmbedUnimplementedNetworkPolicyServiceServer()
+}
+
+func RegisterNetworkPolicyServiceServer(s grpc.ServiceRegistrar, srv NetworkPolicyServiceServer) {
+	// If the following call panics, it indicates UnimplementedNetworkPolicyServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&NetworkPolicyService_ServiceDesc, srv)
+}
+
+func _NetworkPolicyService_PatchTenantAccess_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PatchTenantAccessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).PatchTenantAccess(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_PatchTenantAccess_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).PatchTenantAccess(ctx, req.(*PatchTenantAccessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_SetNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetNetworkPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).SetNetworkPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_SetNetworkPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).SetNetworkPolicy(ctx, req.(*SetNetworkPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_GetNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNetworkPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).GetNetworkPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_GetNetworkPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).GetNetworkPolicy(ctx, req.(*GetNetworkPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_ListNetworkPolicies_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListNetworkPoliciesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).ListNetworkPolicies(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_ListNetworkPolicies_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).ListNetworkPolicies(ctx, req.(*ListNetworkPoliciesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_DeleteNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteNetworkPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).DeleteNetworkPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_DeleteNetworkPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).DeleteNetworkPolicy(ctx, req.(*DeleteNetworkPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_PatchNetworkPolicyDenyRules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PatchNetworkPolicyDenyRulesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).PatchNetworkPolicyDenyRules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_PatchNetworkPolicyDenyRules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).PatchNetworkPolicyDenyRules(ctx, req.(*PatchNetworkPolicyDenyRulesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_PlanNetworkPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PlanNetworkPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).PlanNetworkPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_PlanNetworkPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).PlanNetworkPolicy(ctx, req.(*PlanNetworkPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_GetNetworkPolicyStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNetworkPolicyStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).GetNetworkPolicyStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_GetNetworkPolicyStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).GetNetworkPolicyStatus(ctx, req.(*GetNetworkPolicyStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_SetNetworkPolicySignature_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetNetworkPolicySignatureRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).SetNetworkPolicySignature(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_SetNetworkPolicySignature_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).SetNetworkPolicySignature(ctx, req.(*SetNetworkPolicySignatureRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_ListNetworkPolicySignatures_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListNetworkPolicySignaturesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).ListNetworkPolicySignatures(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_ListNetworkPolicySignatures_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).ListNetworkPolicySignatures(ctx, req.(*ListNetworkPolicySignaturesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkPolicyService_DeleteNetworkPolicySignature_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteNetworkPolicySignatureRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkPolicyServiceServer).DeleteNetworkPolicySignature(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkPolicyService_DeleteNetworkPolicySignature_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkPolicyServiceServer).DeleteNetworkPolicySignature(ctx, req.(*DeleteNetworkPolicySignatureRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// NetworkPolicyService_ServiceDesc is the grpc.ServiceDesc for NetworkPolicyService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var NetworkPolicyService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.NetworkPolicyService",
+	HandlerType: (*NetworkPolicyServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PatchTenantAccess",
+			Handler:    _NetworkPolicyService_PatchTenantAccess_Handler,
+		},
+		{
+			MethodName: "SetNetworkPolicy",
+			Handler:    _NetworkPolicyService_SetNetworkPolicy_Handler,
+		},
+		{
+			MethodName: "GetNetworkPolicy",
+			Handler:    _NetworkPolicyService_GetNetworkPolicy_Handler,
+		},
+		{
+			MethodName: "ListNetworkPolicies",
+			Handler:    _NetworkPolicyService_ListNetworkPolicies_Handler,
+		},
+		{
+			MethodName: "DeleteNetworkPolicy",
+			Handler:    _NetworkPolicyService_DeleteNetworkPolicy_Handler,
+		},
+		{
+			MethodName: "PatchNetworkPolicyDenyRules",
+			Handler:    _NetworkPolicyService_PatchNetworkPolicyDenyRules_Handler,
+		},
+		{
+			MethodName: "PlanNetworkPolicy",
+			Handler:    _NetworkPolicyService_PlanNetworkPolicy_Handler,
+		},
+		{
+			MethodName: "GetNetworkPolicyStatus",
+			Handler:    _NetworkPolicyService_GetNetworkPolicyStatus_Handler,
+		},
+		{
+			MethodName: "SetNetworkPolicySignature",
+			Handler:    _NetworkPolicyService_SetNetworkPolicySignature_Handler,
+		},
+		{
+			MethodName: "ListNetworkPolicySignatures",
+			Handler:    _NetworkPolicyService_ListNetworkPolicySignatures_Handler,
+		},
+		{
+			MethodName: "DeleteNetworkPolicySignature",
+			Handler:    _NetworkPolicyService_DeleteNetworkPolicySignature_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/network_policy.proto",
+}
