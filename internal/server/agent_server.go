@@ -1164,3 +1164,1169 @@ func (s *AgentSkillServer) provisionBoxOnly(ctx context.Context, skill *pb.Agent
 	// reboot) is started so the subsequent seed-exec / loop-exec lands.
 	if info, gerr := s.recipes.containers.manager.Get(name); gerr == nil && info != nil {
 		if info.State != "Running" {
+			if err := s.recipes.containers.manager.Start(name); err != nil {
+				return "", nil, false, status.Errorf(codes.Internal, "failed to start existing agent box %s: %v", name, err)
+			}
+			if reread, rerr := s.recipes.containers.manager.Get(name); rerr == nil && reread != nil {
+				info = reread
+			}
+		}
+		st := boxlxc.StatusFromInfo(info)
+		return skillBoxName(skill.Id), toProtoContainer(&st), false, nil
+	}
+
+	// First provision. Pass the daemon's version as the agent-runtime
+	// recipe's `release` param so the box's post_start pulls matching
+	// agent-box + agent-runtime artifacts (box-image assembly). Recipes that
+	// don't declare these params ignore the extras; assembly is best-effort
+	// (a dev/unpublished version just skips it).
+	dep, derr := s.recipes.deploy(ctx, &pb.DeployRecipeRequest{
+		RecipeId:   recipeID,
+		Name:       name,
+		BackendId:  backendID,
+		Pool:       pool,
+		Parameters: map[string]string{"release": agentRuntimeReleaseTag()},
+	})
+	if derr != nil {
+		return "", nil, false, derr // already a gRPC status from deploy/CreateContainer
+	}
+	return skillBoxName(skill.Id), dep.Container, true, nil
+}
+
+// skillBoxName is the container a skill's runs use: one box per skill id,
+// shared across that skill's runs. validateCrewRoles compares these, so a crew
+// can never name two roles that would land in one box (#2799).
+func skillBoxName(skillID string) string { return "agent-" + skillID + "-container" }
+
+func (s *AgentSkillServer) provisionSkillBoxWith(ctx context.Context, skill *pb.AgentSkill, backendID, pool, inputJSON, runID, gitSource, gitRef, gitCredential, trackerConnection string, opts provisionOptions) (containerName string, box *pb.Container, lease runlease.Lease, gitCommit, workspacePath string, engineRes agentengine.Resolved, err error) {
+	var noLease runlease.Lease
+
+	containerName, box, freshBox, err := s.provisionBoxOnly(ctx, skill, backendID, pool)
+	if err != nil {
+		return "", nil, noLease, "", "", agentengine.Resolved{}, err
+	}
+	name := "agent-" + skill.Id
+
+	// The run's lease: every credential minted below is recorded here so the
+	// run's exit can revoke exactly what the run was given (#1817). SeedDir is
+	// per-run (#1860) so concurrent runs of the same skill — which share this
+	// box — no longer collide on one shared seed directory.
+	seedDir := seedDirFor(runID)
+	lease = runlease.Lease{RunID: runID, Box: containerName, SeedDir: seedDir}
+
+	// Resolve the run's engine BEFORE minting anything (#2222): a skill naming
+	// an engine whose provider has no resolvable key is refused here, before
+	// the platform JWT, the seed script, or any git fetch ever happen — not
+	// minutes later inside the box with "Not logged in". box is already
+	// resolved above (reused or freshly provisioned), so keyOwner resolves
+	// exactly as it will for the gateway mint below. opts.engineOverride
+	// (#2228) wins over the manifest's own choice when the caller set one —
+	// agentengine.Override, not Resolve itself, decides which of the two wins,
+	// so Resolve's own readiness/refusal logic is identical either way.
+	var gwView *agentengine.Gateway
+	if s.gateway != nil {
+		gwView = &s.gateway.engines
+	}
+	keyOwner := runKeyOwner(ctx, box, opts.orgID)
+	want := agentengine.Override(skill.GetEngine(), opts.engineOverride)
+	engineRes, resolveErr := agentengine.Resolve(ctx, want, keyOwner, gwView)
+	if resolveErr != nil {
+		var notReady *agentengine.NotReadyError
+		if errors.As(resolveErr, &notReady) {
+			return "", nil, noLease, "", "", agentengine.Resolved{}, status.Errorf(codes.FailedPrecondition,
+				"skill %s needs engine %s (provider %s) but %s; fix: %s",
+				skill.Id, agentengine.EnvValue(notReady.Engine), notReady.Provider, notReady.Reason, notReady.Fix)
+		}
+		return "", nil, noLease, "", "", agentengine.Resolved{}, status.Errorf(codes.Internal, "resolving engine for skill %s: %v", skill.Id, resolveErr)
+	}
+	if engineRes.Default && skill.GetModel() != "" {
+		log.Printf("[agent-skill] skill %s pins model %q but names no engine; CONTAINARIUM_AGENT_MODEL is not exported (only named-engine skills carry their pinned model to the box)", skill.Id, skill.GetModel())
+	}
+
+	// #2229: a named-engine skill's pinned model is validated against what the
+	// resolved provider actually serves, WHEN we can check. Skipped entirely
+	// for a Default resolution (above): the model is never exported there, so
+	// checking it would refuse a run over a value that is already ignored.
+	// "Can't check" (an unsupported provider shape, or no key to list with) is
+	// NOT a refusal — proceeding without a check we have no way to perform
+	// matches this function's own best-effort posture for the mint a few
+	// lines below, and is strictly no worse than today's unchecked pass-
+	// through. Only a CONFIRMED mismatch — the list call succeeded and the
+	// model isn't in it — is a FailedPrecondition, naming the model, the
+	// provider, and the models it does list, same shape as the engine refusal
+	// above.
+	// modelCeiling is "" exactly when the model is never exported/enforced —
+	// no engine named (Default) or no model pinned — so the gateway token
+	// minted below carries a ceiling only when one is actually meaningful.
+	var modelCeiling string
+	if !engineRes.Default && skill.GetModel() != "" {
+		modelCeiling = skill.GetModel()
+		if s.gateway != nil && s.gateway.models != nil {
+			if models, lerr := s.gateway.models.ListModels(ctx, keyOwner, engineRes.Provider); lerr == nil {
+				if !slices.Contains(models, modelCeiling) {
+					return "", nil, noLease, "", "", agentengine.Resolved{}, status.Errorf(codes.FailedPrecondition,
+						"skill %s pins model %q but provider %s does not list it; available: %s",
+						skill.Id, modelCeiling, engineRes.Provider, strings.Join(models, ", "))
+				}
+			} else if !errors.Is(lerr, modelgateway.ErrModelListUnsupported) && !errors.Is(lerr, modelgateway.ErrNoKey) {
+				log.Printf("[agent-skill] skill %s: model list check for provider %s failed, proceeding without it: %v", skill.Id, engineRes.Provider, lerr)
+			}
+		}
+	}
+
+	token, platformCred, mintErr := s.mintRunToken(ctx, skill, runID, trackerConnection)
+	if mintErr != nil {
+		return "", nil, noLease, "", "", agentengine.Resolved{}, mintErr
+	}
+	lease.Credentials = append(lease.Credentials, platformCred)
+
+	// Seed the prompt/token/input/card into the box.
+	cardJSON := ""
+	if skill.AgentCard != nil {
+		if b, err := protojson.Marshal(skill.AgentCard); err == nil {
+			cardJSON = string(b)
+		}
+	}
+	seedScript := buildAgentSeedScript(seedDir, skill.SystemPrompt, token, inputJSON, cardJSON)
+	if freshBox {
+		// A rebuilt box starts with no run journals (#2096): nothing an image
+		// or an earlier incarnation left under the root belongs to a run this
+		// daemon can resolve. A reused box keeps them — a co-resident run may
+		// be writing one right now.
+		seedScript = clearRunJournalsScript + "\n" + seedScript
+	}
+	// Model-gateway provisioning (#674): when the daemon serves a gateway, mint a
+	// per-skill gateway token — bound to engineRes.Provider (#2222), the run's
+	// RESOLVED provider, not necessarily the daemon's default — and append the
+	// env-seeding to the same exec, so the box's engine routes model calls
+	// through the gateway (real key never enters the box). The token carries
+	// the run's key_owner (#2134), so the call spends the run owner's
+	// registered key rather than the daemon-global one. Best-effort: a mint/
+	// script error logs and falls back to direct mode rather than failing
+	// provisioning — engineRes itself was already confirmed ready above, so
+	// a failure here is an operational one (mint/script), not a readiness one.
+	if s.gateway != nil {
+		if gwTok, gwMinted, gerr := s.mintRunGatewayToken(ctx, name, skill.Id, runID, engineRes.Provider, modelCeiling, box, opts.orgID); gerr != nil {
+			log.Printf("[agent-skill] gateway token mint failed for %s (box runs direct mode): %v", name, gerr)
+		} else if envScript, eerr := gatewayEnvScript(engineRes.Provider, s.gateway.httpPort, gwTok, seedDir); eerr != nil {
+			log.Printf("[agent-skill] gateway env script failed for %s (box runs direct mode): %v", name, eerr)
+		} else {
+			seedScript += "\n" + envScript
+			lease.Credentials = append(lease.Credentials, runlease.Credential{
+				Kind: runlease.KindGatewayToken, JTI: gwMinted.JTI, ExpiresAt: gwMinted.ExpiresAt,
+			})
+		}
+	}
+	// #1922 D4: a run bound to a tracker connection also gets the platform MCP
+	// mounted in-box, restricted to the tracker tools. Appended to the SAME exec
+	// as the rest of the seed so the box never has a token but no way to use it.
+	// Fail-open by construction — see platformMCPSeedScript.
+	if mcpScript, ok := platformMCPSeedScript(seedDir, s.platformMCPPort, trackerConnection); ok {
+		seedScript += "\n" + mcpScript
+	}
+	if err := s.agentBox().Exec(containerName,
+		[]string{"bash", "-c", seedScript}); err != nil {
+		// Credentials exist but the box never received them (or received only
+		// part of the seed). RunAgentSkill's defer isn't armed yet — it arms on
+		// a successful provision — so this partial lease is ours to end.
+		//
+		// This path writes an agent.run_lease_end row with NO preceding
+		// agent.run_lease_issue row, because the issue row is written below,
+		// after the seed lands. That orphan end row is by construction, not a
+		// lost write, and it lists the jtis it revoked — so an operator meeting
+		// one can still answer "what was this run given".
+		s.endRunLease(ctx, lease, s.boxWiper(), provisionFailedReason)
+		return "", nil, noLease, "", "", agentengine.Resolved{}, status.Errorf(codes.Internal, "failed to seed agent box %s: %v", containerName, err)
+	}
+
+	// #1859/#1860: fetch the run's repo, if any, now that the box has
+	// credentials and is ready to read them. The workspace is per-run
+	// (workspaceDirFor), so two concurrent runs of this skill never share a
+	// checkout. A fetch failure is treated exactly like a seed failure — the
+	// partial lease (already-minted credentials) is ended here, before
+	// RunAgentSkill's defer would have taken over.
+	if gitSource != "" {
+		workspacePath = workspaceDirFor(runID)
+		// #1871: recorded on the lease BEFORE the fetch attempt, not after it
+		// succeeds. buildGitFetchScript's `mkdir -p`/`git init` land on disk
+		// before the `git fetch` that can fail, so a failed fetch still
+		// leaves a (credential-free, empty) workspace dir behind. Ending the
+		// lease below must target it for removal even on this failure path.
+		lease.Workspace = workspacePath
+		commit, ferr := s.agentBox().FetchGitSource(containerName, containerpkg.GitSourceSpec{
+			Source:        gitSource,
+			Ref:           gitRef,
+			Credential:    gitCredential,
+			WorkspacePath: workspacePath,
+		})
+		if ferr != nil && opts.gitSourceBestEffort {
+			// The (empty) workspace dir stays on the lease for the wipe;
+			// the run is registered with no git_commit, so
+			// SubmitTrackerChange answers FAILED_PRECONDITION for it.
+			log.Printf("[agent-skill] run %s: git fetch into %s failed; continuing without a workspace: %v", runID, containerName, ferr)
+			workspacePath = ""
+		} else if ferr != nil {
+			s.endRunLease(ctx, lease, s.boxWiper(), provisionFailedReason)
+			return "", nil, noLease, "", "", agentengine.Resolved{}, status.Errorf(codes.FailedPrecondition, "git fetch into agent box %s failed: %v", containerName, ferr)
+		}
+		gitCommit = commit
+
+		// #1861: tell the in-box runtime what it's looking at. Best-effort —
+		// a write failure here means a future runtime can't auto-bind
+		// AGENTBOX_ROOT or cite the commit in its own words, not that the
+		// fetch it describes was wrong (already durable in gitCommit/
+		// workspacePath above, and reported in the RPC response either way).
+		if ferr == nil {
+			wsScript := buildWorkspaceSeedScript(seedDir, workspaceSeed{
+				Path:      workspacePath,
+				GitSource: gitSource,
+				GitRef:    gitRef,
+				GitCommit: gitCommit,
+			})
+			if werr := s.agentBox().Exec(containerName, []string{"bash", "-c", wsScript}); werr != nil {
+				log.Printf("[agent-skill] workspace.json seed failed for %s (runtime won't see the workspace path via the contract file): %v", containerName, werr)
+			}
+		}
+	}
+
+	// Compile allowed_peers into the per-box egress policy (Phase 2).
+	s.applyAllowedPeersPolicy(ctx, name, skill)
+
+	s.auditRunLease(ctx, "agent.run_lease_issue", runID, runLeaseIssuePayload(lease, engineRes.Engine))
+	s.runIndex.add(runID, skill.Id, time.Now(), s.runJournalRetention())
+
+	return containerName, box, lease, gitCommit, workspacePath, engineRes, nil
+}
+
+// runtimeEnvPrefix renders the `CONTAINARIUM_AGENT_ENGINE=... ` and
+// `CONTAINARIUM_AGENT_MODEL=... ` exports for one run's resolved engine
+// (#2222, replacing the old engineEnvPrefix — agentengine.Resolve now makes
+// this decision, this function only renders it).
+//
+//   - res.Engine == UNSPECIFIED exports nothing: byte-identical to every box
+//     that predates this field (direct mode with no engine named).
+//   - Otherwise CONTAINARIUM_AGENT_ENGINE is always exported — in gateway mode
+//     this is what #748 originally fixed (an unpinned box falls back to claude
+//     and a gemini/openai gateway run fails "Not logged in"), now computed by
+//     Resolve instead of a daemon-wide primary-provider lookup.
+//   - CONTAINARIUM_AGENT_MODEL is exported only when res.Default is false —
+//     i.e. only when the manifest named the engine itself, not when Resolve
+//     filled one in from the gateway's default (Q1,
+//     docs/product/agent-router.md: an unspecified-engine skill's pinned
+//     model is never exported, so a skill written before this field can't
+//     start failing on a daemon whose default engine doesn't match it).
+func runtimeEnvPrefix(res agentengine.Resolved, model string) string {
+	if res.Engine == pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED {
+		return ""
+	}
+	out := "CONTAINARIUM_AGENT_ENGINE=" + agentengine.EnvValue(res.Engine) + " "
+	if !res.Default && model != "" {
+		out += "CONTAINARIUM_AGENT_MODEL=" + shellSingleQuote(model) + " "
+	}
+	return out
+}
+
+// startServeMode launches the in-box agent-runtime in serve mode (the A2A
+// server on :8674) as a background process, so peers/crews can delegate tasks
+// to this box. Best-effort: until the box image ships agent-runtime this is a
+// no-op failure (logged), unlike a one-shot run (runInBoxAgentResult), which reports failure. Used by RunCrew for members.
+// skillID names the member's run journal (#2095); the run id comes with each
+// A2A task, not with the launch.
+func (s *AgentSkillServer) startServeMode(ctx context.Context, containerName, seedDir, skillID string, engineRes agentengine.Resolved, model string) error {
+	box := s.inBox()
+	if box == nil {
+		return fmt.Errorf("no container manager to start %s's serve mode on %s", skillID, containerName)
+	}
+	// Stop any previous serve-mode instance before starting a new one
+	// (cloud#1733). The box is reused across runs — provisionSkillBox
+	// re-mints a fresh gateway token and reseeds it to disk on every call —
+	// but this used to background a new agent-runtime unconditionally, with
+	// nothing to stop an earlier instance first. The OSS image's A2A server
+	// binds a fixed port, so every relaunch after the very first one crashed
+	// on EADDRINUSE (confirmed live via the box's own agent-runtime.log),
+	// silently, into a log file nothing here reads. The one surviving
+	// process — the box's first-ever launch — kept serving whatever gateway
+	// token IT read at boot, until that token's TTL passed, after which
+	// every run against a box more than agentTokenTTL old failed "invalid
+	// gateway token: expired" no matter how fresh the just-seeded token on
+	// disk was.
+	//
+	// pkill exits 1 when nothing matched (the box's first-ever
+	// startServeMode call) — a benign race, same convention
+	// pkg/core/container/jump_server.go's collaborator teardown uses; the
+	// error is intentionally not checked. ExecWithExitCode, not
+	// ExecWithOutput, so this step exercises against the fake/mock backend
+	// in tests — see TestStartServeMode_StopsPriorInstanceBeforeLaunching.
+	_, _, _, _ = box.ExecWithExitCode(containerName,
+		[]string{"bash", "-lc", "pkill -9 -f agent-runtime"})
+	if s.agentA2ASecret(skillID) == "" {
+		// The box will serve /agent-card and refuse every task (#2125). Say so
+		// here: in-box the only trace is one line in the box's own log.
+		log.Printf("[agent-skill] no A2A credential derivable for %s: its serve mode will refuse every task", containerName)
+	}
+	cmd := s.serveModeCommand(seedDir, skillID, engineRes, model)
+	_, stderr, exitCode, err := box.ExecWithExitCode(containerName, []string{"bash", "-lc", cmd})
+	if err != nil && !incusExecCommandMissing(err) {
+		return fmt.Errorf("could not launch %s's serve mode on %s: %w", skillID, containerName, err)
+	}
+	if err != nil || exitCode == exitCommandNotFound {
+		log.Printf("[agent-skill] agent-runtime not found on %s (image may not ship it); stderr=%s", containerName, scrubInBoxText(stderr))
+		return fmt.Errorf("on %s: %w", containerName, errInBoxRuntimeMissing)
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("%s's serve-mode launch on %s exited %d; stderr=%s", skillID, containerName, exitCode, scrubInBoxText(stderr))
+	}
+	return s.waitForServeReady(ctx, box, containerName, skillID)
+}
+
+const (
+	// serveReadyTimeoutDefault bounds the wait for a member's A2A endpoint
+	// after its launch. The runtime is a Node process that binds :8674 within
+	// a few seconds when it is healthy; a launch that has not answered by
+	// then is not going to.
+	serveReadyTimeoutDefault  = 30 * time.Second
+	serveReadyIntervalDefault = time.Second
+	// serveLogPath is the process log startServeMode redirects the runtime to.
+	serveLogPath = "/var/log/agent-runtime.log"
+	// serveLogTailBytes is how much of that log is read back on a failure.
+	serveLogTailBytes = 2048
+)
+
+// serveReadyProbe asks the member's A2A server for its agent card from inside
+// the box, over bash's /dev/tcp so it does not depend on curl being installed
+// (#2936). Exit 0 only for an HTTP 200; the surrounding timeout keeps one
+// probe from outliving its poll interval when the port accepts and stalls.
+var serveReadyProbe = []string{"bash", "-lc", fmt.Sprintf(
+	`timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/%d || exit 1; `+
+		`printf "GET /agent-card HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; `+
+		`read -r line <&3; case "$line" in *" 200 "*) exit 0;; esac; exit 1'`, a2aPort)}
+
+// waitForServeReady polls the member's /agent-card until it answers, the
+// bound passes or ctx is cancelled. On a timeout it reads the tail of the
+// runtime's own log back, scrubbed and bounded like every other piece of
+// in-box text (scrubInBoxText): the log is the only place the reason a
+// backgrounded launch died is written (a bad engine credential, a port already
+// bound, a missing binary), and nothing else reads it (#2936).
+func (s *AgentSkillServer) waitForServeReady(ctx context.Context, box inBoxRunner, containerName, skillID string) error {
+	timeout, interval := s.serveReadyTimeout, s.serveReadyInterval
+	if timeout <= 0 {
+		timeout = serveReadyTimeoutDefault
+	}
+	if interval <= 0 {
+		interval = serveReadyIntervalDefault
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, _, code, err := box.ExecWithExitCode(containerName, serveReadyProbe); err == nil && code == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for %s's serve mode on %s: %w", skillID, containerName, ctx.Err())
+		case <-time.After(interval):
+		}
+	}
+
+	tail, _, _, _ := box.ExecWithExitCode(containerName,
+		[]string{"bash", "-lc", fmt.Sprintf("tail -c %d %s 2>/dev/null", serveLogTailBytes, serveLogPath)})
+	tail = scrubInBoxText(tail)
+	if strings.Contains(tail, "command not found") {
+		return fmt.Errorf("on %s: %w; %s: %s", containerName, errInBoxRuntimeMissing, serveLogPath, tail)
+	}
+	return fmt.Errorf("%s's serve mode on %s did not answer /agent-card within %s; the tail of %s: %s",
+		skillID, containerName, timeout, serveLogPath, tail)
+}
+
+// serveModeCommand is the in-box command startServeMode backgrounds. It
+// exports CONTAINARIUM_SKILL_ID so the runtime can name each task's journal
+// (/var/log/agent-runtime/runs/<run_id>/<skill_id>.jsonl, #2095); the run id
+// arrives per task on AgentTask.run_id. /var/log/agent-runtime.log stays the
+// process log.
+//
+// It also exports CONTAINARIUM_A2A_TOKEN: this box's own A2A credential
+// (#2125), the one the runtime demands on every POST /tasks so that only the
+// daemon can deliver a task — and so a peer box that can reach :8674 cannot
+// journal output into a run it is not part of. Each box gets a different value,
+// so holding your own is no help against anyone else's. It is omitted when the
+// daemon cannot derive one, which leaves the box refusing every task: a serve
+// mode nobody can reach is a better failure than one anybody can.
+func (s *AgentSkillServer) serveModeCommand(seedDir, skillID string, engineRes agentengine.Resolved, model string) string {
+	return s.serveModeCommandFor(seedDir, skillID, skillID, engineRes, model)
+}
+
+// serveModeCommandFor separates journal/catalog identity from an isolated box.
+func (s *AgentSkillServer) serveModeCommandFor(seedDir, skillID, boxSkillID string, engineRes agentengine.Resolved, model string) string {
+	a2a := ""
+	if secret := s.agentA2ASecret(boxSkillID); secret != "" {
+		a2a = "CONTAINARIUM_A2A_TOKEN=" + shellSingleQuote(secret) + " "
+	}
+	return sourceGatewayEnvPrefix(seedDir) + runtimeEnvPrefix(engineRes, model) + a2a +
+		"CONTAINARIUM_SKILL_ID=" + shellSingleQuote(skillID) + " " +
+		"CONTAINARIUM_AGENT_MODE=serve AGENT_SEED_DIR=" + seedDir +
+		" setsid agent-runtime >/var/log/agent-runtime.log 2>&1 &"
+}
+
+// runModeCommand is the in-box command a one-shot (run mode) execution runs.
+// It exports CONTAINARIUM_RUN_ID and CONTAINARIUM_SKILL_ID after the gateway
+// env is sourced, so the runtime journals the run under
+// /var/log/agent-runtime/runs/<run_id>/<skill_id>.jsonl (#2095). The runtime
+// refuses to run in run mode without CONTAINARIUM_RUN_ID.
+func (s *AgentSkillServer) runModeCommand(seedDir, runID, skillID string, engineRes agentengine.Resolved, model string) string {
+	return sourceGatewayEnvPrefix(seedDir) + runtimeEnvPrefix(engineRes, model) +
+		"CONTAINARIUM_RUN_ID=" + shellSingleQuote(runID) + " " +
+		"CONTAINARIUM_SKILL_ID=" + shellSingleQuote(skillID) + " " +
+		"AGENT_SEED_DIR=" + seedDir + " agent-runtime"
+}
+
+// errInBoxRuntimeMissing marks a run whose box has no agent-runtime to exec
+// (bash exit 127, "command not found"): the box image does not ship it. It
+// is a precondition failure, not a failed run.
+var errInBoxRuntimeMissing = errors.New("agent-runtime is not installed in the box (the image may not ship it)")
+
+// exitCommandNotFound is bash's exit status for a command it cannot find.
+const exitCommandNotFound = 127
+
+// incusExecCommandMissing matches the op errors a real incus host returns in
+// place of exit statuses 127 and 126: its exec driver converts them into
+// ErrExecCommandNotFound ("Command not found") and
+// ErrExecCommandNotExecutable ("Command not executable"), so the exit code
+// never reaches the caller as data. Both mean the same thing here as a bare
+// 127: agent-runtime is not there to run.
+func incusExecCommandMissing(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "Command not found") || strings.Contains(msg, "Command not executable")
+}
+
+// maxInBoxErrorBytes caps how much of the in-box agent's own error text
+// (artifact.json's `error`, stderr) is carried into a returned error or a
+// log line. The text comes from inside the box and is untrusted.
+const maxInBoxErrorBytes = 1024
+
+// inBoxSecretPatterns scrub credential shapes audit.Redact does not cover:
+// bare provider API keys and bearer tokens an engine might echo back in
+// its error ("401 for key sk-..."). Over-redaction is fine here.
+var inBoxSecretPatterns = []struct {
+	pattern *regexp.Regexp
+	replace string
+}{
+	{regexp.MustCompile(`(?i)\bbearer\s+\S+`), "Bearer [REDACTED]"},
+	{regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{16,}`), "[REDACTED-KEY]"},
+	{regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{30,}`), "[REDACTED-KEY]"},
+	{regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{20,}`), "[REDACTED-KEY]"},
+}
+
+// scrubInBoxText redacts credential shapes from text produced inside the
+// box, then caps it at maxInBoxErrorBytes without splitting a UTF-8 rune.
+// Redaction runs first so a secret straddling the cut leaves no prefix.
+func scrubInBoxText(s string) string {
+	s = audit.Redact(strings.TrimSpace(s))
+	for _, p := range inBoxSecretPatterns {
+		s = p.pattern.ReplaceAllString(s, p.replace)
+	}
+	if len(s) <= maxInBoxErrorBytes {
+		return s
+	}
+	const marker = "…"
+	cut := maxInBoxErrorBytes - len(marker)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + marker
+}
+
+// inBoxRunStatus maps runInBoxAgentResult's error to RunAgentSkill's gRPC
+// status: a box with no runtime is FailedPrecondition, every other failure
+// of the run (engine error, unreadable artifact, exec failure) is Internal.
+// The message names the run so a caller can find its journal.
+func inBoxRunStatus(runID string, err error) error {
+	code := codes.Internal
+	if errors.Is(err, errInBoxRuntimeMissing) {
+		code = codes.FailedPrecondition
+	}
+	return status.Errorf(code, "agent run %s failed: %v", runID, err)
+}
+
+// runInBoxAgentResult executes the in-box agent-runtime over the seeded task
+// and reads its artifact back. The agent-runtime + agent-box live in the
+// agent-runtime box image; the model/engine/provider key come from the box
+// env (secrets-injected). Every failure is returned as an error — the
+// synchronous RunAgentSkill maps it to a gRPC status (inBoxRunStatus) and a
+// dispatched run (#2023) records it as the dispatch row's failure_reason.
+//
+// On a non-zero exit, artifact.json is still read: agent-runtime writes the
+// engine's own error there ({"error": ...}) before exiting 1 (2 for a launch
+// without a run/skill id), and that is the reason the caller needs. Text
+// from the box (that error, stderr) is redacted and capped by
+// scrubInBoxText before it reaches an error or a log line. engineRes/model
+// (#2222) are the run's already-resolved engine (provisionSkillBoxWith) —
+// this function only renders them into the exec, it never resolves anything
+// itself.
+func (s *AgentSkillServer) runInBoxAgentResult(containerName, seedDir, runID, skillID string, engineRes agentengine.Resolved, model string) (string, error) {
+	box := s.inBox()
+	if box == nil {
+		return "", fmt.Errorf("no container manager to run the in-box agent on %s", containerName)
+	}
+
+	_, stderr, exitCode, err := box.ExecWithExitCode(containerName,
+		[]string{"bash", "-lc", s.runModeCommand(seedDir, runID, skillID, engineRes, model)})
+	if err != nil && !incusExecCommandMissing(err) {
+		return "", fmt.Errorf("could not exec the in-box agent on %s: %w", containerName, err)
+	}
+	if err != nil || exitCode == exitCommandNotFound {
+		log.Printf("[agent-skill] agent-runtime not found on %s (image may not ship it yet); stderr=%s",
+			containerName, scrubInBoxText(stderr))
+		return "", fmt.Errorf("on %s: %w", containerName, errInBoxRuntimeMissing)
+	}
+	if exitCode != 0 {
+		log.Printf("[agent-skill] in-box agent on %s exited %d; stderr=%s", containerName, exitCode, scrubInBoxText(stderr))
+		if reason := s.inBoxArtifactError(box, containerName, seedDir); reason != "" {
+			return "", fmt.Errorf("in-box agent on %s exited %d: %s", containerName, exitCode, reason)
+		}
+		return "", fmt.Errorf("in-box agent on %s exited %d (no error recorded in artifact.json)", containerName, exitCode)
+	}
+
+	raw, err := box.ReadFile(containerName, seedDir+"/artifact.json")
+	if err != nil {
+		return "", fmt.Errorf("could not read artifact from %s: %w", containerName, err)
+	}
+	out, err := parseArtifactOutput(raw)
+	if err != nil {
+		return "", fmt.Errorf("in-box agent on %s reported an error: %s", containerName, scrubInBoxText(err.Error()))
+	}
+	return out, nil
+}
+
+// inBoxArtifactError is the scrubbed `error` artifact.json recorded for a
+// run that exited non-zero, or "" when there is no artifact, it does not
+// parse, or it records no error.
+func (s *AgentSkillServer) inBoxArtifactError(box inBoxRunner, containerName, seedDir string) string {
+	raw, err := box.ReadFile(containerName, seedDir+"/artifact.json")
+	if err != nil {
+		return ""
+	}
+	var a struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(raw, &a) != nil {
+		return ""
+	}
+	return scrubInBoxText(a.Error)
+}
+
+// inBox returns the inBoxOps override, else the container manager, else nil.
+func (s *AgentSkillServer) inBox() inBoxRunner {
+	if s.inBoxOps != nil {
+		return s.inBoxOps
+	}
+	if s.recipes == nil || s.recipes.containers == nil || s.recipes.containers.manager == nil {
+		return nil
+	}
+	return s.recipes.containers.manager
+}
+
+// parseArtifactOutput extracts the agent's output JSON from artifact.json
+// (written by agent-runtime). A non-empty `error` field is surfaced as an
+// error so the run is reported failed.
+func parseArtifactOutput(raw []byte) (string, error) {
+	var a struct {
+		OutputJSON string `json:"outputJson"`
+		Error      string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &a); err != nil {
+		return "", fmt.Errorf("decode artifact.json: %w", err)
+	}
+	if a.Error != "" {
+		return "", fmt.Errorf("%s", a.Error)
+	}
+	return a.OutputJSON, nil
+}
+
+// applyAllowedPeersPolicy compiles a skill's allowed_peers into a per-box
+// egress NetworkPolicy and stores it (LOG_ONLY). The box's tenant is its name
+// (the agent-<skill-id> / <tenant>-container convention the enforcer resolves).
+// Best-effort: logs and returns on any error so a policy hiccup never blocks a
+// run. No-op when no policy server is wired or the skill declares no peers.
+//
+// Phase 2 seam: the policy is observe-only here. Dropping non-allowed egress
+// in-kernel needs the env-gated eBPF enforcer (CONTAINARIUM_NETWORK_POLICY_*)
+// on a Linux backend and a flip to ENFORCE. Also, before ENFORCE is safe the
+// allowlist must be broadened to the platform egress the agent legitimately
+// needs (daemon API, DNS) — a peer-only allowlist would otherwise strand the
+// agent. Tracked in #574.
+func (s *AgentSkillServer) applyAllowedPeersPolicy(ctx context.Context, tenant string, skill *pb.AgentSkill) {
+	// Gateway pinning (#674 inc 4): when the model-gateway is enabled, every
+	// skill box is pinned to it — even one with no allowed_peers — so model
+	// calls can ONLY go through the gateway.
+	gatewayCIDR := ""
+	if s.gateway != nil {
+		gatewayCIDR = s.gateway.egressCIDR
+	}
+	// Default-deny (#750): install a policy for EVERY skill box, not only ones
+	// that declare allowed_peers or run under a gateway. A leaf skill
+	// (allowed_peers: []) in direct mode still gets a policy whose egress is just
+	// the provider domains (+ operator CIDRs), with metadata and intra-tenant
+	// denied — so under ENFORCE the box is locked down rather than left with no
+	// eBPF program (i.e. unrestricted egress). The empty-allowlist guard below
+	// still skips the degenerate "nothing allowed" case.
+	if s.netpolicy == nil {
+		return
+	}
+	extraCIDRs, extraDomains, enforce := agentNetworkPolicyConfig()
+	policy := compileAllowedPeersPolicy(tenant, skill.AllowedPeers, s.resolvePeerIP, extraCIDRs, extraDomains, gatewayCIDR, enforce)
+	if len(policy.EgressCidrs) == 0 && len(policy.EgressDomains) == 0 {
+		// Nothing to allow at all. Skip rather than install an empty allowlist
+		// (which, under ENFORCE, denies everything).
+		return
+	}
+	if enforce && len(policy.EgressDomains) == 0 && gatewayCIDR == "" {
+		// #611: an armed agent with no model-provider egress is stranded — it
+		// can reach its peers but not the Claude/OpenAI API. Default domains
+		// prevent this; warn loudly if an operator cleared them. (In gateway
+		// mode model egress is the gatewayCIDR, so this doesn't apply.)
+		log.Printf("[agent-skill] WARNING: ENFORCE armed for %q with no model egress (CONTAINARIUM_AGENT_EGRESS_DOMAINS empty) — the agent loop may be unable to reach its provider API", tenant)
+	}
+	// Compile (validate + normalize) before storing — same path the
+	// SetNetworkPolicy RPC uses — so a bad operator-supplied egress CIDR is
+	// caught here instead of silently dropped by the enforcer's reconcile.
+	compiled, err := netpolicy.Compile(policy)
+	if err != nil {
+		log.Printf("[agent-skill] invalid network policy for %q: %v", tenant, err)
+		return
+	}
+	if err := storeAgentSkillPolicy(ctx, s.netpolicy.Store(), compiled.ToProto()); err != nil {
+		log.Printf("[agent-skill] could not set network policy for %q: %v", tenant, err)
+	}
+}
+
+// a2aDenyNote marks the deny rules compileAllowedPeersPolicy owns (#2140), the
+// same way quarantineNote marks auto-quarantine's: a relaunch replaces exactly
+// these and leaves every operator-authored rule alone.
+const a2aDenyNote = "agent-skill: peer A2A port is daemon-only (#2140)"
+
+// storeAgentSkillPolicy persists a compiled agent-skill policy. Set stores the
+// allow-policy but deliberately never writes deny rules (they are owned by
+// MutateDenyRules, #660), so the peer A2A-port denies are merged in through
+// MutateDenyRules — otherwise they would be silently dropped and never reach
+// the kernel.
+func storeAgentSkillPolicy(ctx context.Context, store NetworkPolicyStore, p *pb.NetworkPolicy) error {
+	if err := store.Set(ctx, p); err != nil {
+		return err
+	}
+	desired := p.GetDenyRules()
+	_, err := store.MutateDenyRules(ctx, p.GetTenant(), func(existing []*pb.NetworkPolicyDenyRule) ([]*pb.NetworkPolicyDenyRule, error) {
+		return mergeA2ADenyRules(existing, desired), nil
+	})
+	return err
+}
+
+// mergeA2ADenyRules replaces the A2A-port denies in existing (identified by
+// a2aDenyNote — stale ones from a previous launch go too) with desired. An
+// operator rule already on a peer's CIDR keeps that slot: the kernel holds one
+// deny per CIDR, and overwriting it would narrow the operator's block to one
+// port. The in-box A2A credential (D1) still holds on that peer either way.
+func mergeA2ADenyRules(existing, desired []*pb.NetworkPolicyDenyRule) []*pb.NetworkPolicyDenyRule {
+	out := make([]*pb.NetworkPolicyDenyRule, 0, len(existing)+len(desired))
+	taken := make(map[string]bool, len(existing))
+	for _, r := range existing {
+		if r.GetNote() == a2aDenyNote {
+			continue
+		}
+		out = append(out, r)
+		taken[strings.TrimSpace(r.GetCidr())] = true
+	}
+	for _, r := range desired {
+		if !taken[r.GetCidr()] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// agentNetworkPolicyConfig reads the operator opt-ins for arming enforcement:
+//   - CONTAINARIUM_AGENT_NETWORK_POLICY_ENFORCE=1 → compile the policy in
+//     ENFORCE mode (drop), instead of the default LOG_ONLY (observe).
+//   - CONTAINARIUM_AGENT_EGRESS_CIDRS=cidr,cidr → platform egress the agent
+//     legitimately needs (daemon API, DNS resolver) added to every agent box's
+//     allowlist, so ENFORCE doesn't strand the agent.
+//
+// Both default off/empty, so the out-of-the-box behaviour stays observe-only.
+// ENFORCE additionally requires the daemon-wide eBPF enforcer to be armed
+// (CONTAINARIUM_NETWORK_POLICY_BPF_OBJECT + CONTAINARIUM_NETWORK_POLICY_ENFORCE).
+// defaultAgentEgressDomains is the model-provider egress every agent box needs
+// so an armed (ENFORCE) policy doesn't strand the loop (#611). All supported
+// providers are allowed since a box may run any engine (Claude, Codex, or
+// Gemini); the Gemini engine reaches the Gemini API at generativelanguage.googleapis.com.
+var defaultAgentEgressDomains = []string{"api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"}
+
+func agentNetworkPolicyConfig() (extraCIDRs, extraDomains []string, enforce bool) {
+	enforce = os.Getenv("CONTAINARIUM_AGENT_NETWORK_POLICY_ENFORCE") == "1"
+	for _, c := range strings.Split(os.Getenv("CONTAINARIUM_AGENT_EGRESS_CIDRS"), ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			extraCIDRs = append(extraCIDRs, c)
+		}
+	}
+	// Model-provider egress: operator override, else the provider defaults.
+	if raw, ok := os.LookupEnv("CONTAINARIUM_AGENT_EGRESS_DOMAINS"); ok {
+		for _, d := range strings.Split(raw, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				extraDomains = append(extraDomains, d)
+			}
+		}
+	} else {
+		extraDomains = append(extraDomains, defaultAgentEgressDomains...)
+	}
+	return extraCIDRs, extraDomains, enforce
+}
+
+// callerSkillID recovers the skill id of the agent making an A2A call. The
+// authenticated token subject wins (an agent box's JWT subject is
+// agent-<skill-id>); otherwise it falls back to the caller-asserted value.
+func (s *AgentSkillServer) callerSkillID(ctx context.Context, asserted string) string {
+	// Use the same gRPC-metadata subject the rest of the server authenticates
+	// on (RequireScope / AuthorizeTenant). The authenticated subject is the
+	// real boundary; the caller-asserted from_skill_id is only a fallback for
+	// non-agent callers (admin/operator), who aren't gated here anyway.
+	if subj, _, ok := auth.SubjectFromGRPCContext(ctx); ok && strings.HasPrefix(subj, agentBoxPrefix) {
+		return strings.TrimPrefix(subj, agentBoxPrefix)
+	}
+	return asserted
+}
+
+// peerAllowed reports whether the calling skill may send to toPeer per its
+// declared allowed_peers. An unknown/empty caller (admin or operator direct
+// call, not an agent box) is allowed — for box-originated traffic the eBPF
+// egress policy is the hard boundary; this is the API-boundary courtesy check.
+func (s *AgentSkillServer) peerAllowed(fromSkillID, toPeerID string) bool {
+	if fromSkillID == "" {
+		return true
+	}
+	skill, err := s.catalog.Get(fromSkillID)
+	if err != nil {
+		return true // unknown caller skill — not ours to gate here
+	}
+	for _, p := range skill.AllowedPeers {
+		if p == toPeerID {
+			return true
+		}
+	}
+	return false
+}
+
+// resolvePeerIP returns a running peer box's IPv4 address, if any. Used to turn
+// an allowed_peer skill id into an egress /32 at launch.
+func (s *AgentSkillServer) resolvePeerIP(peerID string) (string, bool) {
+	info, err := s.recipes.containers.manager.Get("agent-" + peerID)
+	if err != nil || info == nil || info.IPAddress == "" {
+		return "", false
+	}
+	return info.IPAddress, true
+}
+
+// compileAllowedPeersPolicy builds a per-box egress NetworkPolicy from a skill's
+// allowed_peers: each currently-running peer's box IP becomes an egress /32,
+// paired with a deny rule for that peer's A2A port (tcp/a2aPort, #2140) — the
+// peer box stays reachable for anything else a skill does, but a task can only
+// reach its in-box A2A server through the daemon (D1 in
+// docs/architecture/execution-scoped-authorization.md). The deny sits on the
+// calling box's egress, so the daemon's own delivery to a box is unaffected.
+// Pure (resolution is injected) so it is unit-testable without a daemon. The
+// policy is LOG_ONLY — observe, never drop — until Phase 2 enforcement is armed.
+//
+// gatewayCIDR pins the box to the model-gateway (#674 inc 4): when set, the
+// box's model egress is the gateway host (gatewayCIDR — also the daemon API +
+// DNS) and the direct provider domains are DROPPED, so a box can't bypass the gateway to
+// reach a provider with a key it doesn't hold. When empty (direct mode) the
+// box gets the provider domains directly, as before.
+func compileAllowedPeersPolicy(tenant string, allowedPeers []string, resolve func(peerID string) (string, bool), extraCIDRs, extraDomains []string, gatewayCIDR string, enforce bool) *pb.NetworkPolicy {
+	var cidrs []string
+	var deny []*pb.NetworkPolicyDenyRule
+	for _, peer := range allowedPeers {
+		if ip, ok := resolve(peer); ok {
+			cidrs = append(cidrs, ip+"/32")
+			deny = append(deny, &pb.NetworkPolicyDenyRule{
+				Cidr:  ip + "/32",
+				Port:  a2aPort,
+				Proto: "tcp",
+				Note:  a2aDenyNote,
+			})
+		}
+	}
+	// Platform egress the agent legitimately needs (daemon API, DNS) so an
+	// armed ENFORCE policy doesn't strand the agent.
+	cidrs = append(cidrs, extraCIDRs...)
+
+	// Gateway pinning: allow the gateway host (model calls go here) and serve no
+	// direct provider domains. Without a gateway, fall back to direct provider
+	// egress.
+	domains := extraDomains
+	if gatewayCIDR != "" {
+		cidrs = append(cidrs, gatewayCIDR)
+		domains = nil
+	}
+
+	mode := pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY
+	if enforce {
+		mode = pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE
+	}
+	return &pb.NetworkPolicy{
+		Tenant:           tenant,
+		AllowIntraTenant: false,
+		EgressCidrs:      cidrs,
+		// Direct model-provider egress (resolved to IPs by the enforcer's domain
+		// resolver) so the in-box loop can reach the Claude/OpenAI API (#611) —
+		// EMPTY in gateway mode, where model calls go through gatewayCIDR instead.
+		EgressDomains: domains,
+		Mode:          mode,
+		AllowMetadata: false,
+		DenyRules:     deny,
+		Source:        "agent-skill",
+	}
+}
+
+// SendAgentTask delegates a task to a running peer agent over A2A and returns
+// the peer's artifact (Phase 1 transport). Gated on agents:call.
+//
+// Phase 2 will enforce that to_peer_id is in the from-skill's allowed_peers and
+// that network policy permits the hop (the eBPF "trust fabric"); in Phase 1 the
+// send is best-effort. The peer's in-box A2A server (which receives the task)
+// is the agent-runtime image's job — until it lands, a call to a real box
+// reaches no listener and returns Unavailable. The transport itself is wired
+// and unit-tested (see a2a_client_test.go).
+func (s *AgentSkillServer) SendAgentTask(ctx context.Context, req *pb.SendAgentTaskRequest) (*pb.SendAgentTaskResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeAgentsCall); err != nil {
+		return nil, err
+	}
+	if req.ToPeerId == "" {
+		return nil, status.Error(codes.InvalidArgument, "to_peer_id is required")
+	}
+	// A run-bound caller journals only into its own run (#2096): stamp an
+	// absent run_id with the token's claim, refuse a different one.
+	runID, err := taskRunID(ctx, req.GetRunId())
+	if err != nil {
+		return nil, err
+	}
+	req.RunId = runID
+	// run_id names a directory of the peer's run journal (#2095), so it must
+	// have the same shape RunAgentSkill/RunCrew accept. Empty is allowed: the
+	// task is simply not journaled on the peer.
+	if req.GetRunId() != "" {
+		if _, err := resolveRunID(req.GetRunId()); err != nil {
+			return nil, err
+		}
+	}
+
+	// Enforce allowed_peers at the API boundary (Phase 2). The real caller is
+	// the authenticated token subject when it's an agent box (agent-<skill-id>);
+	// fall back to the caller-asserted from_skill_id otherwise. This is
+	// defense-in-depth + fail-fast UX — the hard boundary for raw box-originated
+	// traffic is the eBPF egress policy compiled from allowed_peers.
+	caller := s.callerSkillID(ctx, req.FromSkillId)
+
+	// Correlation id for the whole delegation: honor a caller-threaded id
+	// (a crew, Phase 3), else generate one. Every audit record for this hop
+	// shares it.
+	trace := req.TraceId
+	if trace == "" {
+		trace = genTraceID()
+	}
+
+	target, scoped, routeErr := s.graphPeerTarget(runID, caller, req.ToPeerId)
+	if routeErr != nil {
+		return nil, routeErr
+	}
+	if !scoped && !s.peerAllowed(caller, req.ToPeerId) {
+		s.auditHop(ctx, trace, caller, req.ToPeerId, "denied", "not in allowed_peers")
+		return nil, status.Errorf(codes.PermissionDenied,
+			"skill %q is not permitted to call peer %q (not in its allowed_peers)", caller, req.ToPeerId)
+	}
+
+	// The peer's in-box A2A server takes tasks only from the daemon (#2125) —
+	// which is what stops a box from posting to a peer itself and walking
+	// around the run_id check above. Resolved before the peer is contacted:
+	// without the credential there is no deliverable task.
+	secret := s.agentA2ASecret(target)
+	if secret == "" {
+		s.auditHop(ctx, trace, caller, req.ToPeerId, "failed", "no A2A credential for peer")
+		return nil, status.Errorf(codes.Internal,
+			"cannot authenticate to peer %q: the daemon holds no A2A credential for it", req.ToPeerId)
+	}
+
+	baseURL, _, err := s.resolvePeerA2A(target)
+	if err != nil {
+		s.auditHop(ctx, trace, caller, req.ToPeerId, "unreachable", err.Error())
+		return nil, err
+	}
+
+	task := agentTaskFor(caller, req.ToPeerId, req)
+	art, err := sendA2ATask(ctx, baseURL, task, secret)
+	if err != nil {
+		// A refused credential is not an unreachable peer: that box is serving,
+		// it just does not recognize this daemon (seeded by another one, or
+		// before a signing-key rotation). Reporting it as Unavailable would
+		// send an operator hunting a network fault; Internal, carrying the
+		// peer's own words, points at the box that needs reprovisioning.
+		code, outcome := codes.Unavailable, "failed"
+		if errors.Is(err, errA2AUnauthorized) {
+			code, outcome = codes.Internal, "unauthorized"
+		}
+		s.auditHop(ctx, trace, caller, req.ToPeerId, outcome, err.Error())
+		return nil, status.Errorf(code, "deliver task to peer %q: %v", req.ToPeerId, err)
+	}
+	s.auditHop(ctx, trace, caller, req.ToPeerId, "delivered", "")
+	return &pb.SendAgentTaskResponse{Artifact: art, TraceId: trace}, nil
+}
+
+// agentTaskFor shapes the A2A task SendAgentTask delivers to a peer. run_id is
+// forwarded so the peer's runtime journals the task under the caller's run
+// (#2095).
+func agentTaskFor(caller, toPeerID string, req *pb.SendAgentTaskRequest) *pb.AgentTask {
+	return &pb.AgentTask{
+		Id:        "task-" + caller + "-" + toPeerID,
+		InputJson: req.GetInputJson(),
+		RunId:     req.GetRunId(),
+	}
+}
+
+// genTraceID returns a random 128-bit hex correlation id for an A2A run.
+func genTraceID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// rand failure is effectively impossible; fall back to a time nonce so
+		// the trace is still non-empty rather than colliding on "".
+		return fmt.Sprintf("t%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// auditHop records one A2A delegation under the shared trace id. Best-effort:
+// audit must never fail the call. No-op until the audit store is wired.
+//
+// #1678 — an A2A call is agent-performed: username (from) is the agent's own
+// synthetic subject, so this also resolves and records the dispatching
+// human (auth.RootActor, walked from the caller's delegation chain) and the
+// acting token's jti, per the AC that every agent-performed action records
+// both.
+func (s *AgentSkillServer) auditHop(ctx context.Context, trace, from, to, outcome, detail string) {
+	if s.audit == nil {
+		return
+	}
+	username := from
+	if username == "" {
+		username = "_unknown"
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"trace_id": trace,
+		"from":     from,
+		"to":       to,
+		"outcome":  outcome,
+		"detail":   detail,
+	})
+
+	actor, delegationChain, tokenID := auditAttributionFromContext(ctx)
+
+	if err := s.audit.Log(ctx, &audit.AuditEntry{
+		Username:        username,
+		Action:          "agent.a2a_call",
+		ResourceType:    "agent_skill",
+		ResourceID:      to,
+		Detail:          string(payload),
+		Actor:           actor,
+		DelegationChain: delegationChain,
+		TokenID:         tokenID,
+	}); err != nil {
+		log.Printf("[agent-skill] audit A2A hop %s->%s: %v", from, to, err)
+	}
+}
+
+// ---- run-lease audit rows (#1817, design §5) --------------------------------
+//
+// Two rows per run, both ResourceType "agent_skill_run" with the run id as
+// ResourceID and RunID. Detail is marshalled from the named structs below
+// rather than a map, so the shape an operator queries is declared in one place
+// and a typo is a compile error.
+
+// runLeaseCredential is one minted credential as it appears in an audit row.
+// Exp is RFC3339 so a reader can tell when the credential dies on its own,
+// independent of whether the revoke landed.
+type runLeaseCredential struct {
+	Kind string `json:"kind"`
+	JTI  string `json:"jti"`
+	Exp  string `json:"exp"`
+}
+
+// runLeaseIssueDetail is the Detail of agent.run_lease_issue: what this run was
+// given, and where.
+type runLeaseIssueDetail struct {
+	RunID       string               `json:"run_id"`
+	Box         string               `json:"box"`
+	Credentials []runLeaseCredential `json:"credentials"`
+	// Engine is the run's resolved engine (#2222), its EnvValue name — "" for
+	// AGENT_ENGINE_UNSPECIFIED (direct mode, no engine named), matching what
+	// an auditor reading the daemon's own CONTAINARIUM_AGENT_ENGINE export
+	// would see rather than the proto enum's numeric value.
+	Engine string `json:"engine,omitempty"`
+}
+
+// runLeaseEndDetail is the Detail of agent.run_lease_end: what actually
+// happened when the run's authority was taken back.
+type runLeaseEndDetail struct {
+	RunID       string   `json:"run_id"`
+	Reason      string   `json:"reason"`
+	Revoked     []string `json:"revoked"`
+	Unrevoked   []string `json:"unrevoked"`
+	Wiped       bool     `json:"wiped"`
+	DirsRemoved bool     `json:"dirs_removed"` // #1860: the seed dir + workspace are gone
+	Errors      []string `json:"errors"`
+}
+
+func runLeaseIssuePayload(lease runlease.Lease, engine pb.AgentEngine) string {
+	d := runLeaseIssueDetail{
+		RunID:       lease.RunID,
+		Box:         lease.Box,
+		Credentials: make([]runLeaseCredential, 0, len(lease.Credentials)),
+		Engine:      agentengine.EnvValue(engine),
+	}
+	for _, c := range lease.Credentials {
+		d.Credentials = append(d.Credentials, runLeaseCredential{
+			Kind: string(c.Kind), JTI: c.JTI, Exp: c.ExpiresAt.UTC().Format(time.RFC3339),
+		})
+	}
+	b, _ := json.Marshal(d)
+	return string(b)
+}
+
+func runLeaseEndPayload(lease runlease.Lease, reason string, out runlease.Outcome) string {
+	d := runLeaseEndDetail{
+		RunID:  lease.RunID,
+		Reason: reason,
+		// Non-nil so the row reads "nothing here" rather than JSON null.
+		Revoked:     append([]string{}, out.Revoked...),
+		Unrevoked:   append([]string{}, out.Unrevoked...),
+		Wiped:       out.Wiped,
+		DirsRemoved: out.DirsRemoved,
+		Errors:      make([]string, 0, len(out.Errs)),
+	}
+	for _, err := range out.Errs {
+		d.Errors = append(d.Errors, err.Error())
+	}
+	b, _ := json.Marshal(d)
+	return string(b)
+}
+
+// auditRunLease writes one run-lease row. Best-effort and a no-op until the
+// audit store is wired, exactly like auditHop.
+//
+// TokenID stays the CALLER's jti (auditAttributionFromContext): "what did this
+// credential do" must keep meaning the credential that made the call. The jtis
+// this run was issued live in Detail.
+//
+// Both rows are written on a context detached from the caller's and bounded by
+// auditWriteBudget — the detach and the deadline live HERE, in the one place
+// both call sites go through, so neither can get one without the other:
+//
+//   - Detached, because a run lease exists precisely for the caller-cancel
+//     path. On the RPC context the issue row would be the single write that
+//     fails exactly when the cancellation happens, leaving a run with an end
+//     row and no issue row.
+//   - Bounded, because the write takes a global advisory lock with no timeout
+//     of its own (see auditWriteBudget).
+//
+// Attribution still comes off the ORIGINAL ctx: WithoutCancel keeps the
+// values (gRPC metadata, claims) and drops only the cancellation.
+func (s *AgentSkillServer) auditRunLease(ctx context.Context, action, runID, detail string) {
+	if s.audit == nil {
+		return
+	}
+	username, _, _ := auth.SubjectFromGRPCContext(ctx)
+	if username == "" {
+		username = "_unknown"
+	}
+	actor, delegationChain, tokenID := auditAttributionFromContext(ctx)
+
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditWriteBudget)
+	defer cancel()
+
+	if err := s.audit.Log(wctx, &audit.AuditEntry{
+		Username:        username,
+		Action:          action,
+		ResourceType:    "agent_skill_run",
+		ResourceID:      runID,
+		Detail:          detail,
+		Actor:           actor,
+		DelegationChain: delegationChain,
+		TokenID:         tokenID,
+		RunID:           runID,
+	}); err != nil {
+		log.Printf("[agent-skill] audit %s for run %s: %v", action, runID, err)
+	}
+}
+
+// auditAttributionFromContext resolves the #1678 audit attribution fields
+// from an authenticated request context: actor is the root human/service
+// principal at the base of the caller's delegation chain (auth.RootActor),
+// delegationChain is that chain's own JSON serialization (kept for full
+// depth reconstruction beyond what the flat actor column shows), and
+// tokenID is the acting token's jti. All three are "" when the context
+// carries no delegation claim / no jti — the valid, backward-compatible
+// case for a direct (non-delegated) or pre-#1677/#1678 caller.
+//
+// Extracted as a pure function (no audit.Store dependency) specifically so
+// it's unit-testable without a live Postgres — auditHop's own Log() call
+// only runs against a real *audit.Store, which the test suite can't fake.
+func auditAttributionFromContext(ctx context.Context) (actor, delegationChain, tokenID string) {
+	if act, ok := auth.ActFromGRPCContext(ctx); ok {
+		actor = auth.RootActor(act)
+		if encoded, err := json.Marshal(act); err == nil {
+			delegationChain = string(encoded)
+		}
+	}
+	tokenID, _ = auth.JTIFromGRPCContext(ctx)
+	return actor, delegationChain, tokenID
+}
+
+// resolvePeerA2A finds a running peer's in-box A2A base URL and its agent card.
+// The peer is addressed by skill id; its box is named agent-<skill-id> (the
+// deterministic name RunAgentSkill assigns). Returns FailedPrecondition when
+// the peer is not running.
+func (s *AgentSkillServer) resolvePeerA2A(peerID string) (string, *pb.AgentCard, error) {
+	skill, err := s.catalog.Get(peerID)
+	if err != nil {
+		return "", nil, status.Error(codes.NotFound, err.Error())
+	}
+	name := "agent-" + peerID
+	info, err := s.recipes.containers.manager.Get(name)
+	if err != nil || info == nil || info.IPAddress == "" {
+		return "", nil, status.Errorf(codes.FailedPrecondition,
+			"peer %q is not running (no box %q with an IP); run it first with 'containarium agent run %s'",
+			peerID, name+"-container", peerID)
+	}
+	baseURL := fmt.Sprintf("http://%s:%d", info.IPAddress, a2aPort)
+	return baseURL, skill.AgentCard, nil
+}
+
+// buildAgentSeedScript writes the skill's system prompt, scoped token, task
+// input, and agent card under agentSeedDir with restrictive permissions. The
+// agent card lets the box's A2A server (Phase 1) serve it for peer discovery.
+// Values are single-quote escaped (shellSingleQuote, from recipe_server.go) to
+// prevent shell injection.
+func buildAgentSeedScript(seedDir, systemPrompt, token, inputJSON, cardJSON string) string {
+	if inputJSON == "" {
+		inputJSON = "{}"
+	}
+	if cardJSON == "" {
+		cardJSON = "{}"
+	}
+	var b strings.Builder
+	b.WriteString("set -euo pipefail\n")
+	b.WriteString("umask 077\n")
+	fmt.Fprintf(&b, "mkdir -p %s\n", seedDir)
+	fmt.Fprintf(&b, "printf '%%s' %s > %s/system_prompt.txt\n", shellSingleQuote(systemPrompt), seedDir)
+	fmt.Fprintf(&b, "printf '%%s' %s > %s/token\n", shellSingleQuote(token), seedDir)
+	fmt.Fprintf(&b, "printf '%%s' %s > %s/input.json\n", shellSingleQuote(inputJSON), seedDir)
+	fmt.Fprintf(&b, "printf '%%s' %s > %s/agent-card.json\n", shellSingleQuote(cardJSON), seedDir)
+	fmt.Fprintf(&b, "chmod 600 %s/token\n", seedDir)
+	return b.String()
+}
