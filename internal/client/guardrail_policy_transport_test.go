@@ -97,3 +97,202 @@ func restSetStatus(t *testing.T, c *HTTPClient, req *pb.SetGuardrailPolicyReques
 	body, err := protojson.Marshal(req)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
+	}
+	hreq, err := http.NewRequest(http.MethodPut, c.baseURL+"/v1/guardrail/policy", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(hreq)
+	if err != nil {
+		t.Fatalf("PUT /v1/guardrail/policy: %v", err)
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode
+}
+
+func gpTransportRequest(maxResidual int32) *pb.SetGuardrailPolicyRequest {
+	seed := make([]byte, ed25519.SeedSize)
+	pub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+	return &pb.SetGuardrailPolicyRequest{
+		Policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{
+			{Kind: pb.GuardrailKind_GUARDRAIL_KIND_PII, Action: pb.GuardrailAction_GUARDRAIL_ACTION_REDACT, MaxResidual: maxResidual},
+			{Kind: pb.GuardrailKind_GUARDRAIL_KIND_SECRET, Action: pb.GuardrailAction_GUARDRAIL_ACTION_BLOCK},
+		}},
+		TrustedSigners: []*pb.GuardrailTrustedSigner{{KeyId: guardrail.KeyID(pub), PublicKey: pub, Label: "release key"}},
+	}
+}
+
+// TestGuardrailPolicy_RESTAndGRPCAgree: a Set over one transport is read
+// back identically over the other, both report not-configured the same way
+// before any Set, and a refused call maps to the same status on both.
+func TestGuardrailPolicy_RESTAndGRPCAgree(t *testing.T) {
+	srv := server.NewGuardrailPolicyServer(guardrailpolicy.NewMemoryStore())
+	clients := map[string]guardrailPolicyClient{
+		"grpc": startGRPCGuardrailPolicy(t, srv, true),
+		"rest": startGatewayGuardrailPolicy(t, srv, true),
+	}
+
+	for name, c := range clients {
+		got, err := c.GetGuardrailPolicy()
+		if err != nil || got.GetConfigured() {
+			t.Fatalf("%s Get before any Set = (%v, %v), want configured=false", name, got, err)
+		}
+	}
+
+	set, err := clients["rest"].SetGuardrailPolicy(gpTransportRequest(1))
+	if err != nil {
+		t.Fatalf("rest Set: %v", err)
+	}
+	if set.GetPolicy().GetRevision() != 1 || set.GetPolicy().GetUpdatedBy() != "ops" {
+		t.Fatalf("rest Set = %v, want revision 1 by ops", set.GetPolicy())
+	}
+	viaGRPC, err := clients["grpc"].GetGuardrailPolicy()
+	if err != nil {
+		t.Fatalf("grpc Get: %v", err)
+	}
+	viaREST, err := clients["rest"].GetGuardrailPolicy()
+	if err != nil {
+		t.Fatalf("rest Get: %v", err)
+	}
+	if !proto.Equal(viaGRPC, viaREST) {
+		t.Fatalf("transports disagree:\n grpc %v\n rest %v", viaGRPC, viaREST)
+	}
+	if !proto.Equal(viaREST.GetPolicy().GetTrustedSigners()[0], gpTransportRequest(1).GetTrustedSigners()[0]) {
+		t.Fatalf("signer bytes did not survive the JSON round trip: %v", viaREST.GetPolicy().GetTrustedSigners())
+	}
+
+	if _, err := clients["grpc"].SetGuardrailPolicy(gpTransportRequest(2)); err != nil {
+		t.Fatalf("grpc Set: %v", err)
+	}
+	viaREST, _ = clients["rest"].GetGuardrailPolicy()
+	if viaREST.GetPolicy().GetRevision() != 2 || viaREST.GetPolicy().GetPolicy().GetRules()[0].GetMaxResidual() != 2 {
+		t.Fatalf("rest Get after grpc Set = %v, want revision 2", viaREST.GetPolicy())
+	}
+
+	bad := gpTransportRequest(-1)
+	if _, err := clients["grpc"].SetGuardrailPolicy(bad); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("grpc Set invalid = %v, want InvalidArgument", err)
+	}
+	if _, err := clients["rest"].SetGuardrailPolicy(bad); err == nil {
+		t.Fatalf("rest Set invalid succeeded, want a refusal")
+	}
+	if got := restSetStatus(t, clients["rest"].(*HTTPClient), bad); got != http.StatusBadRequest {
+		t.Fatalf("rest Set invalid = HTTP %d, want %d (InvalidArgument)", got, http.StatusBadRequest)
+	}
+	viaREST, _ = clients["rest"].GetGuardrailPolicy()
+	if viaREST.GetPolicy().GetRevision() != 2 {
+		t.Fatalf("revision after refused Sets = %d, want 2", viaREST.GetPolicy().GetRevision())
+	}
+}
+
+// TestGuardrailPolicy_NonAdminSetRefusedOnBothTransports: AC3 over the wire.
+func TestGuardrailPolicy_NonAdminSetRefusedOnBothTransports(t *testing.T) {
+	srv := server.NewGuardrailPolicyServer(guardrailpolicy.NewMemoryStore())
+	g := startGRPCGuardrailPolicy(t, srv, false)
+	h := startGatewayGuardrailPolicy(t, srv, false)
+	if _, err := g.SetGuardrailPolicy(gpTransportRequest(0)); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("grpc non-admin Set = %v, want PermissionDenied", err)
+	}
+	if _, err := h.SetGuardrailPolicy(gpTransportRequest(0)); err == nil {
+		t.Fatalf("rest non-admin Set succeeded, want a refusal")
+	}
+	if got := restSetStatus(t, h, gpTransportRequest(0)); got != http.StatusForbidden {
+		t.Fatalf("rest non-admin Set = HTTP %d, want %d (PermissionDenied)", got, http.StatusForbidden)
+	}
+	if got, err := h.GetGuardrailPolicy(); err != nil || got.GetConfigured() {
+		t.Fatalf("non-admin Get = (%v, %v), want readable and still not configured", got, err)
+	}
+}
+
+// TestGuardrailStatus_RESTAndGRPCAgree (#2737): GET /v1/guardrail/status and
+// the gRPC call report the same effective policy to a non-admin caller,
+// before and after a policy with an inbound BLOCK rule is set.
+func TestGuardrailStatus_RESTAndGRPCAgree(t *testing.T) {
+	srv := server.NewGuardrailPolicyServer(guardrailpolicy.NewMemoryStore())
+	clients := map[string]interface {
+		GetGuardrailStatus() (*pb.GetGuardrailStatusResponse, error)
+	}{
+		"grpc": startGRPCGuardrailPolicy(t, srv, false),
+		"rest": startGatewayGuardrailPolicy(t, srv, false),
+	}
+	check := func(want pb.GuardrailEffectivePolicy) {
+		t.Helper()
+		var first *pb.GetGuardrailStatusResponse
+		for name, c := range clients {
+			got, err := c.GetGuardrailStatus()
+			if err != nil || got.GetResponsePolicy() != want {
+				t.Fatalf("%s GetGuardrailStatus = (%v, %v), want %v", name, got, err, want)
+			}
+			if first != nil && !proto.Equal(first, got) {
+				t.Fatalf("transports disagree:\n %v\n %v", first, got)
+			}
+			first = got
+		}
+	}
+	check(pb.GuardrailEffectivePolicy_GUARDRAIL_EFFECTIVE_POLICY_BASELINE)
+
+	admin := startGRPCGuardrailPolicy(t, srv, true)
+	if _, err := admin.SetGuardrailPolicy(&pb.SetGuardrailPolicyRequest{Policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{
+		{Kind: pb.GuardrailKind_GUARDRAIL_KIND_PROMPT_INJECTION, Action: pb.GuardrailAction_GUARDRAIL_ACTION_BLOCK},
+	}}}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	check(pb.GuardrailEffectivePolicy_GUARDRAIL_EFFECTIVE_POLICY_ADMIN)
+}
+
+// TestGuardrailBaselineMode_RESTAndGRPCAgree (#2738): PUT
+// /v1/guardrail/baseline through the generated grpc-gateway shim and the
+// gRPC call switch the same stored mode, status reports it identically on
+// both, and a non-admin is refused on both without changing it.
+func TestGuardrailBaselineMode_RESTAndGRPCAgree(t *testing.T) {
+	srv := server.NewGuardrailPolicyServer(guardrailpolicy.NewMemoryStore())
+	type baselineClient interface {
+		SetGuardrailBaselineMode(pb.GuardrailBaselineMode) (*pb.SetGuardrailBaselineModeResponse, error)
+		GetGuardrailStatus() (*pb.GetGuardrailStatusResponse, error)
+	}
+	admins := map[string]baselineClient{
+		"grpc": startGRPCGuardrailPolicy(t, srv, true),
+		"rest": startGatewayGuardrailPolicy(t, srv, true),
+	}
+	users := map[string]baselineClient{
+		"grpc": startGRPCGuardrailPolicy(t, srv, false),
+		"rest": startGatewayGuardrailPolicy(t, srv, false),
+	}
+	wantMode := func(mode pb.GuardrailBaselineMode, rev int64) {
+		t.Helper()
+		var first *pb.GetGuardrailStatusResponse
+		for name, c := range users {
+			got, err := c.GetGuardrailStatus()
+			if err != nil || got.GetBaseline().GetMode() != mode || got.GetBaseline().GetRevision() != rev {
+				t.Fatalf("%s status = (%v, %v), want baseline %v at revision %d", name, got, err, mode, rev)
+			}
+			if first != nil && !proto.Equal(first, got) {
+				t.Fatalf("transports disagree:\n %v\n %v", first, got)
+			}
+			first = got
+		}
+	}
+	wantMode(pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_LOG, 0)
+
+	set, err := admins["rest"].SetGuardrailBaselineMode(pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_BLOCK)
+	if err != nil || set.GetBaseline().GetRevision() != 1 || set.GetBaseline().GetUpdatedBy() != "ops" {
+		t.Fatalf("rest set BLOCK = (%v, %v), want revision 1 by ops", set, err)
+	}
+	wantMode(pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_BLOCK, 1)
+	if _, err := admins["grpc"].SetGuardrailBaselineMode(pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_LOG); err != nil {
+		t.Fatalf("grpc set LOG: %v", err)
+	}
+	wantMode(pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_LOG, 2)
+
+	if _, err := users["grpc"].SetGuardrailBaselineMode(pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_BLOCK); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("grpc non-admin set = %v, want PermissionDenied", err)
+	}
+	if _, err := users["rest"].SetGuardrailBaselineMode(pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_BLOCK); err == nil {
+		t.Fatal("rest non-admin set succeeded, want a refusal")
+	}
+	if _, err := admins["rest"].SetGuardrailBaselineMode(pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_UNSPECIFIED); err == nil {
+		t.Fatal("rest set UNSPECIFIED succeeded, want a refusal")
+	}
+	wantMode(pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_LOG, 2)
+}

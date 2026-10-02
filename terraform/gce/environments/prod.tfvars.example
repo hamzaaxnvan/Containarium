@@ -13,3 +13,50 @@ project_id = "your-production-project-id"  # UPDATE THIS
 region = "us-central1"
 zone   = "us-central1-a"
 
+# Instance Configuration
+instance_name       = "containarium-prod"
+machine_type        = "n2-standard-8"   # 8 vCPU, 32GB RAM (50-100 users)
+use_spot_instance   = true              # Use spot for cost savings with sentinel HA
+use_persistent_disk = true              # REQUIRED for data persistence
+
+# Disk Sizes (GB)
+boot_disk_size = 100
+data_disk_size = 500  # Larger disk for production data
+
+# Security - SSH Keys
+# admin_ssh_keys = {
+#   admin = "ssh-ed25519 AAAA... admin@company.com"
+# }
+
+# Allowed SSH Sources (your office/VPN IP ranges)
+allowed_ssh_sources = [
+  "0.0.0.0/0"  # WARNING: Open to internet! Restrict in production!
+  # Recommended: Restrict to your IP ranges
+  # "203.0.113.0/24",  # Office network
+  # "198.51.100.5/32", # VPN server
+]
+
+# Containarium Daemon
+enable_containarium_daemon = true
+containarium_version       = "latest"
+containarium_binary_url    = ""  # Optional: URL to custom binary
+
+# Sentinel HA (recommended for production with spot instances)
+enable_sentinel = true
+
+# Monitoring and Backups
+enable_monitoring     = true
+enable_disk_snapshots = true
+
+# Labels (for resource organization)
+labels = {
+  environment = "production"
+  managed_by  = "terraform"
+  team        = "devops"
+  project     = "containarium"
+  cost_center = "engineering"
+}
+
+# DNS Configuration (optional)
+# dns_zone_name   = "containarium-prod"
+# dns_zone_domain = "dev.company.com"
