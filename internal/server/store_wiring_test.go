@@ -37,3 +37,30 @@ func TestCrewServer_SetRunStoreIgnoresNil(t *testing.T) {
 }
 
 func TestAgentSkillServer_SetTaskQueueTakesEffect(t *testing.T) {
+	s := &AgentSkillServer{queue: NewMemAgentTaskQueue()}
+	swapped := NewMemAgentTaskQueue()
+	s.SetTaskQueue(swapped)
+	if s.queue != AgentTaskQueue(swapped) {
+		t.Fatal("SetTaskQueue did not replace the queue")
+	}
+
+	// And the swapped queue is the one actually used.
+	if _, err := s.queue.Enqueue(context.Background(), "s", ""); err != nil {
+		t.Fatalf("Enqueue on swapped queue: %v", err)
+	}
+	if d, _ := swapped.Depth(context.Background()); d != 1 {
+		t.Errorf("swapped queue depth = %d, want 1 — writes went elsewhere", d)
+	}
+	if _, ok, _ := swapped.Lease(context.Background(), "", time.Minute); !ok {
+		t.Error("swapped queue had nothing leasable")
+	}
+}
+
+func TestAgentSkillServer_SetTaskQueueIgnoresNil(t *testing.T) {
+	s := &AgentSkillServer{queue: NewMemAgentTaskQueue()}
+	before := s.queue
+	s.SetTaskQueue(nil)
+	if s.queue == nil || s.queue != before {
+		t.Error("SetTaskQueue(nil) cleared the existing queue")
+	}
+}

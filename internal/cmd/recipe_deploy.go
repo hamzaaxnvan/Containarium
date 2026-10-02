@@ -89,3 +89,34 @@ func runRecipeDeploy(cmd *cobra.Command, args []string) error {
 	c, err := newRecipeClient()
 	if err != nil {
 		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	fmt.Printf("Deploying recipe %q as %q...\n", recipeID, name)
+	resp, err := c.DeployRecipe(recipeID, name, recipeDeployGPU, recipeDeployBackendID, recipeDeployPool, params, guardrailInput)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\n✓ %s\n", resp.Message)
+	if resp.Url != "" {
+		fmt.Printf("  URL: %s\n", resp.Url)
+	}
+	if resp.Container != nil {
+		fmt.Printf("  Container: %s (%s)\n", resp.Container.Name, resp.Container.State)
+	}
+	return nil
+}
+
+// parseKeyValues parses repeated "key=value" flags into a map.
+func parseKeyValues(pairs []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, p := range pairs {
+		k, v, ok := strings.Cut(p, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("invalid parameter %q (expected key=value)", p)
+		}
+		out[k] = v
+	}
+	return out, nil
+}
