@@ -51,3 +51,56 @@ if [[ "$PUBLIC_HOSTNAME" == *"<cluster>.example.com"* ]]; then
 fi
 
 if [[ ! -f "$BINARY_SRC" ]]; then
+    echo "Error: $BINARY_SRC not found. SCP the binary there first:"
+    echo "  scp bin/containariumd-linux-amd64 ubuntu@<host>:/tmp/containariumd"
+    exit 1
+fi
+
+echo "==> Installing binary -> $BINARY_DST"
+install -m 0755 "$BINARY_SRC" "$BINARY_DST"
+echo "    md5: $(md5sum "$BINARY_DST" | cut -d' ' -f1)"
+# #1781 rollout compat symlink: keeps the pre-#1780 name working for any
+# runbook/cron this inventory missed.
+ln -sf "$BINARY_DST" /usr/local/bin/containarium
+
+echo "==> Writing systemd unit"
+cat > /etc/systemd/system/containarium-tunnel.service <<TUNNEL
+[Unit]
+Description=Containarium Tunnel Client (${POOL} pool primary)
+Documentation=https://github.com/footprintai/Containarium
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${BINARY_DST} tunnel \\
+  --sentinel-addr ${SENTINEL_ADDR} \\
+  --token ${LAB_TOKEN} \\
+  --spot-id ${SPOT_ID} \\
+  --ports 22,8080,443 \\
+  --pool ${POOL} \\
+  --public-hostname ${PUBLIC_HOSTNAME} \\
+  --public-port ${PUBLIC_PORT}
+Restart=always
+RestartSec=5s
+TimeoutStopSec=10s
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=containarium-tunnel
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+TUNNEL
+
+systemctl daemon-reload
+systemctl enable --now containarium-tunnel
+sleep 3
+
+echo "==> Service status"
+systemctl status containarium-tunnel --no-pager | head -12 || true
+echo
+echo "==> Recent journal"
+journalctl -u containarium-tunnel --no-pager -n 10 --since='30 seconds ago' || true
