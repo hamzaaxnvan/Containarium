@@ -94,3 +94,197 @@ func init() {
 
 	trackerIssueCmd.AddCommand(trackerIssueClaimCmd)
 	trackerIssueClaimCmd.Flags().DurationVar(&trackerIssueClaimStale, "stale-after", 0,
+		"How long a claim from an unconfirmed run is still honored before being takeable. 0 uses the daemon's default (2 hours).")
+
+	trackerIssueCmd.AddCommand(trackerIssueLabelCmd)
+	trackerIssueLabelCmd.Flags().StringArrayVar(&trackerIssueLabelAdd, "add", nil, "Label to add (repeat for multiple)")
+	trackerIssueLabelCmd.Flags().StringArrayVar(&trackerIssueLabelRemove, "remove", nil, "Label to remove (repeat for multiple)")
+}
+
+// buildCreateTrackerIssueRequest validates the `issue create` flags into
+// the request. Whether a parent is required is the daemon's call (it
+// depends on the token), so 0 is accepted here; only a negative parent,
+// an empty title, or a blank label is rejected client-side.
+func buildCreateTrackerIssueRequest(username, connection, title, body string, labels []string, parent int64) (*pb.CreateTrackerIssueRequest, error) {
+	if strings.TrimSpace(title) == "" {
+		return nil, fmt.Errorf("--title is required")
+	}
+	if parent < 0 {
+		return nil, fmt.Errorf("--parent must not be negative")
+	}
+	req := &pb.CreateTrackerIssueRequest{
+		Username: username, Connection: connection,
+		Title: title, Body: body, ParentNumber: parent,
+	}
+	for _, l := range labels {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			return nil, fmt.Errorf("--label entries must not be empty")
+		}
+		req.Labels = append(req.Labels, l)
+	}
+	return req, nil
+}
+
+func runTrackerIssueCreate(cmd *cobra.Command, args []string) error {
+	username, connection := args[0], args[1]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for tracker commands")
+	}
+	req, err := buildCreateTrackerIssueRequest(username, connection, trackerIssueCreateTitle, trackerIssueCreateBody, trackerIssueCreateLabels, trackerIssueCreateParent)
+	if err != nil {
+		return err
+	}
+
+	var issue *pb.TrackerIssue
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if issue, err = h.CreateTrackerIssue(req); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if issue, err = g.CreateTrackerIssue(req); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("created #%d %s\n", issue.GetNumber(), issue.GetTitle())
+	if len(issue.GetLabels()) > 0 {
+		fmt.Printf("labels:  %s\n", strings.Join(issue.GetLabels(), ", "))
+	}
+	return nil
+}
+
+func runTrackerIssueComment(cmd *cobra.Command, args []string) error {
+	username, connection := args[0], args[1]
+	number, err := parseTrackerIssueNumber(args[2])
+	if err != nil {
+		return err
+	}
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for tracker commands")
+	}
+
+	req := &pb.CommentOnTrackerIssueRequest{Username: username, Connection: connection, Number: number, Body: trackerIssueCommentBody}
+	var comment *pb.TrackerComment
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if comment, err = h.CommentOnTrackerIssue(req); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if comment, err = g.CommentOnTrackerIssue(req); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("comment posted by %s\n", comment.GetAuthor())
+	return nil
+}
+
+func runTrackerIssueClaim(cmd *cobra.Command, args []string) error {
+	username, connection := args[0], args[1]
+	number, err := parseTrackerIssueNumber(args[2])
+	if err != nil {
+		return err
+	}
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for tracker commands")
+	}
+
+	req := &pb.ClaimTrackerIssueRequest{
+		Username: username, Connection: connection, Number: number,
+		StaleAfterSeconds: int64(trackerIssueClaimStale.Seconds()),
+	}
+	var result *pb.ClaimTrackerIssueResponse
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if result, err = h.ClaimTrackerIssue(req); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if result, err = g.ClaimTrackerIssue(req); err != nil {
+			return err
+		}
+	}
+
+	if !result.GetClaimed() {
+		fmt.Printf("not claimed — already held by run %s\n", result.GetAlreadyClaimedByRunId())
+		return nil
+	}
+	if result.GetAssigned() {
+		fmt.Println("claimed and assigned")
+	} else {
+		fmt.Println("claimed (issue already had an assignee)")
+	}
+	return nil
+}
+
+func runTrackerIssueLabel(cmd *cobra.Command, args []string) error {
+	username, connection := args[0], args[1]
+	number, err := parseTrackerIssueNumber(args[2])
+	if err != nil {
+		return err
+	}
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for tracker commands")
+	}
+	if len(trackerIssueLabelAdd) == 0 && len(trackerIssueLabelRemove) == 0 {
+		return fmt.Errorf("at least one of --add or --remove is required")
+	}
+
+	req := &pb.SetTrackerIssueLabelsRequest{
+		Username: username, Connection: connection, Number: number,
+		AddLabels: trackerIssueLabelAdd, RemoveLabels: trackerIssueLabelRemove,
+	}
+	var msg string
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if msg, err = h.SetTrackerIssueLabels(req); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if msg, err = g.SetTrackerIssueLabels(req); err != nil {
+			return err
+		}
+	}
+
+	fmt.Println(msg)
+	return nil
+}
