@@ -96,3 +96,36 @@ func TestReconcile_DatasetErrorOnAnInstanceThatStaysIsStillAnError(t *testing.T)
 	}
 }
 
+// The rollback may finish a moment after the error: the re-check gives it a
+// few tries before concluding the instance is not going away.
+func TestReconcile_InstanceThatDisappearsOnALaterRecheckIsSkipped(t *testing.T) {
+	fastGoneChecks(t)
+	f := twoTenantHost()
+	f.ensureErrs = map[string]error{"bob-container": errDatasetGone}
+	listCalls := 0
+	f.afterList = func() {
+		listCalls++
+		if listCalls == 3 { // gather, then the 1st re-check still sees it, the 2nd does not
+			removeFromHost(f, "bob-container")("")
+		}
+	}
+
+	r := NewReconciler(f, enforceCfg())
+	if err := r.ReconcileOnce(context.Background()); err != nil {
+		t.Fatalf("err = %v, want the box skipped once it was gone", err)
+	}
+}
+
+// A different error on an instance that is still there is untouched by any of
+// this.
+func TestReconcile_UnrelatedNICErrorIsStillReported(t *testing.T) {
+	fastGoneChecks(t)
+	f := twoTenantHost()
+	f.ensureErrs = map[string]error{"bob-container": errors.New(`Invalid devices: Device validation failed for "eth0"`)}
+	r := NewReconciler(f, enforceCfg())
+	if err := r.ReconcileOnce(context.Background()); err == nil {
+		t.Fatal("an unrelated NIC error was swallowed")
+	}
+}
+
+var _ = incus.ContainerInfo{}
