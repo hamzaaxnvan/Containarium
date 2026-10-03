@@ -51,3 +51,57 @@ export function useMetrics(server: Server | null, enabled: boolean = true) {
     const result: ContainerMetricsWithRate[] = [];
 
     for (const m of data) {
+      let cpuUsagePercent = 0;
+
+      // Calculate CPU rate if we have previous data
+      if (prevSnapshot.current) {
+        const prev = prevSnapshot.current.metrics[m.name];
+        const elapsedMs = now - prevSnapshot.current.timestamp;
+
+        if (prev && elapsedMs > 0) {
+          const cpuDelta = m.cpuUsageSeconds - prev.cpuUsageSeconds;
+          const elapsedSeconds = elapsedMs / 1000;
+
+          // CPU percentage: (cpu seconds used / elapsed seconds) * 100
+          // Can exceed 100% with multiple cores
+          if (cpuDelta >= 0 && elapsedSeconds > 0) {
+            cpuUsagePercent = (cpuDelta / elapsedSeconds) * 100;
+          }
+        }
+      }
+
+      result.push({
+        ...m,
+        cpuUsagePercent,
+      });
+    }
+
+    // Update previous snapshot for next calculation
+    prevSnapshot.current = {
+      metrics: currentMap,
+      timestamp: now,
+    };
+
+    return result;
+  }, [data]);
+
+  /**
+   * Get metrics for a specific container by name
+   */
+  const getContainerMetrics = (containerName: string): ContainerMetricsWithRate | undefined => {
+    return metricsWithRate.find(m => m.name === containerName);
+  };
+
+  /**
+   * Manually refresh metrics
+   */
+  const refresh = () => mutate();
+
+  return {
+    metrics: metricsWithRate,
+    isLoading,
+    error,
+    getContainerMetrics,
+    refresh,
+  };
+}
