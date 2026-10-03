@@ -258,3 +258,69 @@ func TestRemove_WaitsForAHoldThatIsBeingPlaced(t *testing.T) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `INSERT INTO retention_legal_holds (org_id, reason, set_by, set_at) VALUES ('org-a', 'case 1', 'admin', now())`); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		res retention.Removal
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		res, err := removers(pool, "agent_tasks").Remove(callCtx, time.Now().AddDate(0, 0, -sourceWindowDays), nil, 100)
+		done <- result{res, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("Remove returned (%+v, %v) while a hold was being placed; it must wait for that transaction", r.res, r.err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := <-done
+	if r.err != nil || r.res.Removed != 0 {
+		t.Errorf("Remove after the hold committed = (%+v, %v), want nothing removed", r.res, r.err)
+	}
+	wantRows(t, pool, 3, "the hold committed before the delete ran, so every record is kept")
+}
+
+func TestRemove_AMissingTableRemovesNothing(t *testing.T) {
+	ctx := context.Background()
+	pool := sourcesPool(t)
+	if _, err := pool.Exec(ctx, `DROP TABLE traffic_aggregates`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pgstore.New(ctx, pool); err != nil { // the holds table exists; the swept one does not
+		t.Fatal(err)
+	}
+	res, err := removers(pool, "traffic_aggregates").Remove(ctx, time.Now(), nil, 10)
+	if err != nil || res.Removed != 0 || !strings.Contains(res.Skipped, "traffic_aggregates") {
+		t.Errorf("Remove on a missing table = (%+v, %v), want nothing removed and a Skipped reason naming the table", res, err)
+	}
+}
+
+func TestModeSurvivesARestart(t *testing.T) {
+	ctx := context.Background()
+	pool := sourcesPool(t)
+	first, err := pgstore.New(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := first.GetMode(ctx); m.GetMode() != pb.RetentionMode_RETENTION_MODE_DRY_RUN {
+		t.Fatalf("fresh database mode = %v, want DRY_RUN", m.GetMode())
+	}
+	setMode(t, ctx, first, pb.RetentionMode_RETENTION_MODE_ENFORCE)
+	second, err := pgstore.New(ctx, pool) // a second bootstrap over the same tables
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := second.GetMode(ctx); m.GetMode() != pb.RetentionMode_RETENTION_MODE_ENFORCE || m.GetUpdatedBy() != "admin" {
+		t.Errorf("mode after restart = %v, want ENFORCE by admin", m)
+	}
+}
