@@ -20,3 +20,15 @@ type JWT struct {
 	// (EnvJWTTokenFile)
 	TokenFile string
 	// Audience is the expected `aud` claim. (EnvJWTAudience)
+	Audience string
+}
+
+// LoadJWT reads the CONTAINARIUM_JWT_* namespace once.
+func LoadJWT() JWT {
+	return JWT{
+		Secret:    getString(EnvJWTSecret, ""),
+		Token:     getString(EnvJWTToken, ""),
+		TokenFile: getString(EnvJWTTokenFile, ""),
+		Audience:  getString(EnvJWTAudience, ""),
+	}
+}
