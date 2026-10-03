@@ -64,3 +64,103 @@ func sandboxObject(ns string, spec box.BoxSpec, withPVC bool, def memDefaults, o
 		Ports: []corev1.ContainerPort{{Name: sshPortName, ContainerPort: sshPort, Protocol: corev1.ProtocolTCP}},
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: boolp(false),
+			RunAsNonRoot:             boolp(true),
+			RunAsUser:                int64p(1000),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		// Mount the box's authorized_keys (so it accepts logins) and its stable
+		// host key (so the gateway can pin it). Without the first the box
+		// rejects every login.
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: authorizedKeysVolume, MountPath: authorizedKeysMount, ReadOnly: true},
+			{Name: hostKeyVolume, MountPath: hostKeyMount, ReadOnly: true},
+			secretsMount,
+		},
+	}
+	if res := resourceRequirements(spec.Resources, gpuCount, def); res != nil {
+		container.Resources = *res
+	}
+	// AGENTBOX_MODE selects the box's SSH session behavior in the image
+	// entrypoint (images/agent-box/entrypoint.sh): "shell" swaps the
+	// forced-command MCP session for an interactive login shell. Left unset the
+	// image defaults to the forced-command MCP session.
+	if opts.BoxMode != "" {
+		container.Env = append(container.Env, corev1.EnvVar{Name: "AGENTBOX_MODE", Value: opts.BoxMode})
+	}
+
+	volumes := []corev1.Volume{
+		secretsVolume,
+		{
+			Name: authorizedKeysVolume,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: secretName(spec.Ref.Tenant)},
+			},
+		},
+		{
+			Name: hostKeyVolume,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: hostKeySecretName(spec.Ref.Tenant)},
+			},
+		},
+	}
+	if withPVC {
+		volumes = append(volumes, corev1.Volume{
+			Name: dataVolume,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: pvcName,
+				},
+			},
+		})
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      dataVolume,
+			MountPath: dataMount,
+		})
+	}
+
+	// Pod labels propagate from the template (the controller merges them onto
+	// the pod), keeping the NetworkPolicy pod selector matching.
+	podMeta := sandboxv1beta1.PodMetadata{Labels: labels}
+	if gpuCount > 0 {
+		podMeta.Annotations = map[string]string{
+			gpuCountAnnotation: fmt.Sprintf("%d", gpuCount),
+		}
+	}
+
+	mode := sandboxv1beta1.SandboxOperatingModeSuspended
+	if spec.AutoStart {
+		mode = sandboxv1beta1.SandboxOperatingModeRunning
+	}
+
+	podSpec := corev1.PodSpec{
+		AutomountServiceAccountToken: boolp(false), // the box is a leaf, never a kube-apiserver client
+		SecurityContext: &corev1.PodSecurityContext{
+			RunAsNonRoot:   boolp(true),
+			RunAsUser:      int64p(1000),
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		Containers: []corev1.Container{container},
+		Volumes:    volumes,
+	}
+	// Left nil when unconfigured: an empty RuntimeClassName is NOT the same as
+	// an unset one — the scheduler treats "" as a class that does not exist and
+	// the pod never starts. Unset = the cluster's default runtime.
+	if opts.RuntimeClass != "" {
+		podSpec.RuntimeClassName = &opts.RuntimeClass
+	}
+
+	return &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: ns, Labels: labels},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					ObjectMeta: podMeta,
+					Spec:       podSpec,
+				},
+				Service: boolp(true), // headless Service = the gateway's routing target
+			},
+			OperatingMode: mode,
+		},
+	}
+}
