@@ -270,3 +270,71 @@ func TestSessionDiscovery_MembersSessionFirstThenOwnIsAmbiguous(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSessionDiscovery_OwnFirstThenMembersSessionIsAmbiguous: the opposite
+// order is equally undecidable from the directory (documented as ambiguous).
+func TestSessionDiscovery_OwnFirstThenMembersSessionIsAmbiguous(t *testing.T) {
+	withShortDiscoveryBudget(t, 10)
+	f := newDiscoveryFixture(t, NameClaude)
+	f.prepare()
+	f.poll()
+	time.Sleep(300 * time.Millisecond)
+	f.seed("this-runs-transcript", time.Now())
+	time.Sleep(700 * time.Millisecond)
+	f.seed("members-interactive", time.Now())
+	if got, ok := f.waitSettled(); ok {
+		t.Errorf("adopted %q although two new transcripts appeared", got)
+	}
+}
+
+// TestSessionDiscovery_StopsEarlyWhenTheRunHasExited: the exit sidecar ends
+// the wait, so a short run is evaluated promptly rather than after the budget.
+func TestSessionDiscovery_StopsEarlyWhenTheRunHasExited(t *testing.T) {
+	withShortDiscoveryBudget(t, 300) // 60 s if the exit sidecar were ignored
+	f := newDiscoveryFixture(t, NameClaude)
+	f.prepare()
+	f.seed("only-new", time.Now())
+	writeAt(t, strings.TrimSuffix(f.sidecar, ".session")+".exit", time.Now())
+	start := time.Now()
+	f.poll()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(f.sidecar); err == nil {
+			if strings.TrimSpace(string(data)) != "only-new" {
+				t.Fatalf("sidecar = %q", data)
+			}
+			if time.Since(start) > 3*time.Second {
+				t.Errorf("took %v; exit sidecar was ignored", time.Since(start))
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("sidecar not written after the run exited")
+}
+
+// TestSessionDiscoveryPrepareCommand_UnknownEngine: same fail-closed rule as
+// the poll command.
+func TestSessionDiscoveryPrepareCommand_UnknownEngine(t *testing.T) {
+	if _, ok := SessionDiscoveryPrepareCommand(Name("made-up"), "/h", "/h", "/tmp/x.session"); ok {
+		t.Error("an unknown engine should report ok=false")
+	}
+}
+
+func mustMkdirAll(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeAt(t *testing.T, path string, mtime time.Time) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+}

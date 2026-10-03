@@ -297,3 +297,303 @@ func TestTrafficStore_MigrationDeduplicatesPreExistingRows(t *testing.T) {
 	}
 	if survivors[0] != 900 {
 		t.Errorf("surviving row has bytes_sent=%d, want 900 (the largest — the collector's "+
+			"counters are cumulative, so the row that observed the flow longest is the most "+
+			"complete one to keep)", survivors[0])
+	}
+
+	var nullCount int
+	if err := store.Pool().QueryRow(ctx,
+		"SELECT count(*) FROM traffic_connections WHERE container_name = $1 AND conntrack_id IS NULL",
+		container).Scan(&nullCount); err != nil {
+		t.Fatalf("count null-conntrack-id rows: %v", err)
+	}
+	if nullCount != 1 {
+		t.Errorf("null-conntrack_id rows = %d, want 1 (untouched) — a row with no flow ID must "+
+			"never be swept up as if it duplicated another", nullCount)
+	}
+}
+
+// GetConnectionByConntrackID is what a caller reaches for instead of relying
+// on the absent constraint, so it has to actually work.
+func TestTrafficStore_GetConnectionByConntrackID(t *testing.T) {
+	ctx := context.Background()
+	store, container := trafficTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	id := container + "-conntrack"
+	if err := store.SaveConnection(ctx, aConnection(container, id, now)); err != nil {
+		t.Fatalf("SaveConnection: %v", err)
+	}
+
+	present, err := store.GetConnectionByConntrackID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetConnectionByConntrackID: %v", err)
+	}
+	if !present {
+		t.Error("a stored flow reports as absent — the check-then-insert path callers use " +
+			"instead of the missing constraint would duplicate every flow")
+	}
+
+	absent, err := store.GetConnectionByConntrackID(ctx, id+"-nope")
+	if err != nil {
+		t.Fatalf("GetConnectionByConntrackID(absent): %v", err)
+	}
+	if absent {
+		t.Error("an unstored flow reports as present — the same path would then DROP every flow")
+	}
+}
+
+// Cleanup must remove traffic_aggregates rows past their retention window,
+// and leave recent ones alone (#1395: it used to touch traffic_connections
+// only, so aggregates accumulated for the lifetime of the deployment).
+//
+// The aggregates window is a deliberate multiple of retentionDays
+// (aggregateRetentionMultiplier), not the same value — so Cleanup(30) here
+// is only exercised against an aggregate old enough to be well past ANY
+// sane multiple of 30 days, and a recent one that survives regardless of
+// which multiple is configured.
+func TestTrafficStore_CleanupRemovesAggregatesPastRetention(t *testing.T) {
+	ctx := context.Background()
+	store, container := trafficTestStore(t)
+
+	old := time.Now().UTC().AddDate(0, 0, -400).Truncate(time.Second)
+	oldAgg := &pb.TrafficAggregate{
+		DestIp:          "93.184.216.34",
+		DestPort:        443,
+		BytesSent:       10,
+		BytesReceived:   20,
+		ConnectionCount: 1,
+		Timestamp:       timestamppb.New(old),
+	}
+	if err := store.SaveAggregate(ctx, oldAgg, container, old.Add(time.Hour)); err != nil {
+		t.Fatalf("SaveAggregate(old): %v", err)
+	}
+
+	recent := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	recentAgg := &pb.TrafficAggregate{
+		DestIp:          "93.184.216.34",
+		DestPort:        443,
+		BytesSent:       30,
+		BytesReceived:   40,
+		ConnectionCount: 1,
+		Timestamp:       timestamppb.New(recent),
+	}
+	if err := store.SaveAggregate(ctx, recentAgg, container, recent.Add(time.Hour)); err != nil {
+		t.Fatalf("SaveAggregate(recent): %v", err)
+	}
+
+	if err := store.Cleanup(ctx, 30); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	var remainingStarts []time.Time
+	rows, err := store.Pool().Query(ctx,
+		"SELECT interval_start FROM traffic_aggregates WHERE container_name = $1", container)
+	if err != nil {
+		t.Fatalf("query aggregates: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ts time.Time
+		if err := rows.Scan(&ts); err != nil {
+			t.Fatalf("scan interval_start: %v", err)
+		}
+		remainingStarts = append(remainingStarts, ts)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate aggregates: %v", err)
+	}
+
+	if len(remainingStarts) != 1 {
+		t.Fatalf("got %d aggregate row(s) after Cleanup, want exactly 1 (the recent one): %v",
+			len(remainingStarts), remainingStarts)
+	}
+	got := remainingStarts[0]
+	if got.Before(recent.Add(-time.Minute)) || got.After(recent.Add(time.Minute)) {
+		t.Fatalf("surviving aggregate has interval_start %v, want the recent one (~%v) — the 400-day-old one (%v) should be the one removed",
+			got, recent, old)
+	}
+}
+
+// Retention must actually delete what it claims to, on the table it does cover.
+func TestTrafficStore_CleanupRemovesConnectionsPastRetention(t *testing.T) {
+	ctx := context.Background()
+	store, container := trafficTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if err := store.SaveConnection(ctx, aConnection(container, "recent", now)); err != nil {
+		t.Fatalf("SaveConnection: %v", err)
+	}
+	// created_at defaults to NOW(), which is what Cleanup filters on, so an old
+	// row has to be aged directly.
+	if err := store.SaveConnection(ctx, aConnection(container, "ancient", now)); err != nil {
+		t.Fatalf("SaveConnection(ancient): %v", err)
+	}
+	if _, err := store.Pool().Exec(ctx,
+		"UPDATE traffic_connections SET created_at = $1 WHERE conntrack_id = 'ancient'",
+		now.AddDate(0, 0, -400)); err != nil {
+		t.Fatalf("age the ancient row: %v", err)
+	}
+
+	if err := store.Cleanup(ctx, 30); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	var recent, ancient bool
+	var err error
+	if recent, err = store.GetConnectionByConntrackID(ctx, "recent"); err != nil {
+		t.Fatalf("check recent: %v", err)
+	}
+	if ancient, err = store.GetConnectionByConntrackID(ctx, "ancient"); err != nil {
+		t.Fatalf("check ancient: %v", err)
+	}
+	if ancient {
+		t.Error("a 400-day-old connection survived Cleanup(30) — retention does not retain")
+	}
+	if !recent {
+		t.Error("Cleanup(30) deleted a connection created seconds ago — retention is deleting " +
+			"live history")
+	}
+}
+
+func TestTrafficStore_SchemaInitIsRepeatable(t *testing.T) {
+	ctx := context.Background()
+	store, container := trafficTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if err := store.SaveConnection(ctx, aConnection(container, "survivor", now)); err != nil {
+		t.Fatalf("SaveConnection: %v", err)
+	}
+	second, err := NewStore(ctx, os.Getenv("CONTAINARIUM_TEST_DSN"))
+	if err != nil {
+		t.Fatalf("re-initialising the schema failed: %v — the daemon would not start twice", err)
+	}
+	defer second.Close()
+
+	present, err := store.GetConnectionByConntrackID(ctx, "survivor")
+	if err != nil {
+		t.Fatalf("GetConnectionByConntrackID: %v", err)
+	}
+	if !present {
+		t.Error("the connection did not survive a schema re-init — a restart would erase history")
+	}
+}
+
+// #2884: a host-wide query (empty ContainerName) finds which box connected to a
+// destination without naming the box.
+func TestTrafficStore_HostWideFindsTheBoxThatConnectedToADestination(t *testing.T) {
+	ctx := context.Background()
+	store, base := trafficTestStore(t)
+	boxes := []string{base + "-a", base + "-b", base + "-c"}
+	t.Cleanup(func() {
+		for _, b := range boxes {
+			_, _ = store.Pool().Exec(context.Background(),
+				"DELETE FROM traffic_connections WHERE container_name = $1", b)
+		}
+	})
+	now := time.Now().UTC().Truncate(time.Second)
+
+	for i, b := range boxes {
+		c := aConnection(b, "find-"+b, now)
+		c.DestIp = "198.51.100.7"
+		c.DestPort = 3333
+		if i == 1 { // only box b talks to the sought destination
+			c.DestIp = "203.0.113.9"
+			c.DestPort = 3333
+		}
+		if err := store.SaveConnection(ctx, c); err != nil {
+			t.Fatalf("SaveConnection(%s): %v", b, err)
+		}
+	}
+
+	got, _, err := store.QueryConnections(ctx, QueryParams{
+		StartTime: now.Add(-time.Minute), EndTime: now.Add(time.Minute),
+		DestIP: "203.0.113.9", DestPort: 3333, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("QueryConnections: %v", err)
+	}
+	if len(got) != 1 || got[0].GetContainerName() != boxes[1] {
+		t.Fatalf("got %v, want exactly one row naming %s", got, boxes[1])
+	}
+
+	// Without the destination filter all three of this test's boxes appear.
+	all, total, err := store.QueryConnections(ctx, QueryParams{
+		StartTime: now.Add(-time.Minute), EndTime: now.Add(time.Minute), Limit: 1000,
+	})
+	if err != nil {
+		t.Fatalf("QueryConnections: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, c := range all {
+		seen[c.GetContainerName()] = true
+	}
+	for _, b := range boxes {
+		if !seen[b] {
+			t.Errorf("host-wide query missing box %s (total %d)", b, total)
+		}
+	}
+}
+
+// The window is closed on both ends: started_at == start_time and
+// started_at == end_time are both returned; one second outside is not.
+func TestTrafficStore_WindowBoundsAreInclusive(t *testing.T) {
+	ctx := context.Background()
+	store, box := trafficTestStore(t)
+	t0 := time.Now().UTC().Truncate(time.Second)
+	for i, off := range []time.Duration{-10 * time.Second, 0, 10 * time.Second, 20 * time.Second} {
+		if err := store.SaveConnection(ctx, aConnection(box, fmt.Sprintf("w%d", i), t0.Add(off))); err != nil {
+			t.Fatalf("SaveConnection: %v", err)
+		}
+	}
+	got, total, err := store.QueryConnections(ctx, QueryParams{
+		ContainerName: box, StartTime: t0, EndTime: t0.Add(10 * time.Second), Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("QueryConnections: %v", err)
+	}
+	if len(got) != 2 || total != 2 {
+		t.Fatalf("got %d rows (total %d), want the 2 rows at exactly start and end", len(got), total)
+	}
+}
+
+func TestTrafficStore_HostWideResultsAreCappedAtTheLimit(t *testing.T) {
+	ctx := context.Background()
+	store, box := trafficTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 5; i++ {
+		if err := store.SaveConnection(ctx, aConnection(box, fmt.Sprintf("l%d", i), now)); err != nil {
+			t.Fatalf("SaveConnection: %v", err)
+		}
+	}
+	got, total, err := store.QueryConnections(ctx, QueryParams{
+		StartTime: now.Add(-time.Minute), EndTime: now.Add(time.Minute), DestPort: 443, Limit: 2,
+	})
+	if err != nil {
+		t.Fatalf("QueryConnections: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want limit 2", len(got))
+	}
+	if total < 5 {
+		t.Fatalf("total = %d, want the full match count (>=5)", total)
+	}
+}
+
+func TestTrafficStore_OldestRecord(t *testing.T) {
+	ctx := context.Background()
+	store, box := trafficTestStore(t)
+	if got, err := store.OldestRecord(ctx, box); err != nil || got != nil {
+		t.Fatalf("empty scope: got %v, %v; want nil, nil", got, err)
+	}
+	t0 := time.Now().UTC().Truncate(time.Second)
+	for i, off := range []time.Duration{-time.Hour, -2 * time.Hour} {
+		if err := store.SaveConnection(ctx, aConnection(box, fmt.Sprintf("o%d", i), t0.Add(off))); err != nil {
+			t.Fatalf("SaveConnection: %v", err)
+		}
+	}
+	got, err := store.OldestRecord(ctx, box)
+	if err != nil || got == nil || !got.Equal(t0.Add(-2*time.Hour)) {
+		t.Fatalf("got %v, %v; want %v", got, err, t0.Add(-2*time.Hour))
+	}
+}
