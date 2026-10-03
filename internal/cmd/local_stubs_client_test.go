@@ -28,3 +28,123 @@ func TestHybridCommands_NoServer_NeverReachRealLocalMode(t *testing.T) {
 	tests := []struct {
 		name  string
 		setup func()
+		run   func() error
+	}{
+		{
+			name: "create",
+			setup: func() {
+				noSSHKey = true // skip --ssh-key file I/O; the point here is reaching createLocal, not key handling
+				forceRecreate = false
+				createEncrypted = false
+				createTenantID = ""
+				createPool = ""
+				createBackendID = ""
+				createWait = false
+			},
+			run: func() error { return runCreate(testCmd(), []string{"testuser"}) },
+		},
+		{
+			name:  "delete",
+			setup: func() { forceDelete = false },
+			run:   func() error { return runDelete(testCmd(), []string{"testuser"}) },
+		},
+		{
+			name:  "get",
+			setup: func() { containerGetFormat = "table" },
+			run:   func() error { return runGet(testCmd(), []string{"testuser"}) },
+		},
+		{
+			name:  "list",
+			setup: func() { outputFormat = "table"; filterState = "all"; groupByLabel = "" },
+			run:   func() error { return runList(testCmd(), nil) },
+		},
+		{
+			name:  "info (system)",
+			setup: func() {},
+			run:   func() error { return runInfo(testCmd(), nil) },
+		},
+		{
+			name:  "info (container)",
+			setup: func() {},
+			run:   func() error { return runInfo(testCmd(), []string{"testuser"}) },
+		},
+		{
+			name:  "label list",
+			setup: func() { labelListFormat = "table" },
+			run:   func() error { return runLabelList(testCmd(), []string{"testuser"}) },
+		},
+		{
+			name:  "label set",
+			setup: func() { labelOverwrite = true },
+			run:   func() error { return runLabelSet(testCmd(), []string{"testuser", "k=v"}) },
+		},
+		{
+			name:  "label remove",
+			setup: func() {},
+			run:   func() error { return runLabelRemove(testCmd(), []string{"testuser", "k"}) },
+		},
+		{
+			name:  "install-stack",
+			setup: func() {},
+			run:   func() error { return runInstallStack(testCmd(), []string{"testuser", "nodejs"}) },
+		},
+		{
+			name: "resize",
+			setup: func() {
+				newCPU, newMemory, newDisk, newCPURequest, newMemoryRequest = "4", "", "", "", ""
+			},
+			run: func() error { return runResize(testCmd(), []string{"testuser"}) },
+		},
+		{
+			name:  "ssh-config sync",
+			setup: func() { sshConfigOutPath = t.TempDir() + "/ssh_config"; sshConfigForce = true },
+			run:   func() error { return runSSHConfigSync(testCmd(), nil) },
+		},
+		{
+			name: "collaborator add",
+			setup: func() {
+				keyFile := t.TempDir() + "/bob.pub"
+				if err := os.WriteFile(keyFile, []byte("ssh-ed25519 AAAAtest bob@example.com"), 0o600); err != nil {
+					t.Fatalf("write test ssh key: %v", err)
+				}
+				collaboratorSSHKeyFiles = []string{keyFile}
+				collaboratorGrantSudo = false
+				collaboratorGrantRuntime = false
+			},
+			run: func() error { return runCollaboratorAdd(testCmd(), []string{"owner", "bob"}) },
+		},
+		{
+			name:  "collaborator remove",
+			setup: func() {},
+			run:   func() error { return runCollaboratorRemove(testCmd(), []string{"owner", "bob"}) },
+		},
+		{
+			name:  "collaborator list",
+			setup: func() {},
+			run:   func() error { return runCollaboratorList(testCmd(), []string{"owner"}) },
+		},
+		{
+			name:  "prune",
+			setup: func() { pruneState, pruneNameContains, pruneOlderThan, pruneLabels = "stopped", "", "", nil },
+			run:   func() error { return runPrune(testCmd(), nil) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Every hybrid dispatches on serverAddr/httpMode; pin both to the
+			// "no server anywhere" case regardless of what an earlier subtest
+			// (or -run reordering) left them at.
+			serverAddr, httpMode, authToken = "", false, ""
+			tt.setup()
+
+			err := tt.run()
+			if err == nil {
+				t.Fatalf("expected an error with no server configured, got nil")
+			}
+			if !errors.Is(err, errNoLocalMode) {
+				t.Errorf("expected errNoLocalMode (i.e. the call resolved to a *Local stub, not real Incus code), got: %v", err)
+			}
+		})
+	}
+}
