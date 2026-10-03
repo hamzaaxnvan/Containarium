@@ -43,3 +43,49 @@ const peerNotFoundBody = "not found"
 func (m *Manager) PeerProxyHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		backendID, remainingPath, ok := splitPeerPath(r.URL.Path)
+		if !ok {
+			peerNotFound(w)
+			return
+		}
+
+		backend := m.backends.Get(backendID)
+		if backend == nil {
+			// Same response as a malformed path, on purpose — see the
+			// file comment. Previously this was `backend %q not found`,
+			// which both confirmed the id was well-formed and reflected
+			// it back to the caller.
+			peerNotFound(w)
+			return
+		}
+
+		target := &url.URL{
+			Scheme: "http",
+			Host:   fmt.Sprintf("%s:%d", backend.IP, m.config.HealthPort),
+		}
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		r.URL.Path = remainingPath
+		r.Host = target.Host
+		proxy.ServeHTTP(w, r)
+	})
+}
+
+// splitPeerPath parses `/peer/<backend-id>/<rest>` into its id and the
+// daemon-relative remainder. ok is false for anything that doesn't carry
+// both parts.
+//
+// Note the caller must treat !ok and "unknown backend" identically; this
+// function only reports which it was so the proxy path can be skipped.
+func splitPeerPath(p string) (backendID, remaining string, ok bool) {
+	rest := strings.TrimPrefix(p, "/peer/")
+	slashIdx := strings.Index(rest, "/")
+	if slashIdx <= 0 {
+		// No slash at all (`/peer/abc`), or a leading one (`/peer//v1/x`,
+		// i.e. an empty backend id). Neither addresses a backend.
+		return "", "", false
+	}
+	return rest[:slashIdx], rest[slashIdx:], true
+}
+
+func peerNotFound(w http.ResponseWriter) {
+	http.Error(w, peerNotFoundBody, http.StatusNotFound)
+}

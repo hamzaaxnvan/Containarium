@@ -55,3 +55,32 @@ func TestCheckStorageDirPerms_RejectsWorldReadable(t *testing.T) {
 	}
 }
 
+func TestCheckStorageDirPerms_RejectsWorldWritable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix file mode bits not meaningful on windows")
+	}
+	dir := filepath.Join(t.TempDir(), "caddy")
+	if err := os.MkdirAll(dir, 0o757); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := CheckStorageDirPerms(dir); err == nil {
+		t.Fatal("0757 must be rejected")
+	}
+}
+
+func TestCheckStorageDirPerms_RejectsMissingDir(t *testing.T) {
+	err := CheckStorageDirPerms("/this/path/does/not/exist")
+	if err == nil {
+		t.Fatal("missing dir must error")
+	}
+}
+
+func TestCheckStorageDirPerms_RejectsFile(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "actually-a-file")
+	if err := os.WriteFile(tmp, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := CheckStorageDirPerms(tmp); err == nil {
+		t.Fatal("non-directory path must error")
+	}
+}
