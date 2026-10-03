@@ -469,3 +469,160 @@ func (r *queueRingReader) SetDeadline(time.Time) {}
 func (r *queueRingReader) push(b []byte) {
 	r.mu.Lock()
 	r.queue = append(r.queue, b)
+	r.mu.Unlock()
+}
+
+func (r *queueRingReader) AvailableBytes() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.queue) * execEventSize
+}
+
+func (r *queueRingReader) ReadInto(rec *ringbuf.Record) error {
+	select {
+	case <-r.closed:
+		return ringbuf.ErrClosed
+	default:
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.queue) == 0 {
+		return os.ErrDeadlineExceeded
+	}
+	rec.RawSample = append(rec.RawSample[:0], r.queue[0]...)
+	r.queue = r.queue[1:]
+	return nil
+}
+
+type chanSink struct{ ch chan ExecEvent }
+
+func (s chanSink) OnExecEvent(_ context.Context, ev ExecEvent) { s.ch <- ev }
+
+func TestConsumeExecEvents_LatencyBoundedByInterval(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	rd := &queueRingReader{closed: make(chan struct{})}
+	sink := chanSink{ch: make(chan ExecEvent, 16)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ConsumeExecEventsEvery(context.Background(), rd, interval, sink, nil)
+	}()
+	defer func() { close(rd.closed); rd.push(nil); <-done }()
+
+	for i := uint32(1); i <= 3; i++ {
+		start := time.Now()
+		rd.push(rec(i, "x").RawSample)
+		select {
+		case ev := <-sink.ch:
+			if ev.HostPID != i {
+				t.Fatalf("got pid %d, want %d", ev.HostPID, i)
+			}
+			// One interval plus scheduling slack; the bound that matters is
+			// the < 10 s detection budget, so the slack is generous.
+			if lat := time.Since(start); lat > interval+500*time.Millisecond {
+				t.Fatalf("event %d delivered after %s, want about one %s interval", i, lat, interval)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("event %d never delivered", i)
+		}
+	}
+}
+
+// ResolveExecWatch mirrors Resolve: the embedded keyword with no embedded
+// object fails clearly; a path is loaded as a file (the exec object is the
+// netpolicy path's sibling execwatch.bpf.o, so one env var drives both).
+func TestResolveExecWatch_EmbeddedAbsentErrors(t *testing.T) {
+	if EmbeddedExecObject() != nil {
+		// An embed_bpf build takes the load path instead; that path is the
+		// lane's job. Not a t.Skip: the ebpf_load lane fails on any skip.
+		t.Log("build embeds execwatch.bpf.o; the absent-object branch is not reachable here")
+		return
+	}
+	// The empty value means embedded too (never a CWD-relative file).
+	for _, mode := range []string{"", "  ", "embedded", "1", "TRUE", " on "} {
+		_, err := ResolveExecWatch(mode)
+		if err == nil {
+			t.Fatalf("ResolveExecWatch(%q) = nil error, want a no-embedded-object error", mode)
+		}
+		if !strings.Contains(err.Error(), "no embedded execwatch BPF object") {
+			t.Errorf("ResolveExecWatch(%q) error = %q", mode, err)
+		}
+	}
+}
+
+func TestExecObjectPathFor(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"/opt/containarium/netpolicy.bpf.o", "/opt/containarium/execwatch.bpf.o"},
+		{"/opt/containarium/execwatch.bpf.o", "/opt/containarium/execwatch.bpf.o"},
+		{"netpolicy.bpf.o", "execwatch.bpf.o"},
+		{"/some/dir/", "/some/dir/execwatch.bpf.o"},
+		{"", ""},   // never "./execwatch.bpf.o" relative to the daemon's CWD
+		{"  ", ""}, // whitespace is empty
+	}
+	for _, tc := range tests {
+		if got := ExecObjectPathFor(tc.in); got != tc.want {
+			t.Errorf("ExecObjectPathFor(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestResolveExecWatch_PathValueIsLoadedAsFile(t *testing.T) {
+	_, err := ResolveExecWatch("/no/such/dir/netpolicy.bpf.o")
+	if err == nil {
+		t.Fatal("ResolveExecWatch(path) = nil error, want a stat error for a missing file")
+	}
+	if !strings.Contains(err.Error(), "/no/such/dir/execwatch.bpf.o") {
+		t.Errorf("error should name the sibling exec object path: %v", err)
+	}
+}
+
+// The C source is what `make build-bpf` compiles; pin the two #2774 kernel
+// constants there so a change shows up in the plain unit suite, not only in
+// the eBPF lane: the ring size the Go side assumes, and a shipped default of
+// no per-record wakeup (BPF_RB_NO_WAKEUP on every submit).
+func TestExecWatchSource_RingSizeAndNoWakeupDefault(t *testing.T) {
+	src, err := os.ReadFile("../../experimental/ebpf-phaseA/execwatch.bpf.c")
+	if err != nil {
+		t.Fatalf("read execwatch.bpf.c: %v", err)
+	}
+	for _, want := range []string{
+		"#define EXEC_RING_BYTES    (4 << 20)",
+		"volatile const __u8 exec_wakeup_per_record = 0;",
+		"__u64 wake = exec_wakeup_per_record ? 0 : BPF_RB_NO_WAKEUP;",
+		"bpf_ringbuf_submit(ev, wake);",
+	} {
+		if !bytes.Contains(src, []byte(want)) {
+			t.Errorf("execwatch.bpf.c no longer contains %q", want)
+		}
+	}
+	if execRingBytes != 4<<20 {
+		t.Errorf("execRingBytes = %d, want 4 MiB to match EXEC_RING_BYTES", execRingBytes)
+	}
+	if c := execRingBytes / (execEventSize + 8); c < 5000 {
+		t.Errorf("ring capacity %d records, want >= 5000", c)
+	}
+}
+
+// ExecObjectSource is what ResolveExecWatch loads and what the integrity
+// self-measurement digests (#3120). It pins the empty-setting difference with
+// Resolve (empty = embedded here, no program there) and that every alias
+// Resolve accepts selects the embedded object too.
+func TestExecObjectSource(t *testing.T) {
+	for _, v := range []string{"", "  ", "embedded", "1", "TRUE", " on ", "yes"} {
+		if emb, p := ExecObjectSource(v); !emb || p != "" {
+			t.Errorf("ExecObjectSource(%q) = %v, %q; want embedded", v, emb, p)
+		}
+	}
+	for _, v := range []string{"embedded", "1", "true", "yes", "on", "On"} {
+		if !IsEmbeddedValue(v) {
+			t.Errorf("IsEmbeddedValue(%q) = false", v)
+		}
+	}
+	if IsEmbeddedValue("") {
+		t.Error("IsEmbeddedValue(\"\") = true; the netpolicy resolver treats empty as no program")
+	}
+	emb, p := ExecObjectSource(" /opt/c/netpolicy.bpf.o ")
+	if emb || p != "/opt/c/execwatch.bpf.o" {
+		t.Errorf("path value = %v, %q", emb, p)
+	}
+}
