@@ -27,3 +27,32 @@ type accessEntry struct {
 }
 
 // ParseHost extracts the (lower-cased, port-stripped) request host from one
+// JSON access-log line. It returns ("", false) for lines that don't decode as
+// JSON, that aren't access records (e.g. Caddy's own startup/info lines if they
+// share the file), or that carry no host — callers skip those rather than
+// counting them.
+func ParseHost(line []byte) (string, bool) {
+	var e accessEntry
+	if err := json.Unmarshal(line, &e); err != nil {
+		return "", false
+	}
+	return normalizeHost(e.Request.Host)
+}
+
+// normalizeHost lower-cases the host and strips an optional :port suffix
+// (clients may send Host with a port). Returns ok=false for an empty host.
+func normalizeHost(h string) (string, bool) {
+	if h == "" {
+		return "", false
+	}
+	// SplitHostPort only succeeds when a port is actually present; otherwise
+	// keep the host as-is (it has no port to strip).
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	}
+	h = strings.ToLower(strings.TrimSpace(h))
+	if h == "" {
+		return "", false
+	}
+	return h, true
+}
