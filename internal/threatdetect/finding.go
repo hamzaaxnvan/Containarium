@@ -340,3 +340,231 @@ func (r *FindingResponse) ToProto() *pb.FindingResponse {
 	}
 }
 
+// ResponseWriter is what the process responder needs from a finding store
+// beyond FindingSink/FindingReader: recording what it did. Both stores
+// satisfy it.
+type ResponseWriter interface {
+	// SetResponse replaces the finding's response, emits the updated
+	// finding on the event bus, hands it to the notifier (a response
+	// transition is a webhook delivery, #2718), and returns it.
+	// ErrFindingNotFound if id does not exist. The kill facts are sticky
+	// (#2766, #2816): when the finding has a kill on record and r carries no
+	// kill, or one with a lower count, the stored kill (process_killed, the
+	// latest pid, the count and the skip reason) is kept whole in the same
+	// write, as FindingResponse.KeepKillOf describes.
+	SetResponse(ctx context.Context, id int64, r FindingResponse) (*Finding, error)
+	// SetResponseHeld records box's response while another box of a shared
+	// finding still holds an applied action (#2820): standing (that box's
+	// APPLIED record) is what the finding stores and shows, so it never
+	// reads RELEASED, EXPIRED or FAILED while a box is still throttled or
+	// frozen, and box is what the webhook delivers, naming box.Container.
+	// The kill on record stays sticky on both, as in SetResponse.
+	SetResponseHeld(ctx context.Context, id int64, box, standing FindingResponse) (*Finding, error)
+	// ResolveWithResponse records r and resolves the finding in one write:
+	// the release of the last box holding it (#2820). It is one webhook
+	// delivery, the resolve, carrying r (so the consumer learns both that
+	// the box was released and that the finding resolved). When the finding
+	// is no longer open, r is still recorded and delivered as SetResponse
+	// would, and the error wraps ErrFindingNotOpen; ErrFindingNotFound when
+	// id does not exist. Any other error does not say whether r was written:
+	// the Postgres store reads the row back after its UPDATE, so a failed
+	// read (or a failed SetResponse on the not-open path) can come after r
+	// was recorded and the finding resolved, with nothing delivered. A
+	// caller that must be sure re-reads the finding, or records r again (the
+	// process responder does: SetResponse of the same record is harmless).
+	ResolveWithResponse(ctx context.Context, id int64, r FindingResponse) (*Finding, error)
+}
+
+// ResponseDelivery is the finding a response write hands the webhook:
+// stored as the store now has it, carrying box (the record of the box the
+// write is about) as its response, with the kill on record kept as the store
+// keeps it, and naming box.Container as the finding's container (#2820: the
+// stored row keeps the box that first opened a shared finding, which says
+// nothing about which box this delivery is for). A copy: later writes to
+// the stored finding do not change it.
+func ResponseDelivery(stored *Finding, box FindingResponse) *Finding {
+	out := *stored
+	box.KeepKillOf(stored.Response)
+	out.Response = &box
+	if box.Container != "" {
+		out.Container = box.Container
+	}
+	return &out
+}
+
+// resolveDelivery is the finding a plain resolve (Resolve, not
+// ResolveWithResponse) hands the webhook (#2835): the stored finding, naming
+// the box of the response it carries, if any, so that every post carrying a
+// response names that response's box at the top level. The stored row keeps
+// the box that first opened a shared finding, which says nothing about the
+// response. A copy.
+func resolveDelivery(stored *Finding) *Finding {
+	if stored.Response == nil {
+		out := *stored
+		return &out
+	}
+	return ResponseDelivery(stored, *stored.Response)
+}
+
+// FindingState is the lifecycle state of a Finding.
+type FindingState string
+
+const (
+	FindingStateOpen     FindingState = "open"
+	FindingStateResolved FindingState = "resolved"
+)
+
+// ListFilter narrows FindingStore.List / MemFindingStore.List (#1643). Zero
+// values mean "no filter on this field" — Severity's zero value is
+// THREAT_SEVERITY_UNSPECIFIED, which no real finding has, so an unset
+// filter matches every severity rather than none. TenantID empty means
+// "every tenant" — callers enforce the RBAC scoping (admin-only for that
+// case) before reaching the store, same division of responsibility
+// ListPentestFindings uses.
+type ListFilter struct {
+	Severity pb.ThreatSeverity // exact match; unset = any severity
+	TenantID string
+	Since    time.Time
+	State    FindingState // "" = any state
+	// Rule narrows to one rule; unset (THREAT_RULE_ID_UNSPECIFIED) = any rule.
+	Rule pb.ThreatRuleId
+	// BackendID narrows to findings written by one backend; "" = any backend.
+	BackendID string
+	Limit     int // <= 0 or > 200 => default/cap 50/200
+}
+
+// Finding is a single security finding: an open or resolved instance of a
+// rule firing for one tenant. Mirrors the security_findings table.
+type Finding struct {
+	ID        int64
+	Rule      pb.ThreatRuleId
+	Severity  pb.ThreatSeverity
+	TenantID  string
+	Container string
+	BackendID string
+	// Subject is the dedupe scope within (Rule, TenantID): destination IP,
+	// peer tenant id, or "" — see the security_findings_open_dedupe index.
+	Subject   string
+	State     FindingState
+	Count     int64
+	Evidence  Evidence
+	FirstSeen time.Time
+	LastSeen  time.Time
+	// Response is what the process responder did about this finding, nil
+	// when nothing acted on it (#2636).
+	Response *FindingResponse
+}
+
+// clone copies Evidence and Response separately so later changes cannot alter the snapshot.
+func (f *Finding) clone() *Finding {
+	snapshot := *f
+	snapshot.Evidence.Flows = slices.Clone(f.Evidence.Flows)
+	snapshot.Evidence.Denies = slices.Clone(f.Evidence.Denies)
+	snapshot.Evidence.Configs = slices.Clone(f.Evidence.Configs)
+	snapshot.Evidence.Listeners = slices.Clone(f.Evidence.Listeners)
+	snapshot.Evidence.CPU = slices.Clone(f.Evidence.CPU)
+	snapshot.Evidence.Execs = slices.Clone(f.Evidence.Execs)
+
+	if f.Response != nil {
+		response := *f.Response
+		snapshot.Response = &response
+	}
+	return &snapshot
+}
+
+// ToProto converts a Finding to its wire representation.
+func (f *Finding) ToProto() *pb.Finding {
+	state := pb.FindingState_FINDING_STATE_UNSPECIFIED
+	switch f.State {
+	case FindingStateOpen:
+		state = pb.FindingState_FINDING_STATE_OPEN
+	case FindingStateResolved:
+		state = pb.FindingState_FINDING_STATE_RESOLVED
+	}
+
+	flows := make([]*pb.FlowEvidence, 0, len(f.Evidence.Flows))
+	for _, fl := range f.Evidence.Flows {
+		flows = append(flows, &pb.FlowEvidence{
+			SrcIp:     fl.SrcIP,
+			DstIp:     fl.DstIP,
+			SrcPort:   fl.SrcPort,
+			DstPort:   fl.DstPort,
+			Protocol:  fl.Protocol,
+			Bytes:     fl.Bytes,
+			Packets:   fl.Packets,
+			FirstSeen: timestampProto(fl.FirstSeen),
+			LastSeen:  timestampProto(fl.LastSeen),
+			Matched:   fl.Matched,
+		})
+	}
+	denies := make([]*pb.DenyEvidence, 0, len(f.Evidence.Denies))
+	for _, d := range f.Evidence.Denies {
+		denies = append(denies, &pb.DenyEvidence{
+			DstIp:    d.DstIP,
+			DstPort:  d.DstPort,
+			Protocol: d.Protocol,
+			Reason:   d.Reason,
+			Count:    d.Count,
+		})
+	}
+
+	configs := make([]*pb.ConfigEvidence, 0, len(f.Evidence.Configs))
+	for _, c := range f.Evidence.Configs {
+		configs = append(configs, &pb.ConfigEvidence{
+			Path:       c.Path,
+			Directive:  c.Directive,
+			Value:      c.Value,
+			Remediated: c.Remediated,
+			Note:       c.Note,
+		})
+	}
+
+	listeners := make([]*pb.ListenerEvidence, 0, len(f.Evidence.Listeners))
+	for _, l := range f.Evidence.Listeners {
+		listeners = append(listeners, &pb.ListenerEvidence{
+			Port:        l.Port,
+			BindAddress: l.BindAddress,
+			Pid:         l.PID,
+			Binary:      l.Binary,
+			Note:        l.Note,
+		})
+	}
+
+	cpu := make([]*pb.CPUEvidence, 0, len(f.Evidence.CPU))
+	for _, c := range f.Evidence.CPU {
+		cpu = append(cpu, &pb.CPUEvidence{
+			MeanCores:     c.MeanCores,
+			PeakCores:     c.PeakCores,
+			WindowSeconds: c.WindowSeconds,
+			Samples:       c.Samples,
+		})
+	}
+
+	execs := make([]*pb.ExecEvidence, 0, len(f.Evidence.Execs))
+	for _, x := range f.Evidence.Execs {
+		execs = append(execs, x.ToProto())
+	}
+
+	return &pb.Finding{
+		Id:        f.ID,
+		Rule:      f.Rule,
+		Severity:  f.Severity,
+		TenantId:  f.TenantID,
+		Container: f.Container,
+		BackendId: f.BackendID,
+		Subject:   f.Subject,
+		State:     state,
+		Count:     f.Count,
+		Evidence: &pb.Evidence{
+			Flows:     flows,
+			Denies:    denies,
+			Configs:   configs,
+			Listeners: listeners,
+			Cpu:       cpu,
+			Execs:     execs,
+		},
+		FirstSeen: timestampProto(f.FirstSeen),
+		LastSeen:  timestampProto(f.LastSeen),
+		Response:  f.Response.ToProto(),
+	}
+}
