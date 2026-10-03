@@ -1,0 +1,2 @@
+# This directory is for Swagger UI static files
+# The application will serve Swagger UI from CDN if no files are present here
