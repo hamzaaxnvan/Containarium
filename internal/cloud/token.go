@@ -33,3 +33,12 @@ func MintDriverToken(secretFile string, ttl time.Duration) (string, error) {
 		return "", fmt.Errorf("token manager: %w", err)
 	}
 	// #1679 — explicit wildcard scope: this token drives the daemon through
+	// the sentinel peer-proxy on the cloud's behalf, so it needs full
+	// surface access, and strict mode (once armed) would otherwise reject
+	// it outright as unscoped.
+	tok, err := tm.GenerateToken("cloud-byoc-driver", []string{"admin"}, ttl, auth.ScopeWildcard)
+	if err != nil {
+		return "", fmt.Errorf("mint driver token: %w", err)
+	}
+	return tok, nil
+}
