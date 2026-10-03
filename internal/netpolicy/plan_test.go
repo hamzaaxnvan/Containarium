@@ -70,3 +70,76 @@ func TestAggregateDenies_ProtocolLabelsAndPortBounds(t *testing.T) {
 	t0 := time.Now()
 	got := AggregateDenies([]DenyRow{
 		row(t0, "5.5.5.5", 1, 0, false, false),
+		row(t0, "5.5.5.6", 47, 0, false, false),
+		row(t0, "5.5.5.7", 6, 70000, false, false),
+	}, nil)
+	labels := map[string]string{}
+	for _, d := range got {
+		labels[d.IP.String()] = d.Proto
+	}
+	if labels["5.5.5.5"] != "icmp" || labels["5.5.5.6"] != "47" || labels["5.5.5.7"] != "tcp" {
+		t.Errorf("labels = %v", labels)
+	}
+	for _, d := range got {
+		if d.IP.String() == "5.5.5.7" && d.Port != 0 {
+			t.Errorf("out-of-range port must collapse to 0, got %d", d.Port)
+		}
+	}
+}
+
+func TestCompiledPolicy_Allows(t *testing.T) {
+	c, err := Compile(&pb.NetworkPolicy{Tenant: "a", EgressCidrs: []string{"10.0.0.0/8"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := []netip.Prefix{netip.MustParsePrefix("10.100.0.1/32")}
+	if !c.Allows(netip.MustParseAddr("10.2.3.4"), nil) {
+		t.Error("egress CIDR must allow")
+	}
+	if c.Allows(netip.MustParseAddr("11.0.0.1"), nil) {
+		t.Error("uncovered address must not be allowed")
+	}
+	if !c.Allows(netip.MustParseAddr("10.100.0.1"), gw) {
+		t.Error("implicit prefix must allow")
+	}
+	if c.Allows(netip.MustParseAddr("192.168.0.1"), gw) {
+		t.Error("implicit prefix must not widen beyond itself")
+	}
+}
+
+func TestEgressPreset_CompileRoundTripAndImplicit(t *testing.T) {
+	gw := netip.MustParseAddr("10.100.0.1")
+	// No preset: nothing implicit, round-trips as unspecified.
+	c, err := Compile(&pb.NetworkPolicy{Tenant: "a"})
+	if err != nil || len(ImplicitEgress(c, gw)) != 0 || c.ToProto().GetEgressPreset() != pb.EgressPreset_EGRESS_PRESET_UNSPECIFIED {
+		t.Fatalf("no-preset: %v %v", err, ImplicitEgress(c, gw))
+	}
+	// Preset: the resolver is implicit, and the preset survives ToProto.
+	c, err = Compile(&pb.NetworkPolicy{Tenant: "a", EgressPreset: pb.EgressPreset_EGRESS_PRESET_ALLOW_LIST_ONLY,
+		Mode: pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imp := ImplicitEgress(c, gw)
+	if len(imp) != 1 || imp[0].String() != "10.100.0.1/32" {
+		t.Fatalf("implicit = %v", imp)
+	}
+	if c.ToProto().GetEgressPreset() != pb.EgressPreset_EGRESS_PRESET_ALLOW_LIST_ONLY {
+		t.Error("preset lost in ToProto")
+	}
+	// The preset must not widen the stored lists.
+	if len(c.EgressCIDRs) != 0 {
+		t.Errorf("preset must not write into EgressCIDRs: %v", c.EgressCIDRs)
+	}
+	// Unknown gateway: nothing implicit rather than a bogus entry.
+	if got := ImplicitEgress(c, netip.Addr{}); len(got) != 0 {
+		t.Errorf("zero gateway produced %v", got)
+	}
+	if got := ImplicitEgress(c, netip.MustParseAddr("fe80::1")); len(got) != 0 {
+		t.Errorf("IPv6 gateway produced %v", got)
+	}
+	// Unknown enum value is rejected.
+	if _, err := Compile(&pb.NetworkPolicy{Tenant: "a", EgressPreset: pb.EgressPreset(99)}); err == nil {
+		t.Error("unknown preset must be rejected")
+	}
+}

@@ -36,3 +36,29 @@ def format_config(config: DistroConfig, *, redact_bearer: bool = True) -> str:
         "",
     ]
 
+    if config.endpoint:
+        lines.append("Status: telemetry pipeline will be configured.")
+    else:
+        lines.append("Status: TELEMETRY WILL BE NO-OP. Endpoint env not set; init() will fail-open.")
+        lines.append("Enable monitoring on this LXC with:")
+        lines.append("  containarium monitoring enable <username>")
+
+    return "\n".join(lines)
+
+
+def _format_headers(raw: Optional[str], redact: bool) -> str:
+    if not raw:
+        return "<unset>"
+    if not redact:
+        return raw
+    parts = []
+    for kv in raw.split(","):
+        if "=" not in kv:
+            parts.append(kv)
+            continue
+        k, _ = kv.split("=", 1)
+        if k.strip().lower() in _REDACTED_HEADER_KEYS:
+            parts.append(f"{k.strip()}=<redacted>")
+        else:
+            parts.append(kv)
+    return ",".join(parts)
