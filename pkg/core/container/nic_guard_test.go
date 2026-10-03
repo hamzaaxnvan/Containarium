@@ -79,3 +79,30 @@ func TestCreate_GuardFailureDeletesAndFailsClosed(t *testing.T) {
 	m.SetNICGuard(&recordingGuard{err: errors.New("incus: acl boom")})
 
 	_, err := m.Create(stagesOpts())
+	if !errors.Is(err, ErrNICGuard) {
+		t.Fatalf("err = %v, want ErrNICGuard", err)
+	}
+	if b.started {
+		t.Error("container was started although the guard failed")
+	}
+	if sb.deleteCalls != 1 {
+		t.Errorf("deleteCalls = %d, want 1 (fail closed: the box is removed)", sb.deleteCalls)
+	}
+}
+
+func TestCreate_NoGuardIsNoop(t *testing.T) {
+	b := &guardBackend{stagesBackend: &stagesBackend{}}
+	m := NewWithBackend(b)
+	if _, err := m.Create(stagesOpts()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !b.started {
+		t.Error("container not started")
+	}
+}
+
+type guardFunc func(ctx context.Context, name, tenant string) error
+
+func (f guardFunc) Prepare(ctx context.Context, name, tenant string) error {
+	return f(ctx, name, tenant)
+}
