@@ -58,3 +58,64 @@ func main() {
 	}
 	if err := assertWrappedAndCatchallV2(*adminURL, "after-remove"); err != nil {
 		log.Fatalf("FAIL: %v", err)
+	}
+
+	log.Println("step 5: ListL4Routes (must see the surviving SNI route)")
+	routes, err := m.ListL4Routes()
+	if err != nil {
+		log.Fatalf("ListL4Routes: %v", err)
+	}
+	if len(routes) != 1 || routes[0].SNI != "passthrough-a.example" {
+		log.Fatalf("FAIL: ListL4Routes = %v, want 1 entry for passthrough-a.example", routes)
+	}
+
+	log.Println("step 6: print full L4 server config")
+	resp, err := http.Get(*adminURL + "/config/apps/layer4/servers/tls_passthrough")
+	if err != nil {
+		log.Fatalf("get layer4 config: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var pretty map[string]interface{}
+	_ = json.Unmarshal(body, &pretty)
+	out, _ := json.MarshalIndent(pretty, "", "  ")
+	fmt.Println(string(out))
+
+	log.Println("PASS: lifecycle complete, wrapping survived all 6 steps")
+}
+
+func assertWrappedAndCatchallV2(adminURL, label string) error {
+	resp, err := http.Get(adminURL + "/config/apps/layer4/servers/tls_passthrough")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var srv map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&srv); err != nil {
+		return err
+	}
+	outer, _ := srv["routes"].([]interface{})
+	if len(outer) != 1 {
+		return fmt.Errorf("[%s] expected 1 outer route (wrapped), got %d", label, len(outer))
+	}
+	hs, _ := outer[0].(map[string]interface{})["handle"].([]interface{})
+	if len(hs) != 2 {
+		return fmt.Errorf("[%s] expected 2 outer handlers, got %d", label, len(hs))
+	}
+	if hs[0].(map[string]interface{})["handler"] != "proxy_protocol" {
+		return fmt.Errorf("[%s] outer handler[0] must be proxy_protocol, got %v", label, hs[0])
+	}
+	inner, _ := hs[1].(map[string]interface{})["routes"].([]interface{})
+	if len(inner) == 0 {
+		return fmt.Errorf("[%s] inner subroute has no routes", label)
+	}
+	last := inner[len(inner)-1].(map[string]interface{})
+	if _, hasMatch := last["match"]; hasMatch {
+		return fmt.Errorf("[%s] last inner route has a match clause — catchall is missing/displaced", label)
+	}
+	lastH := last["handle"].([]interface{})[0].(map[string]interface{})
+	if lastH["proxy_protocol"] != "v2" {
+		return fmt.Errorf("[%s] catchall proxy_protocol = %v, want v2", label, lastH["proxy_protocol"])
+	}
+	return nil
+}
