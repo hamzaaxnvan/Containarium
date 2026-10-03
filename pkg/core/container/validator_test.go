@@ -190,3 +190,131 @@ func TestValidateSystemContainerName(t *testing.T) {
 		{
 			name:    "valid system container",
 			input:   "_containarium-core",
+			wantErr: false,
+		},
+		{
+			name:    "valid system with numbers",
+			input:   "_containarium-monitoring-v2",
+			wantErr: false,
+		},
+		{
+			name:    "valid system single char after underscore",
+			input:   "_a",
+			wantErr: false,
+		},
+
+		// Invalid - missing prefix
+		{
+			name:    "invalid no prefix",
+			input:   "containarium-core",
+			wantErr: true,
+		},
+		{
+			name:      "invalid empty",
+			input:     "",
+			wantErr:   true,
+			expectErr: ErrEmpty,
+		},
+
+		// Invalid - format
+		{
+			name:      "invalid uppercase",
+			input:     "_Containarium-core",
+			wantErr:   true,
+			expectErr: ErrInvalidFormat,
+		},
+		{
+			name:      "invalid special chars",
+			input:     "_containarium@core",
+			wantErr:   true,
+			expectErr: ErrInvalidFormat,
+		},
+		{
+			name:      "invalid too long",
+			input:     "_" + strings.Repeat("a", 63),
+			wantErr:   true,
+			expectErr: ErrTooLong,
+		},
+		{
+			name:    "valid at max length",
+			input:   "_" + strings.Repeat("a", 62),
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSystemContainerName(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateSystemContainerName() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.expectErr != nil && !errors.Is(err, tt.expectErr) {
+				t.Errorf("ValidateSystemContainerName() error = %v, expectErr %v", err, tt.expectErr)
+			}
+		})
+	}
+}
+
+func TestValidateUserContainerName(t *testing.T) {
+	// This is an alias for ValidateContainerName, so just test it exists
+	// and works correctly
+	err := ValidateUserContainerName("alice")
+	if err != nil {
+		t.Errorf("ValidateUserContainerName() unexpected error = %v", err)
+	}
+
+	err = ValidateUserContainerName("_system")
+	if err != ErrReservedPrefix {
+		t.Errorf("ValidateUserContainerName() error = %v, want %v", err, ErrReservedPrefix)
+	}
+}
+
+// Benchmark tests for performance
+func BenchmarkValidateContainerName(b *testing.B) {
+	validNames := []string{
+		"alice",
+		"alice-dev",
+		"team-api-prod-v2",
+		strings.Repeat("a", 63),
+	}
+
+	invalidNames := []string{
+		"_system",
+		"Alice",
+		"alice_dev",
+		strings.Repeat("a", 64),
+	}
+
+	b.Run("valid names", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for _, name := range validNames {
+				_ = ValidateContainerName(name)
+			}
+		}
+	})
+
+	b.Run("invalid names", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for _, name := range invalidNames {
+				_ = ValidateContainerName(name)
+			}
+		}
+	})
+}
+
+func BenchmarkIsSystemContainer(b *testing.B) {
+	names := []string{
+		"_containarium-core",
+		"alice",
+		"alice-dev",
+		"_",
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, name := range names {
+			_ = IsSystemContainer(name)
+		}
+	}
+}
