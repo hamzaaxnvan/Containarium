@@ -63,3 +63,68 @@ func TestGetBoxRunUserStatus(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			s, calls := statusServer(t, tt.level, tt.exists, tt.probe, nil)
+			resp, err := s.GetBoxRunUserStatus(adminCtx(), &pb.GetBoxRunUserStatusRequest{Username: "alice"})
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if resp.GetRunUser() != "ctn-run" || resp.GetToolAccessRecorded() != tt.wantRec ||
+				resp.GetRunUserExists() != tt.wantExists || resp.GetState() != tt.wantState {
+				t.Errorf("resp = %v, want recorded=%v exists=%v state=%v", resp, tt.wantRec, tt.wantExists, tt.wantState)
+			}
+			for _, c := range *calls {
+				if strings.Contains(c, "useradd") || strings.Contains(c, "setsid") || strings.Contains(c, "rm ") || strings.Contains(c, "mv ") {
+					t.Errorf("the status check must be read-only, ran: %s", c)
+				}
+			}
+			if tt.level == "" && len(*calls) != 0 {
+				t.Errorf("a box with no level must not be probed, ran %d script(s)", len(*calls))
+			}
+		})
+	}
+}
+
+func TestGetBoxRunUserStatus_Refusals(t *testing.T) {
+	boom := errors.New("exec failed")
+	t.Run("unknown level is refused like StartBoxRun", func(t *testing.T) {
+		s, _ := statusServer(t, "root", "yes\n", "interactive\n", nil)
+		_, err := s.GetBoxRunUserStatus(adminCtx(), &pb.GetBoxRunUserStatusRequest{Username: "alice"})
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("err = %v, want FailedPrecondition", err)
+		}
+	})
+	t.Run("probe failure is unavailable, never reported as not signed in", func(t *testing.T) {
+		s, _ := statusServer(t, "build_tools", "yes\n", "", boom)
+		_, err := s.GetBoxRunUserStatus(adminCtx(), &pb.GetBoxRunUserStatusRequest{Username: "alice"})
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("err = %v, want Unavailable", err)
+		}
+	})
+	t.Run("unreadable existence answer is unavailable", func(t *testing.T) {
+		s, _ := statusServer(t, "build_tools", "garbled", "interactive\n", nil)
+		_, err := s.GetBoxRunUserStatus(adminCtx(), &pb.GetBoxRunUserStatusRequest{Username: "alice"})
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("err = %v, want Unavailable", err)
+		}
+	})
+	t.Run("level read error is unavailable", func(t *testing.T) {
+		s, _ := statusServer(t, "build_tools", "yes\n", "interactive\n", nil)
+		s.boxRunToolAccess = func(context.Context, string) (string, error) { return "", boom }
+		_, err := s.GetBoxRunUserStatus(adminCtx(), &pb.GetBoxRunUserStatusRequest{Username: "alice"})
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("err = %v, want Unavailable", err)
+		}
+	})
+	t.Run("a caller without the scope is refused", func(t *testing.T) {
+		s, _ := statusServer(t, "build_tools", "yes\n", "interactive\n", nil)
+		if _, err := s.GetBoxRunUserStatus(context.Background(), &pb.GetBoxRunUserStatusRequest{Username: "alice"}); err == nil {
+			t.Fatal("an unauthenticated caller must be refused")
+		}
+	})
+	t.Run("username is required", func(t *testing.T) {
+		s, _ := statusServer(t, "build_tools", "yes\n", "interactive\n", nil)
+		if _, err := s.GetBoxRunUserStatus(adminCtx(), &pb.GetBoxRunUserStatusRequest{}); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("err = %v, want InvalidArgument", err)
+		}
+	})
+}
