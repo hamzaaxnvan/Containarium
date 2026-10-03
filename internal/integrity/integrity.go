@@ -91,3 +91,190 @@ type Inputs struct {
 	// (an *ecdsa.PrivateKey via tls.Certificate.PrivateKey).
 	Signer crypto.Signer
 
+	// SigningCertPEM is the PEM of the signing certificate (the peer leaf), so
+	// the verifier can check the signature against the sentinel CA without a
+	// side lookup. Empty when unsigned or unavailable.
+	SigningCertPEM string
+
+	// TPMBacked records whether Signer is a TPM-backed key. The daemon sets this
+	// when a TPM provided the key; false means the software peer key signed.
+	TPMBacked bool
+
+	// Now is injected so callers/tests can pin the recorded timestamp.
+	Now time.Time
+}
+
+// ProgramDigest is one program object's identity + digest.
+type ProgramDigest struct {
+	Name   string
+	Digest string
+}
+
+// Measurement is the computed, possibly-signed self-measurement. It mirrors
+// pb.SelfMeasurement but carries no proto dependency; the server maps it onto
+// the wire type.
+type Measurement struct {
+	HashAlgorithm      string
+	BinaryDigest       string
+	ProgramDigests     []ProgramDigest
+	ConfigDigest       string
+	MeasurementDigest  string
+	Signature          string
+	SignatureAlgorithm string
+	TPMBacked          bool
+	Signed             bool
+	SigningCertPEM     string
+	MeasuredAt         time.Time
+	DaemonVersion      string
+}
+
+// Compute reads the inputs, builds the component digests, folds them into a
+// canonical measurement, and signs it when a signer is supplied. Read errors
+// on the binary or a program object are returned (a measurement we cannot
+// build from real bytes would be misleading); a nil/absent signer is not an
+// error — it yields an unsigned measurement.
+func Compute(in Inputs) (Measurement, error) {
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	m := Measurement{
+		HashAlgorithm: HashAlgorithm,
+		DaemonVersion: in.DaemonVersion,
+		MeasuredAt:    now.UTC(),
+	}
+
+	if in.BinaryPath != "" {
+		d, err := digestFile(in.BinaryPath)
+		if err != nil {
+			return Measurement{}, fmt.Errorf("digest daemon binary %q: %w", in.BinaryPath, err)
+		}
+		m.BinaryDigest = d
+	}
+
+	// Digest each program object, then sort by name for a stable order so the
+	// measurement (and its signature) is deterministic regardless of the
+	// caller's slice ordering.
+	for _, p := range in.Programs {
+		var d string
+		var err error
+		// Data decides the source by nil-ness: a non-nil empty slice digests as
+		// the empty-input hash, while nil falls back to Path (or Name).
+		if p.Data != nil {
+			sum := sha256.Sum256(p.Data)
+			d = hex.EncodeToString(sum[:])
+		} else {
+			path := p.Path
+			if path == "" {
+				path = p.Name
+			}
+			d, err = digestFile(path)
+		}
+		if err != nil {
+			return Measurement{}, fmt.Errorf("digest program object %q: %w", p.Name, err)
+		}
+		m.ProgramDigests = append(m.ProgramDigests, ProgramDigest{Name: p.Name, Digest: d})
+	}
+	sort.Slice(m.ProgramDigests, func(i, j int) bool {
+		return m.ProgramDigests[i].Name < m.ProgramDigests[j].Name
+	})
+
+	m.ConfigDigest = digestConfigState(in.ConfigState)
+
+	// Fold the components into the canonical measurement bytes. This is exactly
+	// what gets signed and what measurement_digest covers, so the verifier
+	// reconstructs the same bytes from the component fields.
+	canonical := canonicalBytes(m)
+	sum := sha256.Sum256(canonical)
+	m.MeasurementDigest = hex.EncodeToString(sum[:])
+
+	if in.Signer == nil {
+		// Unsigned but valid measurement.
+		return m, nil
+	}
+
+	sig, alg, err := sign(in.Signer, sum[:])
+	if err != nil {
+		return Measurement{}, fmt.Errorf("sign measurement: %w", err)
+	}
+	m.Signature = base64.StdEncoding.EncodeToString(sig)
+	m.SignatureAlgorithm = alg
+	m.Signed = true
+	m.TPMBacked = in.TPMBacked
+	m.SigningCertPEM = in.SigningCertPEM
+	return m, nil
+}
+
+// canonicalBytes builds the deterministic byte string that is hashed +
+// signed. A line-oriented, field-tagged encoding keeps it human-auditable and
+// trivially reproducible by a verifier in any language, and avoids JSON map
+// ordering surprises. The measurement_digest / signature fields are excluded —
+// they are derived from these bytes.
+func canonicalBytes(m Measurement) []byte {
+	var b strings.Builder
+	b.WriteString("containarium.self-measurement.v1\n")
+	b.WriteString("hash=" + m.HashAlgorithm + "\n")
+	b.WriteString("daemon_version=" + m.DaemonVersion + "\n")
+	b.WriteString("measured_at=" + m.MeasuredAt.UTC().Format(time.RFC3339Nano) + "\n")
+	b.WriteString("binary=" + m.BinaryDigest + "\n")
+	for _, p := range m.ProgramDigests {
+		b.WriteString("program=" + p.Name + ":" + p.Digest + "\n")
+	}
+	b.WriteString("config=" + m.ConfigDigest + "\n")
+	return []byte(b.String())
+}
+
+// digestConfigState canonicalizes the config snapshot (sorted keys) and hashes
+// it. A nil/empty map hashes the empty object so the field is always present
+// and stable.
+func digestConfigState(state map[string]string) string {
+	keys := make([]string, 0, len(state))
+	for k := range state {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	enc := json.NewEncoder(h)
+	for _, k := range keys {
+		// Encode each key/value pair via json so embedded separators in values
+		// can't forge a different pairing.
+		_ = enc.Encode([2]string{k, state[k]})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// digestFile streams a file through SHA-256 and returns the hex digest.
+func digestFile(path string) (string, error) {
+	f, err := os.Open(path) // #nosec G304 -- path is operator/daemon-controlled (binary + configured program object), not user input
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// sign signs the measurement digest with the node identity key. ECDSA keys
+// (the sentinel-issued peer leaf) sign the digest directly; any other
+// crypto.Signer is signed with SHA-256 as the opts hash. The returned
+// algorithm string records the scheme for the verifier.
+func sign(signer crypto.Signer, digest []byte) (sig []byte, alg string, err error) {
+	switch signer.(type) {
+	case *ecdsa.PrivateKey:
+		s, err := signer.Sign(rand.Reader, digest, crypto.SHA256)
+		if err != nil {
+			return nil, "", err
+		}
+		return s, SignatureAlgorithmECDSAP256SHA256, nil
+	default:
+		s, err := signer.Sign(rand.Reader, digest, crypto.SHA256)
+		if err != nil {
+			return nil, "", err
+		}
+		return s, "sha256", nil
+	}
+}
