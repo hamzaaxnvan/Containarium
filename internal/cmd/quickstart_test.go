@@ -196,3 +196,202 @@ func TestCodexAppendMCP(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		changed, err := codexAppendMCP(path, "containarium-box", "alice")
+		if err != nil {
+			t.Fatalf("append: %v", err)
+		}
+		if !changed {
+			t.Fatal("expected changed=true")
+		}
+		got := readFile(t, path)
+		if !strings.Contains(got, "model = \"o3\"") || !strings.Contains(got, "[mcp_servers.other]") {
+			t.Fatalf("existing config lost:\n%s", got)
+		}
+
+		// second run must be a no-op
+		changed2, err := codexAppendMCP(path, "containarium-box", "alice")
+		if err != nil {
+			t.Fatalf("second append: %v", err)
+		}
+		if changed2 {
+			t.Fatal("expected changed=false on second run")
+		}
+		if n := strings.Count(readFile(t, path), "[mcp_servers.containarium-box]"); n != 1 {
+			t.Fatalf("expected exactly 1 containarium-box table, got %d", n)
+		}
+	})
+}
+
+func TestAgentMCPTargets(t *testing.T) {
+	home := t.TempDir()
+
+	// Only the primary agent's config should be targeted when no others exist.
+	got := agentMCPTargets(home, "claude")
+	if len(got) != 1 || got[0].agent != "claude" {
+		t.Fatalf("expected only claude, got %+v", got)
+	}
+
+	// Create a gemini config; now both should be targeted, primary first.
+	geminiCfg := filepath.Join(home, ".gemini", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(geminiCfg), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(geminiCfg, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got = agentMCPTargets(home, "codex")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 targets, got %d (%+v)", len(got), got)
+	}
+	if got[0].agent != "codex" {
+		t.Fatalf("primary agent must be first, got %q", got[0].agent)
+	}
+	if got[1].agent != "gemini" {
+		t.Fatalf("expected gemini as the already-configured extra, got %q", got[1].agent)
+	}
+}
+
+func TestBuildInstruction(t *testing.T) {
+	got := buildInstruction("containarium-box", "a coffee shop landing page", "coffee.example.com", 8080)
+	for _, want := range []string{
+		`"containarium-box"`,
+		"a coffee shop landing page",
+		"port 8080",
+		"https://coffee.example.com/",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("instruction missing %q:\n%s", want, got)
+		}
+	}
+
+	// No domain → generic URL phrasing, no bare "https:///".
+	noDomain := buildInstruction("containarium-box", "x", "", 3000)
+	if strings.Contains(noDomain, "https:///") {
+		t.Fatalf("empty domain produced a malformed URL:\n%s", noDomain)
+	}
+}
+
+func TestResolveSSHKey(t *testing.T) {
+	t.Run("user-provided key is used verbatim, no managed identity", func(t *testing.T) {
+		pub, identity, generated, err := resolveSSHKey(t.TempDir(), "/home/alice/.ssh/mine.pub")
+		if err != nil {
+			t.Fatalf("resolveSSHKey: %v", err)
+		}
+		if pub != "/home/alice/.ssh/mine.pub" {
+			t.Fatalf("pub = %q, want the provided path", pub)
+		}
+		if identity != "" {
+			t.Fatalf("identity = %q, want empty for a user-provided key", identity)
+		}
+		if generated {
+			t.Fatal("must not generate when a key is provided")
+		}
+	})
+
+	t.Run("no key → generate managed, then reuse (idempotent)", func(t *testing.T) {
+		home := t.TempDir()
+
+		pub, identity, generated, err := resolveSSHKey(home, "")
+		if err != nil {
+			t.Fatalf("first resolveSSHKey: %v", err)
+		}
+		if !generated {
+			t.Fatal("expected a key to be generated on first run")
+		}
+		if !strings.HasSuffix(pub, ".pub") {
+			t.Fatalf("pub path %q should end in .pub", pub)
+		}
+		if identity != strings.TrimSuffix(pub, ".pub") {
+			t.Fatalf("identity %q should be the private-key path of %q", identity, pub)
+		}
+		if _, err := os.Stat(identity); err != nil {
+			t.Fatalf("private key not written at %s: %v", identity, err)
+		}
+
+		pub2, identity2, generated2, err := resolveSSHKey(home, "")
+		if err != nil {
+			t.Fatalf("second resolveSSHKey: %v", err)
+		}
+		if generated2 {
+			t.Fatal("second run must reuse the key, not regenerate")
+		}
+		if pub2 != pub || identity2 != identity {
+			t.Fatalf("second run returned different paths: (%q,%q) vs (%q,%q)", pub2, identity2, pub, identity)
+		}
+	})
+}
+
+// TestAgentLaunchContract pins the confirmed per-agent invocation + MCP config
+// location so a future edit can't silently regress them. Values verified
+// against each shipping CLI (see agentSpecs doc comment).
+func TestAgentLaunchContract(t *testing.T) {
+	home := "/home/u"
+	cases := []struct {
+		agent    string
+		wantArgs []string
+		wantPath string
+	}{
+		{"claude", []string{"do it"}, "/home/u/.claude.json"},
+		{"gemini", []string{"-i", "do it"}, "/home/u/.gemini/settings.json"},
+		{"codex", []string{"do it"}, "/home/u/.codex/config.toml"},
+	}
+	for _, c := range cases {
+		t.Run(c.agent, func(t *testing.T) {
+			spec, ok := agentSpecs[c.agent]
+			if !ok {
+				t.Fatalf("no spec for %q", c.agent)
+			}
+			if got := spec.launchArgs("do it"); strings.Join(got, "\x00") != strings.Join(c.wantArgs, "\x00") {
+				t.Fatalf("launchArgs = %v, want %v", got, c.wantArgs)
+			}
+			if got := spec.mcpConfigPath(home); got != c.wantPath {
+				t.Fatalf("mcpConfigPath = %q, want %q", got, c.wantPath)
+			}
+		})
+	}
+	// The advertised set is exactly these three.
+	if strings.Join(supportedAgents, ",") != "claude,gemini,codex" {
+		t.Fatalf("supportedAgents = %v, want [claude gemini codex]", supportedAgents)
+	}
+}
+
+func TestResolveAgentUnknown(t *testing.T) {
+	if _, err := resolveAgent("cursor"); err == nil {
+		t.Fatal("expected an error for an unsupported agent")
+	}
+	// Every advertised agent must have a spec.
+	for _, a := range supportedAgents {
+		if _, ok := agentSpecs[a]; !ok {
+			t.Fatalf("supportedAgents lists %q but agentSpecs has no entry", a)
+		}
+	}
+}
+
+// ─── helpers ──────────────────────────────────────────────────────────────
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+func mcpServerFromFile(t *testing.T, path, key, name string) mcpServerEntry {
+	t.Helper()
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(readFile(t, path)), &root); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	var servers map[string]mcpServerEntry
+	if err := json.Unmarshal(root[key], &servers); err != nil {
+		t.Fatalf("parse %s[%s]: %v", path, key, err)
+	}
+	entry, ok := servers[name]
+	if !ok {
+		t.Fatalf("%s not present under %s", name, key)
+	}
+	return entry
+}
