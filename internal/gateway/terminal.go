@@ -273,3 +273,279 @@ func (th *TerminalHandler) HandleTerminal(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	containerName := username + "-container"
+
+	asRunUser := false
+	if v := r.URL.Query().Get(asRunUserParam); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			http.Error(w, asRunUserParam+" must be a boolean", http.StatusBadRequest)
+			return
+		}
+		asRunUser = b
+	}
+
+	// Check if container is on a peer backend
+	if th.peerProxy != nil {
+		// Phase 1.5 — read the token from whichever form the
+		// client used (subprotocol > Authorization > legacy
+		// ?token=). The gateway wrapper has already validated
+		// it; we just need to forward the bytes upstream.
+		authToken, _ := auth.ExtractBearerForUpgrade(r)
+		if peerURL, err := th.peerProxy.PeerTerminalURL(username, authToken); err == nil && peerURL != "" {
+			if asRunUser {
+				// The peer applies the guard against its own box.
+				peerURL += "?" + asRunUserParam + "=true"
+			}
+			// Proxy WebSocket to peer
+			log.Printf("Proxying terminal for %s to peer: %s", containerName, peerURL)
+			th.proxyWebSocket(w, r, peerURL, authToken)
+			return
+		}
+	}
+
+	// Verify container exists and is running locally
+	state, _, err := th.incusClient.GetInstanceState(containerName)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Container not found: %v", err), http.StatusNotFound)
+		return
+	}
+
+	if state.Status != "Running" {
+		http.Error(w, fmt.Sprintf("Container is not running (status: %s)", state.Status), http.StatusBadRequest)
+		return
+	}
+
+	// Decided before the upgrade so a refusal is a plain HTTP status.
+	loginUser, refusal := th.resolveTerminalUser(containerName, username, asRunUser)
+	if refusal != nil {
+		http.Error(w, refusal.msg, refusal.status)
+		return
+	}
+
+	// Upgrade HTTP connection to WebSocket
+	conn, err := th.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	log.Printf("Terminal WebSocket connected for container %s (login user %s)", containerName, loginUser)
+
+	// Start terminal session
+	th.startTerminalSession(conn, containerName, loginUser)
+}
+
+// proxyWebSocket proxies a WebSocket connection to a peer backend's terminal endpoint.
+//
+// Phase 1.5 — forwards the bearer token via the
+// Sec-WebSocket-Protocol header (subprotocol form) so the
+// daemon→peer hop also stays out of URL-loggable form. The
+// peer's ExtractBearerForUpgrade picks it up identically.
+func (th *TerminalHandler) proxyWebSocket(w http.ResponseWriter, r *http.Request, peerURL, authToken string) {
+	// Parse the peer URL and set up WebSocket dial
+	u, err := url.Parse(peerURL)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid peer URL: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Strip any legacy ?token= an older callsite may have
+	// already added — we don't want the token to land in both
+	// places on the wire.
+	q := u.Query()
+	q.Del("token")
+	u.RawQuery = q.Encode()
+
+	// Forward the bearer via subprotocol. RFC 6455 wants a
+	// comma-separated list; gorilla parses it back the same
+	// way ExtractBearerForUpgrade does.
+	peerHeaders := http.Header{}
+	peerHeaders.Set("Sec-WebSocket-Protocol", auth.WSSubprotocolBearer+", "+authToken)
+
+	peerConn, _, err := websocket.DefaultDialer.Dial(u.String(), peerHeaders)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to connect to peer terminal: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = peerConn.Close() }()
+
+	// Upgrade client connection
+	clientConn, err := th.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade failed for proxy: %v", err)
+		return
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	// Bidirectional proxy
+	done := make(chan struct{})
+
+	// Client → Peer
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			msgType, msg, err := clientConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := peerConn.WriteMessage(msgType, msg); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Peer → Client
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			msgType, msg, err := peerConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := clientConn.WriteMessage(msgType, msg); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for either direction to close
+	<-done
+}
+
+// startTerminalSession starts an interactive shell session in the container
+func (th *TerminalHandler) startTerminalSession(conn *websocket.Conn, containerName string, username string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create pipes for stdin/stdout
+	stdinReader, stdinWriter := io.Pipe()
+	stdoutReader, stdoutWriter := io.Pipe()
+
+	// Prepare exec request - run bash as the container user
+	req := api.InstanceExecPost{
+		Command:     []string{"su", "-", username}, // Login as the user
+		WaitForWS:   true,
+		Interactive: true,
+		Width:       80,
+		Height:      24,
+	}
+
+	// Execute command in container
+	execArgs := incus.InstanceExecArgs{
+		Stdin:    stdinReader,
+		Stdout:   stdoutWriter,
+		Stderr:   stdoutWriter,
+		Control:  nil,
+		DataDone: make(chan bool),
+	}
+
+	// Start exec operation
+	op, err := th.incusClient.ExecInstance(containerName, req, &execArgs)
+	if err != nil {
+		log.Printf("Failed to start exec: %v", err)
+		th.sendError(conn, fmt.Sprintf("Failed to start terminal: %v", err))
+		return
+	}
+
+	// Create done channel
+	done := make(chan struct{})
+	var once sync.Once
+	closeDone := func() {
+		once.Do(func() {
+			close(done)
+			cancel()
+		})
+	}
+
+	// Forward stdout to WebSocket
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				n, err := stdoutReader.Read(buf)
+				if err != nil {
+					if err != io.EOF {
+						log.Printf("Stdout read error: %v", err)
+					}
+					closeDone()
+					return
+				}
+				if n > 0 {
+					msg := TerminalMessage{
+						Type: "output",
+						Data: string(buf[:n]),
+					}
+					if err := conn.WriteJSON(msg); err != nil {
+						log.Printf("WebSocket write error: %v", err)
+						closeDone()
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	// Read from WebSocket and forward to stdin
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				var msg TerminalMessage
+				if err := conn.ReadJSON(&msg); err != nil {
+					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+						log.Printf("WebSocket read error: %v", err)
+					}
+					closeDone()
+					return
+				}
+
+				switch msg.Type {
+				case "input":
+					if _, err := stdinWriter.Write([]byte(msg.Data)); err != nil {
+						log.Printf("Stdin write error: %v", err)
+						closeDone()
+						return
+					}
+				case "resize":
+					// Note: Incus doesn't easily support window resize after exec starts
+					// Would need to use the control channel
+					log.Printf("Resize requested: %dx%d (not yet implemented)", msg.Cols, msg.Rows)
+				}
+			}
+		}
+	}()
+
+	// Wait for operation to complete
+	go func() {
+		err := op.Wait()
+		if err != nil {
+			log.Printf("Exec operation error: %v", err)
+		}
+		closeDone()
+	}()
+
+	// Wait for session to end
+	<-done
+
+	// Cleanup
+	_ = stdinWriter.Close()
+	_ = stdoutWriter.Close()
+
+	log.Printf("Terminal session ended for container %s", containerName)
+}
+
+// sendError sends an error message over WebSocket
+func (th *TerminalHandler) sendError(conn *websocket.Conn, message string) {
+	msg := TerminalMessage{
+		Type: "error",
+		Data: message,
+	}
+	_ = conn.WriteJSON(msg)
+}

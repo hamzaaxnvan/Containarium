@@ -58,3 +58,33 @@ func TestQuotaLimits_ExceededNamesTheDimension(t *testing.T) {
 // zero limit divided into any usage would otherwise be an instant overrun.
 func TestQuotaLimits_UnsetDimensionsAreUnlimited(t *testing.T) {
 	q := QuotaLimits{Window: time.Minute, MaxTotalTokens: 100}
+
+	// A million calls with an uncapped call limit, and token spend well under
+	// the one cap that is set.
+	u := q.evaluate(counts{calls: 1_000_000, inputTokens: 10, outputTokens: 20})
+	if u.exceeded != "" {
+		t.Errorf("exceeded = %q, want none: only total_tokens is capped and it is under", u.exceeded)
+	}
+	if u.fraction > 1 {
+		t.Errorf("fraction = %v, want <= 1", u.fraction)
+	}
+}
+
+// Cached tokens count toward spend: replaying a huge cached prefix is exactly
+// the runaway a budget exists to stop.
+func TestQuotaLimits_CachedTokensCountTowardTotal(t *testing.T) {
+	q := QuotaLimits{Window: time.Minute, MaxTotalTokens: 100}
+	if u := q.evaluate(counts{calls: 1, cachedTokens: 150}); u.exceeded != "total_tokens" {
+		t.Errorf("exceeded = %q, want total_tokens", u.exceeded)
+	}
+}
+
+// Denials of either kind are not spend — they never reached a provider, so they
+// must not consume the tenant's budget. A throttled tenant whose refusals ate
+// its own quota could never climb back out.
+func TestQuotaLimits_DenialsAreNotSpend(t *testing.T) {
+	q := QuotaLimits{Window: time.Minute, MaxCalls: 5, MaxTotalTokens: 100}
+	if u := q.evaluate(counts{authDenials: 50, policyDenials: 50}); u.exceeded != "" || u.fraction != 0 {
+		t.Errorf("denials consumed budget: exceeded=%q fraction=%v", u.exceeded, u.fraction)
+	}
+}
