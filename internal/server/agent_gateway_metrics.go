@@ -67,3 +67,21 @@ func (s *gatewayOTLPSink) RecordUsage(tenant, skill, provider string, u modelgat
 		attrs = append(attrs, attribute.String("skill", skill))
 	}
 	if u.Model != "" {
+		attrs = append(attrs, attribute.String("model", u.Model))
+	}
+	set := otelmetric.WithAttributes(attrs...)
+	ctx := context.Background()
+	s.calls.Add(ctx, 1, set)
+	if u.InputTokens > 0 {
+		s.input.Add(ctx, u.InputTokens, set)
+	}
+	if u.OutputTokens > 0 {
+		s.output.Add(ctx, u.OutputTokens, set)
+	}
+	if u.CachedTokens > 0 {
+		s.cached.Add(ctx, u.CachedTokens, set)
+	}
+}
+
+// compile-time assertion: gatewayOTLPSink satisfies modelgateway.UsageSink.
+var _ modelgateway.UsageSink = (*gatewayOTLPSink)(nil)
