@@ -195,3 +195,200 @@ func TestGuardrailPolicyStartupStore_FailsClosedWhenPostgresIsNotInstalled(t *te
 					if lit, ok := call.Args[0].(*ast.CompositeLit); ok {
 						if id, ok := lit.Type.(*ast.Ident); ok && id.Name == "unavailableGuardrailPolicyStore" {
 							failClosedCtor++
+						}
+					}
+				}
+			case *ast.SelectorExpr:
+				recv, ok := fn.X.(*ast.Ident)
+				if !ok || recv.Name != "guardrailPolicyServer" || fn.Sel.Name != "SetStore" {
+					return true
+				}
+				setStores++
+				if len(call.Args) == 1 {
+					if inner, ok := call.Args[0].(*ast.CallExpr); ok {
+						if id, ok := inner.Fun.(*ast.Ident); ok && id.Name == "guardrailPolicyStartupStore" {
+							guarded++
+						}
+					}
+				}
+			}
+			return true
+		})
+		if failClosedCtor != 1 || setStores != 1 || guarded != 1 {
+			t.Fatalf("dual_server.go: NewGuardrailPolicyServer(unavailableGuardrailPolicyStore{}) x%d, guardrailPolicyServer.SetStore x%d (x%d via guardrailPolicyStartupStore); want 1, 1, 1",
+				failClosedCtor, setStores, guarded)
+		}
+	})
+	t.Run("postgres configured, store installed", func(t *testing.T) {
+		pg := guardrailpolicy.NewMemoryStore() // stands in for the Postgres store
+		if got := guardrailPolicyStartupStore(true, pg); got != guardrailpolicy.Store(pg) {
+			t.Fatalf("startup store = %T, want the installed store", got)
+		}
+	})
+}
+
+// TestSetPolicy_Validation: every invalid policy is INVALID_ARGUMENT and the
+// stored revision is unchanged.
+func TestSetPolicy_Validation(t *testing.T) {
+	good := gpSigner(1)
+	badSigner := &pb.GuardrailTrustedSigner{KeyId: gpSigner(2).GetKeyId(), PublicKey: good.GetPublicKey()}
+	rule := func(k pb.GuardrailKind, a pb.GuardrailAction, max int32) *pb.GuardrailRule {
+		return &pb.GuardrailRule{Kind: k, Action: a, MaxResidual: max}
+	}
+	const (
+		pii    = pb.GuardrailKind_GUARDRAIL_KIND_PII
+		redact = pb.GuardrailAction_GUARDRAIL_ACTION_REDACT
+	)
+	cases := []struct {
+		name string
+		req  *pb.SetGuardrailPolicyRequest
+	}{
+		{"missing policy", &pb.SetGuardrailPolicyRequest{}},
+		{"unspecified kind", &pb.SetGuardrailPolicyRequest{Policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pb.GuardrailKind_GUARDRAIL_KIND_UNSPECIFIED, redact, 0)}}}},
+		{"unspecified action", &pb.SetGuardrailPolicyRequest{Policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pii, pb.GuardrailAction_GUARDRAIL_ACTION_UNSPECIFIED, 0)}}}},
+		{"duplicate kind", &pb.SetGuardrailPolicyRequest{Policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pii, redact, 0), rule(pii, redact, 1)}}}},
+		{"negative residual", &pb.SetGuardrailPolicyRequest{Policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pii, redact, -1)}}}},
+		{"signer key_id does not match its key", gpRequest(0, good, badSigner)},
+		{"revoked key without a reason", &pb.SetGuardrailPolicyRequest{Policy: gpRequest(0).GetPolicy(), RevokedSigners: []*pb.GuardrailRevokedKey{{KeyId: gpSigner(2).GetKeyId()}}}},
+		{"trusted signer is revoked", &pb.SetGuardrailPolicyRequest{Policy: gpRequest(0).GetPolicy(), TrustedSigners: []*pb.GuardrailTrustedSigner{good}, RevokedSigners: []*pb.GuardrailRevokedKey{{KeyId: good.GetKeyId(), Reason: "leaked"}}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, audit := newGPServer()
+			if _, err := s.SetGuardrailPolicy(gpAdminCtx(), gpRequest(0, good)); err != nil {
+				t.Fatalf("seed Set: %v", err)
+			}
+			_, err := s.SetGuardrailPolicy(gpAdminCtx(), tc.req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("Set(%s) = %v, want InvalidArgument", tc.name, err)
+			}
+			got, err := s.GetGuardrailPolicy(gpAdminCtx(), &pb.GetGuardrailPolicyRequest{})
+			if err != nil || got.GetPolicy().GetRevision() != 1 || !proto.Equal(got.GetPolicy().GetPolicy(), gpRequest(0).GetPolicy()) {
+				t.Fatalf("after a refused Set the store = (%v, %v), want revision 1 and the seed policy", got, err)
+			}
+			if n := len(audit.byAction(guardrailPolicySetAction)); n != 1 {
+				t.Fatalf("audit entries = %d, want 1 (the seed only; a refused Set is not a change)", n)
+			}
+		})
+	}
+}
+
+// TestSetPolicy_RevisionMonotonic: each Set returns revision n and the hash of
+// exactly the rules it stored.
+func TestSetPolicy_RevisionMonotonic(t *testing.T) {
+	s, _ := newGPServer()
+	for want := int64(1); want <= 3; want++ {
+		req := gpRequest(int32(want), gpSigner(1))
+		resp, err := s.SetGuardrailPolicy(gpAdminCtx(), req)
+		if err != nil {
+			t.Fatalf("Set #%d: %v", want, err)
+		}
+		if resp.GetPolicy().GetRevision() != want {
+			t.Fatalf("revision = %d, want %d", resp.GetPolicy().GetRevision(), want)
+		}
+		wantHash, _ := guardrail.PolicyHash(req.GetPolicy())
+		if resp.GetPolicyHash() != wantHash {
+			t.Fatalf("Set #%d policy_hash = %q, want %q", want, resp.GetPolicyHash(), wantHash)
+		}
+	}
+}
+
+// TestSetPolicy_AuditEntry: one guardrail.policy.set entry per Set, carrying
+// old and new revision and hash, attributed to the caller, and no key bytes in
+// any encoding.
+func TestSetPolicy_AuditEntry(t *testing.T) {
+	s, audit := newGPServer()
+	signer := gpSigner(7)
+	first, err := s.SetGuardrailPolicy(gpAdminCtx(), gpRequest(0, signer))
+	if err != nil {
+		t.Fatalf("Set #1: %v", err)
+	}
+	second, err := s.SetGuardrailPolicy(gpAdminCtx(), gpRequest(4, signer))
+	if err != nil {
+		t.Fatalf("Set #2: %v", err)
+	}
+	entries := audit.byAction(guardrailPolicySetAction)
+	if len(entries) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(entries))
+	}
+	e := entries[1]
+	if e.Username != "ops" || e.ResourceType != "guardrail_policy" {
+		t.Fatalf("entry = user %q type %q, want ops / guardrail_policy", e.Username, e.ResourceType)
+	}
+	var d guardrailPolicyAuditDetail
+	if err := json.Unmarshal([]byte(e.Detail), &d); err != nil {
+		t.Fatalf("detail is not the typed JSON: %v (%s)", err, e.Detail)
+	}
+	want := guardrailPolicyAuditDetail{
+		PreviousRevision:    1,
+		PreviousPolicyHash:  first.GetPolicyHash(),
+		Revision:            2,
+		PolicyHash:          second.GetPolicyHash(),
+		TrustedSignerKeyIDs: []string{signer.GetKeyId()},
+	}
+	if d.PreviousRevision != want.PreviousRevision || d.PreviousPolicyHash != want.PreviousPolicyHash ||
+		d.Revision != want.Revision || d.PolicyHash != want.PolicyHash ||
+		len(d.TrustedSignerKeyIDs) != 1 || d.TrustedSignerKeyIDs[0] != signer.GetKeyId() {
+		t.Fatalf("detail = %+v, want %+v", d, want)
+	}
+	var firstDetail guardrailPolicyAuditDetail
+	_ = json.Unmarshal([]byte(entries[0].Detail), &firstDetail)
+	if firstDetail.PreviousRevision != 0 || firstDetail.PreviousPolicyHash != "" {
+		t.Fatalf("first Set's detail = %+v, want no previous revision or hash", firstDetail)
+	}
+	key := signer.GetPublicKey()
+	for _, enc := range []string{string(key), hex.EncodeToString(key), base64.StdEncoding.EncodeToString(key), base64.RawStdEncoding.EncodeToString(key), base64.URLEncoding.EncodeToString(key)} {
+		for _, field := range []string{e.Detail, e.ResourceID, e.Username, e.Action} {
+			if strings.Contains(field, enc) {
+				t.Fatalf("audit entry carries the public key bytes (%q)", field)
+			}
+		}
+	}
+}
+
+// TestSetPolicy_Revocation (#2729): a revocation goes through the audited Set;
+// a Set that drops it is FAILED_PRECONDITION, a stale expected_revision is
+// ABORTED, neither changes the store or writes an entry, and the audit
+// detail names the revoked key ids.
+func TestSetPolicy_Revocation(t *testing.T) {
+	s, audit := newGPServer()
+	oldKey, newKey := gpSigner(1), gpSigner(2)
+	if _, err := s.SetGuardrailPolicy(gpAdminCtx(), gpRequest(0, oldKey)); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+	one := int64(1)
+	revoke := gpRequest(0, newKey)
+	revoke.RevokedSigners = []*pb.GuardrailRevokedKey{{KeyId: oldKey.GetKeyId(), Reason: "leaked"}}
+	revoke.ExpectedRevision = &one
+	if _, err := s.SetGuardrailPolicy(gpUserCtx(), revoke); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("non-admin revoke = %v, want PermissionDenied", err)
+	}
+	resp, err := s.SetGuardrailPolicy(gpAdminCtx(), revoke)
+	if err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if r := resp.GetPolicy().GetRevokedSigners(); len(r) != 1 || r[0].GetRevokedAt() == nil {
+		t.Fatalf("stored revoked = %v, want one stamped entry", r)
+	}
+	if _, err := s.SetGuardrailPolicy(gpAdminCtx(), revoke); status.Code(err) != codes.Aborted {
+		t.Fatalf("Set with a stale expected_revision = %v, want Aborted", err)
+	}
+	if _, err := s.SetGuardrailPolicy(gpAdminCtx(), gpRequest(0, newKey)); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Set dropping the revocation = %v, want FailedPrecondition", err)
+	}
+	got, err := s.GetGuardrailPolicy(gpUserCtx(), &pb.GetGuardrailPolicyRequest{})
+	if err != nil || got.GetPolicy().GetRevision() != 2 || len(got.GetPolicy().GetRevokedSigners()) != 1 {
+		t.Fatalf("after refused Sets = (%v, %v), want revision 2 with the revocation", got, err)
+	}
+	entries := audit.byAction(guardrailPolicySetAction)
+	if len(entries) != 2 {
+		t.Fatalf("audit entries = %d, want 2 (refused Sets write none)", len(entries))
+	}
+	var d guardrailPolicyAuditDetail
+	if err := json.Unmarshal([]byte(entries[1].Detail), &d); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.RevokedSignerKeyIDs) != 1 || d.RevokedSignerKeyIDs[0] != oldKey.GetKeyId() {
+		t.Fatalf("audit detail revoked = %v, want [%s]", d.RevokedSignerKeyIDs, oldKey.GetKeyId())
+	}
+}
