@@ -66,3 +66,140 @@ func containerTopologyKick(ctx context.Context, bus *events.Bus, debounce time.D
 				}
 				timer.Reset(debounce) // trailing: restart on every event of the burst
 			case <-timer.C:
+				select {
+				case kick <- struct{}{}:
+				default: // a pass is already pending; coalesce
+				}
+			}
+		}
+	}()
+	return kick
+}
+
+// Reconcile-pass metrics (#3050). The OTel names use dots; VictoriaMetrics
+// stores them with underscores (containarium_netpolicy_reconcile_passes_total,
+// containarium_netpolicy_reconcile_passes_per_minute).
+const (
+	netPolicyReconcilePassesName = "containarium.netpolicy.reconcile_passes_total"
+	netPolicyReconcileRateName   = "containarium.netpolicy.reconcile_passes_per_minute"
+	netPolicyReconcileRateWindow = time.Minute
+)
+
+// Reconcile triggers, the "trigger" attribute on the pass counter.
+const (
+	reconcileTriggerInitial = "initial"
+	reconcileTriggerTimer   = "timer"
+	reconcileTriggerEvent   = "event"
+)
+
+// reconcileMeter counts reconcile passes and reports how many ran in the
+// trailing minute, so a runaway loop is visible on a dashboard.
+type reconcileMeter struct {
+	passes otelmetric.Int64Counter
+	now    func() time.Time
+
+	mu     sync.Mutex
+	recent []time.Time // pass start times within the trailing window, oldest first
+}
+
+func newReconcileMeter(mp otelmetric.MeterProvider, now func() time.Time) *reconcileMeter {
+	m := &reconcileMeter{now: now}
+	meter := mp.Meter("containarium")
+	c, err := meter.Int64Counter(netPolicyReconcilePassesName,
+		otelmetric.WithDescription("Network-policy reconcile passes, by trigger (initial, timer, event)"))
+	if err != nil {
+		log.Printf("[netpolicy] reconcile pass counter: %v", err)
+	} else {
+		m.passes = c
+	}
+	if _, err := meter.Int64ObservableGauge(netPolicyReconcileRateName,
+		otelmetric.WithDescription("Network-policy reconcile passes that started in the trailing minute"),
+		otelmetric.WithInt64Callback(func(_ context.Context, o otelmetric.Int64Observer) error {
+			o.Observe(int64(m.perMinute()))
+			return nil
+		})); err != nil {
+		log.Printf("[netpolicy] reconcile rate gauge: %v", err)
+	}
+	return m
+}
+
+// record counts one pass started by trigger.
+func (m *reconcileMeter) record(trigger string) {
+	if m.passes != nil {
+		m.passes.Add(context.Background(), 1, otelmetric.WithAttributes(attribute.String("trigger", trigger)))
+	}
+	t := m.now()
+	m.mu.Lock()
+	m.recent = append(m.recent, t)
+	m.pruneLocked(t)
+	m.mu.Unlock()
+}
+
+// perMinute is the number of passes that started in the trailing window.
+func (m *reconcileMeter) perMinute() int {
+	t := m.now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pruneLocked(t)
+	return len(m.recent)
+}
+
+func (m *reconcileMeter) pruneLocked(now time.Time) {
+	cut := 0
+	for cut < len(m.recent) && now.Sub(m.recent[cut]) >= netPolicyReconcileRateWindow {
+		cut++
+	}
+	if cut > 0 {
+		m.recent = append(m.recent[:0], m.recent[cut:]...)
+	}
+}
+
+// runPass runs one reconcile pass and counts it.
+func (e *NetworkPolicyEnforcer) runPass(trigger string) {
+	if e.meter != nil {
+		e.meter.record(trigger)
+	}
+	pass := e.pass
+	if pass == nil {
+		pass = e.reconcile
+	}
+	if err := pass(e.ctx); err != nil {
+		log.Printf("[netpolicy] reconcile (%s): %v", trigger, err)
+	}
+}
+
+// reconcileLoop re-converges every e.interval and when kick fires (a debounced
+// burst of container events). Errors are logged, not fatal. Runs until e.ctx is
+// done; the caller has done e.wg.Add(1).
+func (e *NetworkPolicyEnforcer) reconcileLoop(kick <-chan struct{}) {
+	defer e.wg.Done()
+	tick := time.NewTicker(e.interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-tick.C:
+			e.runPass(reconcileTriggerTimer)
+		case <-kick:
+			e.runPass(reconcileTriggerEvent)
+		}
+	}
+}
+
+// fullListInspector is the enforcer's containerInspector over the Incus
+// client: each pass's container list is one recursive Incus request
+// (ListContainersFull) instead of one GetInstance plus one GetInstanceState per
+// instance (#3050). GetRawInstance is the client's own.
+type fullListInspector struct{ *incus.Client }
+
+var _ containerInspector = fullListInspector{}
+
+func (f fullListInspector) ListContainers() ([]incus.ContainerInfo, error) {
+	return f.ListContainersFull()
+}
+
+// globalReconcileMeter returns a meter on the global OTel provider.
+func globalReconcileMeter() *reconcileMeter {
+	return newReconcileMeter(otel.GetMeterProvider(), time.Now)
+}
