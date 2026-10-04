@@ -120,3 +120,65 @@ func TestQueue_SkillFilter(t *testing.T) {
 	if !ok || leased.SkillID != "beta" {
 		t.Fatalf("filtered lease should return the beta task, got ok=%v %+v", ok, leased)
 	}
+	// "alpha" is still leasable.
+	a, ok := q.lease("alpha", time.Minute)
+	if !ok || a.SkillID != "alpha" {
+		t.Fatalf("alpha task should be leasable, got ok=%v %+v", ok, a)
+	}
+}
+
+func TestQueue_FIFOAndEmpty(t *testing.T) {
+	q, _ := newTestQueue()
+	if _, ok := q.lease("", 0); ok {
+		t.Fatal("empty queue should lease nothing")
+	}
+	id1 := q.enqueue("s", "1")
+	id2 := q.enqueue("s", "2")
+	l1, _ := q.lease("", time.Minute)
+	l2, _ := q.lease("", time.Minute)
+	if l1.ID != id1 || l2.ID != id2 {
+		t.Errorf("FIFO violated: got %s then %s, want %s then %s", l1.ID, l2.ID, id1, id2)
+	}
+}
+
+func TestQueue_DoubleCompleteRejected(t *testing.T) {
+	q, _ := newTestQueue()
+	q.enqueue("s", "a")
+	l, _ := q.lease("", time.Minute)
+	if ok := q.complete(l.ID, l.LeaseToken, "first", ""); !ok {
+		t.Fatal("first complete should succeed")
+	}
+	// Re-completing a gone task is a no-op, not a panic.
+	if ok := q.complete(l.ID, l.LeaseToken, "second", ""); ok {
+		t.Error("completing an already-removed task must return false")
+	}
+}
+
+func TestQueue_ConcurrentLeasesAreUnique(t *testing.T) {
+	q := newAgentTaskQueue() // real clock is fine; we only test mutual exclusion
+	const n = 50
+	for i := 0; i < n; i++ {
+		q.enqueue("s", "x")
+	}
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if l, ok := q.lease("", time.Minute); ok {
+				mu.Lock()
+				if seen[l.ID] {
+					t.Errorf("task %s leased twice concurrently", l.ID)
+				}
+				seen[l.ID] = true
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if len(seen) != n {
+		t.Errorf("leased %d distinct tasks, want %d", len(seen), n)
+	}
+}
