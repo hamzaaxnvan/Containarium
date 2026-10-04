@@ -80,3 +80,85 @@ func TestGetTerminalAllowedOrigins_Default(t *testing.T) {
 		}
 	}
 }
+
+func TestTerminalHandler_WebSocketOriginValidation(t *testing.T) {
+	// Skip if Incus is not available (can't create real handler)
+	handler, err := NewTerminalHandler()
+	if err != nil {
+		t.Skip("Skipping test: Incus not available")
+	}
+
+	tests := []struct {
+		name          string
+		origin        string
+		envOrigins    string
+		expectAllowed bool
+	}{
+		{
+			name:          "no origin header should be rejected",
+			origin:        "",
+			envOrigins:    "",
+			expectAllowed: false,
+		},
+		{
+			name:          "localhost:3000 allowed by default",
+			origin:        "http://localhost:3000",
+			envOrigins:    "",
+			expectAllowed: true,
+		},
+		{
+			name:          "unknown origin rejected by default",
+			origin:        "https://evil.com",
+			envOrigins:    "",
+			expectAllowed: false,
+		},
+		{
+			name:          "configured origin allowed",
+			origin:        "https://myapp.example.com",
+			envOrigins:    "https://myapp.example.com",
+			expectAllowed: true,
+		},
+		{
+			name:          "non-configured origin rejected",
+			origin:        "https://other.com",
+			envOrigins:    "https://myapp.example.com",
+			expectAllowed: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CONTAINARIUM_ALLOWED_ORIGINS", tt.envOrigins)
+
+			req := httptest.NewRequest("GET", "/v1/containers/test/terminal", nil)
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+
+			allowed := handler.upgrader.CheckOrigin(req)
+
+			if allowed != tt.expectAllowed {
+				t.Errorf("expected CheckOrigin to return %v for origin %q, got %v",
+					tt.expectAllowed, tt.origin, allowed)
+			}
+		})
+	}
+}
+
+func TestCORSOriginNotWildcard(t *testing.T) {
+	// Ensure default origins don't include wildcard
+	t.Setenv("CONTAINARIUM_ALLOWED_ORIGINS", "")
+
+	origins := getAllowedOrigins()
+
+	for _, origin := range origins {
+		if origin == "*" {
+			t.Error("SECURITY: Default CORS origins should not include wildcard '*'")
+		}
+	}
+}
+
+// Terminal WebSocket auth (token required, tenant-scoped) is exercised by
+// TestAuthorizeTenantWSAccess in gateway_test.go — a real assertion on the
+// decision logic the /terminal and /console-attach route closures both
+// call, not a documentation placeholder. See #1754.
