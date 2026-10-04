@@ -106,3 +106,58 @@ func TestDemuxer_InterleavedStreamsPreserveOrder(t *testing.T) {
 		t.Fatalf("got %d frames, want %d", len(frames), len(want))
 	}
 	for i, w := range want {
+		if frames[i].Stream != w.stream || string(frames[i].Payload) != w.payload {
+			t.Errorf("frame %d = %v %q, want %v %q", i, frames[i].Stream, frames[i].Payload, w.stream, w.payload)
+		}
+	}
+}
+
+// TestDemuxer_ChunkedArbitrarily feeds the same multi-frame buffer split at
+// several different byte offsets (not aligned to frame boundaries) and
+// checks the decoded result is identical every time — the resumable
+// reader will hand the demuxer whatever byte range tail_log happened to
+// return, never frame-aligned by construction.
+func TestDemuxer_ChunkedArbitrarily(t *testing.T) {
+	var buf bytes.Buffer
+	for i := 0; i < 5; i++ {
+		buf.Write(EncodeFrame(Stdout, []byte("line-out")))
+		buf.Write(EncodeFrame(Stderr, []byte("line-err")))
+	}
+	full := buf.Bytes()
+
+	splits := []int{1, 7, 13, 29, 40}
+	for _, split := range splits {
+		if split >= len(full) {
+			continue
+		}
+		var d Demuxer
+		f1, err := d.Write(full[:split])
+		if err != nil {
+			t.Fatalf("split=%d: Write(first): %v", split, err)
+		}
+		f2, err := d.Write(full[split:])
+		if err != nil {
+			t.Fatalf("split=%d: Write(second): %v", split, err)
+		}
+		got := append(f1, f2...)
+		if len(got) != 10 {
+			t.Fatalf("split=%d: got %d frames, want 10", split, len(got))
+		}
+	}
+}
+
+func TestDemuxer_MalformedLine(t *testing.T) {
+	var d Demuxer
+	_, err := d.Write([]byte("not-a-valid-frame\n"))
+	if err == nil {
+		t.Fatal("expected an error for a malformed frame line")
+	}
+}
+
+func TestDemuxer_UnknownStreamID(t *testing.T) {
+	var d Demuxer
+	_, err := d.Write([]byte("9 aGVsbG8=\n"))
+	if err == nil {
+		t.Fatal("expected an error for an unrecognized stream id")
+	}
+}
