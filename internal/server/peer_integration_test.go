@@ -244,3 +244,497 @@ func TestIntegration_MultiBackendListContainers(t *testing.T) {
 	// Verify backend_id tagging
 	backendCounts := make(map[string]int)
 	for _, c := range containers {
+		backendCounts[c.BackendID]++
+	}
+	if backendCounts["gcp-spot"] != 2 {
+		t.Errorf("expected 2 containers from gcp-spot, got %d", backendCounts["gcp-spot"])
+	}
+	if backendCounts["tunnel-gpu"] != 1 {
+		t.Errorf("expected 1 container from tunnel-gpu, got %d", backendCounts["tunnel-gpu"])
+	}
+}
+
+// TestIntegration_PeerForwardResize verifies that resize operations
+// are forwarded to the correct peer when the container is not local.
+func TestIntegration_PeerForwardResize(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	// Find charlie's peer
+	peer, _ := pool.FindContainerPeer("charlie", "")
+	if peer == nil {
+		t.Fatal("expected to find charlie on tunnel-gpu")
+	}
+	if peer.ID != "tunnel-gpu" {
+		t.Errorf("expected peer ID 'tunnel-gpu', got %q", peer.ID)
+	}
+
+	// Forward resize
+	body := []byte(`{"cpu":"8","memory":"16GB","disk":"100GB"}`)
+	respBody, statusCode, err := peer.ForwardRequest("PUT", "/v1/containers/charlie/resize", "", body)
+	if err != nil {
+		t.Fatalf("resize forward failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected 200, got %d: %s", statusCode, respBody)
+	}
+
+	// Verify request reached the peer
+	lastReq := gpu.lastRequest()
+	if lastReq.Method != "PUT" || lastReq.Path != "/v1/containers/charlie/resize" {
+		t.Errorf("unexpected request: %s %s", lastReq.Method, lastReq.Path)
+	}
+}
+
+// TestIntegration_ResizeContainerForwardsRequestFields verifies that
+// ContainerServer.ResizeContainer's peer-forward path (the container isn't
+// local, so the request is forwarded over HTTP) carries CpuRequest and
+// MemoryRequest along with cpu/memory/disk. The forward body used to be
+// built from a map literal naming only cpu/memory/disk, silently dropping
+// the two request fields on any resize routed through a peer (#1572,
+// caught in review on PR #1577).
+func TestIntegration_ResizeContainerForwardsRequestFields(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	// The container is not local: GetContainer errors, so
+	// container.Manager.Resize returns "not found" and ResizeContainer
+	// falls through to the peer-forward path above.
+	mock := incustest.NewMockBackend()
+	mock.GetContainerFunc = func(name string) (*incus.ContainerInfo, error) {
+		return nil, fmt.Errorf("not found")
+	}
+	s := &ContainerServer{
+		manager:  container.NewWithBackend(mock),
+		peerPool: pool,
+	}
+
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"charlie", []string{"user"}, []string{auth.ScopeContainersWrite})
+
+	_, err := s.ResizeContainer(ctx, &pb.ResizeContainerRequest{
+		Username:      "charlie",
+		Cpu:           "4",
+		CpuRequest:    "500m",
+		MemoryRequest: "1Gi",
+	})
+	if err != nil {
+		t.Fatalf("ResizeContainer: %v", err)
+	}
+
+	lastReq := gpu.lastRequest()
+	if lastReq.Method != "PUT" || lastReq.Path != "/v1/containers/charlie/resize" {
+		t.Fatalf("unexpected request: %s %s", lastReq.Method, lastReq.Path)
+	}
+	var forwarded map[string]string
+	if err := json.Unmarshal([]byte(lastReq.Body), &forwarded); err != nil {
+		t.Fatalf("forwarded body not valid JSON: %v (%s)", err, lastReq.Body)
+	}
+	if forwarded["cpuRequest"] != "500m" {
+		t.Errorf("forwarded cpuRequest = %q, want %q (raw body: %s)", forwarded["cpuRequest"], "500m", lastReq.Body)
+	}
+	if forwarded["memoryRequest"] != "1Gi" {
+		t.Errorf("forwarded memoryRequest = %q, want %q (raw body: %s)", forwarded["memoryRequest"], "1Gi", lastReq.Body)
+	}
+}
+
+// TestIntegration_ResizeAdmissionNotEvaluatedForPeerForwardedContainer proves
+// the #1579 requirement that a peer-forwarded resize is never evaluated
+// against the LOCAL host's capacity. The local gate here is configured to
+// reject absolutely everything (factor effectively 0 capacity headroom) —
+// if the admission check ran unconditionally before the local/peer dispatch
+// decision (rather than only once the container is confirmed local), this
+// resize would be wrongly rejected with ResourceExhausted before ever
+// reaching the peer. It must instead sail through to the peer unblocked.
+func TestIntegration_ResizeAdmissionNotEvaluatedForPeerForwardedContainer(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	// charlie's box is not local: GetContainer errors so ResizeContainer
+	// falls through to the peer-forward path.
+	mock := incustest.NewMockBackend()
+	mock.GetContainerFunc = func(name string) (*incus.ContainerInfo, error) {
+		return nil, fmt.Errorf("not found")
+	}
+	s := &ContainerServer{
+		manager:  container.NewWithBackend(mock),
+		peerPool: pool,
+	}
+	// A maximally strict local gate: 0 physical cores of headroom would
+	// reject any nonzero CPU request outright if evaluated against THIS
+	// host. hostCoresFn reports a nonzero host (so the gate doesn't fail
+	// open on "capacity unknown") with zero factor-adjusted ceiling.
+	s.hostCoresFn = func() (float64, error) { return 8, nil }
+	s.SetCPUOvercommitPolicy(0.0001, true) // effectively zero headroom, strictly enforced
+
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"charlie", []string{"user"}, []string{auth.ScopeContainersWrite})
+
+	_, err := s.ResizeContainer(ctx, &pb.ResizeContainerRequest{Username: "charlie", Cpu: "8"})
+	if err != nil {
+		t.Fatalf("peer-forwarded resize must not be evaluated against local capacity, got %v", err)
+	}
+	if status.Code(err) == codes.ResourceExhausted {
+		t.Fatalf("resize was rejected by the LOCAL admission gate despite the container living on a peer")
+	}
+
+	lastReq := gpu.lastRequest()
+	if lastReq.Method != "PUT" || lastReq.Path != "/v1/containers/charlie/resize" {
+		t.Fatalf("resize never reached the peer: %s %s", lastReq.Method, lastReq.Path)
+	}
+}
+
+// TestIntegration_PeerForwardDelete verifies delete operations forward correctly.
+func TestIntegration_PeerForwardDelete(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	peer, _ := pool.FindContainerPeer("charlie", "")
+	if peer == nil {
+		t.Fatal("expected to find charlie")
+	}
+
+	_, statusCode, err := peer.ForwardRequest("DELETE", "/v1/containers/charlie", "", nil)
+	if err != nil {
+		t.Fatalf("delete forward failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected 200, got %d", statusCode)
+	}
+
+	// Verify container was removed from fake backend
+	gpu.mu.RLock()
+	if len(gpu.containers) != 0 {
+		t.Errorf("expected 0 containers after delete, got %d", len(gpu.containers))
+	}
+	gpu.mu.RUnlock()
+}
+
+// TestIntegration_PeerForwardCollaborators verifies collaborator operations forward correctly.
+func TestIntegration_PeerForwardCollaborators(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie", State: "CONTAINER_STATE_RUNNING"},
+	}, fakeSystemInfo{})
+
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	peer, _ := pool.FindContainerPeer("charlie", "")
+	if peer == nil {
+		t.Fatal("expected to find charlie")
+	}
+
+	// Add collaborator
+	body := []byte(`{"collaborator_username":"dave","ssh_public_key":"ssh-ed25519 AAAA_dave"}`)
+	_, statusCode, err := peer.ForwardRequest("POST", "/v1/containers/charlie/collaborators", "", body)
+	if err != nil {
+		t.Fatalf("add collaborator failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected 200, got %d", statusCode)
+	}
+
+	// List collaborators
+	_, statusCode, err = peer.ForwardRequest("GET", "/v1/containers/charlie/collaborators", "", nil)
+	if err != nil {
+		t.Fatalf("list collaborators failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected 200, got %d", statusCode)
+	}
+
+	// Remove collaborator
+	_, statusCode, err = peer.ForwardRequest("DELETE", "/v1/containers/charlie/collaborators/dave", "", nil)
+	if err != nil {
+		t.Fatalf("remove collaborator failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected 200, got %d", statusCode)
+	}
+}
+
+// TestIntegration_PeerSystemInfo verifies per-backend system info forwarding.
+func TestIntegration_PeerSystemInfo(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", nil, fakeSystemInfo{
+		Hostname:  "node-a",
+		TotalCPUs: 24,
+		TotalMem:  137438953472, // 128GB
+		GPUs: []fakeGPU{
+			{
+				Vendor:        "GPU_VENDOR_NVIDIA",
+				Model:         "GPU_MODEL_NVIDIA_RTX_4090",
+				ModelName:     "NVIDIA GeForce RTX 4090",
+				DriverVersion: "570.211.01",
+				CUDAVersion:   "12.8",
+			},
+		},
+	})
+
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	peer := &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: true, client: gpuSrv.Client(),
+	}
+
+	respBody, statusCode, err := peer.ForwardRequest("GET", "/v1/system/info", "", nil)
+	if err != nil {
+		t.Fatalf("system info forward failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected 200, got %d", statusCode)
+	}
+
+	var resp struct {
+		Info struct {
+			Hostname  string    `json:"hostname"`
+			TotalCPUs int       `json:"totalCpus"`
+			TotalMem  int64     `json:"totalMemoryBytes"`
+			GPUs      []fakeGPU `json:"gpus"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		t.Fatalf("failed to parse: %v", err)
+	}
+
+	if resp.Info.Hostname != "node-a" {
+		t.Errorf("expected hostname 'node-a', got %q", resp.Info.Hostname)
+	}
+	if resp.Info.TotalCPUs != 24 {
+		t.Errorf("expected 24 CPUs, got %d", resp.Info.TotalCPUs)
+	}
+	if len(resp.Info.GPUs) != 1 {
+		t.Fatalf("expected 1 GPU, got %d", len(resp.Info.GPUs))
+	}
+	if resp.Info.GPUs[0].Model != "GPU_MODEL_NVIDIA_RTX_4090" {
+		t.Errorf("expected GPU model RTX 4090, got %q", resp.Info.GPUs[0].Model)
+	}
+	if resp.Info.GPUs[0].CUDAVersion != "12.8" {
+		t.Errorf("expected CUDA 12.8, got %q", resp.Info.GPUs[0].CUDAVersion)
+	}
+}
+
+// TestIntegration_UnhealthyPeerSkipped verifies that unhealthy peers
+// are skipped during list and find operations.
+func TestIntegration_UnhealthyPeerSkipped(t *testing.T) {
+	gpu := newFakeBackend("tunnel-gpu", []fakeContainer{
+		{Name: "charlie-container", Username: "charlie"},
+	}, fakeSystemInfo{})
+
+	gpuSrv := httptest.NewServer(gpu.handler())
+	defer gpuSrv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-gpu"] = &PeerClient{
+		ID: "tunnel-gpu", Addr: gpuSrv.Listener.Addr().String(),
+		Healthy: false, // unhealthy!
+		client:  gpuSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	// List should return 0 (unhealthy peer skipped), but must name the
+	// skipped peer in the unreachable list rather than looking
+	// indistinguishable from "tunnel-gpu genuinely has no containers"
+	// (#1902).
+	containers, unreachable := pool.ListContainers("")
+	if len(containers) != 0 {
+		t.Errorf("expected 0 containers (peer unhealthy), got %d", len(containers))
+	}
+	if len(unreachable) != 1 || unreachable[0].BackendID != "tunnel-gpu" {
+		t.Errorf("expected tunnel-gpu reported as unreachable, got %+v", unreachable)
+	}
+
+	// Find should return nil, and must report tunnel-gpu as unreachable
+	// rather than looking indistinguishable from "charlie is nowhere" (#1905).
+	peer, unreachablePeer := pool.FindContainerPeer("charlie", "")
+	if peer != nil {
+		t.Error("expected nil (peer unhealthy)")
+	}
+	if len(unreachablePeer) != 1 || unreachablePeer[0].BackendID != "tunnel-gpu" {
+		t.Errorf("expected tunnel-gpu reported as unreachable, got %+v", unreachablePeer)
+	}
+
+	// Verify no requests were made to the peer
+	if gpu.requestCount() != 0 {
+		t.Errorf("expected 0 requests to unhealthy peer, got %d", gpu.requestCount())
+	}
+}
+
+// TestIntegration_AuthTokenForwarding verifies that auth tokens are
+// forwarded correctly to peer backends.
+func TestIntegration_AuthTokenForwarding(t *testing.T) {
+	var receivedAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"containers":[]}`))
+	}))
+	defer srv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["peer"] = &PeerClient{
+		ID: "peer", Addr: srv.Listener.Addr().String(),
+		Healthy: true, client: srv.Client(),
+	}
+	pool.mu.Unlock()
+
+	pool.ListContainers("my-jwt-token")
+
+	expected := "Bearer my-jwt-token"
+	if receivedAuth != expected {
+		t.Errorf("expected auth header %q, got %q", expected, receivedAuth)
+	}
+}
+
+// TestIntegration_PeerTerminalURLResolution verifies terminal URL
+// generation for containers on peer backends.
+func TestIntegration_PeerTerminalURLResolution(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{"name": "alice-container", "state": "Running"},
+				{"name": "bob-container", "state": "Running"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["gpu-node"] = &PeerClient{
+		ID: "gpu-node", Addr: srv.Listener.Addr().String(),
+		Healthy: true, client: srv.Client(),
+	}
+	pool.mu.Unlock()
+
+	// Alice's terminal should resolve to peer
+	url, err := pool.PeerTerminalURL("alice", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectedURL := fmt.Sprintf("ws://%s/v1/containers/alice/terminal", srv.Listener.Addr().String())
+	if url != expectedURL {
+		t.Errorf("expected %q, got %q", expectedURL, url)
+	}
+
+	// Unknown user should return empty
+	url, err = pool.PeerTerminalURL("unknown", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if url != "" {
+		t.Errorf("expected empty URL for unknown user, got %q", url)
+	}
+}
+
+// --- Helpers ---
+
+func pathEndsWith(path, suffix string) bool {
+	return len(path) >= len(suffix) && path[len(path)-len(suffix):] == suffix
+}
+
+func pathContains(path, sub string) bool {
+	for i := 0; i <= len(path)-len(sub); i++ {
+		if path[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func extractUsername(path string) string {
+	// /v1/containers/{username} or /v1/containers/{username}?force=true
+	parts := splitPath(path)
+	for i, p := range parts {
+		if p == "containers" && i+1 < len(parts) {
+			u := parts[i+1]
+			// Strip query params
+			if idx := indexOf(u, '?'); idx >= 0 {
+				return u[:idx]
+			}
+			return u
+		}
+	}
+	return ""
+}
+
+func splitPath(path string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i <= len(path); i++ {
+		if i == len(path) || path[i] == '/' {
+			if i > start {
+				parts = append(parts, path[start:i])
+			}
+			start = i + 1
+		}
+	}
+	return parts
+}
+
+func indexOf(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
