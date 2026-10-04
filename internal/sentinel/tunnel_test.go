@@ -203,3 +203,72 @@ func TestConnMuxWithTunnelClient(t *testing.T) {
 		SentinelAddr: fmt.Sprintf("127.0.0.1:%d", muxPort),
 		SentinelPins: []TunnelPin{id.Pin()},
 		Token:        token,
+		SpotID:       "mux-spot",
+		Ports:        []int{echoPort},
+	}
+	go func() { _ = client.Run(ctx) }()
+
+	// Wait for connection
+	select {
+	case spot := <-connectCh:
+		assert.Equal(t, "mux-spot", spot.ID)
+		t.Logf("tunnel client connected through ConnMux: %s at %s", spot.ID, spot.LocalIP)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for tunnel connection through ConnMux")
+	}
+
+	assert.True(t, registry.Connected())
+}
+
+// waitForListener blocks until addr accepts a TCP connection, failing the
+// test after a generous deadline. Tests used to `time.Sleep(100ms)` after
+// starting a server goroutine and then dial; on a loaded CI runner the
+// listener was not always bound yet and the dial got "connection refused".
+// A readiness poll is both faster on an idle machine and correct on a busy
+// one.
+func waitForListener(t *testing.T, addr string) {
+	t.Helper()
+	conn, err := dialRetry(addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("listener %s never came up: %v", addr, err)
+	}
+	// Close the probe. Left open, the server's handler for it blocks reading
+	// the first byte until its 10s handshake deadline, a session goroutine
+	// that outlives the test (#3009).
+	_ = conn.Close()
+}
+
+// dialRetry dials addr until it succeeds or timeout elapses, returning the
+// open connection or the last dial error.
+func dialRetry(addr string, timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return nil, lastErr
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+// policyAny returns a TokenPolicy authorizing the given token for any pool.
+// Test helper for the legacy single-token path.
+func policyAny(token string) *TokenPolicy {
+	p := NewTokenPolicy()
+	p.Allow(token, PoolAny)
+	return p
+}

@@ -29,3 +29,34 @@ type Inspector interface {
 // memory. Bytes past the head still flow through, uninspected (documented best-
 // effort limit; full body inspection is a WAF-engine refinement).
 const maxHeadBytes = 16 * 1024
+
+// block403 is the response written to a client whose request an Inspector blocked
+// (enforce mode). Minimal + Connection: close so the proxy can tear the
+// connection down cleanly without forwarding upstream.
+var block403 = []byte("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+
+// readHead reads from c until the end-of-headers marker ("\r\n\r\n"), max bytes,
+// or EOF — whichever first — and returns everything read. Reassembles across
+// however many TCP segments/reads the head spans. The returned bytes are
+// forwarded verbatim to the upstream after inspection (byte-preserving proxy),
+// so this consumes only the head; the rest of the stream is piped afterward.
+func readHead(c net.Conn, max int) []byte {
+	buf := make([]byte, 0, 2048)
+	tmp := make([]byte, 2048)
+	for len(buf) < max {
+		n, err := c.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			if bytes.Contains(buf, []byte("\r\n\r\n")) {
+				break
+			}
+		}
+		if err != nil {
+			break // EOF / error before a full head — inspect what we have
+		}
+	}
+	if len(buf) > max {
+		buf = buf[:max]
+	}
+	return buf
+}
