@@ -72,3 +72,77 @@ func (r *sshpiperRouter) pipeObject(tenant string, fromKeys []string, hostPubKey
 	if len(hostPubKeys) > 0 && !r.b.cfg.InsecureIgnoreHostKey {
 		to["known_hosts_data"] = knownHostsData(r.upstreamHost(tenant), hostPubKeys...)
 	} else {
+		to["ignore_hostkey"] = true
+	}
+	// The upstream credential: sshpiper authenticates to the box with this key
+	// (its public half is authorized on the box). Set only when configured.
+	if r.b.cfg.GatewayUpstreamKeySecret != "" {
+		to["private_key_secret"] = map[string]any{"name": r.b.cfg.GatewayUpstreamKeySecret}
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "sshpiper.com/v1beta1",
+		"kind":       "Pipe",
+		"metadata": map[string]any{
+			"name":      pipeName(tenant),
+			"namespace": r.b.cfg.GatewayNamespace,
+			"labels":    toAnyMap(boxLabels(tenant)),
+		},
+		"spec": map[string]any{
+			"from": []any{map[string]any{
+				"username":             tenant,
+				"authorized_keys_data": base64.StdEncoding.EncodeToString(buf),
+			}},
+			"to": to,
+		},
+	}}
+}
+
+// ProgramRoute creates or updates the tenant's Pipe in the gateway namespace.
+// No-op when the gateway isn't configured. The Pipe's from-keys are the
+// agent's client keys plus any authorized sentinel keys (so a sentinel in
+// front of this node can complete hop 2).
+func (r *sshpiperRouter) ProgramRoute(ctx context.Context, tenant string, keys []string) error {
+	if !r.Enabled() {
+		return nil
+	}
+	ns := r.b.cfg.GatewayNamespace
+	hostPubs, err := r.b.ensureHostKey(ctx, tenant) // pin the box's stable host keys
+	if err != nil {
+		return fmt.Errorf("ensure host key: %w", err)
+	}
+	fromKeys := append(append([]string{}, keys...), r.b.sentinelKeys(ctx)...)
+	obj := r.pipeObject(tenant, fromKeys, hostPubs)
+	_, err = r.b.dyn.Resource(pipeGVR).Namespace(ns).Create(ctx, obj, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		existing, gerr := r.b.dyn.Resource(pipeGVR).Namespace(ns).Get(ctx, pipeName(tenant), metav1.GetOptions{})
+		if gerr != nil {
+			return gerr
+		}
+		existing.Object["spec"] = obj.Object["spec"]
+		_, err = r.b.dyn.Resource(pipeGVR).Namespace(ns).Update(ctx, existing, metav1.UpdateOptions{})
+	}
+	return err
+}
+
+// RemoveRoute removes the tenant's Pipe. No-op when the gateway isn't configured
+// or the Pipe is already gone. (The Pipe lives in the gateway namespace, so the
+// per-tenant namespace delete does not cascade to it — it must be deleted
+// explicitly.)
+func (r *sshpiperRouter) RemoveRoute(ctx context.Context, tenant string) error {
+	if !r.Enabled() {
+		return nil
+	}
+	err := r.b.dyn.Resource(pipeGVR).Namespace(r.b.cfg.GatewayNamespace).Delete(ctx, pipeName(tenant), metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+func toAnyMap(m map[string]string) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
