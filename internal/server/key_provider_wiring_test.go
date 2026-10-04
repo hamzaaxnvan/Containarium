@@ -41,3 +41,47 @@ func TestKeyProviderFromDir_ConfiguredDirYieldsAProvider(t *testing.T) {
 // The ordering trap.
 //
 // SetEncryptionStorage builds the hooks holding whatever provider the server
+// has at that moment. If custody is configured afterwards, hooks built
+// earlier would keep a nil provider, stay inert, and every encrypted create
+// would fail with "resolved no storage pool" — on a daemon the operator had
+// correctly configured. Either order has to work.
+func TestSetKeyProvider_WorksInEitherOrder(t *testing.T) {
+	provider, err := zfskey.NewFileKeyProvider(filepath.Join(t.TempDir(), "keys"))
+	if err != nil {
+		t.Fatalf("NewFileKeyProvider: %v", err)
+	}
+
+	t.Run("custody configured before the storage wiring", func(t *testing.T) {
+		s := &ContainerServer{}
+		s.SetKeyProvider(provider)
+		s.setEncryptionHooks("tank/tenants", &fakeRefStore{refs: map[string]zfskey.KeyRef{}}, newFakePools())
+
+		if !s.encryption.enabled() {
+			t.Fatal("hooks are inert although key custody is configured")
+		}
+	})
+
+	t.Run("custody configured after the storage wiring", func(t *testing.T) {
+		s := &ContainerServer{}
+		s.setEncryptionHooks("tank/tenants", &fakeRefStore{refs: map[string]zfskey.KeyRef{}}, newFakePools())
+		s.SetKeyProvider(provider)
+
+		if !s.encryption.enabled() {
+			t.Fatal("hooks built before SetKeyProvider kept a nil provider, so encryption stays " +
+				"off on a daemon that configured it — the failure would look like a bug in the " +
+				"create path rather than in startup ordering")
+		}
+	})
+}
+
+// With no custody the hooks stay inert, which is what makes the refusal in
+// validateEncryption the only thing an OSS operator sees.
+func TestSetEncryptionStorage_StaysInertWithoutCustody(t *testing.T) {
+	s := &ContainerServer{}
+	s.setEncryptionHooks("tank/tenants", &fakeRefStore{refs: map[string]zfskey.KeyRef{}}, newFakePools())
+
+	if s.encryption.enabled() {
+		t.Error("the encryption hooks are live on a daemon with no KeyProvider — an encrypted " +
+			"create would proceed with no key custody configured")
+	}
+}

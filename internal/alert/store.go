@@ -202,3 +202,72 @@ func (s *Store) ListEnabled(ctx context.Context) ([]*AlertRule, error) {
 			return nil, fmt.Errorf("failed to scan alert rule: %w", err)
 		}
 
+		if err := json.Unmarshal(labelsJSON, &rule.Labels); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal labels: %w", err)
+		}
+		if err := json.Unmarshal(annotationsJSON, &rule.Annotations); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal annotations: %w", err)
+		}
+
+		rules = append(rules, rule)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating alert rules: %w", err)
+	}
+
+	return rules, nil
+}
+
+// Update updates an existing alert rule
+func (s *Store) Update(ctx context.Context, rule *AlertRule) (*AlertRule, error) {
+	labelsJSON, err := json.Marshal(rule.Labels)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal labels: %w", err)
+	}
+	annotationsJSON, err := json.Marshal(rule.Annotations)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal annotations: %w", err)
+	}
+
+	query := `
+		UPDATE alert_rules SET
+			name = $2, expr = $3, duration = $4, severity = $5,
+			description = $6, labels = $7, annotations = $8,
+			enabled = $9, updated_at = NOW()
+		WHERE id = $1
+		RETURNING updated_at
+	`
+
+	var updatedAt time.Time
+	err = s.pool.QueryRow(ctx, query,
+		rule.ID, rule.Name, rule.Expr, rule.Duration, rule.Severity,
+		rule.Description, labelsJSON, annotationsJSON, rule.Enabled,
+	).Scan(&updatedAt)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, fmt.Errorf("alert rule not found: %s", rule.ID)
+		}
+		return nil, fmt.Errorf("failed to update alert rule: %w", err)
+	}
+
+	rule.UpdatedAt = updatedAt
+	return rule, nil
+}
+
+// Delete removes an alert rule by ID
+func (s *Store) Delete(ctx context.Context, id string) error {
+	result, err := s.pool.Exec(ctx, "DELETE FROM alert_rules WHERE id = $1", id)
+	if err != nil {
+		return fmt.Errorf("failed to delete alert rule: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("alert rule not found: %s", id)
+	}
+	return nil
+}
+
+// Close closes the underlying connection pool
+func (s *Store) Close() {
+	s.pool.Close()
+}
