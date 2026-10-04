@@ -67,3 +67,21 @@ func TestProvisionTLS_StillAppendsOnHealthyRead(t *testing.T) {
 	srv, fc := newRWFakeCaddy(tlsConfigWithPolicy(
 		[]string{"other.example.com"},
 		[]CaddyTLSIssuer{NewACMEIssuer()},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+
+	if err := p.ProvisionTLS("app.example.com"); err != nil {
+		t.Fatalf("ProvisionTLS: %v", err)
+	}
+
+	policies := readPolicies(t, fc)
+	if !hasSubject(policies, "app.example.com") {
+		t.Fatalf("subject not appended on the healthy path; subjects: %v", subjectsOf(policies))
+	}
+	if len(policies) != 1 {
+		t.Fatalf("want the subject appended to the existing policy, not a duplicate policy; got %d policies",
+			len(policies))
+	}
+}
