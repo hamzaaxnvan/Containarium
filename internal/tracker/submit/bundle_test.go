@@ -104,3 +104,109 @@ func TestBundle_Rejected(t *testing.T) {
 			readFunc: func(string, string) ([]byte, error) {
 				return []byte("garbage"), nil
 			},
+		}
+		_, err := ExtractBundle(box, "box1", "/workspace", "aaaa", DefaultMaxBundleBytes)
+		if !errors.Is(err, ErrBundleMalformed) {
+			t.Errorf("err = %v, want ErrBundleMalformed", err)
+		}
+	})
+
+	t.Run("box exec transport failure propagates", func(t *testing.T) {
+		box := &fakeBox{execFunc: func(string, []string) (string, string, error) {
+			return "", "", errors.New("box unreachable")
+		}}
+		_, err := ExtractBundle(box, "box1", "/workspace", "aaaa", DefaultMaxBundleBytes)
+		if err == nil {
+			t.Fatal("want error, got nil")
+		}
+		if len(box.readCalls) != 0 {
+			t.Errorf("ReadFile was called (%v); must not proceed after exec failure", box.readCalls)
+		}
+	})
+}
+
+func TestExtractBundle_HappyPath(t *testing.T) {
+	bundleBytes := validBundleBytes(t)
+	headSHA := "cccccccccccccccccccccccccccccccccccccccc"
+
+	box := &fakeBox{
+		execFunc: func(_ string, cmd []string) (string, string, error) {
+			script := strings.Join(cmd, " ")
+			switch {
+			case strings.Contains(script, "wc -c") || strings.Contains(script, "stat"):
+				return "12345", "", nil
+			case strings.Contains(script, "bundle create"):
+				return headSHA + "\n", "", nil
+			}
+			t.Fatalf("unexpected exec: %v", cmd)
+			return "", "", nil
+		},
+		readFunc: func(string, string) ([]byte, error) {
+			return bundleBytes, nil
+		},
+	}
+
+	result, err := ExtractBundle(box, "box1", "/workspace", "aaaa", DefaultMaxBundleBytes)
+	if err != nil {
+		t.Fatalf("ExtractBundle: %v", err)
+	}
+	if result.HeadSHA != headSHA {
+		t.Errorf("HeadSHA = %q, want %q", result.HeadSHA, headSHA)
+	}
+	if result.BundlePath == "" {
+		t.Fatal("BundlePath is empty")
+	}
+	defer func() { _ = os.Remove(result.BundlePath) }()
+
+	info, err := os.Stat(result.BundlePath)
+	if err != nil {
+		t.Fatalf("stat bundle file: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("bundle file mode = %v, want 0600", info.Mode().Perm())
+	}
+	got, err := os.ReadFile(result.BundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(bundleBytes) {
+		t.Error("bundle file on disk does not match what ReadFile returned")
+	}
+
+	// The exec script must reference the workspace, the base commit, and
+	// the literal ref HEAD (not a resolved sha) as the bundle range —
+	// see PR #1951's flagged finding: `git bundle create` refuses a raw
+	// sha..sha range with "Refusing to create empty bundle" even for a
+	// non-empty commit range, because it has no ref to advertise.
+	foundBundleCreate := false
+	for _, call := range box.execCalls {
+		script := strings.Join(call, " ")
+		if strings.Contains(script, "bundle create") {
+			foundBundleCreate = true
+			if !strings.Contains(script, "aaaa..HEAD") {
+				t.Errorf("bundle create script = %q, want it to use aaaa..HEAD (a ref upper bound)", script)
+			}
+			if !strings.Contains(script, "/workspace") {
+				t.Errorf("bundle create script = %q, want it to reference the workspace path", script)
+			}
+		}
+	}
+	if !foundBundleCreate {
+		t.Error("no exec call contained a bundle create")
+	}
+}
+
+func TestExtractBundle_WorkspaceAndBaseAreShellQuoted(t *testing.T) {
+	box := &fakeBox{execFunc: func(_ string, cmd []string) (string, string, error) {
+		return "", "", errors.New("stop here, only checking argv shape")
+	}}
+	hostile := "/workspace'; rm -rf /; echo '"
+	_, _ = ExtractBundle(box, "box1", hostile, "base'; touch pwned; echo '", DefaultMaxBundleBytes)
+	if len(box.execCalls) == 0 {
+		t.Fatal("no exec call made")
+	}
+	script := strings.Join(box.execCalls[0], " ")
+	if strings.Contains(script, "rm -rf /") && !strings.Contains(script, "'\\''") {
+		t.Errorf("hostile workspace path not shell-quoted: %q", script)
+	}
+}
