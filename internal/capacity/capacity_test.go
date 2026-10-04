@@ -62,3 +62,67 @@ func TestComputeWindowClosedZeroesSpare(t *testing.T) {
 		Now:                  at(3),
 	}
 	h := Compute(Policy{WindowStartHour: 9, WindowEndHour: 17}, st)
+	if h.SpareCPUs != 0 || h.SpareMemoryBytes != 0 || h.SpareDiskBytes != 0 {
+		t.Fatalf("window closed should zero spare, got %+v", h)
+	}
+}
+
+func TestHostIdleFractionAndExclusion(t *testing.T) {
+	now := at(12)
+	old := now.Add(-1 * time.Hour) // well past the 15m default threshold
+	containers := []incus.ContainerInfo{
+		// idle user container
+		{Name: "a-container", State: "Running", LastStartedAt: old, IdleThresholdMinutes: 15},
+		// active user container (recently started)
+		{Name: "b-container", State: "Running", LastStartedAt: now.Add(-1 * time.Minute), IdleThresholdMinutes: 15},
+		// excluded workload class — must not count toward considered or idle
+		{Name: "c-container", State: "Running", LastStartedAt: old, IdleThresholdMinutes: 15,
+			Labels: map[string]string{WorkloadClassLabel: "protected"}},
+		// core container — never considered
+		{Name: "postgres", State: "Running", LastStartedAt: old, Role: incus.RolePostgres},
+		// stopped — never considered
+		{Name: "d-container", State: "Stopped", LastStartedAt: old},
+	}
+	p := Policy{ExcludedWorkloadClasses: []string{"protected"}}
+	st := HostState{Now: now, Containers: containers}
+	h := Compute(p, st)
+	// considered = a + b = 2; idle = a = 1 → 0.5
+	if h.IdleFraction != 0.5 {
+		t.Fatalf("IdleFraction = %v, want 0.5", h.IdleFraction)
+	}
+}
+
+func TestStoreAdvertiseWithdrawIdempotent(t *testing.T) {
+	s := NewStore()
+	st := HostState{AvailableCPUs: 4, AvailableMemoryBytes: 100, Now: at(12)}
+
+	// Initially nothing advertised.
+	if cur := s.Current(st); cur.Advertised {
+		t.Fatal("fresh store should not be advertised")
+	}
+
+	h := s.Advertise(Policy{ReserveFraction: 0.25}, st)
+	if !h.Advertised || h.SpareCPUs != 3 {
+		t.Fatalf("advertise = %+v, want advertised w/ 3 spare cpus", h)
+	}
+	if cur := s.Current(st); !cur.Advertised || cur.SpareCPUs != 3 {
+		t.Fatalf("current after advertise = %+v", cur)
+	}
+
+	// Withdraw is idempotent.
+	w1 := s.Withdraw()
+	if w1.Advertised {
+		t.Fatal("withdraw should clear advertised")
+	}
+	w2 := s.Withdraw()
+	if w2.Advertised {
+		t.Fatal("second withdraw should remain withdrawn (idempotent)")
+	}
+	if cur := s.Current(st); cur.Advertised || cur.SpareCPUs != 0 {
+		t.Fatalf("current after withdraw = %+v, want withdrawn + zero spare", cur)
+	}
+	// Policy is retained across withdraw.
+	if s.Policy().ReserveFraction != 0.25 {
+		t.Fatalf("policy not retained: %+v", s.Policy())
+	}
+}
