@@ -18,3 +18,14 @@ func TestCreate_PodmanEnabledPersistedAsConfigKey(t *testing.T) {
 			backend := &stagesBackend{}
 			m := NewWithBackend(backend)
 			opts := stagesOpts()
+			opts.EnablePodman = enable
+			if _, err := m.Create(opts); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			got, ok := backend.createdConfig.ExtraConfig[incus.PodmanEnabledKey]
+			if !ok || got != strconv.FormatBool(enable) {
+				t.Errorf("ExtraConfig[%q] = %q (present=%v), want %q", incus.PodmanEnabledKey, got, ok, strconv.FormatBool(enable))
+			}
+		})
+	}
+}
