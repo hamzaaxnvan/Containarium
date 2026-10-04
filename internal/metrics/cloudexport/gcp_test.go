@@ -174,3 +174,179 @@ func startFakeOTLPCollector(t *testing.T) (*fakeOTLPMetricsServer, *grpc.ClientC
 	if err != nil {
 		t.Fatalf("dial fake OTLP collector: %v", err)
 	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return fake, conn
+}
+
+// TestGCPSink_NewExporter_PushesToFakeOTLPCollector is the #1979 OTLP
+// migration's replacement for the pre-migration GAPIC-based
+// TestGCPSink_NewExporter_PushesToFakeMonitoring: NewExporter must still
+// return a real, usable sdkmetric.Exporter, and driving the
+// CloudExportCollector against it must land an OTLP export batch
+// carrying the allowlisted host series at a fake OTLP collector — the
+// real exporter code path, only Google's OTLP endpoint faked.
+func TestGCPSink_NewExporter_PushesToFakeOTLPCollector(t *testing.T) {
+	ctx := context.Background()
+	fake, conn := startFakeOTLPCollector(t)
+
+	sink := NewGCPSink()
+	exp, err := sink.NewExporter(ctx, SinkConfig{
+		ProjectID: "test-project",
+		GRPCConn:  conn,
+	})
+	if err != nil {
+		t.Fatalf("NewExporter: %v", err)
+	}
+	if exp == nil {
+		t.Fatal("NewExporter returned a nil exporter")
+	}
+
+	c := NewCollector(CollectorOptions{
+		Sources:  &fakeSources{sr: sampleResources()},
+		Exporter: exp,
+		Labels:   sampleLabels(),
+	})
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = c.Stop(ctx) }()
+
+	if err := c.ForceFlush(ctx); err != nil {
+		t.Fatalf("ForceFlush: %v", err)
+	}
+
+	reqs := fake.received()
+	if len(reqs) == 0 {
+		t.Fatal("fake OTLP collector received no ExportMetricsServiceRequest")
+	}
+	var haveHostSeries bool
+	for _, name := range fake.metricNames() {
+		if strings.Contains(name, "containarium.host.") {
+			haveHostSeries = true
+		}
+	}
+	if !haveHostSeries {
+		t.Errorf("no containarium.host.* series in the OTLP export batches: %v", fake.metricNames())
+	}
+}
+
+// TestGCPSink_NewExporter_SeriesNamesPinned is the #1979 migration's
+// characterization test: it pins the EXACT set of OTLP metric names the
+// GCP sink sends for the default (host-only) collector configuration, as
+// they leave gcp.go's exporter, unprefixed.
+//
+// Google Cloud's OTLP ingestion endpoint (telemetry.googleapis.com)
+// applies the same "workload.googleapis.com/<name>" default metric-type
+// prefix the deprecated opentelemetry-operations-go exporter applied
+// client-side (see
+// https://docs.cloud.google.com/stackdriver/docs/otlp-metrics/overview:
+// "the OTLP metric name is prefixed with the string
+// workload.googleapis.com/, unless the OTLP metric name already contains
+// this string or another valid metric domain") — so an unchanged name
+// here is an unchanged Cloud Monitoring series name end-to-end, which is
+// the #1979 acceptance criterion this test exists to prove. Any diff in
+// this list is exactly the "series names changed" regression that
+// criterion forbids: touching it requires a deliberate review of the
+// billed cost surface, same as collector.go's instrument allowlist.
+func TestGCPSink_NewExporter_SeriesNamesPinned(t *testing.T) {
+	ctx := context.Background()
+	fake, conn := startFakeOTLPCollector(t)
+
+	sink := NewGCPSink()
+	exp, err := sink.NewExporter(ctx, SinkConfig{GRPCConn: conn})
+	if err != nil {
+		t.Fatalf("NewExporter: %v", err)
+	}
+
+	c := NewCollector(CollectorOptions{
+		Sources:  &fakeSources{sr: sampleResources()},
+		Exporter: exp,
+		Labels:   sampleLabels(),
+	})
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = c.Stop(ctx) }()
+
+	if err := c.ForceFlush(ctx); err != nil {
+		t.Fatalf("ForceFlush: %v", err)
+	}
+
+	// The default CollectorOptions.Groups (nil) normalizes to [HOST], so
+	// this is the host allowlist (collector.go's registerHostInstruments)
+	// plus the unconditional heartbeat — nothing more, nothing renamed.
+	want := []string{
+		MetricCPULoad1m,
+		MetricCPULoad5m,
+		MetricCPULoad15m,
+		MetricMemoryUsed,
+		MetricMemoryTotal,
+		MetricDiskUsed,
+		MetricDiskTotal,
+		MetricContainerCount,
+		MetricHeartbeat,
+	}
+	sort.Strings(want)
+
+	got := fake.metricNames()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("exported OTLP metric names changed (this is the series-name regression #1979 forbids):\n got:  %v\nwant: %v", got, want)
+	}
+}
+
+// TestGCPSink_ImplementsResourceProvider asserts the GCP sink supplies a
+// monitored-resource detector (so series land as gce_instance), keeping
+// the GCP detector import contained to gcp.go.
+func TestGCPSink_ImplementsResourceProvider(t *testing.T) {
+	if _, ok := NewGCPSink().(ResourceProvider); !ok {
+		t.Fatal("gcpSink must implement ResourceProvider for gce_instance tagging")
+	}
+}
+
+// attrOf returns the string value of key in res, and whether it was set.
+func attrOf(res *resource.Resource, key string) (string, bool) {
+	for _, kv := range res.Attributes() {
+		if string(kv.Key) == key {
+			return kv.Value.AsString(), true
+		}
+	}
+	return "", false
+}
+
+// TestWithGCPProjectID pins #2590: Google's OTLP ingestion reads the
+// target project from the gcp.project_id resource attribute, but the OTel
+// GCP detector reports it as cloud.account.id. The exported resource must
+// always carry gcp.project_id.
+func TestWithGCPProjectID(t *testing.T) {
+	tests := []struct {
+		name     string
+		in       []attribute.KeyValue
+		fallback string
+		want     string
+		wantSet  bool
+	}{
+		{"detector cloud.account.id maps over", []attribute.KeyValue{attribute.String("cloud.account.id", "proj-a")}, "adc-proj", "proj-a", true},
+		{"existing gcp.project_id is kept", []attribute.KeyValue{attribute.String("gcp.project_id", "proj-b"), attribute.String("cloud.account.id", "other")}, "adc-proj", "proj-b", true},
+		{"no detector attrs falls back to ADC project", nil, "adc-proj", "adc-proj", true},
+		{"nothing known leaves it unset", nil, "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := resource.NewSchemaless(tt.in...)
+			got, err := withGCPProjectID(in, tt.fallback)
+			if err != nil {
+				t.Fatalf("withGCPProjectID: %v", err)
+			}
+			v, ok := attrOf(got, "gcp.project_id")
+			if ok != tt.wantSet || v != tt.want {
+				t.Fatalf("gcp.project_id = %q (set=%v), want %q (set=%v)", v, ok, tt.want, tt.wantSet)
+			}
+			// Other attributes must survive the merge.
+			if _, had := attrOf(in, "cloud.account.id"); had {
+				if _, kept := attrOf(got, "cloud.account.id"); !kept {
+					t.Fatal("cloud.account.id was dropped")
+				}
+			}
+		})
+	}
+}
