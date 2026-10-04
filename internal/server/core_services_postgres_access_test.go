@@ -87,3 +87,183 @@ func (b *accessBox) ran(substr string) int {
 		if strings.Contains(e, substr) {
 			n++
 		}
+	}
+	return n
+}
+
+func (b *accessBox) restarts() int { return b.ran("systemctl restart postgresql") }
+
+func newAccessServices(t *testing.T, b *accessBox, daemonIP string, daemonErr error, probe func(context.Context) error) *CoreServices {
+	t.Helper()
+	oldAddr, oldDelay := localAddrFor, postgresProbeRetryDelay
+	localAddrFor = func(string) (string, error) { return daemonIP, daemonErr }
+	postgresProbeRetryDelay = 0
+	t.Cleanup(func() { localAddrFor, postgresProbeRetryDelay = oldAddr, oldDelay })
+
+	cs := NewCoreServices(b, CoreServicesConfig{NetworkCIDR: "10.100.0.0/24", PostgresPassword: "pw"})
+	cs.postgresIP = "10.100.0.242"
+	cs.pgLoginProbe = probe
+	return cs
+}
+
+func TestConfigurePostgresAccess(t *testing.T) {
+	ok := func(context.Context) error { return nil }
+
+	t.Run("scoped to the daemon and the running metrics container", func(t *testing.T) {
+		b := newAccessBox(&incus.ContainerInfo{Name: CoreVictoriaMetricsContainer, IPAddress: "10.100.0.50", State: "Running"})
+		cs := newAccessServices(t, b, "10.100.0.1", nil, ok)
+
+		if err := cs.configurePostgresAccess(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if b.ran("10.100.0.1/32") != 1 || b.ran("10.100.0.50/32") != 1 {
+			t.Fatalf("expected one rule each for the daemon and the metrics container (its actual address); execs:\n%s", strings.Join(b.execs, "\n"))
+		}
+		if b.ran("10.100.0.0/24") != 0 {
+			t.Errorf("a subnet-wide rule was written:\n%s", strings.Join(b.execs, "\n"))
+		}
+		if b.ran("scram-sha-256") != 2 {
+			t.Errorf("rules must use scram-sha-256:\n%s", strings.Join(b.execs, "\n"))
+		}
+		if b.ran("log_connections = on") != 1 {
+			t.Errorf("connection logging was not turned on:\n%s", strings.Join(b.execs, "\n"))
+		}
+		if b.restarts() != 1 {
+			t.Errorf("restarts = %d, want 1", b.restarts())
+		}
+	})
+
+	t.Run("no metrics container yet → its pinned address", func(t *testing.T) {
+		b := newAccessBox(nil)
+		cs := newAccessServices(t, b, "10.100.0.1", nil, ok)
+
+		if err := cs.configurePostgresAccess(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		pinned, _ := coreStaticIP("10.100.0.0/24", CoreVictoriaMetricsContainer)
+		if pinned == "" || b.ran(pinned+"/32") != 1 {
+			t.Fatalf("expected a rule for the pinned address %q; execs:\n%s", pinned, strings.Join(b.execs, "\n"))
+		}
+	})
+
+	t.Run("daemon cannot log in → falls back to the subnet rule and removes the scoped ones", func(t *testing.T) {
+		b := newAccessBox(nil)
+		cs := newAccessServices(t, b, "10.100.0.1", nil, func(context.Context) error { return errors.New("no pg_hba.conf entry") })
+
+		if err := cs.configurePostgresAccess(context.Background()); err != nil {
+			t.Fatalf("a failed lockout probe must not fail the install: %v", err)
+		}
+		if b.ran("10.100.0.0/24") != 1 {
+			t.Fatalf("fallback rule missing:\n%s", strings.Join(b.execs, "\n"))
+		}
+		// The scoped lines must be removed, not left in front of the fallback:
+		// pg_hba.conf is first-match, so a stale scoped line that still matches
+		// the daemon would keep rejecting it.
+		if b.ran("sed -i") < 1 || b.ran(hbaMarker) < 1 {
+			t.Errorf("scoped rules were not removed before the fallback:\n%s", strings.Join(b.execs, "\n"))
+		}
+		if b.restarts() != 2 {
+			t.Errorf("restarts = %d, want 2 (scoped, then fallback)", b.restarts())
+		}
+	})
+
+	t.Run("daemon address cannot be determined → no scoped attempt", func(t *testing.T) {
+		probeCalled := false
+		b := newAccessBox(nil)
+		cs := newAccessServices(t, b, "", errors.New("no route"), func(context.Context) error { probeCalled = true; return nil })
+
+		if err := cs.configurePostgresAccess(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if b.ran("/32") != 0 {
+			t.Errorf("scoped rules written without knowing the daemon's address:\n%s", strings.Join(b.execs, "\n"))
+		}
+		if b.ran("10.100.0.0/24") != 1 {
+			t.Errorf("fallback rule missing:\n%s", strings.Join(b.execs, "\n"))
+		}
+		if probeCalled {
+			t.Error("the login probe ran although nothing scoped was applied")
+		}
+	})
+
+	t.Run("an unusable user name falls back instead of reaching a shell", func(t *testing.T) {
+		b := newAccessBox(nil)
+		cs := newAccessServices(t, b, "10.100.0.1", nil, ok)
+		cs.config.PostgresUser = "o'brien"
+
+		if err := cs.configurePostgresAccess(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if b.ran("o'brien") != 0 {
+			t.Errorf("an unvalidated user name reached a command:\n%s", strings.Join(b.execs, "\n"))
+		}
+	})
+
+	t.Run("a flaky first probe is retried before giving up", func(t *testing.T) {
+		calls := 0
+		b := newAccessBox(nil)
+		cs := newAccessServices(t, b, "10.100.0.1", nil, func(context.Context) error {
+			calls++
+			if calls < 3 {
+				return errors.New("connection refused")
+			}
+			return nil
+		})
+
+		if err := cs.configurePostgresAccess(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if b.ran("10.100.0.0/24") != 0 {
+			t.Errorf("fell back although the third attempt succeeded:\n%s", strings.Join(b.execs, "\n"))
+		}
+	})
+}
+
+// The pg_hba rule for Grafana names an address before the metrics container
+// exists, so creation must actually put the container on that address.
+func TestPinCoreIP(t *testing.T) {
+	cs := NewCoreServices(incustest.NewMockBackend(), CoreServicesConfig{NetworkCIDR: "10.100.0.0/24"})
+
+	t.Run("a pinned container gets its address on the core bridge", func(t *testing.T) {
+		cfg := incus.ContainerConfig{Name: CoreVictoriaMetricsContainer}
+		cs.pinCoreIP(&cfg, CoreVictoriaMetricsContainer)
+
+		if cfg.NIC == nil || cfg.NIC.Name != "eth0" || cfg.NIC.IPv4Address != "10.100.0.243" || cfg.NIC.Network != coreBridgeName {
+			t.Fatalf("NIC = %+v, want 10.100.0.243 on %s", cfg.NIC, coreBridgeName)
+		}
+		// The address the pg_hba rule names must be the one the container gets.
+		if want := cs.grafanaClientIP(); want != cfg.NIC.IPv4Address {
+			t.Errorf("grafanaClientIP() = %q but the container is pinned to %q", want, cfg.NIC.IPv4Address)
+		}
+	})
+	for _, tc := range []struct{ name, want string }{
+		{CoreCaddyContainer, "10.100.0.241"},
+		{CorePostgresContainer, "10.100.0.242"},
+		{CoreOTelCollectorContainer, "10.100.0.244"},
+		{CoreSecurityContainer, "10.100.0.245"},
+		{CoreGuacamoleContainer, "10.100.0.246"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := incus.ContainerConfig{Name: tc.name}
+			cs.pinCoreIP(&cfg, tc.name)
+			if cfg.NIC == nil || cfg.NIC.Name != "eth0" || cfg.NIC.IPv4Address != tc.want || cfg.NIC.Network != coreBridgeName {
+				t.Fatalf("NIC = %+v, want %s on %s", cfg.NIC, tc.want, coreBridgeName)
+			}
+		})
+	}
+	t.Run("an unpinned container stays on DHCP", func(t *testing.T) {
+		cfg := incus.ContainerConfig{Name: "unknown-container"}
+		cs.pinCoreIP(&cfg, cfg.Name)
+		if cfg.NIC != nil {
+			t.Fatalf("NIC = %+v, want none", cfg.NIC)
+		}
+	})
+	t.Run("an address that cannot be computed falls back to DHCP", func(t *testing.T) {
+		small := NewCoreServices(incustest.NewMockBackend(), CoreServicesConfig{NetworkCIDR: "10.0.0.0/28"})
+		cfg := incus.ContainerConfig{Name: CorePostgresContainer}
+		small.pinCoreIP(&cfg, CorePostgresContainer)
+		if cfg.NIC != nil {
+			t.Fatalf("NIC = %+v, want none on a subnet too small for the offset", cfg.NIC)
+		}
+	})
+}
