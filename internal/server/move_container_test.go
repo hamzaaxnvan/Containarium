@@ -127,3 +127,132 @@ func TestMoveContainer_HappyPath(t *testing.T) {
 	if resp.NewIpAddress != "10.0.7.42" {
 		t.Errorf("NewIpAddress = %q, want %q", resp.NewIpAddress, "10.0.7.42")
 	}
+	if resp.TargetBackendId != "vm2" {
+		t.Errorf("TargetBackendId = %q, want vm2", resp.TargetBackendId)
+	}
+
+	// First three calls must be: init snapshot → init copy → first refresh.
+	if len(runner.calls) < 5 {
+		t.Fatalf("expected at least 5 incus calls, got %d: %v", len(runner.calls), runner.calls)
+	}
+	if runner.calls[0] != "snapshot alice-container/containarium-move-sync0" {
+		t.Errorf("first call = %q", runner.calls[0])
+	}
+	if runner.calls[1] != "copyinit alice-container/containarium-move-sync0 -> vm2" {
+		t.Errorf("second call = %q", runner.calls[1])
+	}
+
+	// Cutover must include a stop on the source — search the call list.
+	foundStop := false
+	for _, c := range runner.calls {
+		if c == "stop alice-container" {
+			foundStop = true
+			break
+		}
+	}
+	if !foundStop {
+		t.Errorf("expected `stop alice-container` somewhere in calls; got %v", runner.calls)
+	}
+}
+
+// TestMoveContainer_RejectsMissingRemote — operators need to set up
+// `incus remote add` first. The orchestrator must surface a clear
+// error rather than letting `incus copy` fail with a less-obvious
+// message later.
+func TestMoveContainer_RejectsMissingRemote(t *testing.T) {
+	runner := &fakeRunner{hasRemote: false} // not set up
+	cs := newTestContainerServer(t, runner, "vm2")
+
+	_, err := cs.MoveContainer(testCtx(),
+		&pb.MoveContainerRequest{Username: "alice", TargetBackendId: "vm2"})
+	if err == nil {
+		t.Fatal("expected error when incus remote isn't configured")
+	}
+	if len(runner.calls) > 0 {
+		t.Errorf("expected zero incus calls before remote check, got %d", len(runner.calls))
+	}
+}
+
+// TestMoveContainer_RollsBackOnCutoverFailure verifies the rollback
+// semantics: if anything fails AFTER `stop source` but BEFORE the
+// route swap, we restart the source container so the public hostname
+// isn't down indefinitely.
+func TestMoveContainer_RollsBackOnCutoverFailure(t *testing.T) {
+	// Fake counts CopyRefresh calls (CopyInitial doesn't increment).
+	// With MaxIterations=1: call 0 = phase 2 iter 1, call 1 = phase 3 final.
+	// We want phase 3 to fail.
+	runner := &fakeRunner{
+		hasRemote:       true,
+		failCopyRefresh: map[int]error{1: errors.New("final-delta copy failed")},
+	}
+	cs := newTestContainerServer(t, runner, "vm2")
+	prev := overrideAdoptForTest(func(_ *PeerClient, _ string, _ *pb.AdoptMigratedContainerRequest) (*pb.AdoptMigratedContainerResponse, error) {
+		t.Error("adopt should not be called after final-delta failure")
+		return nil, nil
+	})
+	defer prev()
+
+	_, err := cs.MoveContainer(testCtx(),
+		&pb.MoveContainerRequest{Username: "alice", TargetBackendId: "vm2", MaxIterations: 1})
+	if err == nil {
+		t.Fatal("expected error on final-delta copy failure")
+	}
+
+	// Rollback: the call sequence must include a `start alice-container`
+	// after the `stop` — that's the recovery from the aborted cutover.
+	stopIdx, startIdx := -1, -1
+	for i, c := range runner.calls {
+		if c == "stop alice-container" && stopIdx == -1 {
+			stopIdx = i
+		}
+		if c == "start alice-container" && startIdx == -1 && stopIdx != -1 {
+			startIdx = i
+		}
+	}
+	if stopIdx == -1 {
+		t.Fatalf("never saw stop in calls: %v", runner.calls)
+	}
+	if startIdx == -1 {
+		t.Errorf("rollback never restarted source after stop: %v", runner.calls)
+	}
+}
+
+// TestMoveContainer_RejectsSelf catches the obvious operator mistake.
+func TestMoveContainer_RejectsSelf(t *testing.T) {
+	runner := &fakeRunner{hasRemote: true}
+	cs := newTestContainerServer(t, runner, "vm2")
+
+	_, err := cs.MoveContainer(testCtx(),
+		&pb.MoveContainerRequest{Username: "alice", TargetBackendId: cs.peerPool.LocalBackendID()})
+	if err == nil {
+		t.Fatal("expected error when target == local backend")
+	}
+}
+
+// TestMigrationDefaults clamps/defaults — small but a frequent source
+// of "the loop ran 10000 times" bugs.
+func TestMigrationDefaults(t *testing.T) {
+	cases := []struct {
+		name      string
+		req       *pb.MoveContainerRequest
+		wantIters int
+		wantDelta int
+	}{
+		{"all zero → defaults", &pb.MoveContainerRequest{}, 3, 5},
+		{"explicit small", &pb.MoveContainerRequest{MaxIterations: 1, DeltaThresholdSeconds: 2}, 1, 2},
+		{"negative iters clamped", &pb.MoveContainerRequest{MaxIterations: -7}, 0, 5},
+		{"huge iters clamped", &pb.MoveContainerRequest{MaxIterations: 999}, 10, 5},
+		{"huge delta clamped", &pb.MoveContainerRequest{MaxIterations: 1, DeltaThresholdSeconds: 9999}, 1, 60},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := migrationDefaults(c.req)
+			if p.maxIterations != c.wantIters {
+				t.Errorf("maxIterations = %d, want %d", p.maxIterations, c.wantIters)
+			}
+			if p.deltaThresholdSeconds != c.wantDelta {
+				t.Errorf("deltaThresholdSeconds = %d, want %d", p.deltaThresholdSeconds, c.wantDelta)
+			}
+		})
+	}
+}
