@@ -29,3 +29,34 @@ export function useCollaborators(server: Server | null, ownerUsername: string | 
   );
 
   const addCollaborator = useCallback(
+    async (req: AddCollaboratorRequest) => {
+      if (!server || !ownerUsername) throw new Error('No server or owner selected');
+      const client = getClient(server);
+      const result = await client.addCollaborator(ownerUsername, req);
+      await mutate();
+      return result;
+    },
+    [server, ownerUsername, mutate]
+  );
+
+  const removeCollaborator = useCallback(
+    async (collaboratorUsername: string) => {
+      if (!server || !ownerUsername) throw new Error('No server or owner selected');
+      const client = getClient(server);
+      await client.removeCollaborator(ownerUsername, collaboratorUsername);
+      await mutate();
+    },
+    [server, ownerUsername, mutate]
+  );
+
+  const refresh = useCallback(() => mutate(), [mutate]);
+
+  return {
+    collaborators: data || [],
+    isLoading,
+    error,
+    addCollaborator,
+    removeCollaborator,
+    refresh,
+  };
+}
