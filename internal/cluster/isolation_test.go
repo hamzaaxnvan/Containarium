@@ -28,3 +28,33 @@ func TestIsolation_OrDefault(t *testing.T) {
 	}
 }
 
+func TestMemStore_NodeIsolationRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemStore()
+	for _, tc := range []struct {
+		name string
+		in   Isolation
+		want Isolation
+	}{
+		{"unset", "", IsolationVM},
+		{"vm", IsolationVM, IsolationVM},
+		{"container", IsolationContainer, IsolationContainer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := s.Create(ctx, &Cluster{
+				ID: tc.name, Owner: "alice", Name: tc.name,
+				State: StateProvisioning, NodeIsolation: tc.in,
+				NodeGroups: DefaultNodeGroups(),
+			}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			got, err := s.Get(ctx, "alice", tc.name)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if got.NodeIsolation != tc.want {
+				t.Fatalf("isolation = %q, want %q", got.NodeIsolation, tc.want)
+			}
+		})
+	}
+}
