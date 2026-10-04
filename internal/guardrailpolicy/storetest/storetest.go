@@ -149,3 +149,154 @@ func runRevocationContract(t *testing.T, newStore func(t *testing.T) guardrailpo
 	rev := func(r int64) *int64 { return &r }
 
 	t.Run("expected_revision must equal the stored revision", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.Set(ctx, &pb.SetGuardrailPolicyRequest{Policy: Policy(0), ExpectedRevision: rev(1)}, "admin-a"); !errors.Is(err, guardrailpolicy.ErrRevisionConflict) {
+			t.Fatalf("Set expecting revision 1 on an empty store = %v, want ErrRevisionConflict", err)
+		}
+		if _, err := s.Get(ctx); !errors.Is(err, guardrailpolicy.ErrNotConfigured) {
+			t.Fatalf("a refused Set stored something: %v", err)
+		}
+		if _, err := s.Set(ctx, &pb.SetGuardrailPolicyRequest{Policy: Policy(0), ExpectedRevision: rev(0)}, "admin-a"); err != nil {
+			t.Fatalf("Set expecting revision 0 on an empty store: %v", err)
+		}
+		if _, err := s.Set(ctx, Req(Policy(1)), "admin-b"); err != nil { // no precondition: applies
+			t.Fatalf("Set without expected_revision: %v", err)
+		}
+		if _, err := s.Set(ctx, &pb.SetGuardrailPolicyRequest{Policy: Policy(3), ExpectedRevision: rev(1)}, "admin-a"); !errors.Is(err, guardrailpolicy.ErrRevisionConflict) {
+			t.Fatalf("stale expected_revision = %v, want ErrRevisionConflict", err)
+		}
+		got, err := s.Get(ctx)
+		if err != nil || got.GetRevision() != 2 || !proto.Equal(got.GetPolicy(), Policy(1)) {
+			t.Fatalf("after a stale Set = (%v, %v), want admin-b's revision 2", got, err)
+		}
+	})
+
+	t.Run("a revoked key is stamped by the store and permanent", func(t *testing.T) {
+		s := newStore(t)
+		gone := Signer(t, 9, "old key")
+		clientTime := timestamppb.New(time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC))
+		revoked := []*pb.GuardrailRevokedKey{{KeyId: gone.GetKeyId(), Reason: "leaked", RevokedAt: clientTime}}
+		res, err := s.Set(ctx, &pb.SetGuardrailPolicyRequest{Policy: Policy(0), RevokedSigners: revoked}, "admin-a")
+		if err != nil {
+			t.Fatalf("Set with a revoked key: %v", err)
+		}
+		stored := res.Current.GetRevokedSigners()
+		if len(stored) != 1 || stored[0].GetKeyId() != gone.GetKeyId() || stored[0].GetReason() != "leaked" {
+			t.Fatalf("stored revoked = %v", stored)
+		}
+		if at := stored[0].GetRevokedAt(); at == nil || at.AsTime().Year() == 2001 {
+			t.Fatalf("revoked_at = %v, want the store's time, not the request's", at)
+		}
+		for name, keep := range map[string][]*pb.GuardrailRevokedKey{
+			"dropped":        nil,
+			"reason changed": {{KeyId: gone.GetKeyId(), Reason: "never mind"}},
+		} {
+			if _, err := s.Set(ctx, &pb.SetGuardrailPolicyRequest{Policy: Policy(0), RevokedSigners: keep}, "admin-b"); !errors.Is(err, guardrailpolicy.ErrRevocationPermanent) {
+				t.Fatalf("Set with the revoked key %s = %v, want ErrRevocationPermanent", name, err)
+			}
+		}
+		res2, err := s.Set(ctx, &pb.SetGuardrailPolicyRequest{Policy: Policy(1), RevokedSigners: []*pb.GuardrailRevokedKey{{KeyId: gone.GetKeyId(), Reason: "leaked"}}}, "admin-b")
+		if err != nil {
+			t.Fatalf("Set keeping the revoked key: %v", err)
+		}
+		if !proto.Equal(res2.Current.GetRevokedSigners()[0], stored[0]) {
+			t.Fatalf("revoked entry changed across a Set: %v -> %v", stored[0], res2.Current.GetRevokedSigners()[0])
+		}
+		if got, err := s.Get(ctx); err != nil || got.GetRevision() != 2 {
+			t.Fatalf("Get = (%v, %v), want revision 2", got, err)
+		}
+	})
+}
+
+// runBaselineModeContract is the baseline mode's part of the contract
+// (#2738): LOG at revision 0 until set, a monotonic revision, and no effect
+// on the stored policy (setting it must not turn the baseline off).
+func runBaselineModeContract(t *testing.T, newStore func(t *testing.T) guardrailpolicy.Store) {
+	ctx := context.Background()
+	const (
+		logMode   = pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_LOG
+		blockMode = pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_BLOCK
+	)
+
+	t.Run("baseline mode is LOG at revision 0 until set", func(t *testing.T) {
+		got, err := newStore(t).GetBaselineMode(ctx)
+		if err != nil {
+			t.Fatalf("GetBaselineMode on an empty store: %v", err)
+		}
+		if got.GetMode() != logMode || got.GetRevision() != 0 || got.GetUpdatedBy() != "" {
+			t.Fatalf("default = %v, want LOG at revision 0 by nobody", got)
+		}
+	})
+
+	t.Run("baseline mode set round-trips with a monotonic revision", func(t *testing.T) {
+		s := newStore(t)
+		prev, _ := s.GetBaselineMode(ctx)
+		for i, mode := range []pb.GuardrailBaselineMode{blockMode, logMode, blockMode} {
+			res, err := s.SetBaselineMode(ctx, mode, "admin-a", nil)
+			if err != nil {
+				t.Fatalf("SetBaselineMode #%d: %v", i+1, err)
+			}
+			if !proto.Equal(res.Previous, prev) {
+				t.Fatalf("set #%d previous = %v, want %v", i+1, res.Previous, prev)
+			}
+			if res.Current.GetMode() != mode || res.Current.GetRevision() != int64(i+1) ||
+				res.Current.GetUpdatedBy() != "admin-a" || res.Current.GetUpdatedAt() == nil {
+				t.Fatalf("set #%d current = %v, want %v at revision %d by admin-a with a time", i+1, res.Current, mode, i+1)
+			}
+			got, err := s.GetBaselineMode(ctx)
+			if err != nil || !proto.Equal(got, res.Current) {
+				t.Fatalf("GetBaselineMode after set #%d = (%v, %v), want %v", i+1, got, err, res.Current)
+			}
+			prev = res.Current
+		}
+	})
+
+	t.Run("baseline mode rejects UNSPECIFIED and leaves the setting", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.SetBaselineMode(ctx, pb.GuardrailBaselineMode_GUARDRAIL_BASELINE_MODE_UNSPECIFIED, "admin-a", nil); err == nil {
+			t.Fatal("SetBaselineMode(UNSPECIFIED) succeeded, want an error")
+		}
+		if got, err := s.GetBaselineMode(ctx); err != nil || got.GetRevision() != 0 {
+			t.Fatalf("after a rejected set = (%v, %v), want the untouched default", got, err)
+		}
+	})
+
+	t.Run("baseline mode beforeCommit sees the change and a failure discards it", func(t *testing.T) {
+		s := newStore(t)
+		var seen *guardrailpolicy.BaselineSetResult
+		_, err := s.SetBaselineMode(ctx, blockMode, "admin-a", func(r *guardrailpolicy.BaselineSetResult) error {
+			seen = r
+			return errors.New("audit store down")
+		})
+		if err == nil {
+			t.Fatal("SetBaselineMode with a failing beforeCommit succeeded, want its error")
+		}
+		if seen == nil || seen.Current.GetMode() != blockMode || seen.Current.GetRevision() != 1 || seen.Previous.GetRevision() != 0 {
+			t.Fatalf("beforeCommit saw %+v, want LOG rev 0 -> BLOCK rev 1", seen)
+		}
+		if got, err := s.GetBaselineMode(ctx); err != nil || got.GetMode() != logMode || got.GetRevision() != 0 {
+			t.Fatalf("after a failed beforeCommit = (%v, %v), want the untouched default", got, err)
+		}
+		// The next set reuses revision 1: nothing of the discarded one remains.
+		res, err := s.SetBaselineMode(ctx, blockMode, "admin-a", func(*guardrailpolicy.BaselineSetResult) error { return nil })
+		if err != nil || res.Current.GetRevision() != 1 {
+			t.Fatalf("set after a discarded one = (%v, %v), want revision 1", res, err)
+		}
+	})
+
+	t.Run("baseline mode is independent of the policy", func(t *testing.T) {
+		s := newStore(t)
+		if _, err := s.SetBaselineMode(ctx, blockMode, "admin-a", nil); err != nil {
+			t.Fatalf("SetBaselineMode: %v", err)
+		}
+		if got, err := s.Get(ctx); !errors.Is(err, guardrailpolicy.ErrNotConfigured) {
+			t.Fatalf("Get after setting the baseline mode = (%v, %v), want ErrNotConfigured", got, err)
+		}
+		if _, err := s.Set(ctx, Req(Policy(0)), "admin-b"); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		if got, err := s.GetBaselineMode(ctx); err != nil || got.GetMode() != blockMode || got.GetRevision() != 1 {
+			t.Fatalf("baseline mode after a policy Set = (%v, %v), want BLOCK at revision 1", got, err)
+		}
+	})
+}

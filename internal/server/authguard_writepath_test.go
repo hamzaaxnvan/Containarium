@@ -72,3 +72,53 @@ func TestComposeAutostart_ReadScopeCannotMutateOwnBox(t *testing.T) {
 	} else if got := status.Code(err); got != codes.PermissionDenied {
 		t.Errorf("Enable: code = %v, want PermissionDenied", got)
 	}
+	if _, err := s.Disable(ctx, &pb.DisableRequest{Username: "alice"}); err == nil {
+		t.Error("a containers:read token disabled autostart on its own box")
+	}
+}
+
+// An entirely unauthenticated caller must not reach any of them.
+func TestComposeAutostart_RefusesUnauthenticated(t *testing.T) {
+	s := &ComposeAutostartServer{}
+	if _, err := s.Enable(context.Background(), &pb.EnableRequest{Username: "alice"}); err == nil {
+		t.Fatal("an unauthenticated caller enabled autostart")
+	}
+}
+
+// #1717. The bad-destination blocklist is a fleet-wide detection control.
+// Removing an entry silently disables a rule, which is why this is gated on
+// the admin role and not only a scope.
+func TestBadDestination_MutationRequiresAdmin(t *testing.T) {
+	s := &ThreatDetectionServer{}
+	// Correctly scoped, but not an admin.
+	ctx := scopedTenantCtx("alice", auth.ScopeSecurityWrite)
+
+	if _, err := s.AddBadDestination(ctx, &pb.AddBadDestinationRequest{Cidr: "10.0.0.0/8"}); err == nil {
+		t.Error("a non-admin added a fleet-wide blocklist entry")
+	} else if got := status.Code(err); got != codes.PermissionDenied {
+		t.Errorf("Add: code = %v, want PermissionDenied", got)
+	}
+	if _, err := s.RemoveBadDestination(ctx, &pb.RemoveBadDestinationRequest{Cidr: "10.0.0.0/8"}); err == nil {
+		t.Error("a non-admin removed a fleet-wide blocklist entry — this silently disables a detection rule")
+	} else if got := status.Code(err); got != codes.PermissionDenied {
+		t.Errorf("Remove: code = %v, want PermissionDenied", got)
+	}
+}
+
+// ...and the admin role alone is not enough either: the scope is still required.
+func TestBadDestination_AdminStillNeedsTheScope(t *testing.T) {
+	s := &ThreatDetectionServer{}
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(), "ops",
+		[]string{auth.RoleAdmin}, []string{auth.ScopeSecurityRead})
+
+	if _, err := s.RemoveBadDestination(ctx, &pb.RemoveBadDestinationRequest{Cidr: "10.0.0.0/8"}); err == nil {
+		t.Error("an admin holding only security:read mutated the blocklist")
+	}
+}
+
+func TestBadDestination_RefusesUnauthenticated(t *testing.T) {
+	s := &ThreatDetectionServer{}
+	if _, err := s.AddBadDestination(context.Background(), &pb.AddBadDestinationRequest{Cidr: "10.0.0.0/8"}); err == nil {
+		t.Fatal("an unauthenticated caller mutated the blocklist")
+	}
+}
