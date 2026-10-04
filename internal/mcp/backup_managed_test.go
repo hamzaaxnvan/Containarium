@@ -143,3 +143,52 @@ func TestVerifyBackupTool_ManagedLatest(t *testing.T) {
 	_, err := handleVerifyBackup(NewClient(h.srv.URL, "t"), map[string]interface{}{
 		"managed": true, "latest": true, "username": "alice", "database": "app", "target_username": "scratch",
 	})
+	if err != nil {
+		t.Fatalf("handleVerifyBackup: %v", err)
+	}
+	if len(h.posts) != 1 || h.posts[0] != "/v1/backups/alice-app-20261003T010000Z/verify" {
+		t.Fatalf("posts = %v", h.posts)
+	}
+	if h.bodies[0]["age_identity"] != identity {
+		t.Error("verify body did not carry the unwrapped identity")
+	}
+}
+
+func TestRestoreBackupTool_RefusesAmbiguousSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args map[string]interface{}
+		want string
+	}{
+		{"id and latest", map[string]interface{}{"id": "x", "latest": true, "username": "alice", "database": "app"}, "latest"},
+		{"latest without database", map[string]interface{}{"latest": true, "username": "alice"}, "database"},
+		{"managed and age_identity_file", map[string]interface{}{"id": "x", "managed": true, "age_identity_file": "k"}, "managed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newMCPManagedHost(t)
+			withMCPFakeKMS(t)
+			_, err := handleRestoreBackup(NewClient(h.srv.URL, "t"), tc.args)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one naming %s", err, tc.want)
+			}
+			if len(h.posts) != 0 {
+				t.Errorf("posts = %v", h.posts)
+			}
+		})
+	}
+}
+
+func TestBackupToolSchemas_DeclareManagedLatestTarget(t *testing.T) {
+	want := map[string][]string{
+		"restore_backup": {"managed", "latest", "username", "database", "target"},
+		"verify_backup":  {"managed", "latest", "username", "database"},
+	}
+	for _, tool := range backupTools() {
+		props, _ := tool.InputSchema["properties"].(map[string]interface{})
+		for _, p := range want[tool.Name] {
+			if _, ok := props[p]; !ok {
+				t.Errorf("%s schema lacks %q", tool.Name, p)
+			}
+		}
+	}
+}
