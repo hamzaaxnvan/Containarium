@@ -395,3 +395,136 @@ func TestChangeKey(t *testing.T) {
 		newKey := testKey(t, 0x9)
 
 		if err := m.ChangeKey(context.Background(), "tank/tenants/alice", newKey); err != nil {
+			t.Fatalf("ChangeKey: %v", err)
+		}
+
+		call := r.lastCall()
+		if len(call) == 0 || call[0] != "change-key" {
+			t.Fatalf("ran %v, want a change-key", call)
+		}
+		// The rule the whole design rests on: key material travels on stdin.
+		// argv is world-readable through /proc/<pid>/cmdline for the life of
+		// the process.
+		for _, arg := range call {
+			if strings.Contains(arg, string(newKey.Bytes())) {
+				t.Fatalf("key material appeared on argv: %v", call)
+			}
+		}
+		if len(r.stdins) == 0 || !bytes.Equal(r.stdins[len(r.stdins)-1], newKey.Bytes()) {
+			t.Error("the new key did not reach stdin")
+		}
+		if !strings.Contains(r.allArgs(), "keylocation=file:///dev/stdin") {
+			t.Errorf("change-key did not read from stdin: %v", call)
+		}
+	})
+
+	t.Run("refuses an empty key", func(t *testing.T) {
+		r := newFakeRunner()
+		m := NewManager(r)
+
+		if err := m.ChangeKey(context.Background(), "tank/tenants/alice", zfskey.Key{}); err == nil {
+			t.Fatal("an empty key was accepted — the dataset would be left wrapped by nothing")
+		}
+		if len(r.calls) != 0 {
+			t.Errorf("zfs was invoked with an empty key: %v", r.calls)
+		}
+	})
+
+	t.Run("refuses a dataset name that is not one", func(t *testing.T) {
+		r := newFakeRunner()
+		m := NewManager(r)
+
+		if err := m.ChangeKey(context.Background(), "-rf", testKey(t, 0x9)); err == nil {
+			t.Fatal("a flag-shaped dataset name was accepted")
+		}
+		if len(r.calls) != 0 {
+			t.Errorf("zfs was invoked: %v", r.calls)
+		}
+	})
+
+	// A failed rotation must say so. Reporting success would leave the
+	// control plane believing the old key is dead when it is still the only
+	// one that works.
+	t.Run("surfaces the zfs error", func(t *testing.T) {
+		r := newFakeRunner()
+		r.errs["change-key"] = errors.New("exit status 1")
+		r.stderr["change-key"] = "Key must be loaded"
+		m := NewManager(r)
+
+		err := m.ChangeKey(context.Background(), "tank/tenants/alice", testKey(t, 0x9))
+		if err == nil {
+			t.Fatal("a failed change-key was reported as success")
+		}
+		if !strings.Contains(err.Error(), "Key must be loaded") {
+			t.Errorf("zfs's reason was lost: %v", err)
+		}
+	})
+}
+
+// HasChildren backs the offboarding guard (#1343): a tenant encryptionroot
+// with child datasets still holds containers.
+//
+// Asked of ZFS rather than of the daemon's own records on purpose. A record
+// can be lost — a config key cleared, a store restored from an older backup —
+// and the enumeration would then report "no containers" for a tenant whose
+// data is still there, which is the one mistake this guard cannot afford.
+func TestHasChildren(t *testing.T) {
+	t.Run("children present", func(t *testing.T) {
+		r := newFakeRunner()
+		r.stdout["list"] = "tank/tenants/alice\ntank/tenants/alice/containers\ntank/tenants/alice/containers/alice-container"
+		m := NewManager(r)
+
+		has, err := m.HasChildren(context.Background(), "tank/tenants/alice")
+		if err != nil {
+			t.Fatalf("HasChildren: %v", err)
+		}
+		if !has {
+			t.Error("reported no children for a dataset that has them — offboarding would destroy " +
+				"a tenant's live container storage")
+		}
+	})
+
+	t.Run("the dataset itself is not a child of itself", func(t *testing.T) {
+		r := newFakeRunner()
+		r.stdout["list"] = "tank/tenants/alice"
+		m := NewManager(r)
+
+		has, err := m.HasChildren(context.Background(), "tank/tenants/alice")
+		if err != nil {
+			t.Fatalf("HasChildren: %v", err)
+		}
+		if has {
+			t.Error("an empty tenant root reported children — its own name is in the recursive " +
+				"listing and must not count, or a tenant could never be offboarded")
+		}
+	})
+
+	// A prefix match would call tank/tenants/alice2 a child of
+	// tank/tenants/alice, and refuse to offboard alice forever.
+	t.Run("a sibling with a shared prefix is not a child", func(t *testing.T) {
+		r := newFakeRunner()
+		r.stdout["list"] = "tank/tenants/alice\ntank/tenants/alice2\ntank/tenants/alice2/containers"
+		m := NewManager(r)
+
+		has, err := m.HasChildren(context.Background(), "tank/tenants/alice")
+		if err != nil {
+			t.Fatalf("HasChildren: %v", err)
+		}
+		if has {
+			t.Error("a sibling sharing a name prefix was counted as a child — alice could never " +
+				"be offboarded while alice2 exists")
+		}
+	})
+
+	t.Run("surfaces the zfs error", func(t *testing.T) {
+		r := newFakeRunner()
+		r.errs["list"] = errors.New("exit status 1")
+		r.stderr["list"] = "cannot open 'tank/tenants/alice': dataset does not exist"
+		m := NewManager(r)
+
+		if _, err := m.HasChildren(context.Background(), "tank/tenants/alice"); err == nil {
+			t.Fatal("an unreadable dataset was reported as having no children — offboarding " +
+				"would proceed on a guess")
+		}
+	})
+}
