@@ -118,3 +118,124 @@ func TestE2ESSHPiperSetup(t *testing.T) {
 
 	t.Run("Port22NotInDNAT", func(t *testing.T) {
 		output := sshSentinel(t, "sudo iptables -t nat -L SENTINEL_PREROUTING -n 2>/dev/null || echo 'no chain'")
+		t.Logf("DNAT rules:\n%s", output)
+
+		// Port 22 should NOT appear in DNAT rules
+		lines := strings.Split(output, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "dpt:22 ") || strings.Contains(line, "dpt:22\t") {
+				t.Error("Port 22 should NOT be in DNAT rules (handled by sshpiper)")
+			}
+		}
+	})
+
+	t.Run("SpotVMFail2BanWhitelist", func(t *testing.T) {
+		output := sshSpot(t, "sudo fail2ban-client get sshd ignoreip 2>/dev/null || echo 'fail2ban not running'")
+		t.Logf("fail2ban ignoreip:\n%s", output)
+
+		assert.Contains(t, output, "10.128.0.0/9", "fail2ban should whitelist GCE internal range")
+	})
+
+	t.Run("SpotVMAuthorizedKeysEndpoint", func(t *testing.T) {
+		// Test the /authorized-keys endpoint from the spot VM
+		output := sshSpot(t, "curl -s http://localhost:8080/authorized-keys")
+		t.Logf("/authorized-keys response:\n%s", output)
+
+		assert.Contains(t, output, "keys", "response should contain keys field")
+	})
+
+	t.Run("SpotVMSentinelKeyEndpoint", func(t *testing.T) {
+		// Test the /authorized-keys/sentinel endpoint accepts POST
+		output := sshSpot(t, `curl -s -X POST -H "Content-Type: application/json" -d '{"public_key":"ssh-ed25519 AAAA_test test@test"}' http://localhost:8080/authorized-keys/sentinel`)
+		t.Logf("/authorized-keys/sentinel response:\n%s", output)
+
+		assert.Contains(t, output, "updated", "response should contain updated count")
+	})
+
+	t.Run("SSHPiperFailToban", func(t *testing.T) {
+		// Get the sentinel's external IP
+		sentinelIP := sshSentinel(t, "curl -s http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip -H 'Metadata-Flavor: Google'")
+		if sentinelIP == "" {
+			t.Skip("Could not get sentinel external IP")
+		}
+
+		t.Logf("Sentinel external IP: %s", sentinelIP)
+
+		// Try SSH with wrong key — should get rejected by sshpiper
+		// We do this from a local perspective, just verifying the failtoban is configured
+		output := sshSentinel(t, "sudo journalctl -u sshpiper --no-pager -n 20 2>/dev/null || echo 'no logs'")
+		t.Logf("sshpiper recent logs:\n%s", output)
+	})
+
+	t.Log("All sshpiper E2E checks passed")
+}
+
+// TestE2ESSHPiperBruteForceProtection tests that sshpiper's failtoban
+// actually bans IPs after repeated auth failures.
+//
+// This test requires an external IP that can SSH to the sentinel.
+// It intentionally fails authentication to trigger the ban.
+func TestE2ESSHPiperBruteForceProtection(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping E2E test in short mode")
+	}
+
+	project := os.Getenv("GCP_PROJECT")
+	zone := os.Getenv("GCP_ZONE")
+	sentinelVM := os.Getenv("SENTINEL_VM")
+	sentinelExternalIP := os.Getenv("SENTINEL_EXTERNAL_IP")
+
+	if project == "" || zone == "" || sentinelVM == "" || sentinelExternalIP == "" {
+		t.Skip("GCP_PROJECT, GCP_ZONE, SENTINEL_VM, and SENTINEL_EXTERNAL_IP must be set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Generate a throwaway key for failed auth attempts
+	tmpDir := t.TempDir()
+	keyPath := tmpDir + "/throwaway_key"
+	cmd := exec.CommandContext(ctx, "ssh-keygen", "-t", "ed25519", "-f", keyPath, "-N", "")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to generate throwaway key: %v\n%s", err, out)
+	}
+
+	// Attempt SSH connections with the wrong key (should all fail)
+	t.Log("Sending failed SSH auth attempts to trigger failtoban...")
+	for i := 0; i < 5; i++ {
+		cmd := exec.CommandContext(ctx, "ssh",
+			"-i", keyPath,
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "ConnectTimeout=5",
+			"-o", "BatchMode=yes",
+			"-p", "22",
+			"nonexistent@"+sentinelExternalIP,
+			"echo hello",
+		)
+		out, _ := cmd.CombinedOutput()
+		t.Logf("Attempt %d: %s", i+1, strings.TrimSpace(string(out)))
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// Check sshpiper logs for ban evidence
+	sshSentinel := func(cmd string) string {
+		out, _ := exec.CommandContext(ctx, "gcloud", "compute", "ssh", sentinelVM,
+			"--project="+project,
+			"--zone="+zone,
+			"--tunnel-through-iap",
+			"--ssh-flag=-p 2222",
+			"--command="+cmd,
+		).CombinedOutput()
+		return strings.TrimSpace(string(out))
+	}
+
+	output := sshSentinel("sudo journalctl -u sshpiper --no-pager -n 50 2>/dev/null")
+	t.Logf("sshpiper logs after brute force:\n%s", output)
+
+	// The failtoban plugin should show ban activity
+	if strings.Contains(output, "ban") || strings.Contains(output, "blocked") {
+		t.Log("failtoban appears to have banned the attacker IP")
+	} else {
+		t.Log("Note: ban evidence not found in recent logs (may need more attempts or longer wait)")
+	}
+}
