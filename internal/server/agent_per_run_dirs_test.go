@@ -23,3 +23,28 @@ func TestSeedDirFor_AndWorkspaceDirFor_ArePerRun(t *testing.T) {
 	if !strings.HasPrefix(a, agentSeedRoot+"/") || !strings.HasPrefix(b, agentSeedRoot+"/") {
 		t.Errorf("seed dir must live under agentSeedRoot %q, got %q / %q", agentSeedRoot, a, b)
 	}
+
+	wa, wb := workspaceDirFor("run-a"), workspaceDirFor("run-b")
+	if wa == wb {
+		t.Fatalf("two different run ids produced the same workspace: %q", wa)
+	}
+	if !strings.HasPrefix(wa, agentWorkspaceRoot+"/") {
+		t.Errorf("workspace must live under agentWorkspaceRoot %q, got %q", agentWorkspaceRoot, wa)
+	}
+	if seedDirFor("run-a") == workspaceDirFor("run-a") {
+		t.Errorf("seed dir and workspace for the SAME run must not be the same path")
+	}
+}
+
+// TestSeedDirFor_RejectsDotAndDotDot documents why resolveRunID must refuse
+// "." and ".." (a caller can never reach seedDirFor/workspaceDirFor with
+// either, per TestResolveRunID_Table) — this pins what would go wrong if
+// that guard were ever removed: both would resolve to the root itself.
+func TestSeedDirFor_RejectsDotAndDotDot(t *testing.T) {
+	if got := seedDirFor("."); got != agentSeedRoot+"/." {
+		t.Fatalf("seedDirFor(%q) = %q — would clean to the root itself, which is exactly why resolveRunID refuses %q before this is ever called", ".", got, ".")
+	}
+	if got := seedDirFor(".."); got != agentSeedRoot+"/.." {
+		t.Fatalf("seedDirFor(%q) = %q — would clean to the PARENT of the root, which is exactly why resolveRunID refuses %q before this is ever called", "..", got, "..")
+	}
+}
