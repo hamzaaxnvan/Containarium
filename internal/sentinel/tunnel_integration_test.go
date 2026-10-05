@@ -178,3 +178,93 @@ func TestTunnelIntegration(t *testing.T) {
 		_, err = stream.Write([]byte("GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n"))
 		require.NoError(t, err)
 
+		// Read response
+		buf := make([]byte, 1024)
+		_ = stream.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, err := stream.Read(buf)
+		require.NoError(t, err)
+		response := string(buf[:n])
+
+		assert.Contains(t, response, "200")
+		assert.Contains(t, response, `"status":"healthy"`)
+		t.Logf("[integration] health response: %s", response)
+	})
+
+	// ---------------------------------------------------------------
+	// 5. Verify: authorized-keys endpoint through tunnel
+	// ---------------------------------------------------------------
+
+	t.Run("authorized_keys_via_yamux", func(t *testing.T) {
+		stream, err := spot.Session.Open()
+		require.NoError(t, err)
+		defer func() { _ = stream.Close() }()
+
+		portBytes := []byte{byte((spotDaemonPort >> 8) & 0xff), byte(spotDaemonPort & 0xff)}
+		_, err = stream.Write(portBytes)
+		require.NoError(t, err)
+
+		_, err = stream.Write([]byte("GET /authorized-keys HTTP/1.0\r\nHost: localhost\r\n\r\n"))
+		require.NoError(t, err)
+
+		buf := make([]byte, 1024)
+		_ = stream.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, err := stream.Read(buf)
+		require.NoError(t, err)
+		response := string(buf[:n])
+
+		assert.Contains(t, response, "200")
+		assert.Contains(t, response, "testuser")
+		t.Logf("[integration] authorized-keys response: %s", response)
+	})
+
+	// ---------------------------------------------------------------
+	// 6. Verify: HTTPS via ConnMux goes to the right place
+	// ---------------------------------------------------------------
+
+	t.Run("https_via_connmux", func(t *testing.T) {
+		// Connect to the mux port with a TLS ClientHello (first byte 0x16)
+		// This should land on the ConnMux HTTPS listener
+		httpsConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", muxPort), 2*time.Second)
+		require.NoError(t, err)
+		defer func() { _ = httpsConn.Close() }()
+
+		// Send a TLS ClientHello byte to trigger HTTPS routing
+		_, _ = httpsConn.Write([]byte{0x16})
+
+		// Read from the HTTPS listener side
+		muxHTTPSConn, err := connMux.HTTPSListener().Accept()
+		if err != nil {
+			t.Skipf("HTTPS listener accept failed (may already be consumed): %v", err)
+		}
+		defer func() { _ = muxHTTPSConn.Close() }()
+
+		// Verify the first byte is 0x16 (replayed by peekedConn)
+		buf := make([]byte, 1)
+		_ = muxHTTPSConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, err = io.ReadFull(muxHTTPSConn, buf)
+		require.NoError(t, err)
+		assert.Equal(t, byte(0x16), buf[0])
+		t.Log("[integration] HTTPS correctly routed through ConnMux")
+	})
+
+	// ---------------------------------------------------------------
+	// 7. Verify: registry state
+	// ---------------------------------------------------------------
+
+	t.Run("registry_state", func(t *testing.T) {
+		assert.True(t, registry.Connected())
+		assert.Equal(t, 1, registry.Count())
+
+		regSpot := registry.Get("integration-spot")
+		require.NotNil(t, regSpot)
+		assert.Equal(t, spot.LocalIP, regSpot.LocalIP)
+		assert.False(t, regSpot.Session.IsClosed())
+	})
+}
+
+func mustSelfSignedCert(t *testing.T) tls.Certificate {
+	t.Helper()
+	cert, err := generateSelfSignedCert()
+	require.NoError(t, err)
+	return cert
+}

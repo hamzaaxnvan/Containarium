@@ -307,3 +307,312 @@ func TestWakeProxy_PathStripping(t *testing.T) {
 	if rec.lastPath != "/foo/bar" {
 		t.Errorf("upstream saw path %q, want /foo/bar", rec.lastPath)
 	}
+}
+
+// TestWakeProxy_CatchAllPath — requests to arbitrary app paths (no
+// /wake/ prefix) are forwarded unchanged. This is how Caddy delivers
+// the user's original request URL.
+func TestWakeProxy_CatchAllPath(t *testing.T) {
+	host, port, rec, srv := startUpstream(t, "ok")
+	defer srv.Close()
+
+	proxy := NewWakeProxy(
+		&countingStarter{ready: true, ip: host, port: port},
+		&fakeLookup{fullDomain: "alice.example.test", containerName: "alice-container", targetIP: host, targetPort: port},
+		&fakeRouteStore{},
+		nil,
+		nil,
+		5*time.Second,
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://alice.example.test/api/v1/widgets", nil)
+	req.Host = "alice.example.test"
+	resp := httptest.NewRecorder()
+	proxy.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.Code)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.lastPath != "/api/v1/widgets" {
+		t.Errorf("upstream saw path %q, want /api/v1/widgets", rec.lastPath)
+	}
+}
+
+// TestWakeProxy_AuditOnReady — success path writes one audit event
+// `autosleep.woken` with result="ready" and a non-zero wake_latency_ms.
+func TestWakeProxy_AuditOnReady(t *testing.T) {
+	host, port, _, srv := startUpstream(t, "ok")
+	defer srv.Close()
+
+	audit := &recordingAudit{}
+	proxy := NewWakeProxy(
+		&countingStarter{ready: true, ip: host, port: port, delay: 5 * time.Millisecond},
+		&fakeLookup{fullDomain: "alice.example.test", containerName: "alice-container", targetIP: host, targetPort: port},
+		&fakeRouteStore{},
+		nil,
+		audit,
+		5*time.Second,
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://alice.example.test/", nil)
+	req.Host = "alice.example.test"
+	resp := httptest.NewRecorder()
+	proxy.ServeHTTP(resp, req)
+
+	ev, ok := audit.last()
+	if !ok {
+		t.Fatal("no audit event recorded")
+	}
+	if ev.name != "autosleep.woken" {
+		t.Errorf("event name = %q, want autosleep.woken", ev.name)
+	}
+	if ev.fields["result"] != "ready" {
+		t.Errorf("result = %v, want ready", ev.fields["result"])
+	}
+	// Latency is int64 in the impl.
+	if lat, _ := ev.fields["wake_latency_ms"].(int64); lat <= 0 {
+		t.Errorf("wake_latency_ms = %v, want > 0", ev.fields["wake_latency_ms"])
+	}
+	if ev.fields["triggered_by"] != "http" {
+		t.Errorf("triggered_by = %v, want http", ev.fields["triggered_by"])
+	}
+	if ev.fields["username"] != "alice" {
+		t.Errorf("username = %v, want alice (containerName-trimmed)", ev.fields["username"])
+	}
+}
+
+// TestWakeProxy_AuditOnTimeout — starter ready=false → audit event has
+// result="error" (the impl folds timeout into the error branch with an
+// explicit "wake: timeout after" error).
+func TestWakeProxy_AuditOnTimeout(t *testing.T) {
+	audit := &recordingAudit{}
+	proxy := NewWakeProxy(
+		&countingStarter{ready: false},
+		&fakeLookup{fullDomain: "alice.example.test", containerName: "alice-container"},
+		&fakeRouteStore{},
+		nil,
+		audit,
+		1*time.Second,
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://alice.example.test/", nil)
+	req.Host = "alice.example.test"
+	resp := httptest.NewRecorder()
+	proxy.ServeHTTP(resp, req)
+
+	ev, ok := audit.last()
+	if !ok {
+		t.Fatal("no audit event recorded")
+	}
+	if ev.fields["result"] != "error" {
+		t.Errorf("result = %v, want error (timeout folds into error branch)", ev.fields["result"])
+	}
+	msg, _ := ev.fields["error"].(string)
+	if !strings.Contains(msg, "timeout") {
+		t.Errorf("error = %q, want it to mention timeout", msg)
+	}
+}
+
+// TestWakeProxy_AuditOnError — hard error from starter → audit event
+// result="error" with the error string preserved.
+func TestWakeProxy_AuditOnError(t *testing.T) {
+	audit := &recordingAudit{}
+	proxy := NewWakeProxy(
+		&countingStarter{err: errors.New("incus refused")},
+		&fakeLookup{fullDomain: "alice.example.test", containerName: "alice-container"},
+		&fakeRouteStore{},
+		nil,
+		audit,
+		1*time.Second,
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://alice.example.test/", nil)
+	req.Host = "alice.example.test"
+	resp := httptest.NewRecorder()
+	proxy.ServeHTTP(resp, req)
+
+	ev, ok := audit.last()
+	if !ok {
+		t.Fatal("no audit event recorded")
+	}
+	if ev.fields["result"] != "error" {
+		t.Errorf("result = %v, want error", ev.fields["result"])
+	}
+	if msg, _ := ev.fields["error"].(string); !strings.Contains(msg, "incus refused") {
+		t.Errorf("error = %q, want it to contain 'incus refused'", msg)
+	}
+}
+
+// listingRouteStore returns a non-empty slice so the wake proxy's
+// post-success scheduleSwapToDirect actually invokes the router.
+type listingRouteStore struct{}
+
+func (l *listingRouteStore) ListByContainer(ctx context.Context, name string) ([]*app.RouteRecord, error) {
+	return []*app.RouteRecord{{
+		ContainerName: name,
+		FullDomain:    "alice.example.test",
+		TargetIP:      "10.0.0.42",
+		TargetPort:    8080,
+		Protocol:      "http",
+	}}, nil
+}
+
+// TestWakeProxy_AfterSuccessSwapToDirect — a successful wake schedules
+// SwapToDirect (fire-and-forget). We can only thread a fake against
+// the *Router type via direct construction; since NewWakeProxy takes
+// `*Router` concretely, we build a Router wrapping a fake ProxyManager
+// and assert via the underlying proxy manager calls.
+func TestWakeProxy_AfterSuccessSwapToDirect(t *testing.T) {
+	host, port, _, srv := startUpstream(t, "ok")
+	defer srv.Close()
+
+	pm := &fakeProxyManager{}
+	tracker := New()
+	router := NewRouter(pm, tracker, "10.0.3.1", 8080)
+
+	proxy := NewWakeProxy(
+		&countingStarter{ready: true, ip: host, port: port},
+		&fakeLookup{fullDomain: "alice.example.test", containerName: "alice-container", targetIP: host, targetPort: port},
+		&listingRouteStore{},
+		router,
+		nil,
+		5*time.Second,
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://alice.example.test/", nil)
+	req.Host = "alice.example.test"
+	resp := httptest.NewRecorder()
+	proxy.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.Code)
+	}
+	// SwapToDirect is fire-and-forget; poll briefly.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if pm.httpCallsCount() > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := pm.httpCallsCount(); got != 1 {
+		t.Errorf("post-wake SwapToDirect → UpdateRoute calls = %d, want 1", got)
+	}
+}
+
+// TestWakeProxy_PortZeroFallsBackToRouteTarget — starter reports
+// port=0 → proxy reuses route.TargetPort. Same for empty IP.
+func TestWakeProxy_PortZeroFallsBackToRouteTarget(t *testing.T) {
+	host, port, _, srv := startUpstream(t, "fellback")
+	defer srv.Close()
+
+	proxy := NewWakeProxy(
+		// Starter reports ready but no ip/port — proxy must reuse the
+		// route record's TargetIP/TargetPort.
+		&countingStarter{ready: true, ip: "", port: 0},
+		&fakeLookup{fullDomain: "alice.example.test", containerName: "alice-container", targetIP: host, targetPort: port},
+		&fakeRouteStore{},
+		nil,
+		nil,
+		5*time.Second,
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://alice.example.test/", nil)
+	req.Host = "alice.example.test"
+	resp := httptest.NewRecorder()
+	proxy.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", resp.Code, resp.Body.String())
+	}
+	if got := resp.Body.String(); got != "fellback" {
+		t.Errorf("body = %q, want fellback", got)
+	}
+}
+
+// TestWakeProxy_WebSocketUpgradeSmoke — Upgrade: websocket headers
+// reach the upstream. httputil.NewSingleHostReverseProxy forwards
+// these headers correctly out of the box (Go 1.12+).
+func TestWakeProxy_WebSocketUpgradeSmoke(t *testing.T) {
+	host, port, rec, srv := startUpstream(t, "ok")
+	defer srv.Close()
+
+	proxy := NewWakeProxy(
+		&countingStarter{ready: true, ip: host, port: port},
+		&fakeLookup{fullDomain: "alice.example.test", containerName: "alice-container", targetIP: host, targetPort: port},
+		&fakeRouteStore{},
+		nil,
+		nil,
+		5*time.Second,
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://alice.example.test/ws", nil)
+	req.Host = "alice.example.test"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	resp := httptest.NewRecorder()
+	proxy.ServeHTTP(resp, req)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if !rec.upgrade {
+		t.Errorf("upstream did not receive Upgrade: websocket; headers=%v", rec.lastHeaders)
+	}
+}
+
+// TestWakeProxy_NilAuditLogger — when audit is nil, the impl falls
+// back to log.Printf — must not panic.
+func TestWakeProxy_NilAuditLogger(t *testing.T) {
+	host, port, _, srv := startUpstream(t, "ok")
+	defer srv.Close()
+
+	proxy := NewWakeProxy(
+		&countingStarter{ready: true, ip: host, port: port},
+		&fakeLookup{fullDomain: "alice.example.test", containerName: "alice-container", targetIP: host, targetPort: port},
+		&fakeRouteStore{},
+		nil,
+		nil, // explicit nil
+		5*time.Second,
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://alice.example.test/", nil)
+	req.Host = "alice.example.test"
+	resp := httptest.NewRecorder()
+	// Defer/recover guards against a regression that introduces a
+	// nil-deref into the impl.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("panicked with nil audit logger: %v", r)
+		}
+	}()
+	proxy.ServeHTTP(resp, req)
+}
+
+// TestWakeProxy_InflightMapClearsAfterCompletion — after a wake
+// completes, a follow-up request re-enters the leader path (i.e. the
+// inflight map entry was deleted). Verified by counting starter calls
+// across two sequential waves.
+func TestWakeProxy_InflightMapClearsAfterCompletion(t *testing.T) {
+	host, port, _, srv := startUpstream(t, "ok")
+	defer srv.Close()
+
+	starter := &countingStarter{ready: true, ip: host, port: port}
+	proxy := NewWakeProxy(
+		starter,
+		&fakeLookup{fullDomain: "alice.example.test", containerName: "alice-container", targetIP: host, targetPort: port},
+		&fakeRouteStore{},
+		nil,
+		nil,
+		5*time.Second,
+	)
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("http://alice.example.test/iter%d", i), nil)
+		req.Host = "alice.example.test"
+		resp := httptest.NewRecorder()
+		proxy.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("iter %d: status = %d, want 200", i, resp.Code)
+		}
+	}
+	// Three sequential waves should each re-enter the leader path —
+	// the inflight entry must be cleared after each completes.
+	if got := starter.calls.Load(); got != 3 {
+		t.Errorf("starter calls = %d, want 3 (inflight not cleared between waves)", got)
+	}
+}
