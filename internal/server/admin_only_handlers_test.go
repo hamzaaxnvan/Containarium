@@ -30,3 +30,35 @@ func TestGetSystemInfo_RejectsNoSubject(t *testing.T) {
 	_, err := srv.GetSystemInfo(context.Background(), &pb.GetSystemInfoRequest{})
 	if status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("missing subject must be Unauthenticated; got %v", status.Code(err))
+	}
+}
+
+func TestMoveContainer_RejectsNonAdmin(t *testing.T) {
+	srv := &ContainerServer{}
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", "user")
+
+	_, err := srv.MoveContainer(ctx, &pb.MoveContainerRequest{
+		Username:        "alice",
+		TargetBackendId: "tunnel-other",
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("non-admin must be denied even on own username; got %v (%v)", status.Code(err), err)
+	}
+}
+
+func TestAdoptMigratedContainer_RejectsNonAdmin(t *testing.T) {
+	srv := &ContainerServer{}
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", "user")
+
+	_, err := srv.AdoptMigratedContainer(ctx, &pb.AdoptMigratedContainerRequest{
+		Username: "alice",
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("non-admin must be denied; got %v (%v)", status.Code(err), err)
+	}
+}
+
+// Positive coverage (admin token passes the gate) is exercised
+// indirectly by existing handler tests that use testCtx() — those
+// inject ContextWithSystemIdentity (admin role) and would fail
+// immediately at RequireRole if the gate were misconfigured.
