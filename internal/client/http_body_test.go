@@ -78,3 +78,123 @@ func TestHTTPRequestBodiesAreJSONObjects(t *testing.T) {
 	}{
 		{
 			name:     "SetSecret (#887, reported)",
+			response: `{"message":"secret created"}`,
+			call: func(c *HTTPClient) error {
+				_, err := c.SetSecret("alice", "API_KEY", "s3cr3t", "compose")
+				return err
+			},
+			wantPath: "/v1/secrets",
+			want: map[string]any{
+				"username": "alice",
+				"name":     "API_KEY",
+				"value":    "s3cr3t",
+				"delivery": "compose",
+			},
+		},
+		{
+			name:     "ToggleMonitoring (same defect, unreported)",
+			response: `{"message":"ok","enabled":true}`,
+			call: func(c *HTTPClient) error {
+				_, _, err := c.ToggleMonitoring("alice", true)
+				return err
+			},
+			wantPath: "/v1/containers/alice/monitoring",
+			want:     map[string]any{"enabled": true},
+		},
+		{
+			name:     "ResizeContainer (same defect, unreported)",
+			response: `{"message":"resized"}`,
+			call: func(c *HTTPClient) error {
+				_, err := c.ResizeContainer("alice", "4", "8GB", "50GB", "", "")
+				return err
+			},
+			wantPath: "/v1/containers/alice/resize",
+			want: map[string]any{
+				"cpu":    "4",
+				"memory": "8GB",
+				"disk":   "50GB",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, c := newBodyRecorder(t, tc.response)
+			if err := tc.call(c); err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if rec.path != tc.wantPath {
+				t.Errorf("path = %q, want %q", rec.path, tc.wantPath)
+			}
+			got := rec.object(t)
+			for k, want := range tc.want {
+				if got[k] != want {
+					t.Errorf("body[%q] = %#v, want %#v (full body: %s)", k, got[k], want, rec.raw)
+				}
+			}
+		})
+	}
+}
+
+// SetSecret omits `delivery` when the caller left it empty, so the daemon
+// applies its own default rather than being handed "".
+func TestSetSecretOmitsEmptyDelivery(t *testing.T) {
+	rec, c := newBodyRecorder(t, `{"message":"ok"}`)
+	if _, err := c.SetSecret("alice", "API_KEY", "s3cr3t", ""); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+	got := rec.object(t)
+	if _, present := got["delivery"]; present {
+		t.Errorf("delivery should be omitted when empty, got %#v", got["delivery"])
+	}
+	if got["username"] != "alice" {
+		t.Errorf("username = %#v", got["username"])
+	}
+}
+
+// The wire format of the endpoints that were already correct must not
+// shift while doRequest's contract changes underneath them. These lock
+// the field names the daemon's protos expect.
+func TestUnaffectedRequestBodiesKeepTheirWireFormat(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response string
+		call     func(*HTTPClient) error
+		want     map[string]any
+	}{
+		{
+			name:     "SetContainerTTL",
+			response: `{"ttlExpiresAt":"2030-01-01T00:00:00Z"}`,
+			call: func(c *HTTPClient) error {
+				_, err := c.SetContainerTTL("alice", 3600)
+				return err
+			},
+			want: map[string]any{"duration_seconds": float64(3600)},
+		},
+		{
+			name:     "SetLabels",
+			response: `{"message":"ok"}`,
+			call: func(c *HTTPClient) error {
+				return c.SetLabels("alice", map[string]string{"team": "core"})
+			},
+			want: map[string]any{"labels": map[string]any{"team": "core"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, c := newBodyRecorder(t, tc.response)
+			if err := tc.call(c); err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			got := rec.object(t)
+			for k, want := range tc.want {
+				if !jsonEqual(got[k], want) {
+					t.Errorf("body[%q] = %#v, want %#v", k, got[k], want)
+				}
+			}
+		})
+	}
+}
+
+func jsonEqual(a, b any) bool {
+	ab, _ := json.Marshal(a)
+	bb, _ := json.Marshal(b)
+	return string(ab) == string(bb)
+}
