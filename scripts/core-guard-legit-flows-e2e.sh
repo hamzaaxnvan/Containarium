@@ -77,3 +77,83 @@ TENANT_IP=$(bridge_ip "$TENANT")
 
 echo "== bridge=$BRIDGE host_gw=$HOST_GW tenant=$TENANT($TENANT_IP)"
 echo "== core: postgres=${PG:-absent} victoriametrics=${VM:-absent} caddy=${CADDY:-absent} otelcollector=${OTEL:-absent}"
+echo
+
+# --- probes ------------------------------------------------------------------
+
+# tcp_from <where> <ip> <port>: where = "host" or a container name.
+# Prints "succeeded" or "failed".
+tcp_from() {
+  local where="$1" ip="$2" port="$3"
+  local probe="timeout $CONNECT_TIMEOUT bash -c 'echo > /dev/tcp/$ip/$port' 2>/dev/null && echo succeeded || echo failed"
+  if [ "$where" = "host" ]; then
+    bash -c "$probe"
+  else
+    incus exec "$where" -- bash -c "$probe" </dev/null
+  fi
+}
+
+# expect <ok|drop> <where> <label> <ip> <port>
+expect() {
+  local want="$1" where="$2" label="$3" ip="$4" port="$5"
+  if [ -z "$ip" ]; then
+    echo "SKIP  $label: target role not deployed on this host"
+    return
+  fi
+  local got
+  got=$(tcp_from "$where" "$ip" "$port")
+  case "$want:$got" in
+    ok:succeeded)  echo "OK    $label ($ip:$port): reachable, as intended" ;;
+    drop:failed)   echo "OK    $label ($ip:$port): dropped, as intended" ;;
+    ok:failed)     echo "FAIL  $label ($ip:$port): legitimate flow is BROKEN by the guard"; FAILS=$((FAILS + 1)) ;;
+    drop:succeeded) echo "FAIL  $label ($ip:$port): tenant reached platform infra — guard not enforcing"; FAILS=$((FAILS + 1)) ;;
+  esac
+}
+
+echo "== legitimate flows must survive"
+expect ok host  "host gateway -> postgres:5432"                     "$PG"    5432
+if [ -n "$VM" ]; then
+  expect ok "containarium-core-victoriametrics" "victoriametrics -> postgres:5432" "$PG" 5432
+else
+  echo "SKIP  victoriametrics -> postgres:5432: victoriametrics not deployed"
+fi
+expect ok "$TENANT" "tenant -> caddy:443"                           "$CADDY" 443
+expect ok "$TENANT" "tenant -> otelcollector:4318"                  "$OTEL"  4318
+echo
+
+echo "== tenant reaching the data plane must be dropped"
+SINCE=$(date '+%Y-%m-%d %H:%M:%S')
+expect drop "$TENANT" "tenant -> postgres:5432"                     "$PG"    5432
+expect drop "$TENANT" "tenant -> victoriametrics:3000 (grafana)"    "$VM"    3000
+expect drop "$TENANT" "tenant -> caddy:2019 (admin API)"            "$CADDY" 2019
+echo
+
+# --- evidence ----------------------------------------------------------------
+
+echo "== each drop must be logged (security.acls.default.ingress.logged=true)"
+if ! command -v journalctl >/dev/null 2>&1; then
+  echo "SKIP  no journalctl on this host; check dmesg for SRC=$TENANT_IP lines by hand"
+else
+  for spec in "$PG:5432" "$VM:3000" "$CADDY:2019"; do
+    ip="${spec%%:*}"; port="${spec##*:}"
+    [ -z "$ip" ] && continue
+    # Capture the window first and grep the captured text. `journalctl | grep -q` under `set -o pipefail` reports
+    # FAILURE even on a match: grep -q exits at the first hit, journalctl takes SIGPIPE writing the rest of the
+    # window, and pipefail surfaces that as the pipeline's status, so every logged drop looked unlogged.
+    klog="$(journalctl -k --since "$SINCE" --no-pager 2>/dev/null || true)"
+    if grep -qE "SRC=$TENANT_IP .*DST=$ip .*DPT=$port\b" <<<"$klog"; then
+      echo "OK    drop logged: $TENANT_IP -> $ip:$port"
+    else
+      echo "FAIL  no kernel-log line for $TENANT_IP -> $ip:$port since $SINCE (is default.ingress.logged=true on that NIC?)"
+      FAILS=$((FAILS + 1))
+    fi
+  done
+fi
+echo
+
+if [ "$FAILS" -eq 0 ]; then
+  echo "PASS: guard enforces the table and the platform still talks to itself"
+else
+  echo "FAILED: $FAILS check(s) — see lines marked FAIL above"
+  exit 1
+fi
