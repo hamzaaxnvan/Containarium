@@ -32,3 +32,38 @@ Examples:
   containarium agent worker hello-agent --server <host>
   containarium agent enqueue hello-agent --input '{"q":"hi"}' --server <host>`,
 	Args: cobra.ExactArgs(1),
+	RunE: runAgentWorker,
+}
+
+func init() {
+	agentCmd.AddCommand(agentWorkerCmd)
+	agentWorkerCmd.Flags().StringVar(&agentWorkerBackendID, "backend-id", "",
+		"Target backend ID (must be the local backend in the prototype)")
+	agentWorkerCmd.Flags().StringVar(&agentWorkerPool, "pool", "",
+		"Target pool (not supported in the prototype)")
+	agentWorkerCmd.Flags().StringVar(&agentWorkerID, "worker-id", "",
+		"Stable worker id for audit/debug (defaults to the box name)")
+}
+
+func runAgentWorker(cmd *cobra.Command, args []string) error {
+	skillID := args[0]
+
+	c, err := newAgentClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	fmt.Printf("Starting pull-queue worker for skill %q...\n", skillID)
+	resp, err := c.StartAgentWorker(skillID, agentWorkerBackendID, agentWorkerPool, agentWorkerID)
+	if err != nil {
+		return err
+	}
+
+	if resp.Container != nil {
+		fmt.Printf("\n✓ worker box ready: %s (%s)\n", resp.Container.Name, resp.Container.State)
+	}
+	fmt.Printf("  worker id: %s\n", resp.WorkerId)
+	fmt.Println("  polling for tasks — enqueue with: containarium agent enqueue " + skillID + " --input '{...}'")
+	return nil
+}

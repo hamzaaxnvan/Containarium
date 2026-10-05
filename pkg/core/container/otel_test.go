@@ -67,3 +67,143 @@ func TestOtelEnvVars_MonitoringOnButNoEndpoint(t *testing.T) {
 		OTelCollectorEndpoint: "",
 		BackendID:             "local",
 	}
+	if got := otelEnvVars(opts, "alice"); got != nil {
+		t.Fatalf("expected nil when collector endpoint is empty, got %v", got)
+	}
+}
+
+func TestOtelEnvVars_FullyConfigured(t *testing.T) {
+	opts := CreateOptions{
+		Username:              "alice",
+		Monitoring:            true,
+		OTelCollectorEndpoint: "http://10.0.0.1:4318",
+		BackendID:             "node-a-gpu",
+	}
+	got := otelEnvVars(opts, "alice-container")
+	if got == nil {
+		t.Fatal("expected non-nil env vars when fully configured")
+	}
+	// Legacy OTEL_* form
+	if got["OTEL_EXPORTER_OTLP_ENDPOINT"] != "http://10.0.0.1:4318" {
+		t.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT = %q, want %q", got["OTEL_EXPORTER_OTLP_ENDPOINT"], "http://10.0.0.1:4318")
+	}
+	if got["OTEL_EXPORTER_OTLP_PROTOCOL"] != "http/protobuf" {
+		t.Errorf("OTEL_EXPORTER_OTLP_PROTOCOL = %q, want %q", got["OTEL_EXPORTER_OTLP_PROTOCOL"], "http/protobuf")
+	}
+	if got["OTEL_SERVICE_NAME"] != "alice" {
+		t.Errorf("OTEL_SERVICE_NAME = %q, want %q", got["OTEL_SERVICE_NAME"], "alice")
+	}
+	attrs := got["OTEL_RESOURCE_ATTRIBUTES"]
+	if !strings.Contains(attrs, "container.id=alice-container") {
+		t.Errorf("OTEL_RESOURCE_ATTRIBUTES missing container.id: %q", attrs)
+	}
+	if !strings.Contains(attrs, "backend.id=node-a-gpu") {
+		t.Errorf("OTEL_RESOURCE_ATTRIBUTES missing backend.id: %q", attrs)
+	}
+	// New split form for sidecar compose-interpolation
+	if got["CONTAINARIUM_CONTAINER_ID"] != "alice-container" {
+		t.Errorf("CONTAINARIUM_CONTAINER_ID = %q, want %q", got["CONTAINARIUM_CONTAINER_ID"], "alice-container")
+	}
+	if got["CONTAINARIUM_BACKEND_ID"] != "node-a-gpu" {
+		t.Errorf("CONTAINARIUM_BACKEND_ID = %q, want %q", got["CONTAINARIUM_BACKEND_ID"], "node-a-gpu")
+	}
+	if got["CONTAINARIUM_TENANT_ID"] != "alice" {
+		t.Errorf("CONTAINARIUM_TENANT_ID = %q, want %q", got["CONTAINARIUM_TENANT_ID"], "alice")
+	}
+}
+
+func TestOtelEnvVars_CloudLabelPreferredOverContainerName(t *testing.T) {
+	// #893: a cloud-managed container carries the real cloud UUID in
+	// labels[CloudContainerIDLabelKey] — that must win over the
+	// derived "alice-container" LXC name so cloud-daemon's
+	// container_id-keyed metrics queries actually match.
+	opts := CreateOptions{
+		Username:              "cld-30dc0e41",
+		Monitoring:            true,
+		OTelCollectorEndpoint: "http://10.0.0.1:4318",
+		BackendID:             "local",
+		Labels: map[string]string{
+			CloudContainerIDLabelKey: "30dc0e41-1234-4abc-9def-000000000001",
+		},
+	}
+	got := otelEnvVars(opts, "cld-30dc0e41-container")
+	if got == nil {
+		t.Fatal("expected non-nil env vars")
+	}
+	want := "30dc0e41-1234-4abc-9def-000000000001"
+	if got["CONTAINARIUM_CONTAINER_ID"] != want {
+		t.Errorf("CONTAINARIUM_CONTAINER_ID = %q, want %q", got["CONTAINARIUM_CONTAINER_ID"], want)
+	}
+	if !strings.Contains(got["OTEL_RESOURCE_ATTRIBUTES"], "container.id="+want) {
+		t.Errorf("OTEL_RESOURCE_ATTRIBUTES missing container.id=%s: %q", want, got["OTEL_RESOURCE_ATTRIBUTES"])
+	}
+}
+
+func TestOtelEnvVars_NoCloudLabelFallsBackToContainerName(t *testing.T) {
+	// Operator-created containers (or any caller that never set the
+	// label) must keep exactly the pre-#893 behavior.
+	opts := CreateOptions{
+		Username:              "alice",
+		Monitoring:            true,
+		OTelCollectorEndpoint: "http://10.0.0.1:4318",
+		BackendID:             "local",
+	}
+	got := otelEnvVars(opts, "alice-container")
+	if got["CONTAINARIUM_CONTAINER_ID"] != "alice-container" {
+		t.Errorf("CONTAINARIUM_CONTAINER_ID = %q, want %q (fallback)", got["CONTAINARIUM_CONTAINER_ID"], "alice-container")
+	}
+}
+
+func TestOTelContainerID(t *testing.T) {
+	cases := []struct {
+		name     string
+		labels   map[string]string
+		fallback string
+		want     string
+	}{
+		{"label present", map[string]string{CloudContainerIDLabelKey: "cloud-uuid-1"}, "alice-container", "cloud-uuid-1"},
+		{"label absent", map[string]string{"other": "x"}, "alice-container", "alice-container"},
+		{"nil labels", nil, "alice-container", "alice-container"},
+		{"label present but empty", map[string]string{CloudContainerIDLabelKey: ""}, "alice-container", "alice-container"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := OTelContainerID(tc.labels, tc.fallback); got != tc.want {
+				t.Errorf("OTelContainerID(%v, %q) = %q, want %q", tc.labels, tc.fallback, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOTelEnvVarsForMigration_EmptyEndpoint(t *testing.T) {
+	if got := OTelEnvVarsForMigration("alice", "alice", "local", ""); got != nil {
+		t.Fatalf("expected nil for empty endpoint, got %v", got)
+	}
+}
+
+func TestOTelEnvVarsForMigration_Populated(t *testing.T) {
+	got := OTelEnvVarsForMigration("alice", "alice-container", "node-b-gpu", "http://10.0.0.2:4318")
+	if got == nil {
+		t.Fatal("expected non-nil map")
+	}
+	if got["OTEL_EXPORTER_OTLP_ENDPOINT"] != "http://10.0.0.2:4318" {
+		t.Errorf("endpoint mismatch: %q", got["OTEL_EXPORTER_OTLP_ENDPOINT"])
+	}
+	if got["OTEL_SERVICE_NAME"] != "alice" {
+		t.Errorf("service name mismatch: %q", got["OTEL_SERVICE_NAME"])
+	}
+	attrs := got["OTEL_RESOURCE_ATTRIBUTES"]
+	if !strings.Contains(attrs, "backend.id=node-b-gpu") {
+		t.Errorf("expected backend.id in attrs, got %q", attrs)
+	}
+	// Split form must match the legacy comma-encoded form
+	if got["CONTAINARIUM_CONTAINER_ID"] != "alice-container" {
+		t.Errorf("split CONTAINARIUM_CONTAINER_ID = %q, want alice-container", got["CONTAINARIUM_CONTAINER_ID"])
+	}
+	if got["CONTAINARIUM_BACKEND_ID"] != "node-b-gpu" {
+		t.Errorf("split CONTAINARIUM_BACKEND_ID = %q, want node-b-gpu", got["CONTAINARIUM_BACKEND_ID"])
+	}
+	if got["CONTAINARIUM_TENANT_ID"] != "alice" {
+		t.Errorf("split CONTAINARIUM_TENANT_ID = %q, want alice", got["CONTAINARIUM_TENANT_ID"])
+	}
+}
