@@ -230,3 +230,235 @@ func RegisterGuardrailPolicyServiceHandlerServer(ctx context.Context, mux *runti
 		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
 		if err != nil {
 			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_GuardrailPolicyService_GetGuardrailPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPut, pattern_GuardrailPolicyService_SetGuardrailPolicy_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/containarium.v1.GuardrailPolicyService/SetGuardrailPolicy", runtime.WithHTTPPathPattern("/v1/guardrail/policy"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_GuardrailPolicyService_SetGuardrailPolicy_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_GuardrailPolicyService_SetGuardrailPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPut, pattern_GuardrailPolicyService_SetGuardrailBaselineMode_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/containarium.v1.GuardrailPolicyService/SetGuardrailBaselineMode", runtime.WithHTTPPathPattern("/v1/guardrail/baseline"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_GuardrailPolicyService_SetGuardrailBaselineMode_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_GuardrailPolicyService_SetGuardrailBaselineMode_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+
+	return nil
+}
+
+// RegisterGuardrailEngineServiceHandlerFromEndpoint is same as RegisterGuardrailEngineServiceHandler but
+// automatically dials to "endpoint" and closes the connection when "ctx" gets done.
+func RegisterGuardrailEngineServiceHandlerFromEndpoint(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) (err error) {
+	conn, err := grpc.NewClient(endpoint, opts...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Errorf("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+			return
+		}
+		go func() {
+			<-ctx.Done()
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Errorf("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+		}()
+	}()
+	return RegisterGuardrailEngineServiceHandler(ctx, mux, conn)
+}
+
+// RegisterGuardrailEngineServiceHandler registers the http handlers for service GuardrailEngineService to "mux".
+// The handlers forward requests to the grpc endpoint over "conn".
+func RegisterGuardrailEngineServiceHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc.ClientConn) error {
+	return RegisterGuardrailEngineServiceHandlerClient(ctx, mux, NewGuardrailEngineServiceClient(conn))
+}
+
+// RegisterGuardrailEngineServiceHandlerClient registers the http handlers for service GuardrailEngineService
+// to "mux". The handlers forward requests to the grpc endpoint over the given implementation of "GuardrailEngineServiceClient".
+// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "GuardrailEngineServiceClient"
+// doesn't go through the normal gRPC flow (creating a gRPC client etc.) then it will be up to the passed in
+// "GuardrailEngineServiceClient" to call the correct interceptors. This client ignores the HTTP middlewares.
+func RegisterGuardrailEngineServiceHandlerClient(ctx context.Context, mux *runtime.ServeMux, client GuardrailEngineServiceClient) error {
+	mux.Handle(http.MethodPost, pattern_GuardrailEngineService_Scan_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.GuardrailEngineService/Scan", runtime.WithHTTPPathPattern("/containarium.v1.GuardrailEngineService/Scan"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_GuardrailEngineService_Scan_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_GuardrailEngineService_Scan_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	return nil
+}
+
+var (
+	pattern_GuardrailEngineService_Scan_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"containarium.v1.GuardrailEngineService", "Scan"}, ""))
+)
+
+var (
+	forward_GuardrailEngineService_Scan_0 = runtime.ForwardResponseMessage
+)
+
+// RegisterGuardrailPolicyServiceHandlerFromEndpoint is same as RegisterGuardrailPolicyServiceHandler but
+// automatically dials to "endpoint" and closes the connection when "ctx" gets done.
+func RegisterGuardrailPolicyServiceHandlerFromEndpoint(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) (err error) {
+	conn, err := grpc.NewClient(endpoint, opts...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Errorf("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+			return
+		}
+		go func() {
+			<-ctx.Done()
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Errorf("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+		}()
+	}()
+	return RegisterGuardrailPolicyServiceHandler(ctx, mux, conn)
+}
+
+// RegisterGuardrailPolicyServiceHandler registers the http handlers for service GuardrailPolicyService to "mux".
+// The handlers forward requests to the grpc endpoint over "conn".
+func RegisterGuardrailPolicyServiceHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc.ClientConn) error {
+	return RegisterGuardrailPolicyServiceHandlerClient(ctx, mux, NewGuardrailPolicyServiceClient(conn))
+}
+
+// RegisterGuardrailPolicyServiceHandlerClient registers the http handlers for service GuardrailPolicyService
+// to "mux". The handlers forward requests to the grpc endpoint over the given implementation of "GuardrailPolicyServiceClient".
+// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "GuardrailPolicyServiceClient"
+// doesn't go through the normal gRPC flow (creating a gRPC client etc.) then it will be up to the passed in
+// "GuardrailPolicyServiceClient" to call the correct interceptors. This client ignores the HTTP middlewares.
+func RegisterGuardrailPolicyServiceHandlerClient(ctx context.Context, mux *runtime.ServeMux, client GuardrailPolicyServiceClient) error {
+	mux.Handle(http.MethodGet, pattern_GuardrailPolicyService_GetGuardrailStatus_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.GuardrailPolicyService/GetGuardrailStatus", runtime.WithHTTPPathPattern("/v1/guardrail/status"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_GuardrailPolicyService_GetGuardrailStatus_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_GuardrailPolicyService_GetGuardrailStatus_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodGet, pattern_GuardrailPolicyService_GetGuardrailPolicy_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.GuardrailPolicyService/GetGuardrailPolicy", runtime.WithHTTPPathPattern("/v1/guardrail/policy"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_GuardrailPolicyService_GetGuardrailPolicy_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_GuardrailPolicyService_GetGuardrailPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPut, pattern_GuardrailPolicyService_SetGuardrailPolicy_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.GuardrailPolicyService/SetGuardrailPolicy", runtime.WithHTTPPathPattern("/v1/guardrail/policy"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_GuardrailPolicyService_SetGuardrailPolicy_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_GuardrailPolicyService_SetGuardrailPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPut, pattern_GuardrailPolicyService_SetGuardrailBaselineMode_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.GuardrailPolicyService/SetGuardrailBaselineMode", runtime.WithHTTPPathPattern("/v1/guardrail/baseline"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_GuardrailPolicyService_SetGuardrailBaselineMode_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_GuardrailPolicyService_SetGuardrailBaselineMode_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	return nil
+}
+
+var (
+	pattern_GuardrailPolicyService_GetGuardrailStatus_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "guardrail", "status"}, ""))
+	pattern_GuardrailPolicyService_GetGuardrailPolicy_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "guardrail", "policy"}, ""))
+	pattern_GuardrailPolicyService_SetGuardrailPolicy_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "guardrail", "policy"}, ""))
+	pattern_GuardrailPolicyService_SetGuardrailBaselineMode_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "guardrail", "baseline"}, ""))
+)
+
+var (
+	forward_GuardrailPolicyService_GetGuardrailStatus_0       = runtime.ForwardResponseMessage
+	forward_GuardrailPolicyService_GetGuardrailPolicy_0       = runtime.ForwardResponseMessage
+	forward_GuardrailPolicyService_SetGuardrailPolicy_0       = runtime.ForwardResponseMessage
+	forward_GuardrailPolicyService_SetGuardrailBaselineMode_0 = runtime.ForwardResponseMessage
+)
