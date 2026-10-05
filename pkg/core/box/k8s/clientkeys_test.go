@@ -119,3 +119,84 @@ func TestSetAuthorizedKeysUpdatesClientKeys(t *testing.T) {
 	sec, _ := cs.CoreV1().Secrets("tenant-carol").Get(ctx, secretName("carol"), metav1.GetOptions{})
 	if got := string(sec.Data[clientKeysKey]); got != "rotated-key\n" {
 		t.Errorf("client_keys after rotation = %q, want rotated-key", got)
+	}
+}
+
+// TestGatewayIngressPortResolvesNodePort verifies the SSH-ingress resolver
+// reads the gateway Service's NodePort, and honors the explicit override.
+func TestGatewayIngressPortResolvesNodePort(t *testing.T) {
+	b, cs, _ := gatewayUpstreamBackend() // GatewayNamespace=agent-gateway, GatewayService=sshpiper
+	ctx := context.Background()
+	mustCreateNodePortService(t, cs, "agent-gateway", "sshpiper", 32022)
+
+	if got := b.GatewayIngressPort(ctx); got != 32022 {
+		t.Errorf("GatewayIngressPort = %d, want 32022", got)
+	}
+
+	// Explicit override wins over the Service lookup.
+	b.cfg.GatewayAdvertisePort = 40000
+	if got := b.GatewayIngressPort(ctx); got != 40000 {
+		t.Errorf("GatewayIngressPort with override = %d, want 40000", got)
+	}
+}
+
+// TestGatewayIngressPortMissingService: no Service, no override → 0 (advertise
+// nothing; sentinel falls back to its legacy convention).
+func TestGatewayIngressPortMissingService(t *testing.T) {
+	b, _, _ := gatewayUpstreamBackend()
+	if got := b.GatewayIngressPort(context.Background()); got != 0 {
+		t.Errorf("GatewayIngressPort with no service = %d, want 0", got)
+	}
+}
+
+// TestResolveGatewayDialTargetNodePort: with a NodePort Service and a node
+// InternalIP, the tunnel dial target is <nodeIP>:<NodePort> — never
+// 127.0.0.1 (the whole point: NodePorts aren't localhost-reachable).
+func TestResolveGatewayDialTargetNodePort(t *testing.T) {
+	b, cs, _ := gatewayUpstreamBackend()
+	ctx := context.Background()
+	mustCreateNodePortService(t, cs, "agent-gateway", "sshpiper", 32022)
+	mustCreateNode(t, cs, "node-1", "10.0.0.7")
+
+	if got := b.ResolveGatewayDialTarget(ctx); got != "10.0.0.7:32022" {
+		t.Errorf("ResolveGatewayDialTarget = %q, want 10.0.0.7:32022", got)
+	}
+}
+
+// TestResolveGatewayDialTargetLoadBalancer: a LoadBalancer ingress wins over
+// the NodePort path — dial the LB address on the Service port.
+func TestResolveGatewayDialTargetLoadBalancer(t *testing.T) {
+	b, cs, _ := gatewayUpstreamBackend()
+	ctx := context.Background()
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "sshpiper", Namespace: "agent-gateway"},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{Name: "ssh", Port: 22, NodePort: 32022}},
+		},
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{IP: "203.0.113.9"}},
+			},
+		},
+	}
+	if _, err := cs.CoreV1().Services("agent-gateway").Create(ctx, svc, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create lb service: %v", err)
+	}
+	if got := b.ResolveGatewayDialTarget(ctx); got != "203.0.113.9:22" {
+		t.Errorf("ResolveGatewayDialTarget = %q, want 203.0.113.9:22", got)
+	}
+}
+
+func mustCreateNode(t *testing.T, cs *fake.Clientset, name, internalIP string) {
+	t.Helper()
+	_, err := cs.CoreV1().Nodes().Create(context.Background(), &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{{Type: corev1.NodeInternalIP, Address: internalIP}},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+}

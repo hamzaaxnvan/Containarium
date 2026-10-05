@@ -9,3 +9,14 @@ Wants=incus.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/incus-watchdog.sh
+# Tune per host without editing the script; see the script header for keys.
+# Environment=INCUS_WATCHDOG_INTERVAL=45
+# Environment=INCUS_WATCHDOG_FAIL_THRESHOLD=2
+Restart=always
+RestartSec=10
+# The watchdog itself must never be OOM-killed or throttled away.
+OOMScoreAdjust=-500
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
