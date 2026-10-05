@@ -134,3 +134,49 @@ func postJSON(url string, body []byte, out interface{}) error {
 		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// deleteJSON does an admin-authenticated DELETE, discarding any response
+// body. Sibling of getJSON/postJSON.
+func deleteJSON(url string) error {
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
+func init() {
+	securityBadDestinationsListCmd.Flags().BoolVar(&badDestinationsListJSONOut, "json", false, "Output raw JSON")
+	securityBadDestinationsCmd.AddCommand(securityBadDestinationsListCmd)
+	securityBadDestinationsCmd.AddCommand(securityBadDestinationsAddCmd)
+	securityBadDestinationsCmd.AddCommand(securityBadDestinationsRemoveCmd)
+	securityCmd.AddCommand(securityBadDestinationsCmd)
+}
