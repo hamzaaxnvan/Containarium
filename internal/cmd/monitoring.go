@@ -44,3 +44,49 @@ Examples:
 }
 
 func init() {
+	rootCmd.AddCommand(monitoringCmd)
+	monitoringCmd.AddCommand(monitoringEnableCmd)
+	monitoringCmd.AddCommand(monitoringDisableCmd)
+}
+
+func runMonitoringToggle(username string, enabled bool) error {
+	// Toggle requires server connectivity — there's no useful local
+	// equivalent (the LXC config update path lives on the daemon).
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for monitoring toggle (no local fallback)")
+	}
+
+	var msg string
+	var nowEnabled bool
+	var err error
+
+	if httpMode {
+		httpClient, herr := client.NewHTTPClient(serverAddr, authToken)
+		if herr != nil {
+			return herr
+		}
+		defer func() { _ = httpClient.Close() }()
+		msg, nowEnabled, err = httpClient.ToggleMonitoring(username, enabled)
+	} else {
+		grpcClient, gerr := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if gerr != nil {
+			return gerr
+		}
+		defer func() { _ = grpcClient.Close() }()
+		msg, nowEnabled, err = grpcClient.ToggleMonitoring(username, enabled)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	state := "disabled"
+	if nowEnabled {
+		state = "enabled"
+	}
+	fmt.Printf("✓ Container %s: monitoring %s\n", username, state)
+	if msg != "" {
+		fmt.Println(msg)
+	}
+	return nil
+}
