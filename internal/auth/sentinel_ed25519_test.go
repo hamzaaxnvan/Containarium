@@ -123,3 +123,129 @@ func TestVerifier_AlgorithmIsolation(t *testing.T) {
 	hmacOnly := NewSentinelVerifier(nil, validHMACSecret)
 	both := NewSentinelVerifier(pub, validHMACSecret)
 
+	edReq := func() *http.Request { return newSignedReq(t, priv, "GET", "/authorized-keys") }
+	hmacReq := func() *http.Request {
+		req := httptest.NewRequest("GET", "http://daemon/authorized-keys", nil)
+		SignSentinelRequest(req, validHMACSecret)
+		return req
+	}
+
+	// ed25519-only verifier: accepts ed25519, rejects HMAC.
+	if err := ed25519Only.VerifyRequest(edReq(), time.Now()); err != nil {
+		t.Errorf("ed25519-only should accept ed25519: %v", err)
+	}
+	if err := ed25519Only.VerifyRequest(hmacReq(), time.Now()); err == nil {
+		t.Error("ed25519-only MUST reject HMAC (no secret to verify, and must not forge)")
+	}
+
+	// HMAC-only verifier: accepts HMAC, rejects ed25519.
+	if err := hmacOnly.VerifyRequest(hmacReq(), time.Now()); err != nil {
+		t.Errorf("hmac-only should accept HMAC: %v", err)
+	}
+	if err := hmacOnly.VerifyRequest(edReq(), time.Now()); err == nil {
+		t.Error("hmac-only MUST reject ed25519")
+	}
+
+	// Dual verifier (migration window): accepts both.
+	if err := both.VerifyRequest(edReq(), time.Now()); err != nil {
+		t.Errorf("dual should accept ed25519: %v", err)
+	}
+	if err := both.VerifyRequest(hmacReq(), time.Now()); err != nil {
+		t.Errorf("dual should accept HMAC: %v", err)
+	}
+}
+
+func TestVerifyResponse_Ed25519_RoundTrip(t *testing.T) {
+	pub, priv := mustKeypair(t)
+	v := NewSentinelVerifier(pub, nil)
+	body := []byte(`{"peers":[{"id":"x"}]}`)
+
+	rec := httptest.NewRecorder()
+	SignSentinelResponseEd25519(rec, priv, body)
+	resp := &http.Response{Header: rec.Header()}
+
+	if err := v.VerifyResponse(resp, body, time.Now()); err != nil {
+		t.Fatalf("valid ed25519 response rejected: %v", err)
+	}
+
+	// Tampered body → reject.
+	if err := v.VerifyResponse(resp, append(body, '!'), time.Now()); err == nil {
+		t.Error("tampered response body accepted")
+	}
+
+	// nil private key → no headers → fail closed.
+	rec2 := httptest.NewRecorder()
+	SignSentinelResponseEd25519(rec2, nil, body)
+	if rec2.Header().Get(SentinelHeaderSignature) != "" {
+		t.Error("nil key must not write a signature header")
+	}
+	if err := v.VerifyResponse(&http.Response{Header: rec2.Header()}, body, time.Now()); err == nil {
+		t.Error("unsigned response accepted")
+	}
+}
+
+func TestSentinelVerifier_Middleware(t *testing.T) {
+	pub, priv := mustKeypair(t)
+
+	call := func(v SentinelVerifier, req *http.Request) int {
+		rec := httptest.NewRecorder()
+		v.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok")
+		})).ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// Unconfigured → fail closed 401.
+	if code := call(NewSentinelVerifier(nil, nil), newSignedReq(t, priv, "GET", "/x")); code != http.StatusUnauthorized {
+		t.Errorf("unconfigured verifier: want 401, got %d", code)
+	}
+	// Valid ed25519 → 200.
+	if code := call(NewSentinelVerifier(pub, nil), newSignedReq(t, priv, "GET", "/x")); code != http.StatusOK {
+		t.Errorf("valid request: want 200, got %d", code)
+	}
+	// Invalid (unsigned) → 401.
+	if code := call(NewSentinelVerifier(pub, nil), httptest.NewRequest("GET", "http://d/x", nil)); code != http.StatusUnauthorized {
+		t.Errorf("unsigned request: want 401, got %d", code)
+	}
+}
+
+func TestConfigured(t *testing.T) {
+	pub, _ := mustKeypair(t)
+	if NewSentinelVerifier(nil, nil).Configured() {
+		t.Error("empty verifier must report unconfigured")
+	}
+	if !NewSentinelVerifier(pub, nil).Configured() {
+		t.Error("ed25519 verifier must report configured")
+	}
+	if !NewSentinelVerifier(nil, validHMACSecret).Configured() {
+		t.Error("hmac verifier must report configured")
+	}
+	// A too-short HMAC secret is treated as absent.
+	if NewSentinelVerifier(nil, []byte("short")).Configured() {
+		t.Error("sub-minimum HMAC secret must be treated as unconfigured")
+	}
+}
+
+// TestEd25519InteropTimestampShared confirms the ed25519 path reuses the same
+// timestamp header + canonical message as HMAC (so a mixed fleet agrees on what
+// is signed). Sign with ed25519, verify the timestamp parses and the message
+// matches the HMAC canonical builder.
+func TestEd25519InteropTimestampShared(t *testing.T) {
+	_, priv := mustKeypair(t)
+	req := newSignedReq(t, priv, "POST", "/authorized-keys/sentinel")
+
+	tsStr := req.Header.Get(SentinelHeaderTimestamp)
+	if _, err := strconv.ParseInt(tsStr, 10, 64); err != nil {
+		t.Fatalf("timestamp header not a unix-seconds int: %q", tsStr)
+	}
+	if !strings.HasPrefix(req.Header.Get(SentinelHeaderSignature), sentinelEd25519SigPrefix) {
+		t.Error("ed25519 signature missing algorithm tag")
+	}
+	// The canonical message must be identical across schemes.
+	got := string(sentinelRequestMessage("POST", "/authorized-keys/sentinel", tsStr))
+	want := "POST\n/authorized-keys/sentinel\n" + tsStr
+	if got != want {
+		t.Errorf("canonical request message = %q, want %q", got, want)
+	}
+}
