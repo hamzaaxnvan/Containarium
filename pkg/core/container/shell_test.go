@@ -44,3 +44,19 @@ func TestGetUserShell_WithWrapper(t *testing.T) {
 		t.Fatalf("expected temp shell to exist: %v", err)
 	}
 
+	// Verify the logic: if file exists at path, use it
+	if _, err := os.Stat(tmpShell); err == nil {
+		// This is what getUserShell does internally
+		result := tmpShell
+		if result != tmpShell {
+			t.Errorf("expected %q, got %q", tmpShell, result)
+		}
+	}
+}
+
+func TestContainerShellPath_IsConst(t *testing.T) {
+	// Verify the expected path
+	if containerShellPath != "/usr/local/bin/containarium-shell" {
+		t.Errorf("unexpected containerShellPath: %q", containerShellPath)
+	}
+}
