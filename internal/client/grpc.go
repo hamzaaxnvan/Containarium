@@ -1096,3 +1096,1101 @@ func (c *GRPCClient) SendAgentTask(fromSkillID, toPeerID, inputJSON string) (*pb
 		return nil, fmt.Errorf("failed to send agent task: %w", err)
 	}
 	return resp.Artifact, nil
+}
+
+// ListCrews lists all built-in crews via gRPC.
+func (c *GRPCClient) ListCrews() ([]*pb.Crew, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := c.crewClient.ListCrews(ctx, &pb.ListCrewsRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list crews: %w", err)
+	}
+	return resp.Crews, nil
+}
+
+// GetCrew fetches a single crew definition via gRPC.
+func (c *GRPCClient) GetCrew(id string) (*pb.Crew, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := c.crewClient.GetCrew(ctx, &pb.GetCrewRequest{Id: id})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get crew: %w", err)
+	}
+	return resp.Crew, nil
+}
+
+// RunCrew launches a crew via gRPC. gitSource/gitRef/gitCredential (#1554)
+// are fetched into EVERY member's own per-run workspace — see
+// RunCrewRequest.git_source in proto/containarium/v1/agent.proto.
+// engineOverrides (#2228), keyed by skill_id, wins over that member's own
+// manifest engine; a member with no entry (or AGENT_ENGINE_UNSPECIFIED) keeps
+// its manifest's own choice, unchanged pre-#2228 behavior.
+func (c *GRPCClient) RunCrew(crewID, backendID, pool, inputJSON, gitSource, gitRef, gitCredential string, engineOverrides map[string]pb.AgentEngine, modelOverrides map[string]string) (*pb.CrewRun, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute) // provisions every member box
+	defer cancel()
+	resp, err := c.crewClient.RunCrew(ctx, &pb.RunCrewRequest{
+		CrewId:          crewID,
+		BackendId:       backendID,
+		Pool:            pool,
+		InputJson:       inputJSON,
+		GitSource:       gitSource,
+		GitRef:          gitRef,
+		GitCredential:   gitCredential,
+		EngineOverrides: engineOverrides,
+		ModelOverrides:  modelOverrides,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to run crew: %w", err)
+	}
+	return resp.Run, nil
+}
+
+// RunCrewGraph dispatches a typed graph through the existing crew RPC.
+func (c *GRPCClient) RunCrewGraph(req *pb.RunCrewRequest) (*pb.CrewRun, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	resp, err := c.crewClient.RunCrew(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("run crew graph: %w", err)
+	}
+	return resp.Run, nil
+}
+
+// GetCrewRun fetches a crew run's status via gRPC.
+func (c *GRPCClient) GetCrewRun(id string) (*pb.CrewRun, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := c.crewClient.GetCrewRun(ctx, &pb.GetCrewRunRequest{Id: id})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get crew run: %w", err)
+	}
+	return resp.Run, nil
+}
+
+// PlanTaskGraph runs the planner without executing graph nodes.
+func (c *GRPCClient) PlanTaskGraph(req *pb.PlanTaskGraphRequest) (*pb.PlanTaskGraphResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	resp, err := c.crewClient.PlanTaskGraph(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("plan task graph: %w", err)
+	}
+	return resp, nil
+}
+
+// ValidateTaskGraph checks a task graph against the daemon's catalogs via
+// gRPC (#2803).
+func (c *GRPCClient) ValidateTaskGraph(g *pb.TaskGraph) (*pb.ValidateTaskGraphResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := c.crewClient.ValidateTaskGraph(ctx, &pb.ValidateTaskGraphRequest{Graph: g})
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate task graph: %w", err)
+	}
+	return resp, nil
+}
+
+// TailRunLog reads one window of a run's journal via gRPC (#2096). The
+// deadline covers the server's follow_seconds wait.
+func (c *GRPCClient) TailRunLog(req *pb.TailRunLogRequest) (*pb.TailRunLogResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.agentClient.TailRunLog(ctx, req)
+}
+
+// CreateBackup dumps a tenant's database and stores it off-host via gRPC.
+func (c *GRPCClient) CreateBackup(req *pb.CreateBackupRequest) (*pb.CreateBackupResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute) // large dumps + upload can take time
+	defer cancel()
+
+	resp, err := c.backupClient.CreateBackup(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create backup: %w", err)
+	}
+	return resp, nil
+}
+
+// ListBackups lists stored backups via gRPC.
+func (c *GRPCClient) ListBackups(username string) ([]*pb.BackupRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.backupClient.ListBackups(ctx, &pb.ListBackupsRequest{Username: username})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list backups: %w", err)
+	}
+	return resp.Records, nil
+}
+
+// GetBackup fetches a single backup record via gRPC.
+func (c *GRPCClient) GetBackup(id string) (*pb.BackupRecord, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.backupClient.GetBackup(ctx, &pb.GetBackupRequest{Id: id})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get backup: %w", err)
+	}
+	return resp.Record, nil
+}
+
+// RestoreBackup restores a stored dump via gRPC.
+func (c *GRPCClient) RestoreBackup(req *pb.RestoreBackupRequest) (*pb.RestoreBackupResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute) // download + pg_restore can take time
+	defer cancel()
+
+	resp, err := c.backupClient.RestoreBackup(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to restore backup: %w", err)
+	}
+	return resp, nil
+}
+
+// VerifyBackup restore-tests a stored dump via gRPC.
+func (c *GRPCClient) VerifyBackup(req *pb.VerifyBackupRequest) (*pb.VerifyBackupResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute) // a restore test is a full restore
+	defer cancel()
+
+	resp, err := c.backupClient.VerifyBackup(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify backup: %w", err)
+	}
+	return resp, nil
+}
+
+// DeleteBackup removes a stored dump and its index entry via gRPC.
+func (c *GRPCClient) DeleteBackup(id string) (*pb.DeleteBackupResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := c.backupClient.DeleteBackup(ctx, &pb.DeleteBackupRequest{Id: id})
+	if err != nil {
+		return nil, fmt.Errorf("failed to delete backup: %w", err)
+	}
+	return resp, nil
+}
+
+// PruneBackups deletes older backups for a tenant, keeping the newest N
+// per database (#1839).
+func (c *GRPCClient) PruneBackups(req *pb.PruneBackupsRequest) (*pb.PruneBackupsResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	resp, err := c.backupClient.PruneBackups(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to prune backups: %w", err)
+	}
+	return resp, nil
+}
+
+// CreateVolume creates a shared CephFS volume via gRPC.
+func (c *GRPCClient) CreateVolume(req *pb.CreateVolumeRequest) (*pb.CreateVolumeResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return c.volumeClient.CreateVolume(ctx, req)
+}
+
+// ListVolumes lists shared volumes (and capability) via gRPC.
+func (c *GRPCClient) ListVolumes(pool string) (*pb.ListVolumesResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.volumeClient.ListVolumes(ctx, &pb.ListVolumesRequest{Pool: pool})
+}
+
+// DeleteVolume deletes a shared volume via gRPC.
+func (c *GRPCClient) DeleteVolume(name, pool string, force bool) (*pb.DeleteVolumeResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.volumeClient.DeleteVolume(ctx, &pb.DeleteVolumeRequest{Name: name, Pool: pool, Force: force})
+}
+
+// AttachVolume mounts a shared volume into a container via gRPC.
+func (c *GRPCClient) AttachVolume(req *pb.AttachVolumeRequest) (*pb.AttachVolumeResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return c.volumeClient.AttachVolume(ctx, req)
+}
+
+// DetachVolume unmounts a shared volume from a container via gRPC.
+func (c *GRPCClient) DetachVolume(volume, container string) (*pb.DetachVolumeResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.volumeClient.DetachVolume(ctx, &pb.DetachVolumeRequest{Volume: volume, Container: container})
+}
+
+// SpawnSandbox creates an ephemeral, no-SSH sandbox via gRPC (#1488 Phase
+// 1). 60s covers the cold-path floor (image clone + boot + network wait);
+// Phase 3's warm-pool claim will be far under this.
+func (c *GRPCClient) SpawnSandbox(req *pb.SpawnSandboxRequest) (*pb.SpawnSandboxResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return c.sandboxClient.SpawnSandbox(ctx, req)
+}
+
+// ExecInSandbox runs one command inside a sandbox via gRPC. Longer timeout
+// than the other sandbox verbs — the command itself, not the RPC
+// round-trip, is what can legitimately take a while.
+func (c *GRPCClient) ExecInSandbox(req *pb.ExecInSandboxRequest) (*pb.ExecInSandboxResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	return c.sandboxClient.ExecInSandbox(ctx, req)
+}
+
+// WriteFileInSandbox writes a file into a sandbox via gRPC.
+func (c *GRPCClient) WriteFileInSandbox(req *pb.WriteFileInSandboxRequest) (*pb.WriteFileInSandboxResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	return c.sandboxClient.WriteFileInSandbox(ctx, req)
+}
+
+// ReadFileInSandbox reads a file back out of a sandbox via gRPC.
+func (c *GRPCClient) ReadFileInSandbox(sandboxID, path string) (*pb.ReadFileInSandboxResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	return c.sandboxClient.ReadFileInSandbox(ctx, &pb.ReadFileInSandboxRequest{SandboxId: sandboxID, Path: path})
+}
+
+// DeleteSandbox destroys a sandbox immediately via gRPC.
+func (c *GRPCClient) DeleteSandbox(sandboxID string) (*pb.DeleteSandboxResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.sandboxClient.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{SandboxId: sandboxID})
+}
+
+// GetPoolStatus reports the warm pool's per-template ready/warming counts
+// via gRPC (#1488 Phase 4).
+func (c *GRPCClient) GetPoolStatus() (*pb.GetPoolStatusResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.sandboxClient.GetPoolStatus(ctx, &pb.GetPoolStatusRequest{})
+}
+
+// GetKMSStatus reports the active KMS backend + envelope state via gRPC.
+func (c *GRPCClient) GetKMSStatus() (*pb.GetKMSStatusResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.kmsClient.GetKMSStatus(ctx, &pb.GetKMSStatusRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("get kms status: %w", err)
+	}
+	return resp, nil
+}
+
+// GetEnvelopeCoverage reports secret counts by encryption mode via gRPC.
+func (c *GRPCClient) GetEnvelopeCoverage() (*pb.GetEnvelopeCoverageResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.kmsClient.GetEnvelopeCoverage(ctx, &pb.GetEnvelopeCoverageRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("get envelope coverage: %w", err)
+	}
+	return resp, nil
+}
+
+// MigrateToEnvelope triggers the legacy→envelope re-wrap via gRPC. A
+// large backlog can exceed the default deadline; the timeout scales
+// loosely with maxRows (0 = unlimited → a generous ceiling).
+func (c *GRPCClient) MigrateToEnvelope(req *pb.MigrateToEnvelopeRequest) (*pb.MigrateToEnvelopeResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	resp, err := c.kmsClient.MigrateToEnvelope(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("migrate to envelope: %w", err)
+	}
+	return resp, nil
+}
+
+// GetGuardrailPolicy reads the server-side guardrail policy via gRPC (#2368).
+func (c *GRPCClient) GetGuardrailPolicy() (*pb.GetGuardrailPolicyResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.guardrailPolicyClient.GetGuardrailPolicy(ctx, &pb.GetGuardrailPolicyRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("get guardrail policy: %w", err)
+	}
+	return resp, nil
+}
+
+// GetGuardrailStatus reads the effective response guardrail policy via gRPC
+// (#2737).
+func (c *GRPCClient) GetGuardrailStatus() (*pb.GetGuardrailStatusResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.guardrailPolicyClient.GetGuardrailStatus(ctx, &pb.GetGuardrailStatusRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("get guardrail status: %w", err)
+	}
+	return resp, nil
+}
+
+// SetGuardrailPolicy replaces the server-side guardrail policy via gRPC
+// (admin only).
+func (c *GRPCClient) SetGuardrailPolicy(req *pb.SetGuardrailPolicyRequest) (*pb.SetGuardrailPolicyResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.guardrailPolicyClient.SetGuardrailPolicy(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("set guardrail policy: %w", err)
+	}
+	return resp, nil
+}
+
+// SetGuardrailBaselineMode switches the baseline response scan between LOG
+// and BLOCK via gRPC (#2738; admin only).
+func (c *GRPCClient) SetGuardrailBaselineMode(mode pb.GuardrailBaselineMode) (*pb.SetGuardrailBaselineModeResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.guardrailPolicyClient.SetGuardrailBaselineMode(ctx, &pb.SetGuardrailBaselineModeRequest{Mode: mode})
+	if err != nil {
+		return nil, fmt.Errorf("set guardrail baseline mode: %w", err)
+	}
+	return resp, nil
+}
+
+// retentionCall runs one RetentionService call with the usual timeout (#2875).
+func retentionCall[T any](op string, call func(context.Context) (T, error)) (T, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := call(ctx)
+	if err != nil {
+		var zero T
+		return zero, fmt.Errorf("%s: %w", op, err)
+	}
+	return resp, nil
+}
+
+// GetRetentionPolicy reads the retention windows via gRPC (admin only).
+func (c *GRPCClient) GetRetentionPolicy() (*pb.GetRetentionPolicyResponse, error) {
+	return retentionCall("get retention policy", func(ctx context.Context) (*pb.GetRetentionPolicyResponse, error) {
+		return c.retentionClient.GetRetentionPolicy(ctx, &pb.GetRetentionPolicyRequest{})
+	})
+}
+
+// SetRetentionPolicy changes retention windows via gRPC (admin only).
+func (c *GRPCClient) SetRetentionPolicy(req *pb.SetRetentionPolicyRequest) (*pb.SetRetentionPolicyResponse, error) {
+	return retentionCall("set retention policy", func(ctx context.Context) (*pb.SetRetentionPolicyResponse, error) {
+		return c.retentionClient.SetRetentionPolicy(ctx, req)
+	})
+}
+
+// ListLegalHolds lists the active legal holds via gRPC (admin only).
+func (c *GRPCClient) ListLegalHolds() (*pb.ListLegalHoldsResponse, error) {
+	return retentionCall("list legal holds", func(ctx context.Context) (*pb.ListLegalHoldsResponse, error) {
+		return c.retentionClient.ListLegalHolds(ctx, &pb.ListLegalHoldsRequest{})
+	})
+}
+
+// SetLegalHold places a legal hold on an org via gRPC (admin only).
+func (c *GRPCClient) SetLegalHold(req *pb.SetLegalHoldRequest) (*pb.SetLegalHoldResponse, error) {
+	return retentionCall("set legal hold", func(ctx context.Context) (*pb.SetLegalHoldResponse, error) {
+		return c.retentionClient.SetLegalHold(ctx, req)
+	})
+}
+
+// ReleaseLegalHold releases an org's legal hold via gRPC (admin only).
+func (c *GRPCClient) ReleaseLegalHold(orgID string) (*pb.ReleaseLegalHoldResponse, error) {
+	return retentionCall("release legal hold", func(ctx context.Context) (*pb.ReleaseLegalHoldResponse, error) {
+		return c.retentionClient.ReleaseLegalHold(ctx, &pb.ReleaseLegalHoldRequest{OrgId: orgID})
+	})
+}
+
+// GetRetentionMode reads the retention mode via gRPC (admin only).
+func (c *GRPCClient) GetRetentionMode() (*pb.GetRetentionModeResponse, error) {
+	return retentionCall("get retention mode", func(ctx context.Context) (*pb.GetRetentionModeResponse, error) {
+		return c.retentionClient.GetRetentionMode(ctx, &pb.GetRetentionModeRequest{})
+	})
+}
+
+// SetRetentionMode switches the retention mode via gRPC (admin only).
+func (c *GRPCClient) SetRetentionMode(req *pb.SetRetentionModeRequest) (*pb.SetRetentionModeResponse, error) {
+	return retentionCall("set retention mode", func(ctx context.Context) (*pb.SetRetentionModeResponse, error) {
+		return c.retentionClient.SetRetentionMode(ctx, req)
+	})
+}
+
+// GetRetentionReport reads the retention report via gRPC (admin only);
+// refresh runs a count-only preview now instead of returning the last
+// periodic report.
+func (c *GRPCClient) GetRetentionReport(refresh bool) (*pb.GetRetentionReportResponse, error) {
+	return retentionCall("get retention report", func(ctx context.Context) (*pb.GetRetentionReportResponse, error) {
+		return c.retentionClient.GetRetentionReport(ctx, &pb.GetRetentionReportRequest{Refresh: refresh})
+	})
+}
+
+// ListApps lists all applications via gRPC
+func (c *GRPCClient) ListApps(username string, stateFilter pb.AppState) ([]*pb.App, int32, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := &pb.ListAppsRequest{
+		Username:    username,
+		StateFilter: stateFilter,
+	}
+
+	resp, err := c.appClient.ListApps(ctx, req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to list apps: %w", err)
+	}
+
+	return resp.Apps, resp.TotalCount, nil
+}
+
+// GetApp gets information about a specific application via gRPC
+func (c *GRPCClient) GetApp(username, appName string) (*pb.App, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := &pb.GetAppRequest{
+		Username: username,
+		AppName:  appName,
+	}
+
+	resp, err := c.appClient.GetApp(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get app: %w", err)
+	}
+
+	return resp.App, nil
+}
+
+// StopApp stops an application via gRPC
+func (c *GRPCClient) StopApp(username, appName string) (*pb.App, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req := &pb.StopAppRequest{
+		Username: username,
+		AppName:  appName,
+	}
+
+	resp, err := c.appClient.StopApp(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stop app: %w", err)
+	}
+
+	return resp.App, nil
+}
+
+// StartApp starts an application via gRPC
+func (c *GRPCClient) StartApp(username, appName string) (*pb.App, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req := &pb.StartAppRequest{
+		Username: username,
+		AppName:  appName,
+	}
+
+	resp, err := c.appClient.StartApp(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start app: %w", err)
+	}
+
+	return resp.App, nil
+}
+
+// RestartApp restarts an application via gRPC
+func (c *GRPCClient) RestartApp(username, appName string) (*pb.App, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	req := &pb.RestartAppRequest{
+		Username: username,
+		AppName:  appName,
+	}
+
+	resp, err := c.appClient.RestartApp(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to restart app: %w", err)
+	}
+
+	return resp.App, nil
+}
+
+// DeleteApp deletes an application via gRPC
+func (c *GRPCClient) DeleteApp(username, appName string, removeData bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req := &pb.DeleteAppRequest{
+		Username:   username,
+		AppName:    appName,
+		RemoveData: removeData,
+	}
+
+	_, err := c.appClient.DeleteApp(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to delete app: %w", err)
+	}
+
+	return nil
+}
+
+// GetAppLogs gets application logs via gRPC
+func (c *GRPCClient) GetAppLogs(username, appName string, tailLines int32) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req := &pb.GetAppLogsRequest{
+		Username:  username,
+		AppName:   appName,
+		TailLines: tailLines,
+		Follow:    false,
+	}
+
+	stream, err := c.appClient.GetAppLogs(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get app logs: %w", err)
+	}
+
+	var logs []string
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			break // End of stream or error
+		}
+		logs = append(logs, resp.LogLines...)
+	}
+
+	return logs, nil
+}
+
+// ============================================
+// Network Service Methods
+// ============================================
+
+// ListRoutes lists all proxy routes via gRPC
+func (c *GRPCClient) ListRoutes(username string, activeOnly bool) ([]*pb.ProxyRoute, int32, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := &pb.GetRoutesRequest{
+		Username:   username,
+		ActiveOnly: activeOnly,
+	}
+
+	resp, err := c.networkClient.GetRoutes(ctx, req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to list routes: %w", err)
+	}
+
+	return resp.Routes, resp.TotalCount, nil
+}
+
+// AddRoute adds a new proxy route via gRPC
+func (c *GRPCClient) AddRoute(domain, targetIP string, targetPort int32, containerName, description string) (*pb.ProxyRoute, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := &pb.AddRouteRequest{
+		Domain:        domain,
+		TargetIp:      targetIP,
+		TargetPort:    targetPort,
+		ContainerName: containerName,
+		Description:   description,
+	}
+
+	resp, err := c.networkClient.AddRoute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add route: %w", err)
+	}
+
+	return resp.Route, nil
+}
+
+// UpdateRoute updates an existing proxy route via gRPC
+func (c *GRPCClient) UpdateRoute(domain, targetIP string, targetPort int32, containerName, description string) (*pb.ProxyRoute, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := &pb.UpdateRouteRequest{
+		Domain:        domain,
+		TargetIp:      targetIP,
+		TargetPort:    targetPort,
+		ContainerName: containerName,
+		Description:   description,
+	}
+
+	resp, err := c.networkClient.UpdateRoute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update route: %w", err)
+	}
+
+	return resp.Route, nil
+}
+
+// DeleteRoute deletes a proxy route via gRPC
+func (c *GRPCClient) DeleteRoute(domain string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := &pb.DeleteRouteRequest{
+		Domain: domain,
+	}
+
+	_, err := c.networkClient.DeleteRoute(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to delete route: %w", err)
+	}
+
+	return nil
+}
+
+// ListPassthroughRoutes lists all TCP/UDP passthrough routes via gRPC
+func (c *GRPCClient) ListPassthroughRoutes() ([]*pb.PassthroughRoute, int32, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.networkClient.ListPassthroughRoutes(ctx, &pb.ListPassthroughRoutesRequest{})
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to list passthrough routes: %w", err)
+	}
+
+	return resp.Routes, resp.TotalCount, nil
+}
+
+// AddPassthroughRoute adds a new TCP/UDP passthrough route via gRPC
+func (c *GRPCClient) AddPassthroughRoute(externalPort, targetPort int32, targetIP string, protocol pb.RouteProtocol, containerName, description string) (*pb.PassthroughRoute, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := &pb.AddPassthroughRouteRequest{
+		ExternalPort:  externalPort,
+		TargetIp:      targetIP,
+		TargetPort:    targetPort,
+		Protocol:      protocol,
+		ContainerName: containerName,
+		Description:   description,
+	}
+
+	resp, err := c.networkClient.AddPassthroughRoute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add passthrough route: %w", err)
+	}
+
+	return resp.Route, nil
+}
+
+// DeletePassthroughRoute deletes a TCP/UDP passthrough route via gRPC
+func (c *GRPCClient) DeletePassthroughRoute(externalPort int32, protocol pb.RouteProtocol) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req := &pb.DeletePassthroughRouteRequest{
+		ExternalPort: externalPort,
+		Protocol:     protocol,
+	}
+
+	_, err := c.networkClient.DeletePassthroughRoute(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to delete passthrough route: %w", err)
+	}
+
+	return nil
+}
+
+// StartEgressProxy asks the daemon to bridge a host-loopback SOCKS (exposed by
+// the caller via `ssh -R`) into a box's netns (#808 egress-via-client). Returns
+// the in-box SOCKS address to point the box's apps at.
+func (c *GRPCClient) StartEgressProxy(containerName string, upstreamPort, proxyPort int32) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := c.networkClient.StartEgressProxy(ctx, &pb.StartEgressProxyRequest{
+		ContainerName: containerName,
+		UpstreamPort:  upstreamPort,
+		ProxyPort:     proxyPort,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to start egress proxy: %w", err)
+	}
+	return resp.GetSocksAddress(), nil
+}
+
+// StopEgressProxy tears down the egress-via-client relay for a box.
+func (c *GRPCClient) StopEgressProxy(containerName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := c.networkClient.StopEgressProxy(ctx, &pb.StopEgressProxyRequest{
+		ContainerName: containerName,
+	}); err != nil {
+		return fmt.Errorf("failed to stop egress proxy: %w", err)
+	}
+	return nil
+}
+
+// --- container snapshots (#1160) ----------------------------------------
+
+// CreateContainerSnapshot snapshots a container's dataset via gRPC.
+func (c *GRPCClient) CreateContainerSnapshot(req *pb.CreateContainerSnapshotRequest) (*pb.CreateContainerSnapshotResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	resp, err := c.client.CreateContainerSnapshot(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create snapshot: %w", err)
+	}
+	return resp, nil
+}
+
+// ListContainerSnapshots lists a container's snapshots via gRPC.
+func (c *GRPCClient) ListContainerSnapshots(req *pb.ListContainerSnapshotsRequest) (*pb.ListContainerSnapshotsResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := c.client.ListContainerSnapshots(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list snapshots: %w", err)
+	}
+	return resp, nil
+}
+
+// DeleteContainerSnapshot destroys a snapshot via gRPC.
+func (c *GRPCClient) DeleteContainerSnapshot(req *pb.DeleteContainerSnapshotRequest) (*pb.DeleteContainerSnapshotResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	resp, err := c.client.DeleteContainerSnapshot(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to delete snapshot: %w", err)
+	}
+	return resp, nil
+}
+
+// RollbackContainerSnapshot rolls a container back to a snapshot via gRPC.
+func (c *GRPCClient) RollbackContainerSnapshot(req *pb.RollbackContainerSnapshotRequest) (*pb.RollbackContainerSnapshotResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	resp, err := c.client.RollbackContainerSnapshot(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to roll back snapshot: %w", err)
+	}
+	return resp, nil
+}
+
+// --- managed Kubernetes clusters (#1413) -------------------------------
+
+// CreateCluster records a new managed cluster (provisioning is
+// asynchronous on the daemon).
+func (c *GRPCClient) CreateCluster(req *pb.CreateClusterRequest) (*pb.CreateClusterResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return c.clusterClient.CreateCluster(ctx, req)
+}
+
+// ListClusters lists managed clusters (owner "" = the caller's own;
+// admins list all).
+func (c *GRPCClient) ListClusters(owner string) (*pb.ListClustersResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.clusterClient.ListClusters(ctx, &pb.ListClustersRequest{Owner: owner})
+}
+
+// GetCluster fetches one managed cluster.
+func (c *GRPCClient) GetCluster(name, owner string) (*pb.GetClusterResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.clusterClient.GetCluster(ctx, &pb.GetClusterRequest{Name: name, Owner: owner})
+}
+
+// DeleteCluster tears down a managed cluster.
+func (c *GRPCClient) DeleteCluster(name, owner string) (*pb.DeleteClusterResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	return c.clusterClient.DeleteCluster(ctx, &pb.DeleteClusterRequest{Name: name, Owner: owner})
+}
+
+// GetClusterKubeconfig reads a READY cluster's admin kubeconfig.
+func (c *GRPCClient) GetClusterKubeconfig(name, owner string) (*pb.GetClusterKubeconfigResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return c.clusterClient.GetClusterKubeconfig(ctx, &pb.GetClusterKubeconfigRequest{Name: name, Owner: owner})
+}
+
+// GetClusterStatus returns nodes, per-group counts, and scale events.
+func (c *GRPCClient) GetClusterStatus(name, owner string, eventsLimit int32) (*pb.GetClusterStatusResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.clusterClient.GetClusterStatus(ctx, &pb.GetClusterStatusRequest{Name: name, Owner: owner, EventsLimit: eventsLimit})
+}
+
+// UpdateClusterNodePool replaces a cluster's node groups.
+func (c *GRPCClient) UpdateClusterNodePool(req *pb.UpdateClusterNodePoolRequest) (*pb.UpdateClusterNodePoolResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return c.clusterClient.UpdateClusterNodePool(ctx, req)
+}
+
+// SetTrackerConnection creates or updates a tenant's tracker connection.
+// Requires tracker:admin.
+func (c *GRPCClient) SetTrackerConnection(req *pb.SetTrackerConnectionRequest) (*pb.TrackerConnection, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.SetTrackerConnection(ctx, req)
+	if err != nil {
+		return nil, "", fmt.Errorf("set tracker connection: %w", err)
+	}
+	return resp.Connection, resp.Message, nil
+}
+
+// ListTrackerConnections returns every tracker connection a tenant owns.
+func (c *GRPCClient) ListTrackerConnections(username string) ([]*pb.TrackerConnection, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.ListTrackerConnections(ctx, &pb.ListTrackerConnectionsRequest{Username: username})
+	if err != nil {
+		return nil, fmt.Errorf("list tracker connections: %w", err)
+	}
+	return resp.Connections, nil
+}
+
+// DeleteTrackerConnection removes a named tracker connection. Does not
+// delete the credential secret it referenced.
+func (c *GRPCClient) DeleteTrackerConnection(username, name string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.DeleteTrackerConnection(ctx, &pb.DeleteTrackerConnectionRequest{
+		Username: username, Name: name,
+	})
+	if err != nil {
+		return "", fmt.Errorf("delete tracker connection: %w", err)
+	}
+	return resp.Message, nil
+}
+
+// SetTrackerRoute creates or updates a scope -> skill route on a tracker
+// connection (#2021). Requires tracker:admin.
+func (c *GRPCClient) SetTrackerRoute(req *pb.SetTrackerRouteRequest) (*pb.TrackerRoute, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.SetTrackerRoute(ctx, req)
+	if err != nil {
+		return nil, "", fmt.Errorf("set tracker route: %w", err)
+	}
+	return resp.Route, resp.Message, nil
+}
+
+// ListTrackerRoutes returns a tracker connection's scope routes (#2021).
+func (c *GRPCClient) ListTrackerRoutes(username, connection string) ([]*pb.TrackerRoute, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.ListTrackerRoutes(ctx, &pb.ListTrackerRoutesRequest{Username: username, Connection: connection})
+	if err != nil {
+		return nil, fmt.Errorf("list tracker routes: %w", err)
+	}
+	return resp.Routes, nil
+}
+
+// DeleteTrackerRoute removes one scope route (#2021).
+func (c *GRPCClient) DeleteTrackerRoute(req *pb.DeleteTrackerRouteRequest) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.DeleteTrackerRoute(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("delete tracker route: %w", err)
+	}
+	return resp.Message, nil
+}
+
+// DispatchTrackerIssues runs one dispatcher tick (#2022). Same long
+// deadline as the HTTP transport: the tick provisions boxes
+// synchronously. maxStarts bounds the runs the tick starts (#2270); 0
+// is unlimited.
+func (c *GRPCClient) DispatchTrackerIssues(username, connection string, maxStarts int32) (*pb.DispatchTrackerIssuesResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), TrackerDispatchTimeout)
+	defer cancel()
+	resp, err := c.trackerClient.DispatchTrackerIssues(ctx, &pb.DispatchTrackerIssuesRequest{Username: username, Connection: connection, MaxStarts: maxStarts})
+	if err != nil {
+		return nil, fmt.Errorf("dispatch tracker issues: %w", err)
+	}
+	return resp, nil
+}
+
+// ListTrackerDispatches returns a connection's dispatch rows (#2022).
+func (c *GRPCClient) ListTrackerDispatches(username, connection string, state pb.TrackerDispatchState) ([]*pb.TrackerDispatch, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.ListTrackerDispatches(ctx, &pb.ListTrackerDispatchesRequest{Username: username, Connection: connection, State: state})
+	if err != nil {
+		return nil, fmt.Errorf("list tracker dispatches: %w", err)
+	}
+	return resp.Dispatches, nil
+}
+
+// GetTrackerStatus probes a tracker connection's credential live —
+// reachability, validity, scopes, expiry, and breadth. Longer timeout
+// than the other tracker calls since it makes a real upstream HTTP
+// request to the tracker itself.
+func (c *GRPCClient) GetTrackerStatus(username, name string) (*pb.GetTrackerStatusResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.GetTrackerStatus(ctx, &pb.GetTrackerStatusRequest{
+		Username: username, Name: name,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get tracker status: %w", err)
+	}
+	return resp, nil
+}
+
+// GetTrackerIssue reads a single issue, including its comments. Longer
+// timeout than the connection-CRUD calls since it reaches the tracker
+// itself (potentially two upstream requests — issue plus comments).
+func (c *GRPCClient) GetTrackerIssue(req *pb.GetTrackerIssueRequest) (*pb.TrackerIssue, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.GetTrackerIssue(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("get tracker issue: %w", err)
+	}
+	return resp.Issue, nil
+}
+
+// ListTrackerIssues enumerates issues, optionally filtered.
+func (c *GRPCClient) ListTrackerIssues(req *pb.ListTrackerIssuesRequest) ([]*pb.TrackerIssue, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.ListTrackerIssues(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("list tracker issues: %w", err)
+	}
+	return resp.Issues, nil
+}
+
+// GetTrackerChange reads a single change request's state and CI
+// verdict.
+func (c *GRPCClient) GetTrackerChange(req *pb.GetTrackerChangeRequest) (*pb.TrackerChange, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.GetTrackerChange(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("get tracker change: %w", err)
+	}
+	return resp.Change, nil
+}
+
+// SubmitTrackerChange bundles the calling run's committed workspace out
+// of its box, pushes it, and opens a change request (#1923). A longer
+// timeout than the read verbs: it execs in the box, transfers a bundle,
+// and makes an upstream call to open the change — closer to the
+// heavier end of this client's RPCs than a plain read.
+func (c *GRPCClient) SubmitTrackerChange(req *pb.SubmitTrackerChangeRequest) (*pb.TrackerChange, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.SubmitTrackerChange(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("submit tracker change: %w", err)
+	}
+	return resp.Change, nil
+}
+
+// SubmitTrackerChangeFiles opens a change request from a file set over
+// the connection's broker credential (#3005). Same timeout as
+// SubmitTrackerChange: a fetch, a push and an upstream call.
+func (c *GRPCClient) SubmitTrackerChangeFiles(req *pb.SubmitTrackerChangeFilesRequest) (*pb.TrackerChange, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.SubmitTrackerChangeFiles(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("submit tracker change files: %w", err)
+	}
+	return resp.Change, nil
+}
+
+// CommentOnTrackerIssue posts a stamped, sanitized comment on an issue
+// or change request.
+func (c *GRPCClient) CommentOnTrackerIssue(req *pb.CommentOnTrackerIssueRequest) (*pb.TrackerComment, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.CommentOnTrackerIssue(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("comment on tracker issue: %w", err)
+	}
+	return resp.Comment, nil
+}
+
+// ClaimTrackerIssue attempts to claim an issue for the calling run.
+func (c *GRPCClient) ClaimTrackerIssue(req *pb.ClaimTrackerIssueRequest) (*pb.ClaimTrackerIssueResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.ClaimTrackerIssue(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("claim tracker issue: %w", err)
+	}
+	return resp, nil
+}
+
+// SetTrackerIssueLabels adds and/or removes labels on an issue.
+func (c *GRPCClient) SetTrackerIssueLabels(req *pb.SetTrackerIssueLabelsRequest) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.SetTrackerIssueLabels(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("set tracker issue labels: %w", err)
+	}
+	return resp.Message, nil
+}
+
+// CreateTrackerIssue files a follow-up issue on the connection's
+// tracker (#2024).
+func (c *GRPCClient) CreateTrackerIssue(req *pb.CreateTrackerIssueRequest) (*pb.TrackerIssue, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := c.trackerClient.CreateTrackerIssue(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("create tracker issue: %w", err)
+	}
+	return resp.Issue, nil
+}
+
+// --- AnonymousBoxService (#2197) ---------------------------------------
+
+// EnsureAnonymousBox resolves or creates the anonymous VM for a key.
+func (c *GRPCClient) EnsureAnonymousBox(req *pb.EnsureAnonymousBoxRequest) (*pb.EnsureAnonymousBoxResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute) // a cold VM boot
+	defer cancel()
+	return c.anonClient.EnsureAnonymousBox(ctx, req)
+}
+
+// ClaimAnonymousBox binds an anonymous box to a tenant via its claim token.
+func (c *GRPCClient) ClaimAnonymousBox(req *pb.ClaimAnonymousBoxRequest) (*pb.ClaimAnonymousBoxResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	return c.anonClient.ClaimAnonymousBox(ctx, req)
+}
+
+// GetAnonymousDoorConfig returns the door's state and fixed limits.
+func (c *GRPCClient) GetAnonymousDoorConfig() (*pb.AnonymousDoorConfig, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.anonClient.GetAnonymousDoorConfig(ctx, &pb.GetAnonymousDoorConfigRequest{})
+}
+
+// SetAnonymousDoorConfig flips the kill switch / edits bans.
+func (c *GRPCClient) SetAnonymousDoorConfig(cfg *pb.AnonymousDoorConfig) (*pb.AnonymousDoorConfig, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.anonClient.SetAnonymousDoorConfig(ctx, &pb.SetAnonymousDoorConfigRequest{Config: cfg})
+}
+
+// ListAnonymousBoxes lists every live anonymous box on the daemon.
+func (c *GRPCClient) ListAnonymousBoxes() (*pb.ListAnonymousBoxesResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return c.anonClient.ListAnonymousBoxes(ctx, &pb.ListAnonymousBoxesRequest{})
+}
+
+// applyProtoLifecycle copies the box lifecycle flags a daemon reports, shared
+// by the list and get converters so they cannot drift (#2858).
+func applyProtoLifecycle(info *incus.ContainerInfo, c *pb.Container) {
+	info.MonitoringEnabled = c.MonitoringEnabled
+	info.AutoSleepEnabled = c.AutoSleepEnabled
+	info.IdleThresholdMinutes = c.IdleThresholdMinutes
+	info.PodmanEnabled = c.PodmanEnabled
+	if v, ok := toolaccess.ConfigValue(c.ToolAccess); ok {
+		info.ToolAccess = v
+	}
+}

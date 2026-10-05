@@ -57,3 +57,23 @@ func NewTrafficStoreAdapter(pool *pgxpool.Pool) *TrafficStoreAdapter {
 // closed connection contributes its ended_at (always set on close), which is
 // its true last-activity instant.
 func (a *TrafficStoreAdapter) LastNetworkActivity(ctx context.Context, containerName string) (time.Time, error) {
+	if a == nil || a.pool == nil {
+		return time.Time{}, nil
+	}
+	const q = `
+		SELECT MAX(CASE WHEN ended_at IS NULL THEN now() ELSE ended_at END)
+		FROM traffic_connections
+		WHERE container_name = $1
+	`
+	var t *time.Time
+	if err := a.pool.QueryRow(ctx, q, containerName).Scan(&t); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	if t == nil {
+		return time.Time{}, nil
+	}
+	return *t, nil
+}
