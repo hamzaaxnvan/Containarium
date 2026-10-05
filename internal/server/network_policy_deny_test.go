@@ -107,3 +107,77 @@ func TestApplyDeny(t *testing.T) {
 		if installed[a.Key()] != a || installed[b.Key()] != b {
 			t.Errorf("installed not recorded: %+v", installed)
 		}
+	})
+
+	t.Run("port-only change is one upsert of the same slot, never a delete", func(t *testing.T) {
+		installed := map[netbpf.DenyKey]netbpf.DenyEntry{a.Key(): a}
+		f := &fakeDenyApplier{}
+		applyDeny(installed, []netbpf.DenyEntry{a2}, f)
+		if len(f.added) != 1 || f.added[0] != a2 {
+			t.Errorf("added=%v, want [a2] (upsert)", f.added)
+		}
+		if len(f.deleted) != 0 {
+			t.Fatalf("deleted=%v, want none — the changed-port rule shares a's key", f.deleted)
+		}
+		if installed[a.Key()] != a2 {
+			t.Errorf("installed[key] = %+v, want a2", installed[a.Key()])
+		}
+	})
+
+	t.Run("removal deletes the stale key and drops it from installed", func(t *testing.T) {
+		installed := map[netbpf.DenyKey]netbpf.DenyEntry{a.Key(): a, b.Key(): b}
+		f := &fakeDenyApplier{}
+		applyDeny(installed, []netbpf.DenyEntry{a}, f)
+		if len(f.deleted) != 1 || f.deleted[0] != b.Key() {
+			t.Errorf("deleted=%v, want [b.Key()]", f.deleted)
+		}
+		if _, ok := installed[b.Key()]; ok {
+			t.Error("b should be gone from installed")
+		}
+	})
+
+	t.Run("a failed add is not recorded so the next reconcile retries", func(t *testing.T) {
+		installed := map[netbpf.DenyKey]netbpf.DenyEntry{}
+		f := &fakeDenyApplier{failAdd: map[netbpf.DenyKey]bool{a.Key(): true}}
+		applyDeny(installed, []netbpf.DenyEntry{a, b}, f)
+		if _, ok := installed[a.Key()]; ok {
+			t.Error("failed add must NOT be recorded in installed (else the kernel and bookkeeping diverge)")
+		}
+		if installed[b.Key()] != b {
+			t.Error("b should still install despite a's failure")
+		}
+		// Next pass with the failure cleared converges a.
+		f.failAdd = nil
+		applyDeny(installed, []netbpf.DenyEntry{a, b}, f)
+		if installed[a.Key()] != a {
+			t.Error("retry should install a once the failure clears")
+		}
+	})
+
+	t.Run("converged state is a no-op", func(t *testing.T) {
+		installed := map[netbpf.DenyKey]netbpf.DenyEntry{a.Key(): a, b.Key(): b}
+		f := &fakeDenyApplier{}
+		applyDeny(installed, []netbpf.DenyEntry{a, b}, f)
+		if len(f.added) != 0 || len(f.deleted) != 0 {
+			t.Errorf("converged apply should do nothing, got added=%v deleted=%v", f.added, f.deleted)
+		}
+	})
+}
+
+func TestActiveDenyRules(t *testing.T) {
+	now := time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC)
+	rules := []netpolicy.DenyRule{
+		{Note: "live", ExpiresAt: now.Add(time.Hour)},
+		{Note: "expired", ExpiresAt: now.Add(-time.Hour)},
+		{Note: "permanent"}, // zero expiry
+	}
+	got := activeDenyRules(rules, now)
+	if len(got) != 2 {
+		t.Fatalf("want 2 active rules, got %d: %+v", len(got), got)
+	}
+	for _, r := range got {
+		if r.Note == "expired" {
+			t.Error("expired rule should have been dropped")
+		}
+	}
+}

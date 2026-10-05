@@ -128,3 +128,91 @@ func TestReservedNamespaceRefusedOnTenantAPI(t *testing.T) {
 // store-integration lane sets it.
 func TestGatewayProviderKey_Roundtrip(t *testing.T) {
 	dsn := os.Getenv("CONTAINARIUM_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set CONTAINARIUM_TEST_DSN to run this against Postgres (the store-integration lane does)")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect Postgres: %v", err)
+	}
+	defer pool.Close()
+
+	key := make([]byte, corecrypto.MasterKeySize)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	cipher, err := corecrypto.NewCipher(key)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	store, err := NewStore(ctx, pool, cipher)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	const owner = "user:gwkey-test-user"
+	const tenant = "gwkey-test-user"
+	_, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1 OR username = $2", "__gateway/"+owner, tenant)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DELETE FROM secrets WHERE username = $1 OR username = $2", "__gateway/"+owner, tenant)
+	})
+
+	if _, ok := store.KeyFor(ctx, owner, "acmeai"); ok {
+		t.Fatal("KeyFor reported a key before one was set")
+	}
+	if err := store.SetGatewayProviderKey(ctx, owner, "acmeai", "REAL-KEY-1"); err != nil {
+		t.Fatalf("SetGatewayProviderKey: %v", err)
+	}
+	got, ok := store.KeyFor(ctx, owner, "acmeai")
+	if !ok || got != "REAL-KEY-1" {
+		t.Fatalf("KeyFor = (%q, %t), want (REAL-KEY-1, true)", got, ok)
+	}
+	// Rotation replaces, never duplicates.
+	if err := store.SetGatewayProviderKey(ctx, owner, "acmeai", "REAL-KEY-2"); err != nil {
+		t.Fatalf("SetGatewayProviderKey (rotate): %v", err)
+	}
+	if got, ok := store.KeyFor(ctx, owner, "acmeai"); !ok || got != "REAL-KEY-2" {
+		t.Fatalf("after rotation KeyFor = (%q, %t), want (REAL-KEY-2, true)", got, ok)
+	}
+
+	// A different provider for the same owner, and a different owner, are
+	// separate rows — no cross-talk.
+	if _, ok := store.KeyFor(ctx, owner, "openai"); ok {
+		t.Error("a key set for one provider answered for another")
+	}
+	if _, ok := store.KeyFor(ctx, "user:someone-else", "acmeai"); ok {
+		t.Error("a key set for one owner answered for another")
+	}
+
+	// The tenant whose username is the owner's suffix sees nothing of it.
+	if _, err := store.Set(ctx, tenant, "OWN_SECRET", "mine", DeliveryFile); err != nil {
+		t.Fatalf("Set tenant secret: %v", err)
+	}
+	metas, err := store.List(ctx, tenant)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, m := range metas {
+		if m.Name != "OWN_SECRET" {
+			t.Errorf("tenant listing leaked %q", m.Name)
+		}
+	}
+	loaded, err := store.LoadAllForUserWithDelivery(ctx, tenant)
+	if err != nil {
+		t.Fatalf("LoadAllForUserWithDelivery: %v", err)
+	}
+	if _, bad := loaded["ACMEAI"]; bad {
+		t.Error("a per-owner gateway key reached a box delivery path")
+	}
+
+	if err := store.DeleteGatewayProviderKey(ctx, owner, "acmeai"); err != nil {
+		t.Fatalf("DeleteGatewayProviderKey: %v", err)
+	}
+	if _, ok := store.KeyFor(ctx, owner, "acmeai"); ok {
+		t.Fatal("KeyFor still reports a key after delete")
+	}
+	if err := store.DeleteGatewayProviderKey(ctx, owner, "acmeai"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second delete = %v, want ErrNotFound", err)
+	}
+}
