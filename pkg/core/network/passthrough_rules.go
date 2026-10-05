@@ -27,3 +27,32 @@ func passthroughPreRoutingArgs(externalPort int, targetIP string, targetPort int
 		"-p", protocol, "!", "-s", networkCIDR,
 		"--dport", fmt.Sprintf("%d", externalPort),
 		"-j", "DNAT", "--to-destination", fmt.Sprintf("%s:%d", targetIP, targetPort),
+	}
+}
+
+// passthroughOutputArgs builds the locally-generated DNAT rule.
+//
+// Scoped with `-m addrtype --dst-type LOCAL`: only traffic addressed to
+// one of this host's own addresses is redirected. Without that scope the
+// rule would capture every locally-originated connection to that port
+// regardless of destination — including a connection to some other
+// machine that happens to use it.
+func passthroughOutputArgs(externalPort int, targetIP string, targetPort int, protocol string) []string {
+	return []string{
+		"-t", "nat", "-A", "OUTPUT",
+		"-p", protocol, "-m", "addrtype", "--dst-type", "LOCAL",
+		"--dport", fmt.Sprintf("%d", externalPort),
+		"-j", "DNAT", "--to-destination", fmt.Sprintf("%s:%d", targetIP, targetPort),
+	}
+}
+
+// passthroughDeleteArgs builds the deletions for every chain a route
+// installs. Leaving an OUTPUT rule behind would silently redirect a
+// later, unrelated connection on that port.
+func passthroughDeleteArgs(externalPort int, protocol string) [][]string {
+	port := fmt.Sprintf("%d", externalPort)
+	return [][]string{
+		{"-t", "nat", "-D", "PREROUTING", "-p", protocol, "--dport", port},
+		{"-t", "nat", "-D", "OUTPUT", "-p", protocol, "-m", "addrtype", "--dst-type", "LOCAL", "--dport", port},
+	}
+}
