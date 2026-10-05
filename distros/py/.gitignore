@@ -3,3 +3,18 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Virtual env
+.venv/
+venv/

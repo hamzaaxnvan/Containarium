@@ -47,3 +47,52 @@ func TestExecWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 	noBackoff(t)
 	calls := 0
 	err := execWithRetry("test", func() error {
+		calls++
+		if calls < 3 {
+			return errTransient
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("err = %v, want nil after transient retries", err)
+	}
+	if calls != 3 {
+		t.Errorf("attempts = %d, want 3 (2 transient + 1 success)", calls)
+	}
+}
+
+// TestExecWithRetry_DoesNotRetryRealError: a genuine command failure
+// (non-transient) must NOT be retried — retrying could double-run a
+// non-idempotent side effect.
+func TestExecWithRetry_DoesNotRetryRealError(t *testing.T) {
+	noBackoff(t)
+	calls := 0
+	realErr := errors.New("command exited with code 1")
+	err := execWithRetry("test", func() error {
+		calls++
+		return realErr
+	})
+	if !errors.Is(err, realErr) {
+		t.Fatalf("err = %v, want the real error", err)
+	}
+	if calls != 1 {
+		t.Errorf("attempts = %d, want 1 (no retry on a real failure)", calls)
+	}
+}
+
+// TestExecWithRetry_ExhaustsAndReturnsLast: a persistently transient error
+// is retried up to the cap, then the last error is returned.
+func TestExecWithRetry_ExhaustsAndReturnsLast(t *testing.T) {
+	noBackoff(t)
+	calls := 0
+	err := execWithRetry("test", func() error {
+		calls++
+		return errTransient
+	})
+	if !isTransientExecErr(err) {
+		t.Fatalf("err = %v, want the transient error after exhaustion", err)
+	}
+	if calls != execMaxAttempts {
+		t.Errorf("attempts = %d, want execMaxAttempts (%d)", calls, execMaxAttempts)
+	}
+}
