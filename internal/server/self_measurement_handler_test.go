@@ -42,3 +42,14 @@ func TestGetSelfMeasurement_LocalUnsignedWhenNoPKI(t *testing.T) {
 	if m.Signed {
 		t.Errorf("expected unsigned measurement without a peer identity key")
 	}
+	if m.Signature != "" {
+		t.Errorf("unsigned measurement must have empty signature, got %q", m.Signature)
+	}
+	if m.HashAlgorithm == "" || m.MeasurementDigest == "" || m.ConfigDigest == "" {
+		t.Errorf("measurement should carry hash/measurement/config digests even when unsigned: %+v", m)
+	}
+	// The running test binary exists on disk, so the binary digest is populated.
+	if m.BinaryDigest == "" {
+		t.Errorf("expected a non-empty binary digest for the running daemon binary")
+	}
+}

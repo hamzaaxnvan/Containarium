@@ -76,3 +76,42 @@ func TestSSHUpstreamFaultDoesNotExitManager(t *testing.T) {
 	cancel()
 	if err := m.Run(ctx); err != nil {
 		t.Fatalf("SSH controller fault terminated the sentinel: %v", err)
+	}
+	r := httptest.NewRecorder()
+	m.MetricsHandler()(r, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(r.Body.String(), "sentinel_ssh_upstream_faulted 1\n") {
+		t.Fatal("startup failure was not observable")
+	}
+}
+
+// TestSSHUpstreamFaultMetricReportsClosedOwner exposes a persistence-fault alert.
+func TestSSHUpstreamFaultMetricReportsClosedOwner(t *testing.T) {
+	m := NewManager(Config{}, &fakeRecoveryProvider{})
+	m.sshUpstream = &sshcontrol.Controller{}
+	for _, want := range []string{"0", "1"} {
+		r := httptest.NewRecorder()
+		m.MetricsHandler()(r, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		if !strings.Contains(r.Body.String(), "sentinel_ssh_upstream_faulted "+want+"\n") {
+			t.Fatalf("missing controller fault health=%s", want)
+		}
+		if err := m.sshUpstream.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestSSHUpstreamManagerRejectsMalformedPolicy prevents silently unguarded startup.
+func TestSSHUpstreamManagerRejectsMalformedPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy.json")
+	if err := os.WriteFile(path, []byte(`{"failureBudegt":2}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{config: Config{SSHUpstreamPolicy: path}, keyStore: NewKeyStore()}
+	stop, err := m.startSSHUpstream()
+	if stop != nil {
+		defer stop()
+	}
+	if err == nil {
+		t.Fatal("malformed policy silently started")
+	}
+}
