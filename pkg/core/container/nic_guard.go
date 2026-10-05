@@ -31,3 +31,36 @@ func (m *Manager) SetNICGuard(g NICGuard) { m.nicGuard = g }
 // uses explicit native membership when supplied, otherwise the existing
 // cloud_org_id / instance-name resolver. Required native membership is persisted
 // before this call and must never use the legacy optional/no-op hook.
+func (m *Manager) guardNIC(containerName string, opts CreateOptions) error {
+	if opts.NetworkTenant != "" {
+		// Ordinary Prepare can be a no-op on an unsupported/off guard.
+		// Explicit security-domain assignment must never take that path.
+		strict, ok := m.nicGuard.(interface {
+			PrepareNetworkTenant(context.Context, string, string) error
+		})
+		if !ok {
+			return fmt.Errorf("%w: explicit network Tenant requires an enforced NIC guard", ErrNICGuard)
+		}
+		if err := strict.PrepareNetworkTenant(context.Background(), containerName, opts.NetworkTenant); err != nil {
+			return fmt.Errorf("%w: %v", ErrNICGuard, err)
+		}
+		return nil
+	}
+	if m.nicGuard == nil {
+		return nil
+	}
+	tenant := incus.ResolveTenant("", opts.Labels[incus.CloudOrgIDLabel], containerName)
+	if err := m.nicGuard.Prepare(context.Background(), containerName, tenant); err != nil {
+		return fmt.Errorf("%w: %v", ErrNICGuard, err)
+	}
+	return nil
+}
+
+// cleanupGuardedCreate retains both causes when cleanup fails. The caller must
+// inspect the original stopped instance before retrying; never start it as repair.
+func (m *Manager) cleanupGuardedCreate(name string, cause error) error {
+	if err := m.incus.DeleteContainer(name); err != nil {
+		return errors.Join(cause, fmt.Errorf("cleanup failed for %q; instance retained stopped, inspect before retry: %w", name, err))
+	}
+	return cause
+}

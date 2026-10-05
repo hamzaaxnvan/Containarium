@@ -42,3 +42,92 @@ type GPUValidationResult struct {
 // This is the daemon-side counterpart of scripts/validate-gpu-passthrough.sh
 // (hardware-verified on an RTX 3090 host): the create→nvidia.runtime→start→
 // nvidia-smi sequence was confirmed live before this landed. Never returns an
+// error — a failed check is reported as Status=unavailable with a Detail, so a
+// CPU-only or mis-bound backend reads cleanly rather than erroring.
+func (m *Manager) ValidateGPU(pci string) (result GPUValidationResult) {
+	ct := fmt.Sprintf("gpuval-%d", time.Now().UnixNano())
+
+	cfg := incus.ContainerConfig{Name: ct, Image: gpuValidationImage}
+	if pci != "" {
+		cfg.GPUs = []incus.GPUDevice{{PCI: pci}}
+	} else {
+		cfg.GPUs = []incus.GPUDevice{{}} // empty device = pass through all GPUs
+	}
+
+	if err := m.incus.CreateContainer(cfg); err != nil {
+		return GPUValidationResult{Status: GPUStatusUnavailable, Detail: fmt.Sprintf("create throwaway LXC: %v", err)}
+	}
+	// Incus refuses raw deletion of running instances. Stop our probe before
+	// deleting it, and do not report success if cleanup left resources behind.
+	started := false
+	defer func() {
+		var stopErr error
+		if started {
+			stopErr = m.incus.StopContainer(ct, true)
+		}
+		deleteErr := m.incus.DeleteContainer(ct)
+		if err := errors.Join(stopErr, deleteErr); err != nil {
+			detail := fmt.Sprintf("GPU probe cleanup: %v", err)
+			log.Printf("[capabilities] %s (%s)", detail, ct)
+			if result.Detail != "" {
+				detail = result.Detail + "; " + detail
+			}
+			result = GPUValidationResult{Status: GPUStatusUnavailable, Detail: detail}
+		}
+	}()
+
+	// nvidia.runtime makes Incus inject the host NVIDIA driver + nvidia-smi at
+	// start (set on the stopped instance, before start).
+	if err := m.incus.SetConfig(ct, "nvidia.runtime", "true"); err != nil {
+		return GPUValidationResult{Status: GPUStatusUnavailable, Detail: fmt.Sprintf("set nvidia.runtime: %v", err)}
+	}
+	if err := m.incus.StartContainer(ct); err != nil {
+		return GPUValidationResult{Status: GPUStatusUnavailable, Detail: fmt.Sprintf("start throwaway LXC: %v", err)}
+	}
+	started = true
+
+	// Wait for the container to be exec-ready, then query the GPU.
+	var out string
+	var lastErr error
+	for i := 0; i < gpuValidationReadyTries; i++ {
+		o, _, err := m.incus.ExecWithOutput(ct, []string{
+			"nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader",
+		})
+		if err == nil && strings.TrimSpace(o) != "" {
+			out = o
+			break
+		}
+		lastErr = err
+		time.Sleep(gpuValidationReadyDelay)
+	}
+
+	if strings.TrimSpace(out) == "" {
+		detail := "nvidia-smi returned no GPU (passthrough not visible inside the LXC)"
+		if lastErr != nil {
+			detail = fmt.Sprintf("nvidia-smi did not run: %v", lastErr)
+		}
+		return GPUValidationResult{Status: GPUStatusUnavailable, Detail: detail}
+	}
+
+	model, driver := parseNvidiaSmiCSV(out)
+	if model == "" {
+		return GPUValidationResult{Status: GPUStatusUnavailable, Detail: "could not parse nvidia-smi output: " + strings.TrimSpace(out)}
+	}
+	return GPUValidationResult{Status: GPUStatusOK, Model: model, DriverVersion: driver}
+}
+
+// parseNvidiaSmiCSV parses the first line of
+// `nvidia-smi --query-gpu=name,driver_version --format=csv,noheader`,
+// e.g. "NVIDIA GeForce RTX 3090, 570.211.01".
+func parseNvidiaSmiCSV(out string) (model, driver string) {
+	line := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
+	if line == "" {
+		return "", ""
+	}
+	parts := strings.SplitN(line, ",", 2)
+	model = strings.TrimSpace(parts[0])
+	if len(parts) > 1 {
+		driver = strings.TrimSpace(parts[1])
+	}
+	return model, driver
+}
