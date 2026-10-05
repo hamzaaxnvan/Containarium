@@ -1,0 +1,830 @@
+package cmd
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+// networkPolicyCmd is the parent for `containarium network-policy <verb>`.
+// It drives the admin-only NetworkPolicyService (#315 Phase A) over the
+// daemon's HTTP/REST surface, so every subcommand requires --server and an
+// admin --token. CLI-first per the repo convention; the platform MCP tool (a
+// later increment) wraps the same endpoints.
+var networkPolicyCmd = &cobra.Command{
+	Use:     "network-policy",
+	Short:   "Manage per-tenant network isolation policies (admin)",
+	Aliases: []string{"netpolicy", "np"},
+	Long: `Manage per-tenant network-isolation policies (#315, Phase A).
+
+A network policy declares a tenant's allowed egress (CIDRs + domains) and
+whether same-tenant containers may talk to each other. Phase A ships in
+log_only mode: denied flows are observed and audited, nothing is dropped.
+
+All subcommands are admin-only and talk to the daemon's HTTP API, so they
+require --server (the daemon's HTTP address) and an admin --token.`,
+}
+
+// npJSONOut toggles raw-JSON output on the read subcommands.
+var npJSONOut bool
+
+// network-policy set flags
+var (
+	npAllowIntraTenant bool
+	npEgressCidrs      []string
+	npEgressDomains    []string
+	npMode             string
+	npEgressMode       string
+	npAllowMetadata    bool
+	npAllowFromTenants []string
+	npEgressPreset     string
+	npPlanSince        time.Duration
+)
+
+var networkPolicySetCmd = &cobra.Command{
+	Use:   "set <tenant>",
+	Short: "Create or update a tenant's network policy",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runNetworkPolicySet,
+}
+
+var networkPolicyPlanCmd = &cobra.Command{
+	Use:   "plan <tenant> [--since 1h]",
+	Short: "Show the destinations a tenant's policy denied or dropped, to write an allow-list from",
+	Long: `Aggregates the tenant's recent deny audit rows (#2440) by destination, busiest first,
+and prints each as a ready-to-paste --egress-cidr flag.
+
+Run it while the tenant is in log_only mode: every row is a flow the policy WOULD
+block once armed, so the list is exactly what an allow-list still has to cover. It
+changes nothing. Destinations the tenant's current egress CIDRs (or its preset's
+implicit resolver) already allow are left out; destinations allowed only through
+--egress-domain are not subtracted, and the output says so.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runNetworkPolicyPlan,
+}
+
+var networkPolicyGetCmd = &cobra.Command{
+	Use:   "get <tenant>",
+	Short: "Show a tenant's network policy",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runNetworkPolicyGet,
+}
+
+var networkPolicyListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List every tenant's network policy",
+	Args:  cobra.NoArgs,
+	RunE:  runNetworkPolicyList,
+}
+
+var networkPolicyDeleteCmd = &cobra.Command{
+	Use:     "delete <tenant>",
+	Short:   "Delete a tenant's network policy",
+	Aliases: []string{"rm"},
+	Args:    cobra.ExactArgs(1),
+	RunE:    runNetworkPolicyDelete,
+}
+
+// network-policy patch — virtual-patch deny rules (#660). A deny rule blocks a
+// tenant's egress to a CIDR (optionally a port/proto) regardless of the
+// allow-list, to "virtually patch" a known-vulnerable destination until the
+// real fix ships. patch add/rm read-modify-write only the deny_rules of the
+// tenant's policy, leaving the allow-list untouched.
+var networkPolicyPatchCmd = &cobra.Command{
+	Use:   "patch",
+	Short: "Manage virtual-patch deny rules for a tenant (#660)",
+	Long: `Manage virtual-patch deny rules — temporary, network-level blocks that
+stop traffic to a known-vulnerable destination before it reaches the
+vulnerable software, buying time until the real upstream patch ships.
+
+A deny rule is evaluated BEFORE the egress allow-list (deny beats allow) and,
+like the rest of network-policy, only drops when the daemon is armed
+(CONTAINARIUM_NETWORK_POLICY_ENFORCE=1); otherwise it is observed and audited.`,
+}
+
+var (
+	npDenyCidr    string
+	npDenyPort    uint32
+	npDenyProto   string
+	npDenyNote    string
+	npDenyExpires string
+)
+
+var networkPolicyPatchAddCmd = &cobra.Command{
+	Use:   "add <tenant> --cidr <cidr> [--port N] [--proto tcp|udp] [--note CVE-…] [--expires RFC3339]",
+	Short: "Add or update a virtual-patch deny rule",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runNetworkPolicyPatchAdd,
+}
+
+var networkPolicyPatchRmCmd = &cobra.Command{
+	Use:   "rm <tenant> --cidr <cidr> [--port N] [--proto tcp|udp]",
+	Short: "Remove a virtual-patch deny rule",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runNetworkPolicyPatchRm,
+}
+
+var networkPolicyPatchListCmd = &cobra.Command{
+	Use:   "list <tenant>",
+	Short: "List a tenant's virtual-patch deny rules",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runNetworkPolicyPatchList,
+}
+
+func init() {
+	rootCmd.AddCommand(networkPolicyCmd)
+	networkPolicyCmd.AddCommand(networkPolicySetCmd, networkPolicyPlanCmd, networkPolicyGetCmd, networkPolicyListCmd, networkPolicyDeleteCmd)
+
+	networkPolicySetCmd.Flags().BoolVar(&npAllowIntraTenant, "allow-intra-tenant", false,
+		"Allow container↔container traffic within the same tenant")
+	networkPolicySetCmd.Flags().StringSliceVar(&npEgressCidrs, "egress-cidr", nil,
+		"Allowed egress destination CIDR (repeatable, e.g. --egress-cidr 10.0.0.0/8)")
+	networkPolicySetCmd.Flags().StringSliceVar(&npEgressDomains, "egress-domain", nil,
+		"Allowed egress domain (repeatable, e.g. --egress-domain api.github.com)")
+	networkPolicySetCmd.Flags().StringVar(&npMode, "mode", "log_only",
+		"Enforcement mode: log_only | enforce")
+	networkPolicySetCmd.Flags().StringVar(&npEgressMode, "egress-mode", "",
+		"Mode of the egress allow-list alone: log_only | enforce. Empty = follow --mode. Use --mode enforce --egress-mode log_only to soak a new allow-list while the cross-tenant drop stays enforced.")
+	networkPolicySetCmd.Flags().StringSliceVar(&npAllowFromTenants, "allow-from-tenant", nil,
+		"Tenant whose containers may reach this tenant's containers over the bridge (repeatable; #2359). The only way to open tenant ingress to another tenant — one-directional.")
+	networkPolicySetCmd.Flags().StringVar(&npEgressPreset, "egress-preset", "",
+		"Ready-made egress posture (#2440): allow-list-only = egress limited to --egress-cidr/--egress-domain plus the box's DNS resolver, which is allowed implicitly so the list cannot blackhole name resolution. Combine with --mode log_only to soak first. Empty = just the lists.")
+	networkPolicySetCmd.Flags().BoolVar(&npAllowMetadata, "allow-metadata", false,
+		"Allow reaching the cloud metadata service (169.254.169.254); default deny even if a CIDR would cover it")
+	networkPolicySetCmd.Flags().BoolVar(&npJSONOut, "json", false, "Output the stored policy as JSON")
+
+	networkPolicyPlanCmd.Flags().DurationVar(&npPlanSince, "since", time.Hour, "Look-back window (default 1h, max 168h)")
+	networkPolicyPlanCmd.Flags().BoolVar(&npJSONOut, "json", false, "Output as JSON")
+
+	networkPolicyGetCmd.Flags().BoolVar(&npJSONOut, "json", false, "Output as JSON")
+	networkPolicyListCmd.Flags().BoolVar(&npJSONOut, "json", false, "Output as JSON")
+
+	networkPolicyCmd.AddCommand(networkPolicyPatchCmd)
+	networkPolicyPatchCmd.AddCommand(networkPolicyPatchAddCmd, networkPolicyPatchRmCmd, networkPolicyPatchListCmd)
+	// add carries the full rule; rm identifies a rule by CIDR alone (there is at
+	// most one deny rule per CIDR — see compileDenyRules).
+	networkPolicyPatchAddCmd.Flags().StringVar(&npDenyCidr, "cidr", "", "Destination CIDR or host IP to block (required, IPv4)")
+	networkPolicyPatchAddCmd.Flags().Uint32Var(&npDenyPort, "port", 0, "Destination port to scope the block (0 = any)")
+	networkPolicyPatchAddCmd.Flags().StringVar(&npDenyProto, "proto", "", "Protocol to scope the block: tcp | udp (empty = any)")
+	networkPolicyPatchAddCmd.Flags().StringVar(&npDenyNote, "note", "", "Operator note, typically the CVE id this virtual-patches")
+	networkPolicyPatchAddCmd.Flags().StringVar(&npDenyExpires, "expires", "", "RFC3339 expiry; the rule auto-removes after this (empty = never)")
+	networkPolicyPatchRmCmd.Flags().StringVar(&npDenyCidr, "cidr", "", "Destination CIDR or host IP of the rule to remove (required)")
+	networkPolicyPatchAddCmd.Flags().BoolVar(&npJSONOut, "json", false, "Output the stored policy as JSON")
+	networkPolicyPatchListCmd.Flags().BoolVar(&npJSONOut, "json", false, "Output as JSON")
+
+	// Tier 2 (#661 PR-B) operator exploit signatures.
+	networkPolicyCmd.AddCommand(networkPolicySignatureCmd)
+	networkPolicySignatureCmd.AddCommand(networkPolicySignatureAddCmd, networkPolicySignatureRmCmd, networkPolicySignatureListCmd)
+	networkPolicySignatureAddCmd.Flags().StringVar(&npSigPattern, "pattern", "", "Cleartext bytes to match in inbound payload (required, 1-32 bytes)")
+	networkPolicySignatureAddCmd.Flags().StringVar(&npSigNote, "note", "", "Operator note")
+	networkPolicySignatureAddCmd.Flags().BoolVar(&npSigDisabled, "disabled", false, "Store the signature but don't load it into the kernel scan")
+	networkPolicySignatureAddCmd.Flags().BoolVar(&npJSONOut, "json", false, "Output the stored signature as JSON")
+	networkPolicySignatureListCmd.Flags().BoolVar(&npJSONOut, "json", false, "Output as JSON")
+}
+
+// signature subcommand flags
+var (
+	npSigPattern  string
+	npSigNote     string
+	npSigDisabled bool
+)
+
+var networkPolicySignatureCmd = &cobra.Command{
+	Use:     "signature",
+	Aliases: []string{"sig"},
+	Short:   "Manage global Tier 2 cleartext exploit signatures (#661)",
+	Long: `Manage operator exploit signatures — cleartext byte patterns matched
+(best-effort) against the inbound payload of containers' TCP connections to
+virtually-patch a vulnerable service before the vendor fix ships. Signatures are
+GLOBAL (fleet-wide), augmenting the daemon's built-in curated set.
+
+Scanning must be enabled on the daemon (CONTAINARIUM_NETWORK_POLICY_SIGNATURES=1)
+for these to take effect, and drops require enforce mode. Best-effort, not a WAF:
+single-packet (no reassembly), cleartext only (TLS opaque), first 256 bytes.`,
+}
+
+var networkPolicySignatureAddCmd = &cobra.Command{
+	Use:   "add <name> --pattern <bytes>",
+	Short: "Add or update an operator exploit signature (upsert by name)",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runNetworkPolicySignatureAdd,
+}
+
+var networkPolicySignatureRmCmd = &cobra.Command{
+	Use:     "rm <name>",
+	Aliases: []string{"delete"},
+	Short:   "Remove an operator exploit signature",
+	Args:    cobra.ExactArgs(1),
+	RunE:    runNetworkPolicySignatureRm,
+}
+
+var networkPolicySignatureListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List operator exploit signatures",
+	Args:  cobra.NoArgs,
+	RunE:  runNetworkPolicySignatureList,
+}
+
+// sigJSON mirrors the NetworkPolicySignature wire shape (grpc-gateway camelCase).
+type sigJSON struct {
+	Name    string `json:"name"`
+	Pattern string `json:"pattern"`
+	Enabled bool   `json:"enabled"`
+	ID      uint32 `json:"id"`
+	Note    string `json:"note"`
+}
+
+type setSigRequest struct {
+	Signature sigJSON `json:"signature"`
+}
+type sigEnvelope struct {
+	Signature sigJSON `json:"signature"`
+}
+type sigsEnvelope struct {
+	Signatures []sigJSON `json:"signatures"`
+}
+
+func runNetworkPolicySignatureAdd(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	if strings.TrimSpace(npSigPattern) == "" {
+		return fmt.Errorf("--pattern is required")
+	}
+	body := setSigRequest{Signature: sigJSON{
+		Name:    args[0],
+		Pattern: npSigPattern,
+		Enabled: !npSigDisabled,
+		Note:    npSigNote,
+	}}
+	var out sigEnvelope
+	if err := doJSON("POST", strings.TrimSuffix(serverAddr, "/")+"/v1/network-policy-signatures", body, &out); err != nil {
+		return err
+	}
+	if npJSONOut {
+		return printJSON(out.Signature)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "✓ signature %q set (id %d)\n", out.Signature.Name, out.Signature.ID)
+	return nil
+}
+
+func runNetworkPolicySignatureRm(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	url := strings.TrimSuffix(serverAddr, "/") + "/v1/network-policy-signatures/" + args[0]
+	if err := doJSON("DELETE", url, nil, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "✓ signature %q removed\n", args[0])
+	return nil
+}
+
+func runNetworkPolicySignatureList(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	var out sigsEnvelope
+	if err := getJSON(strings.TrimSuffix(serverAddr, "/")+"/v1/network-policy-signatures", &out); err != nil {
+		return err
+	}
+	if npJSONOut {
+		return printJSON(out.Signatures)
+	}
+	w := cmd.OutOrStdout()
+	if len(out.Signatures) == 0 {
+		fmt.Fprintln(w, "No operator signatures (built-in signatures are always active when scanning is enabled).")
+		return nil
+	}
+	fmt.Fprintf(w, "%-24s %-6s %-8s %-24s %s\n", "NAME", "ID", "ENABLED", "PATTERN", "NOTE")
+	for _, s := range out.Signatures {
+		fmt.Fprintf(w, "%-24s %-6d %-8v %-24q %s\n", s.Name, s.ID, s.Enabled, s.Pattern, s.Note)
+	}
+	return nil
+}
+
+// netPolicyJSON mirrors the NetworkPolicy wire shape (camelCase from
+// grpc-gateway). Local so a server-side schema change surfaces as a decode
+// failure here, not a silent field-drop.
+type netPolicyJSON struct {
+	Tenant           string         `json:"tenant"`
+	AllowIntraTenant bool           `json:"allowIntraTenant"`
+	EgressCidrs      []string       `json:"egressCidrs"`
+	EgressDomains    []string       `json:"egressDomains"`
+	AllowMetadata    bool           `json:"allowMetadata"`
+	AllowFromTenants []string       `json:"allowFromTenants,omitempty"`
+	EgressPreset     string         `json:"egressPreset,omitempty"`
+	Mode             string         `json:"mode"`
+	EgressMode       string         `json:"egressMode,omitempty"`
+	Source           string         `json:"source"`
+	DenyRules        []denyRuleJSON `json:"denyRules,omitempty"`
+}
+
+// denyRuleJSON mirrors NetworkPolicyDenyRule (#660), grpc-gateway camelCase.
+type denyRuleJSON struct {
+	Cidr      string `json:"cidr"`
+	Port      uint32 `json:"port,omitempty"`
+	Proto     string `json:"proto,omitempty"`
+	Note      string `json:"note,omitempty"`
+	ExpiresAt string `json:"expiresAt,omitempty"`
+}
+
+type setNetworkPolicyRequest struct {
+	Policy netPolicyJSON `json:"policy"`
+}
+type policyEnvelope struct {
+	Policy netPolicyJSON `json:"policy"`
+}
+type policiesEnvelope struct {
+	Policies []netPolicyJSON `json:"policies"`
+}
+
+// normalizeMode maps the friendly CLI mode string to the proto enum name the
+// gateway expects.
+func normalizeMode(m string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(m)) {
+	case "", "log_only", "log-only", "logonly":
+		return "NETWORK_POLICY_MODE_LOG_ONLY", nil
+	case "enforce":
+		return "NETWORK_POLICY_MODE_ENFORCE", nil
+	default:
+		return "", fmt.Errorf("invalid --mode %q (want log_only or enforce)", m)
+	}
+}
+
+// normalizeEgressMode maps the friendly --egress-mode value to the proto enum
+// name. Empty stays empty: the field is then omitted and egress follows mode.
+func normalizeEgressMode(m string) (string, error) {
+	if strings.TrimSpace(m) == "" {
+		return "", nil
+	}
+	mode, err := normalizeMode(m)
+	if err != nil {
+		return "", fmt.Errorf("invalid --egress-mode %q (want log_only or enforce, or leave empty to follow --mode)", m)
+	}
+	return mode, nil
+}
+
+// normalizeEgressPreset maps the friendly CLI value to the proto enum name.
+func normalizeEgressPreset(v string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "":
+		return "", nil
+	case "allow-list-only", "allow_list_only", "allowlistonly":
+		return "EGRESS_PRESET_ALLOW_LIST_ONLY", nil
+	default:
+		return "", fmt.Errorf("invalid --egress-preset %q (want allow-list-only, or leave empty)", v)
+	}
+}
+
+func runNetworkPolicySet(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	mode, err := normalizeMode(npMode)
+	if err != nil {
+		return err
+	}
+	preset, err := normalizeEgressPreset(npEgressPreset)
+	if err != nil {
+		return err
+	}
+	egressMode, err := normalizeEgressMode(npEgressMode)
+	if err != nil {
+		return err
+	}
+	// `set` declares the allow-policy only; virtual-patch deny rules (#660) are
+	// owned by `network-policy patch` and preserved server-side across a set, so
+	// no client round-trip is needed to keep them.
+	body := setNetworkPolicyRequest{Policy: netPolicyJSON{
+		Tenant:           args[0],
+		AllowIntraTenant: npAllowIntraTenant,
+		EgressCidrs:      npEgressCidrs,
+		EgressDomains:    npEgressDomains,
+		AllowMetadata:    npAllowMetadata,
+		AllowFromTenants: npAllowFromTenants,
+		EgressPreset:     preset,
+		Mode:             mode,
+		EgressMode:       egressMode,
+	}}
+	var out policyEnvelope
+	if err := doJSON("POST", strings.TrimSuffix(serverAddr, "/")+"/v1/network-policies", body, &out); err != nil {
+		return err
+	}
+	if npJSONOut {
+		return printJSON(out.Policy)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "✓ network policy set for %q\n", out.Policy.Tenant)
+	printPolicy(cmd.OutOrStdout(), out.Policy)
+	return nil
+}
+
+func runNetworkPolicyGet(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	var out policyEnvelope
+	url := strings.TrimSuffix(serverAddr, "/") + "/v1/network-policies/" + args[0]
+	if err := getJSON(url, &out); err != nil {
+		return err
+	}
+	if npJSONOut {
+		return printJSON(out.Policy)
+	}
+	printPolicy(cmd.OutOrStdout(), out.Policy)
+	return nil
+}
+
+func runNetworkPolicyList(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	var out policiesEnvelope
+	if err := getJSON(strings.TrimSuffix(serverAddr, "/")+"/v1/network-policies", &out); err != nil {
+		return err
+	}
+	if npJSONOut {
+		return printJSON(out.Policies)
+	}
+	w := cmd.OutOrStdout()
+	if len(out.Policies) == 0 {
+		fmt.Fprintln(w, "No network policies.")
+		return nil
+	}
+	// PATCHES surfaces the count of virtual-patch deny rules (#660) so a
+	// vulnerable-and-blocked tenant is visible in the fleet overview, not only via
+	// `get`/`patch list <tenant>`. The --json path above carries the full rules.
+	fmt.Fprintf(w, "%-20s %-12s %-6s %-8s %s\n", "TENANT", "MODE", "INTRA", "PATCHES", "EGRESS")
+	for _, p := range out.Policies {
+		fmt.Fprintf(w, "%-20s %-12s %-6v %-8d %s\n", p.Tenant, shortMode(p.Mode), p.AllowIntraTenant, len(p.DenyRules), egressSummary(p))
+	}
+	return nil
+}
+
+func runNetworkPolicyDelete(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	url := strings.TrimSuffix(serverAddr, "/") + "/v1/network-policies/" + args[0]
+	if err := doJSON("DELETE", url, nil, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "✓ network policy deleted for %q\n", args[0])
+	return nil
+}
+
+func errServerRequired() error {
+	return fmt.Errorf("--server is required (the platform daemon's HTTP address, e.g. http://host:8080)")
+}
+
+// --- virtual-patch deny rules (#660) ---
+
+func runNetworkPolicyPatchAdd(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	rule, err := denyRuleFromFlags()
+	if err != nil {
+		return err
+	}
+	// One atomic server-side patch — no client read-modify-write, so a concurrent
+	// edit can't lose this rule and `set` never has to round-trip to preserve it.
+	out, err := patchDenyRules(patchDenyRulesRequest{Tenant: args[0], Add: []denyRuleJSON{rule}})
+	if err != nil {
+		return err
+	}
+	if npJSONOut {
+		return printJSON(out)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "✓ virtual-patch deny rule set for %q: %s\n", args[0], denyRuleSummary(rule))
+	printDenyRules(cmd.OutOrStdout(), out.DenyRules)
+	return nil
+}
+
+func runNetworkPolicyPatchRm(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	cidr := strings.TrimSpace(npDenyCidr)
+	if cidr == "" {
+		return fmt.Errorf("--cidr is required")
+	}
+	out, err := patchDenyRules(patchDenyRulesRequest{Tenant: args[0], RemoveCidrs: []string{cidr}})
+	if err != nil {
+		return err
+	}
+	if npJSONOut {
+		return printJSON(out)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "✓ removed virtual-patch deny rule %q for %q\n", cidr, args[0])
+	return nil
+}
+
+// patchDenyRulesRequest mirrors PatchNetworkPolicyDenyRulesRequest (grpc-gateway
+// camelCase).
+type patchDenyRulesRequest struct {
+	Tenant      string         `json:"tenant"`
+	Add         []denyRuleJSON `json:"add,omitempty"`
+	RemoveCidrs []string       `json:"removeCidrs,omitempty"`
+}
+
+// patchDenyRules calls the atomic deny-rule patch endpoint and returns the
+// stored (normalized) policy.
+func patchDenyRules(body patchDenyRulesRequest) (netPolicyJSON, error) {
+	var out policyEnvelope
+	if err := doJSON("POST", strings.TrimSuffix(serverAddr, "/")+"/v1/network-policies/deny-rules", body, &out); err != nil {
+		return netPolicyJSON{}, err
+	}
+	return out.Policy, nil
+}
+
+func runNetworkPolicyPatchList(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	pol, found, err := getNetworkPolicy(args[0])
+	if err != nil {
+		return err
+	}
+	if npJSONOut {
+		return printJSON(pol.DenyRules)
+	}
+	w := cmd.OutOrStdout()
+	if !found || len(pol.DenyRules) == 0 {
+		fmt.Fprintf(w, "No virtual-patch deny rules for %q.\n", args[0])
+		return nil
+	}
+	fmt.Fprintf(w, "%-22s %-6s %-6s %-22s %s\n", "CIDR", "PORT", "PROTO", "EXPIRES", "NOTE")
+	for _, r := range pol.DenyRules {
+		fmt.Fprintf(w, "%-22s %-6s %-6s %-22s %s\n", r.Cidr, denyPortStr(r.Port), denyProtoStr(r.Proto), denyExpiresStr(r.ExpiresAt), r.Note)
+	}
+	return nil
+}
+
+// denyRuleFromFlags builds a denyRuleJSON for `patch add` from the
+// --cidr/--port/--proto/--note/--expires flags, validating them client-side
+// (the server re-validates authoritatively).
+func denyRuleFromFlags() (denyRuleJSON, error) {
+	cidr := strings.TrimSpace(npDenyCidr)
+	if cidr == "" {
+		return denyRuleJSON{}, fmt.Errorf("--cidr is required")
+	}
+	proto := strings.ToLower(strings.TrimSpace(npDenyProto))
+	switch proto {
+	case "", "tcp", "udp":
+	default:
+		return denyRuleJSON{}, fmt.Errorf("--proto must be tcp, udp, or empty (got %q)", npDenyProto)
+	}
+	if npDenyPort > 65535 {
+		return denyRuleJSON{}, fmt.Errorf("--port %d out of range (0-65535)", npDenyPort)
+	}
+	return denyRuleJSON{
+		Cidr:      cidr,
+		Port:      npDenyPort,
+		Proto:     proto,
+		Note:      strings.TrimSpace(npDenyNote),
+		ExpiresAt: strings.TrimSpace(npDenyExpires),
+	}, nil
+}
+
+func denyRuleSummary(r denyRuleJSON) string {
+	s := r.Cidr
+	if r.Proto != "" {
+		s += "/" + r.Proto
+	}
+	if r.Port != 0 {
+		s += ":" + strconv.Itoa(int(r.Port))
+	}
+	return s
+}
+
+func printDenyRules(w io.Writer, rules []denyRuleJSON) {
+	if len(rules) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "  deny-rules (virtual patches):\n")
+	for _, r := range rules {
+		extra := ""
+		if r.Note != "" {
+			extra += " (" + r.Note + ")"
+		}
+		if r.ExpiresAt != "" {
+			extra += " expires " + r.ExpiresAt
+		}
+		fmt.Fprintf(w, "    - %s%s\n", denyRuleSummary(r), extra)
+	}
+}
+
+func denyPortStr(p uint32) string {
+	if p == 0 {
+		return "any"
+	}
+	return strconv.Itoa(int(p))
+}
+
+func denyProtoStr(p string) string {
+	if p == "" {
+		return "any"
+	}
+	return p
+}
+
+func denyExpiresStr(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// getNetworkPolicy fetches a tenant's policy, distinguishing a genuine 404
+// (found=false, no error) from a transport/other error — so `patch list` can
+// print "no deny rules" on 404 but surface a real failure. On 404 the returned
+// policy has Tenant pre-filled.
+func getNetworkPolicy(tenant string) (netPolicyJSON, bool, error) {
+	url := strings.TrimSuffix(serverAddr, "/") + "/v1/network-policies/" + tenant
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return netPolicyJSON{}, false, fmt.Errorf("create request: %w", err)
+	}
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		return netPolicyJSON{}, false, fmt.Errorf("request %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return netPolicyJSON{Tenant: tenant}, false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return netPolicyJSON{}, false, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var env policyEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		return netPolicyJSON{}, false, fmt.Errorf("decode policy: %w", err)
+	}
+	if env.Policy.Tenant == "" {
+		env.Policy.Tenant = tenant
+	}
+	return env.Policy, true, nil
+}
+
+func shortMode(m string) string {
+	return strings.TrimPrefix(m, "NETWORK_POLICY_MODE_")
+}
+
+func egressSummary(p netPolicyJSON) string {
+	parts := make([]string, 0, len(p.EgressCidrs)+len(p.EgressDomains))
+	parts = append(parts, p.EgressCidrs...)
+	parts = append(parts, p.EgressDomains...)
+	if len(parts) == 0 {
+		return "(none)"
+	}
+	return strings.Join(parts, ",")
+}
+
+func printPolicy(w io.Writer, p netPolicyJSON) {
+	fmt.Fprintf(w, "  tenant:             %s\n", p.Tenant)
+	fmt.Fprintf(w, "  mode:               %s\n", shortMode(p.Mode))
+	if p.EgressMode == "" || p.EgressMode == "NETWORK_POLICY_MODE_UNSPECIFIED" {
+		fmt.Fprintf(w, "  egress-mode:        %s (follows mode)\n", shortMode(p.Mode))
+	} else {
+		fmt.Fprintf(w, "  egress-mode:        %s\n", shortMode(p.EgressMode))
+	}
+	fmt.Fprintf(w, "  allow-intra-tenant: %v\n", p.AllowIntraTenant)
+	fmt.Fprintf(w, "  allow-metadata:     %v\n", p.AllowMetadata)
+	if p.Source != "" {
+		fmt.Fprintf(w, "  source:             %s\n", p.Source)
+	}
+	if len(p.EgressCidrs) > 0 {
+		fmt.Fprintf(w, "  egress-cidrs:       %s\n", strings.Join(p.EgressCidrs, ", "))
+	}
+	if len(p.EgressDomains) > 0 {
+		fmt.Fprintf(w, "  egress-domains:     %s\n", strings.Join(p.EgressDomains, ", "))
+	}
+	if len(p.AllowFromTenants) > 0 {
+		fmt.Fprintf(w, "  allow-from-tenants: %s\n", strings.Join(p.AllowFromTenants, ", "))
+	}
+	if p.EgressPreset != "" && p.EgressPreset != "EGRESS_PRESET_UNSPECIFIED" {
+		fmt.Fprintf(w, "  egress-preset:      %s (the box's DNS resolver is allowed implicitly)\n",
+			strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(p.EgressPreset, "EGRESS_PRESET_"), "_", "-")))
+	}
+	printDenyRules(w, p.DenyRules)
+}
+
+// doJSON does an admin-authenticated request with an optional JSON body and
+// decodes the JSON response into out (out may be nil to discard the body).
+func doJSON(method, url string, body, out interface{}) error {
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("encode request: %w", err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, url, rdr)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// planEnvelope mirrors PlanNetworkPolicyResponse's grpc-gateway JSON.
+type planEnvelope struct {
+	Tenant       string            `json:"tenant"`
+	SinceMinutes int32             `json:"sinceMinutes"`
+	Destinations []planDestination `json:"destinations"`
+	RowsScanned  uint32            `json:"rowsScanned"`
+	Truncated    bool              `json:"truncated"`
+	Notes        []string          `json:"notes"`
+}
+
+type planDestination struct {
+	IP       string `json:"ip"`
+	Port     uint32 `json:"port"`
+	Protocol string `json:"protocol"`
+	Count    uint32 `json:"count"`
+	Dropped  bool   `json:"dropped"`
+	LastSeen string `json:"lastSeen"`
+}
+
+func runNetworkPolicyPlan(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return errServerRequired()
+	}
+	minutes := int(npPlanSince / time.Minute)
+	if minutes < 1 {
+		return fmt.Errorf("--since must be at least 1m")
+	}
+	var out planEnvelope
+	url := fmt.Sprintf("%s/v1/network-policies/%s/plan?sinceMinutes=%d", strings.TrimSuffix(serverAddr, "/"), args[0], minutes)
+	if err := getJSON(url, &out); err != nil {
+		return err
+	}
+	if npJSONOut {
+		return printJSON(out)
+	}
+	printPlan(cmd.OutOrStdout(), out)
+	return nil
+}
+
+// printPlan renders a plan: a table of destinations and, below it, the
+// --egress-cidr flags to paste into `network-policy set`.
+func printPlan(w io.Writer, p planEnvelope) {
+	fmt.Fprintf(w, "Destinations %q reached that its policy denied or dropped, last %dm:\n\n", p.Tenant, p.SinceMinutes)
+	if len(p.Destinations) == 0 {
+		fmt.Fprintln(w, "  (none: the policy blocked nothing in this window)")
+	} else {
+		fmt.Fprintf(w, "  %-16s %-6s %-6s %-7s %-8s %s\n", "DESTINATION", "PORT", "PROTO", "COUNT", "STATE", "LAST SEEN")
+		seen := map[string]bool{}
+		var flags []string
+		for _, d := range p.Destinations {
+			state := "logged"
+			if d.Dropped {
+				state = "dropped"
+			}
+			fmt.Fprintf(w, "  %-16s %-6d %-6s %-7d %-8s %s\n", d.IP, d.Port, d.Protocol, d.Count, state, d.LastSeen)
+			if !seen[d.IP] {
+				seen[d.IP] = true
+				flags = append(flags, "--egress-cidr "+d.IP+"/32")
+			}
+		}
+		fmt.Fprintf(w, "\nTo allow all of the above, add to `network-policy set %s`:\n\n  %s\n", p.Tenant, strings.Join(flags, " "))
+		fmt.Fprintln(w, "\nReview before pasting: these are the addresses your tenant reached, not a judgement that they are safe.")
+	}
+	for _, n := range p.Notes {
+		fmt.Fprintf(w, "\nNote: %s\n", n)
+	}
+	if p.Truncated {
+		fmt.Fprintf(w, "\nThe audit row cap was reached after %d rows; shorten --since for the full recent picture.\n", p.RowsScanned)
+	}
+}
