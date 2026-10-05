@@ -58,3 +58,64 @@ func TestStartProxies_APIListenerBoundToLoopbackByDefault(t *testing.T) {
 	stubLoopbackAliases(t)
 	apiPortOrSkip(t)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	session, closeSession := newSessionPair(t)
+	defer closeSession()
+
+	ts := NewTunnelServer("", NewTokenPolicy(), NewTunnelRegistry(), 0)
+	closeProxiesOnCleanup(t, ts)
+
+	apiPort := freeLoopbackPort(t)
+	ts.startProxies(ctx, "spot-1", 1, "127.0.0.1", apiPort, []int{8080}, session)
+
+	addrs := listenerAddrs(t, ts, "spot-1")
+	var found bool
+	for _, a := range addrs {
+		require.Truef(t, a.IP.IsLoopback(), "listener %s is not bound to loopback", a)
+		if a.Port == apiPort {
+			found = true
+		}
+	}
+	require.Truef(t, found, "no listener on the per-backend API port %d; got %v", apiPort, addrs)
+
+	// The API port accepts on loopback...
+	c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(apiPort)), time.Second)
+	require.NoError(t, err)
+	_ = c.Close()
+
+	// ...and refuses on any non-loopback local address.
+	if ip := nonLoopbackIPv4(t); ip != nil {
+		c, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), strconv.Itoa(apiPort)), time.Second)
+		if err == nil {
+			_ = c.Close()
+		}
+		require.Errorf(t, err, "API port %d accepted a connection on non-loopback address %s", apiPort, ip)
+	}
+}
+
+func TestStartProxies_APIListenerHonoursAPIBindAddr(t *testing.T) {
+	stubLoopbackAliases(t)
+	apiPortOrSkip(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	session, closeSession := newSessionPair(t)
+	defer closeSession()
+
+	ts := NewTunnelServer("", NewTokenPolicy(), NewTunnelRegistry(), 0)
+	ts.APIBindAddr = "0.0.0.0"
+	closeProxiesOnCleanup(t, ts)
+
+	apiPort := freeLoopbackPort(t)
+	ts.startProxies(ctx, "spot-1", 1, "127.0.0.1", apiPort, []int{8080}, session)
+
+	var api *net.TCPAddr
+	for _, a := range listenerAddrs(t, ts, "spot-1") {
+		if a.Port == apiPort {
+			api = a
+		}
+	}
+	require.NotNil(t, api, "no listener on the per-backend API port")
+	require.Truef(t, api.IP.IsUnspecified(), "API listener bound to %s, want the configured 0.0.0.0", api.IP)
+}
