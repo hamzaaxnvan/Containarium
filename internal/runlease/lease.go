@@ -53,3 +53,171 @@ type Lease struct {
 }
 
 // Revoker is the subset of auth.RevocationStore End needs.
+type Revoker interface {
+	Revoke(ctx context.Context, jti string, expiresAt time.Time, reason string) error
+}
+
+// Wiper is the subset of *container.Manager End needs.
+type Wiper interface {
+	Exec(container string, cmd []string) error
+}
+
+// Outcome reports what End actually did.
+type Outcome struct {
+	Revoked     []string // jtis the store accepted
+	Unrevoked   []string // jtis the store rejected or that had no store
+	Wiped       bool     // the two seed files (token, gateway.env) are gone
+	DirsRemoved bool     // #1860: the seed dir and (if set) the workspace are gone entirely
+	Errs        []error  // one per failed step; never aborts the others
+}
+
+const (
+	revokeTimeout     = 2 * time.Second
+	wipeTimeout       = 3 * time.Second
+	removeDirsTimeout = 3 * time.Second
+)
+
+// End revokes every credential, wipes the seed files, then (#1860) removes
+// the seed directory and workspace entirely. Every step always runs; the
+// order is deliberate: revocation kills an exfiltrated copy, the file wipe
+// closes the specific credential read path quickly, and the directory
+// removal afterward cleans up everything else (prompt, input, a fetched
+// repo) without racing the two steps that matter most for credential safety.
+// A nil revoker records every jti as Unrevoked. The caller is expected to
+// pass a context already detached from its own request
+// (context.WithoutCancel) so a cancelled caller still gets its credentials
+// revoked.
+func End(ctx context.Context, l Lease, rev Revoker, w Wiper, reason string) Outcome {
+	var out Outcome
+
+	for _, c := range l.Credentials {
+		revoked, err := revokeOne(ctx, rev, c, reason)
+		if revoked {
+			out.Revoked = append(out.Revoked, c.JTI)
+		} else {
+			out.Unrevoked = append(out.Unrevoked, c.JTI)
+		}
+		if err != nil {
+			out.Errs = append(out.Errs, err)
+		}
+	}
+
+	wiped, err := wipeSeed(w, l.Box, l.SeedDir)
+	out.Wiped = wiped
+	if err != nil {
+		out.Errs = append(out.Errs, err)
+	}
+
+	dirsRemoved, err := removeDirs(w, l.Box, l.SeedDir, l.Workspace)
+	out.DirsRemoved = dirsRemoved
+	if err != nil {
+		out.Errs = append(out.Errs, err)
+	}
+
+	return out
+}
+
+// revokeOne revokes a single credential under its own timeout. A nil rev
+// counts the jti as unrevoked without treating that as an error step — it
+// means there is no store configured, not that revocation failed.
+func revokeOne(ctx context.Context, rev Revoker, c Credential, reason string) (revoked bool, err error) {
+	if rev == nil {
+		return false, nil
+	}
+
+	rctx, cancel := context.WithTimeout(ctx, revokeTimeout)
+	defer cancel()
+
+	if err := rev.Revoke(rctx, c.JTI, c.ExpiresAt, reason); err != nil {
+		return false, fmt.Errorf("runlease: revoke %s: %w", c.JTI, err)
+	}
+	return true, nil
+}
+
+// wipeSeed removes the run's seed files from the box. w.Exec has no context
+// parameter of its own, so the timeout is enforced by racing its result
+// against a timer; an Exec that is still running past wipeTimeout is
+// reported as failed (Wiped=false) even though it may still complete in the
+// background.
+func wipeSeed(w Wiper, box, seedDir string) (bool, error) {
+	if w == nil {
+		return false, nil
+	}
+	if seedDir == "" {
+		// An empty SeedDir would otherwise build "rm -f /token
+		// /gateway.env" — a box-root-relative command nobody asked
+		// for. Refuse instead of running it.
+		return false, fmt.Errorf("runlease: wipe seed: empty seed dir")
+	}
+
+	cmd := []string{"rm", "-f", seedDir + "/token", seedDir + "/gateway.env"}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Exec(box, cmd)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return false, fmt.Errorf("runlease: wipe seed: %w", err)
+		}
+		return true, nil
+	case <-time.After(wipeTimeout):
+		return false, fmt.Errorf("runlease: wipe seed: timed out after %s", wipeTimeout)
+	}
+}
+
+// removeDirs removes the run's seed directory and, if set, its workspace
+// with one `rm -rf`, under its own timeout — a slow or unreachable box here
+// never blocks the caller past removeDirsTimeout. Both paths must pass
+// isSafeToRemove or nothing is removed and the reason is reported as an
+// error: the command is refused as a whole rather than built from half a
+// validated pair.
+func removeDirs(w Wiper, box, seedDir, workspace string) (bool, error) {
+	if w == nil {
+		return false, nil
+	}
+	if !isSafeToRemove(seedDir) {
+		return false, fmt.Errorf("runlease: remove dirs: seed dir %q is not safe to remove", seedDir)
+	}
+	cmd := []string{"rm", "-rf", seedDir}
+	if workspace != "" {
+		if !isSafeToRemove(workspace) {
+			return false, fmt.Errorf("runlease: remove dirs: workspace %q is not safe to remove", workspace)
+		}
+		cmd = append(cmd, workspace)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- w.Exec(box, cmd)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return false, fmt.Errorf("runlease: remove dirs: %w", err)
+		}
+		return true, nil
+	case <-time.After(removeDirsTimeout):
+		return false, fmt.Errorf("runlease: remove dirs: timed out after %s", removeDirsTimeout)
+	}
+}
+
+// isSafeToRemove reports whether p is a plausible per-run directory to
+// remove with `rm -rf`: an absolute, already-clean path with at least three
+// segments (e.g. "/workspace/runs/<run_id>" or
+// "/etc/containarium/agent/runs/<run_id>"). This is a sanity floor, not an
+// allowlist of specific roots — runlease has no knowledge of the caller's
+// actual root paths, so it can only refuse implausible input (empty,
+// relative, unclean, or shallow like "/" or "/etc") rather than enforce a
+// specific one. The caller is responsible for constructing SeedDir/Workspace
+// under its own fixed, per-run roots.
+func isSafeToRemove(p string) bool {
+	if p == "" || !path.IsAbs(p) || path.Clean(p) != p {
+		return false
+	}
+	segments := strings.Count(strings.TrimPrefix(p, "/"), "/") + 1
+	return segments >= 3
+}
