@@ -66,3 +66,72 @@ func cleanupBridgeDNSRecord(be bridgeDNSStore, bridge, baseDomain, sshHost strin
 	}
 	return nil
 }
+
+// stripBridgeDNSRecord returns raw without the record earlier daemons wrote,
+// and whether anything was removed. Per decision Q36 on #2727 it acts only
+// when an `address=/<base-domain>/<ip>` line is present, and then removes that
+// line plus every `server=/<h>/#` line whose h is the SSH host or a name at or
+// under the base domain. Every other line is kept byte for byte, in order. A
+// result that is only whitespace comes back as "", so the caller unsets the key.
+func stripBridgeDNSRecord(raw, baseDomain, sshHost string) (string, bool) {
+	base, ok := normalizeDNSHost(baseDomain)
+	if !ok || raw == "" {
+		return raw, false
+	}
+	ssh, _ := normalizeDNSHost(sshHost)
+	lines := strings.Split(raw, "\n")
+	hasRecord := false
+	for _, l := range lines {
+		if isBaseDomainAddressLine(l, base) {
+			hasRecord = true
+			break
+		}
+	}
+	if !hasRecord {
+		return raw, false
+	}
+	kept := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if isBaseDomainAddressLine(l, base) {
+			continue
+		}
+		if h, ok := carveoutHost(l); ok && (h == ssh || h == base || strings.HasSuffix(h, "."+base)) {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	out := strings.Join(kept, "\n")
+	if strings.TrimSpace(out) == "" {
+		out = ""
+	}
+	return out, true
+}
+
+// isBaseDomainAddressLine matches the daemon's `address=/<base>/<ip>` shape:
+// exactly one domain, equal to base after normalization.
+func isBaseDomainAddressLine(line, base string) bool {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(line), "address=/")
+	if !ok {
+		return false
+	}
+	domain, target, ok := strings.Cut(rest, "/")
+	if !ok || strings.Contains(target, "/") {
+		return false
+	}
+	n, ok := normalizeDNSHost(domain)
+	return ok && n == base
+}
+
+// carveoutHost returns h for a `server=/<h>/#` line, the only carve-out shape
+// the daemon wrote; a server line naming an upstream address is not one.
+func carveoutHost(line string) (string, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(line), "server=/")
+	if !ok {
+		return "", false
+	}
+	h, ok := strings.CutSuffix(rest, "/#")
+	if !ok || strings.Contains(h, "/") {
+		return "", false
+	}
+	return normalizeDNSHost(h)
+}

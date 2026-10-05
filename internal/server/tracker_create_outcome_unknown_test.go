@@ -88,3 +88,93 @@ func setUpSlowForge(t *testing.T, user string, policy *pb.TrackerPolicy) (*Conta
 
 	pool, err := pgxpool.New(context.Background(), os.Getenv("CONTAINARIUM_TEST_DSN"))
 	if err != nil {
+		t.Fatalf("connect Postgres: %v", err)
+	}
+	defer pool.Close()
+	for _, q := range []string{
+		"DELETE FROM tracker_lineage_reservations WHERE username = $1",
+		"DELETE FROM audit_logs WHERE username = $1",
+	} {
+		if _, err := pool.Exec(context.Background(), q, user); err != nil {
+			t.Fatalf("clean fixture (%s): %v", q, err)
+		}
+	}
+	return s, forge, runCtx, operatorCtx
+}
+
+func outcomeUnknownAuditRows(t *testing.T, s *ContainerServer, user string) []audit.AuditEntry {
+	t.Helper()
+	rows, _, err := s.auditStore.Query(context.Background(), audit.QueryParams{Username: user, Action: auditActionIssueCreateOutcomeUnknown, Limit: 10})
+	if err != nil {
+		t.Fatalf("audit Query: %v", err)
+	}
+	return rows
+}
+
+func assertOutcomeUnknownError(t *testing.T, err error) {
+	t.Helper()
+	if status.Code(err) != codes.Unknown {
+		t.Fatalf("code = %v (%v), want Unknown (outcome unknown)", status.Code(err), err)
+	}
+	msg := status.Convert(err).Message()
+	for _, want := range []string{ErrorReasonUpstreamCreateOutcomeUnknown, "do not retry"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message = %q, want it to contain %q", msg, want)
+		}
+	}
+}
+
+func TestCreateTrackerIssue_AmbiguousUpstreamCreateIsAuditedAndCapped(t *testing.T) {
+	const user = "tracker-rpc-create-outcome-unknown"
+	s, forge, runCtx, _ := setUpSlowForge(t, user, &pb.TrackerPolicy{MaxChildrenPerRun: 1})
+
+	_, err := s.CreateTrackerIssue(runCtx, createReq(user, 42, "scope:architecture"))
+	assertOutcomeUnknownError(t, err)
+
+	rows := outcomeUnknownAuditRows(t, s, user)
+	if len(rows) != 1 {
+		t.Fatalf("%s audit rows = %d, want 1", auditActionIssueCreateOutcomeUnknown, len(rows))
+	}
+	for _, want := range []string{
+		`"run_id":"` + createTestRunID + `"`,
+		`"parent_number":42`,
+		`"depth":1`,
+		`"project":"acme/widgets"`,
+		`"title":"Design the thing"`,
+		`"slot_retained":true`,
+	} {
+		if !strings.Contains(rows[0].Detail, want) {
+			t.Errorf("audit detail = %s, want it to contain %s", rows[0].Detail, want)
+		}
+	}
+	if strings.Contains(rows[0].Detail, "ghp_x") {
+		t.Errorf("audit detail = %s, MUST NOT contain the credential value", rows[0].Detail)
+	}
+
+	// The blind retry: the forge would answer this one promptly, but the
+	// ambiguous attempt still holds the run's only fan-out slot.
+	_, err = s.CreateTrackerIssue(runCtx, createReq(user, 42, "scope:architecture"))
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("retry after outcome unknown: code = %v (%v), want ResourceExhausted", status.Code(err), err)
+	}
+	if n := forge.creates.Load(); n != 1 {
+		t.Errorf("issues created on the forge = %d, want 1 (the retry must not reach it)", n)
+	}
+}
+
+// The operator path has no lineage and no fan-out cap, but the same
+// ambiguity applies: audited, and the distinct error.
+func TestCreateTrackerIssue_OperatorAmbiguousUpstreamCreateIsAudited(t *testing.T) {
+	const user = "tracker-rpc-create-outcome-unknown-op"
+	s, _, _, operatorCtx := setUpSlowForge(t, user, nil)
+
+	_, err := s.CreateTrackerIssue(operatorCtx, createReq(user, 0, "scope:architecture"))
+	assertOutcomeUnknownError(t, err)
+	rows := outcomeUnknownAuditRows(t, s, user)
+	if len(rows) != 1 {
+		t.Fatalf("%s audit rows = %d, want 1", auditActionIssueCreateOutcomeUnknown, len(rows))
+	}
+	if !strings.Contains(rows[0].Detail, `"slot_retained":false`) {
+		t.Errorf("audit detail = %s, want slot_retained:false for an operator token", rows[0].Detail)
+	}
+}
