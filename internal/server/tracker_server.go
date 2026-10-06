@@ -358,3 +358,183 @@ func (s *ContainerServer) GetTrackerStatus(ctx context.Context, req *pb.GetTrack
 // to use), and a describe failure here — the tracker briefly
 // unreachable, a token not yet propagated upstream, a self-managed
 // instance reachable only from a network the daemon doesn't have a
+// route to yet — must never turn that write into an error. GetTrackerStatus
+// is the verb an operator uses to find out WHY a describe isn't working;
+// this one just doesn't let that block registering the connection.
+func (s *ContainerServer) describeCredentialBestEffort(ctx context.Context, conn *tracker.Connection) {
+	describer, err := s.trackerProviderFor(conn.Provider)
+	if err != nil {
+		log.Printf("[tracker] %s/%s: %v", conn.Username, conn.Name, err)
+		return
+	}
+	cred, err := s.secretsStore.BrokerCredential(ctx, conn.Username, conn.CredentialSecret)
+	if err != nil {
+		log.Printf("[tracker] %s/%s: resolve broker credential: %v", conn.Username, conn.Name, err)
+		return
+	}
+	info, err := describer.DescribeCredential(ctx, tracker.Conn{
+		BaseURL: conn.BaseURL, Project: conn.Project, Credential: cred,
+	})
+	if err != nil {
+		log.Printf("[tracker] %s/%s: describe credential: %v", conn.Username, conn.Name, err)
+		return
+	}
+	if err := s.trackerStore.SetCredentialExpiry(ctx, conn.Username, conn.Name, info.ExpiresAt); err != nil {
+		log.Printf("[tracker] %s/%s: persist credential expiry: %v", conn.Username, conn.Name, err)
+		return
+	}
+	conn.CredentialExpiresAt = info.ExpiresAt
+}
+
+// breadthToProto converts the Go-level breadth classification to its
+// proto enum.
+func breadthToProto(b tracker.CredentialBreadth) pb.TrackerCredentialBreadth {
+	switch b {
+	case tracker.BreadthPreferred:
+		return pb.TrackerCredentialBreadth_TRACKER_CREDENTIAL_BREADTH_PREFERRED
+	case tracker.BreadthBroad:
+		return pb.TrackerCredentialBreadth_TRACKER_CREDENTIAL_BREADTH_BROAD
+	default:
+		return pb.TrackerCredentialBreadth_TRACKER_CREDENTIAL_BREADTH_UNSPECIFIED
+	}
+}
+
+// requireBrokerOnlySecret validates that secretName is a secret owned by
+// username, in SECRET_DELIVERY_BROKER_ONLY mode. Reuses
+// secrets.Store.Get's existing three-way outcome rather than adding a
+// new store method: ErrBrokerOnly means the row exists and is
+// broker-only (allowed); a nil error means it exists but is a
+// delivering mode (rejected — a tracker connection must never point at
+// a secret a box can also read); ErrNotFound means no such secret for
+// this tenant.
+func (s *ContainerServer) requireBrokerOnlySecret(ctx context.Context, username, secretName string) error {
+	if secretName == "" {
+		return status.Error(codes.InvalidArgument, "credential_secret is required")
+	}
+	if s.secretsStore == nil {
+		return status.Error(codes.FailedPrecondition, "secrets store not configured on this daemon; a tracker connection needs a broker-only secret to reference")
+	}
+	_, _, err := s.secretsStore.Get(ctx, username, secretName)
+	switch {
+	case errors.Is(err, secrets.ErrBrokerOnly):
+		return nil
+	case err == nil:
+		return status.Errorf(codes.InvalidArgument,
+			"credential_secret %q is not in broker-only mode; set it with delivery_mode=SECRET_DELIVERY_BROKER_ONLY first", secretName)
+	case errors.Is(err, secrets.ErrNotFound):
+		return status.Errorf(codes.InvalidArgument, "credential_secret %q not found for tenant %q", secretName, username)
+	default:
+		return status.Errorf(codes.Internal, "check credential_secret: %v", err)
+	}
+}
+
+// enforceConnectionBinding is #1922 step 6's anti-forgery check: a
+// run-scoped token carrying a tracker_conn claim (minted at RunAgentSkill,
+// after validating tracker_connection against the run's own tenant — see
+// AgentSkillServer.validateTrackerConnection) may only use the tracker
+// verb RPCs against the ONE connection it's bound to. Naming a different
+// connection is rejected — read or write, the run token can't even
+// discover whether a connection it's not bound to exists.
+//
+// An operator/human token carries no tracker_conn claim (TrackerConnFromGRPCContext
+// returns present=false) and may name any connection in its own tenant,
+// per the design note's D3 decision — connection CRUD and ad-hoc CLI/CI
+// use were never meant to be constrained by a run binding they don't have.
+func enforceConnectionBinding(ctx context.Context, connectionName string) error {
+	bound, present := auth.TrackerConnFromGRPCContext(ctx)
+	if !present {
+		return nil
+	}
+	if bound != connectionName {
+		return status.Errorf(codes.PermissionDenied, "this run is bound to tracker connection %q, not %q", bound, connectionName)
+	}
+	return nil
+}
+
+// mapTrackerError maps tracker store errors to gRPC status codes.
+func mapTrackerError(err error) error {
+	if errors.Is(err, tracker.ErrNotFound) {
+		return status.Error(codes.NotFound, "tracker connection not found")
+	}
+	msg := err.Error()
+	if isValidationError(msg) || isTrackerValidationError(msg) {
+		return status.Error(codes.InvalidArgument, msg)
+	}
+	return status.Errorf(codes.Internal, "%v", err)
+}
+
+// isTrackerValidationError matches internal/tracker's own plain-string
+// validation errors (username / name / project / credential_secret
+// required, unknown provider) — a small, stable set, same cheap
+// substring-match idiom as secrets_server.go's isValidationError.
+func isTrackerValidationError(msg string) bool {
+	keywords := []string{
+		"username is required",
+		"name is required",
+		"project is required",
+		"credential_secret is required",
+		"provider must be",
+	}
+	for _, kw := range keywords {
+		if containsCI(msg, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// toProtoTrackerConnection converts the storage-layer struct to the
+// proto-facing one. credential_expires_at is populated best-effort by
+// SetTrackerConnection / GetTrackerStatus (DescribeCredential); it stays
+// unset on a connection that's never been successfully described.
+func toProtoTrackerConnection(c *tracker.Connection) *pb.TrackerConnection {
+	if c == nil {
+		return nil
+	}
+	out := &pb.TrackerConnection{
+		Username:         c.Username,
+		Name:             c.Name,
+		Provider:         c.Provider,
+		BaseUrl:          c.BaseURL,
+		Project:          c.Project,
+		CredentialSecret: c.CredentialSecret,
+		Policy:           c.Policy,
+	}
+	if !c.CredentialExpiresAt.IsZero() {
+		out.CredentialExpiresAt = timestamppb.New(c.CredentialExpiresAt)
+	}
+	return out
+}
+
+// validateTrackerPolicy rejects a policy that can't mean anything: a
+// negative cap or timeout, or an empty allow-list pattern (which would
+// match nothing and is almost certainly a shell-quoting accident). Zero
+// values are fine — they mean the documented defaults.
+func validateTrackerPolicy(p *pb.TrackerPolicy) error {
+	if p == nil {
+		return nil
+	}
+	if p.GetMaxDepth() < 0 || p.GetMaxChildrenPerRun() < 0 || p.GetRunTimeoutSeconds() < 0 {
+		return errors.New("policy: max_depth, max_children_per_run and run_timeout_seconds must not be negative")
+	}
+	for _, pattern := range p.GetLabelAllowList() {
+		if pattern == "" {
+			return errors.New("policy: label_allow_list entries must not be empty")
+		}
+	}
+	return nil
+}
+
+// kindToProto converts the Go-level credential kind to its proto enum.
+func kindToProto(k tracker.CredentialKind) pb.TrackerCredentialKind {
+	switch k {
+	case tracker.KindProject:
+		return pb.TrackerCredentialKind_TRACKER_CREDENTIAL_KIND_PROJECT
+	case tracker.KindGroup:
+		return pb.TrackerCredentialKind_TRACKER_CREDENTIAL_KIND_GROUP
+	case tracker.KindPersonal:
+		return pb.TrackerCredentialKind_TRACKER_CREDENTIAL_KIND_PERSONAL
+	default:
+		return pb.TrackerCredentialKind_TRACKER_CREDENTIAL_KIND_UNSPECIFIED
+	}
+}
