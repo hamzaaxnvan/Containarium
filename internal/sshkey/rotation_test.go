@@ -76,3 +76,30 @@ func TestRemoveRetired_RequiresExplicitMatchingRetirement(t *testing.T) {
 		case "future":
 			record.RetiredAt = &future
 		case "missing":
+			continue
+		}
+		records = append(records, record)
+		if name == "duplicate active" {
+			records = append(records, SSHKey{Fingerprint: fp})
+		}
+	}
+	removed, err := RemoveRetired(opts, records, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0] != paths["retired"] {
+		t.Fatalf("removed=%v, want only retired", removed)
+	}
+	for name, path := range paths {
+		for _, file := range []string{path, path + ".pub"} {
+			_, err := os.Stat(file)
+			if name == "retired" {
+				if !os.IsNotExist(err) {
+					t.Errorf("retired key remains: %s", file)
+				}
+			} else if err != nil {
+				t.Errorf("%s key removed: %v", name, err)
+			}
+		}
+	}
+}
