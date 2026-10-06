@@ -103,3 +103,109 @@ func TestBackendStorageFromPool_NilWhenNothingObserved(t *testing.T) {
 
 // TestContainerServer_ListBackends_PeerReportsStorage proves the fleet view
 // actually carries a peer's storage property end to end.
+//
+// This is the whole point of #1209: a BYOC tunnel host sitting on a
+// shared-filesystem pool is invisible today unless someone reads that host's
+// own startup log. It has to show up in the fleet listing.
+func TestContainerServer_ListBackends_PeerReportsStorage(t *testing.T) {
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/system/info" {
+			http.NotFound(w, r)
+			return
+		}
+		// protojson wire shape a real peer daemon emits through grpc-gateway.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"info":{
+			"hostname":"byoc-host",
+			"storage":{
+				"pool":"default",
+				"driver":"STORAGE_DRIVER_DIR",
+				"isolation":"STORAGE_ISOLATION_SHARED_FILESYSTEM",
+				"driverName":"dir"
+			}
+		}}`))
+	}))
+	defer peerSrv.Close()
+
+	pool := NewPeerPool("local-spot", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-byoc"] = &PeerClient{
+		ID:      "tunnel-byoc",
+		Addr:    peerSrv.Listener.Addr().String(),
+		Healthy: true,
+		client:  peerSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	s := &ContainerServer{peerPool: pool, startTime: time.Now().Add(-time.Minute)}
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+
+	resp, err := s.ListBackends(ctx, &pb.ListBackendsRequest{})
+	if err != nil {
+		t.Fatalf("ListBackends: %v", err)
+	}
+
+	var peer *pb.BackendInfo
+	for _, b := range resp.Backends {
+		if b.Id == "tunnel-byoc" {
+			peer = b
+		}
+	}
+	if peer == nil {
+		t.Fatal("tunnel-byoc missing from the backend list")
+	}
+	// protojson fails the WHOLE decode on an unknown field, so assert a field
+	// from outside the storage block: otherwise a drifted payload reads as
+	// "storage dropped" rather than "this test's JSON is wrong".
+	if peer.Hostname != "byoc-host" {
+		t.Fatalf("Hostname = %q — the peer's SystemInfo did not decode at all", peer.Hostname)
+	}
+	if peer.Storage == nil {
+		t.Fatal("peer Storage is nil — a shared-filesystem BYOC host is invisible in the fleet view (#1209)")
+	}
+	if peer.Storage.Isolation != pb.StorageIsolation_STORAGE_ISOLATION_SHARED_FILESYSTEM {
+		t.Errorf("Isolation = %v, want SHARED_FILESYSTEM", peer.Storage.Isolation)
+	}
+	if peer.Storage.DriverName != "dir" {
+		t.Errorf("DriverName = %q, want %q", peer.Storage.DriverName, "dir")
+	}
+}
+
+// TestContainerServer_ListBackends_PeerWithoutStorageReportsNil is the
+// "we don't know" half. An older peer daemon that predates this field must
+// come back with Storage nil, not a zero-valued struct that would render as
+// an isolated-looking default.
+func TestContainerServer_ListBackends_PeerWithoutStorageReportsNil(t *testing.T) {
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/system/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"info":{"hostname":"old-peer"}}`))
+	}))
+	defer peerSrv.Close()
+
+	pool := NewPeerPool("local-spot", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["tunnel-old"] = &PeerClient{
+		ID:      "tunnel-old",
+		Addr:    peerSrv.Listener.Addr().String(),
+		Healthy: true,
+		client:  peerSrv.Client(),
+	}
+	pool.mu.Unlock()
+
+	s := &ContainerServer{peerPool: pool, startTime: time.Now().Add(-time.Minute)}
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+
+	resp, err := s.ListBackends(ctx, &pb.ListBackendsRequest{})
+	if err != nil {
+		t.Fatalf("ListBackends: %v", err)
+	}
+	for _, b := range resp.Backends {
+		if b.Id == "tunnel-old" && b.Storage != nil {
+			t.Errorf("Storage = %+v, want nil for a peer that reported none", b.Storage)
+		}
+	}
+}
