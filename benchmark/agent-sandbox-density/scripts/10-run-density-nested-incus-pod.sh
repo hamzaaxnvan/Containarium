@@ -81,3 +81,45 @@ CTN_SERVER="http://127.0.0.1:8080"
 log "minting an admin token"
 CTN_TOKEN=$(pod_exec "containarium token generate --username bench-admin --roles admin --expiry 6h --secret-file /etc/containarium/jwt.secret --raw")
 [[ -n "$CTN_TOKEN" ]] || die "failed to mint a token — check the daemon is running inside the pod"
+
+create_box() {
+	local name="$1"
+	pod_exec "containarium create ${name} --no-ssh-key --podman=false --cpu ${LXC_CPU_LIMIT} --memory ${INCUS_MEM_LIMIT} --server ${CTN_SERVER} --http --token ${CTN_TOKEN}" >/dev/null 2>&1
+}
+
+box_ready() {
+	local name="$1"
+	local state
+	state=$(pod_exec "containarium get ${name} --format json --server ${CTN_SERVER} --http --token ${CTN_TOKEN} 2>/dev/null" |
+		jq -r --arg n "$name" '.containers[] | select(.Username==$n) | .State' 2>/dev/null || true)
+	[[ "$state" == "CONTAINER_STATE_RUNNING" ]]
+}
+
+cleanup_box() {
+	local name="$1"
+	pod_exec "containarium delete ${name} --force --server ${CTN_SERVER} --http --token ${CTN_TOKEN}" >/dev/null 2>&1 || true
+}
+
+resource_snapshot "before" "$RESULTS_FILE"
+{
+	echo "profile: cpu ${LXC_CPU_LIMIT}, mem ${INCUS_MEM_LIMIT} (Incus native, single ceiling, same profile as scenario 3)"
+	echo "backend: nested Incus inside one k8s pod (issue #1565) — Kubernetes only ever admits the pod's own declared request/limit"
+	echo
+} >>"$RESULTS_FILE"
+
+run_density_loop "sbdnip" create_box box_ready cleanup_box "$RESULTS_FILE" "$START_INDEX"
+
+resource_snapshot "after (${DENSITY_RESULT_COUNT} ready)" "$RESULTS_FILE"
+{
+	echo "containarium list totals (inside the pod):"
+	echo '```'
+	pod_exec "containarium list --server ${CTN_SERVER} --http --token ${CTN_TOKEN} 2>&1 | tail -5" || true
+	echo '```'
+	echo "pod's own declared request/limit (the one number k8s admitted for everything inside it):"
+	echo '```'
+	ssh_or_local "kubectl get pod ${POD_NAME} -o jsonpath='{.spec.containers[0].resources}'" || true
+	echo '```'
+} >>"$RESULTS_FILE"
+
+log "nested-Incus-pod fourth-scenario result: ${DENSITY_RESULT_COUNT} boxes reached RUNNING"
+log "full log: ${RESULTS_FILE}"

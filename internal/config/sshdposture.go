@@ -17,3 +17,22 @@ const EnvSSHDPostureIntervalMinutes = "CONTAINARIUM_SSHD_POSTURE_INTERVAL_MINUTE
 // EnvSSHListenerCheckDisable turns off only the rogue SSH listener probe
 // (#2439), which costs one exec inside every running box per pass, while
 // leaving the sshd drop-in reconciler (#2424) running.
+const EnvSSHListenerCheckDisable = "CONTAINARIUM_SSH_LISTENER_CHECK_DISABLE"
+
+// SSHDPosture is the typed view of the CONTAINARIUM_SSHD_POSTURE_* namespace.
+type SSHDPosture struct {
+	Disabled bool
+	// ListenerCheckDisabled turns off the rogue SSH listener probe only.
+	ListenerCheckDisabled bool
+	// Interval is zero when the operator set no override.
+	Interval time.Duration
+}
+
+// LoadSSHDPosture reads the CONTAINARIUM_SSHD_POSTURE_* namespace once.
+func LoadSSHDPosture() SSHDPosture {
+	return SSHDPosture{
+		Disabled:              getBool(EnvSSHDPostureDisable),
+		ListenerCheckDisabled: getBool(EnvSSHListenerCheckDisable),
+		Interval:              time.Duration(getInt(EnvSSHDPostureIntervalMinutes, 0)) * time.Minute,
+	}
+}
