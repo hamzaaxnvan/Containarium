@@ -27,3 +27,62 @@ tunnel clients take with --sentinel-pin:
 
 The identity is created by the sentinel on its first start (see
 --tunnel-tls-identity on 'containarium sentinel'). This command only reads it:
+when the file does not exist yet it fails instead of creating one. The pin is
+public; distribute it to every tunnel client of this sentinel.`,
+	Example: `  # On the sentinel host
+  containarium sentinel tunnel-identity
+
+  # Identity kept somewhere other than the default path
+  containarium sentinel tunnel-identity --tunnel-tls-identity /path/to/identity.pem`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		return printTunnelIdentityPin(cmd.OutOrStdout(), sentinelTunnelIdentityPath)
+	},
+}
+
+func init() {
+	sentinelCmd.AddCommand(sentinelTunnelIdentityCmd)
+	sentinelTunnelIdentityCmd.Flags().StringVar(&sentinelTunnelIdentityPath, "tunnel-tls-identity", sentinel.DefaultTunnelIdentityPath, "Path of the sentinel's tunnel identity file")
+}
+
+// printTunnelIdentityPin loads the identity at path and writes its pin as a
+// single line. It never creates the file.
+func printTunnelIdentityPin(out io.Writer, path string) error {
+	id, err := sentinel.LoadTunnelIdentity(path)
+	if err != nil {
+		return fmt.Errorf("load tunnel identity (the sentinel creates it on first start): %w", err)
+	}
+	_, err = fmt.Fprintln(out, id.Pin())
+	return err
+}
+
+// checkDeprecatedCleartextFlag keeps the removed --tunnel-allow-cleartext
+// flag parseable so existing service units still start: false is a no-op,
+// true is refused because cleartext tunnel sessions are no longer supported.
+func checkDeprecatedCleartextFlag(allowCleartext bool) error {
+	if allowCleartext {
+		return fmt.Errorf("--tunnel-allow-cleartext=true is no longer supported: tunnel sessions always require TLS; upgrade the tunnel clients, give them --sentinel-pin, and remove the flag")
+	}
+	return nil
+}
+
+// configureTunnelTransport loads the tunnel identity at identityPath, or
+// generates and saves it on first start, and installs it on ts. The pin is
+// logged on every start so operators can read it from the service log as
+// well as from 'sentinel tunnel-identity'.
+func configureTunnelTransport(ts *sentinel.TunnelServer, identityPath string) (sentinel.TunnelPin, error) {
+	id, generated, err := sentinel.LoadOrGenerateTunnelIdentity(identityPath)
+	if err != nil {
+		return "", fmt.Errorf("tunnel identity: %w", err)
+	}
+	ts.SetTunnelIdentity(id)
+
+	pin := id.Pin()
+	if generated {
+		log.Printf("[sentinel] generated tunnel identity at %s; pin %s", identityPath, pin)
+	} else {
+		log.Printf("[sentinel] loaded tunnel identity from %s; pin %s", identityPath, pin)
+	}
+	log.Printf("[sentinel] tunnel transport: TLS only, cleartext sessions refused")
+	return pin, nil
+}
