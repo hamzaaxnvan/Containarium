@@ -122,3 +122,45 @@ func (s *ContainerServer) collaboratorAccessor() collaboratorAccess {
 	}
 	if s.collaboratorManager != nil {
 		return s.collaboratorManager
+	}
+	return nil
+}
+
+// cloudSessionTerminator hands cloud TERMINATE_USER_SESSIONS assignments to
+// EndUserSessions. In managed mode the assignment's user_id is the control
+// plane's user id (#2602): it is resolved to the local logins recorded on
+// earlier managed AuthorizeSSH ALLOWs, each walked as its self-host user
+// (sshauthz.UserIDForLogin). An id with no record falls back to the
+// self-host rule when it is itself a known local user (a walk that finds
+// one of its boxes); otherwise it is cloud.ErrUserNotMapped.
+type cloudSessionTerminator struct {
+	s   *ContainerServer
+	ids *sshauthz.ManagedIdentities
+}
+
+func (t cloudSessionTerminator) TerminateUserSessions(ctx context.Context, userID, orgID string) error {
+	logins := t.ids.Logins(userID)
+	if len(logins) == 0 {
+		if !container.IsValidAccountName(userID) || strings.Contains(userID, "-container-") {
+			return fmt.Errorf("%w: %q", cloud.ErrUserNotMapped, userID)
+		}
+		resp, err := t.s.EndUserSessions(ctx, userID, orgID)
+		if err == nil && resp.GetBoxesTouched() == 0 {
+			return fmt.Errorf("%w: %q", cloud.ErrUserNotMapped, userID)
+		}
+		return err
+	}
+	var errs []error
+	walked := map[string]bool{}
+	for _, login := range logins {
+		local := sshauthz.UserIDForLogin(login)
+		if walked[local] {
+			continue
+		}
+		walked[local] = true
+		if _, err := t.s.EndUserSessions(ctx, local, orgID); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}

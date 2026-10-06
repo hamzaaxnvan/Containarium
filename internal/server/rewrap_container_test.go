@@ -100,3 +100,106 @@ func TestRewrapContainer_AFailedRewrapLeavesTheOldKeyRecorded(t *testing.T) {
 
 // The new key must be resolvable BEFORE anything is rotated. Rewrapping onto
 // a key the daemon cannot fetch again would destroy access to the data on
+// the next start.
+func TestRewrapContainer_RefusesAKeyItCannotResolve(t *testing.T) {
+	z := newZFSFake()
+	p := &fakeKeyProvider{key: aKey(t), loadErr: errors.New("no such key")}
+	s, refs, _ := rewrapServer(t, z, p)
+
+	_, err := s.RewrapContainer(adminCtx(), &pb.RewrapContainerRequest{
+		Username:  "alice",
+		NewKeyRef: refJSON(t, "/keys/missing.key"),
+	})
+	if err == nil {
+		t.Fatal("rotated onto a key the daemon cannot resolve — the data becomes unreachable at " +
+			"the next start, which is indistinguishable from losing it")
+	}
+	if z.ran("change-key") {
+		t.Errorf("the dataset was rewrapped anyway; calls=%v", z.calls)
+	}
+	if got := refs.refs["alice-container"].URI; got != "/keys/alice.key" {
+		t.Errorf("the recorded ref changed to %q despite the failure", got)
+	}
+}
+
+func TestRewrapContainer_RefusesAnUnencryptedContainer(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	s := &ContainerServer{encryption: testHooksWith(t, z, p,
+		&fakeRefStore{refs: map[string]zfskey.KeyRef{}}, newFakePools())}
+
+	_, err := s.RewrapContainer(adminCtx(), &pb.RewrapContainerRequest{
+		Username: "bob", NewKeyRef: refJSON(t, "/keys/bob.key"),
+	})
+	if err == nil {
+		t.Fatal("rotated a key for a container that has none")
+	}
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", got)
+	}
+}
+
+func TestRewrapContainer_RejectsAMalformedRef(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	s, _, _ := rewrapServer(t, z, p)
+
+	_, err := s.RewrapContainer(adminCtx(), &pb.RewrapContainerRequest{
+		Username: "alice", NewKeyRef: "{not json",
+	})
+	if err == nil {
+		t.Fatal("a malformed key ref was accepted")
+	}
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument", got)
+	}
+}
+
+// Rotation is an infrastructure operation on a tenant's key custody, not a
+// tenant operation — same gate as MoveContainer.
+func TestRewrapContainer_RequiresAdmin(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	s, _, _ := rewrapServer(t, z, p)
+
+	_, err := s.RewrapContainer(
+		tenantWithScopes("alice", auth.ScopeContainersWrite),
+		&pb.RewrapContainerRequest{Username: "alice", NewKeyRef: refJSON(t, "/k")})
+	if err == nil {
+		t.Fatal("a non-admin rotated a tenant's encryption key")
+	}
+	if got := status.Code(err); got != codes.PermissionDenied {
+		t.Errorf("code = %v, want PermissionDenied", got)
+	}
+}
+
+// The response has to name the blast radius. A caller who thinks they
+// rotated one container's key, when they rotated their whole tenant's, will
+// schedule the next maintenance window wrongly.
+func TestRewrapContainer_SaysRotationCoversTheWholeTenant(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	s, refs, _ := rewrapServer(t, z, p)
+	// A second container for the same tenant, on the same pool.
+	refs.refs["alice-two"] = zfskey.KeyRef{Scheme: zfskey.SchemeFile, URI: "/keys/alice.key",
+		Metadata: map[string]string{"tenant": "alice"}}
+	refs.pools["alice-two"] = "containarium-tenant-alice"
+
+	resp, err := s.RewrapContainer(adminCtx(), &pb.RewrapContainerRequest{
+		Username: "alice", NewKeyRef: refJSON(t, "/keys/alice-v2.key"),
+	})
+	if err != nil {
+		t.Fatalf("RewrapContainer: %v", err)
+	}
+
+	if len(resp.RewrappedContainers) < 2 {
+		t.Errorf("reported %v — the tenant's other container shares this encryptionroot and is "+
+			"equally affected; a caller reading this list decides their maintenance window from it",
+			resp.RewrappedContainers)
+	}
+	if !strings.Contains(resp.Message, "tenant") {
+		t.Errorf("the message does not say rotation is tenant-wide: %q", resp.Message)
+	}
+	// And every one of them must now resolve the new key.
+	for _, name := range []string{"alice-container", "alice-two"} {
+		if got := refs.refs[name].URI; got != "/keys/alice-v2.key" {
+			t.Errorf("%s still records %q — it would try the retired key on its next start", name, got)
+		}
+	}
+}
