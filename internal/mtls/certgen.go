@@ -211,3 +211,57 @@ func GenerateWithExistingCA(caPath, caKeyPath string, opts GenerateOptions) erro
 			caCert,
 			caKey,
 			now,
+			now.Add(opts.Duration),
+			certsgen.WithOrganizations(opts.Organization),
+		)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to generate certificates: %w", err)
+	}
+
+	// Get cert paths
+	paths := CertPathsFromDir(opts.OutputDir)
+
+	// Write server certificate and key
+	if err := os.WriteFile(paths.ServerCert, credentials.ServerCert.Bytes(), 0644); err != nil {
+		return fmt.Errorf("failed to write server cert: %w", err)
+	}
+	if err := os.WriteFile(paths.ServerKey, credentials.ServerKey.Bytes(), 0600); err != nil {
+		return fmt.Errorf("failed to write server key: %w", err)
+	}
+
+	// Write client certificate and key
+	if err := os.WriteFile(paths.ClientCert, credentials.ClientCert.Bytes(), 0644); err != nil {
+		return fmt.Errorf("failed to write client cert: %w", err)
+	}
+	if err := os.WriteFile(paths.ClientKey, credentials.ClientKey.Bytes(), 0600); err != nil {
+		return fmt.Errorf("failed to write client key: %w", err)
+	}
+
+	// Copy CA cert to output directory (not the key for security)
+	if err := os.WriteFile(paths.CACert, caCert, 0644); err != nil { //nolint:gosec // G306: CA cert is public by design; only the private key is mode-restricted
+		return fmt.Errorf("failed to copy CA cert: %w", err)
+	}
+
+	return nil
+}
+
+// CertsExist checks if all required certificates exist
+func CertsExist(paths CertPaths) bool {
+	files := []string{
+		paths.CACert,
+		paths.ServerCert,
+		paths.ServerKey,
+		paths.ClientCert,
+		paths.ClientKey,
+	}
+
+	for _, f := range files {
+		if _, err := os.Stat(f); os.IsNotExist(err) {
+			return false
+		}
+	}
+
+	return true
+}

@@ -193,3 +193,296 @@ func TestHandleToolsCallInvalidParams(t *testing.T) {
 			params: map[string]interface{}{"name": 123, "arguments": map[string]interface{}{}},
 		},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &MCPRequest{
+				JSONRPC: "2.0",
+				ID:      4,
+				Method:  "tools/call",
+				Params:  tt.params,
+			}
+
+			resp := server.handleRequest(req)
+
+			assert.NotNil(t, resp.Error)
+			assert.Equal(t, -32602, resp.Error.Code)
+		})
+	}
+}
+
+// TestHandleToolsCallToolNotFound tests tool not found error
+func TestHandleToolsCallToolNotFound(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	req := &MCPRequest{
+		JSONRPC: "2.0",
+		ID:      5,
+		Method:  "tools/call",
+		Params: map[string]interface{}{
+			"name":      "nonexistent_tool",
+			"arguments": map[string]interface{}{},
+		},
+	}
+
+	resp := server.handleRequest(req)
+
+	assert.NotNil(t, resp.Error)
+	assert.Equal(t, -32602, resp.Error.Code)
+	assert.Contains(t, resp.Error.Data, "not found")
+}
+
+// TestHandleToolsCallSurfacesHandlerError verifies that when a tool's
+// handler returns an error, the error string lands in JSON-RPC `message`
+// (not only in `data`). MCP clients vary on which field they render;
+// putting the diagnostic in `message` ensures every client sees it.
+func TestHandleToolsCallSurfacesHandlerError(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	// Replace one tool's handler with a deterministic failure so we can
+	// assert on the surfaced message.
+	const sentinel = "ssh key not readable at ~/.containarium/keys/voice-dev"
+	for i := range server.tools {
+		if server.tools[i].Name == "push" {
+			server.tools[i].Handler = func(_ API, _ map[string]interface{}) (string, error) {
+				return "", errors.New(sentinel)
+			}
+			break
+		}
+	}
+
+	req := &MCPRequest{
+		JSONRPC: "2.0",
+		ID:      7,
+		Method:  "tools/call",
+		Params: map[string]interface{}{
+			"name":      "push",
+			"arguments": map[string]interface{}{"username": "voice-dev"},
+		},
+	}
+	resp := server.handleRequest(req)
+
+	require.NotNil(t, resp.Error)
+	assert.Equal(t, -32603, resp.Error.Code)
+	// The real diagnostic must appear in `message`, not only `data`.
+	assert.Contains(t, resp.Error.Message, sentinel,
+		"error message must include the underlying error for clients that only render `message`")
+	// `data` should still carry it too (for clients that render both).
+	assert.Contains(t, resp.Error.Data, sentinel)
+}
+
+// TestErrorResponse tests error response creation
+func TestErrorResponse(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	req := &MCPRequest{
+		JSONRPC: "2.0",
+		ID:      6,
+		Method:  "test",
+	}
+
+	resp := server.createErrorResponse(req.ID, -32603, "Test error", "Test data")
+
+	assert.Equal(t, "2.0", resp.JSONRPC)
+	assert.Equal(t, 6, resp.ID)
+	assert.NotNil(t, resp.Error)
+	assert.Equal(t, -32603, resp.Error.Code)
+	assert.Equal(t, "Test error", resp.Error.Message)
+	assert.Equal(t, "Test data", resp.Error.Data)
+}
+
+// TestToolInputSchemas tests that all tools have valid input schemas
+func TestToolInputSchemas(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	for _, tool := range server.tools {
+		t.Run(tool.Name, func(t *testing.T) {
+			// Check schema exists
+			assert.NotNil(t, tool.InputSchema)
+
+			// Check schema is valid JSON Schema
+			schema := tool.InputSchema
+			assert.Equal(t, "object", schema["type"])
+			assert.NotNil(t, schema["properties"])
+
+			// Marshal to JSON to verify it's valid
+			schemaJSON, err := json.Marshal(schema)
+			require.NoError(t, err)
+			assert.NotEmpty(t, schemaJSON)
+
+			// Unmarshal back to verify structure
+			var schemaCheck map[string]interface{}
+			err = json.Unmarshal(schemaJSON, &schemaCheck)
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestToolDescriptions tests that all tools have descriptions
+func TestToolDescriptions(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	for _, tool := range server.tools {
+		t.Run(tool.Name, func(t *testing.T) {
+			assert.NotEmpty(t, tool.Name, "Tool name should not be empty")
+			assert.NotEmpty(t, tool.Description, "Tool description should not be empty")
+			assert.NotNil(t, tool.Handler, "Tool handler should not be nil")
+
+			// Description should be reasonable length. Generous upper
+			// bound — multi-step workflow descriptions (see
+			// create_container, expose_port) are valuable for agents
+			// and run >500 chars by design.
+			assert.Greater(t, len(tool.Description), 10, "Description should be descriptive")
+			assert.Less(t, len(tool.Description), 3000, "Description should be concise")
+		})
+	}
+}
+
+// TestJSONRPCCompliance tests JSON-RPC 2.0 compliance
+func TestJSONRPCCompliance(t *testing.T) {
+	config := &Config{
+		ServerURL: "http://localhost:8080",
+		JWTToken:  "test-token",
+	}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name    string
+		request *MCPRequest
+		checkFn func(*testing.T, *MCPResponse)
+	}{
+		{
+			name: "response has jsonrpc field",
+			request: &MCPRequest{
+				JSONRPC: "2.0",
+				ID:      1,
+				Method:  "initialize",
+			},
+			checkFn: func(t *testing.T, resp *MCPResponse) {
+				assert.Equal(t, "2.0", resp.JSONRPC)
+			},
+		},
+		{
+			name: "response has matching id",
+			request: &MCPRequest{
+				JSONRPC: "2.0",
+				ID:      42,
+				Method:  "tools/list",
+			},
+			checkFn: func(t *testing.T, resp *MCPResponse) {
+				assert.Equal(t, 42, resp.ID)
+			},
+		},
+		{
+			name: "success response has result field",
+			request: &MCPRequest{
+				JSONRPC: "2.0",
+				ID:      1,
+				Method:  "initialize",
+			},
+			checkFn: func(t *testing.T, resp *MCPResponse) {
+				assert.NotNil(t, resp.Result)
+				assert.Nil(t, resp.Error)
+			},
+		},
+		{
+			name: "error response has error field",
+			request: &MCPRequest{
+				JSONRPC: "2.0",
+				ID:      1,
+				Method:  "invalid/method",
+			},
+			checkFn: func(t *testing.T, resp *MCPResponse) {
+				assert.Nil(t, resp.Result)
+				assert.NotNil(t, resp.Error)
+				assert.NotEmpty(t, resp.Error.Message)
+				assert.NotZero(t, resp.Error.Code)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := server.handleRequest(tt.request)
+			tt.checkFn(t, resp)
+		})
+	}
+}
+
+// TestConfigValidation tests configuration validation
+func TestConfigValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		config    *Config
+		shouldErr bool
+	}{
+		{
+			name: "valid config",
+			config: &Config{
+				ServerURL: "http://localhost:8080",
+				JWTToken:  "token",
+			},
+			shouldErr: false,
+		},
+		{
+			name: "empty server URL is accepted by NewServer (validation at runtime)",
+			config: &Config{
+				ServerURL: "",
+				JWTToken:  "token",
+			},
+			shouldErr: false, // NewServer doesn't validate yet
+		},
+		{
+			name: "empty JWT token is accepted by NewServer (validation at runtime)",
+			config: &Config{
+				ServerURL: "http://localhost:8080",
+				JWTToken:  "",
+			},
+			shouldErr: false, // NewServer doesn't validate yet
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, err := NewServer(tt.config)
+			if tt.shouldErr {
+				assert.Error(t, err)
+				assert.Nil(t, server)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, server)
+			}
+		})
+	}
+}
