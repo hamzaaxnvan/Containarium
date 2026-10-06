@@ -82,3 +82,87 @@ func TestReadFile_FollowsSymlinkToRelativeTarget(t *testing.T) {
 	// A relative target resolves against the symlink's own directory.
 	f := &fakeFileServer{
 		files:    map[string]string{"/var/lib/rancher/k3s/server/token": fullToken},
+		symlinks: map[string]string{"/var/lib/rancher/k3s/server/node-token": "token"},
+	}
+	c := &Client{server: f}
+
+	got, err := c.ReadFile("cp", "/var/lib/rancher/k3s/server/node-token")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != fullToken {
+		t.Errorf("ReadFile returned %q, want %q", got, fullToken)
+	}
+}
+
+func TestReadFile_SymlinkChainResolves(t *testing.T) {
+	f := &fakeFileServer{
+		files: map[string]string{"/data/real": "payload"},
+		symlinks: map[string]string{
+			"/a": "/b",
+			"/b": "/data/real",
+		},
+	}
+	c := &Client{server: f}
+
+	got, err := c.ReadFile("cp", "/a")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != "payload" {
+		t.Errorf("ReadFile returned %q, want %q", got, "payload")
+	}
+}
+
+func TestReadFile_SymlinkLoopErrors(t *testing.T) {
+	f := &fakeFileServer{
+		symlinks: map[string]string{
+			"/a": "/b",
+			"/b": "/a",
+		},
+	}
+	c := &Client{server: f}
+
+	_, err := c.ReadFile("cp", "/a")
+	if err == nil {
+		t.Fatal("ReadFile on a symlink loop returned nil error, want a bounded failure")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("error %q does not name the symlink loop", err)
+	}
+}
+
+func TestReadFile_RegularFileBytesAreExact(t *testing.T) {
+	// Guard against any transformation of a regular file's bytes —
+	// trailing newline, interior newlines, and the token's own
+	// separators must all survive the round trip untouched.
+	content := "line1\nline2\n\ttrailing whitespace \nK10hash::server:pw\n"
+	f := &fakeFileServer{files: map[string]string{"/etc/some-file": content}}
+	c := &Client{server: f}
+
+	got, err := c.ReadFile("cp", "/etc/some-file")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("ReadFile returned %q, want byte-identical %q", got, content)
+	}
+	if len(f.reads) != 1 {
+		t.Errorf("regular file was read %d times, want 1 (%v)", len(f.reads), f.reads)
+	}
+}
+
+func TestReadFile_DirectoryErrorsInsteadOfPanicking(t *testing.T) {
+	// Incus returns a nil reader for directories; ReadFile must
+	// answer with an error, not a nil dereference.
+	f := &fakeFileServer{dirs: map[string]bool{"/etc": true}}
+	c := &Client{server: f}
+
+	_, err := c.ReadFile("cp", "/etc")
+	if err == nil {
+		t.Fatal("ReadFile on a directory returned nil error, want an error")
+	}
+	if !strings.Contains(err.Error(), "directory") {
+		t.Errorf("error %q does not say it is a directory", err)
+	}
+}
