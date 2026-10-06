@@ -395,3 +395,401 @@ func (c *sshHTTPClient) AddSSHKey(ctx context.Context, name, pub string) (*sshke
 		return nil, err
 	}
 	return &out.Key, nil
+}
+
+func (c *sshHTTPClient) ListSSHKeys(ctx context.Context) ([]sshkey.SSHKey, error) {
+	var out listSSHKeysResp
+	if err := c.doJSON(ctx, http.MethodGet, "/v1/user/ssh-keys", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Keys, nil
+}
+
+func (c *sshHTTPClient) RemoveSSHKey(ctx context.Context, name string) error {
+	// Name is path-segment safe (we validate at runSSHRemove) so we
+	// can inline it without url-escaping. Switch to url.PathEscape if
+	// we ever loosen the validator.
+	return c.doJSON(ctx, http.MethodDelete, "/v1/user/ssh-keys/"+name, nil, nil)
+}
+
+func (c *sshHTTPClient) PropagateSSHKeys(ctx context.Context, boxes []string) (*propagateResp, error) {
+	var out propagateResp
+	if err := c.doJSON(ctx, http.MethodPost, "/v1/user/ssh-keys:propagate", propagateReq{Boxes: boxes}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ---- command handlers --------------------------------------------------
+
+func runSSHRotate(cmd *cobra.Command, args []string) error {
+	srv := pickSSHServer(sshRotateServer)
+	name := sshRotateName
+	if name == "" {
+		name = defaultLocalKeyName()
+	}
+	if err := validateKeyName(name); err != nil {
+		return err
+	}
+	client, err := newSSHHTTPClient(srv)
+	if err != nil {
+		return err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(home, ".containarium", "ssh_config")
+	// #nosec G304 -- fixed config path under the user's home; no cloud input contributes to the path.
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read SSH config (run containarium ssh-config sync first): %w", err)
+	}
+	if _, err := sshconfig.RotateIdentity(string(content), "preflight"); err != nil {
+		return err
+	}
+	pubPath, pub, err := sshkey.GenerateFresh(sshkey.LocateOpts{HomeDir: home})
+	if err != nil {
+		return err
+	}
+	privatePath := strings.TrimSuffix(pubPath, ".pub")
+	g, err := sshconfig.RotateIdentity(string(content), privatePath)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Generated new Ed25519 key at %s\n", privatePath)
+	parent := cmd.Context()
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	var challenge sshKeyChallengeResp
+	err = client.doJSON(ctx, http.MethodPost, "/v1/user/ssh-keys:challenge", sshKeyChallengeReq{}, &challenge)
+	if isUnimplemented(err) {
+		return fmt.Errorf("SSH key rotation is not supported by %s: the challenge endpoint is unavailable; existing SSH config and old key are preserved: %w", srv, err)
+	}
+	if err != nil {
+		return fmt.Errorf("SSH key challenge: %w", err)
+	}
+	if challenge.ChallengeID == "" || len(challenge.Nonce) == 0 {
+		return fmt.Errorf("server returned an incomplete SSH key challenge")
+	}
+	signature, err := sshkey.SignChallenge(privatePath, challenge.Nonce)
+	if err != nil {
+		return err
+	}
+	var stored addSSHKeyResp
+	err = client.doJSON(ctx, http.MethodPost, "/v1/user/ssh-keys", addSSHKeyReq{Name: name, PublicKey: pub, KeyType: sshKeyTypeJSON(sshkey.ParseType(pub)), ChallengeID: challenge.ChallengeID, Signature: signature}, &stored)
+	if err != nil {
+		return fmt.Errorf("register rotation key: %w", err)
+	}
+	fp, err := sshkey.Fingerprint(pub)
+	if err != nil {
+		return err
+	}
+	if stored.Key.Fingerprint != fp {
+		return fmt.Errorf("registration response did not confirm the new fingerprint; existing SSH config is preserved and the new key remains at %s", privatePath)
+	}
+	if _, err := sshconfig.WriteConfig(path, g, false); err != nil {
+		return fmt.Errorf("new key registered at %s, but updating SSH config failed: %w", privatePath, err)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Registered SSH key %q (%s); updated %s\n", name, fp, path)
+	// Reading overlap metadata is best-effort after the new key is selected.
+	// Multiple older generations can share the name; use the latest retirement.
+	var overlapEnd time.Time
+	if keys, err := client.ListSSHKeys(ctx); err == nil {
+		for _, key := range keys {
+			if key.Name == name && key.Fingerprint != "" && key.Fingerprint != fp && key.RetiredAt != nil && key.RetiredAt.After(overlapEnd) {
+				overlapEnd = *key.RetiredAt
+			}
+		}
+	}
+	if overlapEnd.IsZero() {
+		fmt.Fprintln(cmd.OutOrStdout(), "Old keys are retained; overlap end is unknown.")
+	} else {
+		fmt.Fprintf(cmd.OutOrStdout(), "Old keys are retained; overlap ends at %s\n", overlapEnd.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+func runSSHSetup(cmd *cobra.Command, args []string) error {
+	out := cmd.OutOrStdout()
+	srv := pickSSHServer(sshSetupServer)
+	// FYI for token-access servers (cloud): registering an SSH key works, but
+	// it isn't needed — `containarium connect` uses the API token. We still
+	// proceed; the user ran `ssh setup` deliberately.
+	if accessModelFor(srv) == credentials.AccessModelToken {
+		fmt.Fprintf(out, "Note: %s uses token-based access — `containarium connect <box>` opens a shell with no SSH key.\n", srv)
+	}
+	name := sshSetupName
+	if name == "" {
+		name = defaultLocalKeyName()
+	}
+	if err := validateKeyName(name); err != nil {
+		return err
+	}
+
+	pub, source, generated, err := obtainLocalPublicKey()
+	if err != nil {
+		return err
+	}
+	fp, err := sshkey.Fingerprint(pub)
+	if err != nil {
+		return fmt.Errorf("fingerprint key: %w", err)
+	}
+
+	if generated {
+		fmt.Fprintf(out, "Generated new ed25519 keypair at %s\n", source)
+	} else {
+		fmt.Fprintf(out, "Using existing key at %s\n", source)
+	}
+	fmt.Fprintf(out, "  Fingerprint: %s\n", fp)
+	fmt.Fprintf(out, "  Registering as %q with %s\n", name, srv)
+
+	client, err := newSSHHTTPClient(srv)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	stored, err := client.AddSSHKey(ctx, name, pub)
+	if isUnimplemented(err) {
+		fmt.Fprintf(out, "\n⚠ SSH-key registration not yet supported by %s (UserService.AddSSHKey returned Unimplemented).\n", srv)
+		fmt.Fprintf(out, "  Your key is on disk at %s — once the cloud-side endpoint ships, re-run `containarium ssh setup`.\n", source)
+		return nil
+	}
+	if isAlreadyExists(err) {
+		// Re-registering the same key is a no-op, not a failure. This is the
+		// common case on a repeat `containarium login` from the same machine —
+		// report success so the post-login banner doesn't look like an error.
+		fmt.Fprintf(out, "✓ SSH key %q already registered with %s — nothing to do\n", name, srv)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("register key: %w", err)
+	}
+
+	fmt.Fprintf(out, "✓ Registered key %q (fingerprint %s)\n", stored.Name, stored.Fingerprint)
+	return nil
+}
+
+func runSSHList(cmd *cobra.Command, args []string) error {
+	out := cmd.OutOrStdout()
+	srv := pickSSHServer(sshListServer)
+	client, err := newSSHHTTPClient(srv)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	keys, err := client.ListSSHKeys(ctx)
+	if isUnimplemented(err) {
+		fmt.Fprintf(out, "⚠ Listing SSH keys not yet supported by %s (UserService.ListSSHKeys returned Unimplemented).\n", srv)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("list keys: %w", err)
+	}
+	if len(keys) == 0 {
+		fmt.Fprintln(out, "No SSH keys registered. Run `containarium ssh setup` to add one.")
+		return nil
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tFINGERPRINT\tCREATED")
+	for _, k := range keys {
+		created := "-"
+		if !k.CreatedAt.IsZero() {
+			created = k.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		fp := k.Fingerprint
+		if fp == "" && k.PublicKey != "" {
+			// Compute it locally if the server didn't include it
+			// — common against early/partial implementations.
+			if f, err := sshkey.Fingerprint(k.PublicKey); err == nil {
+				fp = f
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", k.Name, fp, created)
+	}
+	return tw.Flush()
+}
+
+func runSSHRemove(cmd *cobra.Command, args []string) error {
+	out := cmd.OutOrStdout()
+	name := args[0]
+	if err := validateKeyName(name); err != nil {
+		return err
+	}
+	srv := pickSSHServer(sshRemoveServer)
+	client, err := newSSHHTTPClient(srv)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err = client.RemoveSSHKey(ctx, name)
+	if isUnimplemented(err) {
+		fmt.Fprintf(out, "⚠ SSH-key removal not yet supported by %s (UserService.RemoveSSHKey returned Unimplemented).\n", srv)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("remove key %q: %w", name, err)
+	}
+	fmt.Fprintf(out, "✓ Removed SSH key %q from %s\n", name, srv)
+	fmt.Fprintln(out, "  (Existing boxes still have this key in authorized_keys — run `containarium ssh propagate` to push the removal.)")
+	return nil
+}
+
+func runSSHPropagate(cmd *cobra.Command, args []string) error {
+	out := cmd.OutOrStdout()
+	srv := pickSSHServer(sshPropagateServer)
+	for _, b := range sshPropagateBoxes {
+		if err := validateBoxName(b); err != nil {
+			return err
+		}
+	}
+	client, err := newSSHHTTPClient(srv)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	if len(sshPropagateBoxes) == 0 {
+		fmt.Fprintf(out, "Propagating keys to every owned box on %s ...\n", srv)
+	} else {
+		fmt.Fprintf(out, "Propagating keys to %d box(es) on %s ...\n", len(sshPropagateBoxes), srv)
+	}
+
+	res, err := client.PropagateSSHKeys(ctx, sshPropagateBoxes)
+	if isUnimplemented(err) {
+		fmt.Fprintf(out, "⚠ Key propagation not yet supported by %s.\n", srv)
+		fmt.Fprintln(out, "  UserService.PropagateSSHKeysToBoxes is a planned cloud-side RPC that")
+		fmt.Fprintln(out, "  hasn't shipped yet. New boxes still get the latest keys at create time;")
+		fmt.Fprintln(out, "  this command will Just Work once the cloud-side endpoint lands —")
+		fmt.Fprintln(out, "  re-run it then. See the PR that introduced `containarium ssh propagate`")
+		fmt.Fprintln(out, "  for the deferred follow-up.")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("propagate: %w", err)
+	}
+	fmt.Fprintf(out, "✓ Updated %d box(es)", len(res.UpdatedBoxes))
+	if len(res.SkippedBoxes) > 0 {
+		fmt.Fprintf(out, ", skipped %d", len(res.SkippedBoxes))
+	}
+	fmt.Fprintln(out)
+	for _, b := range res.UpdatedBoxes {
+		fmt.Fprintf(out, "  + %s\n", b)
+	}
+	for _, b := range res.SkippedBoxes {
+		fmt.Fprintf(out, "  - %s (skipped)\n", b)
+	}
+	return nil
+}
+
+// ---- helpers -----------------------------------------------------------
+
+// obtainLocalPublicKey runs the flag-precedence chain documented on
+// `ssh setup`: explicit --key wins; --generate forces creation; else
+// LocateOrGenerate. Returns (pubkeyContents, sourcePath, wasGenerated, err).
+func obtainLocalPublicKey() (string, string, bool, error) {
+	switch {
+	case sshSetupKeyPath != "":
+		pub, err := sshkey.ReadPublicKey(sshSetupKeyPath)
+		if err != nil {
+			return "", "", false, err
+		}
+		return pub, sshSetupKeyPath, false, nil
+
+	case sshSetupGenerate:
+		path, pub, err := sshkey.Generate(sshkey.LocateOpts{}, sshSetupForce)
+		if err != nil {
+			return "", "", false, fmt.Errorf("generate keypair: %w", err)
+		}
+		return pub, path, true, nil
+
+	default:
+		path, pub, generated, err := sshkey.LocateOrGenerate(sshkey.LocateOpts{})
+		if err != nil {
+			return "", "", false, fmt.Errorf("locate or generate keypair: %w", err)
+		}
+		return pub, path, generated, nil
+	}
+}
+
+// defaultLocalKeyName mirrors login.go's deviceName fallback so the
+// "Active sessions" UI and the "SSH keys" UI on the cloud read with
+// matching labels.
+func defaultLocalKeyName() string {
+	var who, host string
+	if u, err := user.Current(); err == nil {
+		who = u.Username
+	}
+	host, _ = os.Hostname()
+	return sshkey.DefaultKeyName(who, host)
+}
+
+// validateKeyName guards the friendly-name field against obviously
+// hostile input. The cloud-side will re-validate, but rejecting at
+// the CLI gives a clearer message — and validating before we put the
+// name into a URL path (for `ssh remove`) means we don't need
+// url.PathEscape.
+//
+// Rules (intentionally narrow):
+//   - non-empty after trim
+//   - 1..64 chars
+//   - alphanumerics, dash, underscore, dot, @
+//
+// Loosen the regex when a real user files a feature request — until
+// then this is the safe baseline.
+func validateKeyName(name string) error {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return fmt.Errorf("name is empty")
+	}
+	if len(n) > 64 {
+		return fmt.Errorf("name %q exceeds 64 characters", n)
+	}
+	for _, r := range n {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.', r == '@':
+			continue
+		default:
+			return fmt.Errorf("name %q contains disallowed character %q (allowed: alphanumerics, '-', '_', '.', '@')", n, r)
+		}
+	}
+	return nil
+}
+
+// validateBoxName is the same shape as validateKeyName but tighter
+// (no '@' or '.') because box names go into Linux usernames upstream.
+// Keep in sync with internal/server/create_bounds.go if it changes
+// there.
+func validateBoxName(name string) error {
+	n := strings.TrimSpace(name)
+	if n == "" {
+		return fmt.Errorf("box name is empty")
+	}
+	if len(n) > 32 {
+		return fmt.Errorf("box name %q exceeds 32 characters", n)
+	}
+	for _, r := range n {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= '0' && r <= '9',
+			r == '-', r == '_':
+			continue
+		default:
+			return fmt.Errorf("box name %q contains disallowed character %q (allowed: lowercase, digits, '-', '_')", n, r)
+		}
+	}
+	return nil
+}
