@@ -52,3 +52,22 @@ func TestGatewayOTLPSink_EmitsTokenCounters(t *testing.T) {
 						assertAttr(t, dp, "skill", "s1")
 						assertAttr(t, dp, "provider", "anthropic")
 						assertAttr(t, dp, "model", "claude-test")
+					}
+				}
+			}
+		}
+	}
+	for name, wantVal := range want {
+		if got[name] != wantVal {
+			t.Errorf("%s = %d, want %d", name, got[name], wantVal)
+		}
+	}
+}
+
+func assertAttr(t *testing.T, dp metricdata.DataPoint[int64], key, want string) {
+	t.Helper()
+	v, ok := dp.Attributes.Value(attribute.Key(key))
+	if !ok || v.AsString() != want {
+		t.Errorf("attribute %s = %q (present=%v), want %q", key, v.AsString(), ok, want)
+	}
+}
