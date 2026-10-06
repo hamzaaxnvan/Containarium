@@ -139,3 +139,50 @@ func (cr *ConsoleRouter) handleConnection(conn net.Conn) {
 		cr.reject(conn, "unauthorized")
 		return
 	}
+	if hs.SpotID == "" {
+		cr.reject(conn, "spot_id is required")
+		return
+	}
+	if hs.Port <= 0 || hs.Port > 65535 {
+		cr.reject(conn, "a valid port is required")
+		return
+	}
+
+	stream, err := cr.registry.DialTunnel(hs.SpotID, hs.Port)
+	if err != nil {
+		log.Printf("[console-router] dial failed for %s (spot=%q port=%d): %v", remoteAddr, hs.SpotID, hs.Port, err)
+		cr.reject(conn, err.Error())
+		return
+	}
+	defer func() { _ = stream.Close() }()
+
+	_ = conn.SetDeadline(time.Time{})
+	if err := json.NewEncoder(conn).Encode(ConsoleRouterResponse{OK: true}); err != nil {
+		return
+	}
+
+	log.Printf("[console-router] routing %s to spot=%q port=%d", remoteAddr, hs.SpotID, hs.Port)
+	relayConsole(conn, stream)
+}
+
+func (cr *ConsoleRouter) reject(conn net.Conn, reason string) {
+	_ = json.NewEncoder(conn).Encode(ConsoleRouterResponse{OK: false, Error: reason})
+}
+
+// relayConsole bidirectionally copies bytes between a and b until either
+// side's copy finishes, then returns. Matches the tunnel client's own
+// bidirectional-copy shape (internal/sentinel/tunnel_client.go); named
+// distinctly from any helper in this file's neighbors since it is a
+// package-level function other sentinel code may already shadow.
+func relayConsole(a, b io.ReadWriteCloser) {
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(a, b)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(b, a)
+		done <- struct{}{}
+	}()
+	<-done
+}
