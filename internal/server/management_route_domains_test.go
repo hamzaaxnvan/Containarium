@@ -18,3 +18,43 @@ func TestManagementRouteDomains(t *testing.T) {
 		{
 			name: "single base domain (unchanged behavior)",
 			cfg:  &DualServerConfig{BaseDomain: "example.org"},
+			want: []string{"example.org"},
+		},
+		{
+			name: "multiple public base domains take precedence",
+			cfg: &DualServerConfig{
+				BaseDomain:        "example.org",
+				PublicBaseDomains: []string{"lab.example.com", "demo.example.org"},
+			},
+			want: []string{"lab.example.com", "demo.example.org"},
+		},
+		{
+			name: "public base domains without a base domain",
+			cfg:  &DualServerConfig{PublicBaseDomains: []string{"a.com"}},
+			want: []string{"a.com"},
+		},
+		{
+			name: "nothing configured → no routes",
+			cfg:  &DualServerConfig{},
+			want: nil,
+		},
+		{
+			name: "nil config → no routes",
+			cfg:  nil,
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := managementRouteDomains(tt.cfg)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("domain[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
