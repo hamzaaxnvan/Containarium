@@ -183,3 +183,188 @@ func TestGenerate_NoArgvOrEnvRecorded(t *testing.T) {
 	}
 	for _, needle := range []string{run, "hunter2-env-value", "TestOnlyThis", "env-marker-value-7f3a"} {
 		if bytes.Contains(wire, []byte(needle)) || bytes.Contains(js, []byte(needle)) {
+			t.Errorf("pack contains %q", needle)
+		}
+	}
+	// The environment is not forwarded to the box either: every exec is the
+	// fixed wrapper plus positional args.
+	for _, argv := range box.argv {
+		if strings.Contains(strings.Join(argv, " "), "env-marker-value-7f3a") {
+			t.Errorf("exec argv carries the daemon's environment: %q", argv)
+		}
+	}
+}
+
+func TestGenerate_TruncatedLogKeepsTail(t *testing.T) {
+	tail := strings.Repeat("x", LogLimitBytes-4) + "FAIL"
+	box := &fakeBox{
+		declaration: strp("test: make check\n"),
+		steps:       map[string]fakeResult{"make check": {log: tail, exit: 2, size: 5 * LogLimitBytes}},
+	}
+	pack, err := Generate(context.Background(), box, "b", Options{Now: fixedClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := pack.GetSteps()[0]
+	if s.GetName() != "test" || s.GetKind() != pb.ProofPartKind_PROOF_PART_KIND_TEST {
+		t.Errorf("string-form step = %q/%v, want test/TEST", s.GetName(), s.GetKind())
+	}
+	if !s.GetLogTruncated() || s.GetLogOriginalBytes() != 5*LogLimitBytes {
+		t.Errorf("truncated=%v original=%d", s.GetLogTruncated(), s.GetLogOriginalBytes())
+	}
+	if len(s.GetLog()) != LogLimitBytes || !bytes.HasSuffix(s.GetLog(), []byte("FAIL")) {
+		t.Errorf("log len=%d, want the last %d bytes", len(s.GetLog()), LogLimitBytes)
+	}
+	if s.GetLogSha256() != LogDigest(s.GetLog()) {
+		t.Errorf("digest is not over the stored (truncated) bytes")
+	}
+	if pack.GetLogLimitBytes() != LogLimitBytes {
+		t.Errorf("log_limit_bytes = %d", pack.GetLogLimitBytes())
+	}
+}
+
+func TestGenerate_FallbackAndNone(t *testing.T) {
+	t.Run("no declaration, Makefile -> make test", func(t *testing.T) {
+		box := &fakeBox{makefile: true, steps: map[string]fakeResult{"make test": {log: "PASS\n"}}}
+		pack, err := Generate(context.Background(), box, "b", Options{Now: fixedClock()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pack.GetCommandSource() != pb.ProofCommandSource_PROOF_COMMAND_SOURCE_FALLBACK_MAKE_TEST {
+			t.Errorf("source = %v", pack.GetCommandSource())
+		}
+		if pack.GetStatus() != pb.ProofPackStatus_PROOF_PACK_STATUS_PASSED || pack.GetSteps()[0].GetName() != "make-test" {
+			t.Errorf("status=%v step=%q", pack.GetStatus(), pack.GetSteps()[0].GetName())
+		}
+		if pack.GetDeclarationSha256() != "" {
+			t.Errorf("declaration_sha256 set without a declaration")
+		}
+	})
+	t.Run("declaration without test key, Makefile -> make test", func(t *testing.T) {
+		box := &fakeBox{declaration: strp("other_feature: true\n"), makefile: true,
+			steps: map[string]fakeResult{"make test": {log: "PASS\n"}}}
+		pack, err := Generate(context.Background(), box, "b", Options{Now: fixedClock()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pack.GetCommandSource() != pb.ProofCommandSource_PROOF_COMMAND_SOURCE_FALLBACK_MAKE_TEST {
+			t.Errorf("source = %v", pack.GetCommandSource())
+		}
+	})
+	t.Run("nothing to run -> NO_COMMANDS", func(t *testing.T) {
+		box := &fakeBox{}
+		pack, err := Generate(context.Background(), box, "b", Options{Now: fixedClock()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pack.GetStatus() != pb.ProofPackStatus_PROOF_PACK_STATUS_NO_COMMANDS ||
+			pack.GetCommandSource() != pb.ProofCommandSource_PROOF_COMMAND_SOURCE_NONE ||
+			len(pack.GetSteps()) != 0 || len(box.ran) != 0 {
+			t.Errorf("status=%v source=%v steps=%d ran=%v", pack.GetStatus(), pack.GetCommandSource(), len(pack.GetSteps()), box.ran)
+		}
+	})
+}
+
+func TestGenerate_Refusals(t *testing.T) {
+	if _, err := Generate(context.Background(), &fakeBox{missingDir: true}, "b", Options{}); err == nil ||
+		!strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("missing repo dir: err = %v", err)
+	}
+	bad := &fakeBox{declaration: strp("test:\n  - name: unit\n    kind: fuzz\n    run: x\n")}
+	if _, err := Generate(context.Background(), bad, "b", Options{}); err == nil || !strings.Contains(err.Error(), "unknown kind") {
+		t.Errorf("bad declaration: err = %v", err)
+	}
+	null := &fakeBox{declaration: strp("test:\n"), makefile: true, steps: map[string]fakeResult{"make test": {}}}
+	if _, err := Generate(context.Background(), null, "b", Options{}); err == nil || len(null.ran) != 0 {
+		t.Errorf("null test: key: err=%v ran=%v, want an error and no fallback", err, null.ran)
+	}
+	big := &fakeBox{declaration: strp(strings.Repeat("#", MaxDeclarationBytes+1))}
+	if _, err := Generate(context.Background(), big, "b", Options{}); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("oversized declaration: err = %v", err)
+	}
+	if _, err := Generate(context.Background(), &fakeBox{}, "", Options{}); err == nil {
+		t.Errorf("empty box name accepted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	box := &fakeBox{makefile: true, steps: map[string]fakeResult{"make test": {}}}
+	if _, err := Generate(ctx, box, "b", Options{}); !errors.Is(err, context.Canceled) || len(box.ran) != 0 {
+		t.Errorf("cancelled ctx: err=%v ran=%v", err, box.ran)
+	}
+}
+
+// A wrapper failure (stderr is not the size line) is an error, not a step
+// outcome: the pack must not record "exit 97" as if the tests had run.
+func TestGenerate_WrapperFailureIsError(t *testing.T) {
+	box := &wrapperFailBox{}
+	if _, err := Generate(context.Background(), box, "b", Options{}); err == nil || !strings.Contains(err.Error(), "could not run") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+type wrapperFailBox struct{}
+
+func (wrapperFailBox) ExecWithExitCode(_ string, argv []string) (string, string, int, error) {
+	if argv[3] == "proofpack-probe" {
+		return "", "", 12, nil
+	}
+	if argv[0] == "git" {
+		return "", "", 128, nil
+	}
+	return "", "mktemp: failed to create file\n", 98, nil
+}
+
+func TestPartDigests(t *testing.T) {
+	box := &fakeBox{makefile: true, steps: map[string]fakeResult{"make test": {log: "PASS\n"}}}
+	pack, err := Generate(context.Background(), box, "b", Options{Now: fixedClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1, err := PackDigest(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Round-trip through the wire format: the digest is a function of the
+	// content, not of the in-memory value.
+	wire, err := proto.Marshal(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back pb.ProofPack
+	if err := proto.Unmarshal(wire, &back); err != nil {
+		t.Fatal(err)
+	}
+	if d2, _ := PackDigest(&back); d2 != d1 {
+		t.Errorf("PackDigest not stable across a round trip: %s vs %s", d1, d2)
+	}
+
+	back.Steps[0].Log[0] ^= 1
+	err = CheckPartDigests(&back)
+	if err == nil || !strings.Contains(err.Error(), `"make-test"`) {
+		t.Errorf("tampered log: err = %v, want it to name the step", err)
+	}
+	if d3, _ := PackDigest(&back); d3 == d1 {
+		t.Errorf("PackDigest did not change after a log byte changed")
+	}
+}
+
+// A box without `timeout` can still report that there is nothing to run;
+// it is an error only when a step would have to be bounded.
+func TestGenerate_MissingTimeoutOnlyMattersWhenAStepRuns(t *testing.T) {
+	box := &fakeBox{noTimeout: true}
+	pack, err := Generate(context.Background(), box, "b", Options{Now: fixedClock()})
+	if err != nil {
+		t.Fatalf("no commands and no timeout: %v", err)
+	}
+	if pack.GetStatus() != pb.ProofPackStatus_PROOF_PACK_STATUS_NO_COMMANDS {
+		t.Errorf("status = %v", pack.GetStatus())
+	}
+	for name, b := range map[string]*fakeBox{
+		"fallback": {noTimeout: true, makefile: true, steps: map[string]fakeResult{"make test": {}}},
+		"declared": {noTimeout: true, declaration: strp("test: x\n"), steps: map[string]fakeResult{"x": {}}},
+	} {
+		if _, err := Generate(context.Background(), b, "b", Options{}); err == nil || !strings.Contains(err.Error(), "timeout") || len(b.ran) != 0 {
+			t.Errorf("%s: err=%v ran=%v, want a timeout error and nothing run", name, err, b.ran)
+		}
+	}
+}
