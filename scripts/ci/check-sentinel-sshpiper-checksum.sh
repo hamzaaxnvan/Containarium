@@ -64,3 +64,25 @@ if [ "${1:-}" = "--self-test" ]; then
   if [ -n "$(check "$tmp/r")" ]; then
     echo "self-test: clean copy flagged" >&2
     check "$tmp/r" >&2
+    exit 1
+  fi
+  bad="$(printf 'a%.0s' {1..64})"
+  fresh
+  sed -i -E 's/^SSHPIPER_SHA256="[0-9a-f]{64}"/SSHPIPER_SHA256="'"$bad"'"/' "$tmp/r/${SCRIPTS[0]}"
+  expect_fail "wrong value"
+  fresh
+  sed -i '/sha256sum -c/d' "$tmp/r/${SCRIPTS[1]}"
+  expect_fail "verify step removed"
+  fresh
+  sed -i '/^SSHPIPER_SHA256=/d' "$tmp/r/${SCRIPTS[1]}"
+  expect_fail "pin removed"
+  echo "self-test ok"
+  exit 0
+fi
+
+out="$(check "$ROOT")"
+if [ -n "$out" ]; then
+  echo "$out" >&2
+  exit 1
+fi
+echo "ok: both sentinel startup scripts verify the sshpiperd tarball with the pinned sha256"
