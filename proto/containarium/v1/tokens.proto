@@ -62,3 +62,262 @@ message RefreshTokenResponse {
 
   // New refresh token. Save this — the one you just sent
   // in is now revoked and cannot be exchanged again.
+  string refresh_token = 2;
+
+  // Unix-seconds expiry of the access token, for clients
+  // that want to refresh proactively before exp.
+  int64 access_token_expires_at = 3;
+
+  // Unix-seconds expiry of the refresh token.
+  int64 refresh_token_expires_at = 4;
+}
+
+// Revocation is one row of the revocation list, surfaced
+// by the admin listing path. The plaintext token itself is
+// not in the table — only the jti is.
+message Revocation {
+  // The jti claim of the revoked token.
+  string jti = 1;
+
+  // RFC3339 timestamp of the token's original `exp` claim.
+  // Used as the cleanup horizon (rows past this can no
+  // longer authenticate anyway, so the daemon prunes
+  // them eventually).
+  string expires_at = 2;
+
+  // RFC3339 timestamp of when the revocation row was
+  // first inserted. Operators correlating an incident
+  // window use this column.
+  string revoked_at = 3;
+
+  // Free-form reason recorded at revoke time (e.g.
+  // "operator_revoke", "refresh_rotation", "leak_2026_X").
+  string reason = 4;
+}
+
+message ListRevokedTokensRequest {
+  // Max rows to return. 0 → 100 default. Server caps at
+  // 1000.
+  int32 limit = 1;
+
+  // When true, include rows whose expires_at has already
+  // passed (default false — most operators only care
+  // about active revocations).
+  bool include_expired = 2;
+
+  // Narrow by jti prefix. Empty disables. Useful when an
+  // operator only remembers part of a leaked jti.
+  string jti_prefix = 3;
+}
+
+message ListRevokedTokensResponse {
+  repeated Revocation revocations = 1;
+}
+
+// GetUnscopedTokenReportRequest takes no parameters — the report always
+// covers the daemon's whole in-process measurement window (see the response
+// fields), not an operator-chosen range.
+message GetUnscopedTokenReportRequest {}
+
+// GetUnscopedTokenReportResponse answers "how many recent calls used an
+// unscoped token" — the measurement #1679's strict-mode rollout depends on:
+// an operator should be able to see the blast radius BEFORE arming
+// CONTAINARIUM_STRICT_SCOPES, not discover it from a wave of denials after.
+message GetUnscopedTokenReportResponse {
+  // Number of RequireScope calls, since since_ (or 0 if none observed yet),
+  // whose token carried no `scopes` claim at all — the population strict
+  // mode would start rejecting.
+  int64 unscoped_call_count = 1;
+
+  // RFC3339 timestamp of the first such call observed. Empty if
+  // unscoped_call_count is 0. This is an in-process measurement with no
+  // persistence layer — it resets on daemon restart, so it always answers
+  // "since this daemon process started" (or since the first unscoped call
+  // within that lifetime), never a longer historical window.
+  string since = 2;
+
+  // Whether CONTAINARIUM_STRICT_SCOPES is currently armed on this daemon.
+  bool strict_mode_enabled = 3;
+}
+
+// TokensService is the admin surface for JWT lifecycle.
+//
+// RevokeToken requires an admin role + tokens:write scope;
+// tenants can't revoke other tenants' tokens. RefreshToken
+// is open to any holder of a valid refresh token — that's
+// the whole point of the exchange flow.
+service TokensService {
+  // RevokeToken adds a token's jti to the revocation list,
+  // taking effect on the next authenticated request that
+  // names it. Idempotent — repeated revokes are safe.
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse) {
+    option (google.api.http) = {
+      post: "/v1/tokens/revoke"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Revoke a JWT by its jti";
+      description: "Adds the token's jti to the revocation list. The token will be rejected on the next request that tries to use it. Admin-only. Idempotent — revoking an already-revoked jti is a no-op (the original revocation reason is preserved).";
+      tags: "Tokens";
+    };
+  }
+
+  // ExchangeDelegatedToken mints a token that acts FOR another
+  // subject, on the authority of the caller's own credential
+  // (containarium-cloud#1427).
+  //
+  // The problem it solves: a service that fronts this API on
+  // behalf of end users — the cloud control plane is the case
+  // that motivated it — presents its own service credential on
+  // every call. #1676 bounds an agent token by the CALLER's
+  // scopes, but when the caller is a shared service account
+  // that bound is meaningless, and #1678's audit `actor` column
+  // records the service, not the person. `act` is deliberately
+  // a JWT claim and never a header (#1677: set only by the
+  // minting server from an authenticated context), so the
+  // fronting service cannot assert it — it has no signing key,
+  // and giving it one would let it mint any identity.
+  //
+  // So it asks this daemon to mint instead. Two invariants make
+  // that safe, mirroring RunAgentSkill's own delegated mint:
+  //
+  //   * The minted token's scopes are the INTERSECTION of the
+  //     caller's scopes with those requested, so an exchange can
+  //     never produce more authority than the caller already
+  //     holds. Without this the endpoint would be precisely the
+  //     escalation primitive #1676 closed.
+  //   * `act` is built server-side from the authenticated
+  //     caller, wrapping the caller's own chain, so the delegation
+  //     path is recorded rather than claimed.
+  //
+  // Gated on `tokens:delegate` — a distinct scope, not
+  // `tokens:write`: acting as another subject is a different and
+  // more dangerous capability than managing your own tokens.
+  //
+  // Unlike every other RPC, this one FAILS CLOSED on a token that
+  // carries no scopes claim at all, whatever
+  // CONTAINARIUM_STRICT_SCOPES is set to. Elsewhere that claim is
+  // optional for backward compatibility (#1679); here the
+  // caller's scopes ARE the ceiling, so an absent claim would
+  // mean no ceiling. A caller must present a scoped credential.
+  rpc ExchangeDelegatedToken(ExchangeDelegatedTokenRequest) returns (ExchangeDelegatedTokenResponse) {
+    option (google.api.http) = {
+      post: "/v1/tokens/delegate"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Mint a token acting for another subject";
+      description: "Exchanges the caller's credential for a token whose subject is `subject` and whose `act` chain records the caller. Granted scopes are the intersection of the caller's own scopes with those requested — an exchange can never widen authority. Requires the `tokens:delegate` scope, on a token that carries an explicit scopes claim — an unscoped token is rejected here even when strict-scope enforcement is off, because the caller's scopes are the ceiling being applied.";
+      tags: "Tokens";
+    };
+  }
+
+  // RefreshToken exchanges a valid refresh token for a new
+  // (access, refresh) pair. The prior refresh token's jti is
+  // revoked on success — refresh tokens are SINGLE-USE.
+  // Replay of an already-exchanged refresh token returns
+  // Unauthenticated (it's now on the revocation list).
+  //
+  // Unauthenticated endpoint by design — the refresh token
+  // itself IS the credential. Don't wrap with the access-
+  // token middleware.
+  rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse) {
+    option (google.api.http) = {
+      post: "/v1/tokens/refresh"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Exchange a refresh token for a new (access, refresh) pair";
+      description: "Validates the refresh token (signature + exp + tt='refresh' + not revoked), mints a new short-lived access token, mints a new long-lived refresh token, and revokes the input refresh token's jti. Refresh tokens are single-use; the new refresh token must be stored by the client for the next exchange.";
+      tags: "Tokens";
+    };
+  }
+
+  // ListRevokedTokens enumerates active revocations.
+  // Operators use this to confirm a revoke landed or to
+  // investigate "what got killed during the incident window."
+  // Admin-only + tokens:write scope (same surface as
+  // RevokeToken — anyone who can revoke can enumerate).
+  rpc ListRevokedTokens(ListRevokedTokensRequest) returns (ListRevokedTokensResponse) {
+    option (google.api.http) = {
+      get: "/v1/tokens/revoked"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List active token revocations";
+      description: "Returns revocation rows ordered most-recent-first. Default scope is non-expired revocations only; pass include_expired=true for forensic enumeration. Admin-only with the tokens:write scope.";
+      tags: "Tokens";
+    };
+  }
+
+  // GetUnscopedTokenReport reports how many recent calls used a token with
+  // no scopes claim — the measured-rollout deliverable for #1679's strict
+  // mode. Same gate as ListRevokedTokens: admin-only + tokens:read scope.
+  rpc GetUnscopedTokenReport(GetUnscopedTokenReportRequest) returns (GetUnscopedTokenReportResponse) {
+    option (google.api.http) = {
+      get: "/v1/tokens/unscoped-report"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Report how many recent calls used an unscoped token";
+      description: "Returns the in-process count of RequireScope calls whose token carried no scopes claim, since the first such call was observed (resets on daemon restart), plus whether CONTAINARIUM_STRICT_SCOPES is currently armed. Meant to be checked before arming strict mode, so the rollout is a measured decision. Admin-only with the tokens:read scope.";
+      tags: "Tokens";
+    };
+  }
+}
+
+// ExchangeDelegatedTokenRequest asks for a token acting for `subject`.
+message ExchangeDelegatedTokenRequest {
+  // The subject the minted token represents — the end user the
+  // caller is acting for. Required: an empty subject would mint
+  // an unattributed token, which is the state this endpoint
+  // exists to eliminate.
+  string subject = 1;
+
+  // Scopes requested for the minted token. INTERSECTED with the
+  // caller's own scopes, never unioned. Empty requests the
+  // caller's own scope set (still bounded by it).
+  repeated string scopes = 2;
+
+  // Lifetime in seconds. 0 uses the daemon's default access-token
+  // expiry; values above the daemon's maximum are capped rather
+  // than rejected, so a caller asking for too long gets a shorter
+  // token instead of a failure.
+  int64 expires_in_seconds = 3;
+
+  // Roles requested for the minted token. INTERSECTED with the
+  // caller's own roles, never unioned — the same rule scopes follow.
+  //
+  // Unlike scopes, empty means NO ROLES, not "inherit the caller's".
+  // The two differ because their absent-claim semantics are opposite:
+  // an absent scopes claim reads as unrestricted, so an empty scope
+  // grant is dangerous and the daemon refuses it; an absent roles
+  // claim reads as no roles at all (HasRole simply finds nothing), so
+  // empty is already the safe state. Given that, silently inheriting
+  // admin would be the only way to get this wrong, so a caller that
+  // needs a role has to say so.
+  //
+  // A token with no roles can still act for its own subject —
+  // AuthorizeTenant's self-access path does not consult roles — but
+  // cannot reach admin-gated RPCs or another tenant's resources.
+  repeated string roles = 4;
+}
+
+message ExchangeDelegatedTokenResponse {
+  // The minted access token.
+  string token = 1;
+
+  // When it expires, so a caller can cache it rather than
+  // exchanging on every request — the round trip this endpoint
+  // adds is meant to be amortized per (subject, TTL).
+  google.protobuf.Timestamp expires_at = 2;
+
+  // The scopes actually granted, after intersection. Returned
+  // explicitly because they may be NARROWER than requested, and a
+  // caller that assumes otherwise would fail later with a
+  // confusing permission error instead of here.
+  repeated string granted_scopes = 3;
+
+  // The roles actually granted, after intersection. Empty is a normal
+  // and safe result: such a token still acts for its own subject, it
+  // just cannot reach admin-gated RPCs or other tenants.
+  repeated string granted_roles = 4;
+}
