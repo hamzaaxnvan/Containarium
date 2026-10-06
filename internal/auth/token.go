@@ -225,3 +225,457 @@ func (tm *TokenManager) GenerateAccessToken(username string, roles []string, exp
 	if expiresIn <= 0 {
 		expiresIn = DefaultAccessTokenExpiry
 	}
+	tok, _, err := tm.generate(username, roles, scopes, TokenTypeAccess, expiresIn, nil, RunBinding{}, "")
+	return tok, err
+}
+
+// GenerateRefreshToken mints a long-lived refresh token that starts a new
+// rotation family (its own jti doubles as the family id — see FamilyID).
+// Pass 0 for the daemon default (DefaultRefreshTokenExpiry). Carries
+// `tt: "refresh"`; ValidateAccessToken on the API surface REJECTS this
+// token, so a stolen refresh token can't make API calls. Use
+// ValidateRefreshToken when implementing the exchange RPC (Phase 1.6 part
+// B).
+func (tm *TokenManager) GenerateRefreshToken(username string, roles []string, expiresIn time.Duration, scopes ...string) (string, error) {
+	return tm.GenerateRefreshTokenInFamily(username, roles, expiresIn, "", scopes...)
+}
+
+// GenerateRefreshTokenInFamily mints a refresh token continuing an existing
+// rotation family. The RefreshToken RPC's rotation path uses this so every
+// token minted across successive exchanges of one original login carries
+// the same FamilyID — that's what lets reuse of any one of them revoke the
+// whole chain (see RevocationStore.RevokeFamily). A blank familyID starts a
+// new family, identical to GenerateRefreshToken.
+func (tm *TokenManager) GenerateRefreshTokenInFamily(username string, roles []string, expiresIn time.Duration, familyID string, scopes ...string) (string, error) {
+	if expiresIn <= 0 {
+		expiresIn = DefaultRefreshTokenExpiry
+	}
+	tok, _, err := tm.generate(username, roles, scopes, TokenTypeRefresh, expiresIn, nil, RunBinding{}, familyID)
+	return tok, err
+}
+
+// GenerateDelegatedToken mints a token carrying the RFC 8693 `act`
+// delegation claim (#1677) — a token minted for username but presented on
+// behalf of act's chain. act must be built by the caller from its OWN
+// authenticated context (see agent_server.go's mintedAgentAct), never from
+// client/request input — that is the anti-forgery invariant this claim
+// exists to hold. Pass nil for a token with no delegation, identical to
+// GenerateToken. Rejects (does not mint) a chain exceeding MaxActDepth.
+func (tm *TokenManager) GenerateDelegatedToken(username string, roles []string, expiresIn time.Duration, act *Actor, scopes ...string) (string, error) {
+	tok, _, err := tm.GenerateDelegatedTokenWithID(username, roles, expiresIn, act, "", scopes...)
+	return tok, err
+}
+
+// GenerateDelegatedTokenWithID is GenerateDelegatedToken that also returns
+// the minted jti and expiry (#1815), so the issuer of a skill-run credential
+// can later revoke exactly what it issued without re-parsing the token.
+// runID, when non-empty, lands in the `run_id` claim; empty leaves it off
+// the wire (Claims.RunID's omitempty), identical to every call site that
+// doesn't bind a run. See GenerateDelegatedTokenWithRun for also binding a
+// tracker connection.
+func (tm *TokenManager) GenerateDelegatedTokenWithID(username string, roles []string, expiresIn time.Duration, act *Actor, runID string, scopes ...string) (string, MintedID, error) {
+	return tm.GenerateDelegatedTokenWithRun(username, roles, expiresIn, act, RunBinding{RunID: runID}, scopes...)
+}
+
+// RunBinding is everything a run-scoped token says about the run it was
+// minted for. Each field is optional and, when empty, left off the wire
+// (the matching Claims field's omitempty), so a zero RunBinding mints the
+// same token GenerateDelegatedToken does.
+type RunBinding struct {
+	// RunID (#1815) — the `run_id` claim; see Claims.RunID.
+	RunID string
+	// TrackerConn (#1922) — the `tracker_conn` claim; see Claims.TrackerConn.
+	// The caller has already validated it against Tenant's own connections.
+	TrackerConn string
+	// Tenant (#2268) — the `run_tenant` claim; see Claims.RunTenant. The
+	// caller derives it from the dispatching caller's verified subject.
+	Tenant string
+}
+
+// GenerateDelegatedTokenWithRun is GenerateDelegatedTokenWithID that also
+// binds the run to a tracker connection (#1922) and to the tenant it was
+// started for (#2268): run.TrackerConn, when non-empty, lands in the
+// `tracker_conn` claim after the caller (RunAgentSkill) has already
+// validated it against that tenant's own connections, and run.Tenant lands
+// in the `run_tenant` claim — this function trusts its caller on both, the
+// same way it trusts run.RunID. Empty fields stay off the wire (the Claims
+// fields' omitempty), identical to every call site that doesn't bind them.
+func (tm *TokenManager) GenerateDelegatedTokenWithRun(username string, roles []string, expiresIn time.Duration, act *Actor, run RunBinding, scopes ...string) (string, MintedID, error) {
+	if err := validateActDepth(act); err != nil {
+		return "", MintedID{}, fmt.Errorf("mint delegated token: %w", err)
+	}
+	return tm.generate(username, roles, scopes, "", expiresIn, act, run, "")
+}
+
+// generate is the shared implementation. tt may be the
+// empty string for the legacy GenerateToken path; it
+// stays omitempty on the wire so pre-1.6 token shapes are
+// byte-identical for existing test fixtures. act is nil for
+// every call site except GenerateDelegatedToken (#1677); nil
+// stays omitempty on the wire too, so every other mint path's
+// token shape is unaffected. runID is empty for every call site
+// except GenerateDelegatedTokenWithID/WithRun (#1815); empty stays
+// omitempty on the wire for the same reason. run.TrackerConn and
+// run.Tenant are empty for every call site except
+// GenerateDelegatedTokenWithRun (#1922, #2268); same omitempty
+// reasoning. familyID is only ever non-empty for
+// GenerateRefreshTokenInFamily's rotation call sites; for every other
+// tt (including a fresh, family-starting refresh token) it's derived
+// from the freshly minted jti below.
+//
+// Returns the MintedID (jti + expiry) alongside the signed token so callers
+// that need to revoke what they minted don't have to re-parse it.
+func (tm *TokenManager) generate(username string, roles, scopes []string, tt string, expiresIn time.Duration, act *Actor, run RunBinding, familyID string) (string, MintedID, error) {
+	// SECURITY FIX: Enforce maximum expiry - no more non-expiring tokens
+	if expiresIn <= 0 || expiresIn > tm.maxTokenExpiry {
+		expiresIn = tm.maxTokenExpiry
+	}
+
+	jti, err := newJTI()
+	if err != nil {
+		return "", MintedID{}, fmt.Errorf("generate jti: %w", err)
+	}
+
+	var scopesClaim []string
+	if len(scopes) > 0 {
+		scopesClaim = scopes
+	}
+
+	// A refresh token with no explicit family (every fresh mint that
+	// isn't a rotation continuation) starts its own family, keyed on
+	// its own jti. Access/legacy tokens don't carry a family at all —
+	// reuse detection only applies to the refresh-rotation chain.
+	if tt == TokenTypeRefresh && familyID == "" {
+		familyID = jti
+	}
+
+	now := time.Now()
+
+	claims := Claims{
+		Username:    username,
+		Roles:       roles,
+		Scopes:      scopesClaim,
+		TokenType:   tt,
+		Act:         act,
+		RunID:       run.RunID,
+		TrackerConn: run.TrackerConn,
+		RunTenant:   run.Tenant,
+		FamilyID:    familyID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        jti,
+			ExpiresAt: jwt.NewNumericDate(now.Add(expiresIn)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			Issuer:    tm.issuer,
+			Audience:  jwt.ClaimStrings{tm.audience},
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString(tm.secretKey)
+	if err != nil {
+		return "", MintedID{}, err
+	}
+	// MintedID.ExpiresAt must equal the signed exp exactly: read it back from
+	// the claims' NumericDate (which jwt.NewNumericDate already truncated to
+	// jwt.TimePrecision), not from the pre-truncation time.Now().Add(ttl) —
+	// those differ by up to a second.
+	return signed, MintedID{JTI: jti, ExpiresAt: claims.ExpiresAt.Time}, nil
+}
+
+// newJTI returns a base64url-encoded 128-bit cryptographic
+// random ID. 128 bits is enough that collisions never happen
+// in practice (birthday-bound ~2^64 issuances), and base64url
+// keeps the encoded form URL-safe and JWT-friendly.
+func newJTI() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+// errInvalidToken is the only token-validation error returned to
+// clients. Keeping it generic prevents reconnaissance via error
+// messages (which algorithm was tried, whether the signature or the
+// expiry failed, etc.). The full reason is still logged server-side.
+var errInvalidToken = fmt.Errorf("invalid token")
+
+// ValidateToken validates a JWT token and returns claims.
+//
+// Hardening for zero-trust:
+//
+//   - Algorithm is pinned to HS256. Tokens this daemon issues are
+//     always HS256 (see GenerateToken). Accepting any HMAC variant
+//     (HS384, HS512) widens the attack surface for nothing — and the
+//     loose check that was here previously left the door open to
+//     library-level alg-confusion bugs if a dependency ever
+//     regressed. See finding A-CRIT-3 in docs/security/.
+//   - The error returned to clients is a generic "invalid token",
+//     never leaking the offending algorithm name or the
+//     library-level parse error. Full detail is still logged via
+//     %w-wrapping at the caller's discretion.
+func (tm *TokenManager) ValidateToken(tokenString string) (*Claims, error) {
+	claims, err := tm.parseAndVerify(tokenString)
+	if err != nil {
+		return nil, err
+	}
+
+	// Phase 1.2 — revocation list check. We use a short
+	// background timeout so a slow DB doesn't stall the
+	// auth path. A DB outage fails *open* by design
+	// (revocation is a kill-switch, not the primary auth
+	// gate); a noisy log makes the failure visible without
+	// taking the daemon down. Tokens issued before this
+	// release lack a jti — IsRevoked short-circuits on
+	// empty input.
+	if tm.revocationStore != nil && claims.ID != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		revoked, rerr := tm.revocationStore.IsRevoked(ctx, claims.ID)
+		if rerr != nil {
+			log.Printf("WARNING: revocation lookup failed for jti=%s: %v (allowing token; revocation list is the kill-switch, not the primary gate)", claims.ID, rerr)
+		} else if revoked {
+			return nil, errInvalidToken
+		}
+	}
+
+	return claims, nil
+}
+
+// parseAndVerify checks signature (pinned to HS256), exp/nbf, iss/aud, and
+// the #1677 act-depth guard — everything ValidateToken checks EXCEPT the
+// revocation list. It does not consult the revocation list at all, so it
+// returns the claims of an already-revoked-but-otherwise-valid token
+// instead of the same generic error every other failure produces.
+//
+// General callers must keep using ValidateToken / ValidateAccessToken /
+// ValidateRefreshToken, all of which enforce revocation. This exists only
+// for ValidateRefreshTokenClaims, whose caller (the refresh-rotation path)
+// needs to distinguish "this exact credential was already spent" from
+// "never valid" — see that function's doc comment.
+func (tm *TokenManager) parseAndVerify(tokenString string) (*Claims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		// Pin to HS256 exactly. SigningMethodHS256.Alg() == "HS256".
+		if token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+			return nil, errInvalidToken
+		}
+		return tm.secretKey, nil
+	},
+		// Audit A-HIGH-1: iss and aud must match this daemon's
+		// configuration. A token signed by the same key for a
+		// different deployment or with a different intended audience
+		// is now rejected.
+		jwt.WithIssuer(tm.issuer),
+		jwt.WithAudience(tm.audience),
+	)
+
+	if err != nil {
+		return nil, errInvalidToken
+	}
+
+	claims, ok := token.Claims.(*Claims)
+	if !ok || !token.Valid {
+		return nil, errInvalidToken
+	}
+
+	// #1677 — defense in depth: GenerateDelegatedToken already refuses to
+	// mint a chain past MaxActDepth, but reject one here too rather than
+	// trust every future mint path to remember that. A missing Act (nil)
+	// always passes — absence is the valid, backward-compatible case.
+	if err := validateActDepth(claims.Act); err != nil {
+		return nil, errInvalidToken
+	}
+
+	return claims, nil
+}
+
+// ValidateAccessToken validates a token AND enforces that
+// the `tt` claim is either empty (pre-1.6 token, treated as
+// access for backwards compat) or "access". A token marked
+// "refresh" is REJECTED — it must not be usable for API
+// calls. Wire this in the HTTP middleware once the daemon
+// is ready to start enforcing the access/refresh split.
+//
+// Returns the same generic errInvalidToken on any failure
+// (signature, expiry, type mismatch) — no reconnaissance
+// detail leaks to the client.
+func (tm *TokenManager) ValidateAccessToken(tokenString string) (*Claims, error) {
+	claims, err := tm.ValidateToken(tokenString)
+	if err != nil {
+		return nil, err
+	}
+	if claims.TokenType != "" && claims.TokenType != TokenTypeAccess {
+		return nil, errInvalidToken
+	}
+	return claims, nil
+}
+
+// ValidateRefreshToken validates a token AND enforces that
+// `tt == "refresh"`. Used by the refresh-exchange RPC
+// (Phase 1.6 part B). Rejects access tokens and pre-1.6
+// tokens — only an explicit refresh token can be
+// exchanged.
+func (tm *TokenManager) ValidateRefreshToken(tokenString string) (*Claims, error) {
+	claims, err := tm.ValidateToken(tokenString)
+	if err != nil {
+		return nil, err
+	}
+	if claims.TokenType != TokenTypeRefresh {
+		return nil, errInvalidToken
+	}
+	return claims, nil
+}
+
+// ValidateRefreshTokenClaims validates a refresh token's signature, exp,
+// iss/aud and tt claim like ValidateRefreshToken — but, via
+// parseAndVerify, WITHOUT checking the revocation list.
+//
+// This exists for the RefreshToken RPC's reuse detection. Rotation makes
+// every successfully-exchanged refresh token revoked by definition, so if
+// ValidateRefreshToken (which enforces revocation) were used there, a
+// replay of an already-rotated token would be rejected at this parse step
+// with the same generic error as a malformed or expired one — before the
+// rotation handler ever got a chance to see that the credential was
+// specifically *reused*, which is the signal that should revoke the whole
+// rotation family (see RevocationStore.RevokeFamily). The handler performs
+// its own revocation check afterward, via RevokeClaim, and that check IS
+// the reuse signal.
+//
+// Do not use this for anything that authenticates a request — an
+// already-revoked token must never be treated as valid for API access.
+// It exists solely so the rotation handler can read an already-spent
+// token's claims (username, family id) to correlate and kill the chain.
+func (tm *TokenManager) ValidateRefreshTokenClaims(tokenString string) (*Claims, error) {
+	claims, err := tm.parseAndVerify(tokenString)
+	if err != nil {
+		return nil, err
+	}
+	if claims.TokenType != TokenTypeRefresh {
+		return nil, errInvalidToken
+	}
+	return claims, nil
+}
+
+// RevokeToken adds the given claims' jti to the revocation
+// list, using its exp claim as the cleanup horizon. Typically
+// called from logout / admin-revoke flows after the claims
+// have already been validated.
+//
+// Returns an error if the store is unconfigured (the caller
+// is asking to revoke when there's no revocation list — that
+// would silently no-op, which is dangerous).
+func (tm *TokenManager) RevokeToken(ctx context.Context, claims *Claims, reason string) error {
+	if tm.revocationStore == nil {
+		return fmt.Errorf("revocation store not configured")
+	}
+	if claims == nil || claims.ID == "" {
+		return fmt.Errorf("token has no jti — cannot revoke (pre-Phase-1.2 token?)")
+	}
+	exp := time.Time{}
+	if claims.ExpiresAt != nil {
+		exp = claims.ExpiresAt.Time
+	}
+	return tm.revocationStore.Revoke(ctx, claims.ID, exp, reason)
+}
+
+// Context keys for storing authentication information
+type contextKey string
+
+const (
+	ContextKeyUsername    contextKey = "username"
+	ContextKeyRoles       contextKey = "roles"
+	ContextKeyScopes      contextKey = "scopes"       // Phase 1.7b
+	ContextKeyAct         contextKey = "act"          // #1677
+	ContextKeyJTI         contextKey = "jti"          // #1678
+	ContextKeyRunID       contextKey = "run_id"       // #1922
+	ContextKeyTrackerConn contextKey = "tracker_conn" // #1922
+	ContextKeyRunTenant   contextKey = "run_tenant"   // #2268
+)
+
+// ContextWithClaims adds authentication claims to context
+func ContextWithClaims(ctx context.Context, claims *Claims) context.Context {
+	ctx = context.WithValue(ctx, ContextKeyUsername, claims.Username)
+	ctx = context.WithValue(ctx, ContextKeyRoles, claims.Roles)
+	if claims.Scopes != nil {
+		ctx = context.WithValue(ctx, ContextKeyScopes, claims.Scopes)
+	}
+	if claims.Act != nil {
+		ctx = context.WithValue(ctx, ContextKeyAct, claims.Act)
+	}
+	if claims.ID != "" {
+		ctx = context.WithValue(ctx, ContextKeyJTI, claims.ID)
+	}
+	if claims.RunID != "" {
+		ctx = context.WithValue(ctx, ContextKeyRunID, claims.RunID)
+	}
+	if claims.TrackerConn != "" {
+		ctx = context.WithValue(ctx, ContextKeyTrackerConn, claims.TrackerConn)
+	}
+	if claims.RunTenant != "" {
+		ctx = context.WithValue(ctx, ContextKeyRunTenant, claims.RunTenant)
+	}
+	return ctx
+}
+
+// UsernameFromContext retrieves username from context
+func UsernameFromContext(ctx context.Context) (string, bool) {
+	username, ok := ctx.Value(ContextKeyUsername).(string)
+	return username, ok
+}
+
+// RolesFromContext retrieves roles from context
+func RolesFromContext(ctx context.Context) ([]string, bool) {
+	roles, ok := ctx.Value(ContextKeyRoles).([]string)
+	return roles, ok
+}
+
+// ScopesFromContext retrieves the JWT `scopes` claim from
+// context. Returns (nil, false) when no scopes were carried —
+// callers should treat as "no restriction" (the Phase 1.7
+// backwards-compat path). Phase 1.7b.
+func ScopesFromContext(ctx context.Context) ([]string, bool) {
+	scopes, ok := ctx.Value(ContextKeyScopes).([]string)
+	return scopes, ok
+}
+
+// ActFromContext retrieves the JWT `act` delegation claim from context.
+// Returns (nil, false) when no delegation was carried — the
+// backward-compatible "unattributed" case, valid for every non-derived
+// token. #1677.
+func ActFromContext(ctx context.Context) (*Actor, bool) {
+	act, ok := ctx.Value(ContextKeyAct).(*Actor)
+	return act, ok
+}
+
+// JTIFromContext retrieves the JWT `jti` claim from context. Returns ("",
+// false) when no jti was carried. #1678.
+func JTIFromContext(ctx context.Context) (string, bool) {
+	jti, ok := ctx.Value(ContextKeyJTI).(string)
+	return jti, ok
+}
+
+// RunIDFromContext retrieves the JWT `run_id` claim from context. Returns
+// ("", false) when no run id was carried — every operator/human token, and
+// every token minted before run binding (#1815) existed. #1922.
+func RunIDFromContext(ctx context.Context) (string, bool) {
+	runID, ok := ctx.Value(ContextKeyRunID).(string)
+	return runID, ok
+}
+
+// TrackerConnFromContext retrieves the JWT `tracker_conn` claim from
+// context. Returns ("", false) when no tracker connection binding was
+// carried — every operator/human token, and every run not bound to one.
+// #1922.
+func TrackerConnFromContext(ctx context.Context) (string, bool) {
+	conn, ok := ctx.Value(ContextKeyTrackerConn).(string)
+	return conn, ok
+}
+
+// RunTenantFromContext retrieves the JWT `run_tenant` claim from context.
+// Returns ("", false) when no run tenant was carried — every operator/human
+// token, and every run token minted before #2268.
+func RunTenantFromContext(ctx context.Context) (string, bool) {
+	tenant, ok := ctx.Value(ContextKeyRunTenant).(string)
+	return tenant, ok
+}
