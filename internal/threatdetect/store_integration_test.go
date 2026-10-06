@@ -399,3 +399,104 @@ func TestFindingStore_UpsertEscalatesSeverityNeverLowers(t *testing.T) {
 		if got.Severity != step.want {
 			t.Fatalf("Upsert #%d severity = %v, want %v", i+1, got.Severity, step.want)
 		}
+		id = got.ID
+	}
+	var stored string
+	if err := pool.QueryRow(ctx, `SELECT severity FROM security_findings WHERE id = $1`, id).Scan(&stored); err != nil {
+		t.Fatalf("read severity: %v", err)
+	}
+	if stored != pb.ThreatSeverity_THREAT_SEVERITY_HIGH.String() {
+		t.Fatalf("stored severity = %q, want HIGH", stored)
+	}
+}
+
+func drainEvent(t *testing.T, sub *events.Subscriber) {
+	t.Helper()
+	select {
+	case <-sub.Events:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for EVENT_TYPE_SECURITY_FINDING on the bus")
+	}
+}
+
+// Two concurrent Upserts racing to create the FIRST open finding for the
+// same key must still converge to exactly one row — the FOR UPDATE lock in
+// tryUpsert only serializes callers once a row exists, so the INSERT branch
+// itself needs the retry-on-unique-violation path this proves.
+func TestFindingStore_UpsertConcurrentRaceConvergesToOneRow(t *testing.T) {
+	ctx := context.Background()
+	pool := threatdetectPool(t)
+	fs, _, _ := newStores(t, pool)
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := fs.Upsert(ctx, sampleFinding())
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Upsert goroutine %d: %v", i, err)
+		}
+	}
+
+	f := sampleFinding()
+	var rowCount int
+	var count int64
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(count), 0) FROM security_findings WHERE rule = $1 AND tenant_id = $2 AND subject = $3`,
+		f.Rule.String(), f.TenantID, f.Subject).Scan(&rowCount, &count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("rows after %d concurrent upserts = %d, want 1", n, rowCount)
+	}
+	if count != n {
+		t.Fatalf("summed count after %d concurrent upserts = %d, want %d", n, count, n)
+	}
+}
+
+// ListFilter.Rule and .BackendID narrow in the query itself (#2634): the
+// sentry-health loop's takeover of a stale SENTRY_UNAVAILABLE row must not
+// be pushed out of the 200-row page by open findings of other rules. Both
+// stores must honour the filters identically.
+func TestFindingStores_ListFiltersByRuleAndBackend(t *testing.T) {
+	pool := threatdetectPool(t)
+	fs, auditStore, bus := newStores(t, pool)
+	mem, err := NewMemFindingStore(events.NewEmitter(bus), auditStore)
+	if err != nil {
+		t.Fatalf("NewMemFindingStore: %v", err)
+	}
+	ctx := context.Background()
+	for name, st := range map[string]interface {
+		FindingSink
+		FindingReader
+	}{"postgres": fs, "mem": mem} {
+		t.Run(name, func(t *testing.T) {
+			want, err := st.Upsert(ctx, &Finding{Rule: pb.ThreatRuleId_THREAT_RULE_ID_SENTRY_UNAVAILABLE, Severity: pb.ThreatSeverity_THREAT_SEVERITY_MEDIUM, BackendID: "backend-1", Subject: "eBPF object not loaded"})
+			if err != nil {
+				t.Fatalf("Upsert stale: %v", err)
+			}
+			if _, err := st.Upsert(ctx, &Finding{Rule: pb.ThreatRuleId_THREAT_RULE_ID_SENTRY_UNAVAILABLE, Severity: pb.ThreatSeverity_THREAT_SEVERITY_MEDIUM, BackendID: "backend-2", Subject: "other backend"}); err != nil {
+				t.Fatalf("Upsert other backend: %v", err)
+			}
+			for i := 0; i < 210; i++ {
+				if _, err := st.Upsert(ctx, &Finding{Rule: pb.ThreatRuleId_THREAT_RULE_ID_DENY_BURST, Severity: pb.ThreatSeverity_THREAT_SEVERITY_MEDIUM, BackendID: "backend-1", TenantID: fmt.Sprintf("%s-t%d", name, i)}); err != nil {
+					t.Fatalf("Upsert filler %d: %v", i, err)
+				}
+			}
+			got, err := st.List(ctx, ListFilter{State: FindingStateOpen, Rule: pb.ThreatRuleId_THREAT_RULE_ID_SENTRY_UNAVAILABLE, BackendID: "backend-1", Limit: 200})
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			if len(got) != 1 || got[0].ID != want.ID {
+				t.Fatalf("List(rule, backend) = %+v, want only finding %d", got, want.ID)
+			}
+		})
+	}
+}
