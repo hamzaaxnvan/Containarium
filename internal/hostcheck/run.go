@@ -108,3 +108,59 @@ func capCheck() Check {
 	return c
 }
 
+// MissingCaps returns the required capabilities NOT set in the effective
+// capability mask. Pure — unit-tested.
+func MissingCaps(capEff uint64) []string {
+	var missing []string
+	for _, rc := range RequiredCaps {
+		if capEff&(1<<rc.Bit) == 0 {
+			missing = append(missing, rc.Name)
+		}
+	}
+	return missing
+}
+
+// writableCheck confirms dir exists and is writable by creating+removing a
+// temp file (tests writability under the CURRENT caps/sandbox, not just mode).
+func writableCheck(dir string) Check {
+	c := Check{Name: "writable: " + dir, Required: true}
+	info, err := os.Stat(dir)
+	if err != nil {
+		c.Detail = fmt.Sprintf("missing: %v", err)
+		return c
+	}
+	if !info.IsDir() {
+		c.Detail = "not a directory"
+		return c
+	}
+	f, err := os.CreateTemp(dir, ".containarium-doctor-*")
+	if err != nil {
+		c.Detail = fmt.Sprintf("not writable: %v", err)
+		return c
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	c.OK = true
+	return c
+}
+
+// useraddProbe creates then deletes a throwaway user — the definitive
+// capability-trap test (the daemon does this per tenant).
+func useraddProbe() Check {
+	c := Check{Name: "useradd/userdel probe", Required: true}
+	if _, err := exec.LookPath("useradd"); err != nil {
+		c.Detail = "useradd not found on PATH"
+		return c
+	}
+	probe := fmt.Sprintf("__ctn_preflight_%d", os.Getpid())
+	// -M: no home dir (keeps the probe minimal). Always attempt cleanup.
+	out, err := exec.Command("useradd", "-M", "-s", "/usr/sbin/nologin", probe).CombinedOutput() // #nosec G204 -- fixed args + a pid-derived probe name, not user input
+	defer func() { _ = exec.Command("userdel", probe).Run() }()                                  // #nosec G204 -- same
+	if err != nil {
+		c.Detail = fmt.Sprintf("useradd failed (the capability trap): %v: %s", err, strings.TrimSpace(string(out)))
+		return c
+	}
+	c.OK = true
+	return c
+}
