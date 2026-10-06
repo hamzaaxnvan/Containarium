@@ -126,3 +126,132 @@ func TestDNSChallengeFromEnv(t *testing.T) {
 func TestEnvPlaceholdersInDNSProvider(t *testing.T) {
 	t.Run("nil challenge → nil", func(t *testing.T) {
 		if got := EnvPlaceholdersInDNSProvider(nil); got != nil {
+			t.Errorf("got %v, want nil", got)
+		}
+	})
+
+	t.Run("cloudflare default → CF_API_TOKEN", func(t *testing.T) {
+		t.Setenv("CONTAINARIUM_ACME_DNS_PROVIDER", "cloudflare")
+		t.Setenv("CONTAINARIUM_ACME_DNS_PROVIDER_CONFIG", "")
+		got := EnvPlaceholdersInDNSProvider(DNSChallengeFromEnv())
+		if len(got) != 1 || got[0] != "CF_API_TOKEN" {
+			t.Errorf("got %v, want [CF_API_TOKEN]", got)
+		}
+	})
+
+	t.Run("explicit override → that variable, not the default", func(t *testing.T) {
+		t.Setenv("CONTAINARIUM_ACME_DNS_PROVIDER", "cloudflare")
+		t.Setenv("CONTAINARIUM_ACME_DNS_PROVIDER_CONFIG", `{"api_token":"{env.MY_TOKEN}"}`)
+		got := EnvPlaceholdersInDNSProvider(DNSChallengeFromEnv())
+		if len(got) != 1 || got[0] != "MY_TOKEN" {
+			t.Errorf("got %v, want [MY_TOKEN]", got)
+		}
+	})
+
+	t.Run("a literal (non-placeholder) value names nothing", func(t *testing.T) {
+		// route53 reads the AWS env directly; nothing in its provider block
+		// is a Caddy placeholder, so there's nothing for the daemon to
+		// propagate — AWS_* creds are Caddy's own environment concern.
+		t.Setenv("CONTAINARIUM_ACME_DNS_PROVIDER", "route53")
+		t.Setenv("CONTAINARIUM_ACME_DNS_PROVIDER_CONFIG", "")
+		got := EnvPlaceholdersInDNSProvider(DNSChallengeFromEnv())
+		if got != nil {
+			t.Errorf("got %v, want nil", got)
+		}
+	})
+
+	t.Run("multiple placeholders across fields, deduplicated and sorted", func(t *testing.T) {
+		dns := &CaddyACMEChallenges{DNS: &CaddyDNSChallenge{Provider: map[string]interface{}{
+			"name":         "cloudflare",
+			"api_token":    "{env.CF_API_TOKEN}",
+			"zone_id":      "{env.CF_ZONE_ID}",
+			"account_id":   "{env.CF_ZONE_ID}", // duplicate reference, must collapse
+			"literal_flag": "not-a-placeholder",
+		}}}
+		got := EnvPlaceholdersInDNSProvider(dns)
+		want := []string{"CF_API_TOKEN", "CF_ZONE_ID"}
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a placeholder embedded in a larger string doesn't match", func(t *testing.T) {
+		// Caddy's own {env.X} substitution only fires on the whole value;
+		// this function mirrors that so it never reports a variable Caddy
+		// itself wouldn't actually expand.
+		dns := &CaddyACMEChallenges{DNS: &CaddyDNSChallenge{Provider: map[string]interface{}{
+			"note": "token is {env.CF_API_TOKEN} ish",
+		}}}
+		if got := EnvPlaceholdersInDNSProvider(dns); got != nil {
+			t.Errorf("got %v, want nil", got)
+		}
+	})
+}
+
+// TestNewTLSPolicyWithDNS_Wildcard checks a wildcard subject pairs with the
+// DNS-01 issuers (the combination HTTP-01 can't do).
+func TestNewTLSPolicyWithDNS_Wildcard(t *testing.T) {
+	dns := DNSChallengeFromEnvWith(t, "cloudflare")
+	pol := NewTLSPolicyWithDNS([]string{"*.example.com"}, dns)
+	if len(pol.Subjects) != 1 || pol.Subjects[0] != "*.example.com" {
+		t.Fatalf("subjects = %v", pol.Subjects)
+	}
+	if pol.Issuers[0].Challenges == nil {
+		t.Error("wildcard policy issuer missing DNS-01 challenge")
+	}
+}
+
+// DNSChallengeFromEnvWith is a tiny test helper that sets the provider env and
+// returns the resulting challenge.
+func DNSChallengeFromEnvWith(t *testing.T, provider string) *CaddyACMEChallenges {
+	t.Helper()
+	t.Setenv("CONTAINARIUM_ACME_DNS_PROVIDER", provider)
+	return DNSChallengeFromEnv()
+}
+
+// TestDNSProviderModule maps provider names to their xcaddy module so the core
+// Caddy build can compile in the right caddy-dns plugin (#378). A config the
+// daemon emits is useless if Caddy lacks the matching module.
+func TestDNSProviderModule(t *testing.T) {
+	cases := map[string]string{
+		"cloudflare":   "github.com/caddy-dns/cloudflare",
+		"route53":      "github.com/caddy-dns/route53",
+		" cloudflare ": "github.com/caddy-dns/cloudflare", // trimmed
+		"unknown":      "",
+		"":             "",
+	}
+	for in, want := range cases {
+		if got := DNSProviderModule(in); got != want {
+			t.Errorf("DNSProviderModule(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestAllDNSProviderModules pins the count and sortedness of the pre-built
+// Caddy release binary's module list (#1617) — a provider added to
+// dnsProviderModules without also updating the Makefile's build-caddy
+// target would silently ship a binary missing it, so this at least proves
+// the source-of-truth side stays complete and deterministic.
+func TestAllDNSProviderModules(t *testing.T) {
+	got := AllDNSProviderModules()
+	if len(got) != len(dnsProviderModules) {
+		t.Fatalf("AllDNSProviderModules() returned %d modules, want %d (one per dnsProviderModules entry)", len(got), len(dnsProviderModules))
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1] >= got[i] {
+			t.Fatalf("AllDNSProviderModules() not sorted: %q before %q", got[i-1], got[i])
+		}
+	}
+	for _, want := range dnsProviderModules {
+		found := false
+		for _, m := range got {
+			if m == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("AllDNSProviderModules() missing %q", want)
+		}
+	}
+}
