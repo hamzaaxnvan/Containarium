@@ -52,3 +52,57 @@ func TestValidateEncryptionIgnoredWhenNotRequested(t *testing.T) {
 	if err := validateEncryption(&pb.CreateContainerRequest{Encrypted: false}, nil); err != nil {
 		t.Errorf("encrypted=false must not need a KeyProvider: %v", err)
 	}
+}
+
+// AC: the OSS daemon rejects a non-default tenant_id with
+// INVALID_ARGUMENT.
+//
+// The field is defined on the proto so the wire shape stays stable into
+// the multi-tenant cloud build, but accepting a tenant here would be a
+// lie: this daemon has no tenancy, so every "tenant" would share one
+// encryptionroot and the isolation the field implies would not exist.
+func TestValidateTenantIDRejectsRealTenantsOnOSS(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		tenantID string
+		wantErr  bool
+	}{
+		{"unset is fine", "", false},
+		{"explicit default is fine", "default", false},
+		{"a real tenant is rejected", "acme-corp", true},
+		{"another tenant is rejected", "org-alice", true},
+		{"whitespace is not a smuggled default", "  ", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTenantID(tc.tenantID)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("tenant_id %q was accepted by a single-tenant daemon", tc.tenantID)
+				}
+				if got := status.Code(err); got != codes.InvalidArgument {
+					t.Errorf("code = %v, want InvalidArgument", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("tenant_id %q rejected: %v", tc.tenantID, err)
+			}
+		})
+	}
+}
+
+// The rejection has to explain itself: an operator hitting this is using
+// a field the proto documents as valid, and needs to know it is the
+// build, not the request, that is limited.
+func TestTenantIDRejectionIsActionable(t *testing.T) {
+	err := validateTenantID("acme-corp")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	msg := strings.ToLower(err.Error())
+	for _, want := range []string{"tenant", "single-tenant"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message should mention %q so the caller understands why; got %q", want, err)
+		}
+	}
+}
