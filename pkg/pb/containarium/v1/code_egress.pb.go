@@ -439,3 +439,445 @@ func (x *EffectiveCodingToolEgressPolicy) GetEgressCidrs() []string {
 		return x.EgressCidrs
 	}
 	return nil
+}
+
+func (x *EffectiveCodingToolEgressPolicy) GetEgressDomains() []string {
+	if x != nil {
+		return x.EgressDomains
+	}
+	return nil
+}
+
+func (x *EffectiveCodingToolEgressPolicy) GetDenyAll() bool {
+	if x != nil {
+		return x.DenyAll
+	}
+	return false
+}
+
+func (x *EffectiveCodingToolEgressPolicy) GetImplicit() []*CodingToolEgressImplicitEntry {
+	if x != nil {
+		return x.Implicit
+	}
+	return nil
+}
+
+func (x *EffectiveCodingToolEgressPolicy) GetRevision() int64 {
+	if x != nil {
+		return x.Revision
+	}
+	return 0
+}
+
+type SetCodingToolEgressPolicyRequest struct {
+	state         protoimpl.MessageState  `protogen:"open.v1"`
+	Policy        *CodingToolEgressPolicy `protobuf:"bytes,1,opt,name=policy,proto3" json:"policy,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetCodingToolEgressPolicyRequest) Reset() {
+	*x = SetCodingToolEgressPolicyRequest{}
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetCodingToolEgressPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetCodingToolEgressPolicyRequest) ProtoMessage() {}
+
+func (x *SetCodingToolEgressPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetCodingToolEgressPolicyRequest.ProtoReflect.Descriptor instead.
+func (*SetCodingToolEgressPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_code_egress_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *SetCodingToolEgressPolicyRequest) GetPolicy() *CodingToolEgressPolicy {
+	if x != nil {
+		return x.Policy
+	}
+	return nil
+}
+
+type SetCodingToolEgressPolicyResponse struct {
+	state         protoimpl.MessageState  `protogen:"open.v1"`
+	Policy        *CodingToolEgressPolicy `protobuf:"bytes,1,opt,name=policy,proto3" json:"policy,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetCodingToolEgressPolicyResponse) Reset() {
+	*x = SetCodingToolEgressPolicyResponse{}
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetCodingToolEgressPolicyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetCodingToolEgressPolicyResponse) ProtoMessage() {}
+
+func (x *SetCodingToolEgressPolicyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetCodingToolEgressPolicyResponse.ProtoReflect.Descriptor instead.
+func (*SetCodingToolEgressPolicyResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_code_egress_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *SetCodingToolEgressPolicyResponse) GetPolicy() *CodingToolEgressPolicy {
+	if x != nil {
+		return x.Policy
+	}
+	return nil
+}
+
+type GetCodingToolEgressPolicyRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Empty = the cluster default.
+	Tenant        string `protobuf:"bytes,1,opt,name=tenant,proto3" json:"tenant,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetCodingToolEgressPolicyRequest) Reset() {
+	*x = GetCodingToolEgressPolicyRequest{}
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetCodingToolEgressPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetCodingToolEgressPolicyRequest) ProtoMessage() {}
+
+func (x *GetCodingToolEgressPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetCodingToolEgressPolicyRequest.ProtoReflect.Descriptor instead.
+func (*GetCodingToolEgressPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_code_egress_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *GetCodingToolEgressPolicyRequest) GetTenant() string {
+	if x != nil {
+		return x.Tenant
+	}
+	return ""
+}
+
+type GetCodingToolEgressPolicyResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The policy stored under exactly this key; absent when none is set.
+	Policy        *CodingToolEgressPolicy          `protobuf:"bytes,1,opt,name=policy,proto3" json:"policy,omitempty"`
+	Effective     *EffectiveCodingToolEgressPolicy `protobuf:"bytes,2,opt,name=effective,proto3" json:"effective,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetCodingToolEgressPolicyResponse) Reset() {
+	*x = GetCodingToolEgressPolicyResponse{}
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetCodingToolEgressPolicyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetCodingToolEgressPolicyResponse) ProtoMessage() {}
+
+func (x *GetCodingToolEgressPolicyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetCodingToolEgressPolicyResponse.ProtoReflect.Descriptor instead.
+func (*GetCodingToolEgressPolicyResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_code_egress_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *GetCodingToolEgressPolicyResponse) GetPolicy() *CodingToolEgressPolicy {
+	if x != nil {
+		return x.Policy
+	}
+	return nil
+}
+
+func (x *GetCodingToolEgressPolicyResponse) GetEffective() *EffectiveCodingToolEgressPolicy {
+	if x != nil {
+		return x.Effective
+	}
+	return nil
+}
+
+type DeleteCodingToolEgressPolicyRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Empty = the cluster default.
+	Tenant        string `protobuf:"bytes,1,opt,name=tenant,proto3" json:"tenant,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteCodingToolEgressPolicyRequest) Reset() {
+	*x = DeleteCodingToolEgressPolicyRequest{}
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteCodingToolEgressPolicyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteCodingToolEgressPolicyRequest) ProtoMessage() {}
+
+func (x *DeleteCodingToolEgressPolicyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteCodingToolEgressPolicyRequest.ProtoReflect.Descriptor instead.
+func (*DeleteCodingToolEgressPolicyRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_code_egress_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *DeleteCodingToolEgressPolicyRequest) GetTenant() string {
+	if x != nil {
+		return x.Tenant
+	}
+	return ""
+}
+
+type DeleteCodingToolEgressPolicyResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteCodingToolEgressPolicyResponse) Reset() {
+	*x = DeleteCodingToolEgressPolicyResponse{}
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteCodingToolEgressPolicyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteCodingToolEgressPolicyResponse) ProtoMessage() {}
+
+func (x *DeleteCodingToolEgressPolicyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_code_egress_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteCodingToolEgressPolicyResponse.ProtoReflect.Descriptor instead.
+func (*DeleteCodingToolEgressPolicyResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_code_egress_proto_rawDescGZIP(), []int{8}
+}
+
+var File_containarium_v1_code_egress_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_code_egress_proto_rawDesc = "" +
+	"\n" +
+	"!containarium/v1/code_egress.proto\x12\x0fcontainarium.v1\x1a\x1ccontainarium/v1/config.proto\x1a\x1cgoogle/api/annotations.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\"\xa8\x02\n" +
+	"\x16CodingToolEgressPolicy\x12\x16\n" +
+	"\x06tenant\x18\x01 \x01(\tR\x06tenant\x126\n" +
+	"\x04mode\x18\x02 \x01(\x0e2\".containarium.v1.NetworkPolicyModeR\x04mode\x12!\n" +
+	"\fegress_cidrs\x18\x03 \x03(\tR\vegressCidrs\x12%\n" +
+	"\x0eegress_domains\x18\x04 \x03(\tR\regressDomains\x12\x1a\n" +
+	"\brevision\x18\x05 \x01(\x03R\brevision\x129\n" +
+	"\n" +
+	"updated_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12\x1d\n" +
+	"\n" +
+	"updated_by\x18\a \x01(\tR\tupdatedBy\"\xa6\x01\n" +
+	"\x1dCodingToolEgressImplicitEntry\x12A\n" +
+	"\x04kind\x18\x01 \x01(\x0e2-.containarium.v1.CodingToolEgressImplicitKindR\x04kind\x12 \n" +
+	"\vdestination\x18\x02 \x01(\tR\vdestination\x12 \n" +
+	"\vdescription\x18\x03 \x01(\tR\vdescription\"\xa5\x03\n" +
+	"\x1fEffectiveCodingToolEgressPolicy\x12\x16\n" +
+	"\x06tenant\x18\x01 \x01(\tR\x06tenant\x12E\n" +
+	"\x06source\x18\x02 \x01(\x0e2-.containarium.v1.CodingToolEgressPolicySourceR\x06source\x12\x1e\n" +
+	"\n" +
+	"restricted\x18\x03 \x01(\bR\n" +
+	"restricted\x126\n" +
+	"\x04mode\x18\x04 \x01(\x0e2\".containarium.v1.NetworkPolicyModeR\x04mode\x12!\n" +
+	"\fegress_cidrs\x18\x05 \x03(\tR\vegressCidrs\x12%\n" +
+	"\x0eegress_domains\x18\x06 \x03(\tR\regressDomains\x12\x19\n" +
+	"\bdeny_all\x18\a \x01(\bR\adenyAll\x12J\n" +
+	"\bimplicit\x18\b \x03(\v2..containarium.v1.CodingToolEgressImplicitEntryR\bimplicit\x12\x1a\n" +
+	"\brevision\x18\t \x01(\x03R\brevision\"c\n" +
+	" SetCodingToolEgressPolicyRequest\x12?\n" +
+	"\x06policy\x18\x01 \x01(\v2'.containarium.v1.CodingToolEgressPolicyR\x06policy\"d\n" +
+	"!SetCodingToolEgressPolicyResponse\x12?\n" +
+	"\x06policy\x18\x01 \x01(\v2'.containarium.v1.CodingToolEgressPolicyR\x06policy\":\n" +
+	" GetCodingToolEgressPolicyRequest\x12\x16\n" +
+	"\x06tenant\x18\x01 \x01(\tR\x06tenant\"\xb4\x01\n" +
+	"!GetCodingToolEgressPolicyResponse\x12?\n" +
+	"\x06policy\x18\x01 \x01(\v2'.containarium.v1.CodingToolEgressPolicyR\x06policy\x12N\n" +
+	"\teffective\x18\x02 \x01(\v20.containarium.v1.EffectiveCodingToolEgressPolicyR\teffective\"=\n" +
+	"#DeleteCodingToolEgressPolicyRequest\x12\x16\n" +
+	"\x06tenant\x18\x01 \x01(\tR\x06tenant\"&\n" +
+	"$DeleteCodingToolEgressPolicyResponse*\xde\x01\n" +
+	"\x1cCodingToolEgressPolicySource\x120\n" +
+	",CODING_TOOL_EGRESS_POLICY_SOURCE_UNSPECIFIED\x10\x00\x12)\n" +
+	"%CODING_TOOL_EGRESS_POLICY_SOURCE_NONE\x10\x01\x12+\n" +
+	"'CODING_TOOL_EGRESS_POLICY_SOURCE_TENANT\x10\x02\x124\n" +
+	"0CODING_TOOL_EGRESS_POLICY_SOURCE_CLUSTER_DEFAULT\x10\x03*\xb7\x01\n" +
+	"\x1cCodingToolEgressImplicitKind\x120\n" +
+	",CODING_TOOL_EGRESS_IMPLICIT_KIND_UNSPECIFIED\x10\x00\x121\n" +
+	"-CODING_TOOL_EGRESS_IMPLICIT_KIND_DNS_RESOLVER\x10\x01\x122\n" +
+	".CODING_TOOL_EGRESS_IMPLICIT_KIND_MODEL_GATEWAY\x10\x02*\xe8\x01\n" +
+	"\x15CodeEgressEnforcement\x12'\n" +
+	"#CODE_EGRESS_ENFORCEMENT_UNSPECIFIED\x10\x00\x12*\n" +
+	"&CODE_EGRESS_ENFORCEMENT_NONE_NO_POLICY\x10\x01\x12$\n" +
+	" CODE_EGRESS_ENFORCEMENT_LOG_ONLY\x10\x02\x12$\n" +
+	" CODE_EGRESS_ENFORCEMENT_ENFORCED\x10\x03\x12.\n" +
+	"*CODE_EGRESS_ENFORCEMENT_ENFORCED_ESCAPABLE\x10\x042\xdb\x0e\n" +
+	"\x1dCodingToolEgressPolicyService\x12\xe0\x05\n" +
+	"\x19SetCodingToolEgressPolicy\x121.containarium.v1.SetCodingToolEgressPolicyRequest\x1a2.containarium.v1.SetCodingToolEgressPolicyResponse\"\xdb\x04\x92A\xff\x03\n" +
+	"\x16CodingToolEgressPolicy\x12\x1dSet coding-tool egress policy\x1a\xc5\x03Create or replace the coding tool's egress allowlist. Admin-only. On PUT /v1/code/egress-policy/{policy.tenant} the tenant is the URL value, which wins over any policy.tenant in the body (path parameters are applied after the body is decoded). On the bare PUT /v1/code/egress-policy the tenant is policy.tenant from the body; an empty tenant sets the cluster default. mode is required: LOG_ONLY or ENFORCE; UNSPECIFIED is rejected with INVALID_ARGUMENT.\x82\xd3\xe4\x93\x02R:\x06policyZ :\x06policy\x1a\x16/v1/code/egress-policy\x1a&/v1/code/egress-policy/{policy.tenant}\x12\xc6\x04\n" +
+	"\x19GetCodingToolEgressPolicy\x121.containarium.v1.GetCodingToolEgressPolicyRequest\x1a2.containarium.v1.GetCodingToolEgressPolicyResponse\"\xc1\x03\x92A\xfc\x02\n" +
+	"\x16CodingToolEgressPolicy\x12\x1dGet coding-tool egress policy\x1a\xc2\x02Return the stored and effective coding-tool egress policy. On GET /v1/code/egress-policy/{tenant} the tenant is the URL value; on the bare GET /v1/code/egress-policy it is the optional ?tenant= query parameter, and with none the cluster default (admin only). Admin, or the tenant itself holding the code-egress:read scope.\x82\xd3\xe4\x93\x02;Z\x18\x12\x16/v1/code/egress-policy\x12\x1f/v1/code/egress-policy/{tenant}\x12\x8d\x04\n" +
+	"\x1cDeleteCodingToolEgressPolicy\x124.containarium.v1.DeleteCodingToolEgressPolicyRequest\x1a5.containarium.v1.DeleteCodingToolEgressPolicyResponse\"\xff\x02\x92A\xba\x02\n" +
+	"\x16CodingToolEgressPolicy\x12 Delete coding-tool egress policy\x1a\xfd\x01Remove a coding-tool egress policy (idempotent). On DELETE /v1/code/egress-policy/{tenant} the tenant is the URL value; on the bare DELETE /v1/code/egress-policy it is the optional ?tenant= query parameter, and with none the cluster default. Admin-only.\x82\xd3\xe4\x93\x02;Z\x18*\x16/v1/code/egress-policy*\x1f/v1/code/egress-policy/{tenant}BKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_code_egress_proto_rawDescOnce sync.Once
+	file_containarium_v1_code_egress_proto_rawDescData []byte
+)
+
+func file_containarium_v1_code_egress_proto_rawDescGZIP() []byte {
+	file_containarium_v1_code_egress_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_code_egress_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_code_egress_proto_rawDesc), len(file_containarium_v1_code_egress_proto_rawDesc)))
+	})
+	return file_containarium_v1_code_egress_proto_rawDescData
+}
+
+var file_containarium_v1_code_egress_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_containarium_v1_code_egress_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_containarium_v1_code_egress_proto_goTypes = []any{
+	(CodingToolEgressPolicySource)(0),            // 0: containarium.v1.CodingToolEgressPolicySource
+	(CodingToolEgressImplicitKind)(0),            // 1: containarium.v1.CodingToolEgressImplicitKind
+	(CodeEgressEnforcement)(0),                   // 2: containarium.v1.CodeEgressEnforcement
+	(*CodingToolEgressPolicy)(nil),               // 3: containarium.v1.CodingToolEgressPolicy
+	(*CodingToolEgressImplicitEntry)(nil),        // 4: containarium.v1.CodingToolEgressImplicitEntry
+	(*EffectiveCodingToolEgressPolicy)(nil),      // 5: containarium.v1.EffectiveCodingToolEgressPolicy
+	(*SetCodingToolEgressPolicyRequest)(nil),     // 6: containarium.v1.SetCodingToolEgressPolicyRequest
+	(*SetCodingToolEgressPolicyResponse)(nil),    // 7: containarium.v1.SetCodingToolEgressPolicyResponse
+	(*GetCodingToolEgressPolicyRequest)(nil),     // 8: containarium.v1.GetCodingToolEgressPolicyRequest
+	(*GetCodingToolEgressPolicyResponse)(nil),    // 9: containarium.v1.GetCodingToolEgressPolicyResponse
+	(*DeleteCodingToolEgressPolicyRequest)(nil),  // 10: containarium.v1.DeleteCodingToolEgressPolicyRequest
+	(*DeleteCodingToolEgressPolicyResponse)(nil), // 11: containarium.v1.DeleteCodingToolEgressPolicyResponse
+	(NetworkPolicyMode)(0),                       // 12: containarium.v1.NetworkPolicyMode
+	(*timestamppb.Timestamp)(nil),                // 13: google.protobuf.Timestamp
+}
+var file_containarium_v1_code_egress_proto_depIdxs = []int32{
+	12, // 0: containarium.v1.CodingToolEgressPolicy.mode:type_name -> containarium.v1.NetworkPolicyMode
+	13, // 1: containarium.v1.CodingToolEgressPolicy.updated_at:type_name -> google.protobuf.Timestamp
+	1,  // 2: containarium.v1.CodingToolEgressImplicitEntry.kind:type_name -> containarium.v1.CodingToolEgressImplicitKind
+	0,  // 3: containarium.v1.EffectiveCodingToolEgressPolicy.source:type_name -> containarium.v1.CodingToolEgressPolicySource
+	12, // 4: containarium.v1.EffectiveCodingToolEgressPolicy.mode:type_name -> containarium.v1.NetworkPolicyMode
+	4,  // 5: containarium.v1.EffectiveCodingToolEgressPolicy.implicit:type_name -> containarium.v1.CodingToolEgressImplicitEntry
+	3,  // 6: containarium.v1.SetCodingToolEgressPolicyRequest.policy:type_name -> containarium.v1.CodingToolEgressPolicy
+	3,  // 7: containarium.v1.SetCodingToolEgressPolicyResponse.policy:type_name -> containarium.v1.CodingToolEgressPolicy
+	3,  // 8: containarium.v1.GetCodingToolEgressPolicyResponse.policy:type_name -> containarium.v1.CodingToolEgressPolicy
+	5,  // 9: containarium.v1.GetCodingToolEgressPolicyResponse.effective:type_name -> containarium.v1.EffectiveCodingToolEgressPolicy
+	6,  // 10: containarium.v1.CodingToolEgressPolicyService.SetCodingToolEgressPolicy:input_type -> containarium.v1.SetCodingToolEgressPolicyRequest
+	8,  // 11: containarium.v1.CodingToolEgressPolicyService.GetCodingToolEgressPolicy:input_type -> containarium.v1.GetCodingToolEgressPolicyRequest
+	10, // 12: containarium.v1.CodingToolEgressPolicyService.DeleteCodingToolEgressPolicy:input_type -> containarium.v1.DeleteCodingToolEgressPolicyRequest
+	7,  // 13: containarium.v1.CodingToolEgressPolicyService.SetCodingToolEgressPolicy:output_type -> containarium.v1.SetCodingToolEgressPolicyResponse
+	9,  // 14: containarium.v1.CodingToolEgressPolicyService.GetCodingToolEgressPolicy:output_type -> containarium.v1.GetCodingToolEgressPolicyResponse
+	11, // 15: containarium.v1.CodingToolEgressPolicyService.DeleteCodingToolEgressPolicy:output_type -> containarium.v1.DeleteCodingToolEgressPolicyResponse
+	13, // [13:16] is the sub-list for method output_type
+	10, // [10:13] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_code_egress_proto_init() }
+func file_containarium_v1_code_egress_proto_init() {
+	if File_containarium_v1_code_egress_proto != nil {
+		return
+	}
+	file_containarium_v1_config_proto_init()
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_code_egress_proto_rawDesc), len(file_containarium_v1_code_egress_proto_rawDesc)),
+			NumEnums:      3,
+			NumMessages:   9,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_code_egress_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_code_egress_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_code_egress_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_code_egress_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_code_egress_proto = out.File
+	file_containarium_v1_code_egress_proto_goTypes = nil
+	file_containarium_v1_code_egress_proto_depIdxs = nil
+}
