@@ -233,3 +233,160 @@ func TestTrackerConnClaim_EndToEndPropagation(t *testing.T) {
 	wrapped.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	connVals := capturedMD.Get(auth.MDKeyTrackerConn)
+	if len(connVals) != 1 || connVals[0] != "default" {
+		t.Fatalf("tracker_conn metadata = %v; want [default]", connVals)
+	}
+
+	grpcCtx := metadata.NewIncomingContext(context.Background(), capturedMD)
+	got, ok := auth.TrackerConnFromGRPCContext(grpcCtx)
+	if !ok || got != "default" {
+		t.Fatalf("TrackerConnFromGRPCContext = %q, %v; want default, true", got, ok)
+	}
+}
+
+func TestTrackerConnClaim_AbsentClaimPropagatesAsAbsent(t *testing.T) {
+	// A run NOT bound to a connection (or an operator/human token) MUST NOT
+	// carry a tracker_conn metadata entry — the tracker verb RPCs must be
+	// able to tell "unbound, may name any connection in the tenant" from
+	// "bound, must match" purely from whether this claim is present.
+	tm, _ := auth.NewTokenManager("propagation-test-secret-at-least-32-bytes-ok", "test")
+	mw := auth.NewAuthMiddleware(tm)
+
+	tok, _, err := tm.GenerateDelegatedTokenWithID("alice", []string{"user"}, time.Hour, nil, "run-abc123", auth.ScopeTrackerWrite)
+	if err != nil {
+		t.Fatalf("GenerateDelegatedTokenWithID: %v", err)
+	}
+
+	var capturedMD metadata.MD
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMD = annotateContext(r.Context(), r)
+		w.WriteHeader(http.StatusOK)
+	})
+	wrapped := mw.HTTPMiddleware(stub)
+
+	req := httptest.NewRequest("POST", "/v1/tracker/connections/alice/default/issues/1/comments", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+
+	if got := capturedMD.Get(auth.MDKeyTrackerConn); len(got) != 0 {
+		t.Fatalf("a run not bound to a connection should NOT propagate tracker_conn metadata; got %v", got)
+	}
+}
+
+// TestRunTenantClaim_EndToEndPropagation is TestTrackerConnClaim_EndToEndPropagation's
+// counterpart for the `run_tenant` claim (#2268): the tenant a run token
+// was started for must survive the same HTTP-middleware -> annotateContext
+// -> gRPC-metadata hop, since AuthorizeTrackerTenant matches req.Username
+// against it (the token's own subject is the box, agent-<skill-id>).
+func TestRunTenantClaim_EndToEndPropagation(t *testing.T) {
+	tm, err := auth.NewTokenManager("propagation-test-secret-at-least-32-bytes-ok", "test")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	mw := auth.NewAuthMiddleware(tm)
+
+	run := auth.RunBinding{RunID: "run-abc123", TrackerConn: "default", Tenant: "alice"}
+	tok, _, err := tm.GenerateDelegatedTokenWithRun("agent-product-define", nil, time.Hour, &auth.Actor{Subject: "alice"}, run, auth.ScopeTrackerWrite)
+	if err != nil {
+		t.Fatalf("GenerateDelegatedTokenWithRun: %v", err)
+	}
+
+	var capturedMD metadata.MD
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMD = annotateContext(r.Context(), r)
+		w.WriteHeader(http.StatusOK)
+	})
+	wrapped := mw.HTTPMiddleware(stub)
+
+	req := httptest.NewRequest("POST", "/v1/tracker/connections/alice/default/issues/1/comments", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	if got := capturedMD.Get(auth.MDKeyRunTenant); len(got) != 1 || got[0] != "alice" {
+		t.Fatalf("run_tenant metadata = %v; want [alice]", got)
+	}
+	if got := capturedMD.Get(auth.MDKeyUsername); len(got) != 1 || got[0] != "agent-product-define" {
+		t.Fatalf("username metadata = %v; want the box [agent-product-define] — the tenant travels in run_tenant, not as the subject", got)
+	}
+
+	grpcCtx := metadata.NewIncomingContext(context.Background(), capturedMD)
+	if got, ok := auth.RunTenantFromGRPCContext(grpcCtx); !ok || got != "alice" {
+		t.Fatalf("RunTenantFromGRPCContext = %q, %v; want alice, true", got, ok)
+	}
+	// What the tracker verbs do with it, on the metadata the handler sees.
+	if err := auth.AuthorizeTrackerTenant(grpcCtx, "alice"); err != nil {
+		t.Fatalf("AuthorizeTrackerTenant(alice) after the hop: %v", err)
+	}
+	if err := auth.AuthorizeTrackerTenant(grpcCtx, "bob"); err == nil {
+		t.Fatal("AuthorizeTrackerTenant(bob) after the hop: want PermissionDenied, got nil")
+	}
+}
+
+func TestRunTenantClaim_AbsentClaimPropagatesAsAbsent(t *testing.T) {
+	// An operator/human token (and any run token minted before #2268)
+	// carries no run_tenant — AuthorizeTrackerTenant must see it as absent,
+	// never as "" matching an empty req.Username.
+	tm, _ := auth.NewTokenManager("propagation-test-secret-at-least-32-bytes-ok", "test")
+	mw := auth.NewAuthMiddleware(tm)
+
+	tok, _, err := tm.GenerateDelegatedTokenWithID("alice", []string{"user"}, time.Hour, nil, "run-abc123", auth.ScopeTrackerWrite)
+	if err != nil {
+		t.Fatalf("GenerateDelegatedTokenWithID: %v", err)
+	}
+
+	var capturedMD metadata.MD
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMD = annotateContext(r.Context(), r)
+		w.WriteHeader(http.StatusOK)
+	})
+	wrapped := mw.HTTPMiddleware(stub)
+
+	req := httptest.NewRequest("POST", "/v1/tracker/connections/alice/default/issues/1/comments", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+
+	if got := capturedMD.Get(auth.MDKeyRunTenant); len(got) != 0 {
+		t.Fatalf("a token minted without a run tenant should NOT propagate run_tenant metadata; got %v", got)
+	}
+}
+
+func TestScopeClaim_RefreshTokenRejectedAtMiddleware(t *testing.T) {
+	// Refresh tokens carry scopes but cannot authenticate to
+	// the API surface (Phase 1.6). The middleware rejects
+	// them with 401, so the gateway never sees the context —
+	// no metadata is propagated, no scope check runs.
+	tm, _ := auth.NewTokenManager("propagation-test-secret-at-least-32-bytes-ok", "test")
+	mw := auth.NewAuthMiddleware(tm)
+
+	refresh, _ := tm.GenerateRefreshToken("alice", []string{"user"}, time.Hour, auth.ScopeContainersWrite)
+
+	called := false
+	stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+	wrapped := mw.HTTPMiddleware(stub)
+
+	req := httptest.NewRequest("GET", "/v1/containers", nil)
+	req.Header.Set("Authorization", "Bearer "+refresh)
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("refresh token at API: status=%d, want 401", rec.Code)
+	}
+	if called {
+		t.Fatal("inner handler must NOT run for a refresh token")
+	}
+}
