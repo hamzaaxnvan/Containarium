@@ -148,3 +148,53 @@ func NewCipher(masterKey []byte) (*Cipher, error) {
 	aead, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("cipher.NewGCM: %w", err)
+	}
+	return &Cipher{aead: aead}, nil
+}
+
+// Encrypt seals plaintext under the master key with a fresh random
+// nonce, binding (username, name) as Additional Authenticated Data.
+//
+// Returns (nonce, ciphertext_with_tag, err). Both bytes are stored
+// in the secrets row; decrypt reads them back and re-derives the
+// AAD from the same (username, name).
+func (c *Cipher) Encrypt(username, name string, plaintext []byte) (nonce, ciphertext []byte, err error) {
+	nonce = make([]byte, NonceSize)
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, nil, fmt.Errorf("generate nonce: %w", err)
+	}
+	aad := buildAAD(username, name)
+	ciphertext = c.aead.Seal(nil, nonce, plaintext, aad)
+	return nonce, ciphertext, nil
+}
+
+// Decrypt verifies and opens the ciphertext under the master key
+// with (username, name) as AAD. Returns ErrAuthentication if the
+// GCM tag fails to verify — that's the signal that either the
+// master key is wrong, the ciphertext was tampered with, or the
+// (username, name) doesn't match what was encrypted.
+func (c *Cipher) Decrypt(username, name string, nonce, ciphertext []byte) (plaintext []byte, err error) {
+	if len(nonce) != NonceSize {
+		return nil, fmt.Errorf("nonce must be %d bytes, got %d", NonceSize, len(nonce))
+	}
+	aad := buildAAD(username, name)
+	pt, err := c.aead.Open(nil, nonce, ciphertext, aad)
+	if err != nil {
+		// crypto/cipher returns a generic error for any auth
+		// failure; normalize to our sentinel so callers can
+		// match.
+		return nil, ErrAuthentication
+	}
+	return pt, nil
+}
+
+// buildAAD concatenates username + 0x00 + name as the AAD. The
+// null separator prevents the trick where ("alice", "X_KEY") and
+// ("aliceX", "_KEY") would otherwise produce the same concatenation.
+func buildAAD(username, name string) []byte {
+	out := make([]byte, 0, len(username)+1+len(name))
+	out = append(out, username...)
+	out = append(out, 0x00)
+	out = append(out, name...)
+	return out
+}
