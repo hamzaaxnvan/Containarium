@@ -90,3 +90,34 @@ func validateImageRegistry(image string) error {
 // used to match against the allowlist. For Incus-style remotes
 // like "ubuntu:22.04" it's "ubuntu". For full URLs it's
 // "scheme://host". For bare names with no colon and no `/`
+// (e.g. "ubuntu", "22.04") it's "ubuntu" — Incus's default
+// remote for un-prefixed images. For path-style references
+// ("images/ubuntu/22.04") it's the empty string, which the
+// allowlist treats as a non-match → reject.
+func imageRegistryPrefix(image string) string {
+	if image == "" {
+		return ""
+	}
+	// Full URL — scheme://host/path
+	if i := strings.Index(image, "://"); i >= 0 {
+		rest := image[i+3:]
+		if j := strings.IndexAny(rest, "/?"); j >= 0 {
+			return image[:i+3+j]
+		}
+		return image
+	}
+	// Incus-style `remote:name`
+	if i := strings.Index(image, ":"); i >= 0 {
+		return image[:i]
+	}
+	// No remote prefix — treat as the default "ubuntu" remote.
+	// Operators who want to reject these should leave "ubuntu"
+	// out of the allowlist; users will need to be explicit.
+	// A `/` indicates a path-style reference (e.g.
+	// "images/ubuntu/22.04") that doesn't match any single
+	// remote — return empty to force rejection.
+	if !strings.Contains(image, "/") {
+		return "ubuntu"
+	}
+	return ""
+}
