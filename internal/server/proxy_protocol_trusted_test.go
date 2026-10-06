@@ -50,3 +50,29 @@ func TestValidateProxyProtocolTrusted_RejectsMixedWildcard(t *testing.T) {
 		t.Fatal("any wildcard entry in a list must reject the whole list")
 	}
 }
+
+func TestValidateProxyProtocolTrusted_RejectsMalformedCIDR(t *testing.T) {
+	cases := []string{
+		"not-a-cidr",
+		"10.0.0.5",     // missing /mask
+		"10.0.0.5/99",  // bad mask
+		"10.0.0.5\\32", // wrong slash
+	}
+	for _, c := range cases {
+		t.Run(c, func(t *testing.T) {
+			if err := validateProxyProtocolTrusted([]string{c}); err == nil {
+				t.Fatalf("malformed CIDR %q must be rejected", c)
+			}
+		})
+	}
+}
+
+func TestValidateProxyProtocolTrusted_TrimsWhitespace(t *testing.T) {
+	// Leading/trailing whitespace shouldn't be silently accepted —
+	// netip.ParsePrefix rejects them after our trim, so we get a
+	// clean error path rather than a weird "matches but doesn't"
+	// case downstream.
+	if err := validateProxyProtocolTrusted([]string{"  10.0.0.5/32  "}); err != nil {
+		t.Fatalf("trimmed CIDR should pass: %v", err)
+	}
+}
