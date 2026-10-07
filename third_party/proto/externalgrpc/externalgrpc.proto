@@ -123,3 +123,253 @@ message NodeGroup {
   // Debug returns a string containing all information regarding this node group.
   string debug = 4;
 }
+
+message ExternalGrpcNode {
+  // ID of the node assigned by the cloud provider in the format: <ProviderName>://<ProviderSpecificNodeID>.
+  string providerID = 1;
+
+  // Name of the node assigned by the cloud provider.
+  string name = 2;
+
+  // labels is a map of {key,value} pairs with the node's labels.
+  map<string, string> labels = 3;
+
+  // If specified, the node's annotations.
+  map<string, string> annotations = 4;
+}
+
+message NodeGroupsRequest {
+  // Intentionally empty.
+}
+
+message NodeGroupsResponse {
+  // All the node groups that the cloud provider service supports.
+  repeated NodeGroup nodeGroups = 1;
+}
+
+message NodeGroupForNodeRequest {
+  // Node for which the request is performed.
+  ExternalGrpcNode node = 1;
+}
+
+message NodeGroupForNodeResponse {
+  // Node group for the given node. nodeGroup with id = "" means no node group.
+  NodeGroup nodeGroup = 1;
+}
+
+message PricingNodePriceRequest {
+  // Node for which the request is performed.
+  ExternalGrpcNode node = 1;
+
+  // Start time for the request period.
+  k8s.io.apimachinery.pkg.apis.meta.v1.Time startTime = 2;
+
+  // End time for the request period.
+  k8s.io.apimachinery.pkg.apis.meta.v1.Time endTime = 3;
+}
+
+message PricingNodePriceResponse {
+  // Theoretical minimum price of running a node for a given period.
+  double price = 1;
+}
+
+message PricingPodPriceRequest {
+  // Pod for which the request is performed.
+  k8s.io.api.core.v1.Pod pod = 1;
+
+  // Start time for the request period.
+  k8s.io.apimachinery.pkg.apis.meta.v1.Time startTime = 2;
+
+  // End time for the request period.
+  k8s.io.apimachinery.pkg.apis.meta.v1.Time endTime = 3;
+}
+
+message PricingPodPriceResponse {
+  // Theoretical minimum price of running a pod for a given period.
+  double price = 1;
+}
+
+message GPULabelRequest {
+  // Intentionally empty.
+}
+
+message GPULabelResponse {
+  // Label added to nodes with a GPU resource.
+  string label = 1;
+}
+
+message GetAvailableGPUTypesRequest {
+  // Intentionally empty.
+}
+
+message GetAvailableGPUTypesResponse {
+  // GPU types passed in as opaque key-value pairs.
+  map<string, google.protobuf.Any> gpuTypes = 1;
+}
+
+message CleanupRequest {
+  // Intentionally empty.
+}
+
+message CleanupResponse {
+  // Intentionally empty.
+}
+
+message RefreshRequest {
+  // Intentionally empty.
+}
+
+message RefreshResponse {
+  // Intentionally empty.
+}
+
+message NodeGroupTargetSizeRequest {
+  // ID of the node group for the request.
+  string id = 1;
+}
+
+message NodeGroupTargetSizeResponse {
+  // Current target size of the node group.
+  int32 targetSize = 1;
+}
+
+message NodeGroupIncreaseSizeRequest {
+  // Number of nodes to add.
+  int32 delta = 1;
+
+  // ID of the node group for the request.
+  string id = 2;
+}
+
+message NodeGroupIncreaseSizeResponse {
+  // Intentionally empty.
+}
+
+message NodeGroupDeleteNodesRequest {
+  // List of nodes to delete.
+  repeated ExternalGrpcNode nodes = 1;
+
+  // ID of the node group for the request.
+  string id = 2;
+}
+
+message NodeGroupDeleteNodesResponse {
+  // Intentionally empty.
+}
+
+message NodeGroupDecreaseTargetSizeRequest {
+  // Number of nodes to delete.
+  int32 delta = 1;
+
+  // ID of the node group for the request.
+  string id = 2;
+}
+
+message NodeGroupDecreaseTargetSizeResponse {
+  // Intentionally empty.
+}
+
+message NodeGroupNodesRequest {
+  // ID of the node group for the request.
+  string id = 1;
+}
+
+message NodeGroupNodesResponse {
+  // list of cloud provider instances in a node group.
+  repeated Instance instances = 1;
+}
+
+message Instance {
+  // Id of the instance.
+  string id = 1;
+
+  // Status of the node.
+  InstanceStatus status = 2;
+}
+
+// InstanceStatus represents the instance status.
+message InstanceStatus {
+  enum InstanceState {
+    // an Unspecified instanceState means the actual instance status is undefined (nil).
+    unspecified = 0;
+
+    // InstanceRunning means instance is running.
+    instanceRunning = 1;
+
+    // InstanceCreating means instance is being created.
+    instanceCreating = 2;
+
+    // InstanceDeleting means instance is being deleted.
+    instanceDeleting = 3;
+  }
+
+  // InstanceState tells if the instance is running, being created or being deleted.
+  InstanceState instanceState = 1;
+
+  // ErrorInfo provides information about the error status.
+  // If there is no error condition related to instance, then errorInfo.errorCode should be an empty string.
+  InstanceErrorInfo errorInfo = 2;
+}
+
+// InstanceErrorInfo provides information about error condition on instance.
+message InstanceErrorInfo {
+  // ErrorCode is cloud-provider specific error code for error condition.
+  // An empty string for errorCode means there is no errorInfo for the instance (nil).
+  string errorCode = 1;
+
+  // ErrorMessage is the human readable description of error condition.
+  string errorMessage = 2;
+
+  // InstanceErrorClass defines the class of error condition.
+  int32 instanceErrorClass = 3;
+}
+
+message NodeGroupTemplateNodeInfoRequest {
+  // ID of the node group for the request.
+  string id = 1;
+}
+
+message NodeGroupTemplateNodeInfoResponse {
+  // nodeInfo is the extracted data from the cloud provider, as a primitive Kubernetes Node type.
+  k8s.io.api.core.v1.Node nodeInfo = 1;
+}
+
+message NodeGroupAutoscalingOptions {
+  // ScaleDownUtilizationThreshold sets threshold for nodes to be considered for scale down
+  // if cpu or memory utilization is over threshold.
+  double scaleDownUtilizationThreshold = 1;
+
+  // ScaleDownGpuUtilizationThreshold sets threshold for gpu nodes to be
+  // considered for scale down if gpu utilization is over threshold.
+  double scaleDownGpuUtilizationThreshold = 2;
+
+  // ScaleDownUnneededTime sets the duration CA expects a node to be
+  // unneeded/eligible for removal before scaling down the node.
+  k8s.io.apimachinery.pkg.apis.meta.v1.Duration scaleDownUnneededTime = 3;
+
+  // ScaleDownUnreadyTime represents how long an unready node should be
+  // unneeded before it is eligible for scale down.
+  k8s.io.apimachinery.pkg.apis.meta.v1.Duration scaleDownUnreadyTime = 4;
+
+  // MaxNodeProvisionTime time CA waits for node to be provisioned
+  k8s.io.apimachinery.pkg.apis.meta.v1.Duration MaxNodeProvisionTime = 5;
+
+  // ZeroOrMaxNodeScaling means that a node group should be scaled up to maximum size or down to zero nodes all at once instead of one-by-one.
+  bool zeroOrMaxNodeScaling = 6;
+
+  // IgnoreDaemonSetsUtilization sets if daemonsets utilization should be considered during node scale-down
+  bool ignoreDaemonSetsUtilization = 7;
+}
+
+message NodeGroupAutoscalingOptionsRequest {
+  // ID of the node group for the request.
+  string id = 1;
+
+  // default node group autoscaling options.
+  NodeGroupAutoscalingOptions defaults = 2;
+}
+
+message NodeGroupAutoscalingOptionsResponse {
+  // autoscaling options for the requested node.
+  NodeGroupAutoscalingOptions nodeGroupAutoscalingOptions = 1;
+}
