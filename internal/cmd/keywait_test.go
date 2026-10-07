@@ -98,3 +98,104 @@ func TestSSHWithKeyWait(t *testing.T) {
 			name:    "host key failure: not retried",
 			armed:   true,
 			ops:     []error{&connectcore.SSHError{ExitCode: 255, Stderr: "Host key verification failed.\n"}, nil},
+			probes:  []error{errors.New("probe must not run")},
+			wantOps: 1,
+			wantErr: true,
+		},
+		{
+			name:    "unarmed: publickey fails once",
+			armed:   false,
+			ops:     []error{pkDenied(), nil},
+			probes:  []error{errors.New("probe must not run")},
+			wantOps: 1,
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			probe, _ := scripted(tc.probes...)
+			withProbe(t, func(context.Context, []string) error { return probe() })
+			op, nOps := scripted(tc.ops...)
+			var status bytes.Buffer
+			kw := connectcore.KeyWait{
+				Armed: tc.armed, Window: 150 * time.Second, Interval: 5 * time.Second,
+				Status: &status, Clock: &stepClock{now: time.Unix(0, 0)},
+			}
+			err := sshWithKeyWait(context.Background(), kw, []string{"probe"}, op)
+			if *nOps != tc.wantOps {
+				t.Errorf("real ssh ran %d times, want %d", *nOps, tc.wantOps)
+			}
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil && strings.Contains(err.Error(), "probe must not run") {
+				t.Fatalf("probe ran when it should not have: %v", err)
+			}
+			if tc.wantErrIs != nil && !errors.Is(err, tc.wantErrIs) {
+				t.Errorf("err = %v, want %v", err, tc.wantErrIs)
+			}
+			var re *remoteExitError
+			if got := errors.As(err, &re); got != tc.wantRemote {
+				t.Errorf("remote exit pass-through = %v, want %v (err %v)", got, tc.wantRemote, err)
+			}
+			if got := strings.Contains(status.String(), "waiting for the sentinel to learn your key"); got != tc.wantWaiting {
+				t.Errorf("waiting line = %v, want %v (%q)", got, tc.wantWaiting, status.String())
+			}
+		})
+	}
+}
+
+func TestCodeInstall_RetriesPublickeyAfterAuthorize(t *testing.T) {
+	origSSH, origResolve, origClock := sshExec, resolveCodeTargetFn, keyWaitClock
+	origBootstrap, origRelease, origVersion, origWait := codeBootstrapURL, codeRelease, codeClaudeCodeVersion, codeKeyWait
+	t.Cleanup(func() {
+		sshExec, resolveCodeTargetFn, keyWaitClock = origSSH, origResolve, origClock
+		codeBootstrapURL, codeRelease, codeClaudeCodeVersion, codeKeyWait = origBootstrap, origRelease, origVersion, origWait
+	})
+	codeBootstrapURL, codeRelease, codeClaudeCodeVersion, codeKeyWait = "", "", "", ""
+	t.Setenv(connectcore.KeyWaitEnv, "")
+	keyWaitClock = &stepClock{now: time.Unix(0, 0)}
+
+	resolveCodeTargetFn = func(context.Context, string, io.Writer) (connectcore.Target, string, error) {
+		return connectcore.Target{User: "alice", Host: "box.example.test", Port: 22}, "/dev/null", nil
+	}
+	calls := 0
+	sshExec = func(_ io.Writer, _ []string) (string, error) {
+		calls++
+		if calls == 1 {
+			return "", pkDenied()
+		}
+		return "1.2.3 (Claude Code)\ncredential sources present:\n  (none)", nil
+	}
+	probe, _ := scripted(pkDenied(), pkDenied(), nil)
+	withProbe(t, func(context.Context, []string) error { return probe() })
+
+	cmd := &cobra.Command{}
+	var out, stderr bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&stderr)
+	cmd.SetContext(context.Background())
+	if err := runCodeInstall(cmd, []string{"alice"}); err != nil {
+		t.Fatalf("install failed despite the key landing: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "waiting for the sentinel to learn your key") {
+		t.Errorf("expected the waiting line on stderr, got %q", stderr.String())
+	}
+}
+
+func TestResolveCodeKeyWait_FlagAndEnv(t *testing.T) {
+	orig := codeKeyWait
+	t.Cleanup(func() { codeKeyWait = orig })
+
+	t.Setenv(connectcore.KeyWaitEnv, "40s")
+	codeKeyWait = ""
+	kw, err := newKeyWait(codeKeyWait, true, &bytes.Buffer{})
+	if err != nil || kw.Window != 40*time.Second || !kw.Armed {
+		t.Fatalf("env: kw=%+v err=%v", kw, err)
+	}
+	codeKeyWait = "0"
+	kw, err = newKeyWait(codeKeyWait, true, &bytes.Buffer{})
+	if err != nil || kw.Window != 0 {
+		t.Fatalf("flag 0: kw=%+v err=%v", kw, err)
+	}
+}
