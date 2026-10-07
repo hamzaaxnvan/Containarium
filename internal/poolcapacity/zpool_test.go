@@ -126,3 +126,195 @@ func TestWithZpool_SkipsPoolsThatAreNotZFS(t *testing.T) {
 	if got[0].Zpool != nil || got[1].Zpool != nil || got[2].Zpool == nil {
 		t.Fatalf("Zpool by pool = %v %v %v, want only the third", got[0].Zpool, got[1].Zpool, got[2].Zpool)
 	}
+}
+
+// No zpool binary (a daemon in a container, or a host without ZFS tools):
+// every pool keeps its Incus numbers, nothing errors.
+func TestWithZpool_MissingBinaryLeavesThePoolsAlone(t *testing.T) {
+	f := &fakeRun{err: map[string]error{"tank": fmt.Errorf("run zpool: %w", exec.ErrNotFound)}}
+	var logs []string
+	got, err := withZpool(baseRead(zfsPool("default", "tank")), f.run, time.Second, func(format string, a ...any) {
+		logs = append(logs, fmt.Sprintf(format, a...))
+	})()
+	if err != nil {
+		t.Fatalf("a missing zpool failed the read: %v", err)
+	}
+	if got[0].Zpool != nil || got[0].UsedBytes != 50 {
+		t.Fatalf("got %+v, want the Incus reading untouched and no Zpool", got[0])
+	}
+	if len(logs) != 0 {
+		t.Errorf("a host without zpool logged %v: that is not worth a line every tick", logs)
+	}
+}
+
+// A failing or garbled zpool for one pool does not take the others with it,
+// and is logged once, not on every tick.
+func TestWithZpool_OnePoolFailingKeepsTheOthersAndLogsOnce(t *testing.T) {
+	f := &fakeRun{
+		out: map[string]string{"good": "good\t10\t3\n"},
+		err: map[string]error{"bad": errors.New("exit status 1")},
+	}
+	var logs []string
+	read := withZpool(baseRead(zfsPool("p-bad", "bad"), zfsPool("p-good", "good")), f.run, time.Second, func(format string, a ...any) {
+		logs = append(logs, fmt.Sprintf(format, a...))
+	})
+	for i := 0; i < 3; i++ {
+		got, err := read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got[0].Zpool != nil || got[1].Zpool == nil || got[1].Zpool.CapacityPercent != 10 {
+			t.Fatalf("pass %d: Zpool = %v / %v, want only the good pool", i, got[0].Zpool, got[1].Zpool)
+		}
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "p-bad") {
+		t.Fatalf("logs = %v, want one line naming p-bad across three passes", logs)
+	}
+}
+
+// A hung zpool returns when its deadline passes, never later, and never blocks
+// the pool's Incus reading: two hung pools cost one deadline, not two.
+func TestWithZpool_HungCommandReturnsWithinTheDeadline(t *testing.T) {
+	f := &fakeRun{hang: map[string]bool{"a": true, "b": true}}
+	start := time.Now()
+	got, err := WithZpool(baseRead(zfsPool("pa", "a"), zfsPool("pb", "b")), f.run, 80*time.Millisecond)()
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("took %s: a hung zpool held the read", elapsed)
+	}
+	if elapsed > 160*time.Millisecond+500*time.Millisecond { // two sequential deadlines would be ~160ms+; allow scheduling noise
+		t.Logf("elapsed %s", elapsed)
+	}
+	if got[0].Zpool != nil || got[1].Zpool != nil || got[0].UsedBytes != 50 {
+		t.Fatalf("got %+v %+v, want the Incus readings and no Zpool", got[0], got[1])
+	}
+}
+
+// The monitor's tick is not held by it either: the snapshot lands with the
+// Incus numbers, well inside the monitor's own timeout.
+func TestMonitor_ATickWithAHungZpoolStillCompletes(t *testing.T) {
+	f := &fakeRun{hang: map[string]bool{"tank": true}}
+	m := New(WithZpool(baseRead(zfsPool("default", "tank")), f.run, 50*time.Millisecond), Options{Timeout: 5 * time.Second, Logf: func(string, ...any) {}})
+
+	start := time.Now()
+	m.Tick()
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("Tick took %s", time.Since(start))
+	}
+	snap := m.Snapshot()
+	if len(snap.Pools) != 1 || snap.Pools[0].UsedBytes != 50 {
+		t.Fatalf("snapshot = %+v, want the Incus reading", snap.Pools)
+	}
+}
+
+// The Incus read failing is passed through untouched.
+func TestWithZpool_PassesTheReadErrorThrough(t *testing.T) {
+	boom := errors.New("list storage pools: boom")
+	f := &fakeRun{}
+	_, err := WithZpool(func() ([]incus.StoragePoolUsage, error) { return nil, boom }, f.run, time.Second)()
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the read error", err)
+	}
+	if f.called() != 0 {
+		t.Error("zpool was run although the pool list failed")
+	}
+}
+
+// A name that could be read as an option or a path never reaches the command
+// line.
+func TestWithZpool_NeverRunsAnUnsafePoolName(t *testing.T) {
+	f := &fakeRun{}
+	read := baseRead(
+		zfsPool("a", "-evil"), zfsPool("b", "../x"), zfsPool("c", "a b"), zfsPool("d", "tank; reboot"), zfsPool("e", ""),
+	)
+	got, err := WithZpool(read, f.run, time.Second)()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.called() != 0 {
+		t.Fatalf("zpool was run %d times for names that are not pool names: %v", f.called(), f.calls)
+	}
+	for _, p := range got {
+		if p.Zpool != nil {
+			t.Errorf("%s got Zpool numbers", p.Name)
+		}
+	}
+}
+
+// A zpool that ignores its deadline (stuck in uninterruptible I/O) must not
+// hold the read, and must not be joined by another one on the next tick.
+func TestWithZpool_DoesNotStackOnAStuckCommand(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	runs := 0
+	stuck := func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		mu.Lock()
+		runs++
+		mu.Unlock()
+		<-release // ignores ctx on purpose
+		return []byte("tank\t1\t1\n"), nil
+	}
+	read := WithZpool(baseRead(zfsPool("default", "tank")), stuck, 40*time.Millisecond)
+
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		got, err := read()
+		if err != nil || got[0].Zpool != nil || got[0].UsedBytes != 50 {
+			t.Fatalf("pass %d: got %+v err %v, want the Incus reading only", i, got, err)
+		}
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("three reads took %s", time.Since(start))
+	}
+	mu.Lock()
+	n := runs
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("zpool was started %d times while the first was still stuck, want 1", n)
+	}
+	close(release)
+}
+
+// After a failure streak ends, the next failure is news again.
+func TestWithZpool_LogsAgainAfterARecovery(t *testing.T) {
+	f := &fakeRun{err: map[string]error{"tank": errors.New("exit status 1")}, out: map[string]string{"tank": "tank\t5\t5\n"}}
+	var logs int
+	read := withZpool(baseRead(zfsPool("default", "tank")), f.run, time.Second, func(string, ...any) { logs++ })
+
+	_, _ = read() // fails: logged
+	_, _ = read() // still failing: quiet
+	f.mu.Lock()
+	f.err = nil
+	f.mu.Unlock()
+	if got, _ := read(); got[0].Zpool == nil { // recovered
+		t.Fatal("no numbers after recovery")
+	}
+	f.mu.Lock()
+	f.err = map[string]error{"tank": errors.New("exit status 1")}
+	f.mu.Unlock()
+	_, _ = read() // fails again: logged again
+	if logs != 2 {
+		t.Fatalf("logged %d times, want 2 (once per failure streak)", logs)
+	}
+}
+
+// The real runner reports a missing binary as exec.ErrNotFound, which is how
+// WithZpool tells "no ZFS tools here" from a failing zpool.
+func TestExecRunner_MissingBinaryIsErrNotFound(t *testing.T) {
+	_, err := ExecRunner(context.Background(), "containarium-no-such-binary-2853", "list")
+	if !errors.Is(err, exec.ErrNotFound) {
+		t.Fatalf("err = %v, want it to wrap exec.ErrNotFound", err)
+	}
+}
+
+// A command that exits non-zero reports why, from its own stderr, one line and
+// capped, so the single log line per failure streak is actionable.
+func TestExecRunner_FailureCarriesTheFirstStderrLine(t *testing.T) {
+	_, err := ExecRunner(context.Background(), "sh", "-c", "echo 'cannot open pool: no such pool' >&2; echo second line >&2; exit 3")
+	if err == nil || !strings.Contains(err.Error(), "cannot open pool: no such pool") || strings.Contains(err.Error(), "second line") {
+		t.Fatalf("err = %v, want exit status plus only the first stderr line", err)
+	}
+}
