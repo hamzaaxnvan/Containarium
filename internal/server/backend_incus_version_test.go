@@ -55,3 +55,22 @@ func peerBackendFor(t *testing.T, systemInfoJSON string) *pb.BackendInfo {
 // shell access.
 func TestListBackends_PeerReportsIncusVersion(t *testing.T) {
 	peer := peerBackendFor(t, `{"info":{"hostname":"byoc-host","incusVersion":"6.23"}}`)
+	// protojson fails the WHOLE decode on an unknown field, so check a field
+	// from outside the one under test: otherwise a drifted payload reads as
+	// "version dropped" rather than "this test's JSON is wrong".
+	if peer.Hostname != "byoc-host" {
+		t.Fatalf("Hostname = %q — the peer's SystemInfo did not decode at all", peer.Hostname)
+	}
+	if peer.IncusVersion != "6.23" {
+		t.Errorf("IncusVersion = %q, want %q", peer.IncusVersion, "6.23")
+	}
+}
+
+// An empty version means "unknown", e.g. a peer whose daemon could not read
+// its Incus server info. It must stay empty, never a guessed value.
+func TestListBackends_PeerWithoutIncusVersionIsEmpty(t *testing.T) {
+	peer := peerBackendFor(t, `{"info":{"hostname":"old-peer"}}`)
+	if peer.IncusVersion != "" {
+		t.Errorf("IncusVersion = %q, want empty for a peer that reported none", peer.IncusVersion)
+	}
+}

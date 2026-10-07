@@ -46,3 +46,20 @@ func TestSSHUpstreamGCEBootStagesPolicy(t *testing.T) {
 		return string(b)
 	}
 	run(body)
+	active := read("policy.json")
+	changed := strings.ReplaceAll(body, `"failureBudget":2`, `"failureBudget":1`)
+	if changed == body {
+		t.Fatal("fixture did not change the actual GCE policy")
+	}
+	run(changed)
+	if read("policy.json") != active {
+		t.Fatal("GCE reboot replaced the active policy hash")
+	}
+	if !strings.Contains(read("policy.pending.json"), `"failureBudget":1`) {
+		t.Fatal("GCE did not stage the changed policy")
+	}
+	run(body)
+	if _, err := os.Stat(filepath.Join(policyDir, "policy.pending.json")); !os.IsNotExist(err) {
+		t.Fatal("GCE rollback left a stale pending policy")
+	}
+}
