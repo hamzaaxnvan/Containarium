@@ -25,3 +25,31 @@ func peerMTLSValue(t *testing.T, enabled, relevant, set bool) (int64, bool) {
 	c.recordPeerMTLS()
 	var rm metricdata.ResourceMetrics
 	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "containarium.peer.mtls.enabled" {
+				continue
+			}
+			g := m.Data.(metricdata.Gauge[int64])
+			return g.DataPoints[0].Value, true
+		}
+	}
+	return 0, false
+}
+
+func TestPeerMTLSGauge(t *testing.T) {
+	if v, ok := peerMTLSValue(t, true, true, true); !ok || v != 1 {
+		t.Fatalf("enabled: got %d,%v want 1", v, ok)
+	}
+	if v, ok := peerMTLSValue(t, false, true, true); !ok || v != 0 {
+		t.Fatalf("disabled: got %d,%v want 0", v, ok)
+	}
+	if _, ok := peerMTLSValue(t, true, false, true); ok {
+		t.Fatal("not relevant (standalone) must emit nothing")
+	}
+	if _, ok := peerMTLSValue(t, false, true, false); ok {
+		t.Fatal("no hook set must emit nothing")
+	}
+}
