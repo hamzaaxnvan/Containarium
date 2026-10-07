@@ -138,3 +138,39 @@ func TestTrackerVerbs_RealRunToken_AuthorizesOwnTenant(t *testing.T) {
 		t.Fatalf("comments on the forge = %v, want exactly one on #42", provider.commentNumbers)
 	}
 	if !strings.Contains(provider.commentBody, runID) || !strings.Contains(provider.commentBody, "product-define") {
+		t.Errorf("comment stamp = %q, want it to name run %s and skill product-define", provider.commentBody, runID)
+	}
+}
+
+// TestTrackerVerbs_RealRunToken_RefusedOnOtherTenantsConnection is the
+// negative half: a run token minted for tenant A is still refused on
+// tenant B's connection — even one with the same name, which exists, so
+// the refusal can only be the tenant check — and nothing reaches B's
+// forge.
+func TestTrackerVerbs_RealRunToken_RefusedOnOtherTenantsConnection(t *testing.T) {
+	const tenantA = "tracker-real-run-token-tenant-a"
+	const tenantB = "tracker-real-run-token-tenant-b"
+	issue := tracker.Issue{Number: 7, Title: "B's private issue", State: pb.TrackerIssueState_TRACKER_ISSUE_STATE_OPEN}
+	providerB := &fakeWriterProvider{fakeReaderProvider: fakeReaderProvider{issue: issue, issues: []tracker.Issue{issue}}}
+	// Both tenants have a connection named "default" in the same store.
+	setUpCreateConnection(t, tenantA, &fakeWriterProvider{}, nil)
+	s, _, _ := setUpCreateConnection(t, tenantB, providerB, nil)
+	const runID = "run-real-token-cross-tenant"
+	s.runRegistry.Register(runID, runlease.Info{SkillID: "product-define", Model: "fable"})
+	// A's run, bound to A's "default".
+	run := realRunCtx(t, tenantA, runID)
+
+	_, err := s.GetTrackerIssue(run, &pb.GetTrackerIssueRequest{Username: tenantB, Connection: "default", Number: 7})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("GetTrackerIssue on tenant B with A's run token: code = %v (%v), want PermissionDenied", status.Code(err), err)
+	}
+	_, err = s.CommentOnTrackerIssue(run, &pb.CommentOnTrackerIssueRequest{
+		Username: tenantB, Connection: "default", Number: 7, Body: "hello from A's run",
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("CommentOnTrackerIssue on tenant B with A's run token: code = %v (%v), want PermissionDenied", status.Code(err), err)
+	}
+	if len(providerB.commentNumbers) != 0 {
+		t.Fatalf("comments reached tenant B's forge: %v, want none", providerB.commentNumbers)
+	}
+}
