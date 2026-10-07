@@ -162,3 +162,168 @@ func (r *PrimaryRegistry) Unregister(pool Pool) bool {
 // Used when a tunnel-registered primary disconnects. Returns the number of
 // entries removed.
 func (r *PrimaryRegistry) UnregisterByBackendID(backendID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	removed := 0
+	for pool, p := range r.primaries {
+		if p.BackendID == backendID {
+			delete(r.primaries, pool)
+			removed++
+		}
+	}
+	return removed
+}
+
+// isStale returns true if a primary's heartbeat is too old.
+//
+// Tunnel-backed primaries (BackendID != "") have explicit lifecycle hooks
+// — OnTunnelConnect adds them, OnTunnelDisconnect calls
+// UnregisterByBackendID. TTL is for HTTP-registered primaries that may
+// have died without DELETE'ing themselves. Skipping TTL for tunnel-backed
+// entries prevents the registry from forgetting them while their yamux
+// session is still alive (which would otherwise happen 90s after handshake
+// since nothing refreshes their heartbeat).
+func (r *PrimaryRegistry) isStale(p *Primary, now time.Time) bool {
+	if p.BackendID != "" {
+		return false
+	}
+	return now.Sub(p.LastHeartbeat) > PrimaryTTL
+}
+
+// LookupByPool returns the primary serving the given pool, or nil. Stale
+// entries are treated as absent.
+func (r *PrimaryRegistry) LookupByPool(pool Pool) *Primary {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	p, ok := r.primaries[pool]
+	if !ok {
+		return nil
+	}
+	if r.isStale(p, r.now()) {
+		return nil
+	}
+	return p
+}
+
+// LookupByHostname returns the primary registered for the given public
+// hostname, matching either the Hostname or any of the Aliases. Stale
+// entries are skipped. Used by the SNI router.
+func (r *PrimaryRegistry) LookupByHostname(hostname string) *Primary {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := r.now()
+	for _, p := range r.primaries {
+		if r.isStale(p, now) {
+			continue
+		}
+		if p.Hostname == hostname {
+			return p
+		}
+		for _, a := range p.Aliases {
+			if a == hostname {
+				return p
+			}
+		}
+	}
+	return nil
+}
+
+// LookupByBaseDomainSuffix returns the primary whose BaseDomains
+// contain the longest proper DNS suffix of hostname (i.e. hostname is
+// of the form "<sub>.<one-of-BaseDomains>"). A primary may advertise
+// multiple base domains; each is considered independently. The base
+// domain itself is NOT a match — only strict sub-hostnames — so a
+// primary's BaseDomains can include another primary's Hostname
+// without colliding here. Returns nil when no primary qualifies or
+// when two primaries tie on suffix length (ambiguity is a
+// misconfiguration; fail closed rather than pick one arbitrarily).
+// Stale entries are skipped.
+//
+// Used by the SNI router after LookupByHostname misses, to route
+// ad-hoc container subdomains (e.g. blog.example.org) without
+// each one being pre-registered as an alias.
+func (r *PrimaryRegistry) LookupByBaseDomainSuffix(hostname string) *Primary {
+	if hostname == "" {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := r.now()
+
+	var best *Primary
+	bestLen := 0
+	tie := false
+	for _, p := range r.primaries {
+		if r.isStale(p, now) {
+			continue
+		}
+		for _, bd := range p.BaseDomains {
+			if bd == "" {
+				continue
+			}
+			if !strings.HasSuffix(hostname, "."+bd) {
+				continue
+			}
+			switch {
+			case len(bd) > bestLen:
+				best = p
+				bestLen = len(bd)
+				tie = false
+			case len(bd) == bestLen && best != nil && p != best:
+				tie = true
+			}
+		}
+	}
+	if tie {
+		return nil
+	}
+	return best
+}
+
+// All returns a snapshot of registered primaries. Stale entries are excluded
+// and evicted from the underlying map.
+func (r *PrimaryRegistry) All() []*Primary {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.now()
+	out := make([]*Primary, 0, len(r.primaries))
+	for pool, p := range r.primaries {
+		if r.isStale(p, now) {
+			delete(r.primaries, pool)
+			continue
+		}
+		copy := *p
+		out = append(out, &copy)
+	}
+	return out
+}
+
+// ScopeForBackend returns the domains the primary registered by backendID
+// covers (hostname, aliases, base domains), or an empty scope when that
+// backend holds no live primary registration.
+func (r *PrimaryRegistry) ScopeForBackend(backendID string) CertScope {
+	if backendID == "" {
+		return CertScope{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := r.now()
+	var scope CertScope
+	for _, p := range r.primaries {
+		if p.BackendID != backendID || r.isStale(p, now) {
+			continue
+		}
+		if scope.Hostname == "" {
+			scope.Hostname = strings.ToLower(p.Hostname)
+		} else {
+			scope.Aliases = append(scope.Aliases, strings.ToLower(p.Hostname))
+		}
+		for _, a := range p.Aliases {
+			scope.Aliases = append(scope.Aliases, strings.ToLower(a))
+		}
+		for _, bd := range p.BaseDomains {
+			scope.BaseDomains = append(scope.BaseDomains, strings.ToLower(bd))
+		}
+	}
+	return scope
+}
