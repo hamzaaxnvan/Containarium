@@ -218,3 +218,151 @@ func (f *jailFixture) write(name, data string) {
 	}
 }
 
+// read reports missing evidence rather than hiding a failed foreground service.
+func (f *jailFixture) read(name string) string {
+	f.t.Helper()
+	b, err := os.ReadFile(filepath.Join(f.dir, name))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return string(b)
+}
+
+// command runs only locally configured test binaries with a finite deadline.
+func (f *jailFixture) command(name string, args ...string) string {
+	f.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, jailTool(f.t, name), args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		f.t.Fatalf("%s %v: %v\n%s", name, args, err, out)
+	}
+	return string(out)
+}
+
+// start reaps a process group on every exit path, including failed assertions.
+func (f *jailFixture) start(name string, args ...string) func() {
+	f.t.Helper()
+	cmd := exec.Command(jailTool(f.t, name), args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	log, err := os.Create(filepath.Join(f.dir, name+"-process.log"))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	cmd.Stdout, cmd.Stderr = log, log
+	if err := cmd.Start(); err != nil {
+		_ = log.Close()
+		f.t.Fatal(err)
+	}
+	stopped := false
+	stop := func() {
+		if !stopped {
+			stopped = true
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			done := make(chan struct{})
+			go func() { _ = cmd.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				<-done
+			}
+			_ = log.Close()
+		}
+	}
+	f.t.Cleanup(stop)
+	return stop
+}
+
+// connect uses a real SSH handshake and verifies the fixture's host key.
+func (f *jailFixture) connect(login, key string, source ...string) error {
+	data, err := os.ReadFile(key)
+	if err != nil {
+		return err
+	}
+	signer, err := ssh.ParsePrivateKey(data)
+	if err != nil {
+		return err
+	}
+	host, _, _, _, err := ssh.ParseAuthorizedKey([]byte(f.read("host.pub")))
+	if err != nil {
+		return err
+	}
+	dialer := net.Dialer{Timeout: time.Second}
+	if len(source) != 0 {
+		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(source[0])}
+	}
+	c, err := dialer.Dial("tcp", f.addr)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	conn, _, _, err := ssh.NewClientConn(c, f.addr, &ssh.ClientConfig{User: login, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: ssh.FixedHostKey(host)})
+	if err == nil {
+		_ = conn.Close()
+	}
+	return err
+}
+
+// controlFailure supplies a real, nonexempt failure as a log-consumption marker.
+func (f *jailFixture) controlFailure() {
+	if err := f.connect("containarium-jail-control-invalid", f.badKey, "127.0.0.2"); err == nil {
+		f.t.Fatal("control account unexpectedly authenticated")
+	}
+}
+
+// client addresses only this fixture's private fail2ban Unix socket.
+func (f *jailFixture) client(args ...string) string {
+	return f.command("fail2ban-client", append([]string{"-c", f.conf, "-s", filepath.Join(f.dir, "f2b.sock")}, args...)...)
+}
+
+// startJail starts the real polling filter after sshd has finished writing logs.
+func (f *jailFixture) startJail() {
+	f.stopJail = f.start("fail2ban-server", "-xf", "-c", f.conf, "-s", filepath.Join(f.dir, "f2b.sock"), "-p", filepath.Join(f.dir, "f2b.pid"), "--logtarget", filepath.Join(f.dir, "fail2ban.log"), "start")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		log, _ := os.ReadFile(filepath.Join(f.dir, "fail2ban.log"))
+		if strings.Contains(string(log), "Jail 'sshd' started") {
+			break
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("fail2ban readiness: %s", f.read("fail2ban-server-process.log"))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	f.client("ping")
+}
+
+// waitStatus polls the real reader's counters and captures its final snapshot.
+func (f *jailFixture) waitStatus(expected int) string {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		out := f.client("status", "sshd")
+		match := regexp.MustCompile(`Total failed:\s+(\d+)`).FindStringSubmatch(out)
+		if len(match) == 2 && match[1] == strconv.Itoa(expected) {
+			f.write("status.log", out)
+			return out
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("expected %d failures; %s\n%s", expected, out, f.read("fail2ban.log"))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// waitAction proves the jail executed its configured ban or unban action.
+func (f *jailFixture) waitAction(want string) {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		b, _ := os.ReadFile(filepath.Join(f.dir, "actions.log"))
+		if strings.Contains("\n"+string(b), "\n"+want+"\n") {
+			return
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("missing action %q: %s", want, b)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
