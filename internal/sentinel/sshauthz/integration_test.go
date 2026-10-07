@@ -174,3 +174,179 @@ func startIntegrationChain(t *testing.T, authzArgs ...string) *integrationChain 
 		ctn, "sentinel", "ssh-authz-plugin", "--ssh-authz-socket", socket, "--ssh-authz-grace", "2s", "--records-file", records, "--sshpiper-config", configFile}
 	args = append(args, authzArgs...)
 	args = append(args, "--",
+		ctn, "sentinel", "ssh-session-plugin", "--records-file", records, "--sshpiper-config", configFile, "--", yaml, "--config", configFile)
+	cmd := exec.Command(piperd, args...)
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		_ = logFile.Close()
+		if t.Failed() {
+			logs, _ := os.ReadFile(logFile.Name())
+			t.Log(string(logs))
+		}
+	})
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		c, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("sshpiperd not listening")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return &integrationChain{address: address, records: records, dir: dir, upstream: upstream, allowKey: allowKey, denyKey: denyKey, outage: &outage, calls: &calls, respond: &respond}
+}
+
+// dial authenticates as alice offering keys in order and runs one command.
+func (c *integrationChain) dial(keys ...ssh.Signer) error {
+	client, err := ssh.Dial("tcp", c.address, &ssh.ClientConfig{User: "alice", Auth: []ssh.AuthMethod{ssh.PublicKeys(keys...)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 5 * time.Second}) //nolint:gosec // loopback test
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	s, err := client.NewSession()
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	out, err := s.Output("echo audit-ok")
+	if err != nil || strings.TrimSpace(string(out)) != "audit-ok" {
+		return fmt.Errorf("session: %q %v", out, err)
+	}
+	return nil
+}
+
+// tryPhase returns the index'th record of the given phase, if written yet.
+func (c *integrationChain) tryPhase(phase sshsession.SessionPhase, index int) (sshsession.Record, bool) {
+	data, _ := os.ReadFile(c.records)
+	n := 0
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		var rec sshsession.Record
+		if json.Unmarshal(line, &rec) == nil && rec.Phase == phase {
+			if n == index {
+				return rec, true
+			}
+			n++
+		}
+	}
+	return sshsession.Record{}, false
+}
+
+// phase waits for the index'th record of the given phase.
+func (c *integrationChain) phase(t *testing.T, phase sshsession.SessionPhase, index int) sshsession.Record {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if rec, ok := c.tryPhase(phase, index); ok {
+			return rec
+		}
+		if time.Now().After(deadline) {
+			data, _ := os.ReadFile(c.records)
+			t.Fatalf("missing %s record %d: %s", phase, index, data)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestIntegrationAuditOnlyChain(t *testing.T) {
+	c := startIntegrationChain(t)
+	connect := func(key ssh.Signer) {
+		t.Helper()
+		if err := c.dial(key); err != nil {
+			t.Fatalf("audit-only login failed: %v", err)
+		}
+	}
+	assertOpen := func(index int, decision sshsession.AuthzDecision, reason sshsession.DenyReason, user string) {
+		t.Helper()
+		rec := c.phase(t, sshsession.SessionPhaseOpen, index)
+		if rec.UserID != user || rec.AuthzDecision != sshsession.DecisionToProto(decision) || rec.DenyReason != sshsession.ReasonToProto(reason) || rec.Enforced {
+			t.Fatalf("open %d: %+v", index, rec)
+		}
+	}
+	connect(c.allowKey)
+	assertOpen(0, sshsession.AuthzAllow, "", "user-allow")
+	connect(c.denyKey)
+	assertOpen(1, sshsession.AuthzDeny, sshsession.DenyUnknownKey, "")
+	c.outage.Store(true)
+	connect(c.allowKey)
+	assertOpen(2, sshsession.AuthzAllow, "", "user-allow")
+	if c.calls.Load() != 3 {
+		t.Fatalf("grace must follow failed revalidation; calls=%d", c.calls.Load())
+	}
+	time.Sleep(2100 * time.Millisecond)
+	connect(c.allowKey)
+	assertOpen(3, sshsession.AuthzDeny, sshsession.DenyUpstreamUnavailable, "")
+	data, _ := os.ReadFile(c.records)
+	if bytes.Contains(data, []byte(`"phase":"denied"`)) {
+		t.Fatalf("audit-only wrote a denied record: %s", data)
+	}
+}
+
+func integrationFreePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func integrationSSHServer(t *testing.T, host ssh.Signer) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	cfg := &ssh.ServerConfig{NoClientAuth: true}
+	cfg.AddHostKey(host)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				conn, chans, reqs, err := ssh.NewServerConn(c, cfg)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				go ssh.DiscardRequests(reqs)
+				for ch := range chans {
+					if ch.ChannelType() != "session" {
+						_ = ch.Reject(ssh.UnknownChannelType, "session only")
+						continue
+					}
+					channel, requests, err := ch.Accept()
+					if err != nil {
+						continue
+					}
+					go func() {
+						defer channel.Close()
+						for r := range requests {
+							if r.Type == "exec" {
+								_ = r.Reply(true, nil)
+								_, _ = channel.Write([]byte("audit-ok\n"))
+								_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+								return
+							}
+							_ = r.Reply(false, nil)
+						}
+					}()
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
