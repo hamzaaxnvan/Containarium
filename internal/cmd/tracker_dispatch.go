@@ -64,3 +64,202 @@ var (
 	trackerDispatchesState  string
 	// trackerDispatchMaxStarts bounds the runs each tick starts (#2270);
 	// 0 is unlimited.
+	trackerDispatchMaxStarts int32
+)
+
+func init() {
+	trackerCmd.AddCommand(trackerDispatchCmd)
+	trackerDispatchCmd.Flags().BoolVar(&trackerDispatchOnce, "once", false, "Run one tick and exit.")
+	trackerDispatchCmd.Flags().DurationVar(&trackerDispatchInterval, "interval", defaultDispatchInterval,
+		"Time between ticks when looping (minimum 1s). Stops on Ctrl-C / SIGTERM.")
+	trackerDispatchCmd.Flags().Int32Var(&trackerDispatchMaxStarts, "max-starts", 0,
+		"Most runs each tick may start; the rest are left for a later tick. 0 is unlimited.")
+
+	trackerCmd.AddCommand(trackerDispatchesCmd)
+	trackerDispatchesCmd.Flags().StringVar(&trackerDispatchesState, "state", "",
+		"Only list dispatches in this state: queued, running, done or failed.")
+}
+
+// trackerDispatchClient is the slice of the typed client these commands
+// need; both transports satisfy it.
+type trackerDispatchClient interface {
+	DispatchTrackerIssues(username, connection string, maxStarts int32) (*pb.DispatchTrackerIssuesResponse, error)
+	ListTrackerDispatches(username, connection string, state pb.TrackerDispatchState) ([]*pb.TrackerDispatch, error)
+	Close() error
+}
+
+var (
+	_ trackerDispatchClient = (*client.GRPCClient)(nil)
+	_ trackerDispatchClient = (*client.HTTPClient)(nil)
+)
+
+func newTrackerDispatchClient() (trackerDispatchClient, error) {
+	if serverAddr == "" {
+		return nil, fmt.Errorf("--server is required for tracker commands (the daemon runs the dispatch)")
+	}
+	if httpMode {
+		return client.NewHTTPClient(serverAddr, authToken)
+	}
+	return client.NewGRPCClient(serverAddr, certsDir, insecure)
+}
+
+// validateDispatchFlags rejects --once combined with an explicit
+// --interval, an interval short enough to hammer the forge, and a
+// negative --max-starts.
+func validateDispatchFlags(once bool, interval time.Duration, intervalChanged bool, maxStarts int32) error {
+	if maxStarts < 0 {
+		return fmt.Errorf("--max-starts must be 0 (unlimited) or positive, got %d", maxStarts)
+	}
+	if once && intervalChanged {
+		return fmt.Errorf("--once and --interval are mutually exclusive")
+	}
+	if !once && interval < time.Second {
+		return fmt.Errorf("--interval must be at least 1s, got %s", interval)
+	}
+	return nil
+}
+
+// parseDispatchStateFlag maps --state onto the proto enum; empty means
+// every state.
+func parseDispatchStateFlag(s string) (pb.TrackerDispatchState, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED, nil
+	}
+	v, ok := pb.TrackerDispatchState_value["TRACKER_DISPATCH_STATE_"+strings.ToUpper(s)]
+	if !ok || v == int32(pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED) {
+		return 0, fmt.Errorf("--state %q is invalid: use queued, running, done or failed", s)
+	}
+	return pb.TrackerDispatchState(v), nil
+}
+
+// dispatchStateName is the lowercase short form printed in tables.
+func dispatchStateName(s pb.TrackerDispatchState) string {
+	return strings.ToLower(strings.TrimPrefix(s.String(), "TRACKER_DISPATCH_STATE_"))
+}
+
+// runDispatchLoop runs tick once (returning its error) or every
+// interval until ctx is cancelled. In loop mode a failed tick is logged
+// and the loop carries on: a transient forge or network error must not
+// stop a long-running dispatcher, and the daemon's durable rows make a
+// retried tick safe.
+func runDispatchLoop(ctx context.Context, once bool, interval time.Duration, tick func() error, logf func(string, ...any)) error {
+	if once {
+		return tick()
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		if err := tick(); err != nil {
+			logf("dispatch tick failed: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+	}
+}
+
+func runTrackerDispatch(cmd *cobra.Command, args []string) error {
+	username, connection := args[0], args[1]
+	intervalChanged := cmd.Flags().Changed("interval")
+	if err := validateDispatchFlags(trackerDispatchOnce, trackerDispatchInterval, intervalChanged, trackerDispatchMaxStarts); err != nil {
+		return err
+	}
+	c, err := newTrackerDispatchClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	parent := cmd.Context()
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	tick := func() error {
+		resp, err := c.DispatchTrackerIssues(username, connection, trackerDispatchMaxStarts)
+		if err != nil {
+			return err
+		}
+		printDispatchTick(resp)
+		return nil
+	}
+	logf := func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }
+	return runDispatchLoop(ctx, trackerDispatchOnce, trackerDispatchInterval, tick, logf)
+}
+
+func runTrackerDispatches(cmd *cobra.Command, args []string) error {
+	username, connection := args[0], args[1]
+	state, err := parseDispatchStateFlag(trackerDispatchesState)
+	if err != nil {
+		return err
+	}
+	c, err := newTrackerDispatchClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	rows, err := c.ListTrackerDispatches(username, connection, state)
+	if err != nil {
+		return err
+	}
+	printTrackerDispatches(username, connection, rows)
+	return nil
+}
+
+func printDispatchTick(resp *pb.DispatchTrackerIssuesResponse) {
+	ts := time.Now().Format(time.RFC3339)
+	for _, d := range resp.GetStarted() {
+		fmt.Printf("%s started #%d %s%s -> %s (run %s)\n", ts, d.GetIssueNumber(), scopeLabelPrefix, d.GetScope(), d.GetSkillId(), d.GetRunId())
+	}
+	for _, d := range resp.GetFailed() {
+		fmt.Printf("%s failed  #%d %s%s -> %s: %s\n", ts, d.GetIssueNumber(), scopeLabelPrefix, d.GetScope(), d.GetSkillId(), d.GetFailureReason())
+	}
+	for _, d := range resp.GetTimedOut() {
+		cause := strings.ToLower(strings.TrimPrefix(d.GetFailure().String(), "TRACKER_DISPATCH_FAILURE_"))
+		fmt.Printf("%s swept   #%d %s%s -> %s (run %s) %s: %s\n", ts, d.GetIssueNumber(), scopeLabelPrefix, d.GetScope(), d.GetSkillId(),
+			d.GetRunId(), cause, d.GetFailureReason())
+	}
+	fmt.Printf("%s tick: started=%d failed=%d timed_out=%d skipped approval=%d active=%d unrouted=%d over-depth=%d left-undispatched=%d\n", ts,
+		len(resp.GetStarted()), len(resp.GetFailed()), len(resp.GetTimedOut()),
+		resp.GetSkippedNeedsApproval(), resp.GetSkippedActive(), resp.GetSkippedUnrouted(), resp.GetSkippedOverDepth(),
+		resp.GetLeftUndispatched())
+}
+
+// lineageReservationsDetail names the fan-out slots a row's run still
+// holds as lineage reservations (#2062), and since when — "" when none.
+func lineageReservationsDetail(d *pb.TrackerDispatch) string {
+	n := d.GetLineageReservations()
+	if n == 0 {
+		return ""
+	}
+	s := fmt.Sprintf("  reserved=%d", n)
+	if at := d.GetOldestLineageReservationAt(); at != nil {
+		s += " since " + at.AsTime().UTC().Format(time.RFC3339)
+	}
+	return s
+}
+
+func printTrackerDispatches(username, connection string, rows []*pb.TrackerDispatch) {
+	if len(rows) == 0 {
+		fmt.Printf("(no dispatches on %s/%s)\n", username, connection)
+		return
+	}
+	fmt.Printf("%-8s %-8s %-24s %-24s %-38s %s\n", "ISSUE", "STATE", "LABEL", "SKILL", "RUN", "CREATED / REASON")
+	for _, d := range rows {
+		detail := ""
+		if d.GetCreatedAt() != nil {
+			detail = d.GetCreatedAt().AsTime().Format(time.RFC3339)
+		}
+		if r := d.GetFailureReason(); r != "" {
+			detail += "  " + r
+		}
+		detail += lineageReservationsDetail(d)
+		fmt.Printf("%-8s %-8s %-24s %-24s %-38s %s\n", fmt.Sprintf("#%d", d.GetIssueNumber()), dispatchStateName(d.GetState()),
+			scopeLabelPrefix+d.GetScope(), d.GetSkillId(), d.GetRunId(), strings.TrimSpace(detail))
+	}
+}
