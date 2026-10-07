@@ -61,3 +61,67 @@ function writeCodexConfig(cfg: EngineConfig): void {
 }
 
 // mode: "run" (one-shot — read input.json, run once, write artifact.json; the
+// 4a path `agent run` uses), "serve" (start the A2A server so peers/crews can
+// delegate tasks; the 4b path SendAgentTask reaches), or "poll" (pull-queue
+// worker: lease → run → complete in a loop, outbound-only; prototype). Default
+// "run".
+const mode = (process.env.CONTAINARIUM_AGENT_MODE ?? "run").toLowerCase();
+
+async function main(): Promise<void> {
+  const seed = loadSeed(seedDir);
+  const engine = trackClaudeCredentialState(pickEngine(engineName), homedir());
+  const cfg: EngineConfig = {
+    model,
+    systemPrompt: seed.systemPrompt,
+    agentBoxCommand,
+    agentBoxArgs: [],
+    maxTurns,
+    platformMcp: seed.platformMcp,
+    outputSchema: seed.outputSchema,
+  };
+
+  if (engine.name === "codex") writeCodexConfig(cfg);
+
+  if (mode === "serve") {
+    // Long-running: serve /agent-card + /tasks until the box stops. Each task
+    // is journaled under the run_id it carries (#2095).
+    //
+    // POST /tasks is daemon-only (#2125): it demands the per-box secret the
+    // daemon derived for this box and exported as A2A_TOKEN_ENV. Absent, every
+    // task is refused — a box with no credential serves nobody.
+    const journals = serveJournals({
+      skillId: process.env.CONTAINARIUM_SKILL_ID,
+      secrets: journalSecrets(process.env, seed.tokenPath),
+    });
+    startA2AServer({
+      seed,
+      engine,
+      cfg,
+      journals,
+      expectedToken: (process.env[A2A_TOKEN_ENV] ?? "").trim(),
+    });
+    return;
+  }
+
+  if (mode === "poll") {
+    // Long-running pull-queue worker: lease → run → complete, outbound-only.
+    // The seed's system prompt is the worker's persona; the leased task's
+    // input_json is the per-run input.
+    await runPollLoop(pollConfigFromEnv(), engine, cfg);
+    return;
+  }
+
+  // Run mode: journaled under CONTAINARIUM_RUN_ID / CONTAINARIUM_SKILL_ID,
+  // which the daemon exports; missing either is a hard failure (#2095).
+  process.exitCode = await runOnce({
+    env: process.env,
+    seedDir,
+    inputJson: seed.inputJson,
+    tokenPath: seed.tokenPath,
+    engine,
+    cfg,
+    model,
+  });
+}
+
+void main();

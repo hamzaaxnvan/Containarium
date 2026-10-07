@@ -327,3 +327,223 @@ build-macos11: ## Build containarium client for macOS 11 (amd64 + arm64), append
 # One Caddy binary with caddy-l4 (SNI passthrough) + EVERY supported DNS-01
 # provider baked in, published alongside the binaries above so setupCaddy
 # (internal/server/core_services.go) can download+verify it instead of
+# running xcaddy from source on every host at provisioning time — no
+# compiler, no proxy.golang.org egress, no drift between differently-timed
+# provisions, and enabling DNS-01 later becomes a config change instead of a
+# rebuild.
+#
+# Baking in every provider (not just the one xcaddy's PRE-#1617 build cared
+# about) means a host can switch providers without a Caddy rebuild; the cost
+# is a few MB per unused module, not a new host round-trip.
+#
+# CADDY_VERSION is a deliberate pin, not `xcaddy build` with no version arg
+# (which tracks Caddy's latest tag at BUILD time — the same per-provision
+# drift this asset exists to remove, just moved to CI cadence). Bump it
+# deliberately, in its own reviewable commit.
+#
+# The --with list below MUST list every entry in dnsProviderModules
+# (internal/app/caddy_types.go) — TestCaddyModulesInSyncWithMakefile
+# (internal/app/caddy_types_makefile_test.go) fails CI if this drifts from
+# that map, in either direction.
+CADDY_VERSION=v2.11.4
+build-caddy: ## Build the pre-configured Caddy release binary (caddy-l4 + every DNS-01 provider)
+	@echo "==> Installing xcaddy..."
+	@scripts/install-xcaddy.sh $$(go env GOPATH)/bin/xcaddy
+	@echo "==> Building Caddy $(CADDY_VERSION) with caddy-l4 + every DNS-01 provider (this takes a few minutes)..."
+	@$$(go env GOPATH)/bin/xcaddy build $(CADDY_VERSION) \
+	    --with github.com/mholt/caddy-l4 \
+	    --with github.com/caddy-dns/azure \
+	    --with github.com/caddy-dns/cloudflare \
+	    --with github.com/caddy-dns/digitalocean \
+	    --with github.com/caddy-dns/duckdns \
+	    --with github.com/caddy-dns/godaddy \
+	    --with github.com/caddy-dns/googleclouddns \
+	    --with github.com/caddy-dns/namecheap \
+	    --with github.com/caddy-dns/route53 \
+	    --with github.com/caddy-dns/vultr \
+	    --output $(BUILD_DIR)/caddy-linux-amd64
+	@cd $(BUILD_DIR) && shasum -a 256 caddy-linux-amd64 >> SHA256SUMS.txt
+	@echo "==> caddy-linux-amd64 built: $$(du -h $(BUILD_DIR)/caddy-linux-amd64 | cut -f1)"
+
+# ---- Air-gapped install bundle (E3a/E3b) ----
+# Per prd/cloud/air-gapped-install-bundle.md, ship a `.tar.gz` bundle
+# that bakes in every binary, toolchain, .deb, and sidecar image needed
+# to install Containarium on a host with zero internet egress. The
+# bundle wraps `make build-release` output + a download-cache populated
+# by scripts/bundle/download-deps.sh.
+BUNDLE_OS?=linux
+BUNDLE_ARCH?=amd64
+BUNDLE_VERSION?=$(shell grep '^[[:space:]]*Version = ' pkg/version/version.go | head -1 | sed -E 's/.*"([^"]+)".*/v\1/')
+
+# #1732: same freeze as VERSION/GIT_COMMIT/BUILD_TIME above.
+$(foreach v,BUNDLE_OS BUNDLE_ARCH BUNDLE_VERSION,$(if $(filter command\ line environment environment\ override,$(origin $v)),$(eval override $v := $$(value $v))))
+export BUNDLE_OS BUNDLE_ARCH BUNDLE_VERSION
+
+bundle-download-deps: ## Pull toolchains + apt packages into dist/bundle-cache/ (run once per OS/ARCH)
+	@echo "==> Downloading bundle dependencies for $${BUNDLE_OS}/$${BUNDLE_ARCH}..."
+	@chmod +x scripts/bundle/download-deps.sh
+	@OS=$${BUNDLE_OS} ARCH=$${BUNDLE_ARCH} ./scripts/bundle/download-deps.sh
+
+build-bundle: build-release ## Assemble the air-gapped install bundle tarball
+	@echo "==> Building air-gapped bundle $${BUNDLE_VERSION} for $${BUNDLE_OS}/$${BUNDLE_ARCH}..."
+	@chmod +x scripts/bundle/build-bundle.sh
+	@VERSION=$${BUNDLE_VERSION} OS=$${BUNDLE_OS} ARCH=$${BUNDLE_ARCH} \
+		./scripts/bundle/build-bundle.sh
+
+build-bundle-all: ## Build bundles for linux/amd64 and linux/arm64
+	@$(MAKE) build-bundle BUNDLE_OS=linux BUNDLE_ARCH=amd64
+	@$(MAKE) build-bundle BUNDLE_OS=linux BUNDLE_ARCH=arm64
+
+install: build ## Install both containarium and containariumd to /usr/local/bin (requires sudo)
+	@echo "==> Installing $(BINARY_NAME) and $(DAEMON_BINARY_NAME) to /usr/local/bin..."
+	@sudo cp $(BUILD_DIR)/$(BINARY_NAME) /usr/local/bin/
+	@sudo cp $(BUILD_DIR)/$(DAEMON_BINARY_NAME) /usr/local/bin/
+	@echo "==> Installed successfully. Run '$(BINARY_NAME) --help' or '$(DAEMON_BINARY_NAME) --help' to get started"
+
+install-client: proto ## Install only the containarium client binary to /usr/local/bin (requires sudo; what a laptop wants)
+	@echo "==> Building containarium (client)..."
+	@mkdir -p $(BUILD_DIR)
+	@CGO_ENABLED=0 go build $(GOFLAGS) -tags containarium_client $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) cmd/containarium/main.go
+	@echo "==> Installing $(BINARY_NAME) to /usr/local/bin..."
+	@sudo cp $(BUILD_DIR)/$(BINARY_NAME) /usr/local/bin/
+	@echo "==> Installed successfully. Run '$(BINARY_NAME) --help' to get started"
+
+clean: ## Clean build artifacts
+	@echo "==> Cleaning build artifacts..."
+	@rm -rf $(BUILD_DIR)
+	@rm -rf $(PKG_DIR)
+	@echo "==> Clean complete"
+
+clean-ui: ## Clean embedded UI files (swagger-ui and webui)
+	@echo "==> Cleaning UI files..."
+	@rm -rf internal/gateway/swagger-ui/*
+	@rm -rf internal/gateway/webui/*
+	@touch internal/gateway/swagger-ui/.gitkeep
+	@touch internal/gateway/webui/.gitkeep
+	@echo "==> UI files cleaned (swagger-ui and webui)"
+
+clean-all: clean clean-ui ## Clean all artifacts including UI files
+	@echo "==> All artifacts cleaned"
+
+test: ## Run unit tests
+	@echo "==> Running unit tests..."
+	@go test -v -race -coverprofile=coverage.out ./...
+
+test-mcp: ## Run MCP server tests
+	@echo "==> Running MCP server tests..."
+	@go test -v -race -coverprofile=mcp-coverage.out ./internal/mcp
+
+test-mcp-verbose: ## Run MCP tests with verbose output
+	@echo "==> Running MCP tests (verbose)..."
+	@go test -v -count=1 ./internal/mcp
+
+test-mcp-coverage: ## Run MCP tests and show coverage
+	@echo "==> Running MCP tests with coverage..."
+	@go test -v -coverprofile=mcp-coverage.out ./internal/mcp
+	@go tool cover -html=mcp-coverage.out -o mcp-coverage.html
+	@echo "==> Coverage report: mcp-coverage.html"
+
+test-short: ## Run tests in short mode (skip integration tests)
+	@echo "==> Running unit tests (short mode)..."
+	@go test -v -short -race ./...
+
+test-integration: ## Run integration tests (requires running instance)
+	@echo "==> Running integration tests..."
+	@if [ -z "$$CONTAINARIUM_SERVER" ]; then \
+		echo "Warning: CONTAINARIUM_SERVER not set, using localhost:50051"; \
+		echo "Set CONTAINARIUM_SERVER environment variable to test against remote server"; \
+	fi
+	@cd test/integration && go test -v -timeout 15m
+
+test-e2e: ## Run end-to-end reboot persistence test using Terraform (RECOMMENDED)
+	@echo "==> Running E2E reboot persistence test with Terraform..."
+	@if [ -z "$$GCP_PROJECT" ]; then \
+		echo "Error: GCP_PROJECT environment variable not set"; \
+		echo "Set it to your GCP project ID: export GCP_PROJECT=your-project-id"; \
+		exit 1; \
+	fi
+	@cd test/integration && go test -v -run TestE2ERebootPersistenceTerraform -timeout 45m
+
+test-e2e-gcloud: ## Run end-to-end test using gcloud (alternative method)
+	@echo "==> Running E2E reboot persistence test with gcloud..."
+	@if [ -z "$$GCP_PROJECT" ]; then \
+		echo "Error: GCP_PROJECT environment variable not set"; \
+		echo "Set it to your GCP project ID: export GCP_PROJECT=your-project-id"; \
+		exit 1; \
+	fi
+	@cd test/integration && go test -v -run TestE2ERebootPersistence -timeout 45m
+
+test-e2e-installer: ## Run installer quickstart E2E on a bare GCE VM (install.sh --quickstart)
+	@echo "==> Running installer --quickstart E2E on a fresh Ubuntu VM..."
+	@if [ -z "$$GCP_PROJECT" ]; then \
+		echo "Error: GCP_PROJECT environment variable not set"; \
+		echo "Set it to your GCP project ID: export GCP_PROJECT=your-project-id"; \
+		exit 1; \
+	fi
+	@cd test/integration && go test -v -run TestE2EInstallerQuickstart -timeout 40m
+
+test-all: test-short test-integration ## Run all tests
+
+test-coverage: test ## Run tests and show coverage report
+	@echo "==> Generating coverage report..."
+	@go tool cover -html=coverage.out
+
+lint: ## Run linters
+	@echo "==> Running linters..."
+	@if command -v golangci-lint > /dev/null; then \
+		golangci-lint run ./...; \
+	else \
+		echo "golangci-lint not installed. Install with: brew install golangci-lint"; \
+		go vet ./...; \
+	fi
+
+fmt: ## Format Go code
+	@echo "==> Formatting Go code..."
+	@go fmt ./...
+	@gofmt -s -w .
+
+tidy: ## Tidy Go modules
+	@echo "==> Tidying Go modules..."
+	@go mod tidy
+
+deps: ## Download Go dependencies
+	@echo "==> Downloading dependencies..."
+	@go mod download
+
+run-local: build ## Run containarium locally (for testing)
+	@echo "==> Running containarium..."
+	@$(BUILD_DIR)/$(BINARY_NAME)
+
+terraform-init: ## Initialize Terraform
+	@echo "==> Initializing Terraform..."
+	@cd terraform/gce && terraform init
+
+terraform-plan: ## Run Terraform plan
+	@echo "==> Running Terraform plan..."
+	@cd terraform/gce && terraform plan
+
+terraform-apply: ## Apply Terraform configuration
+	@echo "==> Applying Terraform configuration..."
+	@cd terraform/gce && terraform apply
+
+terraform-destroy: ## Destroy Terraform resources
+	@echo "==> Destroying Terraform resources..."
+	@cd terraform/gce && terraform destroy
+
+setup-dev: deps proto ## Set up development environment
+	@echo "==> Setting up development environment..."
+	@echo "==> Installing pre-commit hooks..."
+	@echo "#!/bin/sh\nmake fmt lint test" > .git/hooks/pre-commit
+	@chmod +x .git/hooks/pre-commit
+	@echo "==> Development environment ready!"
+
+version: ## Show version information
+	@echo "Containarium version: $${VERSION}"
+	@echo "Go version: $(shell go version)"
+	@echo "Build platform: $(shell go env GOOS)/$(shell go env GOARCH)"
+
+.DEFAULT_GOAL := help
+
+docs-gates: ## Docs claims hygiene (#2558): README claims vs CLAIMS.md, deployment names, design Status lines
+	@scripts/ci/check-claims.sh --self-test && scripts/ci/check-doc-names.sh --self-test && scripts/ci/check-design-status.sh --self-test
+	@scripts/ci/check-claims.sh && scripts/ci/check-doc-names.sh && scripts/ci/check-design-status.sh
