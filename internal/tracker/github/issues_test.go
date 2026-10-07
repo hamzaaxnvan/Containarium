@@ -119,3 +119,125 @@ func TestListIssues_FiltersOutPullRequests(t *testing.T) {
 	}
 }
 
+func TestListIssues_StateFilter(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	a := New(nil)
+	_, err := a.ListIssues(context.Background(), tracker.Conn{BaseURL: srv.URL, Project: "acme/widgets"},
+		tracker.IssueFilter{State: pb.TrackerIssueState_TRACKER_ISSUE_STATE_OPEN, Labels: []string{"bug", "p1"}})
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if !strings.Contains(gotQuery, "state=open") {
+		t.Errorf("query = %q, want state=open", gotQuery)
+	}
+	if !strings.Contains(gotQuery, "labels=bug%2Cp1") {
+		t.Errorf("query = %q, want labels=bug%%2Cp1", gotQuery)
+	}
+}
+
+func TestListIssues_SearchRoutesToSearchAPI(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"items": [{"number": 5, "title": "found me", "state": "open", "labels": []}]}`))
+	}))
+	defer srv.Close()
+
+	a := New(nil)
+	issues, err := a.ListIssues(context.Background(), tracker.Conn{BaseURL: srv.URL, Project: "acme/widgets"},
+		tracker.IssueFilter{Search: "found me"})
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if gotPath != "/search/issues" {
+		t.Errorf("path = %q, want /search/issues", gotPath)
+	}
+	if len(issues) != 1 || issues[0].Number != 5 {
+		t.Errorf("issues = %+v, want exactly issue #5", issues)
+	}
+}
+
+func TestGetChange_MergedWithSuccessfulCI(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		switch r.URL.Path {
+		case "/repos/acme/widgets/pulls/10":
+			_, _ = w.Write([]byte(`{"number": 10, "state": "closed", "merged": true, "html_url": "https://github.com/acme/widgets/pull/10", "head": {"sha": "abc123"}}`))
+		case "/repos/acme/widgets/commits/abc123/status":
+			_, _ = w.Write([]byte(`{"state": "success", "total_count": 3}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	a := New(nil)
+	change, err := a.GetChange(context.Background(), tracker.Conn{BaseURL: srv.URL, Project: "acme/widgets"}, 10)
+	if err != nil {
+		t.Fatalf("GetChange: %v", err)
+	}
+	if change.State != pb.TrackerIssueState_TRACKER_ISSUE_STATE_MERGED {
+		t.Errorf("State = %v, want MERGED", change.State)
+	}
+	if change.CIVerdict != pb.TrackerCiVerdict_TRACKER_CI_VERDICT_SUCCESS {
+		t.Errorf("CIVerdict = %v, want SUCCESS", change.CIVerdict)
+	}
+	if change.URL != "https://github.com/acme/widgets/pull/10" {
+		t.Errorf("URL = %q", change.URL)
+	}
+}
+
+func TestGetChange_ClosedNotMerged(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		switch r.URL.Path {
+		case "/repos/acme/widgets/pulls/11":
+			_, _ = w.Write([]byte(`{"number": 11, "state": "closed", "merged": false, "head": {"sha": "def456"}}`))
+		case "/repos/acme/widgets/commits/def456/status":
+			_, _ = w.Write([]byte(`{"state": "failure", "total_count": 1}`))
+		}
+	}))
+	defer srv.Close()
+
+	a := New(nil)
+	change, err := a.GetChange(context.Background(), tracker.Conn{BaseURL: srv.URL, Project: "acme/widgets"}, 11)
+	if err != nil {
+		t.Fatalf("GetChange: %v", err)
+	}
+	if change.State != pb.TrackerIssueState_TRACKER_ISSUE_STATE_CLOSED {
+		t.Errorf("State = %v, want CLOSED (closed but not merged)", change.State)
+	}
+	if change.CIVerdict != pb.TrackerCiVerdict_TRACKER_CI_VERDICT_FAILED {
+		t.Errorf("CIVerdict = %v, want FAILED", change.CIVerdict)
+	}
+}
+
+func TestGetChange_NoStatusesIsNoneVerdict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		switch r.URL.Path {
+		case "/repos/acme/widgets/pulls/12":
+			_, _ = w.Write([]byte(`{"number": 12, "state": "open", "merged": false, "head": {"sha": "ghi789"}}`))
+		case "/repos/acme/widgets/commits/ghi789/status":
+			_, _ = w.Write([]byte(`{"state": "pending", "total_count": 0}`))
+		}
+	}))
+	defer srv.Close()
+
+	a := New(nil)
+	change, err := a.GetChange(context.Background(), tracker.Conn{BaseURL: srv.URL, Project: "acme/widgets"}, 12)
+	if err != nil {
+		t.Fatalf("GetChange: %v", err)
+	}
+	if change.CIVerdict != pb.TrackerCiVerdict_TRACKER_CI_VERDICT_NONE {
+		t.Errorf("CIVerdict = %v, want NONE (no CI configured — total_count 0)", change.CIVerdict)
+	}
+}
