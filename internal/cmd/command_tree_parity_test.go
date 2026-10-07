@@ -29,3 +29,35 @@ func TestContainariumdCommandTree_SupersetOfClientGolden(t *testing.T) {
 	b, err := os.ReadFile("testdata/client_command_tree.golden")
 	if err != nil {
 		t.Fatalf("read golden file: %v", err)
+	}
+
+	daemonTree := renderCommandTree(rootCmd)
+	daemonSet := make(map[string]bool, len(daemonTree))
+	for _, p := range daemonTree {
+		daemonSet[p] = true
+	}
+	hasPrefix := func(prefix string) bool {
+		for _, p := range daemonTree {
+			if strings.HasPrefix(p, prefix+" ") {
+				return true
+			}
+		}
+		return false
+	}
+
+	for i, line := range strings.Split(strings.TrimRight(string(b), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		name, isMoved := strings.CutPrefix(line, "moved:")
+		if !isMoved {
+			if !daemonSet[line] {
+				t.Errorf("golden line %d (%q): containariumd is missing a command the client has — the split lost it", i+1, line)
+			}
+			continue
+		}
+		if !daemonSet[name] && !hasPrefix(name) {
+			t.Errorf("golden line %d (%q): containariumd has neither %q itself nor any %q child — the moved command doesn't actually exist server-side", i+1, line, name, name+" *")
+		}
+	}
+}
