@@ -114,3 +114,120 @@ func (codexEngine) InstallScript(o InstallOptions) string {
 		pkg += "@" + v
 	}
 	return `set -e
+# codex needs Node >= ` + CodexNodeMinVersion + ` (its own engines.node). Check it here so a
+# box without it says so, instead of failing inside npm's EBADENGINE output.
+if ! command -v node >/dev/null 2>&1; then
+  echo "codex needs Node >= ` + CodexNodeMinVersion + ` on the box and none is installed." >&2
+  exit 5
+fi
+if ! node -e 'process.exit(parseInt(process.versions.node.split(".")[0], 10) >= ` + CodexNodeMinVersion + ` ? 0 : 1)'; then
+  echo "codex needs Node >= ` + CodexNodeMinVersion + `; this box has $(node --version). Upgrade Node on the box, then re-run." >&2
+  exit 5
+fi
+mkdir -p "$HOME/.local"
+npm config set prefix "$HOME/.local" >/dev/null
+npm install -g --no-fund --no-audit ` + shellQuoteSingle(pkg) + `
+echo "codex installed at ` + codexBin + `"`
+}
+
+// VerifyScript proves the box can actually reach a model: print the
+// installed binary's version, report which credential source is present
+// (names only — never a value, the same rule #2030/#2036 pin for Claude),
+// then run one cheap real prompt through whatever credential the box now
+// has.
+func (e codexEngine) VerifyScript() string {
+	script := `set -e
+` + codexBin + ` --version
+echo "credential sources present:"
+found=0`
+	if e.opts.Credential != nil && e.opts.Credential.Kind() == KindGateway {
+		script += `
+if [ -f "` + codexGatewayEnvPath + `" ]; then
+  echo "  - ` + GatewayTokenEnvVar + ` in ` + codexGatewayEnvPath + ` (containarium model gateway)"
+  found=1
+fi`
+	} else {
+		script += `
+if [ -f /run/containarium/secrets.env ]; then
+  echo "  - /run/containarium/secrets.env (tenant secrets, compose delivery — CODEX_API_KEY or OPENAI_API_KEY)"
+  found=1
+fi
+if [ -d /run/secrets ]; then
+  echo "  - /run/secrets/<NAME> (tenant secrets, file delivery)"
+  found=1
+fi
+if [ -f "` + codexHome + `/auth.json" ]; then
+  echo "  - ` + codexHome + `/auth.json (signed in with codex login)"
+  found=1
+fi`
+	}
+	script += `
+if [ "$found" = 0 ]; then
+  echo "  (none yet — sign in on the box with codex login, or place CODEX_API_KEY in its environment)"
+fi
+` + e.runPrefix() + codexBin + ` exec --json 'print the current working directory'`
+	return script
+}
+
+// RunCommand renders the command process_start spawns.
+//
+// `codex exec` takes the prompt as a POSITIONAL argument after any flags —
+// unlike claude/pi's -p, there is no flag name for it. resume is codex's
+// only continuation mechanism: continueSession maps to `resume --last`,
+// sessionID to `resume <id>`, taking priority over continueSession exactly
+// as the claude/pi paths do (#2193; callers validate the two are mutually
+// exclusive before calling this).
+func (e codexEngine) RunCommand(prompt string, streamJSON, continueSession bool, sessionID string) string {
+	cmd := e.runPrefix() + "~/.local/bin/codex exec"
+	switch {
+	case sessionID != "":
+		cmd += " resume " + shellQuoteSingle(sessionID)
+	case continueSession:
+		cmd += " resume --last"
+	}
+	if streamJSON {
+		cmd += " --json"
+	}
+	if m := strings.TrimSpace(e.opts.Model); m != "" {
+		cmd += " --model " + shellQuoteSingle(m)
+	}
+	return cmd + " " + shellQuoteSingle(prompt)
+}
+
+// codexCredentialStatusScript probes for a codex credential by NAME only
+// (#2277), the same posture as claudeCredentialStatusScript/
+// piCredentialStatusScript: codex's own sign-in (`codex login` /
+// `codex login --device-auth`) caches `~/.codex/auth.json`, which is this
+// engine's "interactive"; CODEX_API_KEY or OPENAI_API_KEY visible to the
+// box's shell environment — the two names `codex exec` itself reads
+// directly, per developers.openai.com/codex/environment-variables — is
+// "api-key"; anything else is "none". Interactive is checked first, so a
+// box with both a sign-in and a leftover env var still reports interactive,
+// the same priority VerifyScript's own multi-line report lists in.
+//
+// #nosec G101 -- this is a shell script that checks for the PRESENCE of
+// ~/.codex/auth.json and the NAMES of two env vars (CODEX_API_KEY,
+// OPENAI_API_KEY) — it never contains, reads, or echoes a credential
+// value. Same rationale as claudeCredentialStatusScript's annotation above.
+const codexCredentialStatusScript = `if [ -f "` + codexHome + `/auth.json" ]; then
+  echo interactive
+  exit 0
+fi
+if [ -n "$CODEX_API_KEY" ] || [ -n "$OPENAI_API_KEY" ]; then
+  echo api-key
+  exit 0
+fi
+echo none`
+
+// runPrefix is the env-loading prefix for this box's credential source,
+// matching pi's shape: a gateway credential sources codex's own gateway.env
+// (not yet reachable from the cmd layer — see the type doc comment); a
+// tenant secret sources the daemon's generic secrets.env, which carries
+// whatever --secret-name named (CODEX_API_KEY, recommended; OPENAI_API_KEY
+// also works per OpenAI's own docs).
+func (e codexEngine) runPrefix() string {
+	if e.opts.Credential != nil && e.opts.Credential.Kind() == KindGateway {
+		return sourceEnvPrefix(`"` + codexGatewayEnvPath + `"`)
+	}
+	return sourceEnvPrefix("/run/containarium/secrets.env")
+}
