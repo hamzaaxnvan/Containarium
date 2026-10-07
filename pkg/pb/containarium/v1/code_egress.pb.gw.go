@@ -270,3 +270,276 @@ func RegisterCodingToolEgressPolicyServiceHandlerServer(ctx context.Context, mux
 		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/SetCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy/{policy.tenant}"))
 		if err != nil {
 			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPut, pattern_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_1, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/SetCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_1(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_1(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodGet, pattern_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/GetCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy/{tenant}"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodGet, pattern_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_1, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/GetCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_1(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_1(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodDelete, pattern_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/DeleteCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy/{tenant}"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodDelete, pattern_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_1, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/DeleteCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_1(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_1(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+
+	return nil
+}
+
+// RegisterCodingToolEgressPolicyServiceHandlerFromEndpoint is same as RegisterCodingToolEgressPolicyServiceHandler but
+// automatically dials to "endpoint" and closes the connection when "ctx" gets done.
+func RegisterCodingToolEgressPolicyServiceHandlerFromEndpoint(ctx context.Context, mux *runtime.ServeMux, endpoint string, opts []grpc.DialOption) (err error) {
+	conn, err := grpc.NewClient(endpoint, opts...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Errorf("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+			return
+		}
+		go func() {
+			<-ctx.Done()
+			if cerr := conn.Close(); cerr != nil {
+				grpclog.Errorf("Failed to close conn to %s: %v", endpoint, cerr)
+			}
+		}()
+	}()
+	return RegisterCodingToolEgressPolicyServiceHandler(ctx, mux, conn)
+}
+
+// RegisterCodingToolEgressPolicyServiceHandler registers the http handlers for service CodingToolEgressPolicyService to "mux".
+// The handlers forward requests to the grpc endpoint over "conn".
+func RegisterCodingToolEgressPolicyServiceHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc.ClientConn) error {
+	return RegisterCodingToolEgressPolicyServiceHandlerClient(ctx, mux, NewCodingToolEgressPolicyServiceClient(conn))
+}
+
+// RegisterCodingToolEgressPolicyServiceHandlerClient registers the http handlers for service CodingToolEgressPolicyService
+// to "mux". The handlers forward requests to the grpc endpoint over the given implementation of "CodingToolEgressPolicyServiceClient".
+// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "CodingToolEgressPolicyServiceClient"
+// doesn't go through the normal gRPC flow (creating a gRPC client etc.) then it will be up to the passed in
+// "CodingToolEgressPolicyServiceClient" to call the correct interceptors. This client ignores the HTTP middlewares.
+func RegisterCodingToolEgressPolicyServiceHandlerClient(ctx context.Context, mux *runtime.ServeMux, client CodingToolEgressPolicyServiceClient) error {
+	mux.Handle(http.MethodPut, pattern_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/SetCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy/{policy.tenant}"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPut, pattern_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_1, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/SetCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_1(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_1(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodGet, pattern_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/GetCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy/{tenant}"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodGet, pattern_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_1, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/GetCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_1(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_1(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodDelete, pattern_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/DeleteCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy/{tenant}"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodDelete, pattern_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_1, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.CodingToolEgressPolicyService/DeleteCodingToolEgressPolicy", runtime.WithHTTPPathPattern("/v1/code/egress-policy"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_1(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_1(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	return nil
+}
+
+var (
+	pattern_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_0    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 1, 0, 4, 1, 5, 3}, []string{"v1", "code", "egress-policy", "policy.tenant"}, ""))
+	pattern_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_1    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "code", "egress-policy"}, ""))
+	pattern_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_0    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 1, 0, 4, 1, 5, 3}, []string{"v1", "code", "egress-policy", "tenant"}, ""))
+	pattern_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_1    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "code", "egress-policy"}, ""))
+	pattern_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 1, 0, 4, 1, 5, 3}, []string{"v1", "code", "egress-policy", "tenant"}, ""))
+	pattern_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_1 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "code", "egress-policy"}, ""))
+)
+
+var (
+	forward_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_0    = runtime.ForwardResponseMessage
+	forward_CodingToolEgressPolicyService_SetCodingToolEgressPolicy_1    = runtime.ForwardResponseMessage
+	forward_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_0    = runtime.ForwardResponseMessage
+	forward_CodingToolEgressPolicyService_GetCodingToolEgressPolicy_1    = runtime.ForwardResponseMessage
+	forward_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_0 = runtime.ForwardResponseMessage
+	forward_CodingToolEgressPolicyService_DeleteCodingToolEgressPolicy_1 = runtime.ForwardResponseMessage
+)
