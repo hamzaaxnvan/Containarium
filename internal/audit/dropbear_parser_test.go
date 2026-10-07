@@ -84,3 +84,61 @@ func TestParseDropbearLine_BlankPasswordIsCaptured(t *testing.T) {
 		t.Errorf("method = %q; it must be distinguishable from a real password login", method)
 	}
 }
+
+// Lines that are not successful logins must not produce records. A failed
+// signature recorded as a login would be worse than no record at all.
+func TestParseDropbearLine_IgnoresNonLogins(t *testing.T) {
+	for _, line := range []string{
+		`Mar 12 14:30:01 Pubkey auth bad signature for 'alice' with key SHA256:abc from 10.0.0.1:54321`,
+		`Mar 12 14:30:01 Exit before auth: Disconnect received`,
+		`Mar 12 14:30:01 Child connection from 10.0.0.1:54321`,
+		``,
+		`random noise`,
+	} {
+		if _, _, _, _, ok := parseDropbearLine(line, parseYear, time.Time{}); ok {
+			t.Errorf("recorded a login for a line that is not one:\n%s", line)
+		}
+	}
+}
+
+// The pod log API can supply a timestamp per line, and dropbear's own stamp
+// is absent in some runtimes. A record with the wrong time is worse than one
+// with a time clearly derived from the reader.
+func TestParseDropbearLine_FallsBackToTheReadersTimestamp(t *testing.T) {
+	fallback := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	line := `Pubkey auth succeeded for 'alice' with ssh-ed25519 key SHA256:abc from 10.0.0.1:54321`
+
+	ts, _, _, _, ok := parseDropbearLine(line, parseYear, fallback)
+	if !ok {
+		t.Fatal("a line without a timestamp should still parse")
+	}
+	if !ts.Equal(fallback) {
+		t.Errorf("timestamp = %v, want the supplied fallback %v", ts, fallback)
+	}
+}
+
+// dropbear prefixes a pid in some configurations.
+func TestParseDropbearLine_ToleratesThePidPrefix(t *testing.T) {
+	line := `[123] Mar 12 14:30:01 Pubkey auth succeeded for 'alice' with ssh-rsa key SHA256:abc from 10.0.0.1:54321`
+	ts, user, _, _, ok := parseDropbearLine(line, parseYear, time.Time{})
+	if !ok || user != "alice" {
+		t.Fatalf("pid-prefixed line did not parse: ok=%v user=%q", ok, user)
+	}
+	if ts.Day() != 12 {
+		t.Errorf("timestamp = %v, want the line's own", ts)
+	}
+}
+
+func TestTrimSourcePort(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"10.0.0.1:54321", "10.0.0.1"},
+		{"10.0.0.1", "10.0.0.1"},
+		{"[2001:db8::1]:54321", "2001:db8::1"},
+		// A bare IPv6 address has several colons and no port to trim.
+		{"2001:db8::1", "2001:db8::1"},
+	} {
+		if got := trimSourcePort(tc.in); got != tc.want {
+			t.Errorf("trimSourcePort(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
