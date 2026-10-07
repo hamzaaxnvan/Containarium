@@ -119,3 +119,369 @@ func TestResolveImageDigests_HappyPath(t *testing.T) {
 	}
 	want := []string{
 		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+	}
+	for _, w := range want {
+		if !contains(got, w) {
+			t.Errorf("missing digest %q in result %v", w, got)
+		}
+	}
+}
+
+func TestResolveImageDigests_AliasAlternates(t *testing.T) {
+	// The product's alias list is "24.04,noble,ubuntu/24.04".
+	// All three should resolve to the same digest set.
+	srv, _ := newFakeStreamsServer(t)
+	defer srv.Close()
+	r := NewStreamsResolver(0)
+
+	for _, alias := range []string{"24.04", "noble", "ubuntu/24.04", "UBUNTU/24.04", " 24.04 "} {
+		got, err := r.ResolveImageDigests(context.Background(), srv.URL, alias)
+		if err != nil {
+			t.Fatalf("alias %q: %v", alias, err)
+		}
+		if len(got) != 4 {
+			t.Errorf("alias %q: got %d digests, want 4", alias, len(got))
+		}
+	}
+}
+
+func TestResolveImageDigests_AliasNotFoundIsEmpty(t *testing.T) {
+	// Unknown aliases return (nil, nil) — the caller
+	// decides whether that's an error in their context.
+	srv, _ := newFakeStreamsServer(t)
+	defer srv.Close()
+	r := NewStreamsResolver(0)
+
+	got, err := r.ResolveImageDigests(context.Background(), srv.URL, "gentoo/rolling")
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d digests, want 0: %v", len(got), got)
+	}
+}
+
+func TestResolveImageDigests_SubstringAliasDoesNotMatch(t *testing.T) {
+	// The product alias is "24.04" — a request for
+	// "4.04" must NOT match. Substring matches are a
+	// classic source of allowlist bypasses; we test the
+	// negative.
+	srv, _ := newFakeStreamsServer(t)
+	defer srv.Close()
+	r := NewStreamsResolver(0)
+
+	got, err := r.ResolveImageDigests(context.Background(), srv.URL, "4.04")
+	if err != nil {
+		t.Fatalf("unexpected: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("substring match leaked through: %v", got)
+	}
+}
+
+func TestResolveImageDigests_MultipleProducts(t *testing.T) {
+	// Aliases from different products should resolve
+	// independently — alpine doesn't bleed into ubuntu
+	// and vice versa.
+	srv, _ := newFakeStreamsServer(t)
+	defer srv.Close()
+	r := NewStreamsResolver(0)
+
+	alpine, err := r.ResolveImageDigests(context.Background(), srv.URL, "alpine/3.19")
+	if err != nil {
+		t.Fatalf("alpine resolve: %v", err)
+	}
+	if len(alpine) != 1 {
+		t.Fatalf("alpine got %d, want 1: %v", len(alpine), alpine)
+	}
+	if alpine[0] != "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" {
+		t.Errorf("wrong alpine digest: %s", alpine[0])
+	}
+}
+
+func TestResolveImageDigests_EmptyServerOrAlias(t *testing.T) {
+	r := NewStreamsResolver(0)
+	if _, err := r.ResolveImageDigests(context.Background(), "", "ubuntu/24.04"); err == nil {
+		t.Error("empty server should error")
+	}
+	if _, err := r.ResolveImageDigests(context.Background(), "https://x", ""); err == nil {
+		t.Error("empty alias should error")
+	}
+}
+
+func TestResolveImageDigests_HTTP500PropagatesError(t *testing.T) {
+	srv, fail := newFakeStreamsServer(t)
+	defer srv.Close()
+	*fail = true
+
+	r := NewStreamsResolver(0)
+	_, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04")
+	if err == nil {
+		t.Fatal("HTTP 500 should produce an error")
+	}
+	if !strings.Contains(err.Error(), "status 500") {
+		t.Errorf("error should mention status; got %v", err)
+	}
+}
+
+func TestResolveImageDigests_BadJSONErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("not json"))
+	}))
+	defer srv.Close()
+	r := NewStreamsResolver(0)
+	_, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04")
+	if err == nil {
+		t.Fatal("bad JSON should error")
+	}
+}
+
+func TestResolveImageDigests_RejectsUnknownIndexFormat(t *testing.T) {
+	// A future simplestreams v2 would change `format`.
+	// Until the resolver is taught the new shape, we must
+	// fail loudly rather than silently mis-parse.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"format":"products:2.0","products":{}}`))
+	}))
+	defer srv.Close()
+	r := NewStreamsResolver(0)
+	_, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04")
+	if err == nil {
+		t.Fatal("unknown index format should error")
+	}
+	if !strings.Contains(err.Error(), "unrecognized index format") {
+		t.Errorf("error should call out the format; got %v", err)
+	}
+}
+
+func TestResolveImageDigests_TimeoutHonored(t *testing.T) {
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}))
+	defer hang.Close()
+	r := NewStreamsResolver(100 * time.Millisecond)
+	start := time.Now()
+	_, err := r.ResolveImageDigests(context.Background(), hang.URL, "ubuntu/24.04")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("should time out")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("timeout not honored; elapsed = %v", elapsed)
+	}
+}
+
+// --- DigestMatchesSet helper tests ---
+
+func TestDigestMatchesSet_HappyPath(t *testing.T) {
+	pub := []string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
+	if !DigestMatchesSet("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", pub) {
+		t.Fatal("exact match should succeed")
+	}
+}
+
+func TestDigestMatchesSet_TolerantPrefixAndCase(t *testing.T) {
+	// Operators paste digests in lots of shapes. The
+	// match function normalizes both sides so callers
+	// don't have to.
+	pub := []string{"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+	for _, candidate := range []string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		" sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ",
+	} {
+		if !DigestMatchesSet(candidate, pub) {
+			t.Errorf("candidate %q should match", candidate)
+		}
+	}
+}
+
+func TestDigestMatchesSet_RejectsMalformed(t *testing.T) {
+	pub := []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	for _, bad := range []string{
+		"",
+		"sha256:",
+		"short",
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaXX", // too long
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaagh",   // non-hex
+		"md5:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	} {
+		if DigestMatchesSet(bad, pub) {
+			t.Errorf("malformed digest %q should not match", bad)
+		}
+	}
+}
+
+func TestDigestMatchesSet_EmptyPublishedSet(t *testing.T) {
+	// No published digests = never matches. The Phase B
+	// gate uses this to refuse "alias not found" cases.
+	if DigestMatchesSet("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil) {
+		t.Fatal("empty published set must never match")
+	}
+	if DigestMatchesSet("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", []string{}) {
+		t.Fatal("empty published slice must never match")
+	}
+}
+
+// contains is a tiny string-slice helper. Stays local
+// rather than reaching for slices.Contains so the package
+// compiles on older Go SDKs the CI fleet still pins.
+func contains(haystack []string, needle string) bool {
+	for _, h := range haystack {
+		if h == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// --- Cache tests (Phase B+ follow-up) ---
+
+// countingServer wraps the fake index server with a
+// per-request hit counter so cache tests can assert
+// "second resolve didn't hit the network."
+func countingServer(t *testing.T) (*httptest.Server, *int) {
+	t.Helper()
+	count := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != indexPath {
+			http.NotFound(w, r)
+			return
+		}
+		count++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(fakeIndex())
+	}))
+	return srv, &count
+}
+
+func TestResolveImageDigests_CacheHitsAvoidNetwork(t *testing.T) {
+	srv, count := countingServer(t)
+	defer srv.Close()
+
+	// 1-hour TTL — both resolves should hit the cache.
+	r := NewStreamsResolverWithCacheTTL(0, time.Hour)
+
+	if _, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04"); err != nil {
+		t.Fatalf("first resolve: %v", err)
+	}
+	if _, err := r.ResolveImageDigests(context.Background(), srv.URL, "alpine/3.19"); err != nil {
+		t.Fatalf("second resolve (different alias, same server): %v", err)
+	}
+	if _, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04"); err != nil {
+		t.Fatalf("third resolve: %v", err)
+	}
+	if *count != 1 {
+		t.Fatalf("expected 1 network fetch (subsequent resolves served from cache); got %d", *count)
+	}
+}
+
+func TestResolveImageDigests_CacheExpiryTriggersRefetch(t *testing.T) {
+	srv, count := countingServer(t)
+	defer srv.Close()
+
+	// Very short TTL so a sleep crosses expiry.
+	r := NewStreamsResolverWithCacheTTL(0, 30*time.Millisecond)
+
+	if _, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04"); err != nil {
+		t.Fatalf("first resolve: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04"); err != nil {
+		t.Fatalf("post-expiry resolve: %v", err)
+	}
+	if *count != 2 {
+		t.Fatalf("expected 2 network fetches across expiry; got %d", *count)
+	}
+}
+
+func TestResolveImageDigests_ZeroTTLDisablesCache(t *testing.T) {
+	srv, count := countingServer(t)
+	defer srv.Close()
+
+	// TTL=0 → caching off; every resolve hits the
+	// network. Tests in pkg/core/incus that don't want
+	// the cache use this constructor form.
+	r := NewStreamsResolverWithCacheTTL(0, 0)
+
+	for i := 0; i < 3; i++ {
+		if _, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04"); err != nil {
+			t.Fatalf("resolve %d: %v", i, err)
+		}
+	}
+	if *count != 3 {
+		t.Fatalf("cache should be disabled with TTL=0; got %d fetches", *count)
+	}
+}
+
+func TestResolveImageDigests_CachePerServer(t *testing.T) {
+	srv1, count1 := countingServer(t)
+	defer srv1.Close()
+	srv2, count2 := countingServer(t)
+	defer srv2.Close()
+
+	// One resolver, two servers → each server's index
+	// is cached independently.
+	r := NewStreamsResolverWithCacheTTL(0, time.Hour)
+	for i := 0; i < 3; i++ {
+		_, _ = r.ResolveImageDigests(context.Background(), srv1.URL, "ubuntu/24.04")
+		_, _ = r.ResolveImageDigests(context.Background(), srv2.URL, "ubuntu/24.04")
+	}
+	if *count1 != 1 || *count2 != 1 {
+		t.Fatalf("each server should be fetched once; got srv1=%d srv2=%d", *count1, *count2)
+	}
+}
+
+func TestResolveImageDigests_InvalidateCacheForcesRefetch(t *testing.T) {
+	srv, count := countingServer(t)
+	defer srv.Close()
+	r := NewStreamsResolverWithCacheTTL(0, time.Hour)
+
+	if _, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04"); err != nil {
+		t.Fatalf("first resolve: %v", err)
+	}
+	r.InvalidateCache()
+	if _, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04"); err != nil {
+		t.Fatalf("post-invalidate resolve: %v", err)
+	}
+	if *count != 2 {
+		t.Fatalf("InvalidateCache should force a refetch; got %d", *count)
+	}
+}
+
+func TestResolveImageDigests_NetworkFailureDoesNotPoisonCache(t *testing.T) {
+	// First call fails → no cache entry → next call
+	// retries the network. Caching a failure would mean
+	// a transient blip locks out CreateContainer for the
+	// full TTL, which is unacceptable.
+	failing := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failing {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(fakeIndex())
+	}))
+	defer srv.Close()
+
+	r := NewStreamsResolverWithCacheTTL(0, time.Hour)
+	if _, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04"); err == nil {
+		t.Fatal("expected failure on first resolve")
+	}
+	failing = false
+	got, err := r.ResolveImageDigests(context.Background(), srv.URL, "ubuntu/24.04")
+	if err != nil {
+		t.Fatalf("second resolve should retry the network and succeed: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("retry should have populated the digest set")
+	}
+}
