@@ -10,3 +10,41 @@ metadata:
   labels:
     app.kubernetes.io/name: sshpiper
 spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sshpiper
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sshpiper
+    spec:
+      serviceAccountName: sshpiper
+      containers:
+        - name: sshpiperd
+          # Pin to a release tag in production rather than :latest.
+          # Containarium-published gateway image (pinned upstream release inside);
+          # published per release by .github/workflows/sidecars.yml.
+          image: ghcr.io/hamzaaxnvan/containarium-sshpiper:latest-stable
+          env:
+            # Activates the kubernetes plugin (watches Pipes in this namespace).
+            - name: PLUGIN
+              value: "kubernetes"
+            # Host key sshpiper presents to CLIENTS (see the runbook for how the
+            # sshpiper-server-key Secret is generated).
+            - name: SSHPIPERD_SERVER_KEY
+              value: /etc/sshpiper/server_key
+          ports:
+            - name: ssh
+              containerPort: 2222
+          volumeMounts:
+            - name: server-key
+              mountPath: /etc/sshpiper
+              readOnly: true
+      volumes:
+        - name: server-key
+          secret:
+            secretName: sshpiper-server-key
+            # 0444 (not 0400): the sshpiperd image runs non-root, so an
+            # owner-only key it can't read crashes it ("permission denied").
+            defaultMode: 0444

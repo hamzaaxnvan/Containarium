@@ -278,3 +278,143 @@ func TestPrimaryRegistry_LookupByBaseDomainSuffix_AmbiguousAcrossMultiDomain(t *
 		assert.Equal(t, Pool("b"), p.Pool)
 	}
 }
+
+// TestSNIRouting_BaseDomainSuffix is an end-to-end check on the SNI
+// router: a BaseDomain-tagged primary captures inbound SNI for its
+// suffix without each subdomain being a registered alias, and an
+// explicit alias on a different primary still wins (exact > suffix
+// precedence). Uses the same dialThroughHandler / startEchoListener
+// harness as TestSNIRouting_DispatchToPrimaryOrFallback in sni_test.go.
+func TestSNIRouting_BaseDomainSuffix(t *testing.T) {
+	demoAddr, demoHits := startEchoListener(t, "DEMO")
+	prodAddr, prodHits := startEchoListener(t, "PROD")
+	fallbackAddr, fallbackHits := startEchoListener(t, "FALLBACK")
+
+	m := &Manager{primaries: NewPrimaryRegistry()}
+
+	demoHost, demoPortStr, err := net.SplitHostPort(demoAddr)
+	require.NoError(t, err)
+	m.primaries.Register(Primary{
+		Pool:        "demo",
+		Hostname:    "demo.example.org",
+		BaseDomains: []string{"example.org"},
+		IP:          demoHost,
+		Port:        mustAtoi(t, demoPortStr),
+	})
+
+	prodHost, prodPortStr, err := net.SplitHostPort(prodAddr)
+	require.NoError(t, err)
+	m.primaries.Register(Primary{
+		Pool:     "prod",
+		Hostname: "prod.example.com",
+		// Explicit alias for a name that ALSO matches demo's BaseDomain.
+		// Exact match must win — operator's explicit choice beats the
+		// implicit suffix routing.
+		Aliases:     []string{"override.example.org"},
+		BaseDomains: []string{"example.com"},
+		IP:          prodHost,
+		Port:        mustAtoi(t, prodPortStr),
+	})
+
+	handler := m.buildSNIRoutingHandler(fallbackAddr)
+
+	// Suffix match: any subdomain of example.org → demo.
+	got := dialThroughHandler(t, handler, &tls.Config{
+		ServerName: "blog.example.org", InsecureSkipVerify: true,
+	})
+	assert.Equal(t, "DEMO", got, "blog.example.org should suffix-match demo")
+
+	// Suffix match: any subdomain of example.com → prod.
+	got = dialThroughHandler(t, handler, &tls.Config{
+		ServerName: "api.example.com", InsecureSkipVerify: true,
+	})
+	assert.Equal(t, "PROD", got, "api.example.com should suffix-match prod")
+
+	// Exact alias wins over suffix: override.example.org → prod
+	// even though example.org is demo's BaseDomain.
+	got = dialThroughHandler(t, handler, &tls.Config{
+		ServerName: "override.example.org", InsecureSkipVerify: true,
+	})
+	assert.Equal(t, "PROD", got, "exact alias must beat suffix match")
+
+	// Exact hostname still works.
+	got = dialThroughHandler(t, handler, &tls.Config{
+		ServerName: "prod.example.com", InsecureSkipVerify: true,
+	})
+	assert.Equal(t, "PROD", got, "exact hostname must hit prod")
+
+	// Nothing matches → fallback.
+	got = dialThroughHandler(t, handler, &tls.Config{
+		ServerName: "evil.invalid", InsecureSkipVerify: true,
+	})
+	assert.Equal(t, "FALLBACK", got, "unrelated SNI must fall through")
+
+	assert.Equal(t, 1, demoHits(), "demo hit once (suffix)")
+	assert.Equal(t, 3, prodHits(), "prod hit thrice (suffix kafeido + exact alias + exact hostname)")
+	assert.Equal(t, 1, fallbackHits(), "fallback hit once (unmatched)")
+}
+
+// TestSNIRouting_MultiBaseDomainOnOneBackend is the end-to-end of the
+// lab-hosts-demo pattern: one backend, two base domains, both routed.
+func TestSNIRouting_MultiBaseDomainOnOneBackend(t *testing.T) {
+	labAddr, labHits := startEchoListener(t, "LAB")
+	fallbackAddr, _ := startEchoListener(t, "FALLBACK")
+
+	m := &Manager{primaries: NewPrimaryRegistry()}
+
+	labHost, labPortStr, err := net.SplitHostPort(labAddr)
+	require.NoError(t, err)
+	m.primaries.Register(Primary{
+		Pool:        "lab",
+		Hostname:    "lab-primary.example.com",
+		BaseDomains: []string{"lab.example.com", "demo.example.org"},
+		IP:          labHost,
+		Port:        mustAtoi(t, labPortStr),
+	})
+
+	handler := m.buildSNIRoutingHandler(fallbackAddr)
+
+	// Lab's own pool subdomain.
+	got := dialThroughHandler(t, handler, &tls.Config{
+		ServerName: "notebook.lab.example.com", InsecureSkipVerify: true,
+	})
+	assert.Equal(t, "LAB", got, "lab.example.com subdomain should hit lab")
+
+	// Migrated demo subdomain on the same backend.
+	got = dialThroughHandler(t, handler, &tls.Config{
+		ServerName: "blog.demo.example.org", InsecureSkipVerify: true,
+	})
+	assert.Equal(t, "LAB", got, "demo.example.org subdomain should also hit lab")
+
+	assert.Equal(t, 2, labHits(), "both SNI suffixes route to the same backend")
+}
+
+// TestPrimaryRegistry_RegisterUpdatesBaseDomain ensures that a
+// re-registration with a different BaseDomains list replaces the old
+// value. Otherwise stale base-domain bindings would persist across
+// daemon restarts. Uses disjoint old/new domains so a longer-suffix
+// match on either side can't muddy the assertion.
+func TestPrimaryRegistry_RegisterUpdatesBaseDomain(t *testing.T) {
+	r := NewPrimaryRegistry()
+	r.Register(Primary{
+		Pool:        "demo",
+		Hostname:    "demo.example.test",
+		BaseDomains: []string{"example.test"},
+		IP:          "10.0.0.20",
+		Port:        443,
+	})
+	r.Register(Primary{
+		Pool:        "demo",
+		Hostname:    "demo.example.test",
+		BaseDomains: []string{"example.org"},
+		IP:          "10.0.0.20",
+		Port:        443,
+	})
+
+	assert.Nil(t, r.LookupByBaseDomainSuffix("blog.example.test"),
+		"old BaseDomains should be gone after re-register")
+	p := r.LookupByBaseDomainSuffix("blog.example.org")
+	if assert.NotNil(t, p) {
+		assert.Equal(t, Pool("demo"), p.Pool)
+	}
+}
