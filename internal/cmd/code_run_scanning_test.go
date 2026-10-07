@@ -53,3 +53,58 @@ func TestReportModelTrafficScanning(t *testing.T) {
 		fake.getErr = errors.New("must not be called")
 		withStoreStatusAPI(t, fake)
 		var out bytes.Buffer
+		reportModelTrafficScanning(scanningEngine(t, engine.SecretCredential{Name: "ANTHROPIC_API_KEY"}), &out)
+		if !strings.Contains(out.String(), "NOT SCANNED (the box's own provider key") {
+			t.Errorf("got %q", out.String())
+		}
+	})
+	t.Run("gateway, no policy configured reports the baseline scan", func(t *testing.T) {
+		fake := withFakeGuardrailPolicyAPI(t)
+		withStoreStatusAPI(t, fake)
+		var out bytes.Buffer
+		reportModelTrafficScanning(scanningEngine(t, gw), &out)
+		if !strings.Contains(out.String(), "model traffic: BASELINE") || strings.Contains(out.String(), "NOT SCANNED") {
+			t.Errorf("got %q", out.String())
+		}
+	})
+	t.Run("gateway, policy without an inbound block rule stays unscanned", func(t *testing.T) {
+		fake := withFakeGuardrailPolicyAPI(t)
+		withStoreStatusAPI(t, fake)
+		setPolicy(t, fake, &pb.GuardrailRule{Kind: pb.GuardrailKind_GUARDRAIL_KIND_SECRET, Action: pb.GuardrailAction_GUARDRAIL_ACTION_BLOCK})
+		var out bytes.Buffer
+		reportModelTrafficScanning(scanningEngine(t, gw), &out)
+		if !strings.Contains(out.String(), "NOT SCANNED") || !strings.Contains(out.String(), "no inbound BLOCK rule") {
+			t.Errorf("got %q", out.String())
+		}
+	})
+	t.Run("gateway, inbound block rule", func(t *testing.T) {
+		fake := withFakeGuardrailPolicyAPI(t)
+		withStoreStatusAPI(t, fake)
+		setPolicy(t, fake, &pb.GuardrailRule{Kind: pb.GuardrailKind_GUARDRAIL_KIND_PROMPT_INJECTION, Action: pb.GuardrailAction_GUARDRAIL_ACTION_BLOCK})
+		var out bytes.Buffer
+		reportModelTrafficScanning(scanningEngine(t, gw), &out)
+		if !strings.Contains(out.String(), "model traffic: SCANNED") {
+			t.Errorf("got %q", out.String())
+		}
+	})
+	t.Run("gateway, server unreachable is unknown and not fatal", func(t *testing.T) {
+		fake := withFakeGuardrailPolicyAPI(t)
+		fake.getErr = errors.New("down")
+		withStoreStatusAPI(t, fake)
+		var out bytes.Buffer
+		reportModelTrafficScanning(scanningEngine(t, gw), &out)
+		if !strings.Contains(out.String(), "status unknown") {
+			t.Errorf("got %q", out.String())
+		}
+	})
+	t.Run("gateway, status API cannot be dialed is unknown and not fatal", func(t *testing.T) {
+		prev := newGuardrailStatusAPI
+		newGuardrailStatusAPI = func() (guardrailStatusAPI, func(), error) { return nil, func() {}, errors.New("dial failed") }
+		t.Cleanup(func() { newGuardrailStatusAPI = prev })
+		var out bytes.Buffer
+		reportModelTrafficScanning(scanningEngine(t, gw), &out)
+		if !strings.Contains(out.String(), "status unknown") {
+			t.Errorf("got %q", out.String())
+		}
+	})
+}
