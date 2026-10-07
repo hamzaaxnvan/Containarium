@@ -267,3 +267,183 @@ func runInputProto(e coderun.InputEvent) *pb.RunInput {
 }
 
 // ListRunInputs lists a box run's open permission requests and its counts.
+func (s *ContainerServer) ListRunInputs(ctx context.Context, req *pb.ListRunInputsRequest) (*pb.ListRunInputsResponse, error) {
+	if err := validateRunInputsRun(req.GetUsername(), req.GetRunName()); err != nil {
+		return nil, err
+	}
+	if err := s.authorizeBoxRuns(ctx, req.GetUsername()); err != nil {
+		return nil, err
+	}
+	st, err := s.readRunInputs(req.GetUsername()+"-container", req.GetUsername(), req.GetRunName())
+	if err != nil {
+		return nil, err
+	}
+	sum := coderun.SummarizeApprovals(st.events)
+	resp := &pb.ListRunInputsResponse{
+		Running:   st.running,
+		Requests:  int32(sum.Requests),  // #nosec G115 -- a count of journal lines
+		Allowed:   int32(sum.Allowed),   // #nosec G115 -- a count of journal lines
+		Denied:    int32(sum.Denied),    // #nosec G115 -- a count of journal lines
+		Expired:   int32(sum.Expired),   // #nosec G115 -- a count of journal lines
+		Cancelled: int32(sum.Cancelled), // #nosec G115 -- a count of journal lines
+	}
+	// An open request on a run that has exited is waiting on nobody, and one
+	// past its expiry is denied whatever the journal says yet.
+	if st.running {
+		now := time.Now()
+		for _, e := range sum.Open {
+			// Report the box's own request line for the id, not a later
+			// one the agent appended.
+			if rec, ok := findRunInput(st.events, e.RequestID); ok {
+				e = rec.request
+			}
+			if !e.ExpiresAt.IsZero() && !now.Before(e.ExpiresAt) {
+				continue
+			}
+			resp.Open = append(resp.Open, runInputProto(e))
+		}
+	}
+	return resp, nil
+}
+
+// runInputAnswerScript drops content as the request's answer, as the box
+// user (so nothing here runs with more rights than the agent already has):
+// written to a temp file in the answers directory, then renamed over any
+// earlier file (one that never got a response is no answer: it may
+// be the agent's, or signed for a tool call the box did not ask). Prints
+// "written", or "nodir" when the run has no answers directory.
+func runInputAnswerScript(answersDir, id, content string) string {
+	q := shellSingleQuote
+	return fmt.Sprintf(`a=%s
+[ -d "$a" ] && [ ! -L "$a" ] || { echo nodir; exit 0; }
+t="$a/.answer.$$"
+printf '%%s' %s > "$t" && mv -f "$t" "$a"/%s || { rm -f "$t"; exit 1; }
+echo written
+`, q(answersDir), q(content), q(id))
+}
+
+// requireAnswerScope is the second half of AnswerRunInput's access rule
+// (#3191): beyond the box-run rule, the caller's token must name code:answer.
+// The box-run rule alone admits the owner's own token, which the agent can hold
+// (an owner who runs `containarium login` inside the box leaves it in
+// ~/.containarium/credentials.json), and an allow from that token is the agent
+// approving itself. Matched literally: a skill run's in-box token can be "*",
+// and a login token can carry no scopes claim at all; neither answers.
+func requireAnswerScope(ctx context.Context) error {
+	if auth.HasLiteralScope(ctx, auth.ScopeCodeAnswer) {
+		return nil
+	}
+	return status.Errorf(codes.PermissionDenied,
+		"scope required: %s (answering permission requests needs a token that names it; the wildcard and unscoped tokens do not count). "+
+			"Mint one off the box with 'containarium token generate --secret-file <file> --username <you> --scopes %s,%s'; see 'containarium code answer --help'",
+		auth.ScopeCodeAnswer, auth.ScopeSSHWrite, auth.ScopeCodeAnswer)
+}
+
+// AnswerRunInput answers one permission request of a box run.
+func (s *ContainerServer) AnswerRunInput(ctx context.Context, req *pb.AnswerRunInputRequest) (*pb.AnswerRunInputResponse, error) {
+	username, name, id := req.GetUsername(), req.GetRunName(), req.GetRequestId()
+	if err := validateRunInputsRun(username, name); err != nil {
+		return nil, err
+	}
+	if !runInputIDPattern.MatchString(id) {
+		return nil, status.Errorf(codes.InvalidArgument, "request_id must match %s", runInputIDPattern.String())
+	}
+	var answer coderun.Answer
+	switch req.GetAnswer() {
+	case pb.RunInputAnswer_RUN_INPUT_ANSWER_ALLOW:
+		answer = coderun.AnswerAllow
+	case pb.RunInputAnswer_RUN_INPUT_ANSWER_DENY:
+		answer = coderun.AnswerDeny
+	default:
+		return nil, status.Error(codes.InvalidArgument, "answer must be ALLOW or DENY")
+	}
+	if len(req.GetRequestSha256()) != sha256.Size {
+		return nil, status.Errorf(codes.InvalidArgument, "request_sha256 must be %d bytes: the SHA-256 of the tool call shown to whoever answered", sha256.Size)
+	}
+	if err := s.authorizeBoxRuns(ctx, username); err != nil {
+		return nil, err
+	}
+	if err := requireAnswerScope(ctx); err != nil {
+		return nil, err
+	}
+	priv, err := s.approvalKey(username)
+	if err != nil {
+		return nil, err
+	}
+	write := s.boxRunStartExecFn()
+	if write == nil {
+		return nil, status.Error(codes.Unavailable, "no container backend to answer the run on")
+	}
+	box := username + "-container"
+
+	// Serialized per run: a duplicate answer waits for the first one's
+	// response and then reports it, instead of racing it.
+	lock := s.boxRunLockFor(boxRunLockKey(box, name))
+	lock.Lock()
+	defer lock.Unlock()
+
+	st, err := s.readRunInputs(box, username, name)
+	if err != nil {
+		return nil, err
+	}
+	rec, ok := findRunInput(st.events, id)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "run %q on %q has no permission request %q", name, username, id)
+	}
+	if rec.response != nil {
+		return closedRunInput(pb.RunInputAnswerOutcome_RUN_INPUT_ANSWER_OUTCOME_ALREADY_CLOSED, *rec.response), nil
+	}
+	if !rec.request.ExpiresAt.IsZero() && !time.Now().Before(rec.request.ExpiresAt) {
+		return &pb.AnswerRunInputResponse{Outcome: pb.RunInputAnswerOutcome_RUN_INPUT_ANSWER_OUTCOME_EXPIRED}, nil
+	}
+	if !st.running {
+		return nil, status.Errorf(codes.FailedPrecondition, "run %q on %q is not running; nothing is waiting on request %q", name, username, id)
+	}
+
+	content := coderun.FormatAnswer(priv, name, id, req.GetRequestSha256(), answer)
+	out, err := write(box, username, runInputAnswerScript(s.boxRunDir()+"/"+name+".answers", id, content))
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "write the answer to %q on %q: %v", id, username, err)
+	}
+	if strings.TrimSpace(out) != "written" {
+		return nil, status.Errorf(codes.FailedPrecondition, "run %q on %q has no answers directory; it was not started with --approvals ask", name, username)
+	}
+
+	deadline := time.Now().Add(s.confirmWait())
+	for {
+		st, err := s.readRunInputs(box, username, name)
+		if err != nil {
+			return nil, err
+		}
+		if rec, ok := findRunInput(st.events, id); ok && rec.response != nil {
+			// Closed some other way meanwhile (it expired, the run ended, or
+			// an earlier answer the other way was taken first): report that,
+			// not this answer.
+			outcome := pb.RunInputAnswerOutcome_RUN_INPUT_ANSWER_OUTCOME_ANSWERED
+			if rec.response.Reason != coderun.ReasonAnswered || rec.response.Answer != answer {
+				outcome = pb.RunInputAnswerOutcome_RUN_INPUT_ANSWER_OUTCOME_ALREADY_CLOSED
+			}
+			return closedRunInput(outcome, *rec.response), nil
+		}
+		if !time.Now().Before(deadline) {
+			return &pb.AnswerRunInputResponse{Outcome: pb.RunInputAnswerOutcome_RUN_INPUT_ANSWER_OUTCOME_NOT_CONFIRMED}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+func closedRunInput(outcome pb.RunInputAnswerOutcome, resp coderun.InputEvent) *pb.AnswerRunInputResponse {
+	out := &pb.AnswerRunInputResponse{
+		Outcome:      outcome,
+		ClosedAnswer: runInputAnswerProto(resp.Answer),
+		CloseReason:  runInputCloseReasonProto(resp.Reason),
+	}
+	if !resp.T.IsZero() {
+		out.ClosedAt = timestamppb.New(resp.T)
+	}
+	return out
+}
