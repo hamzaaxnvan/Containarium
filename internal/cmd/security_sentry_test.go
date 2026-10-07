@@ -91,3 +91,34 @@ func TestPrintSentryStatus_ExecTelemetry(t *testing.T) {
 		name    string
 		env     sentryStatusEnvelope
 		want    []string
+		notWant []string
+	}{
+		{name: "unavailable with reason", env: sentryStatusEnvelope{State: "SENTRY_STATE_OK", ExecTelemetry: "unavailable (netbpf: execwatch: load collection: BTF not found)"},
+			want: []string{"exec-telemetry: unavailable (netbpf: execwatch: load collection: BTF not found)"}, notWant: []string{"exec-events-lost"}},
+		{name: "ok with zero lost", env: sentryStatusEnvelope{State: "SENTRY_STATE_OK", ExecTelemetry: "ok", ExecEventsLost: "0"},
+			want: []string{"exec-telemetry: ok"}, notWant: []string{"exec-events-lost"}},
+		{name: "ok with losses", env: sentryStatusEnvelope{State: "SENTRY_STATE_OK", ExecTelemetry: "ok", ExecEventsLost: "12"},
+			want: []string{"exec-telemetry: ok", "exec-events-lost: 12"}},
+		{name: "older daemon without the field", env: sentryStatusEnvelope{State: "SENTRY_STATE_OK"}, notWant: []string{"exec-telemetry", "exec-hashes-dropped"}},
+		{name: "hash drops (#2768)", env: sentryStatusEnvelope{State: "SENTRY_STATE_OK", ExecTelemetry: "ok", ExecHashesDropped: "37"},
+			want: []string{"exec-hashes-dropped: 37"}},
+		{name: "zero hash drops", env: sentryStatusEnvelope{State: "SENTRY_STATE_OK", ExecTelemetry: "ok", ExecHashesDropped: "0"},
+			notWant: []string{"exec-hashes-dropped"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			printSentryStatus(&buf, tc.env)
+			for _, w := range tc.want {
+				if !strings.Contains(buf.String(), w) {
+					t.Errorf("missing %q in:\n%s", w, buf.String())
+				}
+			}
+			for _, nw := range tc.notWant {
+				if strings.Contains(buf.String(), nw) {
+					t.Errorf("unexpected %q in:\n%s", nw, buf.String())
+				}
+			}
+		})
+	}
+}
