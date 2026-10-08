@@ -48,3 +48,28 @@ func TestNativeTenantMCPCreateAndReadback(t *testing.T) {
 	}
 	args["network_tenant"] = 123
 	if _, err := handleCreateContainer(c, args); err == nil || calls != 1 {
+		t.Fatal("non-string native identity silently ignored")
+	}
+}
+func TestNativeTenantMCPCapabilityToolAndScope(t *testing.T) {
+	s := &Server{}
+	s.registerTools()
+	var found bool
+	for _, tool := range s.tools {
+		if tool.Name == "network_tenant_capabilities" {
+			found = true
+			if tool.RequiredScope != "containers:read" {
+				t.Fatal(tool.RequiredScope)
+			}
+		}
+		if tool.Name == "create_container" {
+			properties := tool.InputSchema["properties"].(map[string]interface{})
+			if _, ok := properties["network_tenant"]; !ok {
+				t.Fatal("MCP native field missing")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("capability tool missing")
+	}
+}
