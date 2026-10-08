@@ -87,3 +87,63 @@ func listFixture() []api.InstanceFull {
 				Pid: 4242,
 				Network: map[string]api.InstanceStateNetwork{
 					"eth0": {Addresses: []api.InstanceStateNetworkAddress{{Family: "inet", Address: "192.0.2.10", Scope: "global"}}},
+				},
+			},
+		},
+		{
+			Instance: api.Instance{
+				Name: "b-box", Status: "Stopped", Type: "container", CreatedAt: created,
+				InstancePut:     api.InstancePut{Config: map[string]string{TenantLabelKey: "b-tenant"}},
+				ExpandedDevices: map[string]map[string]string{"root": {"type": "disk", "size": "5GB"}},
+			},
+			State: &api.InstanceState{},
+		},
+	}
+}
+
+func sortedByName(in []ContainerInfo) []ContainerInfo {
+	sort.Slice(in, func(i, j int) bool { return in[i].Name < in[j].Name })
+	return in
+}
+
+// #3050: the reconcile loop's list is one Incus request, not 1 + 2N, and maps
+// every instance exactly as ListContainers does.
+func TestListContainersFull_OneRequestSameResult(t *testing.T) {
+	f := &fakeListServer{instances: listFixture()}
+	c := &Client{server: f}
+
+	perInstance, err := c.ListContainers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := int(f.gets.Load()+f.states.Load()), 2*len(f.instances); got != want {
+		t.Fatalf("setup: ListContainers made %d per-instance requests, want %d", got, want)
+	}
+	f.names.Store(0)
+	f.gets.Store(0)
+	f.states.Store(0)
+
+	full, err := c.ListContainersFull()
+	if err != nil {
+		t.Fatalf("ListContainersFull: %v", err)
+	}
+	if n, g, s, fl := f.names.Load(), f.gets.Load(), f.states.Load(), f.fulls.Load(); fl != 1 || n+g+s != 0 {
+		t.Fatalf("ListContainersFull made names=%d gets=%d states=%d full=%d requests, want exactly one full list", n, g, s, fl)
+	}
+	if !reflect.DeepEqual(sortedByName(full), sortedByName(perInstance)) {
+		t.Fatalf("ListContainersFull differs from ListContainers:\n full: %+v\n per-instance: %+v", full, perInstance)
+	}
+	if full[0].IPAddress != "192.0.2.10" || full[0].Pid != 4242 {
+		t.Fatalf("running box state not mapped: ip=%q pid=%d", full[0].IPAddress, full[0].Pid)
+	}
+}
+
+// A failed full list fails the list: the caller (one reconcile pass) skips
+// and the next pass retries, rather than acting on a partial view.
+func TestListContainersFull_ErrorFailsTheList(t *testing.T) {
+	f := &fakeListServer{instances: listFixture(), fullErr: errors.New("incus down")}
+	c := &Client{server: f}
+	if got, err := c.ListContainersFull(); err == nil {
+		t.Fatalf("want an error, got %+v", got)
+	}
+}
