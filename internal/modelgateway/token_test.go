@@ -77,3 +77,30 @@ func TestMintToken_StillWraps(t *testing.T) {
 	}
 	if claims.ID == "" {
 		t.Fatal("MintToken's token carries no jti")
+	}
+	if claims.Tenant != "acme" || claims.Provider != "anthropic" || claims.SkillID != "hello-agent" || claims.RunID != "run-2" {
+		t.Errorf("claims mismatch: %+v", claims)
+	}
+
+	// Same validation behavior as MintTokenWithID.
+	if _, err := MintToken(secret, GatewayClaims{Provider: "anthropic"}, time.Hour); err == nil {
+		t.Error("expected error for missing tenant")
+	}
+	if _, _, err := MintTokenWithID(secret, GatewayClaims{Provider: "anthropic"}, time.Hour); err == nil {
+		t.Error("expected error for missing tenant (MintTokenWithID)")
+	}
+
+	// Two independent mints for the same claims get distinct jtis: each mint
+	// draws fresh randomness, so MintToken's wrapped call and this direct
+	// MintTokenWithID call must not collide.
+	claimsFromWithID, err := VerifyToken(secret, tokID)
+	if err != nil {
+		t.Fatalf("VerifyToken(MintTokenWithID result): %v", err)
+	}
+	if claimsFromWithID.ID != id.JTI {
+		t.Errorf("claimsFromWithID.ID = %q, want MintedID.JTI %q", claimsFromWithID.ID, id.JTI)
+	}
+	if claims.ID == id.JTI {
+		t.Errorf("MintToken and MintTokenWithID minted the same jti %q for two separate calls", claims.ID)
+	}
+}
