@@ -455,3 +455,232 @@ func metadataReachableCheck(p posturePaths) Check {
 	return c
 }
 
+// --- metadata-endpoint block (#2298) -----------------------------------
+
+// metadataBlockCheck reports whether hostharden's container-bridge block of
+// the metadata endpoint is armed: the iptables FORWARD rule is in the kernel
+// now, AND the boot unit that re-applies it is installed and enabled.
+//
+// metadataReachableCheck cannot answer this. It dials from the host itself,
+// and the block deliberately leaves the host's OUTPUT chain alone, so on a
+// cloud host that dial succeeds whether or not the block is in place. A host
+// whose `pool join` / `cloud enroll` block step failed or was skipped looks
+// identical there to one that has it; here it does not.
+//
+// Both halves are needed for a pass: a rule with no enabled unit is gone
+// after the next reboot, and a unit with no rule is not protecting anything
+// now.
+func metadataBlockCheck(p posturePaths) Check {
+	c := Check{Name: "container bridge blocked from cloud metadata endpoint (rule + boot unit)"}
+	fix := "fix: run `containarium hostharden block-metadata --persist " + hostharden.DefaultBridge + "`"
+
+	if p.metadataBlockProbe == nil {
+		c.Detail = "could not determine: no probe configured"
+		return c
+	}
+	present, detail, err := p.metadataBlockProbe()
+	if err != nil {
+		c.Detail = fmt.Sprintf("could not determine whether the FORWARD rule is present: %v", err)
+		return c
+	}
+
+	var missing []string
+	if !present {
+		missing = append(missing, "the FORWARD rule is not in the kernel ("+detail+")")
+	}
+	unitInstalled, err := pathExists(p.imdsBlockUnit, os.Stat)
+	if err != nil {
+		c.Detail = fmt.Sprintf("could not determine: checking %s: %v", p.imdsBlockUnit, err)
+		return c
+	}
+	if !unitInstalled {
+		missing = append(missing, "boot unit "+p.imdsBlockUnit+" is not installed, so the rule will not survive a reboot")
+	} else {
+		enabled, err := pathExists(p.imdsBlockWants, os.Lstat)
+		if err != nil {
+			c.Detail = fmt.Sprintf("could not determine: checking %s: %v", p.imdsBlockWants, err)
+			return c
+		}
+		if !enabled {
+			missing = append(missing, "boot unit is installed but not enabled (no "+p.imdsBlockWants+"), so the rule will not survive a reboot")
+		}
+	}
+	if len(missing) > 0 {
+		c.Detail = strings.Join(missing, "; ") + " — " + fix
+		return c
+	}
+	c.OK = true
+	c.Detail = detail + "; boot unit installed and enabled"
+	return c
+}
+
+// pathExists separates "definitely absent" (false, nil) from "could not
+// look" (a non-nil error), which rule 1 above reports differently.
+func pathExists(path string, stat func(string) (os.FileInfo, error)) (bool, error) {
+	_, err := stat(path)
+	switch {
+	case err == nil:
+		return true, nil
+	case os.IsNotExist(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// --- tunnel token exposure --------------------------------------------
+
+// tunnelTokenExposedCheck reports whether the pool-join tunnel unit still
+// carries its authentication token on the (world-readable, 0644) ExecStart
+// line — the pattern this repo's own commit a9cc8a4 moved off of
+// ("fix(cmd): tunnel-handshake token via EnvironmentFile, not ExecStart",
+// #965): current `pool join` writes the token to a root-only (0600)
+// EnvironmentFile= instead. A host joined before that fix, or whose unit
+// was hand-edited back to the old form, keeps a live bearer-equivalent
+// credential readable by any local user via `systemctl show -p ExecStart`,
+// `ps`, or journald (cloud#1074).
+//
+// OK means the token is NOT on the ExecStart line. A missing unit is
+// reported as unknown rather than an implicit pass: the host may simply
+// not be tunnel-joined, but that is indistinguishable here from "the unit
+// was moved/renamed", so it stays unknown per rule 1 above.
+func tunnelTokenExposedCheck(p posturePaths) Check {
+	c := Check{Name: "tunnel unit does not carry its token on ExecStart"}
+
+	execStart, ok, err := effectiveExecStart(p.tunnelUnit, p.tunnelUnitDropIn)
+	if err != nil {
+		c.Detail = fmt.Sprintf("could not determine: reading %s: %v", p.tunnelUnit, err)
+		return c
+	}
+	if !ok {
+		c.Detail = fmt.Sprintf("could not determine: no effective ExecStart= found for %s (base file or its .service.d drop-ins)", p.tunnelUnit)
+		return c
+	}
+	if strings.Contains(execStart, "--token") {
+		c.Detail = fmt.Sprintf("%s's effective ExecStart carries --token — rotate this host's tunnel token and re-run "+
+			"`containarium pool join` to regenerate the unit via EnvironmentFile=", p.tunnelUnit)
+		return c
+	}
+	c.OK = true
+	c.Detail = "effective ExecStart does not carry --token"
+	return c
+}
+
+// effectiveExecStart resolves the EFFECTIVE ExecStart= across unitPath and
+// its .service.d/ drop-ins, in systemd's own override order — drop-ins
+// apply, lexically sorted, AFTER the base file. A check that reads only
+// the base file can be defeated by a drop-in the base file has no idea
+// about (cloud#1074 review follow-up): nothing in this repo creates a
+// drop-in for the TUNNEL unit today, but the daemon unit's OWN drop-in
+// (renderPoolDropIn) already establishes the override idiom this resolves
+// — a bare "ExecStart=" directive (this codebase's documented reset
+// convention) clears whatever was accumulated so far, and a subsequent
+// non-empty "ExecStart=<cmd>" sets the new effective value. Built on
+// extractExecStart, which already distinguishes "no ExecStart= line in
+// this source" ("") from "an explicit bare reset" (the literal string
+// "ExecStart=") — see its own doc comment.
+//
+// Returns ok=false if NO source (base or any drop-in) ever set an
+// effective ExecStart= — unknown, not a pass, per rule 1 above.
+func effectiveExecStart(unitPath, dropInDir string) (string, bool, error) {
+	base, err := os.ReadFile(unitPath) // #nosec G304 -- package-owned constant, overridden only by tests
+	if err != nil {
+		return "", false, err
+	}
+	sources := []string{string(base)}
+
+	entries, derr := os.ReadDir(dropInDir) // #nosec G304 -- package-owned constant, overridden only by tests
+	if derr == nil {
+		var names []string
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".conf") {
+				names = append(names, e.Name())
+			}
+		}
+		sort.Strings(names) // systemd globs *.conf; lexical order is what it gets
+		for _, n := range names {
+			d, rerr := os.ReadFile(filepath.Join(dropInDir, filepath.Base(n))) // #nosec G304 -- dropInDir is package-owned/test-overridden; n is Base()-bounded
+			if rerr != nil {
+				continue
+			}
+			sources = append(sources, string(d))
+		}
+	}
+
+	// Every source can itself contain MULTIPLE ExecStart= directives — the
+	// reset-then-set idiom (renderPoolDropIn's own pattern) puts both in
+	// ONE drop-in file — so each source's directives are walked and
+	// applied in order, not just its first.
+	current := ""
+	found := false
+	for _, src := range sources {
+		for _, v := range allExecStartDirectives(src) {
+			switch {
+			case strings.TrimSpace(v) == "ExecStart=":
+				// Bare reset: systemd's documented idiom for a drop-in to
+				// clear the base unit's ExecStart before setting its own —
+				// this codebase's own renderPoolDropIn uses exactly this.
+				current, found = "", false
+			default:
+				current, found = v, true
+			}
+		}
+	}
+	return current, found, nil
+}
+
+// extractExecStart concatenates a (possibly line-continued with a trailing
+// "\") ExecStart= directive's value out of a systemd unit file's raw text —
+// the FIRST one found. Returns "" if the unit has no ExecStart= line at
+// all. Kept as the single-directive convenience wrapper over
+// allExecStartDirectives.
+func extractExecStart(unit string) string {
+	d := allExecStartDirectives(unit)
+	if len(d) == 0 {
+		return ""
+	}
+	return d[0]
+}
+
+// allExecStartDirectives returns EVERY ExecStart= directive found in unit,
+// in order, each with its own (possibly line-continued via a trailing "\")
+// value joined. Unlike taking just the first, this is what
+// effectiveExecStart needs: a single drop-in file commonly contains BOTH a
+// bare reset ("ExecStart=") and its replacement together, and both must be
+// seen to resolve correctly.
+func allExecStartDirectives(unit string) []string {
+	var directives []string
+	lines := strings.Split(unit, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimRight(lines[i], "\r")
+		if !strings.HasPrefix(line, "ExecStart=") {
+			continue
+		}
+		var parts []string
+		for {
+			cont := strings.HasSuffix(line, `\`)
+			parts = append(parts, strings.TrimSuffix(line, `\`))
+			if !cont || i+1 >= len(lines) {
+				break
+			}
+			i++
+			line = strings.TrimRight(lines[i], "\r")
+		}
+		directives = append(directives, strings.Join(parts, " "))
+	}
+	return directives
+}
+
+// dialMetadataServer attempts a short TCP connect to the link-local
+// metadata address. Short timeout because this runs inside `doctor` and
+// the daemon's status probe; a blocked address typically fails fast, but
+// a DROP rule blackholes rather than refusing, so the timeout is the
+// actual bound.
+func dialMetadataServer() error {
+	conn, err := net.DialTimeout("tcp", "169.254.169.254:80", 1500*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
