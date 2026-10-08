@@ -19,3 +19,25 @@ func TestGcloudUploader_DeleteMapsNotFound(t *testing.T) {
 		{"gcloud storage phrasing", "ERROR: (gcloud.storage.rm) The following URLs matched no objects or files:\ngs://b/x.meta.json", true, true},
 		{"gsutil phrasing", "CommandException: No URLs matched: gs://b/x.meta.json", true, true},
 		{"api not found", "ERROR: HTTPError 404: NotFound", true, true},
+		{"permission denied is a real failure", "ERROR: (gcloud.storage.rm) HTTPError 403: user does not have storage.objects.delete access", true, false},
+		{"success", "Removing gs://b/x.meta.json...", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := &GcloudUploader{run: func(args ...string) (string, error) {
+				if tc.fail {
+					return tc.out, errExec
+				}
+				return tc.out, nil
+			}}
+			err := g.Delete("gs://b/x.meta.json")
+			switch {
+			case !tc.fail && err != nil:
+				t.Fatalf("Delete = %v, want nil", err)
+			case tc.fail && err == nil:
+				t.Fatal("Delete = nil, want an error")
+			case tc.fail && errors.Is(err, ErrObjectNotFound) != tc.notFound:
+				t.Errorf("Delete = %v; errors.Is(ErrObjectNotFound) = %v, want %v", err, !tc.notFound, tc.notFound)
+			}
+		})
+	}
+}
