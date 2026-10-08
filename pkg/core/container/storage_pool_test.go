@@ -137,3 +137,50 @@ func TestCreate_ExplicitStoragePoolEmitsARootDiskWithoutADiskSize(t *testing.T) 
 	if created.Disk.Size != "" {
 		t.Errorf("root disk size = %q, want empty — the caller asked for no size and one was "+
 			"invented", created.Disk.Size)
+	}
+	if created.Disk.Path != "/" {
+		t.Errorf("root disk path = %q, want /", created.Disk.Path)
+	}
+}
+
+// A create that names no pool must behave exactly as it did before this
+// change — same device, or same absence of one. This is the assertion that
+// keeps every existing deployment untouched.
+func TestCreate_WithoutAnExplicitPoolIsUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		disk     string
+		wantDisk bool
+	}{
+		{"a disk size still emits a device on the configured pool", "20GB", true},
+		{"no disk size and no pool still emits nothing", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var created incus.ContainerConfig
+			mock := &incustest.MockBackend{
+				StoragePoolName:     "tenants",
+				CreateContainerFunc: func(cfg incus.ContainerConfig) error { created = cfg; return nil },
+			}
+			m := NewWithBackend(mock)
+
+			_, _ = m.Create(CreateOptions{Username: "bob", Image: "ubuntu:24.04", Disk: tc.disk})
+
+			if tc.wantDisk {
+				if created.Disk == nil {
+					t.Fatal("no root disk device configured")
+				}
+				if created.Disk.Pool != "tenants" {
+					t.Errorf("root disk pool = %q, want the configured %q", created.Disk.Pool, "tenants")
+				}
+				if created.Disk.Size != tc.disk {
+					t.Errorf("root disk size = %q, want %q", created.Disk.Size, tc.disk)
+				}
+				return
+			}
+			if created.Disk != nil {
+				t.Errorf("a create with neither a pool nor a size gained a root disk device %+v — "+
+					"it should still inherit the default profile, as it always has", created.Disk)
+			}
+		})
+	}
+}

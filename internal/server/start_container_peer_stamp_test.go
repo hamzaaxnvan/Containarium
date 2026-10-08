@@ -41,3 +41,46 @@ func TestStartContainer_PeerForwardAlsoStampsLastStartedAt(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
+	t.Cleanup(srv.Close)
+
+	mock := incustest.NewMockBackend()
+	mock.StartContainerFunc = func(string) error { return errors.New("container not found on this backend") }
+	var (
+		mu         sync.Mutex
+		stampCalls []struct{ name, key, value string }
+	)
+	mock.SetConfigFunc = func(name, key, value string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		stampCalls = append(stampCalls, struct{ name, key, value string }{name, key, value})
+		return nil
+	}
+
+	pp := NewPeerPool("local-vm", "", nil, "")
+	peer := peerClientFor(srv)
+	peer.Healthy = true
+	pp.peers["peer-1"] = peer
+
+	s := &ContainerServer{
+		manager:  container.NewWithBackend(mock),
+		peerPool: pp,
+	}
+
+	resp, err := s.StartContainer(testCtx(), &pb.StartContainerRequest{Username: "alice"})
+	if err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected a response on a successful peer-forward")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, c := range stampCalls {
+		if c.key == incus.LastStartedAtKey && c.name == "alice-container" {
+			return
+		}
+	}
+	t.Fatalf("expected SetConfig(alice-container, %q) after a successful peer-forward; calls=%+v",
+		incus.LastStartedAtKey, stampCalls)
+}
