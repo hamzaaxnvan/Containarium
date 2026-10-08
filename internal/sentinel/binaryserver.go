@@ -170,3 +170,176 @@ func buildBinaryServerMux(binaryPath string, manager *Manager) *http.ServeMux {
 	// sentinel's ban state, not something every cluster daemon's shared
 	// HMAC secret should unlock.
 	mux.Handle("/sentinel/fail2ban/bans", auth.SentinelHMACMiddleware(manager.adminSecret, manager.Fail2BanBansHandler()))
+	mux.Handle("/sentinel/fail2ban/unban", auth.SentinelHMACMiddleware(manager.adminSecret, manager.Fail2BanUnbanHandler()))
+	// This controls the enforcing SSH plugin; system fail2ban above is separate.
+	mux.Handle("/sentinel/ssh-bans/", auth.SentinelHMACMiddleware(manager.adminSecret, manager.sshBanHandler()))
+
+	// Peer proxy — forwards /peer/<backend-id>/* to the tunnel backend's loopback
+	// so the control plane can reach tunnel backends through the sentinel without
+	// extra firewall rules for external ports.
+	//
+	// Gated by the ADMIN secret, like /sentinel/tunnel-tokens and
+	// /sentinel/byoc-routes: driving another machine's daemon is a
+	// control-plane authority operation, and the control plane is the only
+	// legitimate caller. Before #1102 this was the one ungated route on this
+	// mux, which made it an unauthenticated lateral-movement surface across
+	// every tenant's backend for anything that could reach this port.
+	mux.Handle("/peer/", auth.SentinelHMACMiddleware(manager.adminSecret, manager.PeerProxyHandler()))
+
+	// Runtime profiles (#1352). Gated by the ADMIN secret for the same reason
+	// as the routes above, and then some: a heap profile is a snapshot of
+	// everything the process holds in memory — tunnel-join tokens, TLS key
+	// material, in-flight bodies. The cluster-wide daemon secret every backend
+	// holds must not be enough to dump the sentinel's memory.
+	//
+	// Exists because #1349 leaked ~18 MB/day for 27 days and was OOM-killed
+	// having never been profiled; see PprofHandler for why this is wired from
+	// runtime/pprof rather than net/http/pprof.
+	mux.Handle(pprofPathPrefix, auth.SentinelHMACMiddleware(manager.adminSecret, manager.PprofHandler()))
+
+	// Status JSON endpoint — always available
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		status := StatusJSON{
+			State:         string(manager.CurrentState()),
+			SpotIP:        manager.SpotIP(),
+			PreemptCount:  manager.PreemptCount(),
+			CertSyncCount: manager.certStore.SyncedCount(),
+		}
+
+		if od := manager.OutageDuration(); od > 0 {
+			status.OutageDuration = od.Round(time.Second).String()
+		}
+		if lp := manager.LastPreemption(); !lp.IsZero() {
+			status.LastPreemption = lp.Format(time.RFC3339)
+		}
+		if ls := manager.certStore.LastSync(); !ls.IsZero() {
+			status.CertLastSync = ls.Format(time.RFC3339)
+		}
+		if err := manager.certStore.LastSyncErr(); err != nil {
+			status.CertSyncError = err.Error()
+		}
+		if !manager.HMACSecretConfigured() {
+			status.SentinelAuthMisconfigured = true
+			status.SentinelAuthDetail = fmt.Sprintf(
+				"CONTAINARIUM_SENTINEL_AUTH_SECRET unset or < %d bytes; keysync/certsync to daemons is failing with 401",
+				auth.SentinelMinSecretLen)
+		}
+		var lastUnattributed time.Time
+		_, status.PrimaryAuthCounts = manager.primaryAuthReport()
+		_, status.UnattributedAuthFailures, lastUnattributed = manager.authHealth.snapshot()
+		if !lastUnattributed.IsZero() {
+			status.LastUnattributedAuthFailure = lastUnattributed.Format(time.RFC3339)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(status)
+	})
+
+	// Prometheus metrics for the spot preemption/recovery signal (#514
+	// follow-up). Served from the always-on sentinel so an EXTERNAL
+	// scraper can alert on the net — the on-spot VictoriaMetrics dies with
+	// the spot it would be reporting on.
+	mux.HandleFunc("/metrics", manager.MetricsHandler())
+
+	return mux
+}
+
+// StartBinaryServer starts an HTTP server that serves the containarium binary
+// for the spot VM to download, plus a /status JSON endpoint.
+// This runs on an internal-only port (default 8888).
+func StartBinaryServer(port int, manager *Manager) (stop func(), err error) {
+	binaryPath := defaultBinaryPath
+
+	// Verify binary exists
+	if _, err := os.Stat(binaryPath); err != nil {
+		return nil, fmt.Errorf("binary not found at %s: %w", binaryPath, err)
+	}
+
+	mux := buildBinaryServerMux(binaryPath, manager)
+
+	srv := &http.Server{
+		Addr:         fmt.Sprintf(":%d", port),
+		Handler:      mux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second, // large file transfer
+	}
+
+	go func() {
+		log.Printf("[sentinel] binary server listening on :%d (serving %s)", port, binaryPath)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Printf("[sentinel] binary server error: %v", err)
+		}
+	}()
+
+	// Phase 0.5: HTTPS variant on a separate port (default port+1)
+	// when the sentinel has a peer-CA. Same handler set, so daemons
+	// that point CONTAINARIUM_SENTINEL_URL at the https://… endpoint
+	// get TLS-protected peer discovery + cert issuance + binary
+	// download. Operators flip daemons over one at a time during
+	// rollout; the HTTP listener stays up for the un-flipped ones.
+	var httpsSrv *http.Server
+	if certPEM, keyPEM := manager.SentinelServerCertPEM(); certPEM != nil && keyPEM != nil {
+		// Sentinel config via the typed loader (internal/config). Only HTTPSPort
+		// is consumed here; its default (HTTP port + 1) depends on the runtime
+		// port, so the default + parse-error logging stay at the call site.
+		sentCfg := config.LoadSentinel()
+		httpsPort := port + 1
+		if env := sentCfg.HTTPSPort; env != "" {
+			if p, perr := parsePort(env); perr == nil {
+				httpsPort = p
+			} else {
+				// #nosec G706 -- env is strconv.Quote'd into the
+				// format string; gosec's taint analysis doesn't
+				// recognize Quote as a sanitizer.
+				log.Printf("[sentinel] invalid %s=%s (%v) — defaulting to %d", config.EnvSentinelHTTPSPort, strconv.Quote(env), perr, httpsPort)
+			}
+		}
+		tlsCert, tlsErr := tls.X509KeyPair(certPEM, keyPEM)
+		if tlsErr != nil {
+			log.Printf("[sentinel] WARNING: failed to build TLS keypair for HTTPS listener (%v) — HTTPS disabled", tlsErr)
+		} else {
+			httpsSrv = &http.Server{
+				Addr:         fmt.Sprintf(":%d", httpsPort),
+				Handler:      mux,
+				ReadTimeout:  30 * time.Second,
+				WriteTimeout: 120 * time.Second,
+				TLSConfig: &tls.Config{
+					Certificates: []tls.Certificate{tlsCert},
+					MinVersion:   tls.VersionTLS12,
+				},
+			}
+			go func() {
+				// #nosec G706 -- httpsPort is an int; taint chases
+				// it back to the env value but %d on an int has no
+				// log-injection vector.
+				log.Printf("[sentinel] binary server HTTPS listener on :%d (Phase 0.5 — clients pin /sentinel/ca)", httpsPort)
+				if err := httpsSrv.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+					log.Printf("[sentinel] binary server HTTPS error: %v", err)
+				}
+			}()
+		}
+	}
+
+	return func() {
+		// Errors on shutdown are not actionable — the process is
+		// going away — but acknowledge them explicitly so static
+		// analysis doesn't flag the unhandled returns.
+		_ = srv.Close()
+		if httpsSrv != nil {
+			_ = httpsSrv.Close()
+		}
+	}, nil
+}
+
+// parsePort is a tiny helper so the HTTPS-port override can come
+// from a string env var without pulling in strconv at every site.
+func parsePort(s string) (int, error) {
+	var n int
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return 0, err
+	}
+	if n <= 0 || n > 65535 {
+		return 0, fmt.Errorf("port %d out of range", n)
+	}
+	return n, nil
+}
