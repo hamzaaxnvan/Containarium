@@ -67,3 +67,26 @@ func TestReadToken_AcceptsMode0600(t *testing.T) {
 	c.SetTokenFile(path)
 	tok, err := c.readToken()
 	if err != nil {
+		t.Fatalf("0600 must be accepted: %v", err)
+	}
+	if tok != "a-valid-jwt" {
+		t.Fatalf("token = %q, want a-valid-jwt", tok)
+	}
+}
+
+func TestReadToken_AcceptsMode0400(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix file mode bits not meaningful on windows")
+	}
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "jwt")
+	if err := os.WriteFile(path, []byte("a-valid-jwt"), 0o400); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	c := NewClient("http://example.invalid", "ignored")
+	c.SetTokenFile(path)
+	if _, err := c.readToken(); err != nil {
+		t.Fatalf("0400 must be accepted: %v", err)
+	}
+}

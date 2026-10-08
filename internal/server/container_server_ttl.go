@@ -41,3 +41,176 @@ const maxTTLSeconds int64 = 7 * 24 * 60 * 60
 // username, the handler resolves <username>-container under the hood
 // via manager.Get. Consistency matters because the CLI in PR #297
 // passes the bare username and the gRPC stubs flow that value into
+// req.Name verbatim.
+func (s *ContainerServer) SetContainerTTL(ctx context.Context, req *pb.SetContainerTTLRequest) (*pb.SetContainerTTLResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Name == "" {
+		return nil, status.Error(codes.InvalidArgument, "name is required")
+	}
+	if err := validateTTLSeconds(req.DurationSeconds); err != nil {
+		return nil, err
+	}
+
+	// Treat req.Name as the bare username (matches the per-container
+	// RPC convention; see CLI PR #297 which sends the bare username
+	// through ttlClientSet). manager.Get appends "-container".
+	username := req.Name
+	if err := auth.AuthorizeTenant(ctx, username); err != nil {
+		return nil, err
+	}
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: username})
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found: %v", username, err)
+	}
+	if info == nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found", username)
+	}
+	if info.IsCore {
+		return nil, status.Errorf(codes.InvalidArgument, "container %s is a core container; TTL is for user containers only", info.Ref.Name)
+	}
+	containerName := info.Ref.Name
+
+	resp := &pb.SetContainerTTLResponse{}
+
+	// TTL-capable backends (K8s: agent-sandbox spec.shutdownTime) persist the
+	// expiry natively; the Incus-config path below is the LXC persistence.
+	if tc, ok := s.boxes().(box.TTLCapable); ok {
+		ref := box.BoxRef{Tenant: username}
+		if req.DurationSeconds == 0 {
+			if err := tc.SetTTL(ctx, ref, nil); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to clear ttl: %v", err)
+			}
+			log.Printf("[ttl] cleared container=%s", containerName)
+			return resp, nil
+		}
+		expiresAt := time.Now().Add(time.Duration(req.DurationSeconds) * time.Second).UTC()
+		if err := tc.SetTTL(ctx, ref, &expiresAt); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to set ttl: %v", err)
+		}
+		log.Printf("[ttl] set container=%s expires_at=%s (duration=%ds)", containerName, expiresAt.Format(time.RFC3339), req.DurationSeconds)
+		resp.TtlExpiresAt = timestamppb.New(expiresAt)
+		return resp, nil
+	}
+
+	if req.DurationSeconds == 0 {
+		// Clear: remove the key entirely so parseTTLExpiresAt and the
+		// sweeper see "absent" rather than "empty string". UnsetConfig
+		// is idempotent — clearing an already-clear TTL is a no-op
+		// followed by a no-op response (TtlExpiresAt zero-value).
+		if err := s.manager.UnsetConfig(containerName, incus.TTLExpiresAtKey); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to clear %s: %v", incus.TTLExpiresAtKey, err)
+		}
+		log.Printf("[ttl] cleared container=%s", containerName)
+		return resp, nil
+	}
+
+	// Set: stamp now() + duration in UTC RFC3339 so the sweeper's
+	// time.Parse round-trips with the same precision. Capping is
+	// already enforced above.
+	expiresAt, err := s.stampTTL(containerName, req.DurationSeconds)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to set %s: %v", incus.TTLExpiresAtKey, err)
+	}
+	log.Printf("[ttl] set container=%s expires_at=%s (duration=%ds)", containerName, expiresAt.Format(time.RFC3339), req.DurationSeconds)
+	resp.TtlExpiresAt = timestamppb.New(expiresAt)
+	return resp, nil
+}
+
+// validateTTLSeconds checks a requested TTL duration against the bounds
+// shared by SetContainerTTL and the birth-TTL path in CreateContainer (#523).
+// Zero is always valid — it means "no TTL" on create and "clear the TTL" on
+// set, so callers handle the zero case themselves. Negative and over-cap
+// (> maxTTLSeconds, 7 days) return InvalidArgument so the two entry points
+// reject identical input identically.
+func validateTTLSeconds(seconds int64) error {
+	if seconds < 0 {
+		return status.Errorf(codes.InvalidArgument, "ttl seconds must be >= 0, got %d", seconds)
+	}
+	if seconds > maxTTLSeconds {
+		return status.Errorf(codes.InvalidArgument, "ttl seconds %d exceeds maximum of %d (7 days)", seconds, maxTTLSeconds)
+	}
+	return nil
+}
+
+// stampBirthTTL applies a create-time TTL (#523) to a just-created box so it
+// is born with a death date the ttlsweeper honors — closing the leak window
+// where a box exists with no TTL because the separate `ttl set` call never
+// ran. On failure it DELETES the box and returns an error rather than hand
+// back a box that was asked to be ephemeral but would otherwise leak forever:
+// default-dead, not default-alive (#522). ttlSeconds must be > 0 (the zero
+// case is "no TTL" and never reaches here). containerName is the backend box
+// name (info.Ref.Name) for logs and the LXC config write; username keys the
+// cleanup delete.
+func (s *ContainerServer) stampBirthTTL(ctx context.Context, containerName, username string, ttlSeconds int64) error {
+	var expiresAt time.Time
+	var err error
+	if tc, ok := s.boxes().(box.TTLCapable); ok {
+		// Native persistence (K8s: Sandbox spec.shutdownTime).
+		expiresAt = time.Now().Add(time.Duration(ttlSeconds) * time.Second).UTC()
+		err = tc.SetTTL(ctx, box.BoxRef{Tenant: username}, &expiresAt)
+	} else {
+		expiresAt, err = s.stampTTL(containerName, ttlSeconds)
+	}
+	if err != nil {
+		if delErr := s.boxes().Delete(ctx, box.BoxRef{Tenant: username}, true); delErr != nil {
+			log.Printf("[ttl] birth TTL stamp failed AND cleanup-delete failed for %s: stamp=%v delete=%v", containerName, err, delErr)
+		}
+		return status.Errorf(codes.Internal, "failed to set birth TTL on %s (box deleted to avoid a leak): %v", containerName, err)
+	}
+	log.Printf("[ttl] birth TTL set container=%s expires_at=%s (duration=%ds)", containerName, expiresAt.Format(time.RFC3339), ttlSeconds)
+	return nil
+}
+
+// stampBirthAutoSleep enables auto-sleep on a just-created box (#524) with the
+// given idle threshold (minutes), via the same Incus config keys ToggleAutoSleep
+// writes — so the box is born with its idle→stop timer and the autosleep loop
+// reclaims its CPU/RAM if a job crashes/cancels without anyone calling
+// toggle_auto_sleep (the stop half of #522's default-sleep model; birth TTL is
+// the delete half). Best-effort: auto-sleep is an optimization, not a leak
+// contract, so a failed stamp logs and the box keeps running (it can be toggled
+// later) rather than failing the create. idleMinutes must be > 0 (the zero case
+// is "no auto-sleep" and never reaches here).
+func (s *ContainerServer) stampBirthAutoSleep(containerName string, idleMinutes int32) {
+	if err := s.manager.SetConfig(containerName, incus.AutoSleepEnabledKey, "true"); err != nil {
+		log.Printf("[autosleep] failed to enable birth auto-sleep on %s: %v (continuing; box has no idle-stop)", containerName, err)
+		return
+	}
+	if err := s.manager.SetConfig(containerName, incus.IdleThresholdMinutesKey, strconv.Itoa(int(idleMinutes))); err != nil {
+		log.Printf("[autosleep] enabled auto-sleep on %s but failed to set idle threshold: %v (autosleep loop falls back to its %dm default)", containerName, err, incus.DefaultIdleThresholdMinutes)
+		return
+	}
+	log.Printf("[autosleep] birth auto-sleep enabled container=%s idle_threshold=%dm", containerName, idleMinutes)
+}
+
+// stampBirthDeleteAfterStopped persists the per-box stopped→delete window
+// (#525) at create, so the ttlsweeper reaps the box once it's been STOPPED
+// that long (the disk-reclaim half of #522's two-phase lifecycle; idle→stop
+// is the CPU/RAM half). Best-effort: a failed stamp logs and the box keeps
+// today's behavior (never reaped on stop). The clock only starts when the box
+// actually stops (StopContainer stamps stopped_at), so persisting the window
+// here is all create needs to do. seconds must be > 0 (0 = no stopped→delete,
+// never reaches here).
+func (s *ContainerServer) stampBirthDeleteAfterStopped(containerName string, seconds int64) {
+	if err := s.manager.SetConfig(containerName, incus.DeleteAfterStoppedSecondsKey, strconv.FormatInt(seconds, 10)); err != nil {
+		log.Printf("[ttl] failed to set birth %s on %s: %v (continuing; box has no stopped→delete)", incus.DeleteAfterStoppedSecondsKey, containerName, err)
+		return
+	}
+	log.Printf("[ttl] birth stopped→delete set container=%s delete_after_stopped=%ds", containerName, seconds)
+}
+
+// stampTTL writes now()+duration as a UTC RFC3339 wall-clock expiry onto the
+// container's Incus config under user.containarium.ttl_expires_at — the exact
+// key + format the ttlsweeper reads, so create and set agree byte-for-byte.
+// durationSeconds MUST be > 0 (validated via validateTTLSeconds); the zero
+// case is the caller's responsibility (clear on set, skip on create). Shared
+// by SetContainerTTL and CreateContainer's birth-TTL path (#523).
+func (s *ContainerServer) stampTTL(containerName string, durationSeconds int64) (time.Time, error) {
+	expiresAt := time.Now().Add(time.Duration(durationSeconds) * time.Second).UTC()
+	if err := s.manager.SetConfig(containerName, incus.TTLExpiresAtKey, expiresAt.Format(time.RFC3339)); err != nil {
+		return time.Time{}, err
+	}
+	return expiresAt, nil
+}
