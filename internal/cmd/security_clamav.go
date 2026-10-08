@@ -40,3 +40,17 @@ func runSecurityClamavInstall(cmd *cobra.Command, args []string) error {
 	}
 	resp, err := c.InstallClamav(args[0])
 	if err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", resp.Outcome, resp.Message)
+	switch resp.Outcome {
+	case "CLAMAV_INSTALL_OUTCOME_INSTALLED", "CLAMAV_INSTALL_OUTCOME_ALREADY_PRESENT":
+		return nil
+	}
+	return fmt.Errorf("clamav install did not complete: %s", resp.Outcome)
+}
+
+func init() {
+	securityClamavCmd.AddCommand(securityClamavInstallCmd)
+	securityCmd.AddCommand(securityClamavCmd)
+}
