@@ -94,3 +94,67 @@ func TestDebugRemediationCommandsParse(t *testing.T) {
 					}
 
 					// Resolve against the REAL command tree, then parse the
+					// flags exactly as cobra would at the terminal.
+					target, remaining, err := rootCmd.Find(argv)
+					if err != nil {
+						t.Fatalf("containarium debug printed %q, but %q is not a known command: %v",
+							cmdline, argv[0], err)
+					}
+					if target == rootCmd {
+						t.Fatalf("containarium debug printed %q, but %q did not resolve to a subcommand",
+							cmdline, argv[0])
+					}
+					if err := target.ParseFlags(remaining); err != nil {
+						t.Fatalf("containarium debug printed %q, which does not parse: %v\n"+
+							"An operator reading this is already locked out and will run it verbatim.",
+							cmdline, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+// The missing-host-user case is the one that regressed, and its ordering is
+// load-bearing: the list is read top-down by someone locked out, so the
+// non-destructive repair must come before delete-and-recreate.
+func TestMissingHostUserRemediationIsNonDestructiveFirst(t *testing.T) {
+	_, actions := server.Diagnose("alice", &pb.DebugContainerResponse{
+		ContainerState: "running",
+		HostUserExists: false,
+	})
+	if len(actions) == 0 {
+		t.Fatal("no next_actions for a missing host user")
+	}
+
+	firstDestructive, firstRepair := -1, -1
+	for i, a := range actions {
+		if firstDestructive < 0 && strings.Contains(a, "containarium delete ") {
+			firstDestructive = i
+		}
+		if firstRepair < 0 && strings.Contains(a, "sync-accounts") {
+			firstRepair = i
+		}
+	}
+	if firstRepair < 0 {
+		t.Fatal("missing-host-user remediation no longer offers sync-accounts, the non-destructive repair")
+	}
+	if firstDestructive >= 0 && firstDestructive < firstRepair {
+		t.Errorf("delete+recreate (action %d) is listed before the sync-accounts repair (action %d); "+
+			"the container and its data are intact in this failure mode, so destroying the box must "+
+			"never be the first thing an operator reads", firstDestructive, firstRepair)
+	}
+	if firstDestructive >= 0 && !strings.Contains(actions[firstDestructive], "DESTRUCTIVE") {
+		t.Error("the delete+recreate action does not announce itself as destructive")
+	}
+}
+
+// Guard the specific flag that regressed, so a rename of --user fails here
+// rather than in someone's terminal.
+func TestSyncAccountsAcceptsTheFlagsDebugRecommends(t *testing.T) {
+	for _, flag := range []string{"user", "dry-run", "force"} {
+		if syncAccountsCmd.Flags().Lookup(flag) == nil {
+			t.Errorf("sync-accounts has no --%s flag; containarium debug recommends it", flag)
+		}
+	}
+}
