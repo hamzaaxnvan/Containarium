@@ -70,3 +70,21 @@ func boxFromSpec(spec box.BoxSpec, namespace string) *containariumv1alpha1.Box {
 		Spec: containariumv1alpha1.BoxSpec{
 			Tenant:  spec.Ref.Tenant,
 			Image:   spec.Image,
+			Mode:    spec.Mode,
+			SSHKeys: spec.SSHKeys,
+			Resources: containariumv1alpha1.BoxResources{
+				CPU:          spec.Resources.CPU,
+				Memory:       spec.Resources.Memory,
+				Disk:         spec.Resources.Disk,
+				StorageClass: spec.Resources.StorageClass,
+			},
+			Stack:         spec.Stack,
+			StackParams:   spec.StackParams,
+			GitSource:     spec.GitSource,
+			GitRef:        spec.GitRef,
+			WorkspacePath: spec.WorkspacePath,
+			Labels:        spec.Labels,
+			AutoStart:     &autoStart,
+		},
+	}
+}
