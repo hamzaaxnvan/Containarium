@@ -46,3 +46,101 @@ cat <<EOF >/etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
 EOF
+modprobe overlay
+modprobe br_netfilter
+
+cat <<EOF >/etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.ipv4.ip_forward                 = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+EOF
+sysctl --system >/dev/null
+REMOTE
+
+	log "kubeadm init with maxPods=${K8S_MAX_PODS}"
+	ssh_or_local "sudo bash -s" <<REMOTE
+set -euo pipefail
+cat <<KUBEADM_CFG >/tmp/kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+networking:
+  podSubnet: "192.168.0.0/16"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+maxPods: ${K8S_MAX_PODS}
+KUBEADM_CFG
+
+kubeadm init --config /tmp/kubeadm-config.yaml
+
+mkdir -p /root/.kube
+cp -f /etc/kubernetes/admin.conf /root/.kube/config
+mkdir -p /home/${REMOTE_SSH_USER}/.kube
+cp -f /etc/kubernetes/admin.conf /home/${REMOTE_SSH_USER}/.kube/config
+chown -R ${REMOTE_SSH_USER}:${REMOTE_SSH_USER} /home/${REMOTE_SSH_USER}/.kube
+
+# Single-node cluster — the control-plane taint would otherwise prevent
+# any pod (Sandbox-controller-owned or Containarium-owned) from
+# scheduling at all.
+kubectl --kubeconfig=/root/.kube/config taint nodes --all node-role.kubernetes.io/control-plane- || true
+REMOTE
+
+	log "installing Calico CNI"
+	ssh_or_local "kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml"
+	# `kubectl wait` on a label selector errors immediately with "no
+	# matching resources found" if zero pods currently match — it does not
+	# wait for the DaemonSet controller to create them. Hit this live: the
+	# calico-node DaemonSet object exists right after apply, but its pods
+	# take a few seconds to appear. Poll for at least one to exist first.
+	ssh_or_local "until [ \"\$(kubectl get pods -l k8s-app=calico-node -n kube-system --no-headers 2>/dev/null | wc -l)\" -gt 0 ]; do sleep 2; done"
+	ssh_or_local "kubectl wait --for=condition=ready pod -l k8s-app=calico-node -n kube-system --timeout=180s"
+
+	log "installing agent-sandbox controller ${AGENT_SANDBOX_VERSION}"
+	ssh_or_local "kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/manifest.yaml"
+	ssh_or_local "kubectl -n agent-sandbox-system wait --for=condition=available deployment/agent-sandbox-controller --timeout=180s"
+}
+
+# install_gvisor installs runsc + the containerd shim, registers it as a
+# containerd runtime handler, and creates the matching k8s RuntimeClass.
+# Called on BOTH sides (see the file header) so gVisor itself isn't a
+# variable between the two runs — only who's doing the scheduling is.
+install_gvisor() {
+	log "installing gVisor (${GVISOR_RUNTIME_CLASS})"
+	ssh_or_local "sudo bash -s" <<REMOTE
+set -euo pipefail
+ARCH=\$(uname -m)
+URL="https://storage.googleapis.com/gvisor/releases/release/latest/\${ARCH}"
+cd /tmp
+curl -fsSLO "\${URL}/runsc" -O "\${URL}/runsc.sha512" \
+	-O "\${URL}/containerd-shim-runsc-v1" -O "\${URL}/containerd-shim-runsc-v1.sha512"
+sha512sum -c runsc.sha512 -c containerd-shim-runsc-v1.sha512
+chmod a+rx runsc containerd-shim-runsc-v1
+mv runsc containerd-shim-runsc-v1 /usr/local/bin/
+
+cat <<TOML >>/etc/containerd/config.toml
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.${GVISOR_RUNTIME_CLASS}]
+  runtime_type = "io.containerd.${GVISOR_RUNTIME_CLASS}.v1"
+TOML
+systemctl restart containerd
+sleep 2
+# Confirm the CRI plugin actually picked up the new runtime handler before
+# moving on — found live that the wrong plugin ID (an older containerd
+# v1-era path, io.containerd.grpc.v1.cri) silently creates an inert config
+# tree on containerd v2.x: no error, no warning, just "no runtime for
+# \"${GVISOR_RUNTIME_CLASS}\" is configured" at first pod creation, several
+# steps later. containerd 2.x's actual CRI plugin id is
+# io.containerd.cri.v1.runtime (see the existing runc entry
+# \`containerd config default\` already generates, in the same file).
+crictl info 2>/dev/null | grep -q "\"${GVISOR_RUNTIME_CLASS}\"" ||
+	{ echo "containerd did not pick up the ${GVISOR_RUNTIME_CLASS} runtime handler after restart" >&2; exit 1; }
+
+cat <<EOF | kubectl apply -f -
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: ${GVISOR_RUNTIME_CLASS}
+handler: ${GVISOR_RUNTIME_CLASS}
+EOF
+REMOTE
+}
