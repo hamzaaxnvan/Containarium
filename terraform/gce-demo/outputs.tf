@@ -59,3 +59,24 @@ output "next_steps" {
     2. Build the platform MCP binary and wire Claude Code. The API is reached
        through the sentinel's Caddy over HTTPS (port 8080 is not exposed
        publicly), so point the MCP server at https://${var.base_domain}:
+
+       make build-mcp
+       claude mcp add containarium-demo --scope user \
+         --env CONTAINARIUM_SERVER_URL=https://${var.base_domain} \
+         --env CONTAINARIUM_JWT_TOKEN="$(cat ~/.containarium-demo-token.txt)" \
+         -- $(pwd)/bin/mcp-server
+
+    3. Restart Claude Code so it picks up the new server.
+
+    4. Drive the demo with one prompt:
+
+       "Spin up a sandbox called 'demo-blog', install nginx, serve a
+        hello-world page, and expose it at demo-blog.${var.base_domain}."
+
+    5. When the recording is done:
+
+       terraform destroy
+
+    ─────────────────────────────────────────────────────────────────
+  EOT
+}

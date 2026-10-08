@@ -41,3 +41,14 @@ RUN apt-get update \
     && useradd --create-home --uid 1000 --shell /usr/sbin/nologin model-gateway
 
 COPY --from=build /out/model-gateway /usr/local/bin/model-gateway
+
+USER model-gateway
+ENV HOME=/home/model-gateway
+# Data plane + admin mux (/__gateway/*) — documentation only; the gateway
+# binds this single port for both.
+EXPOSE 8866
+ENTRYPOINT ["/usr/local/bin/model-gateway"]
+# `serve` is the default subcommand; `mint`/`revoke` are one-shot CLI calls an
+# operator runs with `docker run <image> mint ...` / `... revoke ...`,
+# overriding this CMD.
+CMD ["serve"]
