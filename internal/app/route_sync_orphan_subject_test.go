@@ -94,3 +94,99 @@ func TestSyncHTTPRoutes_ReapingARouteAlsoRemovesItsTLSSubject(t *testing.T) {
 	srv, fc := newRWFakeCaddy(caddyConfigWithRoutesAndPolicy(t,
 		[]string{"kept.example.com", "gone.example.com"},
 		[]string{"kept.example.com", "gone.example.com"},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+	j := &RouteSyncJob{proxyManager: p}
+
+	// Only "kept" remains in the DB — "gone" was deactivated or deleted.
+	if err := j.syncHTTPRoutes([]*RouteRecord{activeRoute("kept.example.com")}); err != nil {
+		t.Fatalf("syncHTTPRoutes: %v", err)
+	}
+
+	policies := readPolicies(t, fc)
+	if hasSubject(policies, "gone.example.com") {
+		t.Fatalf("reaped route's TLS subject was left behind — Caddy will retry ACME for it "+
+			"forever, burning rate-limit budget with no route and no host (#1618); subjects: %v",
+			subjectsOf(policies))
+	}
+	if !hasSubject(policies, "kept.example.com") {
+		t.Fatalf("a still-active route's subject must not be removed; subjects: %v", subjectsOf(policies))
+	}
+}
+
+// A wildcard subject is per-cluster (ProvisionWildcardTLS), not route-derived,
+// and covers hosts beyond the one being reaped. Removing it would take TLS
+// away from every sibling — strictly worse than the orphan being fixed.
+func TestSyncHTTPRoutes_ReapNeverRemovesWildcardSubject(t *testing.T) {
+	srv, fc := newRWFakeCaddy(caddyConfigWithRoutesAndPolicy(t,
+		[]string{"*.example.com"},
+		[]string{"*.example.com", "kept.example.com"},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+	j := &RouteSyncJob{proxyManager: p}
+
+	// The DB has no route named "*.example.com", so the reap path sees it as
+	// removable. It must be skipped anyway.
+	if err := j.syncHTTPRoutes([]*RouteRecord{activeRoute("kept.example.com")}); err != nil {
+		t.Fatalf("syncHTTPRoutes: %v", err)
+	}
+
+	policies := readPolicies(t, fc)
+	if !hasSubject(policies, "*.example.com") {
+		t.Fatalf("wildcard subject was removed — every host it covers loses TLS; subjects: %v",
+			subjectsOf(policies))
+	}
+}
+
+// Steady state must stay silent: nothing to reap means no writes at all, so a
+// quiet fleet doesn't churn Caddy's config every tick.
+func TestSyncHTTPRoutes_NoReapMeansNoSubjectWrites(t *testing.T) {
+	srv, fc := newRWFakeCaddy(caddyConfigWithRoutesAndPolicy(t,
+		[]string{"kept.example.com"},
+		[]string{"kept.example.com"},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+	j := &RouteSyncJob{proxyManager: p}
+	before := fc.puts
+
+	if err := j.syncHTTPRoutes([]*RouteRecord{activeRoute("kept.example.com")}); err != nil {
+		t.Fatalf("syncHTTPRoutes: %v", err)
+	}
+
+	if fc.puts != before {
+		t.Fatalf("in-sync tick performed %d config write(s); it must be a no-op", fc.puts-before)
+	}
+}
+
+// Several routes can disappear at once (a container delete, a batch cleanup).
+// Every orphan must go, not just the first.
+func TestSyncHTTPRoutes_ReapsAllOrphanedSubjects(t *testing.T) {
+	srv, fc := newRWFakeCaddy(caddyConfigWithRoutesAndPolicy(t,
+		[]string{"kept.example.com", "a.example.com", "b.example.com"},
+		[]string{"kept.example.com", "a.example.com", "b.example.com"},
+	))
+	defer srv.Close()
+
+	p := NewProxyManager(srv.URL, "example.com")
+	j := &RouteSyncJob{proxyManager: p}
+
+	if err := j.syncHTTPRoutes([]*RouteRecord{activeRoute("kept.example.com")}); err != nil {
+		t.Fatalf("syncHTTPRoutes: %v", err)
+	}
+
+	policies := readPolicies(t, fc)
+	for _, gone := range []string{"a.example.com", "b.example.com"} {
+		if hasSubject(policies, gone) {
+			t.Errorf("orphaned subject %q survived the reap; subjects: %v", gone, subjectsOf(policies))
+		}
+	}
+	if !hasSubject(policies, "kept.example.com") {
+		t.Error("active route's subject was removed")
+	}
+}

@@ -86,3 +86,135 @@ func TestBackendInfo_DecodesHostLoadWireShape(t *testing.T) {
 	}
 	l := parsed.Backends[0].HostLoad
 	if l == nil {
+		t.Fatal("HostLoad is nil after decoding a response that carries it")
+	}
+	if l.CPULoad1m != 6.5 || l.CPUCores != 8 {
+		t.Errorf("cpu = %v/%d, want 6.5/8", l.CPULoad1m, l.CPUCores)
+	}
+	if l.MemoryUsedBytes != 25769803776 || l.MemoryTotalBytes != 34359738368 {
+		t.Errorf("memory = %d/%d bytes", l.MemoryUsedBytes, l.MemoryTotalBytes)
+	}
+	if got := formatCPULoad(l); got != "6.50/8" {
+		t.Errorf("formatCPULoad = %q, want %q", got, "6.50/8")
+	}
+	if got := formatUsedPercent(l, memoryUsage); got != "75%" {
+		t.Errorf("memory percent = %q, want 75%%", got)
+	}
+}
+
+// A daemon that returns no load block (older build, or an unmeasurable host)
+// must still decode and render, with load shown as unknown.
+func TestBackendInfo_DecodesWithoutHostLoad(t *testing.T) {
+	var parsed backendsListResponse
+	if err := json.Unmarshal([]byte(`{"backends":[{"id":"local","type":"local","healthy":true,"containerCount":0}]}`), &parsed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if parsed.Backends[0].HostLoad != nil {
+		t.Fatal("HostLoad should be nil when absent from the response")
+	}
+	if got := formatCPULoad(parsed.Backends[0].HostLoad); got != "-" {
+		t.Fatalf("formatCPULoad = %q, want %q", got, "-")
+	}
+}
+
+// TestBackendInfo_DecodesStorageWireShape locks the CLI's view of the
+// BackendInfo.storage contract. The struct is hand-maintained here on purpose
+// (see backendInfo's comment), so a server-side rename has to fail loudly
+// rather than silently blanking the column.
+func TestBackendInfo_DecodesStorageWireShape(t *testing.T) {
+	body := `{"backends":[{"id":"b1","type":"local","healthy":true,"storage":{
+		"pool":"default","driver":"STORAGE_DRIVER_DIR",
+		"isolation":"STORAGE_ISOLATION_SHARED_FILESYSTEM","driverName":"dir"}}]}`
+
+	var parsed backendsListResponse
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	s := parsed.Backends[0].Storage
+	if s == nil {
+		t.Fatal("Storage is nil after decoding a response that carries it")
+	}
+	if s.DriverName != "dir" {
+		t.Errorf("DriverName = %q, want %q", s.DriverName, "dir")
+	}
+	if s.Isolation != "STORAGE_ISOLATION_SHARED_FILESYSTEM" {
+		t.Errorf("Isolation = %q", s.Isolation)
+	}
+}
+
+// TestFormatStorage covers what an operator actually reads in the table.
+//
+// The two cases that matter most are the flag on a shared-filesystem pool
+// (the #1206 exposure) and "-" for a backend that reported nothing. An
+// unmeasured pool must not render as a safe-looking value — the same rule
+// formatCPULoad already follows.
+func TestFormatStorage(t *testing.T) {
+	tests := []struct {
+		name    string
+		storage *backendStorage
+		want    string
+	}{
+		{
+			name:    "no report renders as unknown, not as safe",
+			storage: nil,
+			want:    "-",
+		},
+		{
+			name:    "an isolating pool renders plainly",
+			storage: &backendStorage{DriverName: "zfs", Isolation: "STORAGE_ISOLATION_PER_CONTAINER"},
+			want:    "zfs",
+		},
+		{
+			name:    "a shared-filesystem pool is flagged",
+			storage: &backendStorage{DriverName: "dir", Isolation: "STORAGE_ISOLATION_SHARED_FILESYSTEM"},
+			want:    "dir ⚠",
+		},
+		{
+			name:    "an unclassified driver is marked as unverified, not flagged as shared",
+			storage: &backendStorage{DriverName: "future-fs", Isolation: "STORAGE_ISOLATION_UNKNOWN_DRIVER"},
+			want:    "future-fs ?",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatStorage(tt.storage); got != tt.want {
+				t.Errorf("formatStorage() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSharedFilesystemBackends counts the backends an operator needs to act
+// on, which is what drives the table footer. A backend that reported nothing
+// must NOT be counted — "unknown" is not "exposed", and inflating the count
+// with unknowns would make the warning untrustworthy.
+func TestSharedFilesystemBackends(t *testing.T) {
+	backends := []backendInfo{
+		{ID: "a", Storage: &backendStorage{DriverName: "zfs", Isolation: "STORAGE_ISOLATION_PER_CONTAINER"}},
+		{ID: "b", Storage: &backendStorage{DriverName: "dir", Isolation: "STORAGE_ISOLATION_SHARED_FILESYSTEM"}},
+		{ID: "c", Storage: nil},
+		{ID: "d", Storage: &backendStorage{DriverName: "dir", Isolation: "STORAGE_ISOLATION_SHARED_FILESYSTEM"}},
+		{ID: "e", Storage: &backendStorage{DriverName: "x", Isolation: "STORAGE_ISOLATION_UNKNOWN_DRIVER"}},
+	}
+	if got := sharedFilesystemBackends(backends); got != 2 {
+		t.Errorf("sharedFilesystemBackends() = %d, want 2", got)
+	}
+}
+
+// The Incus server version is what a fleet patch-level audit reads. Absent
+// (a peer that could not report it) must decode to "" and print as "-",
+// never as a guessed value.
+func TestBackendInfo_DecodesIncusVersion(t *testing.T) {
+	var got backendsListResponse
+	wire := `{"backends":[{"id":"a","type":"tunnel","healthy":true,"incusVersion":"6.23"},{"id":"b","type":"tunnel","healthy":true}]}`
+	if err := json.Unmarshal([]byte(wire), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Backends[0].IncusVersion != "6.23" {
+		t.Errorf("IncusVersion = %q, want 6.23", got.Backends[0].IncusVersion)
+	}
+	if got.Backends[1].IncusVersion != "" {
+		t.Errorf("IncusVersion = %q, want empty when the backend reported none", got.Backends[1].IncusVersion)
+	}
+}
