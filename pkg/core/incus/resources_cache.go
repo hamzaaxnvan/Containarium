@@ -57,3 +57,122 @@ type resourcesCache struct {
 	cfg   resourcesCacheConfig
 	fetch func() (*SystemResources, error)
 
+	mu       sync.Mutex
+	val      *SystemResources // last good read
+	at       time.Time
+	failedAt time.Time // zero when the last attempt succeeded
+	lastErr  error
+	flight   *resFlight
+}
+
+func newResourcesCache(fetch func() (*SystemResources, error), cfg resourcesCacheConfig) *resourcesCache {
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	return &resourcesCache{cfg: cfg, fetch: fetch}
+}
+
+func cloneResources(v *SystemResources) *SystemResources {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	c.GPUs = append([]GPUInfo(nil), v.GPUs...)
+	return &c
+}
+
+// withFreshLoad copies v and overlays the current load averages (a local /proc read, never an Incus call).
+func withFreshLoad(v *SystemResources) *SystemResources {
+	c := cloneResources(v)
+	if l1, l5, l15, err := getCPULoadAvg(); err == nil {
+		c.CPULoad1Min, c.CPULoad5Min, c.CPULoad15Min = l1, l5, l15
+	}
+	return c
+}
+
+// get returns the system resources, bounded: it never blocks longer than cfg.Wait.
+func (rc *resourcesCache) get() (*SystemResources, error) {
+	rc.mu.Lock()
+	now := rc.cfg.Now()
+	if rc.val != nil && now.Sub(rc.at) < rc.cfg.Fresh {
+		v := rc.val
+		rc.mu.Unlock()
+		return withFreshLoad(v), nil
+	}
+	if !rc.failedAt.IsZero() && now.Sub(rc.failedAt) < rc.cfg.Backoff {
+		v, err := rc.val, rc.lastErr
+		rc.mu.Unlock()
+		return staleOrErr(v, err)
+	}
+	f := rc.flight
+	if f == nil {
+		f = &resFlight{done: make(chan struct{})}
+		rc.flight = f
+		go rc.run(f)
+	}
+	rc.mu.Unlock()
+
+	timer := time.NewTimer(rc.cfg.Wait)
+	defer timer.Stop()
+	select {
+	case <-f.done:
+		if f.err == nil {
+			return withFreshLoad(f.val), nil
+		}
+	case <-timer.C:
+		// The read is still running (a hung Incus). Record the miss so the next callers are not each made to wait,
+		// and let the read finish in the background: its result still lands in the cache when it ends.
+		rc.mu.Lock()
+		if rc.failedAt.IsZero() || rc.cfg.Now().Sub(rc.failedAt) >= rc.cfg.Backoff {
+			rc.failedAt, rc.lastErr = rc.cfg.Now(), ErrResourcesUnavailable
+		}
+		rc.mu.Unlock()
+	}
+	rc.mu.Lock()
+	v, err := rc.val, rc.lastErr
+	rc.mu.Unlock()
+	return staleOrErr(v, err)
+}
+
+func staleOrErr(v *SystemResources, err error) (*SystemResources, error) {
+	if v != nil {
+		return withFreshLoad(v), nil
+	}
+	if err == nil {
+		err = ErrResourcesUnavailable
+	}
+	return nil, err
+}
+
+func (rc *resourcesCache) run(f *resFlight) {
+	val, err := rc.fetch()
+	rc.mu.Lock()
+	if err == nil {
+		rc.val, rc.at, rc.failedAt, rc.lastErr = cloneResources(val), rc.cfg.Now(), time.Time{}, nil
+	} else {
+		rc.failedAt, rc.lastErr = rc.cfg.Now(), err
+	}
+	rc.flight = nil
+	f.val, f.err = rc.val, err
+	rc.mu.Unlock()
+	close(f.done)
+}
+
+var resourcesCaches sync.Map // socket path -> *resourcesCache
+
+// resourcesCacheFor returns the process-wide cache for a socket, creating it on first use. The fetch uses its own
+// short-timeout client, so a hung Incus ends the HTTP request instead of leaking it.
+func resourcesCacheFor(socketPath string) *resourcesCache {
+	if c, ok := resourcesCaches.Load(socketPath); ok {
+		return c.(*resourcesCache)
+	}
+	rc := newResourcesCache(func() (*SystemResources, error) {
+		bounded, err := NewWithSocketAndTimeout(socketPath, resourcesRequestTimeout)
+		if err != nil {
+			return nil, err
+		}
+		return bounded.fetchSystemResources()
+	}, resourcesCacheConfig{Fresh: resourcesFreshFor, Wait: resourcesWait, Backoff: resourcesBackoff})
+	actual, _ := resourcesCaches.LoadOrStore(socketPath, rc)
+	return actual.(*resourcesCache)
+}
