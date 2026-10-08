@@ -68,3 +68,74 @@ func TestValidateImageDigest_EnforcedRejectsBareTag(t *testing.T) {
 
 func TestValidateImageDigest_EnforcedAcceptsValidDigest(t *testing.T) {
 	resetDigestOnce(t)
+	t.Setenv(requireImageDigestEnv, "true")
+
+	good := "ubuntu:22.04@sha256:" + strings.Repeat("a", 64)
+	if err := validateImageDigest(good); err != nil {
+		t.Fatalf("valid digest: %v", err)
+	}
+}
+
+func TestValidateImageDigest_RejectsTooShortDigest(t *testing.T) {
+	resetDigestOnce(t)
+	t.Setenv(requireImageDigestEnv, "true")
+
+	short := "ubuntu:22.04@sha256:abc"
+	err := validateImageDigest(short)
+	if err == nil {
+		t.Fatal("short digest should be rejected")
+	}
+	if !strings.Contains(err.Error(), "64 lowercase hex") {
+		t.Fatalf("error should explain expected shape; got %v", err)
+	}
+}
+
+func TestValidateImageDigest_RejectsUppercaseHex(t *testing.T) {
+	// OCI digests are spec'd as lowercase; uppercase tokens
+	// are technically a different reference and reject is
+	// the safer call.
+	resetDigestOnce(t)
+	t.Setenv(requireImageDigestEnv, "true")
+
+	mixed := "ubuntu:22.04@sha256:" + strings.Repeat("A", 64)
+	if err := validateImageDigest(mixed); err == nil {
+		t.Fatal("uppercase hex should be rejected")
+	}
+}
+
+func TestValidateImageDigest_RejectsWrongAlgo(t *testing.T) {
+	resetDigestOnce(t)
+	t.Setenv(requireImageDigestEnv, "true")
+
+	// sha512 is fine in OCI but we accept only sha256 to
+	// avoid the algorithm-confusion surface that bit JWTs
+	// (the daemon validates one shape end-to-end).
+	wrong := "ubuntu:22.04@sha512:" + strings.Repeat("a", 128)
+	if err := validateImageDigest(wrong); err == nil {
+		t.Fatal("sha512 digest should be rejected (sha256-only policy)")
+	}
+}
+
+func TestValidateImageDigest_EnforcedAllowsEmptyImage(t *testing.T) {
+	// Empty req.Image means "use the daemon's default".
+	// The default substitution happens later in the
+	// pipeline; gating it here would block tenants who
+	// rely on the os_type-driven default.
+	resetDigestOnce(t)
+	t.Setenv(requireImageDigestEnv, "true")
+
+	if err := validateImageDigest(""); err != nil {
+		t.Fatalf("empty image with enforcement on should pass; got %v", err)
+	}
+}
+
+func TestValidateImageDigest_UnrecognizedEnvLeavesOff(t *testing.T) {
+	resetDigestOnce(t)
+	t.Setenv(requireImageDigestEnv, "maybe")
+
+	// Should not enforce — fail-open on bad config so a
+	// typo doesn't silently lock out every tenant.
+	if err := validateImageDigest("ubuntu:22.04"); err != nil {
+		t.Fatalf("unrecognized env should leave enforcement off; got %v", err)
+	}
+}
