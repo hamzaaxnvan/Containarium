@@ -46,3 +46,19 @@ func TestOTelEnvVarsForMigrationWithBearer_EmptyEndpointReturnsNil(t *testing.T)
 	m := OTelEnvVarsForMigrationWithBearer("alice", "alice-container", "backend-1", "", "secret")
 	if m != nil {
 		t.Fatalf("empty endpoint should return nil; got %v", m)
+	}
+}
+
+func TestOTelEnvVarsForMigrationWithBearer_HeaderFormat(t *testing.T) {
+	// The OTel SDK reads OTEL_EXPORTER_OTLP_HEADERS as a
+	// key=value list. The Authorization scheme requires
+	// exactly one space between "Bearer" and the token.
+	m := OTelEnvVarsForMigrationWithBearer("alice", "alice-container", "backend-1", "http://x:4318", "abc")
+	h := m["OTEL_EXPORTER_OTLP_HEADERS"]
+	if !strings.HasPrefix(h, "Authorization=Bearer ") {
+		t.Fatalf("header should start with 'Authorization=Bearer '; got %q", h)
+	}
+	if h != "Authorization=Bearer abc" {
+		t.Fatalf("header = %q; want exact form 'Authorization=Bearer abc'", h)
+	}
+}
