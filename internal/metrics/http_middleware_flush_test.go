@@ -23,3 +23,16 @@ func TestHTTPMetricsMiddleware_StreamingHandlerCanFlush(t *testing.T) {
 			_, _ = w.Write([]byte("chunk\n"))
 			if err := rc.Flush(); err != nil {
 				t.Errorf("flush %d: %v", i, err)
+				return
+			}
+		}
+	})
+	rec := httptest.NewRecorder()
+	HTTPMetricsMiddleware(inner, mp).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/x", nil))
+	if rec.Body.String() != "chunk\nchunk\nchunk\n" {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+	if !rec.Flushed {
+		t.Fatal("underlying writer was not flushed")
+	}
+}
