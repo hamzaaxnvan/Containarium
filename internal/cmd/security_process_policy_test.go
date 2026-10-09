@@ -296,3 +296,152 @@ func TestProcessPolicyRelease_SharedFindingUsesTheBoxRecord(t *testing.T) {
 	cmd.SetOut(&buf)
 	cmd.SetArgs([]string{"box-a"})
 	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	const want = "Released THROTTLE on box-a: CPU limit restored. Finding #6 kept open: another box still has a response.\n"
+	if buf.String() != want {
+		t.Errorf("output = %q, want %q", buf.String(), want)
+	}
+}
+
+func TestProcessPolicyRelease_FreezeWording(t *testing.T) {
+	reply, _ := protojson.Marshal(&pb.ReleaseProcessActionResponse{Finding: &pb.Finding{
+		Id: 7, Response: &pb.FindingResponse{Action: pb.ProcessAction_PROCESS_ACTION_FREEZE},
+	}})
+	(&policyServer{reply: string(reply)}).start(t)
+	cmd := newProcessPolicyReleaseCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"box-2"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "unfrozen") || !strings.Contains(buf.String(), "#7") {
+		t.Errorf("output = %q", buf.String())
+	}
+}
+
+func TestProcessPolicyRelease_NotFoundAndArgs(t *testing.T) {
+	ps := &policyServer{status: http.StatusNotFound, reply: `{"message":"no open action"}`}
+	ps.start(t)
+	cmd := newProcessPolicyReleaseCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"box-1"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Errorf("err = %v, want a 404 surfaced", err)
+	}
+	cmd = newProcessPolicyReleaseCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{})
+	if err := cmd.Execute(); err == nil {
+		t.Error("release without a container must fail")
+	}
+}
+
+func TestProcessPolicy_RequiresServer(t *testing.T) {
+	old := serverAddr
+	serverAddr = ""
+	defer func() { serverAddr = old }()
+	cmd := newProcessPolicyGetCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected an error when --server is unset")
+	}
+}
+
+func TestSentryStatus_PrintsDegradedNoPersistence(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"state":"SENTRY_STATE_DEGRADED","reason":"DEGRADED (no persistence): responses disabled"}`))
+	}))
+	defer srv.Close()
+	old := serverAddr
+	serverAddr = srv.URL
+	defer func() { serverAddr = old }()
+	cmd := testCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	if err := runSecuritySentryStatus(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Sentry: DEGRADED", "Reason: DEGRADED (no persistence): responses disabled"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("missing %q:\n%s", want, buf.String())
+		}
+	}
+}
+
+// Thresholds that were never set are stored as zeros; `get` must show the
+// values the rule is using, not those zeros (#2675).
+func TestProcessPolicyGet_ShowsEffectiveThresholdsNotStoredZeros(t *testing.T) {
+	reply, _ := protojson.Marshal(&pb.GetProcessPolicyResponse{
+		Policy: &pb.ProcessPolicy{MiningBehavior: &pb.MiningBehaviorThresholds{Window: durationpb.New(5 * time.Minute)}},
+		Effective: &pb.ProcessPolicy{
+			Action: pb.ProcessAction_PROCESS_ACTION_ALERT,
+			MiningBehavior: &pb.MiningBehaviorThresholds{
+				MinCores: 1.5, MinFractionOfLimit: 0.75, Window: durationpb.New(5 * time.Minute),
+				FlowMinAge: durationpb.New(3 * time.Minute), StratumPorts: []uint32{3333},
+			},
+		},
+	})
+	ps := &policyServer{reply: string(reply)}
+	ps.start(t)
+	cmd := newProcessPolicyGetCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"min cores:              1.5", "min fraction of limit:  0.75", "stratum ports:          3333"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("output lacks %q:\n%s", want, buf.String())
+		}
+	}
+}
+
+// TestProcessPolicySet_KillProcess (#2638): --kill-process sends the
+// optional bool explicitly (true and false both), so the server's
+// field-by-field merge can tell "turn it off" from "leave it alone".
+func TestProcessPolicySet_KillProcess(t *testing.T) {
+	for _, tc := range []struct {
+		arg, want string
+	}{
+		{"--kill-process=true", `"killProcess":true`},
+		{"--kill-process=false", `"killProcess":false`},
+	} {
+		ps := &policyServer{reply: `{"effective":{"killProcess":true}}`}
+		ps.start(t)
+		if _, err := runPolicySet(t, tc.arg); err != nil {
+			t.Fatalf("%s: %v", tc.arg, err)
+		}
+		if !strings.Contains(string(ps.body), tc.want) {
+			t.Errorf("%s: body = %s, want %s", tc.arg, ps.body, tc.want)
+		}
+	}
+	ps := &policyServer{reply: `{}`}
+	ps.start(t)
+	if _, err := runPolicySet(t, "--action", "alert"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(ps.body), "killProcess") {
+		t.Errorf("a lone --action must not send kill_process; body = %s", ps.body)
+	}
+}
+
+// An unset kill_process prints "inherit", not a false it may not be (#2638
+// review nit).
+func TestWritePolicyBlock_KillProcessInherit(t *testing.T) {
+	var buf bytes.Buffer
+	writePolicyBlock(&buf, &pb.ProcessPolicy{Action: pb.ProcessAction_PROCESS_ACTION_ALERT})
+	if !strings.Contains(buf.String(), "kill process:       inherit") {
+		t.Fatalf("output = %q", buf.String())
+	}
+	on := true
+	buf.Reset()
+	writePolicyBlock(&buf, &pb.ProcessPolicy{KillProcess: &on})
+	if !strings.Contains(buf.String(), "kill process:       true") {
+		t.Fatalf("output = %q", buf.String())
+	}
+}
