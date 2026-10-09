@@ -225,3 +225,231 @@ func waitForInstanceReady(t *testing.T, ctx context.Context, projectID, zone, in
 		time.Sleep(10 * time.Second)
 	}
 
+	// Get instance IP
+	cmd := exec.CommandContext(ctx, "gcloud", "compute", "instances", "describe", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--format=get(networkInterfaces[0].accessConfigs[0].natIP)",
+	)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to get instance IP")
+	instanceIP := strings.TrimSpace(string(output))
+
+	// Wait for SSH to be ready
+	t.Log("Waiting for SSH to be ready...")
+	for i := 0; i < 60; i++ {
+		cmd := exec.CommandContext(ctx, "gcloud", "compute", "ssh", instanceName,
+			"--project="+projectID,
+			"--zone="+zone,
+			"--command=echo ready",
+			"--ssh-flag=-o ConnectTimeout=5",
+		)
+		output, err := cmd.CombinedOutput()
+		if err == nil && strings.Contains(string(output), "ready") {
+			t.Log("✓ SSH is ready")
+			break
+		}
+		t.Logf("Attempt %d/60: Waiting for SSH...", i+1)
+		time.Sleep(10 * time.Second)
+	}
+
+	// Wait for startup script to complete
+	t.Log("Waiting for startup script to complete...")
+	for i := 0; i < 120; i++ {
+		cmd := exec.CommandContext(ctx, "gcloud", "compute", "instances", "get-serial-port-output", instanceName,
+			"--project="+projectID,
+			"--zone="+zone,
+		)
+		output, err := cmd.CombinedOutput()
+		if err == nil && strings.Contains(string(output), "Containarium Setup Complete") {
+			t.Log("✓ Startup script completed")
+			break
+		}
+		t.Logf("Attempt %d/120: Waiting for startup...", i+1)
+		time.Sleep(5 * time.Second)
+	}
+
+	return instanceIP
+}
+
+// verifyZFSSetup verifies ZFS is properly configured
+func verifyZFSSetup(t *testing.T, ctx context.Context, projectID, zone, instanceName string) {
+	t.Log("Verifying ZFS setup...")
+
+	// Check ZFS pool
+	cmd := exec.CommandContext(ctx, "gcloud", "compute", "ssh", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--command=sudo zpool status incus-pool",
+	)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to check ZFS pool")
+	assert.Contains(t, string(output), "ONLINE", "ZFS pool should be ONLINE")
+	t.Log("✓ ZFS pool is ONLINE")
+
+	// Check Incus storage driver
+	cmd = exec.CommandContext(ctx, "gcloud", "compute", "ssh", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--command=sudo incus storage show default",
+	)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to check Incus storage")
+	assert.Contains(t, string(output), "driver: zfs", "Incus should use ZFS driver")
+	t.Log("✓ Incus using ZFS storage driver")
+}
+
+// createContainerWithTestData creates a container and writes test data
+func createContainerWithTestData(t *testing.T, ctx context.Context, projectID, zone, instanceName string) (string, string) {
+	t.Log("Creating container with test data...")
+
+	containerName := "persistence-test"
+	testData := fmt.Sprintf("PERSISTENCE_TEST_%d_%s", time.Now().Unix(), randHex(16))
+
+	// Create container with quota
+	cmd := exec.CommandContext(ctx, "gcloud", "compute", "ssh", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--command=sudo incus launch images:ubuntu/24.04 "+containerName+" -d root,size=20GB",
+	)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to create container: %s", output)
+	t.Log("✓ Container created")
+
+	// Wait for container to be ready
+	time.Sleep(15 * time.Second)
+
+	// Write test data
+	cmd = exec.CommandContext(ctx, "gcloud", "compute", "ssh", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--command=echo '"+testData+"' | sudo incus exec "+containerName+" -- tee /root/test-data.txt",
+	)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to write test data: %s", output)
+	t.Log("✓ Test data written")
+
+	// Calculate checksum
+	checksum := fmt.Sprintf("%x", md5.Sum([]byte(testData+"\n")))
+	t.Logf("Test data checksum: %s", checksum)
+
+	// Verify quota
+	cmd = exec.CommandContext(ctx, "gcloud", "compute", "ssh", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--command=sudo incus exec "+containerName+" -- df -h /",
+	)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to check quota")
+	t.Logf("Container disk usage:\n%s", output)
+
+	return testData, checksum
+}
+
+// rebootInstance reboots the instance
+func rebootInstance(t *testing.T, ctx context.Context, projectID, zone, instanceName string) {
+	t.Log("Rebooting instance...")
+
+	// Stop instance
+	cmd := exec.CommandContext(ctx, "gcloud", "compute", "instances", "stop", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+	)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to stop instance: %s", output)
+	t.Log("✓ Instance stopped")
+
+	// Wait a bit
+	time.Sleep(10 * time.Second)
+
+	// Start instance
+	cmd = exec.CommandContext(ctx, "gcloud", "compute", "instances", "start", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+	)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to start instance: %s", output)
+	t.Log("✓ Instance started")
+}
+
+// verifyDataPersisted verifies the test data survived the reboot
+func verifyDataPersisted(t *testing.T, ctx context.Context, projectID, zone, instanceName, expectedData, expectedChecksum string) {
+	t.Log("Verifying data persisted after reboot...")
+
+	containerName := "persistence-test"
+
+	// Check container still exists
+	cmd := exec.CommandContext(ctx, "gcloud", "compute", "ssh", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--command=sudo incus list "+containerName,
+	)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to list container: %s", output)
+	assert.Contains(t, string(output), containerName, "Container should still exist")
+	t.Log("✓ Container still exists")
+
+	// Read data
+	cmd = exec.CommandContext(ctx, "gcloud", "compute", "ssh", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--command=sudo incus exec "+containerName+" -- cat /root/test-data.txt",
+	)
+	output, err = cmd.CombinedOutput()
+	require.NoError(t, err, "Failed to read test data: %s", output)
+
+	actualData := strings.TrimSpace(string(output))
+	actualChecksum := fmt.Sprintf("%x", md5.Sum([]byte(actualData+"\n")))
+
+	t.Logf("Expected data: %s", expectedData)
+	t.Logf("Actual data:   %s", actualData)
+	t.Logf("Expected checksum: %s", expectedChecksum)
+	t.Logf("Actual checksum:   %s", actualChecksum)
+
+	assert.Equal(t, expectedData, actualData, "Data should match")
+	assert.Equal(t, expectedChecksum, actualChecksum, "Checksum should match")
+
+	t.Log("✅ Data persisted correctly after reboot!")
+}
+
+// cleanupInstance deletes the test instance and associated resources
+func cleanupInstance(t *testing.T, projectID, zone, instanceName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Delete instance
+	cmd := exec.CommandContext(ctx, "gcloud", "compute", "instances", "delete", instanceName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--quiet",
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Logf("Warning: Failed to delete instance: %v\nOutput: %s", err, output)
+	}
+
+	// Delete disk
+	diskName := instanceName + "-data"
+	cmd = exec.CommandContext(ctx, "gcloud", "compute", "disks", "delete", diskName,
+		"--project="+projectID,
+		"--zone="+zone,
+		"--quiet",
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Logf("Warning: Failed to delete disk: %v\nOutput: %s", err, output)
+	}
+
+	t.Log("✓ Cleanup complete")
+}
+
+// Helper functions
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func randHex(n int) string {
+	return fmt.Sprintf("%x", time.Now().UnixNano())[:n]
+}
