@@ -1,0 +1,355 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// ============= Data Models =============
+
+// ZapScanRun represents a single ZAP scan execution
+message ZapScanRun {
+  // Unique scan run ID (UUID)
+  string id = 1;
+
+  // How the scan was triggered: "scheduled", "manual"
+  string trigger = 2;
+
+  // Scan status: "running", "completed", "failed"
+  string status = 3;
+
+  // Number of targets (URLs) scanned
+  int32 targets_count = 4;
+
+  // Alert counts by risk level
+  int32 high_count = 5;
+  int32 medium_count = 6;
+  int32 low_count = 7;
+  int32 info_count = 8;
+
+  // Error message if status is "failed"
+  string error_message = 9;
+
+  // When the scan started (ISO 8601)
+  string started_at = 10;
+
+  // When the scan completed (ISO 8601)
+  string completed_at = 11;
+
+  // Duration of the scan
+  string duration = 12;
+
+  // Number of targets that finished processing
+  int32 completed_count = 13;
+
+  // Container the scan was scoped to. Empty = cluster-wide scan
+  // (every exposed route), the historical/scheduled default.
+  string container_name = 14;
+}
+
+// ZapAlert represents a single ZAP alert (finding)
+message ZapAlert {
+  // Database ID
+  int64 id = 1;
+
+  // SHA-256 fingerprint for deduplication (pluginId|url|alert)
+  string fingerprint = 2;
+
+  // ZAP plugin ID
+  string plugin_id = 3;
+
+  // Alert name (short title)
+  string alert_name = 4;
+
+  // Risk level: "high", "medium", "low", "informational"
+  string risk = 5;
+
+  // Confidence: "high", "medium", "low", "false_positive"
+  string confidence = 6;
+
+  // Detailed description
+  string description = 7;
+
+  // Target URL that was scanned
+  string url = 8;
+
+  // HTTP method
+  string method = 9;
+
+  // Evidence or raw output
+  string evidence = 10;
+
+  // Solution / remediation guidance
+  string solution = 11;
+
+  // Comma-separated CWE IDs
+  string cwe_ids = 12;
+
+  // Reference links
+  string references = 13;
+
+  // Current status: "open", "resolved", "suppressed"
+  string status = 14;
+
+  // Scan run ID that first found this
+  string first_scan_run_id = 15;
+
+  // Scan run ID that last saw this
+  string last_scan_run_id = 16;
+
+  // When first seen (ISO 8601)
+  string first_seen_at = 17;
+
+  // When last seen (ISO 8601)
+  string last_seen_at = 18;
+
+  // When resolved (ISO 8601, empty if still open)
+  string resolved_at = 19;
+
+  // Whether the alert is suppressed
+  bool suppressed = 20;
+
+  // Reason for suppression
+  string suppressed_reason = 21;
+}
+
+// ZapAlertSummary provides aggregate counts
+message ZapAlertSummary {
+  int32 total_alerts = 1;
+  int32 open_alerts = 2;
+  int32 resolved_alerts = 3;
+  int32 suppressed_alerts = 4;
+  int32 high_count = 5;
+  int32 medium_count = 6;
+  int32 low_count = 7;
+  int32 info_count = 8;
+}
+
+// ZapConfig returns the current ZAP configuration
+message ZapConfig {
+  // Whether ZAP scanning is enabled
+  bool enabled = 1;
+
+  // Scan interval (e.g., "720h" for 30 days)
+  string interval = 2;
+
+  // Whether ZAP is installed and available
+  bool zap_available = 3;
+
+  // ZAP version string
+  string zap_version = 4;
+}
+
+// ============= Request/Response Messages =============
+
+message TriggerZapScanRequest {
+  // Optional: container to scope the scan to. Empty = scan every
+  // exposed route, the historical default. Set to scope a single
+  // container's routes for an on-demand operator scan.
+  string container_name = 1;
+}
+
+message TriggerZapScanResponse {
+  // Scan run ID
+  string scan_run_id = 1;
+
+  // Human-readable message
+  string message = 2;
+}
+
+message ListZapScanRunsRequest {
+  // Maximum number of scan runs to return (default: 20)
+  int32 limit = 1;
+
+  // Offset for pagination
+  int32 offset = 2;
+
+  // Optional: filter to scan runs scoped to this container. Empty =
+  // return all runs (both cluster-wide and container-scoped).
+  string container_name = 3;
+}
+
+message ListZapScanRunsResponse {
+  repeated ZapScanRun scan_runs = 1;
+  int32 total_count = 2;
+}
+
+message ListZapAlertsRequest {
+  // Filter by risk level (optional)
+  string risk = 1;
+
+  // Filter by status: "open", "resolved", "suppressed" (optional)
+  string status = 2;
+
+  // Maximum number of alerts to return (default: 50)
+  int32 limit = 3;
+
+  // Offset for pagination
+  int32 offset = 4;
+
+  // Filter by domain/host — substring-matched against the alert's target
+  // URL (optional). E.g. "wordpress.kafeido.app" matches any alert whose
+  // url contains that host.
+  string domain = 5;
+}
+
+message ListZapAlertsResponse {
+  repeated ZapAlert alerts = 1;
+  int32 total_count = 2;
+}
+
+message GetZapAlertSummaryRequest {}
+
+message GetZapAlertSummaryResponse {
+  ZapAlertSummary summary = 1;
+}
+
+message SuppressZapAlertRequest {
+  // Alert ID to suppress
+  int64 alert_id = 1;
+
+  // Reason for suppression
+  string reason = 2;
+}
+
+message SuppressZapAlertResponse {
+  string message = 1;
+}
+
+message GetZapConfigRequest {}
+
+message GetZapConfigResponse {
+  ZapConfig config = 1;
+}
+
+message GetZapReportRequest {
+  // Scan run ID
+  string scan_run_id = 1;
+
+  // Report format: "html", "json", "csv"
+  string format = 2;
+}
+
+message GetZapReportResponse {
+  // Report content (base64-encoded for binary formats)
+  string content = 1;
+
+  // Content type (e.g., "text/html", "application/json")
+  string content_type = 2;
+
+  // Suggested filename
+  string filename = 3;
+}
+
+message InstallZapRequest {}
+
+message InstallZapResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ============= Service Definition =============
+
+// ZapService provides OWASP ZAP web application security scanning
+service ZapService {
+  // TriggerZapScan triggers an on-demand ZAP scan across all exposed endpoints
+  rpc TriggerZapScan(TriggerZapScanRequest) returns (TriggerZapScanResponse) {
+    option (google.api.http) = {
+      post: "/v1/zap/scan"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Trigger ZAP scan";
+      description: "Triggers an on-demand OWASP ZAP scan across all exposed endpoints.";
+      tags: "ZAP";
+    };
+  }
+
+  // ListZapScanRuns returns recent ZAP scan runs
+  rpc ListZapScanRuns(ListZapScanRunsRequest) returns (ListZapScanRunsResponse) {
+    option (google.api.http) = {
+      get: "/v1/zap/scans"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List ZAP scan runs";
+      description: "Returns recent ZAP scan runs with their status and alert counts.";
+      tags: "ZAP";
+    };
+  }
+
+  // ListZapAlerts returns ZAP alerts with optional filtering
+  rpc ListZapAlerts(ListZapAlertsRequest) returns (ListZapAlertsResponse) {
+    option (google.api.http) = {
+      get: "/v1/zap/alerts"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List ZAP alerts";
+      description: "Returns ZAP security alerts with optional filtering by risk level, status, and domain.";
+      tags: "ZAP";
+    };
+  }
+
+  // GetZapAlertSummary returns aggregate alert statistics
+  rpc GetZapAlertSummary(GetZapAlertSummaryRequest) returns (GetZapAlertSummaryResponse) {
+    option (google.api.http) = {
+      get: "/v1/zap/alerts/summary"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get ZAP alert summary";
+      description: "Returns aggregate statistics of ZAP alerts including counts by risk level.";
+      tags: "ZAP";
+    };
+  }
+
+  // SuppressZapAlert marks an alert as suppressed
+  rpc SuppressZapAlert(SuppressZapAlertRequest) returns (SuppressZapAlertResponse) {
+    option (google.api.http) = {
+      post: "/v1/zap/alerts/{alert_id}/suppress"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Suppress a ZAP alert";
+      description: "Marks a ZAP alert as suppressed with a reason.";
+      tags: "ZAP";
+    };
+  }
+
+  // GetZapConfig returns the current ZAP configuration
+  rpc GetZapConfig(GetZapConfigRequest) returns (GetZapConfigResponse) {
+    option (google.api.http) = {
+      get: "/v1/zap/config"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get ZAP configuration";
+      description: "Returns the current ZAP scanner configuration and availability status.";
+      tags: "ZAP";
+    };
+  }
+
+  // GetZapReport downloads a scan report in the specified format
+  rpc GetZapReport(GetZapReportRequest) returns (GetZapReportResponse) {
+    option (google.api.http) = {
+      get: "/v1/zap/scans/{scan_run_id}/report"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get ZAP scan report";
+      description: "Downloads a ZAP scan report in the specified format (html, json, csv).";
+      tags: "ZAP";
+    };
+  }
+
+  // InstallZap downloads and installs OWASP ZAP
+  rpc InstallZap(InstallZapRequest) returns (InstallZapResponse) {
+    option (google.api.http) = {
+      post: "/v1/zap/install"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Install OWASP ZAP";
+      description: "Downloads and installs OWASP ZAP scanner.";
+      tags: "ZAP";
+    };
+  }
+}
