@@ -233,3 +233,82 @@ func handleCodeAttach(client API, args map[string]interface{}) (string, error) {
 		// Say so explicitly: an agent polling a finished run would otherwise
 		// keep asking forever for output that will never arrive.
 		tail = "(run has finished; this is the end of its output)"
+	}
+	return fmt.Sprintf("%s\n\nnext_offset: %d\n\n--- output ---\n%s\n%s", line, next, out, tail), nil
+}
+
+// handleCodeStatus reports liveness and, once finished, the exit code (#2011:
+// this used to report only the header line, never the code, on this surface —
+// coderun.ExitCodeLine is the same renderer the CLI's `code status` uses, so
+// the two cannot drift).
+func handleCodeStatus(client API, args map[string]interface{}) (string, error) {
+	box := strings.TrimSpace(getStringArg(args, "box", ""))
+	if box == "" {
+		return "", fmt.Errorf("`box` is required")
+	}
+	name := codeRunNameArg(args)
+
+	sess, done, err := mcpCodeSession(client, box)
+	if err != nil {
+		return "", err
+	}
+	defer done()
+
+	listing, err := sess.ProcessList(context.Background())
+	if err != nil {
+		return "", fmt.Errorf("process_list on %q: %w", box, err)
+	}
+	line, running := coderun.RunOutcomeLine(listing, name)
+	if line == "" {
+		return fmt.Sprintf("no run named %q on %s", name, box), nil
+	}
+	out := line
+	if !running {
+		out += "\n" + coderun.ExitCodeLine(listing, name)
+	}
+	// #2183: the same approval lines `code status` prints.
+	if approvals, err := sess.ApprovalStatus(context.Background(), name, running, time.Now()); err != nil {
+		out += "\nnote: could not read this run's permission requests: " + err.Error()
+	} else if approvals != "" {
+		out += "\n" + approvals
+	}
+	return out, nil
+}
+
+// handleCodeStop reaps a run. The log is deliberately left readable so its
+// output can still be collected afterwards.
+func handleCodeStop(client API, args map[string]interface{}) (string, error) {
+	box := strings.TrimSpace(getStringArg(args, "box", ""))
+	if box == "" {
+		return "", fmt.Errorf("`box` is required")
+	}
+	name := codeRunNameArg(args)
+
+	sess, done, err := mcpCodeSession(client, box)
+	if err != nil {
+		return "", err
+	}
+	defer done()
+
+	res, err := sess.ProcessKill(context.Background(), name, getBoolArg(args, "force", false))
+	if err != nil {
+		return "", fmt.Errorf("stop run %q on %q: %w", name, box, err)
+	}
+	return fmt.Sprintf("✓ stopped %q on %s (pid %d)\nlog kept at %s", name, box, res.PID, res.LogPath), nil
+}
+
+// readCodeWindow reads one bounded window from a run's log, returning the text
+// and the offset to resume from. Framed output is demultiplexed so a caller
+// sees the run's own stdout/stderr rather than the wire format.
+func readCodeWindow(ctx context.Context, sess *coderun.Session, logPath string, offset int64, streamJSON bool) (string, int64) {
+	var sb strings.Builder
+	var w interface{ Write([]byte) (int, error) } = &sb
+	if streamJSON {
+		w = coderun.NewDemuxWriter(&sb, &sb)
+	}
+	next, err := coderun.StreamOutput(ctx, sess, w, logPath, offset, codeReadWindow, nil)
+	if err != nil && sb.Len() == 0 {
+		return fmt.Sprintf("(no output read: %v)", err), offset
+	}
+	return sb.String(), next
+}
