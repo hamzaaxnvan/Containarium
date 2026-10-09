@@ -52,3 +52,58 @@ func gatewayTools() []Tool {
 					},
 					"allowed_models": map[string]interface{}{
 						"type":        "array",
+						"items":       map[string]interface{}{"type": "string"},
+						"description": "Optional ceiling: the gateway refuses any model not in this list.",
+					},
+					"dry_run": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Validate everything a real mint validates and issue NO token. Default false.",
+					},
+				},
+				"required": []string{"box", "provider"},
+			},
+			Handler: handleMintGatewayToken,
+		},
+	}
+}
+
+func handleMintGatewayToken(client API, args map[string]interface{}) (string, error) {
+	box := getStringArg(args, "box", "")
+	if box == "" {
+		return "", fmt.Errorf("box is required")
+	}
+	provider := getStringArg(args, "provider", "")
+	if provider == "" {
+		return "", fmt.Errorf("provider is required")
+	}
+	req := MintGatewayTokenBody{
+		Box:           box,
+		Provider:      provider,
+		RunID:         getStringArg(args, "run_id", ""),
+		TTL:           getStringArg(args, "ttl", ""),
+		AllowedModels: getStringSliceArg(args, "allowed_models"),
+		DryRun:        getBoolArg(args, "dry_run", false),
+	}
+	resp, err := client.MintGatewayToken(req)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	if req.DryRun {
+		// A dry run issued nothing, so this must not print a token field at all —
+		// an empty "token:" line invites a caller to use it.
+		fmt.Fprintf(&b, "A mint would succeed (dry run — no token issued).\n")
+		fmt.Fprintf(&b, "key_owner: %s\n", resp.KeyOwner)
+		fmt.Fprintf(&b, "base_url:  %s\n", resp.BaseURL)
+		return b.String(), nil
+	}
+	fmt.Fprintf(&b, "token:      %s\n", resp.Token)
+	fmt.Fprintf(&b, "base_url:   %s\n", resp.BaseURL)
+	fmt.Fprintf(&b, "key_owner:  %s\n", resp.KeyOwner)
+	fmt.Fprintf(&b, "token_id:   %s\n", resp.TokenID)
+	if resp.ExpiresAt != "" {
+		fmt.Fprintf(&b, "expires_at: %s\n", resp.ExpiresAt)
+	}
+	return b.String(), nil
+}

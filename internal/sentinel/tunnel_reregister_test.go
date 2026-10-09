@@ -205,3 +205,141 @@ func TestMonitorSessionIgnoresSupersededGeneration(t *testing.T) {
 	ts.startProxies(ctx, "spot-1", firstGen, "127.0.0.1", 0, []int{proxyPort}, firstSession)
 	requireListeners(t, ts, "spot-1")
 
+	monitorDone := make(chan struct{})
+	go func() {
+		ts.monitorSession("spot-1", firstGen, firstSession)
+		close(monitorDone)
+	}()
+
+	// Reconnect: Register closes firstSession, which wakes the monitor above.
+	secondSession, closeSecond := newSessionPair(t)
+	defer closeSecond()
+	_, secondGen, err := registry.Register(handshake("spot-1"), secondSession, TunnelTransportTLS)
+	require.NoError(t, err)
+	// The same port as the first registration: a reconnect rebinds what the
+	// superseded generation had.
+	ts.startProxies(ctx, "spot-1", secondGen, "127.0.0.1", 0, []int{proxyPort}, secondSession)
+
+	select {
+	case <-monitorDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the monitor for the superseded session never returned")
+	}
+
+	// The spot is still registered, on the new generation.
+	live := registry.Get("spot-1")
+	require.NotNil(t, live, "the stale monitor unregistered a live backend — #769")
+	require.Equal(t, secondGen, live.Generation)
+
+	// Its listeners are still the new generation's, and still open.
+	ts.mu.Lock()
+	set, ok := ts.proxies["spot-1"]
+	ts.mu.Unlock()
+	require.True(t, ok, "the stale monitor closed the fresh registration's proxy listeners — #769")
+	require.Equal(t, secondGen, set.gen)
+	require.NotEmpty(t, set.listeners)
+	for _, ln := range set.listeners {
+		conn, dialErr := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+		require.NoError(t, dialErr, "a listener installed by the live registration must still accept connections")
+		_ = conn.Close()
+	}
+
+	// And the manager was never told the backend went away — that callback is
+	// what removes the backend's users from the sshpiper config.
+	mu.Lock()
+	got := append([]string(nil), disconnects...)
+	mu.Unlock()
+	require.Empty(t, got, "OnDisconnect fired for a backend whose tunnel is up — sshpiper would drop its users")
+}
+
+// The mirror case: when the CURRENT session ends, the monitor must do the full
+// teardown, including telling the manager.
+func TestMonitorSessionCleansUpCurrentGeneration(t *testing.T) {
+	stubLoopbackAliases(t)
+
+	registry := NewTunnelRegistry()
+	ts := NewTunnelServer("127.0.0.1:0", NewTokenPolicy(), registry, 0)
+	closeProxiesOnCleanup(t, ts)
+
+	disconnected := make(chan string, 1)
+	ts.OnDisconnect = func(spot *TunnelSpot) { disconnected <- spot.ID }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	session, closeSession := newSessionPair(t)
+	defer closeSession()
+	_, gen, err := registry.Register(handshake("spot-1"), session, TunnelTransportTLS)
+	require.NoError(t, err)
+	ts.startProxies(ctx, "spot-1", gen, "127.0.0.1", 0, []int{freeLoopbackPort(t)}, session)
+
+	ts.mu.Lock()
+	listeners := append([]net.Listener(nil), ts.proxies["spot-1"].listeners...)
+	ts.mu.Unlock()
+	require.NotEmpty(t, listeners)
+
+	go ts.monitorSession("spot-1", gen, session)
+
+	// A real disconnect.
+	_ = session.Close()
+
+	select {
+	case id := <-disconnected:
+		require.Equal(t, "spot-1", id)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a genuine disconnect did not reach OnDisconnect")
+	}
+
+	require.Nil(t, registry.Get("spot-1"), "a genuine disconnect must unregister the spot")
+
+	ts.mu.Lock()
+	_, stillThere := ts.proxies["spot-1"]
+	ts.mu.Unlock()
+	require.False(t, stillThere, "a genuine disconnect must drop the proxy listeners")
+
+	for _, ln := range listeners {
+		_, dialErr := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+		require.Error(t, dialErr, "listeners must actually be closed, not just forgotten")
+	}
+}
+
+// startProxies must not let a late, superseded call clobber the listeners a
+// newer registration already installed.
+func TestStartProxiesRefusesToClobberANewerGeneration(t *testing.T) {
+	stubLoopbackAliases(t)
+
+	registry := NewTunnelRegistry()
+	ts := NewTunnelServer("127.0.0.1:0", NewTokenPolicy(), registry, 0)
+	closeProxiesOnCleanup(t, ts)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	session, closeSession := newSessionPair(t)
+	defer closeSession()
+
+	// Picked at run time, not named: 9090 is Prometheus's default and is
+	// plausibly in use on a developer machine. Both calls share it because the
+	// point is that the second, staler one must not take over the first's
+	// listener on the same port.
+	proxyPort := freeLoopbackPort(t)
+
+	ts.startProxies(ctx, "spot-1", 7, "127.0.0.1", 0, []int{proxyPort}, session)
+	ts.mu.Lock()
+	current := ts.proxies["spot-1"]
+	ts.mu.Unlock()
+	require.Equal(t, uint64(7), current.gen)
+	require.NotEmpty(t, current.listeners)
+
+	// An older registration's call arriving late must be ignored outright.
+	ts.startProxies(ctx, "spot-1", 3, "127.0.0.1", 0, []int{proxyPort}, session)
+
+	ts.mu.Lock()
+	after := ts.proxies["spot-1"]
+	ts.mu.Unlock()
+	require.Equal(t, uint64(7), after.gen, "a stale startProxies replaced the live generation's listeners")
+
+	conn, err := net.DialTimeout("tcp", after.listeners[0].Addr().String(), 2*time.Second)
+	require.NoError(t, err, "the live generation's listener must still be open")
+	_ = conn.Close()
+}
