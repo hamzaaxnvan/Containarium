@@ -222,3 +222,59 @@ func CommittedCores(cpuRequest string) float64 {
 	if s == "" {
 		return 0
 	}
+	// A raw allowance string ("800%", "400ms/100ms") — the value some callers
+	// read straight off limits.cpu.allowance. ContainerInfo.CPU never carries
+	// this form (formatCPULimitFromConfig already normalizes it to "8"/"250m"),
+	// but accepting it keeps the helper total over any CPU/allowance string.
+	// parseAllowanceCores cleanly rejects request-forms ("4", "250m", "0-3"),
+	// which have no "%" and no "/", so they fall through to the request path.
+	if cores, ok := parseAllowanceCores(s); ok {
+		return cores
+	}
+	cl, err := parseCPULimit(s)
+	if err != nil {
+		return 0
+	}
+	if cl.Allowance != "" {
+		if cores, ok := parseAllowanceCores(cl.Allowance); ok {
+			return cores
+		}
+	}
+	// No allowance: Count is either a plain integer count or a CPU set/range
+	// ("0-3", "0,2-4") that parseCPULimit passed through verbatim.
+	return countCPUSet(cl.Count)
+}
+
+// countCPUSet returns the number of cores named by an Incus limits.cpu value:
+// a plain integer count ("8" → 8) or the cardinality of a set/range
+// ("0-3" → 4, "0,2-4" → 4). Malformed fragments are skipped.
+func countCPUSet(spec string) float64 {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return 0
+	}
+	if !strings.ContainsAny(spec, ",-") {
+		if n, err := strconv.Atoi(spec); err == nil && n >= 0 {
+			return float64(n)
+		}
+		return 0
+	}
+	var total float64
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		lo, hi, ok := strings.Cut(part, "-")
+		if !ok {
+			if _, err := strconv.Atoi(part); err == nil {
+				total++
+			}
+			continue
+		}
+		a, aerr := strconv.Atoi(strings.TrimSpace(lo))
+		b, berr := strconv.Atoi(strings.TrimSpace(hi))
+		if aerr != nil || berr != nil || b < a {
+			continue
+		}
+		total += float64(b - a + 1)
+	}
+	return total
+}
