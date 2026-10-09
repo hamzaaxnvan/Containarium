@@ -58,3 +58,24 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 sudo iptables -P FORWARD ACCEPT
 grep -q '^root:' /etc/subuid || echo 'root:1000000:1000000000' | sudo tee -a /etc/subuid
 grep -q '^root:' /etc/subgid || echo 'root:1000000:1000000000' | sudo tee -a /etc/subgid
+
+# Socket-activated: this both proves the client works and brings the
+# daemon up, so the socket the lane connects to exists.
+sudo incus version
+
+log "verifying the host is actually usable (fail, don't skip)"
+[ -S /var/lib/incus/unix.socket ] || {
+  sudo systemctl status incus.service --no-pager || true
+  sudo journalctl -u incus.service --no-pager -n 100 || true
+  fail "no Incus socket at /var/lib/incus/unix.socket — the daemon did not come up"
+}
+command -v dnsmasq >/dev/null || fail "dnsmasq is absent — Incus cannot bring up incusbr0"
+sudo zfs list incus-local/containers >/dev/null || fail "incus-local/containers is absent — the daemon would select the dir driver"
+# The same four preconditions the daemon's own probe checks, asserted
+# here so a provisioning gap is named by the provisioning step.
+[ -e /sys/fs/cgroup/cgroup.controllers ] || fail "no unified cgroup v2 hierarchy — k3s-in-container needs cgroup v2 delegation"
+[ -d /sys/module/br_netfilter ] || fail "br_netfilter is not loaded — k3s networking needs it"
+[ -d /sys/module/overlay ] || fail "overlay is not loaded — containerd's snapshotter needs it"
+sudo incus info | grep -q 'driver: ' || fail "incus info reports no instance drivers"
+
+log "host ready for container-mode cluster nodes (no KVM required or used)"
