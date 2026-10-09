@@ -27,3 +27,32 @@ func TestLoadSentinelReadsEnv(t *testing.T) {
 		t.Errorf("Host = %q, want sentinel.example.com", s.Host)
 	}
 	if s.AuthSecret != "supersecretvalue" {
+		t.Errorf("AuthSecret = %q", s.AuthSecret)
+	}
+	if s.HTTPSPort != "8443" {
+		t.Errorf("HTTPSPort = %q, want 8443", s.HTTPSPort)
+	}
+}
+
+// TestSentinelValidateHTTPSPort covers the only validation rule today.
+func TestSentinelValidateHTTPSPort(t *testing.T) {
+	cases := []struct {
+		port    string
+		wantErr bool
+	}{
+		{"", false},        // unset is valid (caller defaults to HTTP port + 1)
+		{"8443", false},    // in range
+		{"1", false},       // lower bound
+		{"65535", false},   // upper bound
+		{"notaport", true}, // non-numeric
+		{"0", true},        // below range
+		{"70000", true},    // above range
+		{"-5", true},       // negative
+	}
+	for _, tc := range cases {
+		err := Sentinel{HTTPSPort: tc.port}.Validate()
+		if (err != nil) != tc.wantErr {
+			t.Errorf("Validate(HTTPSPort=%q) err = %v, wantErr = %v", tc.port, err, tc.wantErr)
+		}
+	}
+}
