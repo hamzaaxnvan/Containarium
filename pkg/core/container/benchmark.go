@@ -84,3 +84,47 @@ func benchCPU(budget time.Duration) int64 {
 	// host that overrun is significant — using budget.Seconds() would overstate
 	// throughput exactly where accuracy matters for class-drift detection.
 	elapsed := time.Since(start).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return int64(float64(iters) / elapsed)
+}
+
+// benchMem streams a buffer through a copy+sum loop until the budget elapses
+// and returns bytes per second moved. Each pass reads and writes the whole
+// buffer, so the score tracks memory bandwidth rather than loop overhead.
+func benchMem(budget time.Duration, bufBytes int) int64 {
+	if bufBytes <= 0 {
+		return 0
+	}
+	src := make([]byte, bufBytes)
+	dst := make([]byte, bufBytes)
+	for i := range src {
+		src[i] = byte(i)
+	}
+	start := time.Now()
+	deadline := start.Add(budget)
+	var moved int64
+	var sum uint64
+	for {
+		copy(dst, src)
+		for _, b := range dst {
+			sum += uint64(b)
+		}
+		// One pass reads src + writes dst + reads dst.
+		moved += int64(bufBytes) * 3
+		if time.Now().After(deadline) {
+			break
+		}
+	}
+	if sum == 0 {
+		moved++
+	}
+	// Actual elapsed, not the nominal budget — the final pass overruns the
+	// deadline (a whole buffer of work), which budget.Seconds() would ignore.
+	elapsed := time.Since(start).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return int64(float64(moved) / elapsed)
+}
