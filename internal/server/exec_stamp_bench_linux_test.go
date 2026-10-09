@@ -43,3 +43,48 @@ func BenchmarkExecCapture(b *testing.B) {
 		benchProcStat(b, uint32(cmd.Process.Pid)) // #nosec G115 -- a live pid fits
 	})
 	b.Run("bootclock", func(b *testing.B) {
+		var sink threatdetect.ProcStartTicks
+		for b.Loop() {
+			v, err := bootClockTicks()
+			if err != nil {
+				b.Fatal(err)
+			}
+			sink += v
+		}
+		_ = sink
+	})
+	b.Run("time-now", func(b *testing.B) {
+		var sink int64
+		for b.Loop() {
+			sink += time.Now().UnixNano()
+		}
+		_ = sink
+	})
+}
+
+func benchProcStat(b *testing.B, pid uint32) {
+	b.Helper()
+	var sink threatdetect.ProcStartTicks
+	for b.Loop() {
+		v, err := readProcStartTime(execProcRoot, pid)
+		if err != nil {
+			b.Fatal(err)
+		}
+		sink += v
+	}
+	_ = sink
+}
+
+// BenchmarkExecWatcherOnExecEvent is the whole per-exec userspace path after
+// decode (stamp, attribution, replay ring, engine hand-off with a no-op
+// engine), with the stamp the watcher takes now.
+func BenchmarkExecWatcherOnExecEvent(b *testing.B) {
+	w := NewExecWatcher(func(threatdetect.ExecEvent) {})
+	w.byCgroup[42] = execTarget{Container: "box-a", TenantID: "tenant-a"}
+	ev := netbpf.ExecEvent{HostPID: uint32(os.Getpid()), PPID: 1, CgroupID: 42, Comm: "sh", // #nosec G115 -- a live pid fits
+		Filename: "/usr/bin/sh", Argv: []string{"sh", "-c", "true"}}
+	ctx := context.Background()
+	for b.Loop() {
+		w.OnExecEvent(ctx, ev)
+	}
+}
