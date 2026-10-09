@@ -73,3 +73,78 @@ func (q *agentTaskQueue) enqueue(skillID, inputJSON string) string {
 	q.tasks = append(q.tasks, &queuedTask{id: id, skillID: skillID, inputJSON: inputJSON})
 	return id
 }
+
+// lease returns the oldest visible task matching skillFilter (empty = any),
+// hiding it for d (or the default when d <= 0) and minting a new lease token.
+// ok is false when nothing is currently visible.
+func (q *agentTaskQueue) lease(skillFilter string, d time.Duration) (leasedTask, bool) {
+	if d <= 0 {
+		d = defaultLeaseDuration
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := q.now()
+	for _, t := range q.tasks {
+		if skillFilter != "" && t.skillID != skillFilter {
+			continue
+		}
+		visible := t.leaseToken == "" || now.After(t.leaseDeadline) || now.Equal(t.leaseDeadline)
+		if !visible {
+			continue
+		}
+		q.seq++
+		t.leaseToken = fmt.Sprintf("lease-%d", q.seq)
+		t.leaseDeadline = now.Add(d)
+		return leasedTask{
+			ID: t.id, SkillID: t.skillID, InputJSON: t.inputJSON, LeaseToken: t.leaseToken,
+		}, true
+	}
+	return leasedTask{}, false
+}
+
+// complete records a leased task's outcome and removes it. Returns false (and
+// changes nothing) when the task is gone or the token is stale — meaning the
+// lease expired and the task was redelivered under a new token.
+func (q *agentTaskQueue) complete(taskID, leaseToken, artifactJSON, errMsg string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i, t := range q.tasks {
+		if t.id != taskID {
+			continue
+		}
+		if t.leaseToken == "" || t.leaseToken != leaseToken {
+			return false // not leased, or a different (newer) lease owns it now
+		}
+		q.tasks = append(q.tasks[:i], q.tasks[i+1:]...)
+		q.results[taskID] = taskResult{
+			skillID: t.skillID, artifactJSON: artifactJSON, errMsg: errMsg, completedAt: q.now(),
+		}
+		return true
+	}
+	return false
+}
+
+// depth reports how many tasks remain (pending or leased-not-yet-completed).
+func (q *agentTaskQueue) depth() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.tasks)
+}
+
+// result returns a completed task's recorded outcome. Prototype inspection
+// hook; a durable impl would surface this via a GetAgentTask RPC.
+func (q *agentTaskQueue) result(taskID string) (taskResult, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	r, ok := q.results[taskID]
+	return r, ok
+}
+
+// leasedTask is the data a lease hands back (a copy — callers never touch the
+// queue's internal state).
+type leasedTask struct {
+	ID         string
+	SkillID    string
+	InputJSON  string
+	LeaseToken string
+}
