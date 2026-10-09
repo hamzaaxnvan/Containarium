@@ -126,3 +126,132 @@ func TestValidateIndependentNodesHaveDepthOne(t *testing.T) {
 		t.Fatalf("Validate: %v", err)
 	}
 	if want := []string{"a", "b"}; !reflect.DeepEqual(res.Order, want) {
+		t.Errorf("Order = %v, want %v", res.Order, want)
+	}
+	if res.Depth != 1 {
+		t.Errorf("Depth = %d, want 1", res.Depth)
+	}
+}
+
+func TestValidateRejectsCycle(t *testing.T) {
+	g := &pb.TaskGraph{
+		Nodes: []*pb.TaskNode{skillNode("a", "coder"), skillNode("b", "coder"), skillNode("c", "coder"), skillNode("d", "coder")},
+		Edges: []*pb.TaskEdge{edge("b", "a"), edge("c", "b"), edge("b", "c"), edge("d", "c")},
+	}
+	_, err := Validate(g, knownSkills, knownCrews)
+	if !errors.Is(err, ErrCycle) {
+		t.Fatalf("err = %v, want ErrCycle", err)
+	}
+	// a is upstream of the cycle and resolvable, so it is not named.
+	if !strings.Contains(err.Error(), "b, c, d") || strings.Contains(err.Error(), "a,") {
+		t.Errorf("err = %q, want the stuck nodes b, c, d named", err)
+	}
+}
+
+func TestValidateRejectsSelfDependency(t *testing.T) {
+	g := &pb.TaskGraph{Nodes: []*pb.TaskNode{skillNode("a", "coder")}, Edges: []*pb.TaskEdge{edge("a", "a")}}
+	if _, err := Validate(g, knownSkills, knownCrews); !errors.Is(err, ErrCycle) {
+		t.Fatalf("err = %v, want ErrCycle", err)
+	}
+}
+
+func TestValidateRejectsUnknownAssignee(t *testing.T) {
+	for name, n := range map[string]*pb.TaskNode{
+		"skill": skillNode("a", "no-such-skill"),
+		"crew":  crewNode("a", "no-such-crew"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := &pb.TaskGraph{Nodes: []*pb.TaskNode{n}}
+			_, err := Validate(g, knownSkills, knownCrews)
+			if !errors.Is(err, ErrUnknownAssignee) {
+				t.Fatalf("err = %v, want ErrUnknownAssignee", err)
+			}
+			if !strings.Contains(err.Error(), "no-such-") {
+				t.Errorf("err = %q, want the unknown id named", err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsOverCap(t *testing.T) {
+	cases := map[string]*pb.TaskGraph{
+		"too many nodes": func() *pb.TaskGraph {
+			g := &pb.TaskGraph{}
+			for i := 0; i <= MaxNodes; i++ {
+				g.Nodes = append(g.Nodes, skillNode(fmt.Sprintf("n%02d", i), "coder"))
+			}
+			return g
+		}(),
+		"too deep": chain(MaxDepth + 1),
+		"over the graph's own max_nodes": func() *pb.TaskGraph {
+			g := chain(3)
+			g.Edges = nil
+			g.Limits = &pb.TaskGraphLimits{MaxNodes: 2}
+			return g
+		}(),
+		"over the graph's own max_depth": func() *pb.TaskGraph {
+			g := chain(3)
+			g.Limits = &pb.TaskGraphLimits{MaxDepth: 2}
+			return g
+		}(),
+		"max_nodes above the platform cap": func() *pb.TaskGraph {
+			g := chain(1)
+			g.Limits = &pb.TaskGraphLimits{MaxNodes: MaxNodes + 1}
+			return g
+		}(),
+		"max_depth above the platform cap": func() *pb.TaskGraph {
+			g := chain(1)
+			g.Limits = &pb.TaskGraphLimits{MaxDepth: MaxDepth + 1}
+			return g
+		}(),
+	}
+	for name, g := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Validate(g, knownSkills, knownCrews); !errors.Is(err, ErrOverCap) {
+				t.Fatalf("err = %v, want ErrOverCap", err)
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsGraphAtTheCap(t *testing.T) {
+	g := chain(MaxDepth)
+	for i := len(g.Nodes); i < MaxNodes; i++ {
+		g.Nodes = append(g.Nodes, skillNode(fmt.Sprintf("x%02d", i), "reviewer"))
+	}
+	res, err := Validate(g, knownSkills, knownCrews)
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if len(res.Order) != MaxNodes || res.Depth != MaxDepth {
+		t.Errorf("got %d nodes, depth %d; want %d, %d", len(res.Order), res.Depth, MaxNodes, MaxDepth)
+	}
+}
+
+func TestValidateRejectsMalformed(t *testing.T) {
+	cases := map[string]*pb.TaskGraph{
+		"nil graph":      nil,
+		"no nodes":       {Goal: "empty"},
+		"missing id":     {Nodes: []*pb.TaskNode{skillNode("", "coder")}},
+		"missing goal":   {Nodes: []*pb.TaskNode{{Id: "a", Assignee: &pb.TaskNode_SkillId{SkillId: "coder"}}}},
+		"no assignee":    {Nodes: []*pb.TaskNode{{Id: "a", Goal: "g"}}},
+		"empty skill id": {Nodes: []*pb.TaskNode{skillNode("a", "")}},
+		"duplicate id":   {Nodes: []*pb.TaskNode{skillNode("a", "coder"), skillNode("a", "reviewer")}},
+		"bad input_json": {Nodes: []*pb.TaskNode{{Id: "a", Goal: "g", InputJson: "{", Assignee: &pb.TaskNode_SkillId{SkillId: "coder"}}}},
+		"edge from unknown node": {
+			Nodes: []*pb.TaskNode{skillNode("a", "coder")},
+			Edges: []*pb.TaskEdge{edge("ghost", "a")},
+		},
+		"edge to unknown node": {
+			Nodes: []*pb.TaskNode{skillNode("a", "coder")},
+			Edges: []*pb.TaskEdge{edge("a", "ghost")},
+		},
+	}
+	for name, g := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Validate(g, knownSkills, knownCrews); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("err = %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
