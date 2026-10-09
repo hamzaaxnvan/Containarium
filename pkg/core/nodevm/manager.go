@@ -122,3 +122,86 @@ func (m *Manager) pushToken(name, token string) error {
 }
 
 func (m *Manager) waitAgent(name string) error {
+	attempts := m.waitAttempts
+	if attempts <= 0 {
+		attempts = 30
+	}
+	for i := 0; i < attempts; i++ {
+		if _, err := m.run.Run("exec", name, "--", "true"); err == nil {
+			return nil
+		}
+		if i < attempts-1 && m.waitSleep > 0 {
+			time.Sleep(m.waitSleep)
+		}
+	}
+	return fmt.Errorf("VM %s agent did not become ready after %d attempts", name, attempts)
+}
+
+func (m *Manager) vmExists(name string) (bool, error) {
+	nodes, err := m.List()
+	if err != nil {
+		return false, err
+	}
+	for _, n := range nodes {
+		if n.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// List returns the node VMs on this host.
+func (m *Manager) List() ([]Node, error) {
+	out, err := m.run.Run(listArgs()...)
+	if err != nil {
+		return nil, fmt.Errorf("list VMs: %w", err)
+	}
+	var nodes []Node
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		f := strings.SplitN(line, ",", 2)
+		n := Node{Name: strings.TrimSpace(f[0])}
+		if len(f) > 1 {
+			n.State = strings.TrimSpace(f[1])
+		}
+		nodes = append(nodes, n)
+	}
+	return nodes, nil
+}
+
+// Destroy tears a node VM down.
+func (m *Manager) Destroy(name string) error {
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if _, err := m.run.Run(destroyArgs(name)...); err != nil {
+		return fmt.Errorf("destroy VM: %w", err)
+	}
+	return nil
+}
+
+// CLIRunner is the production Runner: it shells out to `incus`.
+type CLIRunner struct{ bin string }
+
+// NewCLIRunner locates `incus` on PATH.
+func NewCLIRunner() (*CLIRunner, error) {
+	bin, err := exec.LookPath("incus")
+	if err != nil {
+		return nil, fmt.Errorf("incus not found on PATH (required for node-VM provisioning): %w", err)
+	}
+	return &CLIRunner{bin: bin}, nil
+}
+
+// Run executes `incus <args...>`.
+func (r *CLIRunner) Run(args ...string) (string, error) {
+	// #nosec G204 -- bin is resolved via exec.LookPath("incus"); args are
+	// fixed verbs plus validated VM/pool names, PCI addrs, and paths.
+	out, err := exec.Command(r.bin, args...).CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("incus %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}

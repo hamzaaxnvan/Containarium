@@ -205,3 +205,107 @@ func TestBackendHealthCarriesAPerBackendAttribute(t *testing.T) {
 // serving from a lower-priority one, and 1 again after failback.
 func TestPrimaryPreferredIsExported(t *testing.T) {
 	m := NewManager(Config{}, &fakeRecoveryProvider{})
+	gcp := &Backend{ID: "gcp", IP: "10.0.0.1", Healthy: true, Priority: 0}
+	peer := &Backend{ID: "tunnel-a", IP: "10.0.0.2", Healthy: true, Priority: 10}
+	m.backends.Add(gcp)
+	m.backends.Add(peer)
+
+	for _, tc := range []struct {
+		name    string
+		primary *Backend
+		want    int64
+	}{
+		{"on the preferred backend", gcp, 1},
+		{"on a fallback", peer, 0},
+		{"restored after failback", gcp, 1},
+	} {
+		m.mu.Lock()
+		m.primary = tc.primary
+		m.mu.Unlock()
+
+		md := findMetric(collectOnce(t, m, "sentinel-test"), metricSentinelPrimaryPref)
+		if md == nil {
+			t.Fatalf("%s: missing %s", tc.name, metricSentinelPrimaryPref)
+		}
+		if got := gaugeValue(t, md); got != tc.want {
+			t.Errorf("%s: %s = %d, want %d", tc.name, metricSentinelPrimaryPref, got, tc.want)
+		}
+	}
+}
+
+// Every datapoint must carry the sentinel's identity, or two sentinels'
+// series collide into one meaningless line in Cloud Monitoring.
+func TestSeriesCarrySentinelIdentity(t *testing.T) {
+	ms := collectOnce(t, NewManager(Config{}, &fakeRecoveryProvider{}), "asia-sentinel")
+
+	md := findMetric(ms, metricSentinelState)
+	if md == nil {
+		t.Fatal("missing state metric")
+	}
+	g := md.Data.(metricdata.Gauge[int64])
+	v, ok := g.DataPoints[0].Attributes.Value("sentinel")
+	if !ok {
+		t.Fatalf("no 'sentinel' attribute on the datapoint: %v", g.DataPoints[0].Attributes)
+	}
+	if v.AsString() != "asia-sentinel" {
+		t.Errorf("sentinel attribute = %q, want %q", v.AsString(), "asia-sentinel")
+	}
+}
+
+// Custom metrics are billed per ingested sample, so a misconfigured (or
+// hostile) sub-minute interval must not be honoured. Mirrors the daemon's
+// existing clamp rather than inventing a second policy.
+func TestExportIntervalClampedToBillingFloor(t *testing.T) {
+	for _, tc := range []struct{ in, want int32 }{
+		{0, cloudexport.MinIntervalSeconds},
+		{-30, cloudexport.MinIntervalSeconds},
+		{1, cloudexport.MinIntervalSeconds},
+		{59, cloudexport.MinIntervalSeconds},
+		{60, 60},
+		{300, 300},
+	} {
+		if got := clampExportInterval(tc.in); got != tc.want {
+			t.Errorf("clampExportInterval(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestStartMetricsExportRequiresAnExporter(t *testing.T) {
+	m := NewManager(Config{}, &fakeRecoveryProvider{})
+	if _, err := StartMetricsExport(m, MetricsExportOptions{}); err == nil {
+		t.Error("StartMetricsExport with no exporter returned nil error; it cannot push anywhere")
+	}
+}
+
+// Start must hand back a working stop so the sentinel can shut the exporter
+// down without leaking its periodic reader goroutine.
+func TestStartMetricsExportStops(t *testing.T) {
+	m := NewManager(Config{}, &fakeRecoveryProvider{})
+	stop, err := StartMetricsExport(m, MetricsExportOptions{
+		Exporter:        &noopExporter{},
+		SentinelID:      "test",
+		IntervalSeconds: 60,
+	})
+	if err != nil {
+		t.Fatalf("StartMetricsExport: %v", err)
+	}
+	if stop == nil {
+		t.Fatal("nil stop func")
+	}
+	if err := stop(context.Background()); err != nil {
+		t.Errorf("stop: %v", err)
+	}
+}
+
+// noopExporter is a minimal sdkmetric.Exporter for lifecycle tests.
+type noopExporter struct{}
+
+func (n *noopExporter) Temporality(k sdkmetric.InstrumentKind) metricdata.Temporality {
+	return sdkmetric.DefaultTemporalitySelector(k)
+}
+func (n *noopExporter) Aggregation(k sdkmetric.InstrumentKind) sdkmetric.Aggregation {
+	return sdkmetric.DefaultAggregationSelector(k)
+}
+func (n *noopExporter) Export(context.Context, *metricdata.ResourceMetrics) error { return nil }
+func (n *noopExporter) ForceFlush(context.Context) error                          { return nil }
+func (n *noopExporter) Shutdown(context.Context) error                            { return nil }
