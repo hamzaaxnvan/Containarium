@@ -138,3 +138,143 @@ func TestRetentionPGStore_ConcurrentSetsOnDifferentClassesNeverReportStale(t *te
 		start := make(chan struct{})
 		results := make([]*retention.PolicySetResult, 2)
 		for j, w := range []*pb.RetentionWindow{{Class: classPrompts, Days: a}, {Class: classResponses, Days: b}} {
+			wg.Add(1)
+			go func(j int, w *pb.RetentionWindow) {
+				defer wg.Done()
+				<-start
+				res, err := s.SetPolicy(ctx, []*pb.RetentionWindow{w}, "admin-a", nil)
+				if err != nil {
+					t.Errorf("SetPolicy: %v", err)
+					return
+				}
+				results[j] = res
+			}(j, w)
+		}
+		close(start)
+		wg.Wait()
+		if results[0] == nil || results[1] == nil {
+			t.FailNow()
+		}
+		later := results[0]
+		if results[1].Current.GetRevision() > later.Current.GetRevision() {
+			later = results[1]
+		}
+		if windowDays(later.Current, classPrompts) != a || windowDays(later.Current, classResponses) != b {
+			stale++
+		}
+	}
+	if stale > 0 {
+		t.Fatalf("the later set's Current was stale in %d of %d rounds", stale, rounds)
+	}
+}
+
+// TestRetentionPGStore_UpgradeClampsAnOverCapWindow: a window stored above
+// the cap under #2917 must not stop the store from starting; it is clamped
+// to the cap and the CHECK ends up validated.
+func TestRetentionPGStore_UpgradeClampsAnOverCapWindow(t *testing.T) {
+	ctx := context.Background()
+	pool := retentionPool(t)
+	createSchema2917(t, pool, `INSERT INTO retention_windows (class, days) VALUES (1, 2000000000), (2, 45);`)
+	s, err := New(ctx, pool)
+	if err != nil {
+		t.Fatalf("New over an over-cap legacy row: %v", err)
+	}
+	p, err := s.GetPolicy(ctx)
+	if err != nil {
+		t.Fatalf("GetPolicy: %v", err)
+	}
+	if got := windowDays(p, classPrompts); got != retention.MaxDays {
+		t.Errorf("prompts = %d after the upgrade, want clamped to %d", got, retention.MaxDays)
+	}
+	if got := windowDays(p, classResponses); got != 45 {
+		t.Errorf("responses = %d after the upgrade, want 45 kept", got)
+	}
+	var validated bool
+	if err := pool.QueryRow(ctx, `SELECT convalidated FROM pg_constraint
+		WHERE conrelid = 'retention_windows'::regclass AND conname = 'retention_windows_days_max'`).Scan(&validated); err != nil {
+		t.Fatalf("read the constraint: %v", err)
+	}
+	if !validated {
+		t.Error("retention_windows_days_max is not validated after the upgrade")
+	}
+	if _, err := New(ctx, pool); err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+}
+
+// TestRetentionPGStore_UpgradeNormalisesPaddedHoldIDs: a hold stored padded
+// under #2917 is trimmed at bootstrap, so it can be released by its trimmed
+// id and the sweepers match it against record org ids. When a padded and a
+// trimmed hold name the same org, the earliest is kept.
+func TestRetentionPGStore_UpgradeNormalisesPaddedHoldIDs(t *testing.T) {
+	ctx := context.Background()
+	pool := retentionPool(t)
+	createSchema2917(t, pool, `INSERT INTO retention_legal_holds VALUES
+		(' org-a', 'case 1', 'admin-a', NOW() - interval '2 days'),
+		('org-b'||chr(9), 'case 2', 'admin-a', NOW() - interval '2 days'),
+		('org-b', 'case 3', 'admin-b', NOW() - interval '1 day'),
+		('org-c', 'case 4', 'admin-a', NOW());`)
+	s, err := New(ctx, pool)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	hs, err := s.ListHolds(ctx)
+	if err != nil {
+		t.Fatalf("ListHolds: %v", err)
+	}
+	want := []struct{ org, reason string }{{"org-a", "case 1"}, {"org-b", "case 2"}, {"org-c", "case 4"}}
+	if len(hs) != len(want) {
+		t.Fatalf("holds after the upgrade = %v, want %v", hs, want)
+	}
+	for i, w := range want {
+		if hs[i].GetOrgId() != w.org || hs[i].GetReason() != w.reason {
+			t.Errorf("hold %d = %q (%q), want %q (%q)", i, hs[i].GetOrgId(), hs[i].GetReason(), w.org, w.reason)
+		}
+	}
+	if r, err := s.ReleaseHold(ctx, "org-a", "admin-a", nil); err != nil || r.GetOrgId() != "org-a" {
+		t.Fatalf("ReleaseHold(org-a) of a hold stored padded = (%v, %v)", r, err)
+	}
+}
+
+// TestRetentionPGStore_ConcurrentBootstrapsOnALegacySchema: daemons starting
+// together over the #2917 schema all come up.
+func TestRetentionPGStore_ConcurrentBootstrapsOnALegacySchema(t *testing.T) {
+	ctx := context.Background()
+	pool := retentionPool(t)
+	createSchema2917(t, pool, `INSERT INTO retention_windows (class, days) VALUES (1, 2000000000);
+		INSERT INTO retention_legal_holds VALUES (' org-a', 'case 1', 'admin-a', NOW());`)
+	var wg sync.WaitGroup
+	errs := make(chan error, 6)
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := New(ctx, pool); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent New: %v", err)
+	}
+	// The upgrade ran exactly once: clamped and trimmed, one revision bump,
+	// one recorded change of each kind.
+	s := pgStore(t, pool)
+	p, err := s.GetPolicy(ctx)
+	if err != nil {
+		t.Fatalf("GetPolicy: %v", err)
+	}
+	if got := windowDays(p, classPrompts); got != retention.MaxDays || p.GetRevision() != 2 || p.GetUpdatedBy() != retention.UpgradeActor {
+		t.Errorf("policy after concurrent starts = prompts %d at revision %d by %q, want %d at revision 2 by %s",
+			got, p.GetRevision(), p.GetUpdatedBy(), retention.MaxDays, retention.UpgradeActor)
+	}
+	hs, err := s.ListHolds(ctx)
+	if err != nil || len(hs) != 1 || hs[0].GetOrgId() != "org-a" || hs[0].GetReason() != "case 1" {
+		t.Errorf("holds after concurrent starts = (%v, %v), want only org-a (case 1)", hs, err)
+	}
+	if got := pendingActions(t, s); len(got) != 2 || got[0] != retention.UpgradeActionClamp || got[1] != retention.UpgradeActionHoldNormalise {
+		t.Errorf("recorded upgrade changes = %v, want one clamp and one normalise", got)
+	}
+}
