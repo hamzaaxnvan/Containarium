@@ -81,3 +81,87 @@ func TestK8sDelivery_ComposeRowsBecomeOneDotenvFile(t *testing.T) {
 // pass looks like a change and rewrites the Secret.
 func TestK8sDelivery_DotenvIsStableAcrossDeliveries(t *testing.T) {
 	rows := map[string]secrets.SecretValue{
+		"A": {Value: "1", Delivery: secrets.DeliveryCompose},
+		"B": {Value: "2", Delivery: secrets.DeliveryCompose},
+		"C": {Value: "3", Delivery: secrets.DeliveryCompose},
+	}
+	first := string(deliverK8s(t, rows).data[composeSecretKey])
+	for i := 0; i < 8; i++ {
+		if got := string(deliverK8s(t, rows).data[composeSecretKey]); got != first {
+			t.Fatalf("dotenv differs between deliveries:\n%q\nvs\n%q\n"+
+				"map iteration order would make every reconcile look like a change", first, got)
+		}
+	}
+}
+
+// The compose file must be the same shape on both backends, so an app's
+// env_file reference differs only in directory.
+func TestK8sDelivery_ComposeFileMatchesTheLXCRendering(t *testing.T) {
+	rows := map[string]secrets.SecretValue{
+		"A": {Value: "1", Delivery: secrets.DeliveryCompose},
+		"B": {Value: "2", Delivery: secrets.DeliveryCompose},
+	}
+	got := deliverK8s(t, rows).data[composeSecretKey]
+	want := container.RenderEnvFile(container.SecretsEnvFile.Header,
+		map[string]string{"A": "1", "B": "2"})
+
+	if string(got) != string(want) {
+		t.Errorf("the K8s compose file differs from the LXC one:\n%q\nvs\n%q", got, want)
+	}
+	if composeSecretKey != "secrets.env" {
+		t.Errorf("compose file is named %q; it should match the LXC path's basename so an "+
+			"env_file: reference differs only in directory", composeSecretKey)
+	}
+}
+
+// A tenant with no secrets must translate to an empty set, because that is
+// what makes the apply delete the object instead of leaving the last values
+// mounted. Deleting the last secret and having it stay readable would be a
+// deletion that reports success and does nothing.
+//
+// (Only the translation is asserted here. That an empty set actually deletes
+// the object is the applier's job and is covered in pkg/core/box/k8s. Calling
+// the fake applier and asserting it was called once would prove nothing —
+// this test calls it directly.)
+func TestK8sDelivery_NoSecretsTranslatesToAnEmptySet(t *testing.T) {
+	if got := secretsToK8sData(map[string]secrets.SecretValue{}); len(got) != 0 {
+		t.Errorf("translated a tenant with no secrets to %d key(s): %v", len(got), keysOf(got))
+	}
+	// A tenant whose only secrets were compose rows, all now deleted, must
+	// also land on empty — not on a lone empty dotenv that keeps the object
+	// alive.
+	if got := secretsToK8sData(nil); len(got) != 0 {
+		t.Errorf("translated a nil row set to %d key(s): %v", len(got), keysOf(got))
+	}
+}
+
+func keysOf(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// The refresh message is the only feedback an operator gets that delivery
+// happened. Naming the LXC mechanism and an object that does not exist on
+// K8s would tell them their secrets landed somewhere they cannot find.
+func TestRefreshMessage_DescribesTheBackendItRanOn(t *testing.T) {
+	k8s := refreshSecretsMessage(box.KindK8s, "alice", 3)
+	lxc := refreshSecretsMessage(box.KindLXC, "alice", 3)
+
+	if strings.Contains(k8s, "alice-container") {
+		t.Errorf("the K8s message names a container that does not exist there: %q", k8s)
+	}
+	if strings.Contains(k8s, "re-stamped") {
+		t.Errorf("the K8s message describes the LXC mechanism: %q", k8s)
+	}
+	if !strings.Contains(lxc, "alice-container") {
+		t.Errorf("the LXC message no longer names the container: %q", lxc)
+	}
+	for name, msg := range map[string]string{"k8s": k8s, "lxc": lxc} {
+		if !strings.Contains(msg, "3") {
+			t.Errorf("%s message does not say how many secrets were delivered: %q", name, msg)
+		}
+	}
+}
