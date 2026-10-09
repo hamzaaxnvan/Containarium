@@ -77,3 +77,83 @@ func TestReleaseRunReservations_ClearsTheEndedRunsLeftovers(t *testing.T) {
 		t.Errorf("second ReleaseRunReservations = %d, %v; want 0, nil", n, err)
 	}
 }
+
+func TestReleaseRunReservations_LeavesOtherRunsAlone(t *testing.T) {
+	store, ctx := newTrackerTestStore(t)
+	const user, otherUser = "tracker-store-resv-scope", "tracker-store-resv-scope-other"
+	resetReservationFixture(t, store, ctx, user, otherUser)
+
+	leaveStaleReservation(t, store, ctx, user, "default", "run-ended", 601)
+	// A different run of the same tenant on the same connection.
+	leaveStaleReservation(t, store, ctx, user, "default", "run-still-going", 602)
+	// The SAME run id under another tenant: run ids can be caller-chosen,
+	// so one tenant's lease end must never reach another tenant's rows.
+	leaveStaleReservation(t, store, ctx, otherUser, "default", "run-ended", 603)
+
+	if _, err := store.ReleaseRunReservations(ctx, user, "run-ended"); err != nil {
+		t.Fatalf("ReleaseRunReservations: %v", err)
+	}
+
+	rows, err := store.ListLineageReservations(ctx, user, "default")
+	if err != nil {
+		t.Fatalf("ListLineageReservations: %v", err)
+	}
+	if len(rows) != 1 || rows[0].CreatedByRun != "run-still-going" {
+		t.Errorf("tenant's reservations = %+v, want only run-still-going's", rows)
+	}
+	rows, err = store.ListLineageReservations(ctx, otherUser, "default")
+	if err != nil {
+		t.Fatalf("ListLineageReservations(other tenant): %v", err)
+	}
+	if len(rows) != 1 || rows[0].CreatedByRun != "run-ended" {
+		t.Errorf("other tenant's reservations = %+v, want its own run-ended row untouched", rows)
+	}
+}
+
+func TestReleaseRunReservations_RequiresUsernameAndRun(t *testing.T) {
+	store, ctx := newTrackerTestStore(t)
+	for _, tc := range []struct{ user, run string }{{"", "run-x"}, {"someone", ""}} {
+		if _, err := store.ReleaseRunReservations(ctx, tc.user, tc.run); err == nil {
+			t.Errorf("ReleaseRunReservations(%q, %q) = nil error, want a refusal (an empty key would widen the delete)", tc.user, tc.run)
+		}
+	}
+}
+
+func TestListLineageReservations_ReportsTheConnectionsRows(t *testing.T) {
+	store, ctx := newTrackerTestStore(t)
+	const user = "tracker-store-resv-list"
+	resetReservationFixture(t, store, ctx, user)
+
+	leaveStaleReservation(t, store, ctx, user, "default", "run-a", 701)
+	leaveStaleReservation(t, store, ctx, user, "default", "run-a", 702)
+	leaveStaleReservation(t, store, ctx, user, "default", "run-b", 703)
+	leaveStaleReservation(t, store, ctx, user, "elsewhere", "run-a", 704)
+
+	rows, err := store.ListLineageReservations(ctx, user, "default")
+	if err != nil {
+		t.Fatalf("ListLineageReservations: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3 (only this connection's): %+v", len(rows), rows)
+	}
+	perRun := map[string]int{}
+	for i, r := range rows {
+		if r.Username != user || r.Connection != "default" {
+			t.Errorf("row %d = %+v, want it scoped to %s/default", i, r, user)
+		}
+		if r.ID == 0 || r.CreatedAt.IsZero() {
+			t.Errorf("row %d = %+v, want its id and created_at", i, r)
+		}
+		if i > 0 && r.CreatedAt.Before(rows[i-1].CreatedAt) {
+			t.Errorf("rows not oldest-first: %+v", rows)
+		}
+		perRun[r.CreatedByRun]++
+	}
+	if perRun["run-a"] != 2 || perRun["run-b"] != 1 {
+		t.Errorf("per-run counts = %v, want run-a=2 run-b=1", perRun)
+	}
+
+	if _, err := store.ListLineageReservations(ctx, "", "default"); err == nil {
+		t.Error("ListLineageReservations with no username = nil error, want a refusal")
+	}
+}
