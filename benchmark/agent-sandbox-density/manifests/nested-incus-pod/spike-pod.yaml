@@ -23,3 +23,21 @@ spec:
   restartPolicy: Never
   containers:
     - name: nested-incus
+      image: ubuntu:24.04
+      command: ["sleep", "infinity"]
+      securityContext:
+        privileged: true
+      resources:
+        requests:
+          cpu: "4"
+          memory: "8Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      volumeMounts:
+        - name: incus-data
+          mountPath: /var/lib/incus
+  volumes:
+    - name: incus-data
+      emptyDir:
+        sizeLimit: 150Gi
