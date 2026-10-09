@@ -118,3 +118,63 @@ func KernelSupportsTCX(release string) (supported bool, known bool) {
 		return false, false
 	}
 	return major > egressMinKernelMajor || (major == egressMinKernelMajor && minor >= egressMinKernelMinor), true
+}
+
+// parseKernelRelease reads "major.minor" from a release like
+// "6.8.0-137-generic" or "6.6.12+". The major must be a plain digit run;
+// the minor is read up to its first non-digit (so "6.6-rc1" and "6.6abc"
+// both read as 6.6).
+func parseKernelRelease(rel string) (major, minor int, ok bool) {
+	parts := strings.SplitN(strings.TrimSpace(rel), ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	minorStr := parts[1]
+	if i := strings.IndexFunc(minorStr, func(r rune) bool { return r < '0' || r > '9' }); i >= 0 {
+		minorStr = minorStr[:i]
+	}
+	if !allDigits(parts[0]) || !allDigits(minorStr) {
+		return 0, 0, false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(minorStr)
+	return major, minor, err1 == nil && err2 == nil
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func cgroupV2Check(p egressPrereqProbes) Check {
+	c := Check{Name: egressCheckCgroupV2}
+	v2, err := p.cgroupV2()
+	if err != nil {
+		return failed(c, ReasonCgroupUnknown, "cannot determine the cgroup hierarchy: %v", err)
+	}
+	if !v2 {
+		return failed(c, ReasonCgroupNotV2, "/sys/fs/cgroup is not a unified cgroup v2 mount (cgroup v1 or hybrid)")
+	}
+	c.OK, c.Detail = true, "/sys/fs/cgroup is cgroup2"
+	return c
+}
+
+func cgroupSKBCheck(p egressPrereqProbes) Check {
+	c := Check{Name: egressCheckCgroupSKB}
+	err := p.cgroupSKB()
+	switch {
+	case errors.Is(err, errCgroupSKBUnsupported):
+		return failed(c, ReasonNoCgroupSKB, "%v", err)
+	case err != nil:
+		return failed(c, ReasonCgroupSKBUnknown, "cannot probe the cgroup_skb program type (needs root/CAP_BPF): %v", err)
+	}
+	c.OK, c.Detail = true, "kernel loads cgroup_skb programs"
+	return c
+}
