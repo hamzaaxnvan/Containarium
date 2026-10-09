@@ -30,3 +30,53 @@ type identityKey struct {
 
 // NewManagedIdentities returns an empty record.
 func NewManagedIdentities() *ManagedIdentities {
+	return &ManagedIdentities{owners: map[identityKey]string{}}
+}
+
+// recordDecision stores the (credential, user id, login) triple of an ALLOW
+// that names a user. A nil record ignores it.
+func (m *ManagedIdentities) recordDecision(req *pb.AuthorizeSSHRequest, resp *pb.AuthorizeSSHResponse) {
+	if m == nil || resp.GetDecision() != pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_ALLOW {
+		return
+	}
+	userID, login := resp.GetUserId(), req.GetLogin()
+	if userID == "" || login == "" {
+		return
+	}
+	key := identityKey{credential: credentialID(req.GetCredential()), login: login}
+	m.mu.Lock()
+	m.owners[key] = userID
+	m.mu.Unlock()
+}
+
+// Logins returns the local logins recorded for a control-plane user id,
+// sorted and without duplicates; nil when none (or for a nil record).
+func (m *ManagedIdentities) Logins(userID string) []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	seen := map[string]bool{}
+	for k, owner := range m.owners {
+		if owner == userID {
+			seen[k.login] = true
+		}
+	}
+	m.mu.RUnlock()
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for l := range seen {
+		out = append(out, l)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func credentialID(c *pb.SSHCredential) string {
+	if cert := c.GetCertificate(); cert != nil {
+		return "cert:" + cert.GetCaFingerprintSha256() + ":" + cert.GetKeyId()
+	}
+	return c.GetPublicKey().GetFingerprintSha256()
+}
