@@ -136,3 +136,142 @@ func TestScanContainer_Outcomes(t *testing.T) {
 			if r.FindingsCount != tc.wantCount {
 				t.Errorf("findings count = %d, want %d", r.FindingsCount, tc.wantCount)
 			}
+			if (box.scanArgv != nil) != tc.wantScan {
+				t.Errorf("clamscan ran = %v, want %v", box.scanArgv != nil, tc.wantScan)
+			}
+			if r.Status != ScanStatusClean && len(hook) == 1 && hook[0].status == ScanStatusClean {
+				t.Fatalf("a %q outcome reached the hook as clean", r.Status)
+			}
+			if len(hook) != 1 || hook[0].status != r.Status {
+				t.Fatalf("hook = %+v, want one call with %q", hook, r.Status)
+			}
+			if strings.Contains(r.Findings, "/home/") || strings.Contains(r.Findings, "secret plans") {
+				t.Errorf("a file path leaked into the stored report: %q", r.Findings)
+			}
+		})
+	}
+}
+
+func TestScanContainer_SaveFailureIsAnError(t *testing.T) {
+	var hook []hookCall
+	rep := &fakeReports{saveErr: errors.New("db down")}
+	s := newTestScanner(readyTenantBox(), rep, &hook)
+	if err := s.ScanContainer(context.Background(), "alice-container", "alice"); err == nil {
+		t.Fatal("a report that could not be saved must fail the job")
+	}
+	if len(hook) != 0 {
+		t.Fatalf("hook must not fire when nothing was recorded: %+v", hook)
+	}
+}
+
+// The scan must run as the unprivileged nobody user with only the read-bypass
+// capability, bounded by timeout, over the whole filesystem minus pseudo-fs —
+// also for a privileged box, where it must never run as in-box root.
+func TestInBoxScanCommand_DropsPrivilegeAndKeepsReadOnly(t *testing.T) {
+	box := readyTenantBox()
+	box.info.Memory = "8GiB"
+	if _, _ = runScan(t, box); box.scanArgv == nil {
+		t.Fatal("scan did not run")
+	}
+	j := strings.Join(box.scanArgv, " ")
+	for _, want := range []string{
+		"timeout 60 setpriv", "--ruid=0", "--euid=65534", "--rgid=65534", "--egid=65534", "--clear-groups",
+		"--bounding-set=-all,+dac_read_search", "--inh-caps=-all,+dac_read_search", "--ambient-caps=-all,+dac_read_search",
+		"--no-new-privs",
+		"clamscan -r -i --no-summary --stdout", "--exclude-dir=^/proc", "--exclude-dir=^/sys", "--exclude-dir=^/dev", "--exclude-dir=^/run", " /",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("scan argv %q is missing %q", j, want)
+		}
+	}
+	for _, bad := range []string{"--reuid=0", "--euid=0", "--egid=0", "dac_override", "sys_admin", "setuid", "--no-clear-groups", "--remove"} {
+		if strings.Contains(j, bad) {
+			t.Errorf("scan argv %q must not contain %q", j, bad)
+		}
+	}
+}
+
+func TestParseMemoryAndBoxTooSmall(t *testing.T) {
+	small := []string{"2GB", "3500MB", "3GiB", "512MiB", "3999999999"}
+	for _, v := range small {
+		if !boxTooSmall(v) {
+			t.Errorf("%q should be too small", v)
+		}
+	}
+	ok := []string{"4GB", "4GiB", "8GB", "16GiB", "1TB", "", "50%", "unlimited", "garbage"}
+	for _, v := range ok {
+		if boxTooSmall(v) {
+			t.Errorf("%q should be allowed (default box size is 4GB; unknown limits do not block)", v)
+		}
+	}
+	if b, ok := parseMemoryBytes("4GiB"); !ok || b != 4<<30 {
+		t.Errorf("4GiB = %d,%v", b, ok)
+	}
+}
+
+func TestSummarizeFindings_DropsPathsKeepsSignatures(t *testing.T) {
+	out := "/home/a b/c: d: Sig.One FOUND\n/x/y: Sig.One FOUND\n/z: Sig.Two FOUND\nnot a finding\n"
+	count, sum := summarizeFindings(out)
+	if count != 3 || sum != "Sig.One (2)\nSig.Two (1)" {
+		t.Fatalf("count=%d summary=%q", count, sum)
+	}
+	if strings.Contains(sum, "/") {
+		t.Fatalf("summary contains a path: %q", sum)
+	}
+}
+
+func TestClassifyInBoxRun_NeverCleanOnError(t *testing.T) {
+	for _, code := range []int{2, 3, 124, 126, 127, 137, 143, -1} {
+		if st, _, _ := classifyInBoxRun(code, ""); st == ScanStatusClean {
+			t.Errorf("exit %d classified clean", code)
+		}
+	}
+	if st, _, _ := classifyInBoxRun(1, ""); st == ScanStatusClean || st == ScanStatusInfected {
+		t.Errorf("exit 1 with no FOUND line must be incomplete, got %q", st)
+	}
+	if st, n, _ := classifyInBoxRun(2, "/a: Sig FOUND\n"); st != ScanStatusInfected || n != 1 {
+		t.Errorf("infection found despite exit 2 must stay infected, got %q %d", st, n)
+	}
+	if st, _, _ := classifyInBoxRun(0, "/a: Sig FOUND\n"); st != ScanStatusInfected {
+		t.Errorf("findings with exit 0 are never clean, got %q", st)
+	}
+}
+
+func TestStatusEnumAndReason(t *testing.T) {
+	if StatusEnum(ScanStatusNotInstalled).String() != "CLAMAV_SCAN_STATUS_NOT_INSTALLED" ||
+		StatusEnum("never").String() != "CLAMAV_SCAN_STATUS_NEVER_SCANNED" ||
+		StatusEnum("bogus").String() != "CLAMAV_SCAN_STATUS_UNSPECIFIED" {
+		t.Error("status → enum mapping is wrong")
+	}
+	if ReasonFor(ScanStatusClean, "ClamAV 1.0") != "" || ReasonFor(ScanStatusInfected, "Sig (1)") != "" {
+		t.Error("clean/infected must not carry a reason")
+	}
+	if ReasonFor(ScanStatusIncomplete, "timed out") != "timed out" {
+		t.Error("incomplete should expose its reason")
+	}
+}
+
+// The principle behind #2631: the platform must not mount a tenant's rootfs
+// into any platform container to scan it. Guard it at the source level so a
+// later change cannot quietly bring the disk-device path back.
+func TestSecurityPackageNeverMountsTenantRootfs(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := string(b)
+		for _, bad := range []string{`"device", "add"`, "storage-pools", "/rootfs", "readonly=true"} {
+			if strings.Contains(src, bad) {
+				t.Errorf("%s contains %q: tenant rootfs must not be mounted into a platform container (#2631)", f, bad)
+			}
+		}
+	}
+}
