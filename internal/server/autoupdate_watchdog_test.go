@@ -148,3 +148,79 @@ func TestWatchdogHealthyKeepsPrev(t *testing.T) {
 }
 
 // TestWatchdogHealthyNoOld: healthy check with no .old is a no-op, and an
+// existing .prev is left alone.
+func TestWatchdogHealthyNoOld(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	binaryPath := filepath.Join(dir, "containarium")
+	_ = os.WriteFile(binaryPath, []byte("new"), 0755)
+	_ = os.WriteFile(binaryPath+".prev", []byte("keep"), 0755)
+	if err := RunUpgradeWatchdog(binaryPath, srv.URL+"/health", 10*time.Second, 0, 200*time.Millisecond, true); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(binaryPath + ".prev"); string(got) != "keep" {
+		t.Errorf(".prev = %q, want keep", got)
+	}
+}
+
+// TestLaunchWatchdogWritesLog (#3058): the detached watchdog's stdout/stderr
+// land in a known file beside the binary, created 0600 and appended to.
+func TestLaunchWatchdogWritesLog(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "containarium")
+	script := "#!/bin/sh\necho \"fake-watchdog args: $*\"\necho \"fake-watchdog stderr\" >&2\n"
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := WatchdogLogPath(bin)
+	if err := os.WriteFile(logPath, []byte("earlier run\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	u := &AutoUpdater{binaryPath: bin}
+	u.launchWatchdog()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var data []byte
+	for time.Now().Before(deadline) {
+		data, _ = os.ReadFile(logPath)
+		if strings.Contains(string(data), "fake-watchdog stderr") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	s := string(data)
+	if !strings.Contains(s, "earlier run") {
+		t.Errorf("log was truncated, not appended: %q", s)
+	}
+	if !strings.Contains(s, "fake-watchdog args: upgrade-watchdog") || !strings.Contains(s, "fake-watchdog stderr") {
+		t.Errorf("log missing stdout/stderr output: %q", s)
+	}
+	fi, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		t.Errorf("log mode %v, want no group/other access", fi.Mode().Perm())
+	}
+}
+
+// TestLaunchWatchdogLogCreatedSafe: a fresh log is created with 0600.
+func TestLaunchWatchdogLogCreatedSafe(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "containarium")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho hi\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	(&AutoUpdater{binaryPath: bin}).launchWatchdog()
+	fi, err := os.Stat(WatchdogLogPath(bin))
+	if err != nil {
+		t.Fatalf("log not created: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("mode %v, want 0600", fi.Mode().Perm())
+	}
+}
