@@ -76,3 +76,42 @@ func TestBuildOTelCollectorConfig_AntiSpoofingProcessor(t *testing.T) {
 		t.Errorf("anti-spoofing processor must source from client.address, got:\n%s", cfg)
 	}
 }
+
+func TestBuildOTelCollectorConfig_DropLabelsRendered(t *testing.T) {
+	cfg := buildOTelCollectorConfig("10.0.3.99", []string{"request_id", "user_email"}, "")
+	if !strings.Contains(cfg, "transform:") {
+		t.Errorf("expected transform processor for non-empty drop list, got:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, `^request_id$|^user_email$`) {
+		t.Errorf("drop regex not rendered correctly, got:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "processors: [attributes/identity, transform, batch]") {
+		t.Errorf("transform should appear in the metrics pipeline, got:\n%s", cfg)
+	}
+}
+
+func TestBuildOTelCollectorConfig_NoDropLabelsSkipsTransform(t *testing.T) {
+	cfg := buildOTelCollectorConfig("10.0.3.99", nil, "")
+	if strings.Contains(cfg, "transform:") {
+		t.Errorf("transform processor should be omitted when drop list is empty, got:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "processors: [attributes/identity, batch]") {
+		t.Errorf("pipeline should not reference transform when drop list is empty, got:\n%s", cfg)
+	}
+}
+
+func TestRegexEscape_EscapesMetacharacters(t *testing.T) {
+	cases := map[string]string{
+		"plain":       "plain",
+		"a.b":         `a\.b`,
+		"a+b":         `a\+b`,
+		"^anchor$":    `\^anchor\$`,
+		"x[y]":        `x\[y\]`,
+		"backslash\\": `backslash\\`,
+	}
+	for in, want := range cases {
+		if got := regexEscape(in); got != want {
+			t.Errorf("regexEscape(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
