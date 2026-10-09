@@ -102,3 +102,107 @@ locals {
 }
 
 resource "google_compute_instance" "jump_server_spot" {
+  count = var.use_spot_instance ? 1 : 0
+
+  name         = local.spot_vm_name
+  machine_type = var.machine_type
+  zone         = var.zone
+  project      = var.project_id
+
+  tags = local.use_sentinel ? concat(var.instance_tags, ["containarium-spot-backend"]) : var.instance_tags
+
+  # Spot instance configuration
+  scheduling {
+    preemptible                 = true
+    automatic_restart           = false
+    on_host_maintenance         = "TERMINATE"
+    provisioning_model          = "SPOT"
+    instance_termination_action = "STOP"
+  }
+
+  boot_disk {
+    auto_delete       = var.boot_disk_auto_delete
+    kms_key_self_link = var.kms_key_self_link == "" ? null : var.kms_key_self_link
+    initialize_params {
+      image = var.os_image
+      size  = var.boot_disk_size
+      type  = var.boot_disk_type
+    }
+  }
+
+  # Attach persistent disk for Incus data
+  dynamic "attached_disk" {
+    for_each = var.use_persistent_disk ? [1] : []
+    content {
+      source      = google_compute_disk.incus_data[0].id
+      device_name = "incus-data"
+      mode        = "READ_WRITE"
+    }
+  }
+
+  network_interface {
+    network    = local.network
+    subnetwork = local.subnetwork
+
+    # Conditional external IP:
+    # - sentinel mode: spot VM gets no external IP (or ephemeral if spot_vm_external_ip=true)
+    # - non-sentinel mode: spot VM gets the static IP
+    dynamic "access_config" {
+      for_each = local.use_sentinel ? (var.spot_vm_external_ip ? [1] : []) : [1]
+      content {
+        nat_ip = local.use_sentinel ? null : google_compute_address.jump_server_ip.address
+      }
+    }
+  }
+
+  metadata = {
+    ssh-keys = join("\n", [
+      for user, key in var.admin_ssh_keys :
+      "${user}:${key}"
+    ])
+    startup-script = templatefile("${path.module}/scripts/startup-spot.sh", {
+      incus_version                = var.incus_version
+      admin_users                  = keys(var.admin_ssh_keys)
+      enable_monitoring            = var.enable_monitoring
+      use_persistent_disk          = var.use_persistent_disk
+      containarium_version         = var.containarium_version
+      containarium_binary_url      = var.containarium_binary_url
+      sentinel_binary_url          = local.use_sentinel ? "http://${google_compute_instance.sentinel[0].network_interface[0].network_ip}:8888/containarium" : ""
+      jwt_secret                   = var.jwt_secret
+      sentinel_auth_secret         = var.sentinel_auth_secret
+      enable_peer_mtls             = var.enable_peer_mtls
+      sentinel_internal_ip         = local.use_sentinel ? google_compute_instance.sentinel[0].network_interface[0].network_ip : ""
+      fail2ban_whitelist_cidr      = var.fail2ban_whitelist_cidr
+      enable_app_hosting           = var.enable_app_hosting
+      base_domain                  = var.base_domain
+      enable_proxy_protocol        = var.enable_proxy_protocol
+      proxy_protocol_trusted_cidrs = local.proxy_protocol_trusted_effective
+      ssh_host                     = var.ssh_host
+      zfs_encryption_keyfile       = var.zfs_encryption_keyfile
+      ssh_authz_keys_command       = var.ssh_authz_keys_command
+      ssh_authz_keys_enforce       = var.ssh_authz_keys_enforce
+    })
+  }
+
+  service_account {
+    email  = var.service_account_email
+    scopes = ["cloud-platform"]
+  }
+
+  labels = merge(
+    var.labels,
+    {
+      component     = "containarium"
+      role          = "jump-server"
+      instance_type = "spot"
+    }
+  )
+
+  allow_stopping_for_update = true
+
+  lifecycle {
+    ignore_changes = [
+      metadata["ssh-keys"],
+    ]
+  }
+}
