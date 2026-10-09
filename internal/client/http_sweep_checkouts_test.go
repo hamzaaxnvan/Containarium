@@ -39,3 +39,24 @@ func TestHTTPSweepBoxRunCheckouts(t *testing.T) {
 }
 
 func TestHTTPSweepBoxRunCheckouts_NotFound(t *testing.T) {
+	t.Run("old daemon without the route is Unimplemented", func(t *testing.T) {
+		srv := httptest.NewServer(http.NotFoundHandler())
+		defer srv.Close()
+		c, _ := NewHTTPClient(srv.URL, "tok")
+		if _, err := c.SweepBoxRunCheckouts(&pb.SweepBoxRunCheckoutsRequest{Username: "alice"}); status.Code(err) != codes.Unimplemented {
+			t.Fatalf("err = %v, want Unimplemented", err)
+		}
+	})
+	t.Run("a gateway NOT_FOUND (no such box) is not Unimplemented", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":5,"message":"no box for \"alice\""}`))
+		}))
+		defer srv.Close()
+		c, _ := NewHTTPClient(srv.URL, "tok")
+		_, err := c.SweepBoxRunCheckouts(&pb.SweepBoxRunCheckoutsRequest{Username: "alice"})
+		if err == nil || status.Code(err) == codes.Unimplemented {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
