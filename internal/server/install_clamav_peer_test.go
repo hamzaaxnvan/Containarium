@@ -134,3 +134,94 @@ func TestInstallClamav_AnUnreachableBackendIsNotAnsweredLocally(t *testing.T) {
 	// report the box as missing).
 	s := serverWithPeers(&PeerClient{ID: "peer-down", Healthy: false})
 
+	_, err := s.InstallClamav(tenantCtx("alice"), &pb.InstallClamavRequest{ContainerName: "alice-container"})
+	if err == nil || !strings.Contains(err.Error(), "unreachable") {
+		t.Fatalf("got %v, want an error naming the unreachable backend", err)
+	}
+}
+
+func TestInstallClamav_NoPeerOwnsTheBoxRunsLocally(t *testing.T) {
+	peer := newFakeOwningPeer(t /* owns nothing */)
+	s := serverWithPeers(peer.client())
+
+	_, err := s.InstallClamav(tenantCtx("alice"), &pb.InstallClamavRequest{ContainerName: "alice-container"})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("got %v, want Unavailable (the local path, no runtime in this test)", err)
+	}
+	if peer.installHits.Load() != 0 {
+		t.Error("a peer that does not own the box must not be sent the install")
+	}
+}
+
+// An install can take minutes; the peer client has a 30 s overall timeout, so
+// the forwarded call must not be bound by it.
+func TestInstallClamav_ForwardIsNotCutShortByThePeerClientTimeout(t *testing.T) {
+	peer := newFakeOwningPeer(t, "alice-container")
+	peer.installWait = 300 * time.Millisecond
+	pc := peer.client()
+	short := *pc.client
+	short.Timeout = 50 * time.Millisecond
+	pc.client = &short
+	s := serverWithPeers(pc)
+
+	// The container list read is a separate short call, so give only the
+	// install a slow server: the list answers at once.
+	resp, err := s.InstallClamav(tenantCtx("alice"), &pb.InstallClamavRequest{ContainerName: "alice-container"})
+	if err != nil {
+		t.Fatalf("a slow install must still complete: %v", err)
+	}
+	if resp.GetOutcome() != pb.ClamavInstallOutcome_CLAMAV_INSTALL_OUTCOME_INSTALLED {
+		t.Errorf("outcome = %v", resp.GetOutcome())
+	}
+}
+
+func TestInstallClamav_AuthzIsCheckedBeforeAnyForward(t *testing.T) {
+	peer := newFakeOwningPeer(t, "bob-container")
+	s := serverWithPeers(peer.client())
+	_, err := s.InstallClamav(tenantCtx("alice"), &pb.InstallClamavRequest{ContainerName: "bob-container"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v, want PermissionDenied for another tenant's box", err)
+	}
+	if peer.installHits.Load() != 0 {
+		t.Error("an unauthorized request must never reach a peer")
+	}
+}
+
+// #2683, second point: a per-box scan started for a box on a peer is executed by
+// the peer that owns the box (the trigger is forwarded; the peer enqueues it on
+// ITS scanner and runs it with ITS runtime), never on the daemon that was asked.
+// The local scanner here is a zero value with no store: touching it would panic.
+func TestTriggerClamavScan_ForwardsToThePeerThatOwnsTheBox(t *testing.T) {
+	var scanHits atomic.Int32
+	var gotBody atomic.Value
+	peer := newFakeOwningPeer(t, "alice-container")
+	inner := peer.srv.Config.Handler
+	peer.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/security/clamav-scan" {
+			scanHits.Add(1)
+			b, _ := io.ReadAll(r.Body)
+			gotBody.Store(string(b))
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"message":"queued on the peer","scannedCount":1}`))
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
+	s := serverWithPeers(peer.client())
+	s.scanner = &security.Scanner{}
+
+	resp, err := s.TriggerClamavScan(tenantCtx("alice"), &pb.TriggerClamavScanRequest{ContainerName: "alice-container"})
+
+	if err != nil {
+		t.Fatalf("TriggerClamavScan: %v", err)
+	}
+	if !strings.Contains(resp.GetMessage(), "peer") {
+		t.Errorf("message = %q, want it to say the scan was queued on the peer", resp.GetMessage())
+	}
+	if scanHits.Load() != 1 {
+		t.Errorf("peer scan hits = %d, want exactly 1 (the owning peer runs the scan)", scanHits.Load())
+	}
+	if !strings.Contains(gotBody.Load().(string), "alice-container") {
+		t.Errorf("peer got body %q, want the box name", gotBody.Load())
+	}
+}
