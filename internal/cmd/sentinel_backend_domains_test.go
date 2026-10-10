@@ -21,3 +21,19 @@ func TestInFleetCertScopeFromFlags(t *testing.T) {
 		t.Fatalf("no flags gave scope %+v, want empty", empty)
 	}
 
+	bad := []struct {
+		hostname    string
+		aliases     []string
+		baseDomains []string
+	}{
+		{hostname: "*.example.com"},
+		{aliases: []string{"api..example.com"}},
+		{baseDomains: []string{"com"}},
+		{baseDomains: []string{"Example.com"}},
+	}
+	for _, b := range bad {
+		if _, err := inFleetCertScopeFromFlags(b.hostname, b.aliases, b.baseDomains); err == nil {
+			t.Errorf("inFleetCertScopeFromFlags(%q, %v, %v) = nil error, want one", b.hostname, b.aliases, b.baseDomains)
+		}
+	}
+}
