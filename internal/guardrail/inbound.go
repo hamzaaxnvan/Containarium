@@ -96,3 +96,28 @@ func DecideInbound(resp *pb.GuardrailScanResponse, scanErr error, policy *pb.Gua
 	perKind := map[pb.GuardrailKind]int64{}
 	hit := false
 	for _, f := range resp.GetFindings() {
+		perKind[f.GetKind()]++
+		if blocking[f.GetKind()] {
+			hit = true
+		}
+	}
+	if len(perKind) > 0 {
+		d.Kinds = sortedKinds(perKind)
+	}
+	switch {
+	case hit:
+		d.Blocked, d.Reason = true, InboundReasonFinding
+	case d.Gaps > 0:
+		d.Blocked, d.Reason = true, InboundReasonCoverageGap
+	default:
+		d.Reason = InboundReasonClean
+	}
+	return d
+}
+
+// InboundBlocked is a block decided without a usable scan result: the
+// engine failed, the held message went over its byte limit, or the policy
+// could not be read.
+func InboundBlocked(reason InboundReason) InboundDecision {
+	return InboundDecision{Blocked: true, Reason: reason}
+}

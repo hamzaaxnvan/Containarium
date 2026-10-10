@@ -10,3 +10,51 @@
 //     are the de-facto namespaces: SENTINEL_, K8S_, AWS_, VAULT_, …),
 //   - exported Env* name constants so each variable name has a single home
 //     instead of being a magic string repeated across the tree,
+//   - a Load<Namespace>() that reads the environment once and applies defaults,
+//   - a Validate() that fails fast at startup rather than deep inside a request.
+//
+// The Kubernetes backend (pkg/core/box/k8s.Config) already follows this shape;
+// this package generalizes it. Migrate consumers incrementally: a half-migrated
+// namespace is safe because Load reads exactly the same variables that any
+// remaining inline os.Getenv calls do — values cannot diverge.
+package config
+
+import (
+	"os"
+	"strconv"
+	"strings"
+)
+
+// getString returns the value of the environment variable key, or def when it
+// is unset or empty. It is the building block Load<Namespace>() functions use so
+// the empty-means-unset convention lives in one place.
+func getString(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// getBool reports whether the environment variable key is set to a truthy value
+// ("1", "true", "yes", "on", case-insensitive). Anything else — including unset
+// — is false. This is a superset of the historical `== "1"` convention, so
+// existing "1" settings keep working.
+func getBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// getInt returns the integer value of the environment variable key, or def when
+// it is unset or not a valid integer.
+func getInt(key string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
