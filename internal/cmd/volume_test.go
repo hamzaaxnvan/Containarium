@@ -29,3 +29,11 @@ func TestParseSizeBytes(t *testing.T) {
 			continue
 		}
 		if err != nil {
+			t.Errorf("parseSizeBytes(%q): unexpected error %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("parseSizeBytes(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
