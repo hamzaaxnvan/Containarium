@@ -124,3 +124,67 @@ func (m *Manager) Fail2BanBansHandler() http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// Fail2BanUnbanHandler unbans an IP address, either from one named jail
+// (Jail set) or from every jail this sentinel currently has configured
+// (Jail empty) — #1962. See Fail2BanUnbanResponse for the
+// success/failure semantics: unbanning an address that isn't banned
+// anywhere targeted is success with unbanned=false, not an error.
+//
+// Gated by the admin secret, same tier as Fail2BanBansHandler above —
+// clearing a ban is a materially bigger capability than any read-only
+// cluster daemon operation.
+func (m *Manager) Fail2BanUnbanHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req Fail2BanUnbanRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+			return
+		}
+
+		// Validate BEFORE any fail2ban-client call (#1962): net.ParseIP
+		// rejects CIDR notation (and anything else that isn't a bare
+		// address) naturally. Silently unbanning only the network
+		// address of a prefix would look like it worked but wouldn't.
+		if req.IP == "" || net.ParseIP(req.IP) == nil {
+			http.Error(w, `{"error":"ip must be a single valid IP address, not a CIDR or empty"}`, http.StatusBadRequest)
+			return
+		}
+
+		runner := m.fail2ban()
+		var targets []string
+		if req.Jail != "" {
+			targets = []string{req.Jail}
+		} else {
+			jails, err := fail2banListJails(runner)
+			if err != nil {
+				writeFail2BanError(w, err)
+				return
+			}
+			targets = jails
+		}
+
+		resp := Fail2BanUnbanResponse{Jails: []string{}}
+		for _, jail := range targets {
+			unbanned, err := fail2banUnban(runner, jail, req.IP)
+			if err != nil {
+				writeFail2BanError(w, err)
+				return
+			}
+			if unbanned {
+				resp.Unbanned = true
+				resp.Jails = append(resp.Jails, jail)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+}
