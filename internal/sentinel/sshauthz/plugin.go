@@ -167,3 +167,172 @@ func (p *Plugin) publicKeyCallback(conn libplugin.ConnMetadata, wire []byte) (*l
 	}
 	fp := ssh.FingerprintSHA256(key)
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.Timeout)
+	defer cancel()
+	backend, known, err := p.cfg.Resolver.ResolveBackend(ctx, conn.User())
+	if err != nil {
+		return p.stash(meta, conn, wire, "", fp, unavailable())
+	}
+	if !known {
+		if !p.cfg.Enforce {
+			return p.pass(conn, wire, meta)
+		}
+		// Fail closed, as a bridge error does: without a backend there is no
+		// daemon decision, and routing the login from the static config.yaml
+		// alone would make that file the sole judge, which is what enforce
+		// mode exists to remove (#2741). The cache is keyed by backend, so no
+		// grace applies. Name the cause in the log: after a manager restart
+		// every login is unknown until the keystore has synced.
+		cause := "no synced backend lists the login"
+		if r, ok := p.cfg.Resolver.(RoutingReadiness); ok && !r.RoutingReady(ctx) {
+			cause = "routing not ready, keystore not yet synced"
+		}
+		p.cfg.Logf("[ssh-authz] login=%q: unknown login refused in enforce mode: %s", conn.User(), cause)
+		return p.stash(meta, conn, wire, "", fp, unavailable())
+	}
+	ck := CacheKey{Backend: backend, Login: conn.User(), Fingerprint: fp}
+	if user, ok := p.cfg.Cache.Get(ck, false); ok {
+		return p.stash(meta, conn, wire, backend, fp, allowed(user))
+	}
+	ip := conn.RemoteAddr()
+	if host, _, err := net.SplitHostPort(ip); err == nil {
+		ip = host
+	}
+	// The client address goes with each request for audit only; approval is
+	// keyed on (user, fingerprint) by the decision source.
+	req := &pb.AuthorizeSSHRequest{
+		Login: conn.User(), ClientIp: ip, SentinelId: p.cfg.SentinelID,
+		Credential: &pb.SSHCredential{Kind: &pb.SSHCredential_PublicKey{PublicKey: &pb.SSHPublicKeyCredential{
+			FingerprintSha256: fp, KeyType: keyType(key),
+		}}},
+	}
+	res, err := p.cfg.Authorizer.Authorize(ctx, backend, req)
+	// The managed daemon may report a cloud outage as a typed denial. It is
+	// subject to the same bounded grace as transport errors and HTTP 5xx.
+	outage := err != nil && isOutage(err)
+	if err == nil && res != nil && res.GetDecision() == pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_DENY && res.GetDenyReason() == pb.SSHDenyReason_SSH_DENY_REASON_UPSTREAM_UNAVAILABLE {
+		outage = true
+	}
+	if outage {
+		if user, ok := p.cfg.Cache.Get(ck, true); ok {
+			return p.stash(meta, conn, wire, backend, fp, allowed(user))
+		}
+		denied := unavailable()
+		if err == nil && res != nil {
+			denied.UserId = res.GetUserId()
+		}
+		return p.stash(meta, conn, wire, backend, fp, denied)
+	}
+	if err != nil || validateResponse(res) != nil {
+		p.cfg.Cache.Delete(ck)
+		return p.stash(meta, conn, wire, backend, fp, unavailable())
+	}
+	if res.GetDecision() == pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_ALLOW {
+		p.cfg.Cache.Put(ck, res.GetUserId(), res.GetCacheTtl().AsDuration())
+		return p.stash(meta, conn, wire, backend, fp, res)
+	}
+	p.cfg.Cache.Delete(ck)
+	// Audit-only mode never prompts: the pending decision is logged and
+	// deferred by stash like any other.
+	if p.cfg.Enforce {
+		if a, ok := newApproval(res, p.cfg.Now()); ok {
+			a.backend, a.fp, a.wire, a.req = backend, fp, wire, req
+			return p.beginApproval(meta, conn, a, res)
+		}
+	}
+	return p.stash(meta, conn, wire, backend, fp, res)
+}
+
+func allowed(user string) *pb.AuthorizeSSHResponse {
+	return &pb.AuthorizeSSHResponse{Decision: pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_ALLOW, UserId: user}
+}
+func unavailable() *pb.AuthorizeSSHResponse {
+	return &pb.AuthorizeSSHResponse{Decision: pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_DENY, DenyReason: pb.SSHDenyReason_SSH_DENY_REASON_UPSTREAM_UNAVAILABLE}
+}
+
+func validateResponse(res *pb.AuthorizeSSHResponse) error {
+	if res == nil {
+		return errors.New("empty authorization response")
+	}
+	switch res.GetDecision() {
+	case pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_ALLOW:
+		if res.GetDenyReason() != pb.SSHDenyReason_SSH_DENY_REASON_UNSPECIFIED {
+			return errors.New("allow with deny reason")
+		}
+		if ttl := res.GetCacheTtl(); ttl != nil {
+			if err := ttl.CheckValid(); err != nil {
+				return err
+			}
+			if ttl.AsDuration() < 0 {
+				return errors.New("negative cache TTL")
+			}
+		}
+	case pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_DENY:
+		if _, ok := pb.SSHDenyReason_name[int32(res.GetDenyReason())]; !ok || res.GetDenyReason() == pb.SSHDenyReason_SSH_DENY_REASON_UNSPECIFIED {
+			return errors.New("invalid deny reason")
+		}
+	default:
+		return fmt.Errorf("invalid decision: %v", res.GetDecision())
+	}
+	return nil
+}
+
+func (p *Plugin) stash(meta map[string]string, conn libplugin.ConnMetadata, wire []byte, backend, fp string, res *pb.AuthorizeSSHResponse) (*libplugin.Upstream, error) {
+	meta[sshsession.MetaUserID] = res.GetUserId()
+	meta[sshsession.MetaAuthzDecision] = string(sshsession.DecisionFromProto(res.GetDecision()))
+	meta[sshsession.MetaDenyReason] = string(sshsession.ReasonFromProto(res.GetDenyReason()))
+	p.cfg.Logf("[ssh-authz] login=%q backend=%q decision=%s reason=%s user_id=%q enforced=%v", conn.User(), backend, meta[sshsession.MetaAuthzDecision], meta[sshsession.MetaDenyReason], res.GetUserId(), p.cfg.Enforce)
+	if !p.cfg.Enforce || res.GetDecision() == pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_ALLOW {
+		return p.pass(conn, wire, meta)
+	}
+	p.recordDenied(conn, fp, res)
+	return nil, fmt.Errorf("ssh authz: login %q denied: %s", conn.User(), meta[sshsession.MetaDenyReason])
+}
+
+// recordDenied writes the ssh_session_denied record for an enforced denial.
+// Like ssh-session-plugin, a sink failure never changes the auth outcome.
+func (p *Plugin) recordDenied(conn libplugin.ConnMetadata, fp string, res *pb.AuthorizeSSHResponse) {
+	p.recordDeniedFor(conn.UniqueID(), conn.RemoteAddr(), conn.User(), fp, res)
+}
+
+// recordDeniedFor is recordDenied for a connection known only by the fields
+// kept with its approval, after the connection itself has gone.
+func (p *Plugin) recordDeniedFor(session, addr, login, fp string, res *pb.AuthorizeSSHResponse) {
+	if p.cfg.Recorder == nil {
+		return
+	}
+	ip, port := hostport.Split(addr, 0)
+	rec := sshsession.Record{
+		SessionID:     session,
+		Phase:         sshsession.SessionPhaseDenied,
+		OccurredAt:    p.cfg.Now(),
+		ClientIP:      ip,
+		ClientPort:    port,
+		Login:         login,
+		AuthMethod:    sshsession.AuthMethodPublicKey,
+		Credential:    sshsession.Credential{KeyFingerprint: fp},
+		UserID:        res.GetUserId(),
+		AuthzDecision: pb.SSHAuthzDecision_SSH_AUTHZ_DECISION_DENY,
+		DenyReason:    res.GetDenyReason(),
+		Enforced:      true,
+	}
+	if err := p.cfg.Recorder.Record(rec); err != nil {
+		p.cfg.Logf("[ssh-authz] login=%q: write denied record: %v", login, err)
+	}
+}
+
+func keyType(key ssh.PublicKey) pb.SSHKeyType {
+	switch key.Type() {
+	case ssh.KeyAlgoED25519:
+		return pb.SSHKeyType_SSH_KEY_TYPE_ED25519
+	case ssh.KeyAlgoRSA:
+		return pb.SSHKeyType_SSH_KEY_TYPE_RSA
+	case ssh.KeyAlgoECDSA256, ssh.KeyAlgoECDSA384, ssh.KeyAlgoECDSA521:
+		return pb.SSHKeyType_SSH_KEY_TYPE_ECDSA
+	case ssh.KeyAlgoSKED25519:
+		return pb.SSHKeyType_SSH_KEY_TYPE_SK_ED25519
+	case ssh.KeyAlgoSKECDSA256:
+		return pb.SSHKeyType_SSH_KEY_TYPE_SK_ECDSA
+	default:
+		return pb.SSHKeyType_SSH_KEY_TYPE_UNSPECIFIED
+	}
+}

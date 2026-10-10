@@ -52,3 +52,22 @@ func TestDefaultPolicy_IsMarkedDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !def.IsHostDefault {
+		t.Error("DefaultPolicy is not marked IsHostDefault")
+	}
+	if compiled(t, &pb.NetworkPolicy{Tenant: "acme"}).IsHostDefault {
+		t.Error("a stored policy is marked IsHostDefault")
+	}
+}
+
+// The plan does not subtract the host default allow-list, and says so (#2996).
+func TestPlanNetworkPolicy_SaysItDoesNotSubtractTheHostDefault(t *testing.T) {
+	s := newNPServer()
+	s.SetPlanSources(&fakeAuditQuery{}, netip.Addr{})
+	resp, err := s.PlanNetworkPolicy(npAdminCtx(), &pb.PlanNetworkPolicyRequest{Tenant: "fresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.GetNotes()) == 0 || !strings.Contains(resp.GetNotes()[0], "default egress allow-list") || !strings.Contains(resp.GetNotes()[0], "not subtracted") {
+		t.Errorf("notes = %v", resp.GetNotes())
+	}
+}
