@@ -106,3 +106,111 @@ func TestMoveContainer_UnencryptedCopiesCarryNoStorageOverride(t *testing.T) {
 
 	for _, call := range runner.calls {
 		if strings.Contains(call, "storage=") {
+			t.Errorf("an unencrypted migration passed a storage override (%q) — it would be "+
+				"pinned to a pool it never asked for", call)
+		}
+	}
+	if adopted == nil {
+		t.Fatal("adopt was never called")
+	}
+	if adopted.ZfsKeyRef != "" || adopted.ZfsPool != "" {
+		t.Errorf("an unencrypted adopt carried placement fields: ref=%q pool=%q",
+			adopted.ZfsKeyRef, adopted.ZfsPool)
+	}
+}
+
+// --- destination side --------------------------------------------------
+
+// The destination records what it was told, so a restarted daemon — or any
+// later start — can find the encryptionroot. Without this the container is
+// running but unopenable the moment it stops.
+func TestAdoptMigratedContainer_RecordsThePlacementItWasGiven(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	refs := &fakeRefStore{refs: map[string]zfskey.KeyRef{}, pools: map[string]string{}}
+	s := &ContainerServer{encryption: testHooksWith(t, z, p, refs, newFakePools())}
+
+	err := s.recordAdoptedPlacement(&pb.AdoptMigratedContainerRequest{
+		Username:  "alice",
+		ZfsKeyRef: refJSON(t, "/keys/alice.key"),
+		ZfsPool:   "containarium-tenant-alice",
+	})
+	if err != nil {
+		t.Fatalf("recordAdoptedPlacement: %v", err)
+	}
+
+	if got := refs.refs["alice-container"]; got.URI != "/keys/alice.key" {
+		t.Errorf("stored ref = %+v, want alice's", got)
+	}
+	if got := refs.pools["alice-container"]; got != "containarium-tenant-alice" {
+		t.Errorf("stored pool = %q, want the tenant pool", got)
+	}
+}
+
+// An unencrypted adoption must not touch encryption state at all.
+func TestAdoptMigratedContainer_UnencryptedRecordsNothing(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	refs := &fakeRefStore{refs: map[string]zfskey.KeyRef{}, pools: map[string]string{}}
+	s := &ContainerServer{encryption: testHooksWith(t, z, p, refs, newFakePools())}
+
+	if err := s.recordAdoptedPlacement(&pb.AdoptMigratedContainerRequest{Username: "bob"}); err != nil {
+		t.Fatalf("recordAdoptedPlacement: %v", err)
+	}
+	if len(refs.refs) != 0 || len(refs.pools) != 0 {
+		t.Errorf("an unencrypted adoption recorded encryption state: refs=%v pools=%v",
+			refs.refs, refs.pools)
+	}
+}
+
+// A ref that arrives without a pool (or the reverse) is a half-message. It
+// must fail rather than be recorded, because a container with a ref and no
+// pool refuses to start — and one with a pool and no ref reads as
+// unencrypted, which is the dangerous direction.
+//
+// NOTE, so this is not mistaken for a unit test of the explicit check in
+// recordAdoptedPlacement: it is not. Deleting that check leaves this test
+// passing, because both halves are refused anyway — a missing pool by
+// RecordPlacement (#1340), a missing ref by the JSON decode. What is asserted
+// here is the GUARANTEE, which is upheld by three independent mechanisms. The
+// explicit check earns its place only by naming which half is missing, which
+// the other two cannot.
+func TestAdoptMigratedContainer_RejectsAHalfMessage(t *testing.T) {
+	for _, tc := range []struct{ name, ref, pool string }{
+		{"ref without pool", `{"scheme":"file","uri":"/k"}`, ""},
+		{"pool without ref", "", "containarium-tenant-alice"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+			refs := &fakeRefStore{refs: map[string]zfskey.KeyRef{}, pools: map[string]string{}}
+			s := &ContainerServer{encryption: testHooksWith(t, z, p, refs, newFakePools())}
+
+			err := s.recordAdoptedPlacement(&pb.AdoptMigratedContainerRequest{
+				Username: "alice", ZfsKeyRef: tc.ref, ZfsPool: tc.pool,
+			})
+			if err == nil {
+				t.Fatal("a half-specified placement was accepted")
+			}
+			if len(refs.refs) != 0 || len(refs.pools) != 0 {
+				t.Errorf("state was recorded anyway: refs=%v pools=%v", refs.refs, refs.pools)
+			}
+		})
+	}
+}
+
+// A destination with no encryption wired that is handed an encrypted
+// container must refuse loudly. The pre-flight should have stopped this, so
+// reaching here means the source skipped it or the daemon changed underneath
+// — either way, recording nothing and reporting success would leave a
+// container nobody can unlock.
+func TestAdoptMigratedContainer_RefusesEncryptedWithoutEncryptionWired(t *testing.T) {
+	s := &ContainerServer{} // no hooks
+
+	err := s.recordAdoptedPlacement(&pb.AdoptMigratedContainerRequest{
+		Username:  "alice",
+		ZfsKeyRef: refJSON(t, "/keys/alice.key"),
+		ZfsPool:   "containarium-tenant-alice",
+	})
+	if err == nil {
+		t.Fatal("a daemon with no key custody accepted an encrypted container — it would run " +
+			"until its first stop and then never start again, with nothing recording why")
+	}
+}

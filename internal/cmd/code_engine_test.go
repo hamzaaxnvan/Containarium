@@ -472,3 +472,162 @@ func TestCodeInstall_FlagValidation(t *testing.T) {
 		{
 			// models.json's apiKey is a "$VAR" reference, so there must be a
 			// variable to name. Defaulting to the gateway's variable would point
+			// pi at a value this path never writes.
+			name:  "pi on a secret without a secret name",
+			flags: map[string]string{"engine": "pi", "credential": "secret", "model": "m", "provider-base-url": "https://api.openai.com/v1"},
+			want:  "--secret-name",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// A deliberately failing secrets RPC: a flag mistake must be reported
+			// as itself, not masked by a lookup that should never have happened.
+			secretsErr := errors.New("secrets RPC must not be reached for a flag error")
+			env, err := runInstallEngine(t, "alice", tc.flags, okMint(), nil, secretsErr)
+			if err == nil {
+				t.Fatalf("expected a rejection for %v", tc.flags)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error should mention %q: %v", tc.want, err)
+			}
+			if strings.Contains(err.Error(), "must not be reached") {
+				t.Errorf("a flag error was masked by a secrets RPC failure: %v", err)
+			}
+			if len(env.scripts) != 0 {
+				t.Errorf("flags were rejected but %d remote script(s) still ran", len(env.scripts))
+			}
+		})
+	}
+}
+
+// TestCodeInstall_GatewayEnvNeverLeaksTheTokenIntoAnArgument: the install path
+// writes gateway.env over ssh, so the token IS in a script — but it must be
+// single-quoted and reach the box as a heredoc-style redirect, never as an
+// unquoted word a shell could re-split or a `ps` could show mid-pipeline.
+func TestCodeInstall_GatewayTokenIsShellQuoted(t *testing.T) {
+	mint := okMint()
+	mint.resp.Token = "gw-token with spaces and 'quotes'"
+	env, err := runInstallEngine(t, "alice", map[string]string{
+		"engine": "pi", "credential": "gateway", "provider": "kafeido", "model": "kafeido-coder",
+	}, mint, nil, nil)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	scripts := env.allScripts()
+	// The raw token must never appear unquoted.
+	if strings.Contains(scripts, "=gw-token with spaces") {
+		t.Errorf("token was interpolated unquoted:\n%s", scripts)
+	}
+	// It must appear in its shell-quoted form.
+	if !strings.Contains(scripts, `'gw-token with spaces and '\''quotes'\'''`) {
+		t.Errorf("token is not shell-quoted:\n%s", scripts)
+	}
+}
+
+// TestCodeInstall_ProviderBaseURLOverride: --provider-base-url replaces the base
+// entirely, and no per-provider suffix is appended to an operator's complete URL.
+func TestCodeInstall_ProviderBaseURLOverride(t *testing.T) {
+	env, err := runInstallEngine(t, "alice", map[string]string{
+		"engine": "pi", "credential": "gateway", "provider": "kafeido", "model": "m",
+		"provider-base-url": "https://inference.example.test/v1",
+	}, okMint(), nil, nil)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	scripts := env.allScripts()
+	if !strings.Contains(scripts, "https://inference.example.test/v1") {
+		t.Errorf("--provider-base-url not honoured:\n%s", scripts)
+	}
+	if strings.Contains(scripts, "/v1/model/kafeido/v1") {
+		t.Errorf("the gateway base should have been replaced, not appended to:\n%s", scripts)
+	}
+}
+
+// ===========================================================================
+// --engine codex (#2273)
+// ===========================================================================
+
+// TestCodeInstall_CodexSecret covers the AC's main path: install codex on
+// the secret credential, record code.json, and verify with `codex exec
+// --json`. No daemon calls at all — codex's preflight is identical to
+// Claude's and pi's secret path (metadata-only, and only when --secret-name
+// is given).
+func TestCodeInstall_CodexSecret(t *testing.T) {
+	secrets := []*pb.SecretMetadata{
+		{Name: "CODEX_API_KEY", DeliveryMode: pb.SecretDelivery_SECRET_DELIVERY_COMPOSE},
+	}
+	env, err := runInstallEngine(t, "alice", map[string]string{
+		"engine": "codex", "credential": "secret", "secret-name": "CODEX_API_KEY",
+	}, mintResult{}, secrets, nil)
+	if err != nil {
+		t.Fatalf("install: %v\nstderr: %s", err, env.stderr)
+	}
+	scripts := env.allScripts()
+
+	// codex, via npm, with its postinstall script left enabled.
+	if !strings.Contains(scripts, "@openai/codex") {
+		t.Errorf("codex was not installed via npm:\n%s", scripts)
+	}
+	if strings.Contains(scripts, "--ignore-scripts") {
+		t.Errorf("codex's install must not skip npm scripts (it needs the postinstall binary fetch):\n%s", scripts)
+	}
+	// No gateway token minted: this is the secret path.
+	if len(env.mintReqs) != 0 {
+		t.Errorf("the secret path minted %d gateway token(s); it must mint none", len(env.mintReqs))
+	}
+	// code.json records the choice.
+	for _, want := range []string{`"engine": "codex"`, `"credential": "secret"`, `"secret_name": "CODEX_API_KEY"`} {
+		if !strings.Contains(scripts, want) {
+			t.Errorf("code.json missing %q:\n%s", want, scripts)
+		}
+	}
+	// Verification the AC names.
+	if !strings.Contains(scripts, "codex exec --json") || !strings.Contains(scripts, "print the current working directory") {
+		t.Errorf("codex verification step missing:\n%s", scripts)
+	}
+	// Next-steps help names codex's OWN sign-in command, not pi's leftover
+	// "/login" text.
+	if !strings.Contains(env.stdout, "codex login") {
+		t.Errorf("next-steps help should name codex's own sign-in command:\n%s", env.stdout)
+	}
+	if strings.Contains(env.stdout, "# then /login") {
+		t.Errorf("next-steps help must not print pi's /login text for codex:\n%s", env.stdout)
+	}
+}
+
+// TestCodeInstall_CodexVersionPin covers --codex-version.
+func TestCodeInstall_CodexVersionPin(t *testing.T) {
+	env, err := runInstallEngine(t, "alice", map[string]string{
+		"engine": "codex", "credential": "secret", "codex-version": "0.50.0",
+	}, mintResult{}, nil, nil)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if !strings.Contains(env.allScripts(), "@openai/codex@0.50.0") {
+		t.Errorf("--codex-version was not honoured:\n%s", env.allScripts())
+	}
+}
+
+// TestCodeInstall_CodexGatewayNotYetSupported pins the #2273 scoping
+// decision: --engine codex --credential gateway is rejected, naming the fix,
+// rather than shipping an unverified path. Nothing runs on the box.
+func TestCodeInstall_CodexGatewayNotYetSupported(t *testing.T) {
+	env, err := runInstallEngine(t, "alice", map[string]string{
+		"engine": "codex", "credential": "gateway", "provider": "openai", "model": "gpt-5-codex",
+	}, okMint(), nil, nil)
+	if err == nil {
+		t.Fatal("install succeeded with --engine codex --credential gateway, which is not supported yet")
+	}
+	msg := err.Error()
+	for _, want := range []string{"not supported", "CODEX_API_KEY", "secret"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error should name the fix (missing %q): %v", want, msg)
+		}
+	}
+	if len(env.scripts) != 0 {
+		t.Errorf("a rejected flag combination still ran %d remote script(s):\n%s", len(env.scripts), env.allScripts())
+	}
+	if len(env.mintReqs) != 0 {
+		t.Errorf("a rejected flag combination still minted a gateway token")
+	}
+}
