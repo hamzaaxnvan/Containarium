@@ -73,3 +73,41 @@ func fetchApprovalKey(newClient func() (runInputsAPI, error), box string) (ed255
 	resp, err := c.GetRunApprovalKey(box)
 	if err != nil {
 		return nil, fmt.Errorf("get the box's approval key from the daemon (it needs a daemon with permission-request answers): %w", err)
+	}
+	return coderun.ParseApprovalPublicKey(resp.GetPublicKey())
+}
+
+// journalApprovalNote writes note as the run's approval journal. Called right
+// after process_start, so it lands after the previous run's journal was
+// rotated aside. Best-effort: the run is already going.
+func journalApprovalNote(ctx context.Context, sess approvalSession, name, note string, diag io.Writer) {
+	line, err := coderun.InputEvent{Kind: coderun.KindInputStatus, T: time.Now().UTC(), Text: note}.MarshalLine()
+	if err == nil {
+		err = sess.WriteFile(ctx, coderun.ApprovalJournalPath(name), string(line), "0600")
+	}
+	if err != nil {
+		fmt.Fprintf(diag, "note: could not journal that (non-fatal): %v\n", err)
+	}
+}
+
+// codeRunBoxHint is the status hint's argument tail: the box is the user's own
+// argument, so only a non-default --name needs repeating.
+func codeRunBoxHint(name string) string {
+	if name == defaultCodeRunName {
+		return "<box>"
+	}
+	return "<box> --name " + name
+}
+
+// validateApprovalFlags checks --approvals / --approval-timeout before anything
+// touches the box.
+func validateApprovalFlags() (coderun.ApprovalMode, error) {
+	mode, err := coderun.ParseApprovalMode(codeRunApprovals)
+	if err != nil {
+		return "", err
+	}
+	if codeRunApprovalTimeout <= 0 {
+		return "", fmt.Errorf("--approval-timeout must be positive, got %s", codeRunApprovalTimeout)
+	}
+	return mode, nil
+}
