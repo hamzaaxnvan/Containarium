@@ -32,3 +32,37 @@ func TestToProtoMetricsCarriesEveryField(t *testing.T) {
 		got   int64
 		want  int64
 	}{
+		{"CpuUsageSeconds", got.CpuUsageSeconds, 1234},
+		{"MemoryUsageBytes", got.MemoryUsageBytes, 2048},
+		{"MemoryPeakBytes", got.MemoryPeakBytes, 4096},
+		{"DiskUsageBytes", got.DiskUsageBytes, 8192},
+		{"NetworkRxBytes", got.NetworkRxBytes, 16},
+		{"NetworkTxBytes", got.NetworkTxBytes, 32},
+		{"CpuNrPeriods", got.CpuNrPeriods, 40031},
+		{"CpuNrThrottled", got.CpuNrThrottled, 12847},
+		{"CpuThrottledUsec", got.CpuThrottledUsec, 98765432},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.field, c.got, c.want)
+		}
+	}
+	if got.Name != "alice-container" {
+		t.Errorf("Name = %q, want %q", got.Name, "alice-container")
+	}
+	if got.ProcessCount != 7 {
+		t.Errorf("ProcessCount = %d, want 7", got.ProcessCount)
+	}
+}
+
+// A box whose runtime reports no throttling signal must come back as zeros
+// rather than inventing a value — the MCP layer renders that as
+// "not reported", which is a different claim from "not throttled".
+func TestToProtoMetricsLeavesUnreportedThrottlingAtZero(t *testing.T) {
+	got := toProtoMetrics(&incus.ContainerMetrics{Name: "bob-container", CPUUsageSeconds: 5})
+
+	if got.CpuNrPeriods != 0 || got.CpuNrThrottled != 0 || got.CpuThrottledUsec != 0 {
+		t.Errorf("unreported throttling should stay zero, got periods %d, throttled %d, usec %d",
+			got.CpuNrPeriods, got.CpuNrThrottled, got.CpuThrottledUsec)
+	}
+}
