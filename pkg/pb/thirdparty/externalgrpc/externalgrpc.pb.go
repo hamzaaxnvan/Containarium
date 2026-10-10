@@ -1069,3 +1069,1074 @@ func (x *NodeGroupIncreaseSizeRequest) ProtoReflect() protoreflect.Message {
 		return ms
 	}
 	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupIncreaseSizeRequest.ProtoReflect.Descriptor instead.
+func (*NodeGroupIncreaseSizeRequest) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *NodeGroupIncreaseSizeRequest) GetDelta() int32 {
+	if x != nil {
+		return x.Delta
+	}
+	return 0
+}
+
+func (x *NodeGroupIncreaseSizeRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type NodeGroupIncreaseSizeResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupIncreaseSizeResponse) Reset() {
+	*x = NodeGroupIncreaseSizeResponse{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupIncreaseSizeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupIncreaseSizeResponse) ProtoMessage() {}
+
+func (x *NodeGroupIncreaseSizeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupIncreaseSizeResponse.ProtoReflect.Descriptor instead.
+func (*NodeGroupIncreaseSizeResponse) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{21}
+}
+
+type NodeGroupDeleteNodesRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// List of nodes to delete.
+	Nodes []*ExternalGrpcNode `protobuf:"bytes,1,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	// ID of the node group for the request.
+	Id            string `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupDeleteNodesRequest) Reset() {
+	*x = NodeGroupDeleteNodesRequest{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupDeleteNodesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupDeleteNodesRequest) ProtoMessage() {}
+
+func (x *NodeGroupDeleteNodesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupDeleteNodesRequest.ProtoReflect.Descriptor instead.
+func (*NodeGroupDeleteNodesRequest) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *NodeGroupDeleteNodesRequest) GetNodes() []*ExternalGrpcNode {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
+}
+
+func (x *NodeGroupDeleteNodesRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type NodeGroupDeleteNodesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupDeleteNodesResponse) Reset() {
+	*x = NodeGroupDeleteNodesResponse{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupDeleteNodesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupDeleteNodesResponse) ProtoMessage() {}
+
+func (x *NodeGroupDeleteNodesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupDeleteNodesResponse.ProtoReflect.Descriptor instead.
+func (*NodeGroupDeleteNodesResponse) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{23}
+}
+
+type NodeGroupDecreaseTargetSizeRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Number of nodes to delete.
+	Delta int32 `protobuf:"varint,1,opt,name=delta,proto3" json:"delta,omitempty"`
+	// ID of the node group for the request.
+	Id            string `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupDecreaseTargetSizeRequest) Reset() {
+	*x = NodeGroupDecreaseTargetSizeRequest{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupDecreaseTargetSizeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupDecreaseTargetSizeRequest) ProtoMessage() {}
+
+func (x *NodeGroupDecreaseTargetSizeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupDecreaseTargetSizeRequest.ProtoReflect.Descriptor instead.
+func (*NodeGroupDecreaseTargetSizeRequest) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *NodeGroupDecreaseTargetSizeRequest) GetDelta() int32 {
+	if x != nil {
+		return x.Delta
+	}
+	return 0
+}
+
+func (x *NodeGroupDecreaseTargetSizeRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type NodeGroupDecreaseTargetSizeResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupDecreaseTargetSizeResponse) Reset() {
+	*x = NodeGroupDecreaseTargetSizeResponse{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupDecreaseTargetSizeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupDecreaseTargetSizeResponse) ProtoMessage() {}
+
+func (x *NodeGroupDecreaseTargetSizeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupDecreaseTargetSizeResponse.ProtoReflect.Descriptor instead.
+func (*NodeGroupDecreaseTargetSizeResponse) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{25}
+}
+
+type NodeGroupNodesRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// ID of the node group for the request.
+	Id            string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupNodesRequest) Reset() {
+	*x = NodeGroupNodesRequest{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupNodesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupNodesRequest) ProtoMessage() {}
+
+func (x *NodeGroupNodesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupNodesRequest.ProtoReflect.Descriptor instead.
+func (*NodeGroupNodesRequest) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *NodeGroupNodesRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type NodeGroupNodesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// list of cloud provider instances in a node group.
+	Instances     []*Instance `protobuf:"bytes,1,rep,name=instances,proto3" json:"instances,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupNodesResponse) Reset() {
+	*x = NodeGroupNodesResponse{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupNodesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupNodesResponse) ProtoMessage() {}
+
+func (x *NodeGroupNodesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupNodesResponse.ProtoReflect.Descriptor instead.
+func (*NodeGroupNodesResponse) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *NodeGroupNodesResponse) GetInstances() []*Instance {
+	if x != nil {
+		return x.Instances
+	}
+	return nil
+}
+
+type Instance struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Id of the instance.
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Status of the node.
+	Status        *InstanceStatus `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Instance) Reset() {
+	*x = Instance{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Instance) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Instance) ProtoMessage() {}
+
+func (x *Instance) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Instance.ProtoReflect.Descriptor instead.
+func (*Instance) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *Instance) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *Instance) GetStatus() *InstanceStatus {
+	if x != nil {
+		return x.Status
+	}
+	return nil
+}
+
+// InstanceStatus represents the instance status.
+type InstanceStatus struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// InstanceState tells if the instance is running, being created or being deleted.
+	InstanceState InstanceStatus_InstanceState `protobuf:"varint,1,opt,name=instanceState,proto3,enum=clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceStatus_InstanceState" json:"instanceState,omitempty"`
+	// ErrorInfo provides information about the error status.
+	// If there is no error condition related to instance, then errorInfo.errorCode should be an empty string.
+	ErrorInfo     *InstanceErrorInfo `protobuf:"bytes,2,opt,name=errorInfo,proto3" json:"errorInfo,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstanceStatus) Reset() {
+	*x = InstanceStatus{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstanceStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstanceStatus) ProtoMessage() {}
+
+func (x *InstanceStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstanceStatus.ProtoReflect.Descriptor instead.
+func (*InstanceStatus) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *InstanceStatus) GetInstanceState() InstanceStatus_InstanceState {
+	if x != nil {
+		return x.InstanceState
+	}
+	return InstanceStatus_unspecified
+}
+
+func (x *InstanceStatus) GetErrorInfo() *InstanceErrorInfo {
+	if x != nil {
+		return x.ErrorInfo
+	}
+	return nil
+}
+
+// InstanceErrorInfo provides information about error condition on instance.
+type InstanceErrorInfo struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// ErrorCode is cloud-provider specific error code for error condition.
+	// An empty string for errorCode means there is no errorInfo for the instance (nil).
+	ErrorCode string `protobuf:"bytes,1,opt,name=errorCode,proto3" json:"errorCode,omitempty"`
+	// ErrorMessage is the human readable description of error condition.
+	ErrorMessage string `protobuf:"bytes,2,opt,name=errorMessage,proto3" json:"errorMessage,omitempty"`
+	// InstanceErrorClass defines the class of error condition.
+	InstanceErrorClass int32 `protobuf:"varint,3,opt,name=instanceErrorClass,proto3" json:"instanceErrorClass,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *InstanceErrorInfo) Reset() {
+	*x = InstanceErrorInfo{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstanceErrorInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstanceErrorInfo) ProtoMessage() {}
+
+func (x *InstanceErrorInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstanceErrorInfo.ProtoReflect.Descriptor instead.
+func (*InstanceErrorInfo) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *InstanceErrorInfo) GetErrorCode() string {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ""
+}
+
+func (x *InstanceErrorInfo) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *InstanceErrorInfo) GetInstanceErrorClass() int32 {
+	if x != nil {
+		return x.InstanceErrorClass
+	}
+	return 0
+}
+
+type NodeGroupTemplateNodeInfoRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// ID of the node group for the request.
+	Id            string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupTemplateNodeInfoRequest) Reset() {
+	*x = NodeGroupTemplateNodeInfoRequest{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupTemplateNodeInfoRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupTemplateNodeInfoRequest) ProtoMessage() {}
+
+func (x *NodeGroupTemplateNodeInfoRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupTemplateNodeInfoRequest.ProtoReflect.Descriptor instead.
+func (*NodeGroupTemplateNodeInfoRequest) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *NodeGroupTemplateNodeInfoRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type NodeGroupTemplateNodeInfoResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// nodeInfo is the extracted data from the cloud provider, as a primitive Kubernetes Node type.
+	NodeInfo      *v11.Node `protobuf:"bytes,1,opt,name=nodeInfo,proto3" json:"nodeInfo,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupTemplateNodeInfoResponse) Reset() {
+	*x = NodeGroupTemplateNodeInfoResponse{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupTemplateNodeInfoResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupTemplateNodeInfoResponse) ProtoMessage() {}
+
+func (x *NodeGroupTemplateNodeInfoResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupTemplateNodeInfoResponse.ProtoReflect.Descriptor instead.
+func (*NodeGroupTemplateNodeInfoResponse) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *NodeGroupTemplateNodeInfoResponse) GetNodeInfo() *v11.Node {
+	if x != nil {
+		return x.NodeInfo
+	}
+	return nil
+}
+
+type NodeGroupAutoscalingOptions struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// ScaleDownUtilizationThreshold sets threshold for nodes to be considered for scale down
+	// if cpu or memory utilization is over threshold.
+	ScaleDownUtilizationThreshold float64 `protobuf:"fixed64,1,opt,name=scaleDownUtilizationThreshold,proto3" json:"scaleDownUtilizationThreshold,omitempty"`
+	// ScaleDownGpuUtilizationThreshold sets threshold for gpu nodes to be
+	// considered for scale down if gpu utilization is over threshold.
+	ScaleDownGpuUtilizationThreshold float64 `protobuf:"fixed64,2,opt,name=scaleDownGpuUtilizationThreshold,proto3" json:"scaleDownGpuUtilizationThreshold,omitempty"`
+	// ScaleDownUnneededTime sets the duration CA expects a node to be
+	// unneeded/eligible for removal before scaling down the node.
+	ScaleDownUnneededTime *v1.Duration `protobuf:"bytes,3,opt,name=scaleDownUnneededTime,proto3" json:"scaleDownUnneededTime,omitempty"`
+	// ScaleDownUnreadyTime represents how long an unready node should be
+	// unneeded before it is eligible for scale down.
+	ScaleDownUnreadyTime *v1.Duration `protobuf:"bytes,4,opt,name=scaleDownUnreadyTime,proto3" json:"scaleDownUnreadyTime,omitempty"`
+	// MaxNodeProvisionTime time CA waits for node to be provisioned
+	MaxNodeProvisionTime *v1.Duration `protobuf:"bytes,5,opt,name=MaxNodeProvisionTime,proto3" json:"MaxNodeProvisionTime,omitempty"`
+	// ZeroOrMaxNodeScaling means that a node group should be scaled up to maximum size or down to zero nodes all at once instead of one-by-one.
+	ZeroOrMaxNodeScaling bool `protobuf:"varint,6,opt,name=zeroOrMaxNodeScaling,proto3" json:"zeroOrMaxNodeScaling,omitempty"`
+	// IgnoreDaemonSetsUtilization sets if daemonsets utilization should be considered during node scale-down
+	IgnoreDaemonSetsUtilization bool `protobuf:"varint,7,opt,name=ignoreDaemonSetsUtilization,proto3" json:"ignoreDaemonSetsUtilization,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
+}
+
+func (x *NodeGroupAutoscalingOptions) Reset() {
+	*x = NodeGroupAutoscalingOptions{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupAutoscalingOptions) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupAutoscalingOptions) ProtoMessage() {}
+
+func (x *NodeGroupAutoscalingOptions) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupAutoscalingOptions.ProtoReflect.Descriptor instead.
+func (*NodeGroupAutoscalingOptions) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *NodeGroupAutoscalingOptions) GetScaleDownUtilizationThreshold() float64 {
+	if x != nil {
+		return x.ScaleDownUtilizationThreshold
+	}
+	return 0
+}
+
+func (x *NodeGroupAutoscalingOptions) GetScaleDownGpuUtilizationThreshold() float64 {
+	if x != nil {
+		return x.ScaleDownGpuUtilizationThreshold
+	}
+	return 0
+}
+
+func (x *NodeGroupAutoscalingOptions) GetScaleDownUnneededTime() *v1.Duration {
+	if x != nil {
+		return x.ScaleDownUnneededTime
+	}
+	return nil
+}
+
+func (x *NodeGroupAutoscalingOptions) GetScaleDownUnreadyTime() *v1.Duration {
+	if x != nil {
+		return x.ScaleDownUnreadyTime
+	}
+	return nil
+}
+
+func (x *NodeGroupAutoscalingOptions) GetMaxNodeProvisionTime() *v1.Duration {
+	if x != nil {
+		return x.MaxNodeProvisionTime
+	}
+	return nil
+}
+
+func (x *NodeGroupAutoscalingOptions) GetZeroOrMaxNodeScaling() bool {
+	if x != nil {
+		return x.ZeroOrMaxNodeScaling
+	}
+	return false
+}
+
+func (x *NodeGroupAutoscalingOptions) GetIgnoreDaemonSetsUtilization() bool {
+	if x != nil {
+		return x.IgnoreDaemonSetsUtilization
+	}
+	return false
+}
+
+type NodeGroupAutoscalingOptionsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// ID of the node group for the request.
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// default node group autoscaling options.
+	Defaults      *NodeGroupAutoscalingOptions `protobuf:"bytes,2,opt,name=defaults,proto3" json:"defaults,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NodeGroupAutoscalingOptionsRequest) Reset() {
+	*x = NodeGroupAutoscalingOptionsRequest{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupAutoscalingOptionsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupAutoscalingOptionsRequest) ProtoMessage() {}
+
+func (x *NodeGroupAutoscalingOptionsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupAutoscalingOptionsRequest.ProtoReflect.Descriptor instead.
+func (*NodeGroupAutoscalingOptionsRequest) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *NodeGroupAutoscalingOptionsRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *NodeGroupAutoscalingOptionsRequest) GetDefaults() *NodeGroupAutoscalingOptions {
+	if x != nil {
+		return x.Defaults
+	}
+	return nil
+}
+
+type NodeGroupAutoscalingOptionsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// autoscaling options for the requested node.
+	NodeGroupAutoscalingOptions *NodeGroupAutoscalingOptions `protobuf:"bytes,1,opt,name=nodeGroupAutoscalingOptions,proto3" json:"nodeGroupAutoscalingOptions,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
+}
+
+func (x *NodeGroupAutoscalingOptionsResponse) Reset() {
+	*x = NodeGroupAutoscalingOptionsResponse{}
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeGroupAutoscalingOptionsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeGroupAutoscalingOptionsResponse) ProtoMessage() {}
+
+func (x *NodeGroupAutoscalingOptionsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_externalgrpc_externalgrpc_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeGroupAutoscalingOptionsResponse.ProtoReflect.Descriptor instead.
+func (*NodeGroupAutoscalingOptionsResponse) Descriptor() ([]byte, []int) {
+	return file_externalgrpc_externalgrpc_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *NodeGroupAutoscalingOptionsResponse) GetNodeGroupAutoscalingOptions() *NodeGroupAutoscalingOptions {
+	if x != nil {
+		return x.NodeGroupAutoscalingOptions
+	}
+	return nil
+}
+
+var File_externalgrpc_externalgrpc_proto protoreflect.FileDescriptor
+
+const file_externalgrpc_externalgrpc_proto_rawDesc = "" +
+	"\n" +
+	"\x1fexternalgrpc/externalgrpc.proto\x12/clusterautoscaler.cloudprovider.v1.externalgrpc\x1a\x19google/protobuf/any.proto\x1a google/protobuf/descriptor.proto\x1a\"k8s.io/api/core/v1/generated.proto\x1a4k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto\"e\n" +
+	"\tNodeGroup\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
+	"\aminSize\x18\x02 \x01(\x05R\aminSize\x12\x18\n" +
+	"\amaxSize\x18\x03 \x01(\x05R\amaxSize\x12\x14\n" +
+	"\x05debug\x18\x04 \x01(\tR\x05debug\"\x9e\x03\n" +
+	"\x10ExternalGrpcNode\x12\x1e\n" +
+	"\n" +
+	"providerID\x18\x01 \x01(\tR\n" +
+	"providerID\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12e\n" +
+	"\x06labels\x18\x03 \x03(\v2M.clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode.LabelsEntryR\x06labels\x12t\n" +
+	"\vannotations\x18\x04 \x03(\v2R.clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode.AnnotationsEntryR\vannotations\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a>\n" +
+	"\x10AnnotationsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x13\n" +
+	"\x11NodeGroupsRequest\"p\n" +
+	"\x12NodeGroupsResponse\x12Z\n" +
+	"\n" +
+	"nodeGroups\x18\x01 \x03(\v2:.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupR\n" +
+	"nodeGroups\"p\n" +
+	"\x17NodeGroupForNodeRequest\x12U\n" +
+	"\x04node\x18\x01 \x01(\v2A.clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNodeR\x04node\"t\n" +
+	"\x18NodeGroupForNodeResponse\x12X\n" +
+	"\tnodeGroup\x18\x01 \x01(\v2:.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupR\tnodeGroup\"\x80\x02\n" +
+	"\x17PricingNodePriceRequest\x12U\n" +
+	"\x04node\x18\x01 \x01(\v2A.clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNodeR\x04node\x12H\n" +
+	"\tstartTime\x18\x02 \x01(\v2*.k8s.io.apimachinery.pkg.apis.meta.v1.TimeR\tstartTime\x12D\n" +
+	"\aendTime\x18\x03 \x01(\v2*.k8s.io.apimachinery.pkg.apis.meta.v1.TimeR\aendTime\"0\n" +
+	"\x18PricingNodePriceResponse\x12\x14\n" +
+	"\x05price\x18\x01 \x01(\x01R\x05price\"\xd3\x01\n" +
+	"\x16PricingPodPriceRequest\x12)\n" +
+	"\x03pod\x18\x01 \x01(\v2\x17.k8s.io.api.core.v1.PodR\x03pod\x12H\n" +
+	"\tstartTime\x18\x02 \x01(\v2*.k8s.io.apimachinery.pkg.apis.meta.v1.TimeR\tstartTime\x12D\n" +
+	"\aendTime\x18\x03 \x01(\v2*.k8s.io.apimachinery.pkg.apis.meta.v1.TimeR\aendTime\"/\n" +
+	"\x17PricingPodPriceResponse\x12\x14\n" +
+	"\x05price\x18\x01 \x01(\x01R\x05price\"\x11\n" +
+	"\x0fGPULabelRequest\"(\n" +
+	"\x10GPULabelResponse\x12\x14\n" +
+	"\x05label\x18\x01 \x01(\tR\x05label\"\x1d\n" +
+	"\x1bGetAvailableGPUTypesRequest\"\xea\x01\n" +
+	"\x1cGetAvailableGPUTypesResponse\x12w\n" +
+	"\bgpuTypes\x18\x01 \x03(\v2[.clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesResponse.GpuTypesEntryR\bgpuTypes\x1aQ\n" +
+	"\rGpuTypesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
+	"\x05value\x18\x02 \x01(\v2\x14.google.protobuf.AnyR\x05value:\x028\x01\"\x10\n" +
+	"\x0eCleanupRequest\"\x11\n" +
+	"\x0fCleanupResponse\"\x10\n" +
+	"\x0eRefreshRequest\"\x11\n" +
+	"\x0fRefreshResponse\",\n" +
+	"\x1aNodeGroupTargetSizeRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"=\n" +
+	"\x1bNodeGroupTargetSizeResponse\x12\x1e\n" +
+	"\n" +
+	"targetSize\x18\x01 \x01(\x05R\n" +
+	"targetSize\"D\n" +
+	"\x1cNodeGroupIncreaseSizeRequest\x12\x14\n" +
+	"\x05delta\x18\x01 \x01(\x05R\x05delta\x12\x0e\n" +
+	"\x02id\x18\x02 \x01(\tR\x02id\"\x1f\n" +
+	"\x1dNodeGroupIncreaseSizeResponse\"\x86\x01\n" +
+	"\x1bNodeGroupDeleteNodesRequest\x12W\n" +
+	"\x05nodes\x18\x01 \x03(\v2A.clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNodeR\x05nodes\x12\x0e\n" +
+	"\x02id\x18\x02 \x01(\tR\x02id\"\x1e\n" +
+	"\x1cNodeGroupDeleteNodesResponse\"J\n" +
+	"\"NodeGroupDecreaseTargetSizeRequest\x12\x14\n" +
+	"\x05delta\x18\x01 \x01(\x05R\x05delta\x12\x0e\n" +
+	"\x02id\x18\x02 \x01(\tR\x02id\"%\n" +
+	"#NodeGroupDecreaseTargetSizeResponse\"'\n" +
+	"\x15NodeGroupNodesRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"q\n" +
+	"\x16NodeGroupNodesResponse\x12W\n" +
+	"\tinstances\x18\x01 \x03(\v29.clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceR\tinstances\"s\n" +
+	"\bInstance\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12W\n" +
+	"\x06status\x18\x02 \x01(\v2?.clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceStatusR\x06status\"\xca\x02\n" +
+	"\x0eInstanceStatus\x12s\n" +
+	"\rinstanceState\x18\x01 \x01(\x0e2M.clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceStatus.InstanceStateR\rinstanceState\x12`\n" +
+	"\terrorInfo\x18\x02 \x01(\v2B.clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceErrorInfoR\terrorInfo\"a\n" +
+	"\rInstanceState\x12\x0f\n" +
+	"\vunspecified\x10\x00\x12\x13\n" +
+	"\x0finstanceRunning\x10\x01\x12\x14\n" +
+	"\x10instanceCreating\x10\x02\x12\x14\n" +
+	"\x10instanceDeleting\x10\x03\"\x85\x01\n" +
+	"\x11InstanceErrorInfo\x12\x1c\n" +
+	"\terrorCode\x18\x01 \x01(\tR\terrorCode\x12\"\n" +
+	"\ferrorMessage\x18\x02 \x01(\tR\ferrorMessage\x12.\n" +
+	"\x12instanceErrorClass\x18\x03 \x01(\x05R\x12instanceErrorClass\"2\n" +
+	" NodeGroupTemplateNodeInfoRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"Y\n" +
+	"!NodeGroupTemplateNodeInfoResponse\x124\n" +
+	"\bnodeInfo\x18\x01 \x01(\v2\x18.k8s.io.api.core.v1.NodeR\bnodeInfo\"\xd3\x04\n" +
+	"\x1bNodeGroupAutoscalingOptions\x12D\n" +
+	"\x1dscaleDownUtilizationThreshold\x18\x01 \x01(\x01R\x1dscaleDownUtilizationThreshold\x12J\n" +
+	" scaleDownGpuUtilizationThreshold\x18\x02 \x01(\x01R scaleDownGpuUtilizationThreshold\x12d\n" +
+	"\x15scaleDownUnneededTime\x18\x03 \x01(\v2..k8s.io.apimachinery.pkg.apis.meta.v1.DurationR\x15scaleDownUnneededTime\x12b\n" +
+	"\x14scaleDownUnreadyTime\x18\x04 \x01(\v2..k8s.io.apimachinery.pkg.apis.meta.v1.DurationR\x14scaleDownUnreadyTime\x12b\n" +
+	"\x14MaxNodeProvisionTime\x18\x05 \x01(\v2..k8s.io.apimachinery.pkg.apis.meta.v1.DurationR\x14MaxNodeProvisionTime\x122\n" +
+	"\x14zeroOrMaxNodeScaling\x18\x06 \x01(\bR\x14zeroOrMaxNodeScaling\x12@\n" +
+	"\x1bignoreDaemonSetsUtilization\x18\a \x01(\bR\x1bignoreDaemonSetsUtilization\"\x9e\x01\n" +
+	"\"NodeGroupAutoscalingOptionsRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12h\n" +
+	"\bdefaults\x18\x02 \x01(\v2L.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsR\bdefaults\"\xb6\x01\n" +
+	"#NodeGroupAutoscalingOptionsResponse\x12\x8e\x01\n" +
+	"\x1bnodeGroupAutoscalingOptions\x18\x01 \x01(\v2L.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsR\x1bnodeGroupAutoscalingOptions2\xbf\x14\n" +
+	"\rCloudProvider\x12\x97\x01\n" +
+	"\n" +
+	"NodeGroups\x12B.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupsRequest\x1aC.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupsResponse\"\x00\x12\xa9\x01\n" +
+	"\x10NodeGroupForNode\x12H.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupForNodeRequest\x1aI.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupForNodeResponse\"\x00\x12\xa9\x01\n" +
+	"\x10PricingNodePrice\x12H.clusterautoscaler.cloudprovider.v1.externalgrpc.PricingNodePriceRequest\x1aI.clusterautoscaler.cloudprovider.v1.externalgrpc.PricingNodePriceResponse\"\x00\x12\xa6\x01\n" +
+	"\x0fPricingPodPrice\x12G.clusterautoscaler.cloudprovider.v1.externalgrpc.PricingPodPriceRequest\x1aH.clusterautoscaler.cloudprovider.v1.externalgrpc.PricingPodPriceResponse\"\x00\x12\x91\x01\n" +
+	"\bGPULabel\x12@.clusterautoscaler.cloudprovider.v1.externalgrpc.GPULabelRequest\x1aA.clusterautoscaler.cloudprovider.v1.externalgrpc.GPULabelResponse\"\x00\x12\xb5\x01\n" +
+	"\x14GetAvailableGPUTypes\x12L.clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesRequest\x1aM.clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesResponse\"\x00\x12\x8e\x01\n" +
+	"\aCleanup\x12?.clusterautoscaler.cloudprovider.v1.externalgrpc.CleanupRequest\x1a@.clusterautoscaler.cloudprovider.v1.externalgrpc.CleanupResponse\"\x00\x12\x8e\x01\n" +
+	"\aRefresh\x12?.clusterautoscaler.cloudprovider.v1.externalgrpc.RefreshRequest\x1a@.clusterautoscaler.cloudprovider.v1.externalgrpc.RefreshResponse\"\x00\x12\xb2\x01\n" +
+	"\x13NodeGroupTargetSize\x12K.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTargetSizeRequest\x1aL.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTargetSizeResponse\"\x00\x12\xb8\x01\n" +
+	"\x15NodeGroupIncreaseSize\x12M.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupIncreaseSizeRequest\x1aN.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupIncreaseSizeResponse\"\x00\x12\xb5\x01\n" +
+	"\x14NodeGroupDeleteNodes\x12L.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDeleteNodesRequest\x1aM.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDeleteNodesResponse\"\x00\x12\xca\x01\n" +
+	"\x1bNodeGroupDecreaseTargetSize\x12S.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDecreaseTargetSizeRequest\x1aT.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDecreaseTargetSizeResponse\"\x00\x12\xa3\x01\n" +
+	"\x0eNodeGroupNodes\x12F.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupNodesRequest\x1aG.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupNodesResponse\"\x00\x12\xc4\x01\n" +
+	"\x19NodeGroupTemplateNodeInfo\x12Q.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTemplateNodeInfoRequest\x1aR.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTemplateNodeInfoResponse\"\x00\x12\xc2\x01\n" +
+	"\x13NodeGroupGetOptions\x12S.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsRequest\x1aT.clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsResponse\"\x00B\xec\x02\n" +
+	"3com.clusterautoscaler.cloudprovider.v1.externalgrpcB\x11ExternalgrpcProtoP\x01ZBgithub.com/footprintai/containarium/pkg/pb/thirdparty/externalgrpc\xa2\x02\x04CCVE\xaa\x02/Clusterautoscaler.Cloudprovider.V1.Externalgrpc\xca\x02/Clusterautoscaler\\Cloudprovider\\V1\\Externalgrpc\xe2\x02;Clusterautoscaler\\Cloudprovider\\V1\\Externalgrpc\\GPBMetadata\xea\x022Clusterautoscaler::Cloudprovider::V1::Externalgrpcb\x06proto3"
+
+var (
+	file_externalgrpc_externalgrpc_proto_rawDescOnce sync.Once
+	file_externalgrpc_externalgrpc_proto_rawDescData []byte
+)
+
+func file_externalgrpc_externalgrpc_proto_rawDescGZIP() []byte {
+	file_externalgrpc_externalgrpc_proto_rawDescOnce.Do(func() {
+		file_externalgrpc_externalgrpc_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_externalgrpc_externalgrpc_proto_rawDesc), len(file_externalgrpc_externalgrpc_proto_rawDesc)))
+	})
+	return file_externalgrpc_externalgrpc_proto_rawDescData
+}
+
+var file_externalgrpc_externalgrpc_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_externalgrpc_externalgrpc_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_externalgrpc_externalgrpc_proto_goTypes = []any{
+	(InstanceStatus_InstanceState)(0),           // 0: clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceStatus.InstanceState
+	(*NodeGroup)(nil),                           // 1: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroup
+	(*ExternalGrpcNode)(nil),                    // 2: clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode
+	(*NodeGroupsRequest)(nil),                   // 3: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupsRequest
+	(*NodeGroupsResponse)(nil),                  // 4: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupsResponse
+	(*NodeGroupForNodeRequest)(nil),             // 5: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupForNodeRequest
+	(*NodeGroupForNodeResponse)(nil),            // 6: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupForNodeResponse
+	(*PricingNodePriceRequest)(nil),             // 7: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingNodePriceRequest
+	(*PricingNodePriceResponse)(nil),            // 8: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingNodePriceResponse
+	(*PricingPodPriceRequest)(nil),              // 9: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingPodPriceRequest
+	(*PricingPodPriceResponse)(nil),             // 10: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingPodPriceResponse
+	(*GPULabelRequest)(nil),                     // 11: clusterautoscaler.cloudprovider.v1.externalgrpc.GPULabelRequest
+	(*GPULabelResponse)(nil),                    // 12: clusterautoscaler.cloudprovider.v1.externalgrpc.GPULabelResponse
+	(*GetAvailableGPUTypesRequest)(nil),         // 13: clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesRequest
+	(*GetAvailableGPUTypesResponse)(nil),        // 14: clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesResponse
+	(*CleanupRequest)(nil),                      // 15: clusterautoscaler.cloudprovider.v1.externalgrpc.CleanupRequest
+	(*CleanupResponse)(nil),                     // 16: clusterautoscaler.cloudprovider.v1.externalgrpc.CleanupResponse
+	(*RefreshRequest)(nil),                      // 17: clusterautoscaler.cloudprovider.v1.externalgrpc.RefreshRequest
+	(*RefreshResponse)(nil),                     // 18: clusterautoscaler.cloudprovider.v1.externalgrpc.RefreshResponse
+	(*NodeGroupTargetSizeRequest)(nil),          // 19: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTargetSizeRequest
+	(*NodeGroupTargetSizeResponse)(nil),         // 20: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTargetSizeResponse
+	(*NodeGroupIncreaseSizeRequest)(nil),        // 21: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupIncreaseSizeRequest
+	(*NodeGroupIncreaseSizeResponse)(nil),       // 22: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupIncreaseSizeResponse
+	(*NodeGroupDeleteNodesRequest)(nil),         // 23: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDeleteNodesRequest
+	(*NodeGroupDeleteNodesResponse)(nil),        // 24: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDeleteNodesResponse
+	(*NodeGroupDecreaseTargetSizeRequest)(nil),  // 25: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDecreaseTargetSizeRequest
+	(*NodeGroupDecreaseTargetSizeResponse)(nil), // 26: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDecreaseTargetSizeResponse
+	(*NodeGroupNodesRequest)(nil),               // 27: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupNodesRequest
+	(*NodeGroupNodesResponse)(nil),              // 28: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupNodesResponse
+	(*Instance)(nil),                            // 29: clusterautoscaler.cloudprovider.v1.externalgrpc.Instance
+	(*InstanceStatus)(nil),                      // 30: clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceStatus
+	(*InstanceErrorInfo)(nil),                   // 31: clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceErrorInfo
+	(*NodeGroupTemplateNodeInfoRequest)(nil),    // 32: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTemplateNodeInfoRequest
+	(*NodeGroupTemplateNodeInfoResponse)(nil),   // 33: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTemplateNodeInfoResponse
+	(*NodeGroupAutoscalingOptions)(nil),         // 34: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptions
+	(*NodeGroupAutoscalingOptionsRequest)(nil),  // 35: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsRequest
+	(*NodeGroupAutoscalingOptionsResponse)(nil), // 36: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsResponse
+	nil,                 // 37: clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode.LabelsEntry
+	nil,                 // 38: clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode.AnnotationsEntry
+	nil,                 // 39: clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesResponse.GpuTypesEntry
+	(*v1.Time)(nil),     // 40: k8s.io.apimachinery.pkg.apis.meta.v1.Time
+	(*v11.Pod)(nil),     // 41: k8s.io.api.core.v1.Pod
+	(*v11.Node)(nil),    // 42: k8s.io.api.core.v1.Node
+	(*v1.Duration)(nil), // 43: k8s.io.apimachinery.pkg.apis.meta.v1.Duration
+	(*anypb.Any)(nil),   // 44: google.protobuf.Any
+}
+var file_externalgrpc_externalgrpc_proto_depIdxs = []int32{
+	37, // 0: clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode.labels:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode.LabelsEntry
+	38, // 1: clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode.annotations:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode.AnnotationsEntry
+	1,  // 2: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupsResponse.nodeGroups:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroup
+	2,  // 3: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupForNodeRequest.node:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode
+	1,  // 4: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupForNodeResponse.nodeGroup:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroup
+	2,  // 5: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingNodePriceRequest.node:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode
+	40, // 6: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingNodePriceRequest.startTime:type_name -> k8s.io.apimachinery.pkg.apis.meta.v1.Time
+	40, // 7: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingNodePriceRequest.endTime:type_name -> k8s.io.apimachinery.pkg.apis.meta.v1.Time
+	41, // 8: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingPodPriceRequest.pod:type_name -> k8s.io.api.core.v1.Pod
+	40, // 9: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingPodPriceRequest.startTime:type_name -> k8s.io.apimachinery.pkg.apis.meta.v1.Time
+	40, // 10: clusterautoscaler.cloudprovider.v1.externalgrpc.PricingPodPriceRequest.endTime:type_name -> k8s.io.apimachinery.pkg.apis.meta.v1.Time
+	39, // 11: clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesResponse.gpuTypes:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesResponse.GpuTypesEntry
+	2,  // 12: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDeleteNodesRequest.nodes:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.ExternalGrpcNode
+	29, // 13: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupNodesResponse.instances:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.Instance
+	30, // 14: clusterautoscaler.cloudprovider.v1.externalgrpc.Instance.status:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceStatus
+	0,  // 15: clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceStatus.instanceState:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceStatus.InstanceState
+	31, // 16: clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceStatus.errorInfo:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.InstanceErrorInfo
+	42, // 17: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTemplateNodeInfoResponse.nodeInfo:type_name -> k8s.io.api.core.v1.Node
+	43, // 18: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptions.scaleDownUnneededTime:type_name -> k8s.io.apimachinery.pkg.apis.meta.v1.Duration
+	43, // 19: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptions.scaleDownUnreadyTime:type_name -> k8s.io.apimachinery.pkg.apis.meta.v1.Duration
+	43, // 20: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptions.MaxNodeProvisionTime:type_name -> k8s.io.apimachinery.pkg.apis.meta.v1.Duration
+	34, // 21: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsRequest.defaults:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptions
+	34, // 22: clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsResponse.nodeGroupAutoscalingOptions:type_name -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptions
+	44, // 23: clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesResponse.GpuTypesEntry.value:type_name -> google.protobuf.Any
+	3,  // 24: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroups:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupsRequest
+	5,  // 25: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupForNode:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupForNodeRequest
+	7,  // 26: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.PricingNodePrice:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.PricingNodePriceRequest
+	9,  // 27: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.PricingPodPrice:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.PricingPodPriceRequest
+	11, // 28: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.GPULabel:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.GPULabelRequest
+	13, // 29: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.GetAvailableGPUTypes:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesRequest
+	15, // 30: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.Cleanup:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.CleanupRequest
+	17, // 31: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.Refresh:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.RefreshRequest
+	19, // 32: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupTargetSize:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTargetSizeRequest
+	21, // 33: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupIncreaseSize:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupIncreaseSizeRequest
+	23, // 34: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupDeleteNodes:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDeleteNodesRequest
+	25, // 35: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupDecreaseTargetSize:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDecreaseTargetSizeRequest
+	27, // 36: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupNodes:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupNodesRequest
+	32, // 37: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupTemplateNodeInfo:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTemplateNodeInfoRequest
+	35, // 38: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupGetOptions:input_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsRequest
+	4,  // 39: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroups:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupsResponse
+	6,  // 40: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupForNode:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupForNodeResponse
+	8,  // 41: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.PricingNodePrice:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.PricingNodePriceResponse
+	10, // 42: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.PricingPodPrice:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.PricingPodPriceResponse
+	12, // 43: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.GPULabel:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.GPULabelResponse
+	14, // 44: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.GetAvailableGPUTypes:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.GetAvailableGPUTypesResponse
+	16, // 45: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.Cleanup:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.CleanupResponse
+	18, // 46: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.Refresh:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.RefreshResponse
+	20, // 47: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupTargetSize:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTargetSizeResponse
+	22, // 48: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupIncreaseSize:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupIncreaseSizeResponse
+	24, // 49: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupDeleteNodes:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDeleteNodesResponse
+	26, // 50: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupDecreaseTargetSize:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupDecreaseTargetSizeResponse
+	28, // 51: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupNodes:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupNodesResponse
+	33, // 52: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupTemplateNodeInfo:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupTemplateNodeInfoResponse
+	36, // 53: clusterautoscaler.cloudprovider.v1.externalgrpc.CloudProvider.NodeGroupGetOptions:output_type -> clusterautoscaler.cloudprovider.v1.externalgrpc.NodeGroupAutoscalingOptionsResponse
+	39, // [39:54] is the sub-list for method output_type
+	24, // [24:39] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
+}
+
+func init() { file_externalgrpc_externalgrpc_proto_init() }
+func file_externalgrpc_externalgrpc_proto_init() {
+	if File_externalgrpc_externalgrpc_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_externalgrpc_externalgrpc_proto_rawDesc), len(file_externalgrpc_externalgrpc_proto_rawDesc)),
+			NumEnums:      1,
+			NumMessages:   39,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_externalgrpc_externalgrpc_proto_goTypes,
+		DependencyIndexes: file_externalgrpc_externalgrpc_proto_depIdxs,
+		EnumInfos:         file_externalgrpc_externalgrpc_proto_enumTypes,
+		MessageInfos:      file_externalgrpc_externalgrpc_proto_msgTypes,
+	}.Build()
+	File_externalgrpc_externalgrpc_proto = out.File
+	file_externalgrpc_externalgrpc_proto_goTypes = nil
+	file_externalgrpc_externalgrpc_proto_depIdxs = nil
+}
