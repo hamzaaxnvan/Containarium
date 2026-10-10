@@ -58,3 +58,34 @@ func TestGatewayPolicyFromEnv_AnomalyAloneIsEnough(t *testing.T) {
 	if !got.Anomaly.Enabled {
 		t.Error("anomaly not enabled")
 	}
+	if !got.Quota.IsZero() {
+		t.Errorf("quota = %+v, want zero", got.Quota)
+	}
+}
+
+// Garbage must fall back to "not configured" rather than to some accidental
+// number: a typo'd cap that silently becomes 0 would read as unlimited, and one
+// that silently becomes 1 would deny everything.
+func TestGatewayPolicyFromEnv_MalformedValuesAreIgnored(t *testing.T) {
+	t.Setenv(appconfig.EnvGatewayQuotaCalls, "many")
+	t.Setenv(appconfig.EnvGatewayQuotaTokens, "-5")
+	t.Setenv(appconfig.EnvGatewayQuotaWindow, "sometimes")
+	t.Setenv(appconfig.EnvGatewayAnomalyRevokeAt, "yes")
+
+	if got := gatewayPolicyFromEnv(); got != nil {
+		t.Fatalf("malformed values produced a policy: %+v", got)
+	}
+}
+
+func TestGatewayPolicyFromEnv_RevokeAtOptIn(t *testing.T) {
+	t.Setenv(appconfig.EnvGatewayAnomalyEnabled, "1")
+	t.Setenv(appconfig.EnvGatewayAnomalyRevokeAt, "0.95")
+
+	got := gatewayPolicyFromEnv()
+	if got == nil {
+		t.Fatal("no policy")
+	}
+	if got.RevokeAt != 0.95 {
+		t.Errorf("RevokeAt = %v, want 0.95", got.RevokeAt)
+	}
+}
