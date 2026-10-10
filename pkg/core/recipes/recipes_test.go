@@ -369,3 +369,375 @@ func TestMem0Recipe(t *testing.T) {
 	}
 	if r.RequiresGpu {
 		t.Error("mem0 should not require a GPU")
+	}
+	// API on 8000, dashboard on 3000 — the dashboard is optional at deploy but
+	// its route is always declared, so enabling it needs no catalog change.
+	if len(r.Ports) != 2 || r.Ports[0].ContainerPort != 8000 || r.Ports[1].ContainerPort != 3000 {
+		t.Errorf("mem0 should expose 8000 (api) + 3000 (dashboard); got %+v", r.Ports)
+	}
+	// Memories outlive the container: pgdata and the history log sit on the
+	// box volume, not in the image or a podman-managed volume.
+	if len(r.Volumes) != 1 || r.Volumes[0].Path != "/var/lib/mem0" {
+		t.Errorf("mem0 should persist under /var/lib/mem0; got %+v", r.Volumes)
+	}
+	// The gateway keeps the real provider key out of the box and meters mem0's
+	// own LLM/embedding calls per tenant.
+	if r.ModelGatewayProvider != "openai" {
+		t.Errorf("mem0 model_gateway_provider: got %q want openai", r.ModelGatewayProvider)
+	}
+	// postgres_password is the one required parameter — a memory store must
+	// never come up with a default credential.
+	var pw *pb.RecipeParam
+	for _, p := range r.Parameters {
+		if p.Name == "postgres_password" {
+			pw = p
+		}
+	}
+	if pw == nil || !pw.Required || pw.Default != "" {
+		t.Errorf("postgres_password must be required with no default; got %+v", pw)
+	}
+	if pw != nil && pw.Type != "password" {
+		t.Errorf("postgres_password type: got %q want password", pw.Type)
+	}
+	if _, err := ResolveParameters(r, map[string]string{}); err == nil {
+		t.Error("resolving without postgres_password should fail (required)")
+	}
+	// Every secret-bearing parameter must render masked in a UI.
+	for _, name := range []string{"admin_password", "jwt_secret", "openai_api_key"} {
+		for _, p := range r.Parameters {
+			if p.Name == name && p.Type != "password" {
+				t.Errorf("parameter %q type: got %q want password", name, p.Type)
+			}
+		}
+	}
+	joined := strings.Join(r.PostStart, "\n")
+	for _, want := range []string{
+		"--restart=always", // survives box reboot and SSH logout
+		"--env-file",       // literal env semantics, never bash-sourced
+		"MEM0_TELEMETRY=false",
+		"AUTH_DISABLED=false",        // the API is publicly routed; auth stays on
+		"listen_addresses=127.0.0.1", // Postgres never reaches the box's routable iface
+		"alembic upgrade head",       // the image runs no migrations on its own
+		"CONTAINARIUM_MODEL_GATEWAY_URL",
+		"CONTAINARIUM_GATEWAY_TOKEN",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("mem0 post_start missing %q", want)
+		}
+	}
+	// Upstream's CMD is a dev server (uvicorn --reload over a bind-mounted
+	// source tree). The recipe must override it, never inherit it.
+	if strings.Contains(joined, "--reload") {
+		t.Error("mem0 post_start must not run uvicorn --reload (upstream's dev CMD)")
+	}
+	// The arm64-only published image would silently fail to run on an amd64
+	// host; the recipe builds from source instead.
+	if strings.Contains(joined, "mem0/mem0-api-server") {
+		t.Error("mem0 must build from source, not pull the arm64-only published image")
+	}
+	// Regression: upstream's init-db.sh creates mem0_app with psql's \gexec,
+	// which is a META-command — honoured only on stdin (their heredoc). Passed
+	// through `psql -c` it is sent as literal SQL and fails with a syntax
+	// error, which a live deploy caught. Keep the check-then-create form.
+	if strings.Contains(joined, "gexec") {
+		t.Error("mem0 post_start must not use psql \\gexec (a meta-command; invalid via psql -c)")
+	}
+	// Regression: upstream pins the pure-Python `psycopg` but builds on
+	// python:3.12-slim, which has no libpq — the image builds clean and then
+	// crash-loops on "no pq wrapper available". A live deploy caught this.
+	if !strings.Contains(joined, "psycopg[binary]") {
+		t.Error("mem0 build must add psycopg[binary]; upstream's slim base ships no libpq")
+	}
+	// Regression: mem0 validates admin_email with pydantic's EmailStr, which
+	// rejects RFC 6761 special-use domains outright. A default in one of them
+	// 422s at the seeding step and fails the whole deploy.
+	var email *pb.RecipeParam
+	for _, p := range r.Parameters {
+		if p.Name == "admin_email" {
+			email = p
+		}
+	}
+	if email == nil {
+		t.Fatal("mem0 must declare admin_email")
+	}
+	for _, reserved := range []string{".local", ".localhost", ".invalid", ".test", ".example"} {
+		if strings.HasSuffix(email.Default, reserved) {
+			t.Errorf("admin_email default %q uses reserved domain %q; EmailStr rejects it with 422", email.Default, reserved)
+		}
+	}
+}
+
+// coding-agent must ship no credential of any kind: Claude Code comes from
+// Anthropic's unmodified installer, run as the unprivileged box user, and the
+// recipe never sets an auth method, env var, or managed setting.
+func TestCodingAgentRecipe(t *testing.T) {
+	m := New()
+	if err := m.LoadEmbedded(); err != nil {
+		t.Fatalf("LoadEmbedded: %v", err)
+	}
+	r, err := m.Get("coding-agent")
+	if err != nil {
+		t.Fatalf("expected built-in recipe coding-agent: %v", err)
+	}
+	joined := strings.Join(r.PostStart, "\n")
+	for _, want := range []string{
+		"install-agent-runtime.sh",
+		"--no-agent-runtime",
+		"https://claude.ai/install.sh",
+		"runuser -u",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("coding-agent post_start missing %q", want)
+		}
+	}
+	params := map[string]*pb.RecipeParam{}
+	for _, p := range r.Parameters {
+		params[p.Name] = p
+	}
+	for _, name := range []string{"release", "claude_code_version", "bootstrap_url"} {
+		if params[name] == nil {
+			t.Errorf("coding-agent missing parameter %q", name)
+		}
+	}
+	if p := params["release"]; p != nil && !p.Required {
+		t.Error("release must be required")
+	}
+	if p := params["box_user"]; p == nil || p.Default == "" || p.Default == "root" {
+		t.Error("box_user must default to an unprivileged user")
+	}
+	// The installer must never run as root: every claude.ai/install.sh
+	// invocation has to be inside a runuser line.
+	for _, line := range r.PostStart {
+		if strings.Contains(line, "claude.ai/install.sh") && !strings.Contains(line, "runuser -u") {
+			t.Errorf("Claude Code installer not run as the box user: %q", line)
+		}
+	}
+	// Lint: nothing credential- or policy-shaped anywhere in the recipe.
+	text := r.String()
+	for _, banned := range []string{
+		"forceLoginMethod", "forceLoginOrgUUID", "forceLoginGatewayUrl",
+		"ANTHROPIC_", "CLAUDE_CODE_OAUTH_TOKEN", "managed-settings", "/etc/claude-code",
+	} {
+		if strings.Contains(text, banned) {
+			t.Errorf("coding-agent recipe must not contain %q", banned)
+		}
+	}
+}
+
+// TestCodingAgentRecipe_InstallsSDLCSkills (#2065): the recipe installs the
+// pinned SDLC role skills for the box user, with an opt-out, and a release that
+// predates the feature must not fail the whole deploy.
+func TestCodingAgentRecipe_InstallsSDLCSkills(t *testing.T) {
+	m := New()
+	if err := m.LoadEmbedded(); err != nil {
+		t.Fatalf("LoadEmbedded: %v", err)
+	}
+	r, err := m.Get("coding-agent")
+	if err != nil {
+		t.Fatalf("coding-agent: %v", err)
+	}
+
+	var step string
+	for _, line := range r.PostStart {
+		if strings.Contains(line, "install-sdlc-skills.sh") {
+			step = line
+		}
+	}
+	if step == "" {
+		t.Fatal("coding-agent post_start does not run install-sdlc-skills.sh")
+	}
+	if !strings.Contains(step, "runuser -u") {
+		t.Errorf("SDLC skills must be installed AS the box user (they land in its ~/.claude/skills), not root: %q", step)
+	}
+	if !strings.Contains(step, "CONTAINARIUM_PARAM_SDLC_SKILLS") {
+		t.Error("the SDLC skills step does not honour the sdlc_skills opt-out parameter")
+	}
+	if !strings.Contains(step, "has no SDLC skills") {
+		t.Error("a release that predates the skills asset must skip with a message, not fail the deploy")
+	}
+
+	var param *pb.RecipeParam
+	for _, p := range r.Parameters {
+		if p.Name == "sdlc_skills" {
+			param = p
+		}
+	}
+	if param == nil {
+		t.Fatal("coding-agent missing parameter sdlc_skills")
+	}
+	if param.Required {
+		t.Error("sdlc_skills must be optional")
+	}
+	if param.Default != "true" {
+		t.Errorf("sdlc_skills default = %q, want \"true\" (skills on first boot is the point of #2065)", param.Default)
+	}
+}
+
+// TestCodingAgentRecipe_SkillSetsParam (#3048): skill_sets selects set ids, empty
+// defers to the deprecated sdlc_skills alias, and the step hands the installer
+// a SKILL_SETS value.
+func TestCodingAgentRecipe_SkillSetsParam(t *testing.T) {
+	m := New()
+	if err := m.LoadEmbedded(); err != nil {
+		t.Fatalf("LoadEmbedded: %v", err)
+	}
+	r, err := m.Get("coding-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var param *pb.RecipeParam
+	for _, p := range r.Parameters {
+		if p.Name == "skill_sets" {
+			param = p
+		}
+	}
+	if param == nil {
+		t.Fatal("coding-agent missing parameter skill_sets")
+	}
+	if param.Required || param.Default != "" {
+		t.Errorf("skill_sets must be optional with an empty default (empty = fall back to the sdlc_skills alias, then all); got required=%v default=%q", param.Required, param.Default)
+	}
+	for _, p := range r.Parameters {
+		if p.Name == "sdlc_skills" && !strings.Contains(strings.ToLower(p.Description), "deprecated") {
+			t.Errorf("sdlc_skills description must carry the deprecation note: %q", p.Description)
+		}
+	}
+	var step string
+	for _, line := range r.PostStart {
+		if strings.Contains(line, "install-sdlc-skills.sh") {
+			step = line
+		}
+	}
+	for _, want := range []string{"CONTAINARIUM_PARAM_SKILL_SETS", `SKILL_SETS="$SETS"`, "predates skill sets"} {
+		if !strings.Contains(step, want) {
+			t.Errorf("the SDLC skills step lacks %q", want)
+		}
+	}
+}
+
+// TestCodingAgentRecipe_SkillSetsResolution runs the step's selection logic:
+// skill_sets wins; otherwise sdlc_skills=false means none and anything else all.
+func TestCodingAgentRecipe_SkillSetsResolution(t *testing.T) {
+	m := New()
+	if err := m.LoadEmbedded(); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := m.Get("coding-agent")
+	var step string
+	for _, line := range r.PostStart {
+		if strings.Contains(line, "install-sdlc-skills.sh") {
+			step = line
+		}
+	}
+	// Everything up to the runuser line is the selection logic.
+	logic := step[:strings.Index(step, "runuser")]
+	start := strings.Index(logic, `SETS="${CONTAINARIUM_PARAM_SKILL_SETS`)
+	if start < 0 {
+		t.Fatal("the SDLC skills step does not resolve SETS from skill_sets")
+	}
+	logic = logic[start:]
+	for _, tc := range []struct{ skillSets, alias, want string }{
+		{"", "true", "all"}, {"", "", "all"}, {"", "false", "none"},
+		{"qa", "true", "qa"}, {"qa,sdlc", "false", "qa,sdlc"}, {"none", "true", "none"},
+	} {
+		out, err := exec.Command("bash", "-c", "set -e\n"+
+			"CONTAINARIUM_PARAM_SKILL_SETS='"+tc.skillSets+"' CONTAINARIUM_PARAM_SDLC_SKILLS='"+tc.alias+"'\n"+
+			"export CONTAINARIUM_PARAM_SKILL_SETS CONTAINARIUM_PARAM_SDLC_SKILLS\n"+
+			logic+"\necho \"RESULT=$SETS\"").CombinedOutput() //nolint:gosec // test-only, embedded recipe text
+		if err != nil {
+			t.Fatalf("%+v: %v\n%s", tc, err, out)
+		}
+		if !strings.Contains(string(out), "RESULT="+tc.want+"\n") {
+			t.Errorf("skill_sets=%q sdlc_skills=%q: %s, want RESULT=%s", tc.skillSets, tc.alias, out, tc.want)
+		}
+	}
+}
+
+// TestLibreChatRecipe_InferenceProviderParam (#1728): the recipe still opts
+// into Gemini by default (model_gateway_provider unchanged), and declares the
+// new inference_provider parameter as optional (no required flag, empty
+// default) so a deploy that doesn't set it gets exactly today's behavior.
+func TestLibreChatRecipe_InferenceProviderParam(t *testing.T) {
+	r, err := GetDefault().Get("librechat")
+	if err != nil {
+		t.Fatalf("get librechat recipe: %v", err)
+	}
+	if r.ModelGatewayProvider != "gemini-openai" {
+		t.Errorf("librechat model_gateway_provider: got %q want gemini-openai", r.ModelGatewayProvider)
+	}
+	var p *pb.RecipeParam
+	for _, param := range r.Parameters {
+		if param.Name == "inference_provider" {
+			p = param
+			break
+		}
+	}
+	if p == nil {
+		t.Fatal("librechat missing parameter \"inference_provider\"")
+	}
+	if p.Required {
+		t.Error("inference_provider must not be required — empty keeps the recipe's default provider")
+	}
+	if p.Default != "" {
+		t.Errorf("inference_provider default: got %q want empty (keeps model_gateway_provider)", p.Default)
+	}
+}
+
+// TestCodingAgentRecipe_OldInstallerHandling runs the recipe's inner installer
+// step against a fake curl: an installer without the "# skill-sets: v1" marker
+// (or no installer at all) must not silently widen a narrowed selection, and
+// none/all keep working against old releases (#3048).
+func TestCodingAgentRecipe_OldInstallerHandling(t *testing.T) {
+	m := New()
+	if err := m.LoadEmbedded(); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := m.Get("coding-agent")
+	var step string
+	for _, line := range r.PostStart {
+		if strings.Contains(line, "install-sdlc-skills.sh") {
+			step = line
+		}
+	}
+	start := strings.Index(step, "bash -c '")
+	end := strings.LastIndex(step, "\n'")
+	if start < 0 || end < start {
+		t.Fatal("cannot find the inner installer script")
+	}
+	inner := step[start+len("bash -c '") : end]
+
+	for _, tc := range []struct {
+		name, status, sets, body string
+		wantOK, wantRan          bool
+	}{
+		{"old, all", "200", "all", "", true, true},
+		{"old, none", "200", "none", "", true, false},
+		{"old, qa", "200", "qa", "", false, false},
+		{"mention only, qa", "200", "qa", "# honours SKILL_SETS\n", false, false},
+		{"marked, qa", "200", "qa", "# skill-sets: v1\n", true, true},
+		{"marked, none", "200", "none", "# skill-sets: v1\n", true, true},
+		{"404, all", "404", "all", "", true, false},
+		{"404, none", "404", "none", "", true, false},
+		{"404, qa", "404", "qa", "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			marker := dir + "/ran"
+			fake := "#!/bin/sh\nout=''\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) out=\"$2\"; shift;; esac; shift; done\n" +
+				"printf '#!/bin/sh\\n" + strings.ReplaceAll(tc.body, "\n", "\\n") + "touch " + marker + "\\n' > \"$out\"\nprintf '" + tc.status + "'\n"
+			if err := os.MkdirAll(dir+"/bin", 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dir+"/bin/curl", []byte(fake), 0o700); err != nil { //nolint:gosec // test stand-in
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", "-c", inner) //nolint:gosec // embedded recipe text
+			cmd.Env = append(os.Environ(), "PATH="+dir+"/bin:"+os.Getenv("PATH"), "RELEASE=v9.9.9", "SETS="+tc.sets)
+			out, err := cmd.CombinedOutput()
+			_, statErr := os.Stat(marker)
+			if (err == nil) != tc.wantOK || (statErr == nil) != tc.wantRan {
+				t.Errorf("ok=%v ran=%v, want ok=%v ran=%v\n%s", err == nil, statErr == nil, tc.wantOK, tc.wantRan, out)
+			}
+		})
+	}
+}
