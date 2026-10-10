@@ -33,3 +33,109 @@ func TestValidate(t *testing.T) {
 		block  = pb.GuardrailAction_GUARDRAIL_ACTION_BLOCK
 	)
 
+	cases := []struct {
+		name    string
+		policy  *pb.GuardrailPolicy
+		signers []*pb.GuardrailTrustedSigner
+		wantErr string // substring; empty = valid
+	}{
+		{name: "valid policy with signers", policy: storetest.Policy(1), signers: []*pb.GuardrailTrustedSigner{good, other}},
+		{name: "empty rule list is valid", policy: &pb.GuardrailPolicy{}},
+		{name: "missing policy", policy: nil, wantErr: "policy is required"},
+		{name: "unspecified kind", policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pb.GuardrailKind_GUARDRAIL_KIND_UNSPECIFIED, redact, 0)}}, wantErr: "kind"},
+		{name: "unknown kind value", policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pb.GuardrailKind(99), redact, 0)}}, wantErr: "kind"},
+		{name: "unspecified action", policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pii, pb.GuardrailAction_GUARDRAIL_ACTION_UNSPECIFIED, 0)}}, wantErr: "action"},
+		{name: "unknown action value", policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pii, pb.GuardrailAction(42), 0)}}, wantErr: "action"},
+		{name: "duplicate kind", policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pii, redact, 0), rule(secret, block, 0), rule(pii, block, 0)}}, wantErr: "duplicate"},
+		{name: "negative residual", policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{rule(pii, redact, -1)}}, wantErr: "max_residual"},
+		{name: "nil rule", policy: &pb.GuardrailPolicy{Rules: []*pb.GuardrailRule{nil}}, wantErr: "kind"},
+		{name: "signer key_id does not match its key", policy: storetest.Policy(0), signers: []*pb.GuardrailTrustedSigner{good, mismatched}, wantErr: "key_id"},
+		// These wantErr strings are text only the length branch produces.
+		{name: "signer key is not ed25519-sized", policy: storetest.Policy(0), signers: []*pb.GuardrailTrustedSigner{shortKey}, wantErr: "public_key is 16 bytes, want an Ed25519 key"},
+		{name: "signer with an empty key", policy: storetest.Policy(0), signers: []*pb.GuardrailTrustedSigner{emptyKey}, wantErr: "public_key is 0 bytes, want an Ed25519 key"},
+		{name: "nil signer", policy: storetest.Policy(0), signers: []*pb.GuardrailTrustedSigner{nil}, wantErr: "want an Ed25519 key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := guardrailpolicy.Validate(tc.policy, tc.signers)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Validate = %v, want an error mentioning %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateSetRequest: the revoked keys (#2729) on top of Validate. Every
+// revoked key carries a well-formed key_id and a reason, appears once, and
+// is not also a trusted signer.
+func TestValidateSetRequest(t *testing.T) {
+	good := storetest.Signer(t, 1, "release key")
+	old := storetest.Signer(t, 2, "old key")
+	revoked := func(keyID, reason string) *pb.GuardrailRevokedKey {
+		return &pb.GuardrailRevokedKey{KeyId: keyID, Reason: reason}
+	}
+	cases := []struct {
+		name    string
+		req     *pb.SetGuardrailPolicyRequest
+		wantErr string // substring; empty = valid
+	}{
+		{name: "valid with a revoked key", req: &pb.SetGuardrailPolicyRequest{Policy: storetest.Policy(0), TrustedSigners: []*pb.GuardrailTrustedSigner{good}, RevokedSigners: []*pb.GuardrailRevokedKey{revoked(old.GetKeyId(), "leaked")}}},
+		{name: "rules are still validated", req: &pb.SetGuardrailPolicyRequest{}, wantErr: "policy is required"},
+		{name: "revoked key without a reason", req: &pb.SetGuardrailPolicyRequest{Policy: storetest.Policy(0), RevokedSigners: []*pb.GuardrailRevokedKey{revoked(old.GetKeyId(), "  ")}}, wantErr: "reason"},
+		{name: "revoked key_id is not a SHA-256 hex", req: &pb.SetGuardrailPolicyRequest{Policy: storetest.Policy(0), RevokedSigners: []*pb.GuardrailRevokedKey{revoked("abc", "leaked")}}, wantErr: "64 lowercase hex"},
+		{name: "revoked key_id in upper case", req: &pb.SetGuardrailPolicyRequest{Policy: storetest.Policy(0), RevokedSigners: []*pb.GuardrailRevokedKey{revoked(strings.ToUpper(old.GetKeyId()), "leaked")}}, wantErr: "64 lowercase hex"},
+		{name: "revoked twice", req: &pb.SetGuardrailPolicyRequest{Policy: storetest.Policy(0), RevokedSigners: []*pb.GuardrailRevokedKey{revoked(old.GetKeyId(), "a"), revoked(old.GetKeyId(), "b")}}, wantErr: "revoked twice"},
+		{name: "revoked key still trusted", req: &pb.SetGuardrailPolicyRequest{Policy: storetest.Policy(0), TrustedSigners: []*pb.GuardrailTrustedSigner{good, old}, RevokedSigners: []*pb.GuardrailRevokedKey{revoked(old.GetKeyId(), "leaked")}}, wantErr: "is revoked"},
+		{name: "nil revoked entry", req: &pb.SetGuardrailPolicyRequest{Policy: storetest.Policy(0), RevokedSigners: []*pb.GuardrailRevokedKey{nil}}, wantErr: "64 lowercase hex"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := guardrailpolicy.ValidateSetRequest(tc.req)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateSetRequest = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ValidateSetRequest = %v, want an error mentioning %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestParseSetRequest: the CLI's --file format is the protojson of
+// SetGuardrailPolicyRequest, with enum names, and an unknown field is an
+// error rather than silently dropped (a typo must not weaken a policy).
+func TestParseSetRequest(t *testing.T) {
+	good := storetest.Signer(t, 1, "release key")
+	ok := `{"policy":{"rules":[{"kind":"GUARDRAIL_KIND_PII","action":"GUARDRAIL_ACTION_REDACT","maxResidual":1}]},` +
+		`"trustedSigners":[{"keyId":"` + good.GetKeyId() + `","publicKey":"` + b64(good.GetPublicKey()) + `","label":"release key"}]}`
+	req, err := guardrailpolicy.ParseSetRequest([]byte(ok))
+	if err != nil {
+		t.Fatalf("ParseSetRequest(valid) = %v", err)
+	}
+	if got := req.GetPolicy().GetRules()[0].GetKind(); got != pb.GuardrailKind_GUARDRAIL_KIND_PII {
+		t.Fatalf("kind = %v, want PII", got)
+	}
+	if req.GetTrustedSigners()[0].GetKeyId() != good.GetKeyId() {
+		t.Fatalf("signer key_id not decoded")
+	}
+
+	for name, in := range map[string]string{
+		"unknown field": `{"policy":{"rules":[]},"policyy":{}}`,
+		"not json":      `rules: []`,
+	} {
+		if _, err := guardrailpolicy.ParseSetRequest([]byte(in)); err == nil {
+			t.Errorf("ParseSetRequest(%s) = nil, want an error", name)
+		}
+	}
+}
+
+func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }

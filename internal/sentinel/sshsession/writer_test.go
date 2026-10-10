@@ -85,3 +85,62 @@ func TestJSONLRecorder_OneLinePerRecord(t *testing.T) {
 func TestNewJSONLFileRecorder_CreatesParentDir(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "does-not-exist-yet", "ssh-sessions.jsonl")
+
+	w, err := NewJSONLFileRecorder(path)
+	if err != nil {
+		t.Fatalf("NewJSONLFileRecorder: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if err := w.Record(Record{SessionID: "a", Phase: SessionPhaseOpen}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("sink file not created: %v", err)
+	}
+}
+
+func TestNewJSONLFileRecorder_AppendsAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ssh-sessions.jsonl")
+
+	w1, err := NewJSONLFileRecorder(path)
+	if err != nil {
+		t.Fatalf("NewJSONLFileRecorder: %v", err)
+	}
+	if err := w1.Record(Record{SessionID: "a", Phase: SessionPhaseOpen}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := w1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	w2, err := NewJSONLFileRecorder(path)
+	if err != nil {
+		t.Fatalf("reopen NewJSONLFileRecorder: %v", err)
+	}
+	if err := w2.Record(Record{SessionID: "a", Phase: SessionPhaseClose}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read sink: %v", err)
+	}
+
+	lines := bytes.Count(bytes.TrimRight(data, "\n"), []byte("\n")) + 1
+	if lines != 2 {
+		t.Fatalf("got %d lines after reopen+append, want 2:\n%s", lines, data)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat sink: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("sink perm = %v, want 0600", fi.Mode().Perm())
+	}
+}
