@@ -66,3 +66,141 @@ func NewGRPCInterceptor() *GRPCInterceptor {
 				recordPersistFailure()
 			}
 		}
+	}()
+	return g
+}
+
+// SetStore attaches the audit store, arming the interceptor. Call once,
+// from dual_server.go, right after the audit store connects.
+func (g *GRPCInterceptor) SetStore(store *Store) {
+	g.setLogger(store)
+}
+
+func (g *GRPCInterceptor) setLogger(l auditLogger) {
+	g.mu.Lock()
+	g.store = l
+	g.mu.Unlock()
+}
+
+func (g *GRPCInterceptor) getStore() auditLogger {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.store
+}
+
+// Unary returns a grpc.UnaryServerInterceptor. Register it AFTER the auth
+// interceptor in dual_server.go's grpc.NewServer() call — same ordering as
+// gateway.go's "auth first (sets username in context), then audit" HTTP
+// stack — so SubjectFromGRPCContext below actually finds something.
+func (g *GRPCInterceptor) Unary() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		start := time.Now()
+		reqID := requestIDFromMD(incomingMD(ctx))
+		ctx = ContextWithRequestID(ctx, reqID)
+		_ = grpc.SetHeader(ctx, metadata.Pairs(RequestIDHeader, reqID))
+
+		resp, err := handler(ctx, req)
+
+		g.record(ctx, info.FullMethod, "grpc_unary", reqID, start, err)
+		return resp, err
+	}
+}
+
+// Stream is the streaming counterpart of Unary.
+func (g *GRPCInterceptor) Stream() grpc.StreamServerInterceptor {
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		start := time.Now()
+		ctx := ss.Context()
+		reqID := requestIDFromMD(incomingMD(ctx))
+		ctx = ContextWithRequestID(ctx, reqID)
+		_ = ss.SetHeader(metadata.Pairs(RequestIDHeader, reqID))
+
+		err := handler(srv, &wrappedServerStream{ServerStream: ss, ctx: ctx})
+
+		g.record(ctx, info.FullMethod, "grpc_stream", reqID, start, err)
+		return err
+	}
+}
+
+// wrappedServerStream overrides Context() so a stream handler (and anything
+// it calls) sees the request-ID-bearing context, the same way the unary
+// path passes its own modified ctx to handler(ctx, req).
+type wrappedServerStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (w *wrappedServerStream) Context() context.Context { return w.ctx }
+
+// record builds the audit entry and hands it to the async writer, unless
+// the store isn't armed yet or buildEntry decides to skip this call.
+func (g *GRPCInterceptor) record(ctx context.Context, fullMethod, action, reqID string, start time.Time, callErr error) {
+	if g.getStore() == nil {
+		return
+	}
+	entry := buildEntry(ctx, fullMethod, action, reqID, start, callErr)
+	if entry == nil {
+		return
+	}
+	select {
+	case g.entryCh <- entry:
+	default:
+		// Channel full — drop rather than block the RPC. Same trade-off
+		// HTTPAuditMiddleware makes.
+		recordPersistFailure()
+	}
+}
+
+// buildEntry is a pure function (no I/O) so it's unit-testable without a
+// store or a real gRPC call. Returns nil when this call shouldn't produce
+// its own row — currently just the gateway-forward dedup case.
+func buildEntry(ctx context.Context, fullMethod, action, reqID string, start time.Time, callErr error) *AuditEntry {
+	md := incomingMD(ctx)
+	if len(md.Get(GatewayForwardMDKey)) > 0 {
+		return nil
+	}
+
+	username, roles, _ := auth.SubjectFromGRPCContext(ctx)
+
+	peerAddr := ""
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		peerAddr = p.Addr.String()
+	}
+
+	// Detail carries the same `request_id=... duration=...` shape as the
+	// HTTP middleware, plus roles (the HTTP path doesn't carry these today,
+	// but the issue asks for them here — no dedicated column, so they ride
+	// in Detail like everything else that isn't a first-class field).
+	detail := "request_id=" + reqID + " duration=" + time.Since(start).String()
+	if len(roles) > 0 {
+		detail += " roles=" + strings.Join(roles, ",")
+	}
+
+	return &AuditEntry{
+		Timestamp:    start,
+		Username:     username,
+		Action:       action,
+		ResourceType: "grpc",
+		ResourceID:   fullMethod,
+		Detail:       SanitizeDetail(detail),
+		SourceIP:     peerAddr,
+		StatusCode:   int(status.Code(callErr)),
+	}
+}
+
+func incomingMD(ctx context.Context) metadata.MD {
+	md, _ := metadata.FromIncomingContext(ctx)
+	return md
+}
+
+// requestIDFromMD is requestIDHeader's gRPC-side counterpart: honor an
+// inbound x-request-id (grpc metadata keys are case-insensitive/lowercased
+// on both Set and Get) if it's shaped like one, otherwise mint a fresh one.
+// Reuses the same validRequestID/newRequestID request_id.go already defines
+// for the HTTP path.
+func requestIDFromMD(md metadata.MD) string {
+	if vals := md.Get(RequestIDHeader); len(vals) > 0 && validRequestID(vals[0]) {
+		return vals[0]
+	}
+	return newRequestID()
+}
