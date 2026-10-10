@@ -73,3 +73,28 @@ func TestFetchVerified(t *testing.T) {
 
 	// Happy path: fetched, verified, executable, atomic.
 	dst := filepath.Join(dir, "k3s")
+	if err := fetchVerified(context.Background(), srv.URL+"/good", dst, goodSHA); err != nil {
+		t.Fatalf("fetchVerified: %v", err)
+	}
+	st, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat fetched artifact: %v", err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Fatalf("fetched artifact mode = %v, want 0755", st.Mode().Perm())
+	}
+
+	// Tampered payload fails closed and leaves nothing at the target.
+	dst2 := filepath.Join(dir, "k3s2")
+	if err := fetchVerified(context.Background(), srv.URL+"/tampered", dst2, goodSHA); err == nil {
+		t.Fatal("tampered artifact accepted")
+	}
+	if _, err := os.Stat(dst2); !os.IsNotExist(err) {
+		t.Fatalf("tampered fetch left a file behind: %v", err)
+	}
+
+	// HTTP error fails.
+	if err := fetchVerified(context.Background(), srv.URL+"/missing", dst2, goodSHA); err == nil {
+		t.Fatal("404 accepted")
+	}
+}
