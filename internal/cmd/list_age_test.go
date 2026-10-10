@@ -29,3 +29,35 @@ func TestListHTTP_AgeColumn_UnixSecondsCreatedAt(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		body := fmt.Sprintf(
 			`{"containers":[{"name":"alice-container","username":"alice","state":"Running","createdAt":"%d"}]}`,
+			createdAt.Unix(),
+		)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	httpClient, err := client.NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	containers, err := httpClient.ListContainers()
+	if err != nil {
+		t.Fatalf("ListContainers: %v", err)
+	}
+	if len(containers) != 1 {
+		t.Fatalf("got %d containers, want 1", len(containers))
+	}
+
+	got := ageString(time.Now(), containers[0].CreatedAt)
+	if got == "age=unknown" {
+		t.Fatalf("age column shows %q for a box with a Unix-seconds createdAt — reproduces #2146", got)
+	}
+
+	// Loose bound: the round trip through the fake server takes some time,
+	// so assert the age lands near 90m rather than pinning it exactly.
+	if !containers[0].CreatedAt.Before(time.Now().Add(-80*time.Minute)) ||
+		!containers[0].CreatedAt.After(time.Now().Add(-100*time.Minute)) {
+		t.Errorf("CreatedAt = %v, want ~90m ago", containers[0].CreatedAt)
+	}
+}
