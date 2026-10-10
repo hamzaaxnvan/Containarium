@@ -575,3 +575,148 @@ func (pm *PassthroughManager) parsePassthroughRule(line string) *PassthroughRout
 			target := strings.TrimPrefix(field, "to:")
 			parts := strings.Split(target, ":")
 			if len(parts) == 2 {
+				route.TargetIP = parts[0]
+				if _, err := fmt.Sscanf(parts[1], "%d", &route.TargetPort); err != nil {
+					log.Printf("  failed to parse target port %q: %v", parts[1], err)
+				}
+			}
+		}
+	}
+
+	if route.ExternalPort == 0 || route.TargetIP == "" {
+		return nil
+	}
+
+	return route
+}
+
+// AddRoute adds a new passthrough route via iptables
+func (pm *PassthroughManager) AddRoute(externalPort int, targetIP string, targetPort int, protocol string) error {
+	if protocol == "" {
+		protocol = "tcp"
+	}
+	protocol = strings.ToLower(protocol)
+
+	log.Printf("Adding passthrough route: %s:%d -> %s:%d", protocol, externalPort, targetIP, targetPort)
+
+	// Check if rule already exists
+	if pm.routeExists(externalPort, protocol) {
+		return fmt.Errorf("passthrough route for port %d/%s already exists", externalPort, protocol)
+	}
+
+	// Enable IP forwarding
+	cmd := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to enable IP forwarding: %w, output: %s", err, string(output))
+	}
+
+	// Add PREROUTING DNAT rule — traffic arriving on an interface.
+	// Excludes the container network so containers can still reach
+	// external services on the same port.
+	cmd = exec.Command("iptables", passthroughPreRoutingArgs(externalPort, targetIP, targetPort, protocol, pm.networkCIDR)...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to add DNAT rule: %w, output: %s", err, string(output))
+	}
+
+	// Add OUTPUT DNAT rule — traffic generated ON this host. PREROUTING
+	// never sees those packets, so without this the published endpoint
+	// refuses connections from the daemon host itself: the e2e lane and
+	// any operator curling it (#1459). PortForwarder has always done
+	// both chains for the same reason.
+	cmd = exec.Command("iptables", passthroughOutputArgs(externalPort, targetIP, targetPort, protocol)...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to add OUTPUT DNAT rule: %w, output: %s", err, string(output))
+	}
+
+	// Add POSTROUTING MASQUERADE rule for return traffic
+	// Check if rule already exists
+	checkCmd := exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING",
+		"-p", protocol, "-d", targetIP, "--dport", fmt.Sprintf("%d", targetPort),
+		"-j", "MASQUERADE")
+	if checkCmd.Run() != nil {
+		// Rule doesn't exist, add it
+		cmd = exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING",
+			"-p", protocol, "-d", targetIP, "--dport", fmt.Sprintf("%d", targetPort),
+			"-j", "MASQUERADE")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to add MASQUERADE rule: %w, output: %s", err, string(output))
+		}
+	}
+
+	log.Printf("  Passthrough route added successfully")
+	return nil
+}
+
+// routeExists checks if a passthrough route already exists
+func (pm *PassthroughManager) routeExists(externalPort int, protocol string) bool {
+	cmd := exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
+		"-p", protocol,
+		"!", "-s", pm.networkCIDR,
+		"--dport", fmt.Sprintf("%d", externalPort),
+		"-j", "DNAT")
+	return cmd.Run() == nil
+}
+
+// RemoveRoute removes a passthrough route
+func (pm *PassthroughManager) RemoveRoute(externalPort int, protocol string) error {
+	if protocol == "" {
+		protocol = "tcp"
+	}
+	protocol = strings.ToLower(protocol)
+
+	log.Printf("Removing passthrough route: %s:%d", protocol, externalPort)
+
+	// Get the full rule details first
+	routes, err := pm.ListRoutes()
+	if err != nil {
+		return err
+	}
+
+	var targetIP string
+	var targetPort int
+	for _, route := range routes {
+		if route.ExternalPort == externalPort && route.Protocol == protocol {
+			targetIP = route.TargetIP
+			targetPort = route.TargetPort
+			break
+		}
+	}
+
+	if targetIP == "" {
+		return fmt.Errorf("passthrough route for port %d/%s not found", externalPort, protocol)
+	}
+
+	// Remove PREROUTING DNAT rule
+	cmd := exec.Command("iptables", "-t", "nat", "-D", "PREROUTING",
+		"-p", protocol,
+		"!", "-s", pm.networkCIDR,
+		"--dport", fmt.Sprintf("%d", externalPort),
+		"-j", "DNAT", "--to-destination", fmt.Sprintf("%s:%d", targetIP, targetPort))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to remove DNAT rule: %w, output: %s", err, string(output))
+	}
+
+	// Remove the OUTPUT DNAT rule (#1459). Leaving it behind would
+	// silently redirect a later, unrelated local connection on this
+	// port to a container that no longer serves it. Tolerated as
+	// best-effort so removal still succeeds on a host whose route
+	// predates the OUTPUT rule.
+	cmd = exec.Command("iptables", "-t", "nat", "-D", "OUTPUT",
+		"-p", protocol, "-m", "addrtype", "--dst-type", "LOCAL",
+		"--dport", fmt.Sprintf("%d", externalPort),
+		"-j", "DNAT", "--to-destination", fmt.Sprintf("%s:%d", targetIP, targetPort))
+	if err := cmd.Run(); err != nil {
+		log.Printf("  Passthrough OUTPUT rule may not exist (route predates #1459) (ignored): %v", err)
+	}
+
+	// Remove POSTROUTING MASQUERADE rule
+	cmd = exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING",
+		"-p", protocol, "-d", targetIP, "--dport", fmt.Sprintf("%d", targetPort),
+		"-j", "MASQUERADE")
+	if err := cmd.Run(); err != nil {
+		log.Printf("  Passthrough MASQUERADE rule may not exist or be shared (ignored): %v", err)
+	}
+
+	log.Printf("  Passthrough route removed successfully")
+	return nil
+}

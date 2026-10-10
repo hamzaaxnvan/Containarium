@@ -14,3 +14,71 @@ func encodeFlowStat(r FlowRecord) []byte {
 	binary.NativeEndian.PutUint64(b[0:8], r.Packets)
 	binary.NativeEndian.PutUint64(b[8:16], r.Bytes)
 	binary.NativeEndian.PutUint64(b[16:24], r.FirstNs)
+	binary.NativeEndian.PutUint64(b[24:32], r.LastNs)
+	binary.NativeEndian.PutUint64(b[32:40], r.RxPackets)
+	binary.NativeEndian.PutUint64(b[40:48], r.RxBytes)
+	return b
+}
+
+func TestDecodeFlow_RoundTrip(t *testing.T) {
+	// 10.100.0.42:51000 -> 1.1.1.1:443, TCP, addresses in network byte order.
+	want := FlowRecord{
+		Ifindex:   59,
+		Saddr:     binary.NativeEndian.Uint32([]byte{10, 100, 0, 42}),
+		Daddr:     binary.NativeEndian.Uint32([]byte{1, 1, 1, 1}),
+		Sport:     51000,
+		Dport:     443,
+		Proto:     6,
+		Packets:   12,
+		Bytes:     8456,
+		FirstNs:   1_000_000_000,
+		LastNs:    3_500_000_000,
+		RxPackets: 9,
+		RxBytes:   12_004,
+	}
+
+	var got FlowRecord
+	if err := decodeFlowKey(encodeFlowKey(want), &got); err != nil {
+		t.Fatalf("decodeFlowKey: %v", err)
+	}
+	if err := decodeFlowStat(encodeFlowStat(want), &got); err != nil {
+		t.Fatalf("decodeFlowStat: %v", err)
+	}
+	if got != want {
+		t.Errorf("round-trip mismatch:\n got %+v\nwant %+v", got, want)
+	}
+	if got.Src().String() != "10.100.0.42" {
+		t.Errorf("Src() = %s, want 10.100.0.42", got.Src())
+	}
+	if got.Dst().String() != "1.1.1.1" {
+		t.Errorf("Dst() = %s, want 1.1.1.1", got.Dst())
+	}
+}
+
+// TestDecodeFlowStat_V1NoRx guards backward compat (#631): a 32-byte value from
+// an object built before the rx counters decodes fine, leaving Rx* at 0.
+func TestDecodeFlowStat_V1NoRx(t *testing.T) {
+	v1 := make([]byte, flowStatSizeV1)
+	binary.NativeEndian.PutUint64(v1[0:8], 7)     // packets
+	binary.NativeEndian.PutUint64(v1[8:16], 4096) // bytes
+	var got FlowRecord
+	if err := decodeFlowStat(v1, &got); err != nil {
+		t.Fatalf("decodeFlowStat(v1): %v", err)
+	}
+	if got.Packets != 7 || got.Bytes != 4096 {
+		t.Errorf("tx fields = %d/%d, want 7/4096", got.Packets, got.Bytes)
+	}
+	if got.RxPackets != 0 || got.RxBytes != 0 {
+		t.Errorf("rx fields should default 0 for a v1 value, got %d/%d", got.RxPackets, got.RxBytes)
+	}
+}
+
+func TestDecodeFlow_ShortSamples(t *testing.T) {
+	var r FlowRecord
+	if err := decodeFlowKey([]byte{1, 2, 3}, &r); err == nil {
+		t.Error("expected error for short flow key")
+	}
+	if err := decodeFlowStat([]byte{1, 2, 3}, &r); err == nil {
+		t.Error("expected error for short flow stat")
+	}
+}
