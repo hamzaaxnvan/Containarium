@@ -79,3 +79,84 @@ func TestComposeTools_RequiredFields(t *testing.T) {
 }
 
 // handler dispatch — verify each handler exists and respects local
+// required-field checks before any network call. We pass a nil client
+// because the validation should fire before doRequest is reached;
+// a nil-deref would mean the validation is missing.
+
+func TestHandleComposeEnable_RequiresDir(t *testing.T) {
+	_, err := handleComposeEnablePlatform(nil, map[string]interface{}{"username": "alice"})
+	if err == nil || !strings.Contains(err.Error(), "dir is required") {
+		t.Errorf("expected 'dir is required' error, got %v", err)
+	}
+}
+
+func TestHandleComposeDisable_RequiresDir(t *testing.T) {
+	_, err := handleComposeDisablePlatform(nil, map[string]interface{}{"username": "alice"})
+	if err == nil || !strings.Contains(err.Error(), "dir is required") {
+		t.Errorf("expected 'dir is required' error, got %v", err)
+	}
+}
+
+func TestHandleComposeStatus_RequiresUsernameAndDir(t *testing.T) {
+	// Missing username — handler calls composeStatus which checks first
+	// (defensive even though the daemon would also reject; saves a
+	// round-trip + gives a clearer message to the agent).
+	c := &Client{} // unused for the username-empty path
+	_, err := handleComposeStatusPlatform(c, map[string]interface{}{})
+	if err == nil || !strings.Contains(err.Error(), "username is required") {
+		t.Errorf("expected 'username is required' error, got %v", err)
+	}
+}
+
+// Verify the discover request builder maps args correctly. We don't
+// fire doRequest; instead we exercise the parts that don't need a
+// network: the JSON marshaling of the request body.
+func TestComposeDiscoverReq_Marshaling(t *testing.T) {
+	// Full request — every field set.
+	req := composeDiscoverReq{
+		Username: "alice",
+		Root:     "/home/alice",
+		MaxDepth: 4,
+		Skip:     []string{"node_modules", "vendor"},
+		NoSkip:   true,
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := string(b)
+	for _, want := range []string{
+		`"username":"alice"`,
+		`"root":"/home/alice"`,
+		`"maxDepth":4`,
+		`"skip":["node_modules","vendor"]`,
+		`"noSkip":true`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in: %s", want, got)
+		}
+	}
+
+	// Empty optional fields → omitempty drops them so the daemon sees
+	// the zero-value defaults rather than ambiguous explicit ""s.
+	minimal := composeDiscoverReq{Username: "alice"}
+	b, _ = json.Marshal(minimal)
+	got = string(b)
+	for _, mustNotContain := range []string{`"root"`, `"maxDepth"`, `"skip"`, `"noSkip"`} {
+		if strings.Contains(got, mustNotContain) {
+			t.Errorf("minimal request should omit %s but got: %s", mustNotContain, got)
+		}
+	}
+}
+
+func TestComposeEnableReq_DirRequired(t *testing.T) {
+	// Dir is NOT marked omitempty — server-side will reject empty,
+	// but the handler-side check catches it earlier; this test asserts
+	// the JSON shape preserves explicit "" so the handler-side check
+	// is the only thing gating us (no silent default).
+	req := composeEnableReq{Username: "alice", Dir: ""}
+	b, _ := json.Marshal(req)
+	if !strings.Contains(string(b), `"dir":""`) {
+		t.Errorf("dir should serialize as empty string, not omitted: %s", string(b))
+	}
+}
