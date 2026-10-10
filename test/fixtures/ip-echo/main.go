@@ -30,3 +30,20 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
+
+	log.Printf("[ip-echo] listening on %s", *addr)
+	log.Fatal(srv.ListenAndServe())
+}
+
+func writeKV(w io.Writer, key, value string) {
+	_, _ = io.WriteString(w, key)
+	_, _ = io.WriteString(w, "=")
+	_, _ = io.WriteString(w, value)
+	_, _ = io.WriteString(w, "\n")
+}
