@@ -98,3 +98,37 @@ func TestRunCreate_ForceDeletesAndCreatesOnlyAfterTheDaemonAcceptsThePreflight(t
 	d := newFakeForceDaemon(t)
 
 	if err := forceCreateAgainst(t, d); err != nil {
+		t.Fatalf("runCreate = %v", err)
+	}
+	if got := d.sequence(); got != "GET,DRYRUN,DELETE,CREATE" {
+		t.Fatalf("daemon saw %q, want GET,DRYRUN,DELETE,CREATE", got)
+	}
+}
+
+// With no existing box there is nothing to protect: no pre-flight round trip,
+// the create is the validation. Pins that --force on a fresh name is unchanged.
+func TestRunCreate_ForceOnAFreshNameSkipsThePreflight(t *testing.T) {
+	d := newFakeForceDaemon(t)
+	d.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			d.calls = append(d.calls, "GET")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"not found"}`))
+		case http.MethodPost:
+			d.calls = append(d.calls, "CREATE")
+			_, _ = w.Write([]byte(`{"container":{"name":"alice-container","username":"alice","state":"CONTAINER_STATE_CREATING"}}`))
+		default:
+			d.calls = append(d.calls, "UNEXPECTED "+r.Method)
+		}
+	})
+	if err := forceCreateAgainst(t, d); err != nil {
+		t.Fatalf("runCreate = %v", err)
+	}
+	if got := d.sequence(); got != "GET,CREATE" {
+		t.Fatalf("daemon saw %q, want GET,CREATE", got)
+	}
+}
