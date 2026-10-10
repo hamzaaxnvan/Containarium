@@ -70,3 +70,51 @@ func TestResolveSentinel_SingleSkipsProbe(t *testing.T) {
 	probe := func([]sentinelCandidate) []rttRow { probed = true; return nil }
 	c := []sentinelCandidate{{Region: "us", Addr: "only:443"}}
 	got, rows, err := resolveSentinel(c, "auto", probe)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if probed {
+		t.Error("single candidate must skip probing")
+	}
+	if got.Addr != "only:443" || rows != nil {
+		t.Errorf("unexpected result: %+v rows=%v", got, rows)
+	}
+}
+
+func TestResolveSentinel_AutoPicksLowest(t *testing.T) {
+	c := []sentinelCandidate{{Region: "us", Addr: "u"}, {Region: "eu", Addr: "e"}}
+	probe := func(cs []sentinelCandidate) []rttRow {
+		return []rttRow{
+			{Cand: cs[0], RTT: 50 * time.Millisecond},
+			{Cand: cs[1], RTT: 5 * time.Millisecond},
+		}
+	}
+	got, rows, err := resolveSentinel(c, "auto", probe)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got.Region != "eu" {
+		t.Errorf("auto should pick lowest RTT (eu), got %+v", got)
+	}
+	if len(rows) != 2 {
+		t.Errorf("expected probe table of 2 rows, got %d", len(rows))
+	}
+}
+
+func TestResolveSentinel_NamedRegion(t *testing.T) {
+	c := []sentinelCandidate{{Region: "us", Addr: "u"}, {Region: "eu", Addr: "e"}}
+	got, _, err := resolveSentinel(c, "eu", nil)
+	if err != nil || got.Addr != "e" {
+		t.Fatalf("named region: got %+v err=%v", got, err)
+	}
+	if _, _, err := resolveSentinel(c, "nope", nil); err == nil {
+		t.Error("unknown region must error")
+	}
+}
+
+func TestResolveSentinel_MultipleNoRegionIsAmbiguous(t *testing.T) {
+	c := []sentinelCandidate{{Addr: "a"}, {Addr: "b"}}
+	if _, _, err := resolveSentinel(c, "", nil); err == nil {
+		t.Error("multiple candidates with no --region must error (ambiguous), not pick arbitrarily")
+	}
+}
