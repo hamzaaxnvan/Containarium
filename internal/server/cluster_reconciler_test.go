@@ -262,3 +262,267 @@ func testReconcilerRig(t *testing.T) (*ClusterServer, *ClusterReconciler, *state
 	srv.SetReconciler(rec)
 	return srv, rec, host
 }
+
+func TestReconciler_ProvisionsToReady(t *testing.T) {
+	srv, rec, host := testReconcilerRig(t)
+	ctx := context.Background()
+	mustCreate(t, srv, tenantCtx("alice"), "demo") // default presets: small min=1
+
+	// Pass 1: control plane first, no workers yet.
+	rec.ReconcileOnce(ctx)
+	if _, ok := host.vms["alice-k8s-demo-cp"]; !ok {
+		t.Fatalf("pass 1 did not create the control plane; vms=%v", vmNames(host))
+	}
+	if len(host.vms) != 1 {
+		t.Fatalf("pass 1 created workers before the CP was observed running: %v", vmNames(host))
+	}
+
+	// Pass 2: worker to min, endpoint recorded, cluster READY (the
+	// fake cluster API reports both nodes Ready).
+	rec.ReconcileOnce(ctx)
+	if _, ok := host.vms["alice-k8s-demo-small-1"]; !ok {
+		t.Fatalf("pass 2 did not create the small worker: %v", vmNames(host))
+	}
+	// Worker got the binary, the 0600 token, and a join script.
+	if string(host.files["alice-k8s-demo-small-1:"+clustercore.AgentTokenPath]) != "K10::join-token" {
+		t.Fatal("worker did not receive the CP's join token")
+	}
+
+	rec.ReconcileOnce(ctx) // settle
+	got, err := srv.GetCluster(tenantCtx("alice"), &pb.GetClusterRequest{Name: "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Cluster.State != pb.ClusterState_CLUSTER_STATE_READY {
+		t.Fatalf("state = %v, want READY (reason %q)", got.Cluster.State, got.Cluster.StateReason)
+	}
+	if got.Cluster.ApiEndpoint != "10.166.11.5:6443" {
+		t.Fatalf("endpoint = %q (publish seam nil → CP IP)", got.Cluster.ApiEndpoint)
+	}
+
+	// Kubeconfig now flows through the reconciler's reader, rewritten
+	// to the recorded endpoint.
+	kc, err := srv.GetClusterKubeconfig(tenantCtx("alice"), &pb.GetClusterKubeconfigRequest{Name: "demo"})
+	if err != nil {
+		t.Fatalf("kubeconfig: %v", err)
+	}
+	if !strings.Contains(kc.Kubeconfig, "server: https://10.166.11.5:6443") {
+		t.Fatalf("kubeconfig not rewritten:\n%s", kc.Kubeconfig)
+	}
+
+	// Status shows the worker row and per-group counts.
+	st, err := srv.GetClusterStatus(tenantCtx("alice"), &pb.GetClusterStatusRequest{Name: "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Nodes) != 2 {
+		t.Fatalf("status nodes = %d, want cp+worker", len(st.Nodes))
+	}
+}
+
+func TestReconciler_ReplacesLostWorker(t *testing.T) {
+	srv, rec, host := testReconcilerRig(t)
+	ctx := context.Background()
+	mustCreate(t, srv, tenantCtx("alice"), "demo")
+	rec.ReconcileOnce(ctx)
+	rec.ReconcileOnce(ctx)
+	rec.ReconcileOnce(ctx)
+
+	// Kill the worker out-of-band.
+	delete(host.vms, "alice-k8s-demo-small-1")
+
+	rec.ReconcileOnce(ctx)
+	if _, ok := host.vms["alice-k8s-demo-small-1"]; !ok {
+		t.Fatalf("lost worker not replaced: %v", vmNames(host))
+	}
+	// The replacement is on the scale-event record.
+	st, err := srv.GetClusterStatus(tenantCtx("alice"), &pb.GetClusterStatusRequest{Name: "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Events) == 0 {
+		t.Fatal("no scale events recorded for the replacement")
+	}
+}
+
+func TestReconciler_AsyncDeleteDrainsEverything(t *testing.T) {
+	srv, rec, host := testReconcilerRig(t)
+	ctx := context.Background()
+	mustCreate(t, srv, tenantCtx("alice"), "demo")
+	rec.ReconcileOnce(ctx)
+	rec.ReconcileOnce(ctx)
+
+	resp, err := srv.DeleteCluster(tenantCtx("alice"), &pb.DeleteClusterRequest{Name: "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Message, "in progress") {
+		t.Fatalf("async delete message = %q", resp.Message)
+	}
+	// Record still present (DELETING) until the reconciler drains it.
+	if _, err := srv.GetCluster(tenantCtx("alice"), &pb.GetClusterRequest{Name: "demo"}); err != nil {
+		t.Fatalf("record vanished before the reconciler ran: %v", err)
+	}
+
+	rec.ReconcileOnce(ctx) // deletes VMs
+	rec.ReconcileOnce(ctx) // observes empty, drops rows
+	if len(host.vms) != 0 {
+		t.Fatalf("VMs survived deletion: %v", vmNames(host))
+	}
+	_, err = srv.GetCluster(tenantCtx("alice"), &pb.GetClusterRequest{Name: "demo"})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("record after drain = %v, want NotFound", err)
+	}
+	// Name immediately reusable.
+	mustCreate(t, srv, tenantCtx("alice"), "demo")
+}
+
+func TestReconciler_AdmissionRefusalIsLoud(t *testing.T) {
+	srv, rec, host := testReconcilerRig(t)
+	ctx := context.Background()
+	rec.SetAdmission(func(owner, cpu string) (func(), error) { return nil, errors.New("host at capacity") })
+	mustCreate(t, srv, tenantCtx("alice"), "demo")
+
+	rec.ReconcileOnce(ctx)
+	if len(host.vms) != 0 {
+		t.Fatalf("VM created despite admission refusal: %v", vmNames(host))
+	}
+	st, err := srv.GetClusterStatus(tenantCtx("alice"), &pb.GetClusterStatusRequest{Name: "demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Events) == 0 || st.Events[0].Kind != pb.ScaleEventKind_SCALE_EVENT_KIND_REFUSED {
+		t.Fatalf("refusal not recorded as a REFUSED event: %+v", st.Events)
+	}
+}
+
+func TestReconciler_VMCapabilityGatesCreate(t *testing.T) {
+	srv, _, host := testReconcilerRig(t)
+	host.capErr = clustercore.ErrVMsUnsupported
+
+	_, err := srv.CreateCluster(tenantCtx("alice"), &pb.CreateClusterRequest{Name: "demo"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("create on a VM-incapable host = %v, want FailedPrecondition", err)
+	}
+	if !strings.Contains(err.Error(), "virtual machines") {
+		t.Fatalf("error does not explain the capability gap: %v", err)
+	}
+}
+
+func vmNames(h *stateHost) []string {
+	var out []string
+	for n := range h.vms {
+		out = append(out, n)
+	}
+	return out
+}
+
+// The create-time capability probe dispatches on the cluster's
+// isolation class (#1429): a VM cluster is gated by VMCapable only, a
+// container cluster by ContainerNodeCapable only.
+func TestReconciler_CapabilityProbeMatchesIsolation(t *testing.T) {
+	vmErr := clustercore.ErrVMsUnsupported
+	containerErr := fmt.Errorf("%w: br_netfilter: kernel module not present", clustercore.ErrContainerNodesUnsupported)
+
+	cases := []struct {
+		name            string
+		isolation       pb.NodeIsolation
+		vmCapErr        error
+		containerCapErr error
+		wantCode        codes.Code // OK = create allowed
+		wantIn          string
+	}{
+		{"vm cluster gated by the VM probe", pb.NodeIsolation_NODE_ISOLATION_VM, vmErr, nil, codes.FailedPrecondition, "virtual machines"},
+		{"vm cluster ignores the container probe", pb.NodeIsolation_NODE_ISOLATION_VM, nil, containerErr, codes.OK, ""},
+		{"container cluster gated by the container probe, refusal names the precondition", pb.NodeIsolation_NODE_ISOLATION_CONTAINER, nil, containerErr, codes.FailedPrecondition, "br_netfilter"},
+		{"container cluster does not require VM capability", pb.NodeIsolation_NODE_ISOLATION_CONTAINER, vmErr, nil, codes.OK, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _, host := testReconcilerRig(t)
+			srv.SetIsolationGateFromEnv("true")
+			host.capErr, host.containerCapErr = tc.vmCapErr, tc.containerCapErr
+
+			_, err := srv.CreateCluster(tenantCtx("alice"), &pb.CreateClusterRequest{
+				Name: "demo", NodeIsolation: tc.isolation,
+			})
+			if status.Code(err) != tc.wantCode {
+				t.Fatalf("CreateCluster = %v, want code %v", err, tc.wantCode)
+			}
+			if tc.wantIn != "" && !strings.Contains(err.Error(), tc.wantIn) {
+				t.Fatalf("refusal %q does not name %q", err, tc.wantIn)
+			}
+		})
+	}
+}
+
+// A container cluster's nodes are provisioned as container nodes all
+// the way down the seam; a default cluster's stay VM (#1429).
+func TestReconciler_ProvisionIsolationMatchesCluster(t *testing.T) {
+	cases := []struct {
+		name      string
+		isolation pb.NodeIsolation
+		want      clustercore.Isolation
+	}{
+		{"default cluster provisions VM nodes", pb.NodeIsolation_NODE_ISOLATION_UNSPECIFIED, clustercore.IsolationVM},
+		{"container cluster provisions container nodes", pb.NodeIsolation_NODE_ISOLATION_CONTAINER, clustercore.IsolationContainer},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, rec, host := testReconcilerRig(t)
+			srv.SetIsolationGateFromEnv("true")
+			ctx := context.Background()
+			if _, err := srv.CreateCluster(tenantCtx("alice"), &pb.CreateClusterRequest{
+				Name: "demo", NodeIsolation: tc.isolation,
+			}); err != nil {
+				t.Fatalf("CreateCluster: %v", err)
+			}
+
+			rec.ReconcileOnce(ctx) // control plane
+			rec.ReconcileOnce(ctx) // workers to min
+			if len(host.vms) < 2 {
+				t.Fatalf("expected CP + worker, got %v", vmNames(host))
+			}
+			for name := range host.vms {
+				if got := host.isolations[name]; got != tc.want {
+					t.Fatalf("node %s created with isolation %q, want %q", name, got, tc.want)
+				}
+				// Existence is not provisioning. CreateNode runs before
+				// anything that can fail later in the sequence, so a
+				// provision that aborted after it still leaves an
+				// instance here — which is how a broken container path
+				// passed this test unnoticed (#1466 review). Assert the
+				// node was actually bootstrapped.
+				if _, ok := host.files[name+":/root/containarium-bootstrap.sh"]; !ok {
+					t.Fatalf("node %s exists but was never bootstrapped; provisioning aborted after CreateNode", name)
+				}
+			}
+		})
+	}
+}
+
+// The published endpoint must be a subject-alt-name on the API server
+// certificate, or the kubeconfig the product hands a tenant cannot
+// verify — precisely what run 14 of the container lane hit:
+//
+//	x509: certificate is valid for 10.100.0.102, 10.43.0.1, 127.0.0.1,
+//	  ::1, fd42:..., not <advertise-host>
+//
+// The design always intended this ("TLSSANs are ... the external
+// endpoint and the VM IP, so the rewritten kubeconfig verifies"); the
+// reconciler simply passed nil (#1464).
+func TestReconcilerGivesControlPlaneTheAdvertiseSAN(t *testing.T) {
+	srv, rec, host := testReconcilerRig(t)
+	rec.advertiseHost = "198.51.100.20"
+	mustCreate(t, srv, tenantCtx("alice"), "demo")
+
+	rec.ReconcileOnce(context.Background())
+
+	script := string(host.files["alice-k8s-demo-cp:/root/containarium-bootstrap.sh"])
+	if script == "" {
+		t.Fatal("control plane was never bootstrapped")
+	}
+	if !strings.Contains(script, "--tls-san 198.51.100.20") {
+		t.Errorf("control-plane cert will not cover the published endpoint:\n%s", script)
+	}
+}
