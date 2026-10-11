@@ -96,3 +96,36 @@ func TestBuildMCPTLSConfig_HTTPSWithCAPin(t *testing.T) {
 		t.Fatalf("CA-pin config should succeed: %v", err)
 	}
 	if cfg == nil || cfg.RootCAs == nil {
+		t.Fatal("expected non-nil config with RootCAs populated")
+	}
+	if cfg.MinVersion < 0x0303 { // TLS 1.2 = 0x0303
+		t.Fatalf("MinVersion should be >= TLS 1.2; got %d", cfg.MinVersion)
+	}
+}
+
+func TestBuildMCPTLSConfig_CAFileMissing(t *testing.T) {
+	t.Setenv(mcpTrustedCAFileEnv, "/nonexistent/ca.crt")
+	cfg, err := buildMCPTLSConfig("https://daemon.example.com:8080")
+	if err == nil {
+		t.Fatal("missing CA file must produce an error")
+	}
+	if cfg != nil {
+		t.Fatal("config must be nil when CA file is bad")
+	}
+}
+
+func TestNewClient_StoresTLSConfigError(t *testing.T) {
+	t.Setenv(mcpAllowInsecureEnv, "")
+	c := NewClient("http://daemon.example.com:8080", "test-token")
+	if c.tlsConfigErr == nil {
+		t.Fatal("Client should carry the TLS config error so doRequest can surface it")
+	}
+	// And any doRequest must fail with the stashed error.
+	_, err := c.doRequest("GET", "/v1/anything", nil)
+	if err == nil {
+		t.Fatal("doRequest should refuse when tlsConfigErr is set")
+	}
+	if !strings.Contains(err.Error(), "MCP client refuses") {
+		t.Fatalf("error should be the TLS refusal: %v", err)
+	}
+}
