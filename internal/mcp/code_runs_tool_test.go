@@ -29,3 +29,35 @@ func TestHandleCodeRuns(t *testing.T) {
 	assert.Equal(t, []string{"task", "exited", "0", "2026-09-28T10:00:00Z", "2026-09-28T10:01:00Z", "-", "/tmp/agent-box/task.log"},
 		strings.Fields(lines[1]))
 }
+
+func TestHandleCodeRuns_RequiresBox(t *testing.T) {
+	_, err := handleCodeRuns(NewClient("http://127.0.0.1:0", "t"), map[string]interface{}{})
+	require.Error(t, err)
+}
+
+// code_logs returns one bounded window plus end_offset (tail_log's shape).
+func TestHandleCodeLogs_OneWindow(t *testing.T) {
+	chunk := "hello from the agent\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/containers/alice/code-runs/task/log", r.URL.Path)
+		assert.Equal(t, "40", r.URL.Query().Get("start_offset"))
+		assert.Equal(t, "10", r.URL.Query().Get("follow_seconds"))
+		_, _ = w.Write([]byte(`{"chunk":"` + base64.StdEncoding.EncodeToString([]byte(chunk)) +
+			`","endOffset":"88","truncated":false,"ended":true,"stderrDropped":true}`))
+	}))
+	defer server.Close()
+
+	out, err := handleCodeLogs(NewClient(server.URL, "test-token"), map[string]interface{}{
+		"box": "alice", "run": "task", "start_offset": float64(40), "follow_seconds": float64(99),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "end_offset: 88\nended: true\ntruncated: false\nstderr_dropped: true\n---\n"+chunk, out)
+}
+
+func TestHandleCodeLogs_RequiresBoxAndRun(t *testing.T) {
+	c := NewClient("http://127.0.0.1:0", "t")
+	_, err := handleCodeLogs(c, map[string]interface{}{"box": "alice"})
+	require.Error(t, err)
+	_, err = handleCodeLogs(c, map[string]interface{}{"run": "task"})
+	require.Error(t, err)
+}
