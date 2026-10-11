@@ -40,3 +40,18 @@ func TestHandleTrackerRouteList(t *testing.T) {
 	}))
 	defer server.Close()
 
+	c := NewClient(server.URL, "tok")
+	out, err := handleTrackerRouteList(c, map[string]interface{}{"username": "alice", "connection": "default"})
+	require.NoError(t, err)
+	assert.Contains(t, out, "scope:product")
+	assert.Contains(t, out, "product-define")
+
+	body = `{}`
+	out, err = handleTrackerRouteList(c, map[string]interface{}{"username": "alice", "connection": "default"})
+	require.NoError(t, err)
+	assert.Contains(t, out, "No scope routes")
+}
+
+func TestTrackerRouteList_ScopeIsTrackerAdmin(t *testing.T) {
+	assert.Equal(t, auth.ScopeTrackerAdmin, toolScopeAssignments()["tracker_route_list"])
+}

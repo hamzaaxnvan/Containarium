@@ -112,3 +112,41 @@ func TestHTTPClient_ListCollaborators_Success(t *testing.T) {
 	c, err := NewHTTPClient(srv.URL, "tok")
 	if err != nil {
 		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	resp, err := c.ListCollaborators("alice")
+	if err != nil {
+		t.Fatalf("ListCollaborators: %v", err)
+	}
+
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q; want GET", gotMethod)
+	}
+	if gotPath != "/v1/containers/alice/collaborators" {
+		t.Errorf("path = %q; want /v1/containers/alice/collaborators", gotPath)
+	}
+	if len(resp.GetCollaborators()) != 2 {
+		t.Fatalf("got %d collaborators; want 2", len(resp.GetCollaborators()))
+	}
+	if resp.GetCollaborators()[0].GetCollaboratorUsername() != "bob" {
+		t.Errorf("collaborators[0] username = %q; want bob", resp.GetCollaborators()[0].GetCollaboratorUsername())
+	}
+}
+
+// TestHTTPClient_AddCollaborator_ErrorPropagated pins that a 4xx daemon
+// error surfaces to the caller instead of being swallowed.
+func TestHTTPClient_AddCollaborator_ErrorPropagated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error": "container alice-container does not exist"}`))
+	}))
+	defer srv.Close()
+
+	c, err := NewHTTPClient(srv.URL, "tok")
+	if err != nil {
+		t.Fatalf("NewHTTPClient: %v", err)
+	}
+	_, err = c.AddCollaborator("alice", "bob", []string{"ssh-ed25519 AAAA"}, false, false)
+	if err == nil {
+		t.Fatalf("expected an error for a 400 response, got nil")
+	}
+}
