@@ -103,3 +103,30 @@ func TestSelfHostDecider_CollaboratorWithoutStore(t *testing.T) {
 
 func TestUserIDForLogin(t *testing.T) {
 	for login, want := range map[string]string{
+		"alice":               "alice",
+		"alice-container-bob": "bob",
+		"":                    "",
+	} {
+		if got := UserIDForLogin(login); got != want {
+			t.Errorf("UserIDForLogin(%q) = %q, want %q", login, got, want)
+		}
+	}
+}
+
+func TestNewKeyRecord(t *testing.T) {
+	pub := testKey(t)
+	rec, err := NewKeyRecord(pub, "alice-container-bob", SourceCollaborator, caseNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Username != "alice-container-bob" || rec.UserID != "bob" || rec.Source != SourceCollaborator ||
+		rec.KeyType != pb.SSHKeyType_SSH_KEY_TYPE_ED25519 || !rec.CreatedAt.Equal(caseNow) || !rec.RevokedAt.IsZero() {
+		t.Fatalf("unexpected record %+v", rec)
+	}
+	if len(rec.Fingerprint) < len("SHA256:") || rec.Fingerprint[:7] != "SHA256:" {
+		t.Fatalf("fingerprint %q is not in ssh-keygen SHA256 form", rec.Fingerprint)
+	}
+	if _, err := NewKeyRecord("garbage", "alice", SourceAPI, caseNow); err == nil {
+		t.Fatal("garbage key must not produce a record")
+	}
+}
