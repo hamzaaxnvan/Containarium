@@ -53,3 +53,22 @@ func TestSystemInfoInvalidResponses(t *testing.T) {
 		{"HTTP error", 403, `{"error":"scope required: containers:read","code":403}`, "scope required: containers:read"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			c, err := NewHTTPClient(srv.URL, "tok")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, infoErr := c.GetSystemInfo()
+			_, keyErr := c.ManagedBackupKeyConfigured()
+			for name, err := range map[string]error{"info": infoErr, "managed key": keyErr} {
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("%s error = %v, want %q", name, err, tc.want)
+				}
+			}
+		})
+	}
+}
