@@ -1,0 +1,857 @@
+syntax = "proto3";
+
+package containarium.v1;
+
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+option go_package = "github.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1";
+
+// RouteType represents whether the route is a proxy or passthrough
+enum RouteType {
+  // Unspecified type
+  ROUTE_TYPE_UNSPECIFIED = 0;
+
+  // Proxy route: TLS terminated at Caddy, HTTP/gRPC reverse proxy
+  ROUTE_TYPE_PROXY = 1;
+
+  // Passthrough route: Direct TCP/UDP forwarding via iptables, end-to-end TLS
+  ROUTE_TYPE_PASSTHROUGH = 2;
+}
+
+// RouteProtocol represents the protocol type for a route
+enum RouteProtocol {
+  // Unspecified protocol (defaults to HTTP)
+  ROUTE_PROTOCOL_UNSPECIFIED = 0;
+
+  // HTTP/1.1 and HTTP/2 (standard web traffic) - for proxy routes
+  ROUTE_PROTOCOL_HTTP = 1;
+
+  // gRPC (requires HTTP/2 transport) - for proxy routes
+  ROUTE_PROTOCOL_GRPC = 2;
+
+  // TCP passthrough - for passthrough routes
+  ROUTE_PROTOCOL_TCP = 3;
+
+  // UDP passthrough - for passthrough routes
+  ROUTE_PROTOCOL_UDP = 4;
+
+  // TLS passthrough - SNI-based routing without TLS termination (for mTLS gRPC)
+  ROUTE_PROTOCOL_TLS_PASSTHROUGH = 5;
+}
+
+// ACLAction represents the action to take when a rule matches
+enum ACLAction {
+  // Unspecified action (should not be used)
+  ACL_ACTION_UNSPECIFIED = 0;
+
+  // Allow the traffic
+  ACL_ACTION_ALLOW = 1;
+
+  // Drop the traffic silently
+  ACL_ACTION_DROP = 2;
+
+  // Reject the traffic with ICMP response
+  ACL_ACTION_REJECT = 3;
+}
+
+// ACLPreset represents predefined firewall rule sets
+enum ACLPreset {
+  // Unspecified preset
+  ACL_PRESET_UNSPECIFIED = 0;
+
+  // Full isolation: only allow HTTP from proxy, block inter-container traffic
+  ACL_PRESET_FULL_ISOLATION = 1;
+
+  // HTTP only: allow HTTP/HTTPS inbound, standard egress
+  ACL_PRESET_HTTP_ONLY = 2;
+
+  // Permissive: allow all traffic (for development)
+  ACL_PRESET_PERMISSIVE = 3;
+
+  // Custom: user-defined rules
+  ACL_PRESET_CUSTOM = 4;
+}
+
+// ACLRule represents a single firewall rule
+message ACLRule {
+  // Rule priority (lower number = higher priority)
+  int32 priority = 1;
+
+  // Action to take when rule matches
+  ACLAction action = 2;
+
+  // Source address (CIDR notation, "@internal", "@external", or "*")
+  string source = 3;
+
+  // Destination address (CIDR notation, "@internal", "@external", or "*")
+  string destination = 4;
+
+  // Destination port(s): "80", "80,443", "1000-2000", or "*"
+  string destination_port = 5;
+
+  // Protocol: "tcp", "udp", "icmp", or "*"
+  string protocol = 6;
+
+  // Human-readable description
+  string description = 7;
+}
+
+// NetworkACL represents firewall rules for a container/app
+message NetworkACL {
+  // Unique ACL ID
+  string id = 1;
+
+  // ACL name (e.g., "acl-alice-web")
+  string name = 2;
+
+  // Description
+  string description = 3;
+
+  // Preset type (if using a predefined rule set)
+  ACLPreset preset = 4;
+
+  // Ingress (inbound) rules
+  repeated ACLRule ingress_rules = 5;
+
+  // Egress (outbound) rules
+  repeated ACLRule egress_rules = 6;
+
+  // Associated app ID (if app-specific)
+  string app_id = 7;
+
+  // Associated container name
+  string container_name = 8;
+}
+
+// ProxyRoute represents a DNS/domain to container mapping
+message ProxyRoute {
+  // Subdomain (e.g., "alice-web")
+  string subdomain = 1;
+
+  // Full domain (e.g., "alice-web.containarium.dev")
+  string full_domain = 2;
+
+  // Container IP address
+  string container_ip = 3;
+
+  // Container port
+  int32 port = 4;
+
+  // Whether the route is active
+  bool active = 5;
+
+  // Associated app ID
+  string app_id = 6;
+
+  // Associated app name
+  string app_name = 7;
+
+  // Owner username
+  string username = 8;
+
+  // Protocol type (HTTP or gRPC)
+  RouteProtocol protocol = 9;
+
+  // Name of the container this route forwards to (the box behind the
+  // upstream IP), e.g. "cld-abc123". Resolved from the route record or by
+  // reverse-lookup of container_ip. Distinct from app_name (the display
+  // name): a multi-tenant control plane keys its route reconciler on the
+  // container, so it needs the box identity, not just the display label.
+  string container_name = 10;
+}
+
+// PassthroughRoute represents a direct TCP/UDP port forwarding rule
+message PassthroughRoute {
+  // External port on the host
+  int32 external_port = 1;
+
+  // Target container IP address
+  string target_ip = 2;
+
+  // Target port on the container
+  int32 target_port = 3;
+
+  // Protocol: TCP or UDP
+  RouteProtocol protocol = 4;
+
+  // Whether the route is active
+  bool active = 5;
+
+  // Associated container name (for display)
+  string container_name = 6;
+
+  // Description
+  string description = 7;
+}
+
+// NetworkNode represents a node in the network topology
+message NetworkNode {
+  // Node ID
+  string id = 1;
+
+  // Node type: "proxy", "container", "app"
+  string type = 2;
+
+  // Display name
+  string name = 3;
+
+  // IP address (if applicable)
+  string ip_address = 4;
+
+  // Node state: "running", "stopped", "error"
+  string state = 5;
+
+  // Associated ACL name
+  string acl_name = 6;
+}
+
+// NetworkEdge represents a connection between nodes
+message NetworkEdge {
+  // Source node ID
+  string source = 1;
+
+  // Target node ID
+  string target = 2;
+
+  // Edge type: "route", "blocked", "allowed"
+  string type = 3;
+
+  // Port(s) on this edge
+  string ports = 4;
+
+  // Protocol
+  string protocol = 5;
+}
+
+// NetworkTopology represents the complete network visualization
+message NetworkTopology {
+  // All nodes in the network
+  repeated NetworkNode nodes = 1;
+
+  // All edges (connections) between nodes
+  repeated NetworkEdge edges = 2;
+
+  // Network CIDR (e.g., "10.100.0.0/24")
+  string network_cidr = 3;
+
+  // Gateway IP
+  string gateway_ip = 4;
+}
+
+// GetRoutesRequest lists all proxy routes
+message GetRoutesRequest {
+  // Filter by username (optional)
+  string username = 1;
+
+  // Filter by active status (optional)
+  bool active_only = 2;
+}
+
+message GetRoutesResponse {
+  // List of routes
+  repeated ProxyRoute routes = 1;
+
+  // Total count
+  int32 total_count = 2;
+}
+
+// AddRouteRequest adds a new proxy route
+message AddRouteRequest {
+  // Domain name (e.g., "test.example.com" or subdomain like "myapp")
+  string domain = 1;
+
+  // Target container IP address
+  string target_ip = 2;
+
+  // Target port on the container
+  int32 target_port = 3;
+
+  // Optional: Associated container name (for display purposes)
+  string container_name = 4;
+
+  // Optional: Description
+  string description = 5;
+
+  // Protocol type (HTTP or gRPC, defaults to HTTP)
+  RouteProtocol protocol = 6;
+}
+
+message AddRouteResponse {
+  // The created route
+  ProxyRoute route = 1;
+
+  // Status message
+  string message = 2;
+}
+
+// UpdateRouteRequest updates an existing proxy route
+message UpdateRouteRequest {
+  // Domain name to update
+  string domain = 1;
+
+  // New target container IP address (optional, empty means no change)
+  string target_ip = 2;
+
+  // New target port (optional, 0 means no change)
+  int32 target_port = 3;
+
+  // Optional: Associated container name
+  string container_name = 4;
+
+  // Optional: Description
+  string description = 5;
+
+  // Protocol type (HTTP or gRPC, defaults to HTTP)
+  RouteProtocol protocol = 6;
+
+  // Enable or disable the route (optional, only updated if set)
+  optional bool active = 7;
+}
+
+message UpdateRouteResponse {
+  // The updated route
+  ProxyRoute route = 1;
+
+  // Status message
+  string message = 2;
+}
+
+// DeleteRouteRequest removes a proxy route
+message DeleteRouteRequest {
+  // Domain name to delete
+  string domain = 1;
+}
+
+message DeleteRouteResponse {
+  // Status message
+  string message = 2;
+}
+
+// ListPassthroughRoutesRequest lists all passthrough routes
+message ListPassthroughRoutesRequest {}
+
+message ListPassthroughRoutesResponse {
+  // List of passthrough routes
+  repeated PassthroughRoute routes = 1;
+
+  // Total count
+  int32 total_count = 2;
+}
+
+// AddPassthroughRouteRequest adds a new passthrough route
+message AddPassthroughRouteRequest {
+  // External port on the host
+  int32 external_port = 1;
+
+  // Target container IP address
+  string target_ip = 2;
+
+  // Target port on the container
+  int32 target_port = 3;
+
+  // Protocol: TCP or UDP (defaults to TCP)
+  RouteProtocol protocol = 4;
+
+  // Optional: Associated container name (for display)
+  string container_name = 5;
+
+  // Optional: Description
+  string description = 6;
+}
+
+message AddPassthroughRouteResponse {
+  // The created route
+  PassthroughRoute route = 1;
+
+  // Status message
+  string message = 2;
+}
+
+// DeletePassthroughRouteRequest removes a passthrough route
+message DeletePassthroughRouteRequest {
+  // External port to remove
+  int32 external_port = 1;
+
+  // Protocol: TCP or UDP
+  RouteProtocol protocol = 2;
+}
+
+message DeletePassthroughRouteResponse {
+  // Status message
+  string message = 1;
+}
+
+// UpdatePassthroughRouteRequest updates an existing passthrough route
+message UpdatePassthroughRouteRequest {
+  // External port to update (required, identifies the route)
+  int32 external_port = 1;
+
+  // Protocol: TCP or UDP (required, identifies the route)
+  RouteProtocol protocol = 2;
+
+  // New target IP (optional, empty means no change)
+  string target_ip = 3;
+
+  // New target port (optional, 0 means no change)
+  int32 target_port = 4;
+
+  // Optional: Associated container name (for display)
+  string container_name = 5;
+
+  // Optional: Description
+  string description = 6;
+
+  // Enable or disable the route (optional, only updated if set)
+  optional bool active = 7;
+}
+
+message UpdatePassthroughRouteResponse {
+  // The updated route
+  PassthroughRoute route = 1;
+
+  // Status message
+  string message = 2;
+}
+
+// DNSRecord represents a DNS record
+message DNSRecord {
+  // Record type (A, CNAME, etc.)
+  string type = 1;
+
+  // Record name (subdomain or @ for root)
+  string name = 2;
+
+  // Record data (IP address for A records)
+  string data = 3;
+
+  // TTL in seconds
+  int32 ttl = 4;
+}
+
+// ListDNSRecordsRequest lists DNS records for the configured domain
+message ListDNSRecordsRequest {
+  // Optional record type filter (e.g., "A", "CNAME")
+  string record_type = 1;
+}
+
+message ListDNSRecordsResponse {
+  // DNS records
+  repeated DNSRecord records = 1;
+
+  // Base domain
+  string base_domain = 2;
+
+  // Total count
+  int32 total_count = 3;
+}
+
+// GetContainerACLRequest gets firewall rules for a DevBox container
+message GetContainerACLRequest {
+  // Username (container owner)
+  string username = 1;
+}
+
+message GetContainerACLResponse {
+  // Firewall rules
+  NetworkACL acl = 1;
+}
+
+// UpdateContainerACLRequest updates firewall rules for a DevBox container
+message UpdateContainerACLRequest {
+  // Username (container owner)
+  string username = 1;
+
+  // Use a preset (mutually exclusive with custom rules)
+  ACLPreset preset = 2;
+
+  // Custom ingress rules. No longer accepted (#2359): tenant ingress is owned
+  // by the tenant network guard, and a per-container allow would be evaluated
+  // next to it and could re-open what it closed. A request carrying any is
+  // refused with INVALID_ARGUMENT; to admit another tenant use
+  // NetworkPolicy.allow_from_tenants. Presets apply their egress half only.
+  repeated ACLRule ingress_rules = 3;
+
+  // Custom egress rules (only if preset is CUSTOM)
+  repeated ACLRule egress_rules = 4;
+}
+
+message UpdateContainerACLResponse {
+  // Updated ACL
+  NetworkACL acl = 1;
+
+  // Status message
+  string message = 2;
+}
+
+// GetNetworkTopologyRequest gets network visualization data
+message GetNetworkTopologyRequest {
+  // Include stopped containers/apps
+  bool include_stopped = 1;
+}
+
+message GetNetworkTopologyResponse {
+  // Network topology data
+  NetworkTopology topology = 1;
+}
+
+// ListACLPresetsRequest lists available ACL presets
+message ListACLPresetsRequest {}
+
+message ACLPresetInfo {
+  // Preset type
+  ACLPreset preset = 1;
+
+  // Display name
+  string name = 2;
+
+  // Description
+  string description = 3;
+
+  // Default ingress rules for this preset
+  repeated ACLRule default_ingress_rules = 4;
+
+  // Default egress rules for this preset
+  repeated ACLRule default_egress_rules = 5;
+}
+
+message ListACLPresetsResponse {
+  // Available presets
+  repeated ACLPresetInfo presets = 1;
+}
+
+// GuardMode is a NIC-ACL guard's arming state (internal/nicguard). There
+// is no audit mode: an Incus NIC ACL either drops or it doesn't.
+enum GuardMode {
+  GUARD_MODE_UNSPECIFIED = 0;
+  // The guard is disabled on this host (CONTAINARIUM_*_GUARD=off).
+  GUARD_MODE_OFF = 1;
+  // The guard attaches ACLs and they drop (the default).
+  GUARD_MODE_ENFORCE = 2;
+}
+
+// GuardEntry is one guarded subject (a core-role or tenant container) as of
+// the guard's last pass.
+message GuardEntry {
+  string container = 1;
+  // Role for the core guard (e.g. core-postgres); tenant for the tenant guard.
+  string subject = 2;
+  string ip = 3;
+  string acl_name = 4;
+  bool attached = 5;
+  string last_error = 6;
+}
+
+// GuardStatus is one guard's last-pass snapshot.
+message GuardStatus {
+  GuardMode mode = 1;
+  // Incus firewall driver seen on the last pass ("nftables" is required).
+  string firewall_driver = 2;
+  // Unsupported is true when this host cannot carry bridge NIC ACLs at all
+  // (firewall driver, or Incus without network_bridge_acl_devices): nothing
+  // is guarded, creates are not refused, last_error says why.
+  bool unsupported = 3;
+  // last_pass is the RFC 3339 time of the last pass; empty before the first.
+  string last_pass = 4;
+  string last_error = 5;
+  // stale_since is set (RFC 3339) while passes keep failing; the ACLs from
+  // the last good pass stay in force meanwhile.
+  string stale_since = 6;
+  repeated GuardEntry entries = 7;
+  // Containers the guard could not attribute (tenant guard) or roles its
+  // table does not know (core guard). Reported, never guessed.
+  repeated string unresolved = 8;
+  // Number of distinct subjects (tenants for the tenant guard).
+  int32 subjects = 9;
+  // Instances carrying no user.containarium.* key (made directly in Incus,
+  // or a VM). Left unguarded and listed for information only; unlike
+  // unresolved they do not degrade the verdict (#2396).
+  repeated string unmanaged = 10;
+}
+
+message GetNetworkGuardStatusRequest {}
+
+// NetworkGuardStatus is the posture of both Incus NIC-ACL guards on this
+// backend (docs/architecture/tenant-network-guard.md).
+message NetworkGuardStatus {
+  // core keeps tenants off core-role containers (#2084).
+  GuardStatus core = 1;
+  // tenant keeps tenants off each other (#2347).
+  GuardStatus tenant = 2;
+}
+
+// NetworkService provides network and firewall management
+service NetworkService {
+  // Reports native creation separately from atomic cross-Tenant policy writes.
+  rpc GetNetworkTenantCapabilities(GetNetworkTenantCapabilitiesRequest) returns (GetNetworkTenantCapabilitiesResponse) {
+    option (google.api.http) = {get: "/v1/network-tenants/capabilities"};
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get native network Tenant capabilities"
+      description: "Authenticated admin capability query; policy writes are not implied by shared creation."
+      tags: "Network"
+    };
+  }
+
+  // GetNetworkGuardStatus reports both NIC-ACL guards' last-pass state.
+  rpc GetNetworkGuardStatus(GetNetworkGuardStatusRequest) returns (NetworkGuardStatus) {
+    option (google.api.http) = {
+      get: "/v1/network/guard"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Network guard status";
+      description: "Reports the core-infra guard (#2084) and the tenant guard (#2347): arming mode, Incus firewall driver, whether this host can carry bridge NIC ACLs at all, the last pass time and error, and one entry per guarded container. Admin only.";
+      tags: "Network";
+    };
+  }
+
+
+  // GetRoutes lists all proxy routes (DNS to container mappings)
+  rpc GetRoutes(GetRoutesRequest) returns (GetRoutesResponse) {
+    option (google.api.http) = {
+      get: "/v1/network/routes"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List proxy routes";
+      description: "Returns all DNS/domain to container mappings configured in the reverse proxy.";
+      tags: "Network";
+    };
+  }
+
+  // AddRoute adds a new proxy route (domain to container mapping)
+  rpc AddRoute(AddRouteRequest) returns (AddRouteResponse) {
+    option (google.api.http) = {
+      post: "/v1/network/routes"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Add proxy route";
+      description: "Creates a new DNS/domain to container mapping in the reverse proxy.";
+      tags: "Network";
+    };
+  }
+
+  // UpdateRoute updates an existing proxy route
+  rpc UpdateRoute(UpdateRouteRequest) returns (UpdateRouteResponse) {
+    option (google.api.http) = {
+      put: "/v1/network/routes/{domain}"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Update proxy route";
+      description: "Updates an existing DNS/domain to container mapping.";
+      tags: "Network";
+    };
+  }
+
+  // DeleteRoute removes a proxy route
+  rpc DeleteRoute(DeleteRouteRequest) returns (DeleteRouteResponse) {
+    option (google.api.http) = {
+      delete: "/v1/network/routes/{domain}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Delete proxy route";
+      description: "Removes a DNS/domain to container mapping from the reverse proxy.";
+      tags: "Network";
+    };
+  }
+
+  // ListDNSRecords lists DNS records for the configured base domain
+  rpc ListDNSRecords(ListDNSRecordsRequest) returns (ListDNSRecordsResponse) {
+    option (google.api.http) = {
+      get: "/v1/network/dns-records"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List DNS records";
+      description: "Returns DNS records configured for the base domain. Useful for selecting available subdomains when creating routes.";
+      tags: "Network";
+    };
+  }
+
+  // ListPassthroughRoutes lists all TCP/UDP passthrough routes
+  rpc ListPassthroughRoutes(ListPassthroughRoutesRequest) returns (ListPassthroughRoutesResponse) {
+    option (google.api.http) = {
+      get: "/v1/network/passthrough"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List passthrough routes";
+      description: "Returns all TCP/UDP port forwarding rules configured via iptables. These routes provide direct passthrough without TLS termination.";
+      tags: "Network";
+    };
+  }
+
+  // AddPassthroughRoute adds a new TCP/UDP passthrough route
+  rpc AddPassthroughRoute(AddPassthroughRouteRequest) returns (AddPassthroughRouteResponse) {
+    option (google.api.http) = {
+      post: "/v1/network/passthrough"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Add passthrough route";
+      description: "Creates a new TCP/UDP port forwarding rule via iptables. Traffic is forwarded directly to the container without TLS termination, suitable for mTLS or custom protocols.";
+      tags: "Network";
+    };
+  }
+
+  // DeletePassthroughRoute removes a TCP/UDP passthrough route
+  rpc DeletePassthroughRoute(DeletePassthroughRouteRequest) returns (DeletePassthroughRouteResponse) {
+    option (google.api.http) = {
+      delete: "/v1/network/passthrough/{external_port}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Delete passthrough route";
+      description: "Removes a TCP/UDP port forwarding rule from iptables.";
+      tags: "Network";
+    };
+  }
+
+  // UpdatePassthroughRoute updates an existing TCP/UDP passthrough route
+  rpc UpdatePassthroughRoute(UpdatePassthroughRouteRequest) returns (UpdatePassthroughRouteResponse) {
+    option (google.api.http) = {
+      put: "/v1/network/passthrough/{external_port}"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Update passthrough route";
+      description: "Updates an existing TCP/UDP port forwarding rule. Can be used to enable/disable the route or change the target.";
+      tags: "Network";
+    };
+  }
+
+  // GetContainerACL gets firewall rules for a DevBox container
+  rpc GetContainerACL(GetContainerACLRequest) returns (GetContainerACLResponse) {
+    option (google.api.http) = {
+      get: "/v1/containers/{username}/acl"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get container firewall rules";
+      description: "Returns the network ACL (firewall rules) configured for a user's DevBox container.";
+      tags: "Network";
+    };
+  }
+
+  // UpdateContainerACL updates firewall rules for a DevBox container
+  rpc UpdateContainerACL(UpdateContainerACLRequest) returns (UpdateContainerACLResponse) {
+    option (google.api.http) = {
+      put: "/v1/containers/{username}/acl"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Update container firewall rules";
+      description: "Updates the network ACL for a DevBox container. Use a preset for common configurations or specify custom rules.";
+      tags: "Network";
+    };
+  }
+
+  // GetNetworkTopology returns network visualization data
+  rpc GetNetworkTopology(GetNetworkTopologyRequest) returns (GetNetworkTopologyResponse) {
+    option (google.api.http) = {
+      get: "/v1/network/topology"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get network topology";
+      description: "Returns the network topology including all containers, apps, proxy routes, and their connections for visualization.";
+      tags: "Network";
+    };
+  }
+
+  // ListACLPresets lists available firewall presets
+  rpc ListACLPresets(ListACLPresetsRequest) returns (ListACLPresetsResponse) {
+    option (google.api.http) = {
+      get: "/v1/network/acl-presets"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List ACL presets";
+      description: "Returns available firewall rule presets with their default configurations.";
+      tags: "Network";
+    };
+  }
+
+  // StartEgressProxy starts a source-restricted relay that lets a box egress
+  // through an operator-reachable SOCKS — "egress via client" (#808). The
+  // operator first opens `ssh -R 127.0.0.1:<upstream_port>:localhost:<socks>`
+  // to expose their SOCKS on the host loopback; this RPC then bridges that
+  // host-netns listener into the box's netns, scoped to the box's source IP.
+  rpc StartEgressProxy(StartEgressProxyRequest) returns (StartEgressProxyResponse) {
+    option (google.api.http) = {
+      post: "/v1/network/egress-proxy"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Start egress-via-client proxy";
+      description: "Bridges a host-loopback SOCKS (exposed by the caller via ssh -R) into a box's network namespace via a source-restricted relay, so the box egresses with the operator's IP.";
+      tags: "Network";
+    };
+  }
+
+  // StopEgressProxy stops the egress-via-client relay for a box.
+  rpc StopEgressProxy(StopEgressProxyRequest) returns (StopEgressProxyResponse) {
+    option (google.api.http) = {
+      delete: "/v1/network/egress-proxy/{container_name}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Stop egress-via-client proxy";
+      description: "Tears down the source-restricted egress relay for the named box.";
+      tags: "Network";
+    };
+  }
+}
+
+// StartEgressProxyRequest asks the daemon to bridge a host-loopback SOCKS into
+// a box's netns (#808 egress-via-client).
+message StartEgressProxyRequest {
+  // Box (container) whose egress should be routed.
+  string container_name = 1;
+
+  // Host-loopback port where the caller has exposed their SOCKS proxy via
+  // `ssh -R 127.0.0.1:<upstream_port>:localhost:<local-socks>`. The daemon's
+  // relay forwards box connections to 127.0.0.1:<upstream_port>.
+  int32 upstream_port = 2;
+
+  // Optional bridge-gateway port the in-box relay should listen on. 0 = the
+  // daemon picks a free port.
+  int32 proxy_port = 3;
+}
+
+// StartEgressProxyResponse returns the in-box SOCKS address to point apps at.
+message StartEgressProxyResponse {
+  // SOCKS address reachable from inside the box, e.g. "10.100.0.1:18080".
+  // Point the box's apps at socks5://<socks_address> (Chrome:
+  // --proxy-server=socks5://<socks_address>).
+  string socks_address = 1;
+}
+
+// StopEgressProxyRequest tears down the egress relay for a box.
+message StopEgressProxyRequest {
+  string container_name = 1;
+}
+
+// StopEgressProxyResponse is the (empty) ack for a teardown.
+message StopEgressProxyResponse {
+  bool stopped = 1;
+}
+
+// GetNetworkTenantCapabilitiesRequest requests the local native contract.
+message GetNetworkTenantCapabilitiesRequest {}
+// GetNetworkTenantCapabilitiesResponse is the capability handshake between a
+// daemon and its clients (CLI, Host MCP, external gRPC consumers). Clients
+// must match contract against the daemon-published constant
+// (incus.NativeTenantContractID, "native-network-tenant/v1") before relying
+// on the additive create-time network_tenant field.
+message GetNetworkTenantCapabilitiesResponse {
+  // Stable contract identifier; never infer capabilities from a version string.
+  string contract = 1;
+  // Provider list/get exposes resolved native membership and source.
+  bool native_membership_read = 2;
+  // Current local enforced Guard and create path are ready for shared creation.
+  bool shared_tenant_create = 3;
+  // Atomic ingress-only cross-Tenant editing support, independent of creation.
+  bool atomic_tenant_access = 4;
+  // Current credential authorization for the atomic policy contract.
+  bool network_policy_write = 5;
+  // Explanation when local shared creation is unavailable.
+  string reason = 6;
+  // Scope of verified creation and membership evidence: local-lxc
+  // (incus.NativeTenantBackendScope) — this daemon's own local Linux LXC
+  // backend only.
+  string backend_scope = 7;
+}
