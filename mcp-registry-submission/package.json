@@ -33,3 +33,39 @@
     "capabilities": {
       "tools": true
     },
+    "tools": [
+      {
+        "name": "create_container",
+        "description": "Create a new LXC container with specified resources"
+      },
+      {
+        "name": "list_containers",
+        "description": "List all containers with their status"
+      },
+      {
+        "name": "get_container",
+        "description": "Get detailed information about a specific container"
+      },
+      {
+        "name": "delete_container",
+        "description": "Delete a container permanently"
+      },
+      {
+        "name": "start_container",
+        "description": "Start a stopped container"
+      },
+      {
+        "name": "stop_container",
+        "description": "Stop a running container"
+      },
+      {
+        "name": "get_metrics",
+        "description": "Get runtime metrics for containers"
+      },
+      {
+        "name": "get_system_info",
+        "description": "Get information about the host system"
+      }
+    ]
+  }
+}
