@@ -88,3 +88,26 @@ func TestBackupRestore_RefusesIdentityOverCleartext(t *testing.T) {
 
 	err := runBackupRestore(backupRestoreCmd, []string{"alice-app-x"})
 	if err == nil || !strings.Contains(err.Error(), "age identity") {
+		t.Fatalf("expected a refusal naming the age identity, got %v", err)
+	}
+	if f.gotRestore != nil {
+		t.Error("the key must not be sent: no restore call may be made")
+	}
+}
+
+// Without an identity nothing secret is in the request, so cleartext
+// behaves exactly as before.
+func TestBackupVerify_NoIdentity_CleartextUnchanged(t *testing.T) {
+	f := &fakeBackupAPI{resp: &pb.VerifyBackupResponse{
+		Message:      "ok",
+		Verification: &pb.BackupVerification{Result: pb.VerificationResult_VERIFICATION_RESULT_PASSED},
+	}}
+	withFakeBackupClient(t, f)
+	setTransportGlobals(t, "http://host.example.com", true, false)
+	backupVerifyTarget = "scratch-tenant"
+	backupVerifyAgeIdentityFile = ""
+
+	if err := runBackupVerify(backupVerifyCmd, []string{"alice-app-x"}); err != nil {
+		t.Fatalf("verify without an identity must not be affected by the guard: %v", err)
+	}
+}
