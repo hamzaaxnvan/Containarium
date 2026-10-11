@@ -140,3 +140,99 @@ func TestPprofClientTimeoutOutlastsCPUWindow(t *testing.T) {
 // signs a request, the real sentinel handler serves a real heap profile behind
 // the real HMAC middleware, and the profile lands on disk. The unit tests above
 // cover URL assembly; this one covers "does the whole thing actually work".
+func TestSentinelPprofEndToEnd(t *testing.T) {
+	const secret = "e2e-pprof-admin-secret-32-bytes-ok!!"
+
+	var mgr sentinel.Manager
+	srv := httptest.NewServer(auth.SentinelHMACMiddleware([]byte(secret), mgr.PprofHandler()))
+	t.Cleanup(srv.Close)
+
+	out := filepath.Join(t.TempDir(), "heap.pb.gz")
+	t.Cleanup(resetSentinelPprofFlags)
+	resetSentinelPprofFlags()
+	sentinelPprofURL = srv.URL
+	sentinelPprofProfile = "heap"
+	sentinelPprofOutput = out
+	sentinelPprofGC = true
+	sentinelPprofSecret = secret
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := runSentinelPprof(cmd, nil); err != nil {
+		t.Fatalf("runSentinelPprof: %v", err)
+	}
+
+	fi, err := os.Stat(out)
+	if err != nil {
+		t.Fatalf("profile not written: %v", err)
+	}
+	// A heap profile carries whatever the process holds in memory; it must not
+	// be group/world readable on the operator's workstation.
+	if perm := fi.Mode().Perm(); perm != 0600 {
+		t.Errorf("profile mode = %04o, want 0600 — it contains sentinel heap contents", perm)
+	}
+
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read profile: %v", err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("saved file is not a gzipped profile, go tool pprof cannot open it: %v", err)
+	}
+	defer func() { _ = zr.Close() }()
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("corrupt profile: %v", err)
+	}
+	if !bytes.Contains(raw, []byte("inuse_space")) {
+		t.Error("saved heap profile has no inuse_space sample type")
+	}
+}
+
+// TestSentinelPprofRejectsWrongSecret pins the operator-facing half of the
+// gate: a bad secret must produce an actionable 401 message, not a stray file.
+func TestSentinelPprofRejectsWrongSecret(t *testing.T) {
+	var mgr sentinel.Manager
+	srv := httptest.NewServer(auth.SentinelHMACMiddleware([]byte("the-real-admin-secret-32-bytes-long!"), mgr.PprofHandler()))
+	t.Cleanup(srv.Close)
+
+	out := filepath.Join(t.TempDir(), "heap.pb.gz")
+	t.Cleanup(resetSentinelPprofFlags)
+	resetSentinelPprofFlags()
+	sentinelPprofURL = srv.URL
+	sentinelPprofProfile = "heap"
+	sentinelPprofOutput = out
+	sentinelPprofSecret = "a-different-admin-secret-32-bytes-x!"
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+
+	err := runSentinelPprof(cmd, nil)
+	if err == nil {
+		t.Fatal("want an error on a wrong secret, got nil")
+	}
+	if !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), config.EnvSentinelAdminSecret) {
+		t.Errorf("error = %q, want it to mention 401 and %s so the operator knows what to fix", err, config.EnvSentinelAdminSecret)
+	}
+	if _, statErr := os.Stat(out); statErr == nil {
+		t.Error("a rejected request still created the output file")
+	}
+}
+
+// resetSentinelPprofFlags clears the package-level flag vars between tests, so
+// one test's settings cannot leak into another's.
+func resetSentinelPprofFlags() {
+	sentinelPprofURL = ""
+	sentinelPprofProfile = "heap"
+	sentinelPprofOutput = ""
+	sentinelPprofSeconds = 0
+	sentinelPprofDebug = 0
+	sentinelPprofGC = false
+	sentinelPprofList = false
+	sentinelPprofSecret = ""
+}
