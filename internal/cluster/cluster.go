@@ -137,3 +137,97 @@ type Cluster struct {
 	APIEndpoint string
 	NodeGroups  []NodeGroup
 	// NodeIsolation is the cluster's isolation class, fixed at create
+	// and never rewritten. Stores resolve an unset value to
+	// IsolationVM, so a read never has to guess.
+	NodeIsolation Isolation
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+// Node is one VM belonging to a cluster.
+type Node struct {
+	Owner     string
+	Cluster   string
+	VMName    string
+	Role      string
+	Group     string
+	State     NodeState
+	CreatedAt time.Time
+}
+
+// Event is one entry in a cluster's scale history.
+type Event struct {
+	At     time.Time
+	Kind   EventKind
+	Group  string
+	Reason string
+}
+
+// DefaultNodeGroups are the platform's preset size classes. The
+// autoscaler advertises one node group per class and picks the class
+// whose template fits pending pods; presets exist so `cluster create`
+// works with no size flags at all.
+func DefaultNodeGroups() []NodeGroup {
+	return []NodeGroup{
+		{Name: "small", Size: Size{CPU: "2", Memory: "4GB", Disk: "40GB"}, MinNodes: 1, MaxNodes: 3},
+		{Name: "medium", Size: Size{CPU: "4", Memory: "8GB", Disk: "80GB"}, MinNodes: 0, MaxNodes: 2},
+		{Name: "large", Size: Size{CPU: "8", Memory: "16GB", Disk: "160GB"}, MinNodes: 0, MaxNodes: 1},
+	}
+}
+
+// nameRE is DNS-label syntax capped at 20 chars: the VM naming scheme
+// `<tenant>-k8s-<cluster>-<group>-<n>` has to stay inside Incus's
+// 63-char instance-name limit with room for the tenant's own name.
+var nameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,18}[a-z0-9])?$`)
+
+// sizeRE matches the house memory/disk format ("4GB", "512MB", "1TB").
+var sizeRE = regexp.MustCompile(`^[1-9][0-9]*(MB|GB|TB)$`)
+
+// ValidateName checks cluster (and group) name syntax.
+func ValidateName(name string) error {
+	if !nameRE.MatchString(name) {
+		return fmt.Errorf("invalid name %q: must be a lowercase DNS label of at most 20 characters", name)
+	}
+	return nil
+}
+
+// ValidateNodeGroups checks a replacement set of node groups: at least
+// one group, unique label-valid names, positive integer CPU, parseable
+// memory/disk, 0 <= min <= max per group, and at least one schedulable
+// node across the pool (sum of max >= 1).
+func ValidateNodeGroups(groups []NodeGroup) error {
+	if len(groups) == 0 {
+		return errors.New("at least one node group is required")
+	}
+	seen := make(map[string]bool, len(groups))
+	var totalMax int64
+	for _, g := range groups {
+		if err := ValidateName(g.Name); err != nil {
+			return fmt.Errorf("node group: %w", err)
+		}
+		if seen[g.Name] {
+			return fmt.Errorf("duplicate node group name %q", g.Name)
+		}
+		seen[g.Name] = true
+		if cpu, err := strconv.Atoi(g.Size.CPU); err != nil || cpu <= 0 {
+			return fmt.Errorf("node group %q: cpu must be a positive integer, got %q", g.Name, g.Size.CPU)
+		}
+		if !sizeRE.MatchString(g.Size.Memory) {
+			return fmt.Errorf("node group %q: memory must look like \"8GB\", got %q", g.Name, g.Size.Memory)
+		}
+		if !sizeRE.MatchString(g.Size.Disk) {
+			return fmt.Errorf("node group %q: disk must look like \"80GB\", got %q", g.Name, g.Size.Disk)
+		}
+		if g.MinNodes < 0 {
+			return fmt.Errorf("node group %q: min_nodes must be >= 0, got %d", g.Name, g.MinNodes)
+		}
+		if g.MaxNodes < g.MinNodes {
+			return fmt.Errorf("node group %q: max_nodes (%d) must be >= min_nodes (%d)", g.Name, g.MaxNodes, g.MinNodes)
+		}
+		totalMax += int64(g.MaxNodes)
+	}
+	if totalMax < 1 {
+		return errors.New("node pool must allow at least one node (sum of max_nodes >= 1)")
+	}
+	return nil
+}
