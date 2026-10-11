@@ -328,3 +328,113 @@ func TestChain_ALegalHoldStopsThePrefixAtTheOldestHeldOrOrglessRow(t *testing.T)
 		if _, _, n := e.ids(t); n != 30 {
 			t.Fatalf("%d rows remain, want all 30: with a hold active nothing org-less may be purged", n)
 		}
+	})
+	t.Run("a held org's oldest row bounds the purge", func(t *testing.T) {
+		var rows []chainRow
+		for i := 0; i < 30; i++ {
+			org := "org-b"
+			if i == 7 { // id 8
+				org = "org-a"
+			}
+			rows = append(rows, chainRow{"api_access", 200, org})
+		}
+		e := newChainEnv(t, rows)
+		e.anchorAt(t, 25)
+		if _, err := e.store.SetHold(e.ctx, "org-a", "case", "admin", nil); err != nil {
+			t.Fatal(err)
+		}
+		rep := e.enforce(t)
+		min, max, _ := e.ids(t)
+		if min != 8 || max != 30 {
+			t.Fatalf("ids %d..%d, want 8..30: the purge stops at the held org's oldest row (id 8)", min, max)
+		}
+		e.verify(t)
+		if got := entry(t, rep, gwClass); got.GetChainBase().GetBaseId() != 7 {
+			t.Errorf("base = %v, want id 7", got.GetChainBase())
+		}
+
+		// Once the hold is released the rest of the prefix goes on the next sweep.
+		if _, err := e.store.ReleaseHold(e.ctx, "org-a", "admin", nil); err != nil {
+			t.Fatal(err)
+		}
+		e.enforce(t)
+		if min, _, _ := e.ids(t); min != 25 {
+			t.Fatalf("after the release the purge stops at the anchor: min id %d, want 25", min)
+		}
+		e.verify(t)
+	})
+}
+
+func TestChain_RemovePrefixWaitsForAHoldThatIsBeingPlaced(t *testing.T) {
+	e := newChainEnv(t, expiredThenFresh())
+	e.anchorAt(t, 15)
+	tx, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(e.ctx) }()
+	if _, err := tx.Exec(e.ctx, `INSERT INTO retention_legal_holds (org_id, reason, set_by, set_at) VALUES ('org-a', 'case', 'admin', now())`); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		res retention.PrefixRemoval
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(e.ctx, 20*time.Second)
+		defer cancel()
+		cut := time.Now().AddDate(0, 0, -90)
+		res, err := e.source.RemovePrefix(ctx, map[pb.RetentionClass]time.Time{gwClass: cut, sessClass: cut}, nil, 1000)
+		done <- result{res, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("RemovePrefix returned (%+v, %v) while a hold was being placed; it must wait for that transaction", r.res, r.err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := tx.Commit(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-done; r.err != nil {
+		t.Fatalf("RemovePrefix: %v", r.err)
+	}
+	// The hold committed first, and the rows have no org, so they are held.
+	if _, _, n := e.ids(t); n != 30 {
+		t.Fatalf("%d rows remain, want all 30: the hold committed before the delete ran", n)
+	}
+}
+
+func TestChain_ASecondPurgeMovesTheBaseForwardAndAccumulates(t *testing.T) {
+	e := newChainEnv(t, expiredThenFresh())
+	e.anchorAt(t, 10)
+	e.enforce(t)
+	e.anchorAt(t, 18)
+	e.enforce(t)
+
+	base, ok, err := e.audit.ChainBase(e.ctx)
+	if err != nil || !ok || base.ID != 17 || base.RowsPurged != 17 {
+		t.Fatalf("base = %+v ok=%v err=%v, want id 17 and 17 rows purged in total", base, ok, err)
+	}
+	if min, _, _ := e.ids(t); min != 18 {
+		t.Fatalf("min id %d, want 18", min)
+	}
+	e.verify(t)
+}
+
+func TestChain_AMissingHoldsTableRemovesNothing(t *testing.T) {
+	e := newChainEnv(t, expiredThenFresh())
+	e.anchorAt(t, 15)
+	if _, err := e.pool.Exec(e.ctx, `DROP TABLE retention_legal_holds`); err != nil {
+		t.Fatal(err)
+	}
+	cut := time.Now().AddDate(0, 0, -90)
+	res, err := e.source.RemovePrefix(e.ctx, map[pb.RetentionClass]time.Time{gwClass: cut, sessClass: cut}, nil, 1000)
+	if err != nil || len(res.RemovedByClass) != 0 && res.RemovedByClass[gwClass]+res.RemovedByClass[sessClass] != 0 || !strings.Contains(res.Skipped, "retention_legal_holds") {
+		t.Fatalf("RemovePrefix without a holds table = (%+v, %v), want nothing removed and a Skipped reason naming the table", res, err)
+	}
+	if _, _, n := e.ids(t); n != 30 {
+		t.Fatalf("%d rows remain, want all 30", n)
+	}
+}
