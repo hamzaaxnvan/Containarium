@@ -76,3 +76,43 @@ func TestBranchName_DaemonChosen(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := BranchName(tc.runID, tc.issueNumber, tc.title)
 			if got != tc.want {
+				t.Errorf("BranchName(%q, %d, %q) = %q, want %q", tc.runID, tc.issueNumber, tc.title, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBranchName_RequestCannotInfluenceRunOrIssueSegments asserts the
+// property the acceptance criteria actually care about: no matter what
+// a caller puts in title, the run id and issue number segments of the
+// branch are exactly what was passed as runID/issueNumber — a request
+// field can only ever move the trailing, cosmetic slug.
+func TestBranchName_RequestCannotInfluenceRunOrIssueSegments(t *testing.T) {
+	const runID = "run-abc123def456ghi789"
+	const issue = int64(42)
+	wantPrefix := "agent/" + runIDShort(runID) + "/" + "42"
+
+	for _, title := range []string{
+		"", "normal title", "../../../etc/passwd",
+		"refs/heads/main", "main", strings.Repeat("x", 500),
+	} {
+		got := BranchName(runID, issue, title)
+		if !strings.HasPrefix(got, wantPrefix) {
+			t.Errorf("BranchName(%q, %d, %q) = %q, want prefix %q", runID, issue, title, got, wantPrefix)
+		}
+	}
+}
+
+func TestSlugify(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"Fix the flaky retry test", "fix-the-flaky-retry-test"},
+		{"", ""},
+		{"---", ""},
+		{"UPPER CASE", "upper-case"},
+		{"a/b/c", "a-b-c"},
+	} {
+		if got := slugify(tc.in); got != tc.want {
+			t.Errorf("slugify(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
