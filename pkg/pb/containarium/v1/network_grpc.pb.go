@@ -191,3 +191,585 @@ func (c *networkServiceClient) DeletePassthroughRoute(ctx context.Context, in *D
 	}
 	return out, nil
 }
+
+func (c *networkServiceClient) UpdatePassthroughRoute(ctx context.Context, in *UpdatePassthroughRouteRequest, opts ...grpc.CallOption) (*UpdatePassthroughRouteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdatePassthroughRouteResponse)
+	err := c.cc.Invoke(ctx, NetworkService_UpdatePassthroughRoute_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkServiceClient) GetContainerACL(ctx context.Context, in *GetContainerACLRequest, opts ...grpc.CallOption) (*GetContainerACLResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetContainerACLResponse)
+	err := c.cc.Invoke(ctx, NetworkService_GetContainerACL_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkServiceClient) UpdateContainerACL(ctx context.Context, in *UpdateContainerACLRequest, opts ...grpc.CallOption) (*UpdateContainerACLResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateContainerACLResponse)
+	err := c.cc.Invoke(ctx, NetworkService_UpdateContainerACL_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkServiceClient) GetNetworkTopology(ctx context.Context, in *GetNetworkTopologyRequest, opts ...grpc.CallOption) (*GetNetworkTopologyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNetworkTopologyResponse)
+	err := c.cc.Invoke(ctx, NetworkService_GetNetworkTopology_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkServiceClient) ListACLPresets(ctx context.Context, in *ListACLPresetsRequest, opts ...grpc.CallOption) (*ListACLPresetsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListACLPresetsResponse)
+	err := c.cc.Invoke(ctx, NetworkService_ListACLPresets_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkServiceClient) StartEgressProxy(ctx context.Context, in *StartEgressProxyRequest, opts ...grpc.CallOption) (*StartEgressProxyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartEgressProxyResponse)
+	err := c.cc.Invoke(ctx, NetworkService_StartEgressProxy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *networkServiceClient) StopEgressProxy(ctx context.Context, in *StopEgressProxyRequest, opts ...grpc.CallOption) (*StopEgressProxyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StopEgressProxyResponse)
+	err := c.cc.Invoke(ctx, NetworkService_StopEgressProxy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// NetworkServiceServer is the server API for NetworkService service.
+// All implementations must embed UnimplementedNetworkServiceServer
+// for forward compatibility.
+//
+// NetworkService provides network and firewall management
+type NetworkServiceServer interface {
+	// Reports native creation separately from atomic cross-Tenant policy writes.
+	GetNetworkTenantCapabilities(context.Context, *GetNetworkTenantCapabilitiesRequest) (*GetNetworkTenantCapabilitiesResponse, error)
+	// GetNetworkGuardStatus reports both NIC-ACL guards' last-pass state.
+	GetNetworkGuardStatus(context.Context, *GetNetworkGuardStatusRequest) (*NetworkGuardStatus, error)
+	// GetRoutes lists all proxy routes (DNS to container mappings)
+	GetRoutes(context.Context, *GetRoutesRequest) (*GetRoutesResponse, error)
+	// AddRoute adds a new proxy route (domain to container mapping)
+	AddRoute(context.Context, *AddRouteRequest) (*AddRouteResponse, error)
+	// UpdateRoute updates an existing proxy route
+	UpdateRoute(context.Context, *UpdateRouteRequest) (*UpdateRouteResponse, error)
+	// DeleteRoute removes a proxy route
+	DeleteRoute(context.Context, *DeleteRouteRequest) (*DeleteRouteResponse, error)
+	// ListDNSRecords lists DNS records for the configured base domain
+	ListDNSRecords(context.Context, *ListDNSRecordsRequest) (*ListDNSRecordsResponse, error)
+	// ListPassthroughRoutes lists all TCP/UDP passthrough routes
+	ListPassthroughRoutes(context.Context, *ListPassthroughRoutesRequest) (*ListPassthroughRoutesResponse, error)
+	// AddPassthroughRoute adds a new TCP/UDP passthrough route
+	AddPassthroughRoute(context.Context, *AddPassthroughRouteRequest) (*AddPassthroughRouteResponse, error)
+	// DeletePassthroughRoute removes a TCP/UDP passthrough route
+	DeletePassthroughRoute(context.Context, *DeletePassthroughRouteRequest) (*DeletePassthroughRouteResponse, error)
+	// UpdatePassthroughRoute updates an existing TCP/UDP passthrough route
+	UpdatePassthroughRoute(context.Context, *UpdatePassthroughRouteRequest) (*UpdatePassthroughRouteResponse, error)
+	// GetContainerACL gets firewall rules for a DevBox container
+	GetContainerACL(context.Context, *GetContainerACLRequest) (*GetContainerACLResponse, error)
+	// UpdateContainerACL updates firewall rules for a DevBox container
+	UpdateContainerACL(context.Context, *UpdateContainerACLRequest) (*UpdateContainerACLResponse, error)
+	// GetNetworkTopology returns network visualization data
+	GetNetworkTopology(context.Context, *GetNetworkTopologyRequest) (*GetNetworkTopologyResponse, error)
+	// ListACLPresets lists available firewall presets
+	ListACLPresets(context.Context, *ListACLPresetsRequest) (*ListACLPresetsResponse, error)
+	// StartEgressProxy starts a source-restricted relay that lets a box egress
+	// through an operator-reachable SOCKS — "egress via client" (#808). The
+	// operator first opens `ssh -R 127.0.0.1:<upstream_port>:localhost:<socks>`
+	// to expose their SOCKS on the host loopback; this RPC then bridges that
+	// host-netns listener into the box's netns, scoped to the box's source IP.
+	StartEgressProxy(context.Context, *StartEgressProxyRequest) (*StartEgressProxyResponse, error)
+	// StopEgressProxy stops the egress-via-client relay for a box.
+	StopEgressProxy(context.Context, *StopEgressProxyRequest) (*StopEgressProxyResponse, error)
+	mustEmbedUnimplementedNetworkServiceServer()
+}
+
+// UnimplementedNetworkServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedNetworkServiceServer struct{}
+
+func (UnimplementedNetworkServiceServer) GetNetworkTenantCapabilities(context.Context, *GetNetworkTenantCapabilitiesRequest) (*GetNetworkTenantCapabilitiesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNetworkTenantCapabilities not implemented")
+}
+func (UnimplementedNetworkServiceServer) GetNetworkGuardStatus(context.Context, *GetNetworkGuardStatusRequest) (*NetworkGuardStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNetworkGuardStatus not implemented")
+}
+func (UnimplementedNetworkServiceServer) GetRoutes(context.Context, *GetRoutesRequest) (*GetRoutesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRoutes not implemented")
+}
+func (UnimplementedNetworkServiceServer) AddRoute(context.Context, *AddRouteRequest) (*AddRouteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AddRoute not implemented")
+}
+func (UnimplementedNetworkServiceServer) UpdateRoute(context.Context, *UpdateRouteRequest) (*UpdateRouteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateRoute not implemented")
+}
+func (UnimplementedNetworkServiceServer) DeleteRoute(context.Context, *DeleteRouteRequest) (*DeleteRouteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteRoute not implemented")
+}
+func (UnimplementedNetworkServiceServer) ListDNSRecords(context.Context, *ListDNSRecordsRequest) (*ListDNSRecordsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListDNSRecords not implemented")
+}
+func (UnimplementedNetworkServiceServer) ListPassthroughRoutes(context.Context, *ListPassthroughRoutesRequest) (*ListPassthroughRoutesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListPassthroughRoutes not implemented")
+}
+func (UnimplementedNetworkServiceServer) AddPassthroughRoute(context.Context, *AddPassthroughRouteRequest) (*AddPassthroughRouteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AddPassthroughRoute not implemented")
+}
+func (UnimplementedNetworkServiceServer) DeletePassthroughRoute(context.Context, *DeletePassthroughRouteRequest) (*DeletePassthroughRouteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeletePassthroughRoute not implemented")
+}
+func (UnimplementedNetworkServiceServer) UpdatePassthroughRoute(context.Context, *UpdatePassthroughRouteRequest) (*UpdatePassthroughRouteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdatePassthroughRoute not implemented")
+}
+func (UnimplementedNetworkServiceServer) GetContainerACL(context.Context, *GetContainerACLRequest) (*GetContainerACLResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetContainerACL not implemented")
+}
+func (UnimplementedNetworkServiceServer) UpdateContainerACL(context.Context, *UpdateContainerACLRequest) (*UpdateContainerACLResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateContainerACL not implemented")
+}
+func (UnimplementedNetworkServiceServer) GetNetworkTopology(context.Context, *GetNetworkTopologyRequest) (*GetNetworkTopologyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNetworkTopology not implemented")
+}
+func (UnimplementedNetworkServiceServer) ListACLPresets(context.Context, *ListACLPresetsRequest) (*ListACLPresetsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListACLPresets not implemented")
+}
+func (UnimplementedNetworkServiceServer) StartEgressProxy(context.Context, *StartEgressProxyRequest) (*StartEgressProxyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartEgressProxy not implemented")
+}
+func (UnimplementedNetworkServiceServer) StopEgressProxy(context.Context, *StopEgressProxyRequest) (*StopEgressProxyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StopEgressProxy not implemented")
+}
+func (UnimplementedNetworkServiceServer) mustEmbedUnimplementedNetworkServiceServer() {}
+func (UnimplementedNetworkServiceServer) testEmbeddedByValue()                        {}
+
+// UnsafeNetworkServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to NetworkServiceServer will
+// result in compilation errors.
+type UnsafeNetworkServiceServer interface {
+	mustEmbedUnimplementedNetworkServiceServer()
+}
+
+func RegisterNetworkServiceServer(s grpc.ServiceRegistrar, srv NetworkServiceServer) {
+	// If the following call panics, it indicates UnimplementedNetworkServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&NetworkService_ServiceDesc, srv)
+}
+
+func _NetworkService_GetNetworkTenantCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNetworkTenantCapabilitiesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).GetNetworkTenantCapabilities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_GetNetworkTenantCapabilities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).GetNetworkTenantCapabilities(ctx, req.(*GetNetworkTenantCapabilitiesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_GetNetworkGuardStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNetworkGuardStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).GetNetworkGuardStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_GetNetworkGuardStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).GetNetworkGuardStatus(ctx, req.(*GetNetworkGuardStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_GetRoutes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRoutesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).GetRoutes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_GetRoutes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).GetRoutes(ctx, req.(*GetRoutesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_AddRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddRouteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).AddRoute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_AddRoute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).AddRoute(ctx, req.(*AddRouteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_UpdateRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateRouteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).UpdateRoute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_UpdateRoute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).UpdateRoute(ctx, req.(*UpdateRouteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_DeleteRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteRouteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).DeleteRoute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_DeleteRoute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).DeleteRoute(ctx, req.(*DeleteRouteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_ListDNSRecords_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListDNSRecordsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).ListDNSRecords(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_ListDNSRecords_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).ListDNSRecords(ctx, req.(*ListDNSRecordsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_ListPassthroughRoutes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListPassthroughRoutesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).ListPassthroughRoutes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_ListPassthroughRoutes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).ListPassthroughRoutes(ctx, req.(*ListPassthroughRoutesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_AddPassthroughRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddPassthroughRouteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).AddPassthroughRoute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_AddPassthroughRoute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).AddPassthroughRoute(ctx, req.(*AddPassthroughRouteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_DeletePassthroughRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeletePassthroughRouteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).DeletePassthroughRoute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_DeletePassthroughRoute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).DeletePassthroughRoute(ctx, req.(*DeletePassthroughRouteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_UpdatePassthroughRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdatePassthroughRouteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).UpdatePassthroughRoute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_UpdatePassthroughRoute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).UpdatePassthroughRoute(ctx, req.(*UpdatePassthroughRouteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_GetContainerACL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetContainerACLRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).GetContainerACL(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_GetContainerACL_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).GetContainerACL(ctx, req.(*GetContainerACLRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_UpdateContainerACL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateContainerACLRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).UpdateContainerACL(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_UpdateContainerACL_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).UpdateContainerACL(ctx, req.(*UpdateContainerACLRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_GetNetworkTopology_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNetworkTopologyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).GetNetworkTopology(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_GetNetworkTopology_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).GetNetworkTopology(ctx, req.(*GetNetworkTopologyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_ListACLPresets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListACLPresetsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).ListACLPresets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_ListACLPresets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).ListACLPresets(ctx, req.(*ListACLPresetsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_StartEgressProxy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartEgressProxyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).StartEgressProxy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_StartEgressProxy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).StartEgressProxy(ctx, req.(*StartEgressProxyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NetworkService_StopEgressProxy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StopEgressProxyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NetworkServiceServer).StopEgressProxy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NetworkService_StopEgressProxy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NetworkServiceServer).StopEgressProxy(ctx, req.(*StopEgressProxyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// NetworkService_ServiceDesc is the grpc.ServiceDesc for NetworkService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var NetworkService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.NetworkService",
+	HandlerType: (*NetworkServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetNetworkTenantCapabilities",
+			Handler:    _NetworkService_GetNetworkTenantCapabilities_Handler,
+		},
+		{
+			MethodName: "GetNetworkGuardStatus",
+			Handler:    _NetworkService_GetNetworkGuardStatus_Handler,
+		},
+		{
+			MethodName: "GetRoutes",
+			Handler:    _NetworkService_GetRoutes_Handler,
+		},
+		{
+			MethodName: "AddRoute",
+			Handler:    _NetworkService_AddRoute_Handler,
+		},
+		{
+			MethodName: "UpdateRoute",
+			Handler:    _NetworkService_UpdateRoute_Handler,
+		},
+		{
+			MethodName: "DeleteRoute",
+			Handler:    _NetworkService_DeleteRoute_Handler,
+		},
+		{
+			MethodName: "ListDNSRecords",
+			Handler:    _NetworkService_ListDNSRecords_Handler,
+		},
+		{
+			MethodName: "ListPassthroughRoutes",
+			Handler:    _NetworkService_ListPassthroughRoutes_Handler,
+		},
+		{
+			MethodName: "AddPassthroughRoute",
+			Handler:    _NetworkService_AddPassthroughRoute_Handler,
+		},
+		{
+			MethodName: "DeletePassthroughRoute",
+			Handler:    _NetworkService_DeletePassthroughRoute_Handler,
+		},
+		{
+			MethodName: "UpdatePassthroughRoute",
+			Handler:    _NetworkService_UpdatePassthroughRoute_Handler,
+		},
+		{
+			MethodName: "GetContainerACL",
+			Handler:    _NetworkService_GetContainerACL_Handler,
+		},
+		{
+			MethodName: "UpdateContainerACL",
+			Handler:    _NetworkService_UpdateContainerACL_Handler,
+		},
+		{
+			MethodName: "GetNetworkTopology",
+			Handler:    _NetworkService_GetNetworkTopology_Handler,
+		},
+		{
+			MethodName: "ListACLPresets",
+			Handler:    _NetworkService_ListACLPresets_Handler,
+		},
+		{
+			MethodName: "StartEgressProxy",
+			Handler:    _NetworkService_StartEgressProxy_Handler,
+		},
+		{
+			MethodName: "StopEgressProxy",
+			Handler:    _NetworkService_StopEgressProxy_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/network.proto",
+}
