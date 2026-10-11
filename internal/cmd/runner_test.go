@@ -15,3 +15,12 @@ func TestRunRunnerProvision_RunnerGroupFlag(t *testing.T) {
 
 	prevPAT, prevCount, prevGroup, prevSentinel := runnerPAT, runnerCount, runnerGroup, runnerSentinelHost
 	t.Cleanup(func() {
+		runnerPAT, runnerCount, runnerGroup, runnerSentinelHost = prevPAT, prevCount, prevGroup, prevSentinel
+	})
+	runnerPAT, runnerCount, runnerGroup, runnerSentinelHost = "ghp_x", 1, "gpu", ""
+
+	err := runRunnerProvision(nil, []string{"owner/repo"})
+	if err == nil || !strings.Contains(err.Error(), "runner group requires an organization target") {
+		t.Fatalf("want the organization-target refusal, got %v", err)
+	}
+}
