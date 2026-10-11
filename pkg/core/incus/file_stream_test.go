@@ -49,3 +49,54 @@ func TestReadFileStream_TransfersUnreadBodyOwnership(t *testing.T) {
 	}
 	if body.reads != 0 || body.closed {
 		t.Fatal("file was read or closed before caller consumed it")
+	}
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "dump bytes" {
+		t.Fatalf("body=%q", b)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !body.closed {
+		t.Fatal("caller did not receive ownership of response body")
+	}
+}
+
+func TestReadFileStream_BoundsSymlinkTarget(t *testing.T) {
+	s := &fakeFileServer{symlinks: map[string]string{"/link": strings.Repeat("x", 4097)}}
+	_, err := (&Client{server: s}).ReadFileStream("tenant-container", "/link")
+	if err == nil || !strings.Contains(err.Error(), "4096") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestWriteFileStream_ReadFailuresAndReplay(t *testing.T) {
+	for _, kind := range []string{"normal", "reader-error", "forward-replay", "seekable-replay"} {
+		t.Run(kind, func(t *testing.T) {
+			s := &streamFileServer{replay: strings.Contains(kind, "replay")}
+			c := &Client{server: s}
+			r := io.LimitReader(strings.NewReader("dump bytes"), 10)
+			if kind == "reader-error" {
+				r = io.MultiReader(r, streamReadError{})
+			}
+			if kind == "seekable-replay" {
+				r = strings.NewReader("dump bytes")
+			}
+			err := c.WriteFileStream("tenant-container", "/tmp/dump", r, "0600")
+			wantError := kind == "reader-error" || kind == "forward-replay"
+			if (err != nil) != wantError {
+				t.Fatalf("err=%v", err)
+			}
+			if !wantError && (s.written != 10 || s.mode != 0o600) {
+				t.Fatalf("written=%d mode=%o", s.written, s.mode)
+			}
+		})
+	}
+}
+
+type streamReadError struct{}
+
+func (streamReadError) Read([]byte) (int, error) { return 0, errors.New("stream read failed") }
