@@ -52,3 +52,31 @@ func TestValidateGroups(t *testing.T) {
 	host := pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST
 	container := pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_CONTAINER
 	platform := pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_PLATFORM
+	unspecified := pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_UNSPECIFIED
+
+	tests := []struct {
+		name    string
+		in      []pb.CloudMetricsGroup
+		wantErr bool
+	}{
+		{"nil is valid", nil, false},
+		{"empty is valid", []pb.CloudMetricsGroup{}, false},
+		{"host is valid", []pb.CloudMetricsGroup{host}, false},
+		{"all three valid", []pb.CloudMetricsGroup{host, container, platform}, false},
+		{"unspecified alone rejected", []pb.CloudMetricsGroup{unspecified}, true},
+		{"unspecified in mix rejected", []pb.CloudMetricsGroup{host, unspecified}, true},
+		{"out-of-range rejected", []pb.CloudMetricsGroup{pb.CloudMetricsGroup(99)}, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateGroups(tc.in)
+			if tc.wantErr && err == nil {
+				t.Errorf("ValidateGroups(%v) = nil, want error", tc.in)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("ValidateGroups(%v) = %v, want nil", tc.in, err)
+			}
+		})
+	}
+}
