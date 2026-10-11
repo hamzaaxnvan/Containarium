@@ -141,3 +141,75 @@ Examples:
 				CheckpointFile: checkpointFile,
 				SentinelID:     sentinelID,
 				BatchSize:      batchSize,
+				DefaultBackend: backendID, // standalone: every record goes to this backend
+				Tokens:         staticTokens{backend: backendID, token: tok},
+				NewClient: func(_, token string) (sshsession.IngestClient, error) {
+					return client.NewHTTPClient(url, token)
+				},
+				Rejected:    client.IsIngestRejected,
+				OrphanAfter: orphanAfter,
+				Logf:        func(f string, a ...any) { log.Printf("ssh-sessions ship: "+f, a...) },
+			}
+
+			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+			defer stop()
+			out := cmd.OutOrStdout()
+
+			switch {
+			case reconcile:
+				st, err := sshsession.Reconcile(ctx, cfg)
+				fmt.Fprintf(out, "orphans_closed=%d skipped_unroutable=%d\n", st.OrphansClosed, st.SkippedUnroutable)
+				return err
+			case once:
+				st, err := sshsession.ShipOnce(ctx, cfg)
+				fmt.Fprintf(out, "shipped=%d duplicates=%d skipped_unroutable=%d skipped_malformed=%d rotated_file_missing=%d\n",
+					st.Shipped, st.Duplicates, st.SkippedUnroutable, st.SkippedMalformed, st.RotatedFileMissing)
+				return err
+			default:
+				err := sshsession.Ship(ctx, cfg, interval)
+				if errors.Is(err, context.Canceled) {
+					return nil
+				}
+				return err
+			}
+		},
+	}
+
+	f := cmd.Flags()
+	f.StringVar(&recordsFile, "records-file", sshsession.DefaultRecordsFile, "Path to the SSH session records JSONL sink to ship")
+	f.StringVar(&checkpointFile, "checkpoint-file", sshsession.DefaultStandaloneCheckpointFile, "Where to persist shipping progress (byte offset + inode); separate from the sentinel's in-process shipper, never share it")
+	f.StringVar(&url, "url", "", "Backend REST base URL, e.g. http://<backend>:8080 (required)")
+	f.StringVar(&token, "token", "", "audit:ingest JWT minted on that backend (prefer --token-file or $"+envAuditIngestToken+": a flag shows up in ps)")
+	f.StringVar(&tokenFile, "token-file", "", "File containing the audit:ingest JWT")
+	f.StringVar(&backendID, "backend-id", "default", "Name this backend is checkpointed under")
+	f.StringVar(&sentinelID, "sentinel-id", "", "Identifier recorded in each row's detail (default: hostname)")
+	f.BoolVar(&once, "once", false, "Run a single pass and exit (non-zero if any batch could not be shipped)")
+	f.BoolVar(&reconcile, "reconcile", false, "Ship unknown_orphan closes for old opens with no close, instead of tailing")
+	f.DurationVar(&orphanAfter, "orphan-after", sshsession.DefaultOrphanAfter, "With --reconcile: how old an unclosed open must be to count as an orphan")
+	f.DurationVar(&interval, "interval", 5*time.Second, "Polling interval when running continuously")
+	f.IntVar(&batchSize, "batch-size", sshsession.DefaultBatchSize, "Max records per ingest call")
+	return cmd
+}
+
+// resolveShipToken enforces: at most one of --token/--token-file, falling
+// back to the environment, and at least one source overall.
+func resolveShipToken(token, tokenFile string) (string, error) {
+	if token != "" && tokenFile != "" {
+		return "", errors.New("pass exactly one of --token or --token-file, not both")
+	}
+	switch {
+	case tokenFile != "":
+		b, err := os.ReadFile(tokenFile) // #nosec G304 -- operator-supplied path
+		if err != nil {
+			return "", fmt.Errorf("read --token-file: %w", err)
+		}
+		token = string(b)
+	case token == "":
+		token = os.Getenv(envAuditIngestToken)
+	}
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", fmt.Errorf("an audit:ingest token is required: pass --token-file, --token, or set $%s", envAuditIngestToken)
+	}
+	return token, nil
+}
