@@ -42,3 +42,15 @@ func (c *GRPCClient) TerminateUserSessions(username string) (*pb.TerminateUserSe
 		return nil, fmt.Errorf("terminate user sessions: %w", err)
 	}
 	return resp, nil
+}
+
+// TerminateUserSessions ends every live SSH session username holds on the
+// backend, via REST.
+func (c *HTTPClient) TerminateUserSessions(username string) (*pb.TerminateUserSessionsResponse, error) {
+	out := &pb.TerminateUserSessionsResponse{}
+	if err := c.trackerDoTimeout(sessionsTimeout, http.MethodPost,
+		TerminateUserSessionsPath(username), "terminate user sessions", []byte("{}"), out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
