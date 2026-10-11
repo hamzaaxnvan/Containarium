@@ -60,3 +60,190 @@ export function redact(s: string, secrets: readonly string[]): string {
 }
 
 // truncateBytes cuts s to at most max UTF-8 bytes (marker included) without
+// splitting a code point.
+export function truncateBytes(s: string, max: number): string {
+  if (Buffer.byteLength(s, "utf8") <= max) return s;
+  const budget = max - Buffer.byteLength(TRUNCATION_MARKER, "utf8");
+  let bytes = 0;
+  let end = 0;
+  for (const ch of s) {
+    const n = Buffer.byteLength(ch, "utf8");
+    if (bytes + n > budget) break;
+    bytes += n;
+    end += ch.length;
+  }
+  return s.slice(0, end) + TRUNCATION_MARKER;
+}
+
+// sanitize redacts every string field, then truncates the capped ones.
+// Redacting first means a secret straddling the cut cannot leave a prefix.
+function sanitize(entry: JournalEntry, secrets: readonly string[]): JournalEntry {
+  switch (entry.kind) {
+    case "tool_use":
+      return { kind: "tool_use", tool: redact(entry.tool, secrets), input: truncateBytes(redact(entry.input, secrets), MAX_FIELD_BYTES) };
+    case "tool_result":
+      return { kind: "tool_result", tool: redact(entry.tool, secrets), text: truncateBytes(redact(entry.text, secrets), MAX_FIELD_BYTES) };
+    case "status":
+    case "assistant":
+    case "error":
+      return { kind: entry.kind, text: redact(entry.text, secrets) };
+  }
+}
+
+export interface FileJournalOptions {
+  root?: string;
+  runId: string;
+  skillId: string;
+  // Literal values that must never appear in a line (see journalSecrets).
+  secrets: readonly string[];
+  now?: () => Date;
+}
+
+// FileJournal appends sanitized events to one journal file. Appends are
+// synchronous so lines land in call order and seq is strictly increasing.
+export class FileJournal implements JournalSink {
+  readonly path: string;
+  private seq: number;
+  private readonly secrets: readonly string[];
+  private readonly now: () => Date;
+
+  private constructor(path: string, seq: number, secrets: readonly string[], now: () => Date) {
+    this.path = path;
+    this.seq = seq;
+    this.secrets = secrets;
+    this.now = now;
+  }
+
+  // open creates the run directory and resumes seq from any lines already in
+  // the file, so a second task of the same run on the same box (or a
+  // restarted runtime) keeps seq monotonic within the file.
+  static open(opts: FileJournalOptions): FileJournal {
+    const path = journalPath(opts.root ?? JOURNAL_ROOT, opts.runId, opts.skillId);
+    mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
+    let seq = 0;
+    if (existsSync(path)) {
+      for (const c of readFileSync(path, "utf8")) if (c === "\n") seq++;
+    }
+    const secrets = opts.secrets.filter((s) => s.length >= MIN_SECRET_LENGTH);
+    return new FileJournal(path, seq, secrets, opts.now ?? (() => new Date()));
+  }
+
+  append(entry: JournalEntry): void {
+    const event = { seq: ++this.seq, t: this.now().toISOString(), ...sanitize(entry, this.secrets) } as JournalEvent;
+    try {
+      appendFileSync(this.path, JSON.stringify(event) + "\n", { mode: 0o600 });
+    } catch (e) {
+      // A full disk must not kill the agent mid-run; the process log says why
+      // the journal stopped.
+      process.stderr.write(`agent-runtime: journal append to ${this.path} failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+  }
+}
+
+const defaultWarn = (m: string): void => {
+  process.stderr.write(`agent-runtime: ${m}\n`);
+};
+
+// openJournal opens a run's journal under the one policy the runtime applies
+// to journal I/O: a journal never kills a run. An id that is not a safe path
+// segment still throws (that is a bad request, not an I/O fault); a directory
+// or file that cannot be created or read degrades to NULL_JOURNAL with a
+// warning on the process log, the same as an append that fails mid-run.
+export function openJournal(opts: FileJournalOptions, warn: (msg: string) => void = defaultWarn): JournalSink {
+  journalPath(opts.root ?? JOURNAL_ROOT, opts.runId, opts.skillId);
+  try {
+    return FileJournal.open(opts);
+  } catch (e) {
+    warn(`journal for run ${opts.runId} could not be opened; not journaled: ${e instanceof Error ? e.message : String(e)}`);
+    return NULL_JOURNAL;
+  }
+}
+
+// The env vars that carry a credential into the box: the model-gateway token
+// under each provider's name (the daemon's gatewayProviderEnvs), the provider
+// keys a direct-mode box is seeded with, and the per-box A2A credential the
+// daemon authenticates to this box's /tasks with (#2125) — which a journal
+// served back by TailRunLog must not carry out of the box.
+const SECRET_ENV_VARS = [
+  "CONTAINARIUM_A2A_TOKEN",
+  "CONTAINARIUM_GATEWAY_TOKEN",
+  "ANTHROPIC_AUTH_TOKEN",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "CODEX_API_KEY",
+] as const;
+
+// journalSecrets lists the literal credential values this runtime holds: the
+// seeded gateway token / provider keys from the environment and the seeded
+// platform JWT. The git credential a run fetches its repo with is used by
+// the daemon for that one fetch and never persisted in the box, so the
+// runtime holds no value of it to redact.
+export function journalSecrets(env: Readonly<Record<string, string | undefined>>, tokenPath: string | null): string[] {
+  const out = new Set<string>();
+  for (const name of SECRET_ENV_VARS) {
+    const v = env[name]?.trim();
+    if (v) out.add(v);
+  }
+  if (tokenPath && existsSync(tokenPath)) {
+    const v = readFileSync(tokenPath, "utf8").trim();
+    if (v) out.add(v);
+  }
+  return [...out];
+}
+
+// runJournaled runs one task through the engine bracketed by status lines:
+// "run started", then whatever the engine journals, then "run ended exit=N"
+// (0 on success; on failure the error is journaled first, exit=1, and the
+// error is rethrown). A run that changed files but returned no final message
+// is re-prompted once inside the bracket (runWithFinalJsonReprompt, #2513).
+export async function runJournaled(engine: Engine, task: string, cfg: EngineConfig, journal: JournalSink): Promise<EngineResult> {
+  journal.append({ kind: "status", text: "run started" });
+  try {
+    const res = await runWithFinalJsonReprompt(engine, task, cfg, journal);
+    journal.append({ kind: "status", text: "run ended exit=0" });
+    return res;
+  } catch (e) {
+    journal.append({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    journal.append({ kind: "status", text: "run ended exit=1" });
+    throw e;
+  }
+}
+
+export interface ServeJournalOptions {
+  root?: string;
+  // CONTAINARIUM_SKILL_ID, exported by the daemon when it starts serve mode.
+  skillId: string | undefined;
+  secrets: readonly string[];
+  warn?: (msg: string) => void;
+}
+
+// serveJournals returns the per-task journal lookup for serve mode: each A2A
+// task names its run (AgentTask.run_id), the box's skill id names the file.
+// Tasks of the same run share one FileJournal so seq stays monotonic. A task
+// with no run_id (a direct SendAgentTask outside a tracked run), a box
+// started without a skill id, or a journal that cannot be opened is not
+// journaled; the process log says so. An unsafe run_id throws, which fails
+// that task.
+export function serveJournals(opts: ServeJournalOptions): (runId: string | undefined) => JournalSink {
+  const warn = opts.warn ?? defaultWarn;
+  const open = new Map<string, JournalSink>();
+  return (runId) => {
+    if (!runId) {
+      warn("task has no run_id; not journaled");
+      return NULL_JOURNAL;
+    }
+    if (!opts.skillId) {
+      warn("CONTAINARIUM_SKILL_ID is not set; task not journaled");
+      return NULL_JOURNAL;
+    }
+    const path = journalPath(opts.root ?? JOURNAL_ROOT, runId, opts.skillId);
+    const cached = open.get(path);
+    if (cached) return cached;
+    const j = openJournal({ root: opts.root, runId, skillId: opts.skillId, secrets: opts.secrets }, warn);
+    // Only a journal that opened is kept: a later task of the run retries.
+    if (j !== NULL_JOURNAL) open.set(path, j);
+    return j;
+  };
+}
