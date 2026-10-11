@@ -77,3 +77,83 @@ func TestScorecardTrustedTriggers(t *testing.T) {
 func TestScorecardBadge(t *testing.T) {
 	b, err := os.ReadFile("../../README.md")
 	if err != nil {
+		t.Fatal(err)
+	}
+	want := "[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/FootprintAI/Containarium/badge)](https://scorecard.dev/viewer/?uri=github.com/FootprintAI/Containarium)"
+	if !strings.Contains(string(b), want) {
+		t.Error("README must link the upstream repository's published Scorecard badge")
+	}
+}
+
+func TestScorecardPublicationBoundary(t *testing.T) {
+	wf := loadScorecardWorkflow(t)
+	if len(wf.Permissions) != 1 || wf.Permissions["contents"] != "read" {
+		t.Error("workflow token must default to contents: read")
+	}
+	if wf.Env.Kind != 0 || wf.Defaults.Kind != 0 {
+		t.Error("Scorecard publication forbids workflow env/defaults")
+	}
+	job, ok := wf.Jobs["analysis"]
+	if !ok {
+		t.Fatal("missing Scorecard analysis job")
+	}
+	if !strings.HasPrefix(job.RunsOn, "ubuntu-") {
+		t.Error("Scorecard must use a GitHub-hosted Ubuntu runner")
+	}
+	if job.Env.Kind != 0 || job.Defaults.Kind != 0 || job.Container.Kind != 0 || job.Services.Kind != 0 {
+		t.Error("Scorecard publication forbids job env/defaults/containers/services")
+	}
+	for name, access := range job.Permissions {
+		if access == "write" && name != "security-events" && name != "id-token" {
+			t.Errorf("unexpected job write permission: %s", name)
+		}
+	}
+	if job.Permissions["contents"] != "read" || job.Permissions["security-events"] != "write" {
+		t.Error("analysis needs contents: read and security-events: write")
+	}
+	for name, other := range wf.Jobs {
+		if name != "analysis" && other.Permissions["id-token"] == "write" {
+			t.Errorf("only the Scorecard job may mint an OIDC token: %s", name)
+		}
+	}
+	allowed := map[string]bool{
+		"actions/checkout": true, "ossf/scorecard-action": true,
+		"actions/upload-artifact": true, "github/codeql-action/upload-sarif": true,
+	}
+	seen := map[string]scorecardStep{}
+	for _, step := range job.Steps {
+		action, pin, found := strings.Cut(step.Uses, "@")
+		if step.Run != "" || !found || !allowed[action] {
+			t.Errorf("privileged analysis may only invoke approved actions: %q", step.Uses)
+		}
+		if !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(pin) {
+			t.Errorf("action must be pinned to a full SHA: %s", step.Uses)
+		}
+		seen[action] = step
+	}
+	for action := range allowed {
+		if _, ok := seen[action]; !ok {
+			t.Errorf("missing %s", action)
+		}
+	}
+	if seen["actions/checkout"].With["persist-credentials"] != "false" {
+		t.Error("checkout must not persist the privileged job's token")
+	}
+	scan := seen["ossf/scorecard-action"]
+	if scan.With["results_format"] != "sarif" || scan.With["results_file"] == "" {
+		t.Error("Scorecard must produce a SARIF report")
+	}
+	if scan.With["repo_token"] != "" {
+		t.Error("Scorecard must use its default token, not a new PAT secret")
+	}
+	if scan.With["publish_results"] != "true" {
+		t.Error("Scorecard must publish results to update the badge")
+	}
+	if job.Permissions["id-token"] != "write" {
+		t.Error("publishing the badge requires job-scoped OIDC")
+	}
+	if seen["github/codeql-action/upload-sarif"].With["sarif_file"] != scan.With["results_file"] ||
+		seen["actions/upload-artifact"].With["path"] != scan.With["results_file"] {
+		t.Error("code scanning and the public artifact must publish the scan's report")
+	}
+}
