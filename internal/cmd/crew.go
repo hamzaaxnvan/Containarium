@@ -8,3 +8,44 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var crewCmd = &cobra.Command{
+	Use:   "crew",
+	Short: "Run crews — collaborating sets of agent skills (Phase 3)",
+	Long: `A crew is a collaborating set of skills bound to a task purpose, wired by a
+topology (pipeline / orchestrator / freeform). 'crew run' validates the
+topology against the members' allowed_peers, provisions each member's box under
+one trace id, and returns the run.
+
+  containarium crew list
+  containarium crew get hello-crew
+  containarium crew run hello-crew --input '{"q":"hi"}' --server <host>
+  containarium crew status <run-id> --server <host>
+  containarium crew logs <run-id> --follow --server <host>
+  containarium crew plan validate plan.yaml`,
+}
+
+func init() {
+	rootCmd.AddCommand(crewCmd)
+}
+
+type crewAPI interface {
+	RunCrewGraph(req *pb.RunCrewRequest) (*pb.CrewRun, error)
+	PlanTaskGraph(req *pb.PlanTaskGraphRequest) (*pb.PlanTaskGraphResponse, error)
+	ListCrews() ([]*pb.Crew, error)
+	GetCrew(id string) (*pb.Crew, error)
+	RunCrew(crewID, backendID, pool, inputJSON, gitSource, gitRef, gitCredential string, engineOverrides map[string]pb.AgentEngine, modelOverrides map[string]string) (*pb.CrewRun, error)
+	GetCrewRun(id string) (*pb.CrewRun, error)
+	TailRunLog(req *pb.TailRunLogRequest) (*pb.TailRunLogResponse, error)
+	ValidateTaskGraph(g *pb.TaskGraph) (*pb.ValidateTaskGraphResponse, error)
+	Close() error
+}
+
+func newCrewClient() (crewAPI, error) {
+	if serverAddr == "" {
+		return nil, fmt.Errorf("--server is required")
+	}
+	if httpMode {
+		return client.NewHTTPClient(serverAddr, authToken)
+	}
+	return client.NewGRPCClient(serverAddr, certsDir, insecure)
+}
