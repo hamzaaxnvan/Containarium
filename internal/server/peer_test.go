@@ -1,0 +1,416 @@
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/footprintai/containarium/internal/metrics/cloudexport"
+	boxlxc "github.com/footprintai/containarium/pkg/core/box/lxc"
+)
+
+func TestNewPeerPool(t *testing.T) {
+	pool := NewPeerPool("local-vm", "", nil, "")
+	if pool.LocalBackendID() != "local-vm" {
+		t.Errorf("expected local backend ID 'local-vm', got %q", pool.LocalBackendID())
+	}
+	if len(pool.Peers()) != 0 {
+		t.Errorf("expected 0 peers, got %d", len(pool.Peers()))
+	}
+}
+
+func TestNewPeerPool_StaticPeers(t *testing.T) {
+	pool := NewPeerPool("local-vm", "", []string{"10.0.0.1:8080", "10.0.0.2:8080"}, "")
+	if len(pool.Peers()) != 2 {
+		t.Errorf("expected 2 peers, got %d", len(pool.Peers()))
+	}
+	peer := pool.Get("10.0.0.1:8080")
+	if peer == nil {
+		t.Fatal("expected to find peer 10.0.0.1:8080")
+	}
+	if peer.ID != "10.0.0.1:8080" {
+		t.Errorf("expected peer ID '10.0.0.1:8080', got %q", peer.ID)
+	}
+}
+
+func TestPeerPool_Get(t *testing.T) {
+	pool := NewPeerPool("local", "", []string{"peer-1"}, "")
+	if pool.Get("peer-1") == nil {
+		t.Error("expected to find peer-1")
+	}
+	if pool.Get("nonexistent") != nil {
+		t.Error("expected nil for nonexistent peer")
+	}
+}
+
+// TestPeerPool_Snapshot is the design doc's peer-snapshot unit test
+// (#1084): registered healthy/unhealthy peers appear in the snapshot
+// with their correct state, keyed by the enrolled host name (peer.ID),
+// never anything else.
+func TestPeerPool_Snapshot(t *testing.T) {
+	pool := NewPeerPool("local", "", []string{"peer-1", "peer-2"}, "")
+	pool.Get("peer-1").Healthy = true
+	// peer-2 stays unhealthy (zero value) — the point of this fixture is
+	// to exercise both states in one snapshot.
+
+	snap := pool.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("expected 2 peers in snapshot, got %d", len(snap))
+	}
+
+	byID := map[string]cloudexport.PeerState{}
+	for _, s := range snap {
+		byID[s.ID] = s
+	}
+	if p, ok := byID["peer-1"]; !ok || !p.Healthy {
+		t.Errorf("expected peer-1 present and healthy in snapshot, got %+v (ok=%v)", p, ok)
+	}
+	if p, ok := byID["peer-2"]; !ok || p.Healthy {
+		t.Errorf("expected peer-2 present and unhealthy in snapshot, got %+v (ok=%v)", p, ok)
+	}
+}
+
+// TestPeerPool_Snapshot_Empty guards the no-peers case the collector's
+// zero-value test depends on: an empty pool returns an empty (not nil)
+// slice, never a panic.
+func TestPeerPool_Snapshot_Empty(t *testing.T) {
+	pool := NewPeerPool("local", "", nil, "")
+	if snap := pool.Snapshot(); len(snap) != 0 {
+		t.Errorf("expected empty snapshot, got %d entries", len(snap))
+	}
+}
+
+// TestPeerPool_Snapshot_ConcurrentSafe is the design doc's -race
+// requirement: Snapshot() alongside concurrent registry mutation
+// (discovery churn flipping a peer's Healthy field) must not race.
+func TestPeerPool_Snapshot_ConcurrentSafe(t *testing.T) {
+	pool := NewPeerPool("local", "", []string{"peer-1"}, "")
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = pool.Snapshot()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			pool.mu.Lock()
+			pool.peers["peer-1"].Healthy = !pool.peers["peer-1"].Healthy
+			pool.mu.Unlock()
+		}
+	}()
+	wg.Wait()
+}
+
+func TestPeerClient_ForwardRequest(t *testing.T) {
+	// Mock peer server
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/containers/alice/resize" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"message":"resized"}`))
+	}))
+	defer srv.Close()
+
+	// Extract host:port from test server
+	addr := srv.Listener.Addr().String()
+	pc := &PeerClient{
+		ID:      "test-peer",
+		Addr:    addr,
+		Healthy: true,
+		client:  srv.Client(),
+	}
+
+	body := []byte(`{"cpu":"8","memory":"16GB"}`)
+	respBody, statusCode, err := pc.ForwardRequest("PUT", "/v1/containers/alice/resize", "test-token", body)
+	if err != nil {
+		t.Fatalf("ForwardRequest failed: %v", err)
+	}
+	if statusCode != 200 {
+		t.Errorf("expected status 200, got %d", statusCode)
+	}
+	if string(respBody) != `{"message":"resized"}` {
+		t.Errorf("unexpected response body: %s", respBody)
+	}
+}
+
+func TestPeerClient_ForwardRequest_NoAuth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Error("expected no auth header when token is empty")
+		}
+		w.Write([]byte(`ok`))
+	}))
+	defer srv.Close()
+
+	pc := &PeerClient{
+		ID:     "test-peer",
+		Addr:   srv.Listener.Addr().String(),
+		client: srv.Client(),
+	}
+
+	_, _, err := pc.ForwardRequest("GET", "/test", "", nil)
+	if err != nil {
+		t.Fatalf("ForwardRequest failed: %v", err)
+	}
+}
+
+func TestPeerPool_ListContainers(t *testing.T) {
+	// Mock peer that returns containers
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{
+					"name":     "alice-container",
+					"username": "alice",
+					"state":    "CONTAINER_STATE_RUNNING",
+					"resources": map[string]string{
+						"cpu": "4", "memory": "8GB", "disk": "50GB",
+					},
+					"network": map[string]string{"ipAddress": "10.0.3.100"},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["test-peer"] = &PeerClient{
+		ID:      "test-peer",
+		Addr:    srv.Listener.Addr().String(),
+		Healthy: true,
+		client:  srv.Client(),
+	}
+	pool.mu.Unlock()
+
+	containers, unreachable := pool.ListContainers("")
+	if len(containers) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(containers))
+	}
+	if containers[0].Name != "alice-container" {
+		t.Errorf("expected container name 'alice-container', got %q", containers[0].Name)
+	}
+	if containers[0].BackendID != "test-peer" {
+		t.Errorf("expected backend ID 'test-peer', got %q", containers[0].BackendID)
+	}
+	if len(unreachable) != 0 {
+		t.Errorf("expected no unreachable peers for a healthy fetch, got %+v", unreachable)
+	}
+}
+
+// TestPeerPool_ListContainers_SkipsUnhealthy pins #1902: a peer the
+// sentinel marks unhealthy must not just silently contribute zero
+// containers — it must be named in the returned unreachable list so a
+// caller can tell "this backend is unreachable" from "this backend
+// genuinely has no containers" instead of the two looking identical.
+func TestPeerPool_ListContainers_SkipsUnhealthy(t *testing.T) {
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["unhealthy"] = &PeerClient{
+		ID:      "unhealthy",
+		Healthy: false,
+		client:  &http.Client{},
+	}
+	pool.mu.Unlock()
+
+	containers, unreachable := pool.ListContainers("")
+	if len(containers) != 0 {
+		t.Errorf("expected 0 containers from unhealthy peer, got %d", len(containers))
+	}
+	if len(unreachable) != 1 || unreachable[0].BackendID != "unhealthy" {
+		t.Fatalf("expected the unhealthy peer reported as unreachable, got %+v", unreachable)
+	}
+	if !strings.Contains(unreachable[0].Reason, "unhealthy") {
+		t.Errorf("Reason = %q, want it to say why (marked unhealthy by sentinel)", unreachable[0].Reason)
+	}
+}
+
+func TestPeerPool_FindContainerPeer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{"name": "bob-container", "username": "bob", "state": "Running"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["gpu-node"] = &PeerClient{
+		ID:      "gpu-node",
+		Addr:    srv.Listener.Addr().String(),
+		Healthy: true,
+		client:  srv.Client(),
+	}
+	pool.mu.Unlock()
+
+	// Should find bob on gpu-node
+	peer, _ := pool.FindContainerPeer("bob", "")
+	if peer == nil {
+		t.Fatal("expected to find peer for bob")
+	}
+	if peer.ID != "gpu-node" {
+		t.Errorf("expected peer ID 'gpu-node', got %q", peer.ID)
+	}
+
+	// Should not find alice, and no peer was unreachable while looking
+	peer, unreachable := pool.FindContainerPeer("alice", "")
+	if peer != nil {
+		t.Error("expected nil for alice (not on any peer)")
+	}
+	if len(unreachable) != 0 {
+		t.Errorf("expected no unreachable peers (gpu-node answered fine), got %+v", unreachable)
+	}
+}
+
+func TestPeerPool_PeerTerminalURL_NotFound(t *testing.T) {
+	// Empty pool — no peers, should return empty URL
+	pool := NewPeerPool("local", "", nil, "")
+	url, err := pool.PeerTerminalURL("nonexistent", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if url != "" {
+		t.Errorf("expected empty URL for nonexistent user, got %q", url)
+	}
+}
+
+func TestPeerPool_PeerTerminalURL_Found(t *testing.T) {
+	// Mock peer with a container
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{"name": "alice-container", "state": "Running"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	pool := NewPeerPool("local", "", nil, "")
+	pool.mu.Lock()
+	pool.peers["gpu-node"] = &PeerClient{
+		ID:      "gpu-node",
+		Addr:    srv.Listener.Addr().String(),
+		Healthy: true,
+		client:  srv.Client(),
+	}
+	pool.mu.Unlock()
+
+	url, err := pool.PeerTerminalURL("alice", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := "ws://" + srv.Listener.Addr().String() + "/v1/containers/alice/terminal"
+	if url != expected {
+		t.Errorf("expected %q, got %q", expected, url)
+	}
+}
+
+func TestExtractHost(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"http://10.128.0.5:8081", "10.128.0.5"},
+		{"https://example.com:443", "example.com"},
+		{"http://localhost:8080/path", "localhost:8080"},
+		{"10.0.0.1", "10.0.0.1"},
+	}
+	for _, tt := range tests {
+		got := extractHost(tt.input)
+		if got != tt.want {
+			t.Errorf("extractHost(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestExtractPort(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"http://10.128.0.5:8081", "8081"},
+		{"https://example.com:443", "443"},
+		{"http://localhost:8080/path", "8080"},
+		{"10.0.0.1", "8888"}, // default
+	}
+	for _, tt := range tests {
+		got := extractPort(tt.input)
+		if got != tt.want {
+			t.Errorf("extractPort(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestIsDiscoveredPeer(t *testing.T) {
+	if !isDiscoveredPeer("tunnel-node-a-gpu") {
+		t.Error("expected tunnel-node-a-gpu to be discovered peer")
+	}
+	if isDiscoveredPeer("static-peer") {
+		t.Error("expected static-peer to not be discovered peer")
+	}
+	if isDiscoveredPeer("short") {
+		t.Error("expected short string to not be discovered peer")
+	}
+}
+
+// #2858: a peer's podmanEnabled must survive the peer decode. Both the list
+// and the get-fallback paths turn the decoded ContainerInfo into the response
+// via StatusFromInfo + toProtoContainer, so the chain is asserted here. A peer
+// that omits the field (an older daemon) reports true, as every box did before
+// the flag was recorded; dropping the field would report false for every box
+// on every peer.
+func TestPeerPool_ListContainers_PodmanEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field map[string]interface{}
+		want  bool
+	}{
+		{"older peer omits the field", nil, true},
+		{"enabled", map[string]interface{}{"podmanEnabled": true}, true},
+		{"disabled", map[string]interface{}{"podmanEnabled": false}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				c := map[string]interface{}{"name": "alice-container", "username": "alice", "state": "CONTAINER_STATE_RUNNING"}
+				for k, v := range tc.field {
+					c[k] = v
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"containers": []interface{}{c}})
+			}))
+			defer srv.Close()
+
+			pool := NewPeerPool("local", "", nil, "")
+			pool.mu.Lock()
+			pool.peers["test-peer"] = &PeerClient{ID: "test-peer", Addr: srv.Listener.Addr().String(), Healthy: true, client: srv.Client()}
+			pool.mu.Unlock()
+
+			containers, _ := pool.ListContainers("")
+			if len(containers) != 1 {
+				t.Fatalf("expected 1 container, got %d", len(containers))
+			}
+			st := boxlxc.StatusFromInfo(&containers[0])
+			if got := toProtoContainer(&st).PodmanEnabled; got != tc.want {
+				t.Errorf("PodmanEnabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
