@@ -93,3 +93,35 @@ func TestBackupVerifyExitCodeReflectsResult(t *testing.T) {
 	}
 }
 
+// The CLI must pass the target through; a verify that silently defaulted
+// the target could restore somewhere the operator did not intend.
+func TestBackupVerifySendsTarget(t *testing.T) {
+	f := &fakeBackupAPI{resp: &pb.VerifyBackupResponse{
+		Message:      "ok",
+		Verification: &pb.BackupVerification{Result: pb.VerificationResult_VERIFICATION_RESULT_PASSED},
+	}}
+	withFakeBackupClient(t, f)
+	backupVerifyTarget = "scratch-tenant"
+
+	if err := runBackupVerify(backupVerifyCmd, []string{"alice-app-20260605T130405Z"}); err != nil {
+		t.Fatalf("runBackupVerify: %v", err)
+	}
+	if f.gotReq.TargetUsername != "scratch-tenant" {
+		t.Errorf("TargetUsername = %q, want scratch-tenant", f.gotReq.TargetUsername)
+	}
+	if f.gotReq.Id != "alice-app-20260605T130405Z" {
+		t.Errorf("Id = %q", f.gotReq.Id)
+	}
+}
+
+// A daemon response with no verification payload is a protocol error, not
+// a silent pass.
+func TestBackupVerifyRejectsEmptyResult(t *testing.T) {
+	f := &fakeBackupAPI{resp: &pb.VerifyBackupResponse{Message: "ok"}}
+	withFakeBackupClient(t, f)
+	backupVerifyTarget = "scratch"
+
+	if err := runBackupVerify(backupVerifyCmd, []string{"alice-app-20260605T130405Z"}); err == nil {
+		t.Error("a response with no verification must be an error")
+	}
+}
