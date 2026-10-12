@@ -86,3 +86,91 @@ func TestStartupListener_OtherPathsUnavailable(t *testing.T) {
 			t.Errorf("GET %s = %d, want 503 while the daemon is starting", path, resp.StatusCode)
 		}
 		if !strings.Contains(string(body), "postgres unavailable") {
+			t.Errorf("GET %s body %q does not name the reason", path, body)
+		}
+		if resp.Header.Get("Retry-After") == "" {
+			t.Errorf("GET %s has no Retry-After header", path)
+		}
+	}
+}
+
+func TestStartupListener_ServeHandsOverToRealHandler(t *testing.T) {
+	sl := startStartupListener(t, "initialising daemon")
+	base := "http://" + sl.Addr().String()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/v1/ping", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "pong") })
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- sl.Serve(mux) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, got := getHealth(t, base)
+		if got.Status == "healthy" {
+			if got.Reason != "" {
+				t.Errorf("healthy response carries reason %q", got.Reason)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/health still %q after Serve installed the real handler", got.Status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	resp, err := http.Get(base + "/v1/ping")
+	if err != nil {
+		t.Fatalf("GET /v1/ping: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "pong" {
+		t.Errorf("/v1/ping = %q, want pong from the handed-over handler", body)
+	}
+
+	_ = sl.Close()
+	select {
+	case <-errCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return after Close")
+	}
+}
+
+// The real gateway must serve on the listener the daemon bound early, not
+// bind the port a second time (which would fail with "address in use").
+func TestGatewayStart_TakesOverStartupListener(t *testing.T) {
+	sl := startStartupListener(t, "initialising daemon")
+	base := "http://" + sl.Addr().String()
+
+	tm, err := auth.NewTokenManager("test-secret-for-startup-listener-0123456789", "containarium")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	// httpPort 1 would be unbindable for a test process; Start must not
+	// try to bind it when it has a startup listener.
+	gs := NewGatewayServer("127.0.0.1:1", 1, auth.NewAuthMiddleware(tm), t.TempDir(), "", "")
+	gs.SetStartupListener(sl)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- gs.Start(ctx) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case err := <-errCh:
+			t.Fatalf("gateway Start returned early: %v", err)
+		default:
+		}
+		_, got := getHealth(t, base)
+		if got.Status == healthStatusHealthy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/health still %q: the gateway did not take over the startup listener", got.Status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
