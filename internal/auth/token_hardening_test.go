@@ -89,3 +89,49 @@ func TestValidateToken_RejectsWrongAudience(t *testing.T) {
 
 	if _, err := tm.ValidateToken(tokStr); err == nil {
 		t.Fatal("token with foreign audience must not validate")
+	}
+}
+
+func TestGenerateToken_StampsIssAndAud(t *testing.T) {
+	const secret = "a-secret-that-is-at-least-32-bytes-long!!"
+	tm, err := NewTokenManager(secret, "containarium-test")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+
+	tok, err := tm.GenerateToken("alice", []string{"user"}, time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	claims, err := tm.ValidateToken(tok)
+	if err != nil {
+		t.Fatalf("ValidateToken: %v", err)
+	}
+	if claims.Issuer != "containarium-test" {
+		t.Fatalf("Issuer = %q, want containarium-test", claims.Issuer)
+	}
+	if len(claims.Audience) != 1 || claims.Audience[0] != DefaultAudience {
+		t.Fatalf("Audience = %v, want [%s]", claims.Audience, DefaultAudience)
+	}
+}
+
+func TestValidateToken_AudienceOverrideFromEnv(t *testing.T) {
+	const secret = "a-secret-that-is-at-least-32-bytes-long!!"
+	t.Setenv("CONTAINARIUM_JWT_AUDIENCE", "containarium-edge")
+
+	tm, err := NewTokenManager(secret, "containarium-test")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	tok, err := tm.GenerateToken("alice", []string{"user"}, time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	claims, err := tm.ValidateToken(tok)
+	if err != nil {
+		t.Fatalf("ValidateToken: %v", err)
+	}
+	if claims.Audience[0] != "containarium-edge" {
+		t.Fatalf("Audience override not applied: got %v", claims.Audience)
+	}
+}
