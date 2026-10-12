@@ -121,3 +121,44 @@ func (c *Client) fetch(ctx context.Context) (*Release, error) {
 	}
 	return &rel, nil
 }
+
+// Compare returns -1, 0, or +1 as semantic version a is less than, equal
+// to, or greater than b. A leading "v" and any pre-release/build suffix
+// (after '-' or '+') are ignored — sufficient for this project's vX.Y.Z
+// release tags. A non-numeric or missing component sorts as 0.
+func Compare(a, b string) int {
+	pa, pb := splitVersion(a), splitVersion(b)
+	for i := 0; i < 3; i++ {
+		if pa[i] != pb[i] {
+			if pa[i] < pb[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// IsBehind reports whether current is an older release than latest.
+func IsBehind(current, latest string) bool {
+	return Compare(current, latest) < 0
+}
+
+// splitVersion turns "v0.22.10" / "0.22.10-rc1" into [0,22,10].
+func splitVersion(s string) [3]int {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "v")
+	// Drop pre-release / build metadata.
+	if i := strings.IndexAny(s, "-+"); i >= 0 {
+		s = s[:i]
+	}
+	var out [3]int
+	for i, part := range strings.SplitN(s, ".", 3) {
+		if i > 2 {
+			break
+		}
+		n, _ := strconv.Atoi(strings.TrimSpace(part))
+		out[i] = n
+	}
+	return out
+}
