@@ -45,3 +45,51 @@ func TestCollaboratorToProto(t *testing.T) {
 	now := time.Now()
 	c := &collaborator.Collaborator{
 		ID:                   "c1",
+		ContainerName:        "alice-container",
+		OwnerUsername:        "alice",
+		CollaboratorUsername: "bob",
+		AccountName:          "alice-container-bob",
+		SSHPublicKey:         "ssh-ed25519 AAAAlaptop\nssh-ed25519 AAAAdesktop",
+		CreatedAt:            now,
+		CreatedBy:            "alice",
+		HasSudo:              true,
+		HasContainerRuntime:  false,
+	}
+
+	got := collaboratorToProto(c)
+
+	if got.GetSshPublicKey() != "ssh-ed25519 AAAAlaptop" {
+		t.Errorf("SshPublicKey = %q, want just the first key, not the joined blob", got.GetSshPublicKey())
+	}
+	want := []string{"ssh-ed25519 AAAAlaptop", "ssh-ed25519 AAAAdesktop"}
+	if len(got.GetSshPublicKeys()) != len(want) {
+		t.Fatalf("SshPublicKeys = %v, want %v", got.GetSshPublicKeys(), want)
+	}
+	for i, k := range want {
+		if got.GetSshPublicKeys()[i] != k {
+			t.Errorf("SshPublicKeys[%d] = %q, want %q", i, got.GetSshPublicKeys()[i], k)
+		}
+	}
+	// The rest of the mapping must still round-trip untouched.
+	if got.GetId() != "c1" || got.GetOwnerUsername() != "alice" || got.GetCollaboratorUsername() != "bob" ||
+		got.GetAccountName() != "alice-container-bob" || !got.GetHasSudo() || got.GetHasContainerRuntime() {
+		t.Errorf("unrelated fields changed: %+v", got)
+	}
+	if got.GetAddedAt() != now.Unix() {
+		t.Errorf("AddedAt = %d, want %d", got.GetAddedAt(), now.Unix())
+	}
+}
+
+// TestCollaboratorToProto_SingleKey is the pre-#369 / single-key case: a
+// collaborator with exactly one key must not regress — scalar and the sole
+// element of the repeated field agree.
+func TestCollaboratorToProto_SingleKey(t *testing.T) {
+	c := &collaborator.Collaborator{ID: "c2", SSHPublicKey: "ssh-ed25519 AAAAonly"}
+	got := collaboratorToProto(c)
+	if got.GetSshPublicKey() != "ssh-ed25519 AAAAonly" {
+		t.Errorf("SshPublicKey = %q", got.GetSshPublicKey())
+	}
+	if len(got.GetSshPublicKeys()) != 1 || got.GetSshPublicKeys()[0] != "ssh-ed25519 AAAAonly" {
+		t.Errorf("SshPublicKeys = %v, want [ssh-ed25519 AAAAonly]", got.GetSshPublicKeys())
+	}
+}
