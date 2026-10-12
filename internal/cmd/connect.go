@@ -251,3 +251,88 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	// Tier 2 — stateful tmux session on the box.
 	if connectSession != "" {
 		if err := connectcore.ValidateSessionName(connectSession); err != nil {
+			return err
+		}
+		if connectExec != "" {
+			return runSessionExec(ctx, kw, probe, diag, cmd.OutOrStdout(), target, privPath, connectSession, connectExec)
+		}
+		// No --exec: attach the user's terminal to the session (create if absent).
+		return runSSH(ctx, kw, probe, connectcore.BuildAttachArgs(target, privPath, connectSession))
+	}
+
+	sshArgs := connectcore.BuildSSHArgs(target, privPath, connectExec)
+	if connectPrint {
+		// The ready invocation is the deliverable here → stdout.
+		fmt.Fprintf(cmd.OutOrStdout(), "ssh %s\n", strings.Join(sshArgs, " "))
+		return nil
+	}
+	return runSSH(ctx, kw, probe, sshArgs)
+}
+
+// runSessionExec runs one command inside a named tmux session on the box
+// and prints its captured output. The remote exit code is propagated
+// (os.Exit) so CI / scripts see failures, matching plain --exec.
+func runSessionExec(ctx context.Context, kw connectcore.KeyWait, probe []string, diag, out io.Writer, target connectcore.Target, identity, session, command string) error {
+	marker, err := connectcore.NewMarker()
+	if err != nil {
+		return err
+	}
+	if _, err := exec.LookPath("ssh"); err != nil {
+		return fmt.Errorf("ssh not found in PATH: %w", err)
+	}
+
+	args := connectcore.BuildSessionExecArgs(target, identity, session, marker, connectcore.EncodeCommand(command), 60)
+	var stdout bytes.Buffer
+	runErr := sshWithKeyWait(ctx, kw, probe, func() error {
+		// Box-side poll caps at the timeout; give the ssh process a little
+		// more before we abandon it. Per attempt, so a key wait doesn't eat it.
+		actx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		stdout.Reset()
+		// ssh's own diagnostics (host-key, connection) go to diag.
+		return runSSHTee(actx, strings.NewReader(connectcore.SessionExecScript()), &stdout, diag, args)
+	})
+	if runErr != nil {
+		var se *connectcore.SSHError
+		var re *remoteExitError
+		switch {
+		case errors.Is(runErr, connectcore.ErrKeyNotLearned):
+			return runErr
+		case errors.As(runErr, &se), errors.As(runErr, &re):
+			// Non-zero ssh exit (e.g. orchestration exit 127) still has
+			// framed output we can parse below; fall through.
+		default:
+			return fmt.Errorf("session exec: %w", runErr)
+		}
+	}
+
+	cmdOut, code, perr := connectcore.ParseSessionResult(stdout.String(), marker)
+	if perr != nil {
+		return perr
+	}
+	if cmdOut != "" {
+		fmt.Fprint(out, cmdOut)
+		if !strings.HasSuffix(cmdOut, "\n") {
+			fmt.Fprintln(out)
+		}
+	}
+	if code != 0 {
+		os.Exit(code)
+	}
+	return nil
+}
+
+// runSSH execs the local ssh client, inheriting the terminal. For an
+// interactive session stdin is the user's TTY (ssh allocates a PTY); for
+// --exec it's a one-shot command whose stdout/stderr stream through. The
+// remote exit code is propagated verbatim so CI / agents see failures.
+// A publickey denial right after this invocation authorized the key is
+// retried under kw while the sentinel learns the key (#2013).
+func runSSH(ctx context.Context, kw connectcore.KeyWait, probe, args []string) error {
+	err := sshWithKeyWait(ctx, kw, probe, func() error {
+		// Not bound to ctx: an interactive session lives as long as the user
+		// keeps it, exactly as before.
+		return runSSHTee(context.Background(), os.Stdin, os.Stdout, os.Stderr, args)
+	})
+	return exitForSSHError(err)
+}

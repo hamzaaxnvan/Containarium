@@ -55,3 +55,23 @@ func (s *WakeStarter) WakeForRequest(ctx context.Context, username string) (bool
 	})
 	if err != nil {
 		return false, "", 0, fmt.Errorf("start: %w", err)
+	}
+	ready := resp != nil && !resp.ReadyTimedOut
+
+	// Pull the IP from the live Incus state. The container.Manager
+	// is the canonical place — it's what StartContainer queried for
+	// the response we already have, but the pb.Container shape
+	// doesn't expose IPAddress directly in all proto versions, so
+	// we re-fetch.
+	var ip string
+	if info, ierr := s.cs.GetManager().Get(username); ierr == nil && info != nil {
+		ip = info.IPAddress
+	} else if ierr != nil {
+		log.Printf("[wake] post-start container.Get(%s): %v", username, ierr)
+	}
+
+	// Port is the route's TargetPort — we don't have it here, but
+	// the wake proxy falls back to route.TargetPort when the
+	// starter doesn't report one.
+	return ready, ip, 0, nil
+}
