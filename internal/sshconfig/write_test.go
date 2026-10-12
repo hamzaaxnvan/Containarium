@@ -64,3 +64,103 @@ func TestWriteConfig_TableDriven(t *testing.T) {
 		wantErr     bool
 		wantContent string
 		wantBackup  bool
+	}{
+		{
+			name:        "zero hosts over absent file is fine",
+			gen:         Generated{Content: "", Count: 0},
+			wantContent: "",
+		},
+		{
+			name:        "zero hosts over EMPTY file is fine",
+			existing:    "",
+			gen:         Generated{Content: "", Count: 0},
+			wantContent: "",
+		},
+		{
+			name:        "normal write over existing keeps a backup",
+			existing:    "Host old\n",
+			gen:         Generated{Content: "Host new\n", Count: 1},
+			wantContent: "Host new\n",
+			wantBackup:  true,
+		},
+		{
+			name:        "zero hosts over non-empty is refused",
+			existing:    "Host old\n",
+			gen:         Generated{Content: "", Count: 0},
+			wantErr:     true,
+			wantContent: "Host old\n",
+		},
+		{
+			name:        "first write, no prior file, no backup",
+			gen:         Generated{Content: "Host new\n", Count: 1},
+			wantContent: "Host new\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "ssh_config")
+			// Distinguish "no file" from "empty file": the zero-host guard
+			// only trips on a file with content.
+			if tt.existing != "" || tt.name == "zero hosts over EMPTY file is fine" {
+				if err := os.WriteFile(path, []byte(tt.existing), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			backedUp, err := WriteConfig(path, tt.gen, tt.force)
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if backedUp != tt.wantBackup {
+				t.Errorf("backedUp = %v, want %v", backedUp, tt.wantBackup)
+			}
+
+			got, readErr := os.ReadFile(path)
+			if tt.wantContent == "" && os.IsNotExist(readErr) {
+				return // absent is an acceptable form of "empty"
+			}
+			if readErr != nil {
+				t.Fatalf("read back: %v", readErr)
+			}
+			if string(got) != tt.wantContent {
+				t.Errorf("content = %q, want %q", got, tt.wantContent)
+			}
+		})
+	}
+}
+
+func TestWriteConfig_ModeIs0600(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ssh_config")
+	if _, err := WriteConfig(path, Generated{Content: "Host a\n", Count: 1}, false); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The file lists every host the caller can reach; it must not widen
+	// just because it now goes through a temp file + rename.
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("mode = %o, want 600", perm)
+	}
+}
+
+func TestWriteConfig_LeavesNoTempFileBehind(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ssh_config")
+	if _, err := WriteConfig(path, Generated{Content: "Host a\n", Count: 1}, false); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "ssh_config" {
+			t.Errorf("unexpected leftover file: %s", e.Name())
+		}
+	}
+}
