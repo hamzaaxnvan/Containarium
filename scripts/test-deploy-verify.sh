@@ -31,3 +31,15 @@ runner_spaces()   { echo "  aaaa1111  "; }
 pass=0; fail=0
 check() { # name expected_rc runner
   local name="$1" want="$2"; shift 2
+  verify_remote "$name" "$@" >/dev/null 2>&1; local rc=$?
+  if [ "$rc" = "$want" ]; then echo "  PASS  $name (rc=$rc)"; pass=$((pass+1));
+  else echo "  FAIL  $name (rc=$rc want=$want)"; fail=$((fail+1)); fi
+}
+echo "=== verify_remote behaviour ==="
+check "matching checksum -> accept"        0 runner_match
+check "mismatched checksum -> REFUSE"      1 runner_mismatch
+check "empty response -> REFUSE"           1 runner_empty
+check "ssh failure -> REFUSE"              1 runner_fails
+check "whitespace tolerated -> accept"     0 runner_spaces
+echo "passed=$pass failed=$fail"
+[ "$fail" = "0" ]

@@ -320,3 +320,972 @@ func (x *RecipeParam) GetRequired() bool {
 	return false
 }
 
+// Recipe is a declarative definition of a GPU/app workload that Containarium
+// can provision as a new dedicated container. The container is an LXC system
+// container; the recipe's image runs inside it via Podman (post_start),
+// mirroring how the kubeflow stack runs k3s inside an LXC.
+type Recipe struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Stable recipe identifier (e.g. "ollama").
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Display name (e.g. "Ollama").
+	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// Short description.
+	Description string `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
+	// OCI image run via `podman run` inside the LXC (e.g. "ollama/ollama").
+	Image string `protobuf:"bytes,4,opt,name=image,proto3" json:"image,omitempty"`
+	// When true, the deploy must specify a GPU (--gpu) and/or a GPU-capable
+	// backend (--backend-id/--pool); the daemon rejects the deploy otherwise.
+	RequiresGpu bool `protobuf:"varint,5,opt,name=requires_gpu,json=requiresGpu,proto3" json:"requires_gpu,omitempty"`
+	// Default resource limits for the container.
+	Resources *RecipeResources `protobuf:"bytes,6,opt,name=resources,proto3" json:"resources,omitempty"`
+	// Ports to expose publicly after the app is running.
+	Ports []*RecipePort `protobuf:"bytes,7,rep,name=ports,proto3" json:"ports,omitempty"`
+	// Persistent volumes to create and mount.
+	Volumes []*RecipeVolume `protobuf:"bytes,8,rep,name=volumes,proto3" json:"volumes,omitempty"`
+	// Static environment variables passed to the app.
+	Env map[string]string `protobuf:"bytes,9,rep,name=env,proto3" json:"env,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Deploy-time parameters (with defaults), surfaced to UIs and exported to
+	// post_start as CONTAINARIUM_PARAM_<NAME>.
+	Parameters []*RecipeParam `protobuf:"bytes,10,rep,name=parameters,proto3" json:"parameters,omitempty"`
+	// Shell commands run inside the container after it is up (e.g. the
+	// `podman run ...` that starts the app, plus model warm-up). Same trust
+	// level as a stack's post_install: these ship in-tree and are reviewed.
+	PostStart []string `protobuf:"bytes,11,rep,name=post_start,json=postStart,proto3" json:"post_start,omitempty"`
+	// When non-empty, the daemon brokers this recipe's model calls through the
+	// managed model-gateway for the named provider (e.g. "gemini-openai"): it
+	// mints a scoped, revocable gateway token and exports
+	// CONTAINARIUM_MODEL_GATEWAY_URL + CONTAINARIUM_GATEWAY_TOKEN into post_start,
+	// so the box uses the platform key (metered, never leaked) instead of one the
+	// user supplies. Inert when the daemon holds no key for the provider — the
+	// box then comes up unconfigured (self-hosted default).
+	ModelGatewayProvider string `protobuf:"bytes,12,opt,name=model_gateway_provider,json=modelGatewayProvider,proto3" json:"model_gateway_provider,omitempty"`
+	// When set, every deploy of this recipe is gated on a guardrail
+	// attestation (#2368): DeployRecipe verifies the dataset the request
+	// stages against the server guardrail policy and its trusted signers
+	// BEFORE the container is created, copies exactly the verified bytes to
+	// dataset_path, and only then runs post_start. The recipe decides whether
+	// a gate applies; a caller cannot opt out by leaving guardrail_input out.
+	GuardrailGate *GuardrailGate `protobuf:"bytes,13,opt,name=guardrail_gate,json=guardrailGate,proto3" json:"guardrail_gate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Recipe) Reset() {
+	*x = Recipe{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Recipe) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Recipe) ProtoMessage() {}
+
+func (x *Recipe) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Recipe.ProtoReflect.Descriptor instead.
+func (*Recipe) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *Recipe) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *Recipe) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Recipe) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
+func (x *Recipe) GetImage() string {
+	if x != nil {
+		return x.Image
+	}
+	return ""
+}
+
+func (x *Recipe) GetRequiresGpu() bool {
+	if x != nil {
+		return x.RequiresGpu
+	}
+	return false
+}
+
+func (x *Recipe) GetResources() *RecipeResources {
+	if x != nil {
+		return x.Resources
+	}
+	return nil
+}
+
+func (x *Recipe) GetPorts() []*RecipePort {
+	if x != nil {
+		return x.Ports
+	}
+	return nil
+}
+
+func (x *Recipe) GetVolumes() []*RecipeVolume {
+	if x != nil {
+		return x.Volumes
+	}
+	return nil
+}
+
+func (x *Recipe) GetEnv() map[string]string {
+	if x != nil {
+		return x.Env
+	}
+	return nil
+}
+
+func (x *Recipe) GetParameters() []*RecipeParam {
+	if x != nil {
+		return x.Parameters
+	}
+	return nil
+}
+
+func (x *Recipe) GetPostStart() []string {
+	if x != nil {
+		return x.PostStart
+	}
+	return nil
+}
+
+func (x *Recipe) GetModelGatewayProvider() string {
+	if x != nil {
+		return x.ModelGatewayProvider
+	}
+	return ""
+}
+
+func (x *Recipe) GetGuardrailGate() *GuardrailGate {
+	if x != nil {
+		return x.GuardrailGate
+	}
+	return nil
+}
+
+// GuardrailGate is a recipe's guardrail precondition
+// (docs/architecture/guardrail-inbound-and-server-policy.md, "The gate").
+type GuardrailGate struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Absolute path in the new box where the verified bytes are placed before
+	// post_start.
+	DatasetPath string `protobuf:"bytes,1,opt,name=dataset_path,json=datasetPath,proto3" json:"dataset_path,omitempty"`
+	// Kinds the attestation must have covered, in addition to the server
+	// policy's own.
+	RequireKinds  []GuardrailKind `protobuf:"varint,2,rep,packed,name=require_kinds,json=requireKinds,proto3,enum=containarium.v1.GuardrailKind" json:"require_kinds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GuardrailGate) Reset() {
+	*x = GuardrailGate{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GuardrailGate) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GuardrailGate) ProtoMessage() {}
+
+func (x *GuardrailGate) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GuardrailGate.ProtoReflect.Descriptor instead.
+func (*GuardrailGate) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *GuardrailGate) GetDatasetPath() string {
+	if x != nil {
+		return x.DatasetPath
+	}
+	return ""
+}
+
+func (x *GuardrailGate) GetRequireKinds() []GuardrailKind {
+	if x != nil {
+		return x.RequireKinds
+	}
+	return nil
+}
+
+// GuardrailGateInput is the dataset a gated deploy checks.
+type GuardrailGateInput struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// A directory under the daemon's guardrail staging root (the daemon flag
+	// --guardrail-staging-root), as a clean relative path. Nothing on the
+	// platform stages a dataset there yet: an operator or an out-of-band copy
+	// does (the `ship` verb is a documented gap).
+	StagingRef string `protobuf:"bytes,1,opt,name=staging_ref,json=stagingRef,proto3" json:"staging_ref,omitempty"`
+	// The attestation `containarium guardrail apply` wrote for that directory.
+	Attestation   *GuardrailAttestation `protobuf:"bytes,2,opt,name=attestation,proto3" json:"attestation,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GuardrailGateInput) Reset() {
+	*x = GuardrailGateInput{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GuardrailGateInput) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GuardrailGateInput) ProtoMessage() {}
+
+func (x *GuardrailGateInput) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GuardrailGateInput.ProtoReflect.Descriptor instead.
+func (*GuardrailGateInput) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *GuardrailGateInput) GetStagingRef() string {
+	if x != nil {
+		return x.StagingRef
+	}
+	return ""
+}
+
+func (x *GuardrailGateInput) GetAttestation() *GuardrailAttestation {
+	if x != nil {
+		return x.Attestation
+	}
+	return nil
+}
+
+// ListRecipesRequest is the request to list available recipes.
+type ListRecipesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListRecipesRequest) Reset() {
+	*x = ListRecipesRequest{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListRecipesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListRecipesRequest) ProtoMessage() {}
+
+func (x *ListRecipesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListRecipesRequest.ProtoReflect.Descriptor instead.
+func (*ListRecipesRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{7}
+}
+
+// ListRecipesResponse returns all built-in recipes.
+type ListRecipesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Recipes       []*Recipe              `protobuf:"bytes,1,rep,name=recipes,proto3" json:"recipes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListRecipesResponse) Reset() {
+	*x = ListRecipesResponse{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListRecipesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListRecipesResponse) ProtoMessage() {}
+
+func (x *ListRecipesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListRecipesResponse.ProtoReflect.Descriptor instead.
+func (*ListRecipesResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *ListRecipesResponse) GetRecipes() []*Recipe {
+	if x != nil {
+		return x.Recipes
+	}
+	return nil
+}
+
+// GetRecipeRequest fetches a single recipe definition.
+type GetRecipeRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRecipeRequest) Reset() {
+	*x = GetRecipeRequest{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRecipeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRecipeRequest) ProtoMessage() {}
+
+func (x *GetRecipeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRecipeRequest.ProtoReflect.Descriptor instead.
+func (*GetRecipeRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetRecipeRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+// GetRecipeResponse returns a single recipe definition.
+type GetRecipeResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Recipe        *Recipe                `protobuf:"bytes,1,opt,name=recipe,proto3" json:"recipe,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRecipeResponse) Reset() {
+	*x = GetRecipeResponse{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRecipeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRecipeResponse) ProtoMessage() {}
+
+func (x *GetRecipeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRecipeResponse.ProtoReflect.Descriptor instead.
+func (*GetRecipeResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *GetRecipeResponse) GetRecipe() *Recipe {
+	if x != nil {
+		return x.Recipe
+	}
+	return nil
+}
+
+// DeployRecipeRequest provisions a new dedicated container from a recipe.
+type DeployRecipeRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Recipe to deploy (e.g. "ollama").
+	RecipeId string `protobuf:"bytes,1,opt,name=recipe_id,json=recipeId,proto3" json:"recipe_id,omitempty"`
+	// Deployment / container identity (the new container is named
+	// "<name>-container", same identity scheme as `containarium create`).
+	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// GPU device ID for passthrough (e.g. "0" or a PCI address). Required for
+	// recipes with requires_gpu unless a GPU-capable backend is selected.
+	Gpu string `protobuf:"bytes,3,opt,name=gpu,proto3" json:"gpu,omitempty"`
+	// Target backend ID for placement (empty = primary backend).
+	BackendId string `protobuf:"bytes,4,opt,name=backend_id,json=backendId,proto3" json:"backend_id,omitempty"`
+	// Pool selector for placement (empty = untagged backends only).
+	Pool string `protobuf:"bytes,5,opt,name=pool,proto3" json:"pool,omitempty"`
+	// Overrides for the recipe's declared parameters (by name).
+	Parameters map[string]string `protobuf:"bytes,6,rep,name=parameters,proto3" json:"parameters,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Optional overrides for the recipe's default resource limits.
+	ResourceOverrides *RecipeResources `protobuf:"bytes,7,opt,name=resource_overrides,json=resourceOverrides,proto3" json:"resource_overrides,omitempty"`
+	// Custom labels stamped on the provisioned container (forwarded to
+	// CreateContainer). Lets a control plane attribute a recipe-deployed box to
+	// a tenant/org the same way it does for a plain CreateContainer — without
+	// labels, a cloud front-end that filters containers by label can't see a
+	// recipe-deployed box. Same key/value rules as CreateContainerRequest.labels.
+	Labels map[string]string `protobuf:"bytes,8,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// async runs the recipe's post_start in the background: the RPC returns as
+	// soon as the container is created (state CREATING) instead of blocking until
+	// post_start finishes. Set this when the deploy is driven over a connection
+	// with a request/idle timeout shorter than the post_start (e.g. a control
+	// plane reaching a BYOC host through a peer-proxy): a recipe that pulls a
+	// multi-GB image can exceed that timeout, which would otherwise abort the
+	// deploy mid-pull. The CLI leaves this false so a human sees post_start's
+	// result inline. The box becomes fully functional once the background
+	// post_start completes; poll the container / its workspace access to detect
+	// readiness.
+	Async bool `protobuf:"varint,9,opt,name=async,proto3" json:"async,omitempty"`
+	// The dataset and attestation for a recipe with guardrail_gate set.
+	// Required for such a recipe (absent is FAILED_PRECONDITION); ignored for
+	// an ungated one. A gated recipe cannot be deployed async.
+	GuardrailInput *GuardrailGateInput `protobuf:"bytes,10,opt,name=guardrail_input,json=guardrailInput,proto3" json:"guardrail_input,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *DeployRecipeRequest) Reset() {
+	*x = DeployRecipeRequest{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeployRecipeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeployRecipeRequest) ProtoMessage() {}
+
+func (x *DeployRecipeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeployRecipeRequest.ProtoReflect.Descriptor instead.
+func (*DeployRecipeRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *DeployRecipeRequest) GetRecipeId() string {
+	if x != nil {
+		return x.RecipeId
+	}
+	return ""
+}
+
+func (x *DeployRecipeRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *DeployRecipeRequest) GetGpu() string {
+	if x != nil {
+		return x.Gpu
+	}
+	return ""
+}
+
+func (x *DeployRecipeRequest) GetBackendId() string {
+	if x != nil {
+		return x.BackendId
+	}
+	return ""
+}
+
+func (x *DeployRecipeRequest) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
+}
+
+func (x *DeployRecipeRequest) GetParameters() map[string]string {
+	if x != nil {
+		return x.Parameters
+	}
+	return nil
+}
+
+func (x *DeployRecipeRequest) GetResourceOverrides() *RecipeResources {
+	if x != nil {
+		return x.ResourceOverrides
+	}
+	return nil
+}
+
+func (x *DeployRecipeRequest) GetLabels() map[string]string {
+	if x != nil {
+		return x.Labels
+	}
+	return nil
+}
+
+func (x *DeployRecipeRequest) GetAsync() bool {
+	if x != nil {
+		return x.Async
+	}
+	return false
+}
+
+func (x *DeployRecipeRequest) GetGuardrailInput() *GuardrailGateInput {
+	if x != nil {
+		return x.GuardrailInput
+	}
+	return nil
+}
+
+// DeployRecipeResponse is the result of a recipe deployment.
+type DeployRecipeResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The created container.
+	Container *Container `protobuf:"bytes,1,opt,name=container,proto3" json:"container,omitempty"`
+	// Public URL of the first exposed port, if any.
+	Url string `protobuf:"bytes,2,opt,name=url,proto3" json:"url,omitempty"`
+	// Human-readable status message.
+	Message       string `protobuf:"bytes,3,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeployRecipeResponse) Reset() {
+	*x = DeployRecipeResponse{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeployRecipeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeployRecipeResponse) ProtoMessage() {}
+
+func (x *DeployRecipeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeployRecipeResponse.ProtoReflect.Descriptor instead.
+func (*DeployRecipeResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *DeployRecipeResponse) GetContainer() *Container {
+	if x != nil {
+		return x.Container
+	}
+	return nil
+}
+
+func (x *DeployRecipeResponse) GetUrl() string {
+	if x != nil {
+		return x.Url
+	}
+	return ""
+}
+
+func (x *DeployRecipeResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// GetWorkspaceAccessRequest fetches a zero-click access URL for an
+// agent-workspace box.
+type GetWorkspaceAccessRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The box identity (the container is named "<name>-container"), same scheme
+	// as DeployRecipeRequest.name.
+	Name          string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetWorkspaceAccessRequest) Reset() {
+	*x = GetWorkspaceAccessRequest{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetWorkspaceAccessRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetWorkspaceAccessRequest) ProtoMessage() {}
+
+func (x *GetWorkspaceAccessRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetWorkspaceAccessRequest.ProtoReflect.Descriptor instead.
+func (*GetWorkspaceAccessRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *GetWorkspaceAccessRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+// GetWorkspaceAccessResponse carries a bootstrap URL the console can load in an
+// iframe to sign the user into the in-box workspace proxy without a prompt.
+type GetWorkspaceAccessResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The in-box auth proxy's per-box session token.
+	Token string `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
+	// Ready-to-embed bootstrap URL (https://<workspace-domain>/__ws_login?t=...);
+	// loading it sets the session cookie and redirects to the workspace UI.
+	Url           string `protobuf:"bytes,2,opt,name=url,proto3" json:"url,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetWorkspaceAccessResponse) Reset() {
+	*x = GetWorkspaceAccessResponse{}
+	mi := &file_containarium_v1_recipe_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetWorkspaceAccessResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetWorkspaceAccessResponse) ProtoMessage() {}
+
+func (x *GetWorkspaceAccessResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_recipe_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetWorkspaceAccessResponse.ProtoReflect.Descriptor instead.
+func (*GetWorkspaceAccessResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_recipe_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *GetWorkspaceAccessResponse) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
+func (x *GetWorkspaceAccessResponse) GetUrl() string {
+	if x != nil {
+		return x.Url
+	}
+	return ""
+}
+
+var File_containarium_v1_recipe_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_recipe_proto_rawDesc = "" +
+	"\n" +
+	"\x1ccontainarium/v1/recipe.proto\x12\x0fcontainarium.v1\x1a\x1cgoogle/api/annotations.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\x1a\x1fcontainarium/v1/container.proto\x1a\x1dcontainarium/v1/network.proto\x1a\x1fcontainarium/v1/guardrail.proto\"O\n" +
+	"\x0fRecipeResources\x12\x10\n" +
+	"\x03cpu\x18\x01 \x01(\tR\x03cpu\x12\x16\n" +
+	"\x06memory\x18\x02 \x01(\tR\x06memory\x12\x12\n" +
+	"\x04disk\x18\x03 \x01(\tR\x04disk\"\xb2\x01\n" +
+	"\n" +
+	"RecipePort\x12%\n" +
+	"\x0econtainer_port\x18\x01 \x01(\x05R\rcontainerPort\x12\x1c\n" +
+	"\tsubdomain\x18\x02 \x01(\tR\tsubdomain\x12:\n" +
+	"\bprotocol\x18\x03 \x01(\x0e2\x1e.containarium.v1.RouteProtocolR\bprotocol\x12#\n" +
+	"\rexternal_port\x18\x04 \x01(\x05R\fexternalPort\"6\n" +
+	"\fRecipeVolume\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
+	"\x04path\x18\x02 \x01(\tR\x04path\"\xa3\x01\n" +
+	"\vRecipeParam\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
+	"\x05label\x18\x02 \x01(\tR\x05label\x12 \n" +
+	"\vdescription\x18\x03 \x01(\tR\vdescription\x12\x12\n" +
+	"\x04type\x18\x04 \x01(\tR\x04type\x12\x18\n" +
+	"\adefault\x18\x05 \x01(\tR\adefault\x12\x1a\n" +
+	"\brequired\x18\x06 \x01(\bR\brequired\"\xf9\x04\n" +
+	"\x06Recipe\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12 \n" +
+	"\vdescription\x18\x03 \x01(\tR\vdescription\x12\x14\n" +
+	"\x05image\x18\x04 \x01(\tR\x05image\x12!\n" +
+	"\frequires_gpu\x18\x05 \x01(\bR\vrequiresGpu\x12>\n" +
+	"\tresources\x18\x06 \x01(\v2 .containarium.v1.RecipeResourcesR\tresources\x121\n" +
+	"\x05ports\x18\a \x03(\v2\x1b.containarium.v1.RecipePortR\x05ports\x127\n" +
+	"\avolumes\x18\b \x03(\v2\x1d.containarium.v1.RecipeVolumeR\avolumes\x122\n" +
+	"\x03env\x18\t \x03(\v2 .containarium.v1.Recipe.EnvEntryR\x03env\x12<\n" +
+	"\n" +
+	"parameters\x18\n" +
+	" \x03(\v2\x1c.containarium.v1.RecipeParamR\n" +
+	"parameters\x12\x1d\n" +
+	"\n" +
+	"post_start\x18\v \x03(\tR\tpostStart\x124\n" +
+	"\x16model_gateway_provider\x18\f \x01(\tR\x14modelGatewayProvider\x12E\n" +
+	"\x0eguardrail_gate\x18\r \x01(\v2\x1e.containarium.v1.GuardrailGateR\rguardrailGate\x1a6\n" +
+	"\bEnvEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"w\n" +
+	"\rGuardrailGate\x12!\n" +
+	"\fdataset_path\x18\x01 \x01(\tR\vdatasetPath\x12C\n" +
+	"\rrequire_kinds\x18\x02 \x03(\x0e2\x1e.containarium.v1.GuardrailKindR\frequireKinds\"~\n" +
+	"\x12GuardrailGateInput\x12\x1f\n" +
+	"\vstaging_ref\x18\x01 \x01(\tR\n" +
+	"stagingRef\x12G\n" +
+	"\vattestation\x18\x02 \x01(\v2%.containarium.v1.GuardrailAttestationR\vattestation\"\x14\n" +
+	"\x12ListRecipesRequest\"H\n" +
+	"\x13ListRecipesResponse\x121\n" +
+	"\arecipes\x18\x01 \x03(\v2\x17.containarium.v1.RecipeR\arecipes\"\"\n" +
+	"\x10GetRecipeRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"D\n" +
+	"\x11GetRecipeResponse\x12/\n" +
+	"\x06recipe\x18\x01 \x01(\v2\x17.containarium.v1.RecipeR\x06recipe\"\xda\x04\n" +
+	"\x13DeployRecipeRequest\x12\x1b\n" +
+	"\trecipe_id\x18\x01 \x01(\tR\brecipeId\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x10\n" +
+	"\x03gpu\x18\x03 \x01(\tR\x03gpu\x12\x1d\n" +
+	"\n" +
+	"backend_id\x18\x04 \x01(\tR\tbackendId\x12\x12\n" +
+	"\x04pool\x18\x05 \x01(\tR\x04pool\x12T\n" +
+	"\n" +
+	"parameters\x18\x06 \x03(\v24.containarium.v1.DeployRecipeRequest.ParametersEntryR\n" +
+	"parameters\x12O\n" +
+	"\x12resource_overrides\x18\a \x01(\v2 .containarium.v1.RecipeResourcesR\x11resourceOverrides\x12H\n" +
+	"\x06labels\x18\b \x03(\v20.containarium.v1.DeployRecipeRequest.LabelsEntryR\x06labels\x12\x14\n" +
+	"\x05async\x18\t \x01(\bR\x05async\x12L\n" +
+	"\x0fguardrail_input\x18\n" +
+	" \x01(\v2#.containarium.v1.GuardrailGateInputR\x0eguardrailInput\x1a=\n" +
+	"\x0fParametersEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"|\n" +
+	"\x14DeployRecipeResponse\x128\n" +
+	"\tcontainer\x18\x01 \x01(\v2\x1a.containarium.v1.ContainerR\tcontainer\x12\x10\n" +
+	"\x03url\x18\x02 \x01(\tR\x03url\x12\x18\n" +
+	"\amessage\x18\x03 \x01(\tR\amessage\"/\n" +
+	"\x19GetWorkspaceAccessRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\"D\n" +
+	"\x1aGetWorkspaceAccessResponse\x12\x14\n" +
+	"\x05token\x18\x01 \x01(\tR\x05token\x12\x10\n" +
+	"\x03url\x18\x02 \x01(\tR\x03url2\xda\b\n" +
+	"\rRecipeService\x12\xd1\x02\n" +
+	"\x12GetWorkspaceAccess\x12*.containarium.v1.GetWorkspaceAccessRequest\x1a+.containarium.v1.GetWorkspaceAccessResponse\"\xe1\x01\x92A\xb2\x01\n" +
+	"\aRecipes\x12\x18Get workspace access URL\x1a\x8c\x01Returns a zero-click bootstrap URL for an agent-workspace box, embeddable in the console to authenticate the in-box workspace UI seamlessly.\x82\xd3\xe4\x93\x02%\x12#/v1/recipes/workspace/{name}/access\x12\xd3\x01\n" +
+	"\vListRecipes\x12#.containarium.v1.ListRecipesRequest\x1a$.containarium.v1.ListRecipesResponse\"y\x92Ac\n" +
+	"\aRecipes\x12\fList recipes\x1aJReturns all built-in recipes that can be deployed as dedicated containers.\x82\xd3\xe4\x93\x02\r\x12\v/v1/recipes\x12\xe9\x01\n" +
+	"\tGetRecipe\x12!.containarium.v1.GetRecipeRequest\x1a\".containarium.v1.GetRecipeResponse\"\x94\x01\x92Ay\n" +
+	"\aRecipes\x12\n" +
+	"Get recipe\x1abReturns the definition of a single recipe, including its parameters, ports, and resource defaults.\x82\xd3\xe4\x93\x02\x12\x12\x10/v1/recipes/{id}\x12\xb2\x02\n" +
+	"\fDeployRecipe\x12$.containarium.v1.DeployRecipeRequest\x1a%.containarium.v1.DeployRecipeResponse\"\xd4\x01\x92A\xa7\x01\n" +
+	"\aRecipes\x12\x0fDeploy a recipe\x1a\x8a\x01Provisions a new dedicated container (with optional GPU passthrough), runs the recipe's image inside it, and exposes the configured ports.\x82\xd3\xe4\x93\x02#:\x01*\"\x1e/v1/recipes/{recipe_id}/deployBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_recipe_proto_rawDescOnce sync.Once
+	file_containarium_v1_recipe_proto_rawDescData []byte
+)
+
+func file_containarium_v1_recipe_proto_rawDescGZIP() []byte {
+	file_containarium_v1_recipe_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_recipe_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_recipe_proto_rawDesc), len(file_containarium_v1_recipe_proto_rawDesc)))
+	})
+	return file_containarium_v1_recipe_proto_rawDescData
+}
+
+var file_containarium_v1_recipe_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_containarium_v1_recipe_proto_goTypes = []any{
+	(*RecipeResources)(nil),            // 0: containarium.v1.RecipeResources
+	(*RecipePort)(nil),                 // 1: containarium.v1.RecipePort
+	(*RecipeVolume)(nil),               // 2: containarium.v1.RecipeVolume
+	(*RecipeParam)(nil),                // 3: containarium.v1.RecipeParam
+	(*Recipe)(nil),                     // 4: containarium.v1.Recipe
+	(*GuardrailGate)(nil),              // 5: containarium.v1.GuardrailGate
+	(*GuardrailGateInput)(nil),         // 6: containarium.v1.GuardrailGateInput
+	(*ListRecipesRequest)(nil),         // 7: containarium.v1.ListRecipesRequest
+	(*ListRecipesResponse)(nil),        // 8: containarium.v1.ListRecipesResponse
+	(*GetRecipeRequest)(nil),           // 9: containarium.v1.GetRecipeRequest
+	(*GetRecipeResponse)(nil),          // 10: containarium.v1.GetRecipeResponse
+	(*DeployRecipeRequest)(nil),        // 11: containarium.v1.DeployRecipeRequest
+	(*DeployRecipeResponse)(nil),       // 12: containarium.v1.DeployRecipeResponse
+	(*GetWorkspaceAccessRequest)(nil),  // 13: containarium.v1.GetWorkspaceAccessRequest
+	(*GetWorkspaceAccessResponse)(nil), // 14: containarium.v1.GetWorkspaceAccessResponse
+	nil,                                // 15: containarium.v1.Recipe.EnvEntry
+	nil,                                // 16: containarium.v1.DeployRecipeRequest.ParametersEntry
+	nil,                                // 17: containarium.v1.DeployRecipeRequest.LabelsEntry
+	(RouteProtocol)(0),                 // 18: containarium.v1.RouteProtocol
+	(GuardrailKind)(0),                 // 19: containarium.v1.GuardrailKind
+	(*GuardrailAttestation)(nil),       // 20: containarium.v1.GuardrailAttestation
+	(*Container)(nil),                  // 21: containarium.v1.Container
+}
+var file_containarium_v1_recipe_proto_depIdxs = []int32{
+	18, // 0: containarium.v1.RecipePort.protocol:type_name -> containarium.v1.RouteProtocol
+	0,  // 1: containarium.v1.Recipe.resources:type_name -> containarium.v1.RecipeResources
+	1,  // 2: containarium.v1.Recipe.ports:type_name -> containarium.v1.RecipePort
+	2,  // 3: containarium.v1.Recipe.volumes:type_name -> containarium.v1.RecipeVolume
+	15, // 4: containarium.v1.Recipe.env:type_name -> containarium.v1.Recipe.EnvEntry
+	3,  // 5: containarium.v1.Recipe.parameters:type_name -> containarium.v1.RecipeParam
+	5,  // 6: containarium.v1.Recipe.guardrail_gate:type_name -> containarium.v1.GuardrailGate
+	19, // 7: containarium.v1.GuardrailGate.require_kinds:type_name -> containarium.v1.GuardrailKind
+	20, // 8: containarium.v1.GuardrailGateInput.attestation:type_name -> containarium.v1.GuardrailAttestation
+	4,  // 9: containarium.v1.ListRecipesResponse.recipes:type_name -> containarium.v1.Recipe
+	4,  // 10: containarium.v1.GetRecipeResponse.recipe:type_name -> containarium.v1.Recipe
+	16, // 11: containarium.v1.DeployRecipeRequest.parameters:type_name -> containarium.v1.DeployRecipeRequest.ParametersEntry
+	0,  // 12: containarium.v1.DeployRecipeRequest.resource_overrides:type_name -> containarium.v1.RecipeResources
+	17, // 13: containarium.v1.DeployRecipeRequest.labels:type_name -> containarium.v1.DeployRecipeRequest.LabelsEntry
+	6,  // 14: containarium.v1.DeployRecipeRequest.guardrail_input:type_name -> containarium.v1.GuardrailGateInput
+	21, // 15: containarium.v1.DeployRecipeResponse.container:type_name -> containarium.v1.Container
+	13, // 16: containarium.v1.RecipeService.GetWorkspaceAccess:input_type -> containarium.v1.GetWorkspaceAccessRequest
+	7,  // 17: containarium.v1.RecipeService.ListRecipes:input_type -> containarium.v1.ListRecipesRequest
+	9,  // 18: containarium.v1.RecipeService.GetRecipe:input_type -> containarium.v1.GetRecipeRequest
+	11, // 19: containarium.v1.RecipeService.DeployRecipe:input_type -> containarium.v1.DeployRecipeRequest
+	14, // 20: containarium.v1.RecipeService.GetWorkspaceAccess:output_type -> containarium.v1.GetWorkspaceAccessResponse
+	8,  // 21: containarium.v1.RecipeService.ListRecipes:output_type -> containarium.v1.ListRecipesResponse
+	10, // 22: containarium.v1.RecipeService.GetRecipe:output_type -> containarium.v1.GetRecipeResponse
+	12, // 23: containarium.v1.RecipeService.DeployRecipe:output_type -> containarium.v1.DeployRecipeResponse
+	20, // [20:24] is the sub-list for method output_type
+	16, // [16:20] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_recipe_proto_init() }
+func file_containarium_v1_recipe_proto_init() {
+	if File_containarium_v1_recipe_proto != nil {
+		return
+	}
+	file_containarium_v1_container_proto_init()
+	file_containarium_v1_network_proto_init()
+	file_containarium_v1_guardrail_proto_init()
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_recipe_proto_rawDesc), len(file_containarium_v1_recipe_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   18,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_recipe_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_recipe_proto_depIdxs,
+		MessageInfos:      file_containarium_v1_recipe_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_recipe_proto = out.File
+	file_containarium_v1_recipe_proto_goTypes = nil
+	file_containarium_v1_recipe_proto_depIdxs = nil
+}
