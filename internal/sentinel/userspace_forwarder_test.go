@@ -100,3 +100,106 @@ func TestUserspaceForwarder_HandlerWritesProxyFrame(t *testing.T) {
 	// Run handle() with emit=true.
 	fwd := newUserspaceForwarder(true)
 	fwd.handle(clientAccepted, backendAddr)
+
+	r := <-out
+	if r.err != nil {
+		t.Fatalf("backend read err: %v", r.err)
+	}
+	if !r.gotHeader {
+		t.Errorf("expected PROXY v2 signature on the wire, didn't see it")
+	}
+	if string(r.body) != "hello" {
+		t.Errorf("payload not forwarded verbatim: got %q want %q", r.body, "hello")
+	}
+}
+
+// TestUserspaceForwarder_HandlerWritesNoFrameWhenDisabled is the
+// counterpart: emit=false means the wire has no PROXY frame, just
+// the payload.
+func TestUserspaceForwarder_HandlerWritesNoFrameWhenDisabled(t *testing.T) {
+	backendLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer func() { _ = backendLn.Close() }()
+
+	out := make(chan []byte, 1)
+	go func() {
+		c, err := backendLn.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		body, _ := io.ReadAll(c)
+		out <- body
+	}()
+
+	clientLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer func() { _ = clientLn.Close() }()
+	ch := make(chan net.Conn, 1)
+	go func() { c, _ := clientLn.Accept(); ch <- c }()
+	cd, _ := net.Dial("tcp", clientLn.Addr().String())
+	defer func() { _ = cd.Close() }()
+	ca := <-ch
+	defer func() { _ = ca.Close() }()
+	go func() {
+		_, _ = cd.Write([]byte("plain"))
+		_ = cd.(*net.TCPConn).CloseWrite()
+	}()
+
+	fwd := newUserspaceForwarder(false)
+	fwd.handle(ca, backendLn.Addr().String())
+
+	got := <-out
+	if string(got) != "plain" {
+		t.Errorf("payload not forwarded verbatim: got %q want %q", got, "plain")
+	}
+	// Make sure the signature is NOT at the start.
+	sig := []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
+	if bytes.HasPrefix(got, sig) {
+		t.Error("PROXY v2 frame was emitted even though emitProxy=false")
+	}
+}
+
+// TestUserspaceForwarder_StartStopIsIdempotent makes sure stop() can
+// be called multiple times and on an empty forwarder without panicking,
+// since switchToMaintenance may call it before start() has run on the
+// first proxy switch.
+func TestUserspaceForwarder_StartStopIsIdempotent(t *testing.T) {
+	fwd := newUserspaceForwarder(true)
+	fwd.stop() // never started — must not panic
+
+	// Try starting then double-stopping.
+	port := freePort(t)
+	if err := fwd.start("127.0.0.1", []int{port}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fwd.stop()
+	fwd.stop()
+}
+
+// TestUserspaceForwarder_BindFailureReturnsError verifies that a port
+// conflict surfaces as an error (so switchToProxy can roll back rather
+// than continue into a half-configured state). The forwarder binds
+// to ":<port>" (all interfaces), so the held listener must do the same
+// — on macOS, holding 127.0.0.1:<port> doesn't prevent 0.0.0.0:<port>
+// from binding.
+func TestUserspaceForwarder_BindFailureReturnsError(t *testing.T) {
+	hold, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("hold listen: %v", err)
+	}
+	defer func() { _ = hold.Close() }()
+	port := hold.Addr().(*net.TCPAddr).Port
+
+	fwd := newUserspaceForwarder(true)
+	defer fwd.stop()
+	err = fwd.start("127.0.0.1", []int{port})
+	if err == nil {
+		t.Fatal("expected start() to fail when port is already taken")
+	}
+	if !strings.Contains(err.Error(), "listen") {
+		t.Errorf("error should mention listen failure, got: %v", err)
+	}
+}
