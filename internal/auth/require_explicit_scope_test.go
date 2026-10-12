@@ -40,3 +40,45 @@ func TestRequireExplicitScope(t *testing.T) {
 			name: "scope granted",
 			ctx:  ContextWithTestSubjectScopes(context.Background(), "shipper", []string{"service"}, []string{ScopeAuditIngest}),
 			want: codes.OK,
+		},
+		{
+			name: "wildcard granted",
+			ctx:  ContextWithTestSubjectScopes(context.Background(), "admin", []string{"admin"}, []string{ScopeWildcard}),
+			want: codes.OK,
+		},
+		{
+			name: "other scopes only",
+			ctx:  ContextWithTestSubjectScopes(context.Background(), "alice", []string{"user"}, []string{ScopeContainersRead, ScopeAuditRead}),
+			want: codes.PermissionDenied,
+		},
+		{
+			// The case that distinguishes this helper from RequireScope: a
+			// pre-scope token with no scopes claim is denied even though
+			// strict mode is off.
+			name: "no scopes claim, strict off",
+			ctx:  ContextWithTestSubject(context.Background(), "admin", "admin"),
+			want: codes.PermissionDenied,
+		},
+		{
+			name:   "no scopes claim, strict on",
+			ctx:    ContextWithTestSubject(context.Background(), "admin", "admin"),
+			strict: true,
+			want:   codes.PermissionDenied,
+		},
+		{
+			name: "empty scopes claim",
+			ctx:  ContextWithTestSubjectScopes(context.Background(), "alice", []string{"user"}, []string{}),
+			want: codes.PermissionDenied,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			SetStrictScopes(tc.strict)
+			defer SetStrictScopes(false)
+			err := RequireExplicitScope(tc.ctx, ScopeAuditIngest)
+			if got := status.Code(err); got != tc.want {
+				t.Fatalf("RequireExplicitScope = %v (code %s), want code %s", err, got, tc.want)
+			}
+		})
+	}
+}
