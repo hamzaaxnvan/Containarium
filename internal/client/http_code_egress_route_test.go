@@ -65,3 +65,20 @@ func TestCodeEgress_HTTPPathsAndDecoding(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if gotMethod != http.MethodGet || gotPath != "/v1/code/egress-policy/alice" {
+			t.Errorf("%s %s", gotMethod, gotPath)
+		}
+		if resp.GetEffective().GetSource() != pb.CodingToolEgressPolicySource_CODING_TOOL_EGRESS_POLICY_SOURCE_NONE {
+			t.Errorf("decoded %+v", resp)
+		}
+	})
+	t.Run("Delete", func(t *testing.T) {
+		respBody = `{}`
+		if _, err := c.DeleteCodingToolEgressPolicy(&pb.DeleteCodingToolEgressPolicyRequest{Tenant: "alice"}); err != nil {
+			t.Fatal(err)
+		}
+		if gotMethod != http.MethodDelete || gotPath != "/v1/code/egress-policy/alice" {
+			t.Errorf("%s %s", gotMethod, gotPath)
+		}
+	})
+}
