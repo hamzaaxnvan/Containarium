@@ -100,3 +100,411 @@ func badDestAdminCtx() context.Context {
 
 func TestAddThenListBadDestination(t *testing.T) {
 	s := NewThreatDetectionServer(nil, false, false, "")
+	rule, err := threatdetect.NewBadDestinationRule(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("NewBadDestinationRule: %v", err)
+	}
+	s.SetBadDestinationRule(rule)
+
+	addResp, err := s.AddBadDestination(badDestAdminCtx(), &pb.AddBadDestinationRequest{Cidr: "192.0.2.55/32", Label: "test entry"})
+	if err != nil {
+		t.Fatalf("AddBadDestination: %v", err)
+	}
+	if addResp.GetEntry().GetCidr() != "192.0.2.55/32" || addResp.GetEntry().GetSource() != "operator" {
+		t.Errorf("AddBadDestination entry = %+v, want cidr=192.0.2.55/32 source=operator", addResp.GetEntry())
+	}
+
+	listResp, err := s.ListBadDestinations(secReadCtx(), &pb.ListBadDestinationsRequest{})
+	if err != nil {
+		t.Fatalf("ListBadDestinations: %v", err)
+	}
+	found := false
+	for _, e := range listResp.GetEntries() {
+		if e.GetCidr() == "192.0.2.55/32" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ListBadDestinations = %+v, want the just-added entry", listResp.GetEntries())
+	}
+}
+
+func TestAddBadDestination_MissingCidr(t *testing.T) {
+	s := NewThreatDetectionServer(nil, false, false, "")
+	rule, err := threatdetect.NewBadDestinationRule(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("NewBadDestinationRule: %v", err)
+	}
+	s.SetBadDestinationRule(rule)
+
+	if _, err := s.AddBadDestination(badDestAdminCtx(), &pb.AddBadDestinationRequest{Label: "no cidr"}); err == nil {
+		t.Fatal("AddBadDestination with no cidr should error, got nil")
+	}
+}
+
+func TestRemoveBadDestination_NotFound(t *testing.T) {
+	s := NewThreatDetectionServer(nil, false, false, "")
+	rule, err := threatdetect.NewBadDestinationRule(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("NewBadDestinationRule: %v", err)
+	}
+	s.SetBadDestinationRule(rule)
+
+	if _, err := s.RemoveBadDestination(badDestAdminCtx(), &pb.RemoveBadDestinationRequest{Cidr: "192.0.2.99/32"}); err == nil {
+		t.Fatal("RemoveBadDestination on a never-added entry should error, got nil")
+	}
+}
+
+func TestRemoveBadDestination_RoundTrip(t *testing.T) {
+	s := NewThreatDetectionServer(nil, false, false, "")
+	rule, err := threatdetect.NewBadDestinationRule(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("NewBadDestinationRule: %v", err)
+	}
+	s.SetBadDestinationRule(rule)
+
+	if _, err := s.AddBadDestination(badDestAdminCtx(), &pb.AddBadDestinationRequest{Cidr: "192.0.2.55/32", Label: "temp"}); err != nil {
+		t.Fatalf("AddBadDestination: %v", err)
+	}
+	if _, err := s.RemoveBadDestination(badDestAdminCtx(), &pb.RemoveBadDestinationRequest{Cidr: "192.0.2.55/32"}); err != nil {
+		t.Fatalf("RemoveBadDestination: %v", err)
+	}
+	listResp, err := s.ListBadDestinations(secReadCtx(), &pb.ListBadDestinationsRequest{})
+	if err != nil {
+		t.Fatalf("ListBadDestinations: %v", err)
+	}
+	for _, e := range listResp.GetEntries() {
+		if e.GetCidr() == "192.0.2.55/32" {
+			t.Errorf("entry still listed after removal: %+v", e)
+		}
+	}
+}
+
+func TestListFindings_NoStore_ReturnsUnavailable(t *testing.T) {
+	s := NewThreatDetectionServer(nil, false, false, "")
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", auth.RoleAdmin)
+	_, err := s.ListFindings(ctx, &pb.ListFindingsRequest{})
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("code = %v, want Unavailable", status.Code(err))
+	}
+}
+
+func TestListFindings_Unauthenticated(t *testing.T) {
+	s := NewThreatDetectionServer(nil, false, false, "")
+	s.SetFindingStore(&fakeFindingReader{})
+	if _, err := s.ListFindings(context.Background(), &pb.ListFindingsRequest{}); err == nil {
+		t.Fatal("ListFindings with no authenticated subject should error, got nil")
+	}
+}
+
+// Admin sees every tenant: an explicit tenant_id filter passes through
+// unchanged to the store.
+func TestListFindings_Admin_SeesRequestedTenant(t *testing.T) {
+	store := &fakeFindingReader{
+		findings: []*threatdetect.Finding{{ID: 1, TenantID: "bob", Severity: pb.ThreatSeverity_THREAT_SEVERITY_HIGH, State: threatdetect.FindingStateOpen}},
+	}
+	s := NewThreatDetectionServer(nil, false, false, "")
+	s.SetFindingStore(store)
+
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", auth.RoleAdmin)
+	resp, err := s.ListFindings(ctx, &pb.ListFindingsRequest{TenantId: "bob"})
+	if err != nil {
+		t.Fatalf("ListFindings: %v", err)
+	}
+	if store.lastFilter.TenantID != "bob" {
+		t.Errorf("store received TenantID = %q, want %q (admin's explicit filter passed through)", store.lastFilter.TenantID, "bob")
+	}
+	if len(resp.Findings) != 1 || resp.Findings[0].TenantId != "bob" {
+		t.Errorf("Findings = %+v, want the one bob finding", resp.Findings)
+	}
+}
+
+// Non-admin: an unset tenant_id filter is forced to the caller's own
+// subject, same as ListContainersRequest.username — findings are the same
+// "who can see whose stuff" boundary as containers.
+func TestListFindings_NonAdmin_ForcedToOwnTenant(t *testing.T) {
+	store := &fakeFindingReader{}
+	s := NewThreatDetectionServer(nil, false, false, "")
+	s.SetFindingStore(store)
+
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", "member")
+	if _, err := s.ListFindings(ctx, &pb.ListFindingsRequest{}); err != nil {
+		t.Fatalf("ListFindings: %v", err)
+	}
+	if store.lastFilter.TenantID != "alice" {
+		t.Errorf("store received TenantID = %q, want %q (forced to subject)", store.lastFilter.TenantID, "alice")
+	}
+}
+
+// Non-admin requesting a different tenant's findings is denied outright —
+// never silently rewritten to their own (that would look like "it worked"
+// while actually returning the wrong data).
+func TestListFindings_NonAdmin_ExplicitOtherTenant_Denied(t *testing.T) {
+	store := &fakeFindingReader{}
+	s := NewThreatDetectionServer(nil, false, false, "")
+	s.SetFindingStore(store)
+
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", "member")
+	if _, err := s.ListFindings(ctx, &pb.ListFindingsRequest{TenantId: "bob"}); err == nil {
+		t.Fatal("ListFindings for another tenant as non-admin should error, got nil")
+	}
+}
+
+func TestListFindings_FiltersPassThrough(t *testing.T) {
+	store := &fakeFindingReader{}
+	s := NewThreatDetectionServer(nil, false, false, "")
+	s.SetFindingStore(store)
+
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", auth.RoleAdmin)
+	_, err := s.ListFindings(ctx, &pb.ListFindingsRequest{
+		Severity: pb.ThreatSeverity_THREAT_SEVERITY_CRITICAL,
+		State:    pb.FindingState_FINDING_STATE_OPEN,
+		Limit:    10,
+	})
+	if err != nil {
+		t.Fatalf("ListFindings: %v", err)
+	}
+	if store.lastFilter.Severity != pb.ThreatSeverity_THREAT_SEVERITY_CRITICAL {
+		t.Errorf("Severity = %v, want CRITICAL", store.lastFilter.Severity)
+	}
+	if store.lastFilter.State != threatdetect.FindingStateOpen {
+		t.Errorf("State = %v, want open", store.lastFilter.State)
+	}
+	if store.lastFilter.Limit != 10 {
+		t.Errorf("Limit = %d, want 10", store.lastFilter.Limit)
+	}
+}
+
+func TestResolveFinding_NoStore_ReturnsUnavailable(t *testing.T) {
+	s := NewThreatDetectionServer(nil, false, false, "")
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", auth.RoleAdmin)
+	_, err := s.ResolveFinding(ctx, &pb.ResolveFindingRequest{Id: 1})
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("code = %v, want Unavailable", status.Code(err))
+	}
+}
+
+func TestResolveFinding_MissingID(t *testing.T) {
+	s := NewThreatDetectionServer(nil, false, false, "")
+	s.SetFindingStore(&fakeFindingReader{})
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", auth.RoleAdmin)
+	_, err := s.ResolveFinding(ctx, &pb.ResolveFindingRequest{})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("code = %v, want InvalidArgument", status.Code(err))
+	}
+}
+
+func TestResolveFinding_NotFound(t *testing.T) {
+	s := NewThreatDetectionServer(nil, false, false, "")
+	s.SetFindingStore(&fakeFindingReader{resolveErr: threatdetect.ErrFindingNotFound})
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", auth.RoleAdmin)
+	_, err := s.ResolveFinding(ctx, &pb.ResolveFindingRequest{Id: 99})
+	if status.Code(err) != codes.NotFound {
+		t.Errorf("code = %v, want NotFound", status.Code(err))
+	}
+}
+
+func TestResolveFinding_AlreadyResolved(t *testing.T) {
+	s := NewThreatDetectionServer(nil, false, false, "")
+	s.SetFindingStore(&fakeFindingReader{resolveErr: threatdetect.ErrFindingNotOpen})
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", auth.RoleAdmin)
+	_, err := s.ResolveFinding(ctx, &pb.ResolveFindingRequest{Id: 1})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", status.Code(err))
+	}
+}
+
+func TestResolveFinding_Success(t *testing.T) {
+	store := &fakeFindingReader{
+		resolved: &threatdetect.Finding{ID: 1, State: threatdetect.FindingStateResolved},
+	}
+	s := NewThreatDetectionServer(nil, false, false, "")
+	s.SetFindingStore(store)
+	ctx := auth.ContextWithTestSubject(context.Background(), "alice", auth.RoleAdmin)
+	resp, err := s.ResolveFinding(ctx, &pb.ResolveFindingRequest{Id: 1})
+	if err != nil {
+		t.Fatalf("ResolveFinding: %v", err)
+	}
+	if resp.Finding.State != pb.FindingState_FINDING_STATE_RESOLVED {
+		t.Errorf("state = %v, want RESOLVED", resp.Finding.State)
+	}
+}
+
+// fakeFindingReader is a minimal threatdetect.FindingReader test double.
+type fakeFindingReader struct {
+	findings   []*threatdetect.Finding
+	lastFilter threatdetect.ListFilter
+	resolved   *threatdetect.Finding
+	resolveErr error
+}
+
+func (f *fakeFindingReader) Get(ctx context.Context, id int64) (*threatdetect.Finding, error) {
+	return nil, threatdetect.ErrFindingNotFound
+}
+
+func (f *fakeFindingReader) List(ctx context.Context, filter threatdetect.ListFilter) ([]*threatdetect.Finding, error) {
+	f.lastFilter = filter
+	return f.findings, nil
+}
+
+func (f *fakeFindingReader) Resolve(ctx context.Context, id int64) (*threatdetect.Finding, error) {
+	if f.resolveErr != nil {
+		return nil, f.resolveErr
+	}
+	return f.resolved, nil
+}
+
+// fakeFindingSink and fakeRule are minimal threatdetect.FindingSink /
+// threatdetect.Rule test doubles — this file only needs an Engine to exist
+// and report status, not to actually detect anything.
+type fakeFindingSink struct{}
+
+func (fakeFindingSink) Upsert(ctx context.Context, f *threatdetect.Finding) (*threatdetect.Finding, error) {
+	return f, nil
+}
+
+type fakeRule struct{ id pb.ThreatRuleId }
+
+func (r *fakeRule) ID() pb.ThreatRuleId { return r.id }
+func (r *fakeRule) OnFlows(threatdetect.RuleContext, []netbpf.FlowRecord) []threatdetect.RawFinding {
+	return nil
+}
+func (r *fakeRule) OnDeny(threatdetect.RuleContext, netbpf.DenyEvent) []threatdetect.RawFinding {
+	return nil
+}
+func (r *fakeRule) Sweep(threatdetect.RuleContext, time.Time) []threatdetect.RawFinding {
+	return nil
+}
+
+// TestGetSentryStatus_CPUSampler pins that the CPU sampler's source (#2645)
+// rides the status response when the sentry is running.
+func TestGetSentryStatus_CPUSampler(t *testing.T) {
+	for _, src := range []string{"", "metrics-collector", "standalone (30s)", "unavailable (incus client unavailable: x)"} {
+		engine := threatdetect.NewEngine(&fakeFindingSink{}, "backend-1", false, nil, nil)
+		s := NewThreatDetectionServer(engine, true, true, "")
+		if src != "" {
+			s.SetCPUSamplerStatus(src)
+		}
+		resp, err := s.GetSentryStatus(secReadCtx(), &pb.GetSentryStatusRequest{})
+		if err != nil {
+			t.Fatalf("GetSentryStatus: %v", err)
+		}
+		want := src
+		if want == "" {
+			want = "unavailable (not started)"
+		}
+		if resp.CpuSampler != want {
+			t.Errorf("cpu_sampler = %q, want %q", resp.CpuSampler, want)
+		}
+	}
+}
+
+// The finding store is on Postgres (engine not degraded) but the responder
+// was forced ALERT-only — the security_actions store failed, or the responder
+// could not be built. A THROTTLE/FREEZE policy is inert, so status must say
+// DEGRADED with the responder's reason, never OK (#2719).
+func TestGetSentryStatus_ResponderDegradedWhileFindingsPersisted(t *testing.T) {
+	tests := []struct {
+		name       string
+		responder  string
+		engineDegr bool
+		wantState  pb.SentryState
+		wantReason string
+	}{
+		{
+			name:       "actions store failed",
+			responder:  "security_actions store unavailable",
+			wantState:  pb.SentryState_SENTRY_STATE_DEGRADED,
+			wantReason: "DEGRADED (security_actions store unavailable): responses disabled",
+		},
+		{
+			name:       "responder not constructed",
+			responder:  "process responder disabled: incus client unavailable",
+			wantState:  pb.SentryState_SENTRY_STATE_DEGRADED,
+			wantReason: "DEGRADED (process responder disabled: incus client unavailable): responses disabled",
+		},
+		{
+			name:       "no responder fault stays OK",
+			wantState:  pb.SentryState_SENTRY_STATE_OK,
+			wantReason: "",
+		},
+		{
+			name:       "finding store degraded too reports the no-persistence line once",
+			responder:  "finding store has no persistence",
+			engineDegr: true,
+			wantState:  pb.SentryState_SENTRY_STATE_DEGRADED,
+			wantReason: "DEGRADED (no persistence): responses disabled",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine := threatdetect.NewEngine(&fakeFindingSink{}, "backend-1", tt.engineDegr, nil, nil)
+			s := NewThreatDetectionServer(engine, true, true, "")
+			s.SetResponderDegraded(tt.responder)
+			resp, err := s.GetSentryStatus(secReadCtx(), &pb.GetSentryStatusRequest{})
+			if err != nil {
+				t.Fatalf("GetSentryStatus: %v", err)
+			}
+			if resp.State != tt.wantState || resp.Reason != tt.wantReason {
+				t.Errorf("status = %v/%q, want %v/%q", resp.State, resp.Reason, tt.wantState, tt.wantReason)
+			}
+		})
+	}
+}
+
+// End to end through the sentry-health loop: findings persisted + responder
+// ALERT-only ⇒ exactly one MEDIUM SENTRY_UNAVAILABLE finding naming the
+// responder fault, deduped across ticks (#2719).
+func TestSentryHealth_RaisesFindingWhenOnlyResponderDegraded(t *testing.T) {
+	engine := threatdetect.NewEngine(&fakeFindingSink{}, "backend-1", false, nil, nil)
+	s := NewThreatDetectionServer(engine, true, true, "")
+	// CPU sampler and exec telemetry (#2637) healthy, so the only fault is
+	// the responder's.
+	s.SetCPUSamplerStatus("standalone (30s)")
+	s.SetExecTelemetry(&fakeExecSource{status: execTelemetryOK})
+	s.SetResponderDegraded("security_actions store unavailable")
+	store := &fakeHealthStore{}
+	h := NewSentryHealth(s.sentryStatus, store, func() string { return "backend-1" }, nil, time.Minute)
+	h.Check(context.Background())
+	h.Check(context.Background())
+
+	open := store.open()
+	if len(open) != 1 {
+		t.Fatalf("open findings = %d (%+v), want 1", len(open), open)
+	}
+	f := open[0]
+	if f.Rule != pb.ThreatRuleId_THREAT_RULE_ID_SENTRY_UNAVAILABLE || f.Severity != pb.ThreatSeverity_THREAT_SEVERITY_MEDIUM {
+		t.Errorf("rule/severity = %v/%v, want SENTRY_UNAVAILABLE/MEDIUM", f.Rule, f.Severity)
+	}
+	if want := "DEGRADED (security_actions store unavailable): responses disabled"; f.Subject != want {
+		t.Errorf("subject = %q, want %q", f.Subject, want)
+	}
+	if f.Count != 2 {
+		t.Errorf("count = %d, want 2 (deduped across ticks)", f.Count)
+	}
+}
+
+// The daemon wiring's reason for an ALERT-only responder (#2719): every
+// condition that forces ALERT-only has one, and only a fully wired,
+// persisted responder has none.
+func TestProcessResponderDegradedReason(t *testing.T) {
+	tests := []struct {
+		name              string
+		findingsPersisted bool
+		actionsPersisted  bool
+		disabledReason    string
+		want              string
+	}{
+		{name: "all persisted", findingsPersisted: true, actionsPersisted: true, want: ""},
+		{name: "actions store failed", findingsPersisted: true, actionsPersisted: false, want: "security_actions store unavailable"},
+		{name: "finding store in memory", findingsPersisted: false, actionsPersisted: false, want: "finding store has no persistence"},
+		{name: "responder not built wins", findingsPersisted: true, actionsPersisted: true, disabledReason: "incus client unavailable", want: "process responder disabled: incus client unavailable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := processResponderDegradedReason(tt.findingsPersisted, tt.actionsPersisted, tt.disabledReason); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
