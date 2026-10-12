@@ -99,3 +99,104 @@ func TestIntegrationIdle_OpenConnectionReportsActivityAsOfNow(t *testing.T) {
 
 	// Opened two hours ago and never closed — a debug session someone is
 	// sitting in right now.
+	opened := time.Now().UTC().Add(-2 * time.Hour)
+	saveConn(t, store, container, container+"-open", opened, nil)
+
+	got, err := (&TrafficStoreAdapter{pool: pool}).LastNetworkActivity(ctx, container)
+	if err != nil {
+		t.Fatalf("LastNetworkActivity: %v", err)
+	}
+
+	if since := time.Since(got); since > 5*time.Minute {
+		t.Fatalf("last activity reported as %v (%v ago) for a connection opened %v ago and still "+
+			"open.\n\nAny idle threshold shorter than that age would sleep this box out from "+
+			"under the person connected to it — which is exactly #524. The query must treat an "+
+			"open connection as active AS OF NOW, not as of started_at.",
+			got, since.Truncate(time.Second), time.Since(opened).Truncate(time.Second))
+	}
+}
+
+// A closed connection contributes its ended_at — its true last-activity
+// instant — not now(). Without this, every container with any history would
+// look permanently active and nothing would ever sleep.
+func TestIntegrationIdle_ClosedConnectionReportsItsEndTime(t *testing.T) {
+	ctx := context.Background()
+	pool, store, container := idleTestPool(t)
+
+	started := time.Now().UTC().Add(-3 * time.Hour)
+	ended := time.Now().UTC().Add(-90 * time.Minute)
+	saveConn(t, store, container, container+"-closed", started, &ended)
+
+	got, err := (&TrafficStoreAdapter{pool: pool}).LastNetworkActivity(ctx, container)
+	if err != nil {
+		t.Fatalf("LastNetworkActivity: %v", err)
+	}
+
+	if diff := got.Sub(ended); diff > time.Minute || diff < -time.Minute {
+		t.Errorf("last activity = %v, want the connection's ended_at %v — reporting now() for a "+
+			"CLOSED connection would keep every container with any history permanently awake",
+			got, ended)
+	}
+}
+
+// With both kinds present the open one wins, because it is active now.
+func TestIntegrationIdle_OpenConnectionOutranksAnOlderClosedOne(t *testing.T) {
+	ctx := context.Background()
+	pool, store, container := idleTestPool(t)
+
+	ended := time.Now().UTC().Add(-90 * time.Minute)
+	saveConn(t, store, container, container+"-closed", time.Now().UTC().Add(-3*time.Hour), &ended)
+	saveConn(t, store, container, container+"-open", time.Now().UTC().Add(-2*time.Hour), nil)
+
+	got, err := (&TrafficStoreAdapter{pool: pool}).LastNetworkActivity(ctx, container)
+	if err != nil {
+		t.Fatalf("LastNetworkActivity: %v", err)
+	}
+	if since := time.Since(got); since > 5*time.Minute {
+		t.Errorf("last activity = %v (%v ago) with one open connection present — the MAX must "+
+			"pick the open connection's now(), or a box with recent closed traffic sleeps while "+
+			"a session is live", got, since.Truncate(time.Second))
+	}
+}
+
+// The query is scoped to one container: another container's live session must
+// not keep this one awake, and must not stop it sleeping.
+func TestIntegrationIdle_ActivityIsScopedToOneContainer(t *testing.T) {
+	ctx := context.Background()
+	pool, store, container := idleTestPool(t)
+	other := container + "-other"
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(),
+			"DELETE FROM traffic_connections WHERE container_name = $1", other)
+	})
+
+	// A live session on somebody ELSE's container.
+	saveConn(t, store, other, other+"-open", time.Now().UTC().Add(-time.Hour), nil)
+
+	got, err := (&TrafficStoreAdapter{pool: pool}).LastNetworkActivity(ctx, container)
+	if err != nil {
+		t.Fatalf("LastNetworkActivity: %v", err)
+	}
+	if !got.IsZero() {
+		t.Errorf("a container with no traffic of its own reported activity at %v — another "+
+			"container's live session is keeping it awake, so nothing on a busy host ever sleeps",
+			got)
+	}
+}
+
+// No rows must be the zero time, which Decide special-cases as "no traffic
+// ever recorded". Anything else — epoch 0, or an error — changes the sleep
+// decision for every container the collector has not seen yet.
+func TestIntegrationIdle_NoTrafficReportsTheZeroTime(t *testing.T) {
+	ctx := context.Background()
+	pool, _, container := idleTestPool(t)
+
+	got, err := (&TrafficStoreAdapter{pool: pool}).LastNetworkActivity(ctx, container)
+	if err != nil {
+		t.Fatalf("LastNetworkActivity on a container with no traffic: %v", err)
+	}
+	if !got.IsZero() {
+		t.Errorf("got %v, want the zero time — Decide treats zero as 'no traffic ever recorded', "+
+			"and any other value is a real timestamp it will compare against the threshold", got)
+	}
+}
