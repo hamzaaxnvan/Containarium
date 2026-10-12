@@ -487,3 +487,167 @@ func (s *Store) GetAggregates(ctx context.Context, params AggregateParams) ([]*p
 	}
 
 	return aggregates, nil
+}
+
+// aggregateRetentionMultiplier makes the traffic_aggregates retention
+// window a deliberate multiple of the connections window, not an
+// accidental reuse of retentionDays (#1395). Aggregates are the cheaper
+// long-term record — one row per (container, dest, interval) rather than
+// one per connection — so keeping them longer than the raw connection
+// history they're derived from is a reasonable, cheap default. 4x is
+// arbitrary but stated; change it here (one place) if that default is
+// wrong for a deployment, rather than plumbing a second config field for
+// a decision nobody has needed to tune yet.
+const aggregateRetentionMultiplier = 4
+
+// Cleanup removes old traffic data beyond the retention period, from both
+// traffic_connections (filtered on created_at, when the row was written)
+// and traffic_aggregates (filtered on interval_start, what the row
+// describes — aggregates have no created_at column). Retention windows
+// differ deliberately; see aggregateRetentionMultiplier.
+func (s *Store) Cleanup(ctx context.Context, retentionDays int) error {
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+
+	result, err := s.pool.Exec(ctx,
+		"DELETE FROM traffic_connections WHERE created_at < $1", cutoff)
+	if err != nil {
+		return fmt.Errorf("failed to cleanup old connections: %w", err)
+	}
+	if n := result.RowsAffected(); n > 0 {
+		log.Printf("[traffic] cleaned up %d old connection record(s)", n)
+	}
+
+	aggCutoff := time.Now().AddDate(0, 0, -retentionDays*aggregateRetentionMultiplier)
+	aggResult, err := s.pool.Exec(ctx,
+		"DELETE FROM traffic_aggregates WHERE interval_start < $1", aggCutoff)
+	if err != nil {
+		return fmt.Errorf("failed to cleanup old aggregates: %w", err)
+	}
+	if n := aggResult.RowsAffected(); n > 0 {
+		log.Printf("[traffic] cleaned up %d old aggregate record(s)", n)
+	}
+
+	return nil
+}
+
+// parseInterval parses interval strings like "1m", "5m", "1h", "1d"
+func parseInterval(interval string) (time.Duration, error) {
+	if interval == "" {
+		return time.Hour, nil // default to 1 hour
+	}
+
+	switch interval {
+	case "1m":
+		return time.Minute, nil
+	case "5m":
+		return 5 * time.Minute, nil
+	case "15m":
+		return 15 * time.Minute, nil
+	case "30m":
+		return 30 * time.Minute, nil
+	case "1h":
+		return time.Hour, nil
+	case "6h":
+		return 6 * time.Hour, nil
+	case "12h":
+		return 12 * time.Hour, nil
+	case "1d":
+		return 24 * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("unsupported interval: %s", interval)
+	}
+}
+
+// reAggregate re-aggregates hourly data to a larger interval
+func reAggregate(aggregates []*pb.TrafficAggregate, interval time.Duration) []*pb.TrafficAggregate {
+	if len(aggregates) == 0 {
+		return aggregates
+	}
+
+	// Group by truncated timestamp
+	buckets := make(map[int64]*pb.TrafficAggregate)
+
+	for _, agg := range aggregates {
+		ts := agg.Timestamp.AsTime()
+		bucketTime := ts.Truncate(interval)
+		bucketKey := bucketTime.Unix()
+
+		if existing, ok := buckets[bucketKey]; ok {
+			existing.BytesSent += agg.BytesSent
+			existing.BytesReceived += agg.BytesReceived
+			existing.ConnectionCount += agg.ConnectionCount
+		} else {
+			buckets[bucketKey] = &pb.TrafficAggregate{
+				Timestamp:       timestamppb.New(bucketTime),
+				DestIp:          agg.DestIp,
+				DestPort:        agg.DestPort,
+				BytesSent:       agg.BytesSent,
+				BytesReceived:   agg.BytesReceived,
+				ConnectionCount: agg.ConnectionCount,
+			}
+		}
+	}
+
+	// Convert back to slice
+	result := make([]*pb.TrafficAggregate, 0, len(buckets))
+	for _, agg := range buckets {
+		result = append(result, agg)
+	}
+
+	return result
+}
+
+// SaveAggregate saves a pre-computed aggregate (for periodic aggregation jobs)
+func (s *Store) SaveAggregate(ctx context.Context, agg *pb.TrafficAggregate, containerName string, intervalEnd time.Time) error {
+	query := `
+		INSERT INTO traffic_aggregates (
+			container_name, dest_ip, dest_port, interval_start, interval_end,
+			bytes_sent, bytes_received, connection_count
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (container_name, dest_ip, dest_port, interval_start) DO UPDATE SET
+			bytes_sent = traffic_aggregates.bytes_sent + EXCLUDED.bytes_sent,
+			bytes_received = traffic_aggregates.bytes_received + EXCLUDED.bytes_received,
+			connection_count = traffic_aggregates.connection_count + EXCLUDED.connection_count
+	`
+
+	var destIP *string
+	var destPort *int32
+	if agg.DestIp != "" {
+		destIP = &agg.DestIp
+	}
+	if agg.DestPort > 0 {
+		port := safecast.I32FromU32(agg.DestPort)
+		destPort = &port
+	}
+
+	_, err := s.pool.Exec(ctx, query,
+		containerName,
+		destIP,
+		destPort,
+		agg.Timestamp.AsTime(),
+		intervalEnd,
+		agg.BytesSent,
+		agg.BytesReceived,
+		agg.ConnectionCount,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to save aggregate: %w", err)
+	}
+
+	return nil
+}
+
+// GetConnectionByConntrackID checks if a connection with the given conntrack ID exists
+func (s *Store) GetConnectionByConntrackID(ctx context.Context, conntrackID string) (bool, error) {
+	query := "SELECT 1 FROM traffic_connections WHERE conntrack_id = $1 LIMIT 1"
+	var exists int
+	err := s.pool.QueryRow(ctx, query, conntrackID).Scan(&exists)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
