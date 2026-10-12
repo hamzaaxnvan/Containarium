@@ -42,3 +42,25 @@ func TestStoragePoolUsages_PerPoolAndSkipsFailedPool(t *testing.T) {
 	}
 	got, err := (&Client{server: srv}).StoragePoolUsages()
 	if err != nil {
+		t.Fatal(err)
+	}
+	want := []StoragePoolUsage{
+		{Name: "a", Driver: "zfs", UsedBytes: 96, TotalBytes: 100},
+		{Name: "b", Driver: "dir", UsedBytes: 1, TotalBytes: 1000},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("pool %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestStoragePoolUsages_ListErrorIsReturned(t *testing.T) {
+	_, err := (&Client{server: &fakePoolServer{listErr: errors.New("down")}}).StoragePoolUsages()
+	if err == nil {
+		t.Fatal("want an error when the pool list fails")
+	}
+}
