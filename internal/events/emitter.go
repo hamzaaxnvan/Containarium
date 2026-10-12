@@ -171,3 +171,90 @@ func (e *Emitter) EmitAppStateChanged(app *pb.App, previousState pb.AppState) {
 	)
 	event.Payload = &pb.Event_AppEvent{
 		AppEvent: &pb.AppEvent{
+			App:           app,
+			PreviousState: previousState,
+		},
+	}
+	e.bus.Publish(event)
+}
+
+// Route Events
+
+// EmitRouteAdded emits an event when a route is added
+func (e *Emitter) EmitRouteAdded(route *pb.ProxyRoute) {
+	event := newEvent(
+		pb.EventType_EVENT_TYPE_ROUTE_ADDED,
+		pb.ResourceType_RESOURCE_TYPE_ROUTE,
+		route.FullDomain,
+	)
+	event.Payload = &pb.Event_RouteEvent{
+		RouteEvent: &pb.RouteEvent{
+			Route: route,
+		},
+	}
+	e.bus.Publish(event)
+}
+
+// EmitRouteDeleted emits an event when a route is deleted
+func (e *Emitter) EmitRouteDeleted(domain string) {
+	event := newEvent(
+		pb.EventType_EVENT_TYPE_ROUTE_DELETED,
+		pb.ResourceType_RESOURCE_TYPE_ROUTE,
+		domain,
+	)
+	e.bus.Publish(event)
+}
+
+// Metrics Events
+
+// EmitMetricsUpdate emits a metrics update event
+func (e *Emitter) EmitMetricsUpdate(metrics []*pb.ContainerMetrics) {
+	event := newEvent(
+		pb.EventType_EVENT_TYPE_METRICS_UPDATE,
+		pb.ResourceType_RESOURCE_TYPE_METRICS,
+		"",
+	)
+	event.Payload = &pb.Event_MetricsEvent{
+		MetricsEvent: &pb.MetricsEvent{
+			Metrics: metrics,
+		},
+	}
+	e.bus.Publish(event)
+}
+
+// Security Events
+
+// EmitSecurityFinding emits an event when the threat-detection engine
+// creates or updates a security finding.
+func (e *Emitter) EmitSecurityFinding(finding *pb.Finding) {
+	event := newEvent(
+		pb.EventType_EVENT_TYPE_SECURITY_FINDING,
+		pb.ResourceType_RESOURCE_TYPE_SECURITY_FINDING,
+		finding.TenantId,
+	)
+	event.Payload = &pb.Event_SecurityFindingEvent{
+		SecurityFindingEvent: &pb.SecurityFindingEvent{
+			Finding: finding,
+		},
+	}
+	e.bus.Publish(event)
+}
+
+// Traffic Events
+
+// EmitTrafficEvent emits a traffic event for connection updates
+func (e *Emitter) EmitTrafficEvent(trafficEvent *pb.TrafficEvent) {
+	resourceID := ""
+	if trafficEvent.Connection != nil {
+		resourceID = trafficEvent.Connection.ContainerName
+	}
+	event := newEvent(
+		pb.EventType_EVENT_TYPE_TRAFFIC_UPDATE,
+		pb.ResourceType_RESOURCE_TYPE_TRAFFIC,
+		resourceID,
+	)
+	event.Payload = &pb.Event_TrafficEvent{
+		TrafficEvent: trafficEvent,
+	}
+	e.bus.Publish(event)
+}
