@@ -65,3 +65,20 @@ export interface TestWebhookResponse {
   message: string;
 }
 
+export interface WebhookDelivery {
+  id: number;
+  timestamp: string;
+  alertName: string;
+  source: string;
+  webhookUrl: string;
+  success: boolean;
+  httpStatus: number;
+  errorMessage: string;
+  payloadSize: number;
+  durationMs: number;
+}
+
+export interface WebhookDeliveriesResponse {
+  deliveries: WebhookDelivery[];
+  totalCount: number;
+}
