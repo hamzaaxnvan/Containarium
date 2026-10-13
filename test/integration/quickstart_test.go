@@ -79,3 +79,30 @@ func TestQuickstartLocalIncus(t *testing.T) {
 }
 
 // runQuickstartCLI runs the containarium binary with HOME redirected to the
+// test's temp dir. Any daemon auth/TLS flags come from CONTAINARIUM_TEST_FLAGS.
+func runQuickstartCLI(t *testing.T, home string, args ...string) (string, error) {
+	t.Helper()
+	bin := os.Getenv("CONTAINARIUM_BIN")
+
+	if extra := strings.Fields(os.Getenv("CONTAINARIUM_TEST_FLAGS")); len(extra) > 0 {
+		args = append(args, extra...)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	// Redirect HOME so config writes are isolated; keep the rest of the env
+	// (PATH, CONTAINARIUM_TOKEN, etc.) so auth passes through.
+	cmd.Env = append(os.Environ(), "HOME="+home)
+
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	require.NoError(t, err, "read %s", path)
+	return string(b)
+}
