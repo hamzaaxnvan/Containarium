@@ -50,3 +50,16 @@ func TestBackupAllRequested(t *testing.T) {
 		req  *pb.CreateBackupRequest
 		want bool
 	}{
+		{"no database, no hook → all", &pb.CreateBackupRequest{Connection: &pb.PgConnection{}}, true},
+		{"nil connection, no hook → all", &pb.CreateBackupRequest{}, true},
+		{"explicit database → single", &pb.CreateBackupRequest{Connection: &pb.PgConnection{Database: "app"}}, false},
+		{"hook, no database → single", &pb.CreateBackupRequest{Hook: "/opt/dump.sh"}, false},
+		{"hook and database → single (hook wins)", &pb.CreateBackupRequest{Hook: "/opt/dump.sh", Connection: &pb.PgConnection{Database: "app"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := backupAllRequested(tc.req); got != tc.want {
+				t.Errorf("backupAllRequested = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
