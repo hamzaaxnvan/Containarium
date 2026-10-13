@@ -312,3 +312,108 @@ func hardenedEnv(home, credential string) []string {
 // depend on internal/tracker (see runIDShortLen in branch.go).
 const installationTokenPrefix = "ghs_"
 
+// authHeader is the http.extraHeader value that authenticates credential
+// to the remote.
+//
+// A GitHub App installation token (ghs_…) gets Basic auth with the
+// literal username "x-access-token" — the form GitHub documents for
+// installation tokens over git HTTPS; a bearer header carrying one is not
+// that form (#2271).
+//
+// Everything else (PATs, GitLab tokens) keeps the bearer form, the same
+// header shape as pkg/core/container/git_source.go's buildGitFetchScript.
+func authHeader(credential string) string {
+	if strings.HasPrefix(credential, installationTokenPrefix) {
+		return "AUTHORIZATION: Basic " + installationTokenBasic(credential)
+	}
+	return "AUTHORIZATION: bearer " + credential
+}
+
+// installationTokenBasic is the Basic-auth credential for an installation
+// token: base64("x-access-token:<token>").
+func installationTokenBasic(token string) string {
+	return base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+}
+
+// wrapGitErr folds a failed step's context and stderr into one error,
+// redacting the credential from stderr first — git does not normally
+// echo a header value back on failure, but nothing here relies on that
+// being true forever, and the redaction costs nothing when the
+// substring isn't present.
+func wrapGitErr(step string, err error, stderr, credential string) error {
+	msg := strings.TrimSpace(stderr)
+	if credential != "" {
+		msg = strings.ReplaceAll(msg, credential, "[redacted]")
+		// The installation-token header carries the credential base64-
+		// encoded, which the raw-substring redaction above would miss.
+		msg = strings.ReplaceAll(msg, installationTokenBasic(credential), "[redacted]")
+	}
+	if msg == "" {
+		return fmt.Errorf("submit: %s: %w", step, err)
+	}
+	return fmt.Errorf("submit: %s: %w: %s", step, err, msg)
+}
+
+// realGitRun is gitRunFunc's production implementation: exec.Command
+// with an explicit, complete Env (never os.Environ()+append) and no
+// Dir (every caller passes an absolute path or `-C <path>` in args
+// instead, so there is no ambient working directory for a hostile
+// repo's config to matter even if one somehow applied).
+func realGitRun(ctx context.Context, env []string, args []string) (stdout, stderr string, err error) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		return "", "", fmt.Errorf("submit: git not found on PATH: %w", err)
+	}
+	// #nosec G204 -- argv is package-built from validated fields
+	// (temp dir paths this function created, a caller-supplied remote
+	// URL/sha treated as opaque git arguments, never shell-evaluated).
+	cmd := exec.CommandContext(ctx, gitPath, args...)
+	cmd.Env = env
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err = cmd.Run()
+	return outBuf.String(), errBuf.String(), err
+}
+
+// GitVersionAtLeast reports whether versionOutput (the trimmed stdout
+// of `git version`) names a version >= major.minor. Used by the host
+// git preflight (#1923 build-order step 8, "Host git is a preflight");
+// a separate, tiny parser rather than a general semver library because
+// git's own version string format ("git version 2.43.0") is the only
+// input it ever needs to handle.
+func GitVersionAtLeast(versionOutput string, major, minor int) bool {
+	fields := strings.Fields(versionOutput)
+	for _, f := range fields {
+		parts := strings.SplitN(f, ".", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		gotMajor, err1 := parseLeadingInt(parts[0])
+		gotMinor, err2 := parseLeadingInt(parts[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		if gotMajor != major {
+			return gotMajor > major
+		}
+		return gotMinor >= minor
+	}
+	return false
+}
+
+func parseLeadingInt(s string) (int, error) {
+	n := 0
+	found := false
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			break
+		}
+		n = n*10 + int(r-'0')
+		found = true
+	}
+	if !found {
+		return 0, fmt.Errorf("submit: no leading digits in %q", s)
+	}
+	return n, nil
+}
