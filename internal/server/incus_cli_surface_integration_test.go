@@ -77,3 +77,82 @@ func firstLine(s string) string {
 // TestIntegrationIncus_MigrationRunnerCLISurface exercises every command
 // pkg/core/incus/migration.go shells out to, against a real Incus.
 //
+// This is the test #1392 needed and did not have. It fails if a future Incus
+// changes any of these commands under the runner, instead of that surfacing as
+// a migration failing in production.
+func TestIntegrationIncus_MigrationRunnerCLISurface(t *testing.T) {
+	s, _, _ := encTestEnv(t)
+
+	if v, ok := incusRun("version"); ok {
+		t.Logf("incus version:\n%s", v)
+	}
+
+	tenant := fmt.Sprintf("cli%d", os.Getpid())
+	instance := tenant + "-container"
+	t.Cleanup(func() { incusenv.DeleteInstance(t, instance) })
+
+	ctx, cancel := context.WithTimeout(
+		tenantWithScopes(tenant, auth.ScopeContainersWrite), 25*time.Minute)
+	defer cancel()
+	if _, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Username:  tenant,
+		Image:     incusenv.BoxImage(),
+		OsType:    pb.OSType_OS_TYPE_UBUNTU_2404,
+		Resources: &pb.ResourceLimits{Disk: "5GB"},
+	}); err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+
+	const snap = "probe-snap"
+	runner := &incus.ExecRunner{}
+
+	// The production methods, called directly. Probing raw argv would prove
+	// that SOME syntax works while leaving ExecRunner free to use another —
+	// which is exactly the gap that let #1392 ship. What needs testing is the
+	// function the daemon actually calls.
+	if err := runner.Snapshot(instance, snap); err != nil {
+		t.Fatalf("ExecRunner.Snapshot against a real Incus: %v\n\n"+
+			"This is MoveContainer's FIRST call, so migration is broken end to end on this "+
+			"version. Re-run the raw-syntax probe below to find the form this Incus accepts.", err)
+	}
+	t.Log("FACT: ExecRunner.Snapshot works against this Incus")
+
+	// Idempotency is matched on the CLI's message text, so it breaks silently
+	// whenever the CLI is corrected under it — as it just was. A retry after a
+	// partial failure re-snapshots the same name and must not error.
+	if err := runner.Snapshot(instance, snap); err != nil {
+		t.Errorf("re-snapshotting an existing name failed: %v — MoveContainer retries after a "+
+			"partial failure, and this is the swallow that makes that safe", err)
+	}
+
+	if err := runner.DeleteSnapshot(instance, snap); err != nil {
+		t.Errorf("ExecRunner.DeleteSnapshot against a real Incus: %v — every migration would "+
+			"leave its sync snapshots behind, pinning disk on both hosts", err)
+	}
+	// And deleting one that is already gone must stay a no-op, same reasoning.
+	if err := runner.DeleteSnapshot(instance, snap); err != nil {
+		t.Errorf("deleting an absent snapshot returned %v, want nil — a cleanup that already "+
+			"ran must not fail the migration", err)
+	}
+
+	if err := runner.Stop(instance); err != nil {
+		t.Errorf("ExecRunner.Stop: %v — the migration cutover cannot stop the source", err)
+	}
+	if err := runner.Start(instance); err != nil {
+		t.Errorf("ExecRunner.Start: %v — a rolled-back migration cannot restart the source", err)
+	}
+
+	// 5/6. Copy. Not run for real (it needs a second daemon), so only the
+	// argument shape is checked — `--help` proves the flags parse, which is
+	// what the runner gets wrong when a CLI changes under it.
+	if out, ok := incusRun("copy", "--help"); !ok {
+		t.Errorf("DEFECT: `incus copy --help` failed: %s", firstLine(out))
+	} else {
+		for _, flag := range []string{"--instance-only", "--refresh", "--storage"} {
+			if !strings.Contains(out, flag) {
+				t.Errorf("DEFECT: `incus copy` does not advertise %s, which CopyInitial/CopyRefresh "+
+					"pass — the migration would fail on an unknown flag", flag)
+			}
+		}
+	}
+}

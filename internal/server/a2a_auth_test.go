@@ -118,3 +118,64 @@ func TestSendA2ATask_SendsBearerToken(t *testing.T) {
 	}
 	if gotAuth != "Bearer peer-secret" {
 		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer peer-secret")
+	}
+}
+
+// Fail closed, and fail early: with no credential the daemon does not put a
+// task on the wire at all.
+func TestSendA2ATask_WithoutCredentialSendsNothing(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_, err := sendA2ATask(context.Background(), srv.URL, &pb.AgentTask{Id: "t"}, "")
+	if err == nil {
+		t.Fatal("expected an error without a credential, got nil")
+	}
+	if hits != 0 {
+		t.Errorf("peer was contacted %d times, want 0", hits)
+	}
+}
+
+// A peer that refuses the credential is a different failure from a peer that is
+// down, and the error says which.
+func TestSendA2ATask_PeerRefusalIsDistinguishable(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, `{"error":"a2a: credential is not this box's daemon credential"}`, code)
+		}))
+		_, err := sendA2ATask(context.Background(), srv.URL, &pb.AgentTask{Id: "t"}, "wrong")
+		srv.Close()
+		if err == nil {
+			t.Fatalf("%d: expected an error, got nil", code)
+		}
+		if !errors.Is(err, errA2AUnauthorized) {
+			t.Errorf("%d: error %v is not recognized as a refused credential", code, err)
+		}
+	}
+	// A 502 is still a plain transport failure, not an authorization one.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	_, err := sendA2ATask(context.Background(), srv.URL, &pb.AgentTask{Id: "t"}, "ok")
+	if err == nil || errors.Is(err, errA2AUnauthorized) {
+		t.Errorf("502 should not be an authorization failure, got %v", err)
+	}
+}
+
+// SendAgentTask refuses before it resolves or contacts the peer when the daemon
+// holds no credential for it — the task is never delivered unauthenticated.
+func TestSendAgentTask_RefusesWithoutPeerCredential(t *testing.T) {
+	s := &AgentSkillServer{} // no token manager: nothing derivable
+	_, err := s.SendAgentTask(adminCtx(), &pb.SendAgentTaskRequest{ToPeerId: "hello-agent"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("err = %v (code %v), want Internal", err, status.Code(err))
+	}
+	if !strings.Contains(err.Error(), "authenticate") {
+		t.Errorf("error should explain it cannot authenticate to the peer, got: %v", err)
+	}
+}
