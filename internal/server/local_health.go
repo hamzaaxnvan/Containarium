@@ -108,3 +108,113 @@ type localHealth struct {
 }
 
 func newLocalHealth(probe func(ctx context.Context) error, timeout, grace time.Duration) *localHealth {
+	return &localHealth{probe: probe, timeout: timeout, grace: grace, now: time.Now, logf: log.Printf}
+}
+
+// Healthy reports whether the local backend may take new work. It returns
+// within about h.timeout.
+func (h *localHealth) Healthy() bool {
+	call := h.join()
+	timer := time.NewTimer(h.timeout)
+	defer timer.Stop()
+
+	var sampleErr error
+	sampleOK, timedOut := false, false
+	select {
+	case <-call.done:
+		sampleErr = call.err
+		sampleOK = sampleErr == nil
+	case <-timer.C:
+		timedOut = true
+	}
+	return h.decide(sampleOK, timedOut, sampleErr)
+}
+
+// join returns the probe in flight, starting one if there is none.
+func (h *localHealth) join() *probeCall {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.inflight != nil {
+		return h.inflight
+	}
+	call := &probeCall{done: make(chan struct{})}
+	h.inflight = call
+	go h.run(call)
+	return call
+}
+
+func (h *localHealth) run(call *probeCall) {
+	ctx, cancel := context.WithTimeout(context.Background(), probeCeilingFactor*h.timeout)
+	defer cancel()
+	start := time.Now()
+	err := h.probe(ctx)
+	took := time.Since(start)
+
+	h.mu.Lock()
+	if err == nil {
+		// Even a late answer (the caller may have given up already) proves
+		// Incus is alive.
+		h.lastOK = h.now()
+		if took > h.timeout/slowProbeFraction && h.now().Sub(h.lastSlowLog) >= slowLogInterval {
+			h.lastSlowLog = h.now()
+			h.logf("[health] local backend probe slow: took %v of a %v budget (host is under pressure)", took.Round(time.Millisecond), h.timeout)
+		}
+	}
+	call.err = err
+	h.inflight = nil
+	h.mu.Unlock()
+	close(call.done)
+}
+
+// decide turns one sample into the published verdict and logs transitions.
+func (h *localHealth) decide(sampleOK, timedOut bool, sampleErr error) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := h.now()
+	sinceOK := time.Duration(-1)
+	if !h.lastOK.IsZero() {
+		sinceOK = now.Sub(h.lastOK)
+	}
+	healthy := sampleOK || (sinceOK >= 0 && sinceOK <= h.grace)
+
+	prev := h.verdict
+	switch {
+	case healthy:
+		h.verdict = verdictHealthy
+		if prev == verdictUnhealthy {
+			h.logf("[health] local backend healthy again")
+		}
+	default:
+		h.verdict = verdictUnhealthy
+		if prev != verdictUnhealthy {
+			reason := "no answer within " + h.timeout.String()
+			if !timedOut && sampleErr != nil {
+				reason = "probe failed: " + sampleErr.Error()
+			}
+			last := "never answered"
+			if sinceOK >= 0 {
+				last = "last answered " + sinceOK.Round(time.Second).String() + " ago"
+			}
+			h.logf("[health] local backend unhealthy: %s; %s (grace %v)", reason, last, h.grace)
+		}
+	}
+	return healthy
+}
+
+// incusLivenessProbe is the production probe: Incus' own server-info call,
+// through a client with a call timeout so a wedged daemon cannot hold the
+// goroutine forever. Deliberately does NOT list instances: its cost must not
+// grow with the number of tenants on the host.
+func incusLivenessProbe(callTimeout time.Duration) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		client, err := incus.NewWithSocketAndTimeout(incus.DefaultSocketPath, callTimeout)
+		if err != nil {
+			return err
+		}
+		_, err = client.GetServerInfo()
+		return err
+	}
+}
