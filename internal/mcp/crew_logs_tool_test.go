@@ -22,3 +22,11 @@ func TestHandleCrewLogs_OneWindow(t *testing.T) {
 		_, _ = w.Write([]byte(`{"chunk":"` + base64.StdEncoding.EncodeToString([]byte(chunk)) +
 			`","endOffset":"88","truncated":false,"ended":true,"skillIds":["planner","reviewer"]}`))
 	}))
+	defer server.Close()
+
+	out, err := handleCrewLogs(NewClient(server.URL, "test-token"), map[string]interface{}{
+		"run_id": "run-1", "skill_id": "reviewer", "start_offset": float64(40), "follow_seconds": float64(99),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "end_offset: 88\nended: true\ntruncated: false\nskill_ids: planner,reviewer\n---\n"+chunk, out)
+}

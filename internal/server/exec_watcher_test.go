@@ -356,3 +356,719 @@ func TestExecWatcher_StampsExecsWithBootClock(t *testing.T) {
 	procRoot, cgroupRoot, ino := fakeTree(t, map[int64]string{100: "lxc.payload.box-a"})
 	opens := procOpenTrap(t, procRoot, 4242, "my (miner)", 987654, procPerExecFiles...)
 	m := newFakeCgroupMap()
+	var got []threatdetect.ExecEvent
+	w := newTestWatcher(t, procRoot, cgroupRoot, m)
+	w.engine = func(ev threatdetect.ExecEvent) { got = append(got, ev) }
+	clock := []threatdetect.ProcStartTicks{987654, 987660}
+	var clockErr error
+	w.bootTicks = func() (threatdetect.ProcStartTicks, error) {
+		if clockErr != nil {
+			return 0, clockErr
+		}
+		v := clock[0]
+		clock = clock[1:]
+		return v, nil
+	}
+	w.Reconcile([]incus.ContainerInfo{running("box-a", 100)})
+
+	cg := ino["lxc.payload.box-a"]
+	w.OnExecEvent(context.Background(), kernelEvent(cg, 4242, "xmrig", "./xmrig"))
+	w.OnExecEvent(context.Background(), kernelEvent(cg, 5555, "sh", "sh")) // exited before decode
+	clockErr = errors.New("clock_gettime failed")
+	w.OnExecEvent(context.Background(), kernelEvent(cg, 6666, "sh", "sh"))
+
+	if len(got) != 3 {
+		t.Fatalf("engine got %d events, want 3", len(got))
+	}
+	if got[0].StartTime != 987654 || got[1].StartTime != 987660 {
+		t.Fatalf("stamps = %d, %d; want 987654, 987660", got[0].StartTime, got[1].StartTime)
+	}
+	if got[2].StartTime != 0 {
+		t.Fatalf("failed clock read: stamp = %d, want 0 (unknown)", got[2].StartTime)
+	}
+	if w.StampFailures() != 1 {
+		t.Fatalf("stamp failures = %d, want 1", w.StampFailures())
+	}
+	if n := opens.Load(); n != 0 {
+		t.Fatalf("decode opened files under /proc/4242 %d times, want 0", n)
+	}
+}
+
+// TestExecWatcher_StampFailureIsCountedAndLogged: a failing boot clock is
+// counted on every exec and logged the first time and then every
+// execStampFailLogEvery-th, never once per exec.
+func TestExecWatcher_StampFailureIsCountedAndLogged(t *testing.T) {
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	w := NewExecWatcher(func(threatdetect.ExecEvent) {})
+	w.byCgroup[42] = execTarget{Container: "box-a", TenantID: "tenant-a"}
+	w.bootTicks = func() (threatdetect.ProcStartTicks, error) { return 0, errors.New("clock_gettime: EINVAL") }
+	const execs = 2*execStampFailLogEvery + 5
+	for i := 0; i < execs; i++ {
+		w.OnExecEvent(context.Background(), netbpf.ExecEvent{HostPID: uint32(1000 + i), CgroupID: 42, Comm: "sh"}) // #nosec G115 -- small test pids
+	}
+	if w.StampFailures() != execs {
+		t.Fatalf("stamp failures = %d, want %d", w.StampFailures(), execs)
+	}
+	lines := strings.Count(buf.String(), "boot-clock stamp failed")
+	if lines != 3 { // the 1st, the 1000th, the 2000th
+		t.Fatalf("logged %d times, want 3:\n%s", lines, buf.String())
+	}
+	if !strings.Contains(buf.String(), "clock_gettime: EINVAL") {
+		t.Fatalf("log does not name the error:\n%s", buf.String())
+	}
+}
+
+// procPerExecFiles are the /proc/<pid> files a per-exec capture would
+// plausibly read; procOpenTrap turns each into a trap.
+var procPerExecFiles = []string{"stat", "status", "cgroup", "cmdline"}
+
+// procOpenTrap creates <root>/<pid>/<name> for each name as a FIFO whose
+// writer counts every open of it. The paths must not exist yet: replacing a
+// file that was just written lets a host file scanner (seen on macOS)
+// open the FIFO and count as a read. Opening a FIFO for reading rendezvouses
+// with the writer, so ANY open of these paths is seen, whatever code does
+// it (readProcStartTime, os.ReadFile, os.Open...), not just calls through
+// one helper. The reader gets a stat line (field 22 = start) and EOF.
+func procOpenTrap(t *testing.T, root string, pid int, comm string, start threatdetect.ProcStartTicks, names ...string) *atomic.Int64 {
+	t.Helper()
+	dir := filepath.Join(root, fmt.Sprint(pid))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opens := new(atomic.Int64)
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	var paths []string
+	// Stop the writers: each is blocked in open (waiting for a reader) or
+	// probing for its reader to leave. Hold a non-blocking reader open on
+	// every FIFO until they have all returned, so a writer woken after a
+	// short-lived reader already closed cannot block again.
+	t.Cleanup(func() {
+		stop.Store(true)
+		var readers []*os.File
+		for _, p := range paths {
+			if f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
+				readers = append(readers, f)
+			}
+		}
+		defer func() {
+			for _, f := range readers {
+				_ = f.Close()
+			}
+		}()
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("procOpenTrap writers did not stop")
+		}
+	})
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		if _, err := os.Lstat(path); err == nil {
+			t.Fatalf("procOpenTrap: %s already exists; traps go on fresh paths", path)
+		}
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Skipf("no FIFOs here: %v", err)
+		}
+		paths = append(paths, path)
+		content := []byte(statLine(pid, comm, start))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				f, err := os.OpenFile(path, os.O_WRONLY, 0) // blocks until a reader opens
+				if err != nil {
+					return
+				}
+				if stop.Load() {
+					_ = f.Close()
+					return
+				}
+				opens.Add(1)
+				_, _ = f.Write(content)
+				_ = f.Close()
+				// Wait for this reader to close before the next blocking
+				// open, which would otherwise succeed at once against the
+				// same reader and count it twice. A non-blocking writer
+				// open fails (ENXIO) once no reader holds the FIFO.
+				for !stop.Load() {
+					g, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+					if err != nil {
+						break
+					}
+					_ = g.Close()
+					time.Sleep(50 * time.Microsecond)
+				}
+			}
+		}()
+	}
+	return opens
+}
+
+// TestExecWatcher_FloodOfNonMatchingExecsReadsNoProc: the whole exec path
+// (ring decode → watcher → engine with the miner-signature rule →
+// responder with the real host killer, kill_process on) opens nothing under
+// /proc/<pid> for a flood of execs no rule matches, and reads the stat
+// exactly once for the one exec it kills. The flood's pids are FIFO traps
+// (procOpenTrap), so a read added through any code path is caught. The
+// stat read must stay off the per-exec path: under an exec flood it is what
+// would make the ring consumer fall behind (exec_events_lost).
+func TestExecWatcher_FloodOfNonMatchingExecsReadsNoProc(t *testing.T) {
+	const initPID, minerPID = 100, 4242
+	// The miner's cgroup is a plain file; its stat is a trap created on a
+	// fresh path (procOpenTrap must never replace a file just written: a
+	// host file scanner reacting to that write can open the FIFO).
+	proc := fakeProc(t, map[int]string{initPID: "/lxc.payload.box-a/init.scope"})
+	minerDir := filepath.Join(proc, fmt.Sprint(minerPID))
+	if err := os.MkdirAll(minerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(minerDir, "cgroup"), []byte("0::/lxc.payload.box-a/user.slice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const floodPIDs = 8
+	var floodOpens []*atomic.Int64
+	for i := 0; i < floodPIDs; i++ {
+		floodOpens = append(floodOpens, procOpenTrap(t, proc, 10_000+i, "sh", fakeStart(10_000+i), procPerExecFiles...))
+	}
+	minerStatOpens := procOpenTrap(t, proc, minerPID, "xmrig", fakeStart(minerPID), "stat")
+
+	fx := newResponderFixture(t, false)
+	fx.setKill(t, "", true)
+	var killed []int
+	fx.r.SetProcessKiller(&hostProcessKiller{
+		procRoot: proc,
+		initPID:  func(string) (int64, error) { return initPID, nil },
+		open:     func(p int) (pidHandle, error) { return fakePIDHandle{killed: &killed, pid: p}, nil },
+	})
+	engine := threatdetect.NewEngine(NewActingSink(fx.findings, fx.r), "b1", false, nil, nil)
+	rule, err := threatdetect.NewMinerSignatureRule(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.Register(rule)
+	w := NewExecWatcher(engine.OnExec)
+	w.procRoot = proc
+	w.bootTicks = func() (threatdetect.ProcStartTicks, error) { return fakeStart(minerPID) + 10, nil }
+	w.byCgroup[42] = execTarget{Container: "box-a", TenantID: "tenant-a"}
+
+	const flood = 20_000
+	ctx := context.Background()
+	for i := 0; i < flood; i++ {
+		w.OnExecEvent(ctx, netbpf.ExecEvent{HostPID: uint32(10_000 + i%floodPIDs), PPID: 1, CgroupID: 42, Comm: "sh", // #nosec G115 -- small test pids
+			Filename: "/usr/bin/sh", Argv: []string{"sh", "-c", "true"}})
+	}
+	for i, o := range floodOpens {
+		if n := o.Load(); n != 0 {
+			t.Fatalf("%d non-matching execs opened files under /proc/%d %d times, want 0", flood, 10_000+i, n)
+		}
+	}
+	if len(killed) != 0 {
+		t.Fatalf("non-matching flood killed %v", killed)
+	}
+	if got := fx.findings.byRule(pb.ThreatRuleId_THREAT_RULE_ID_MINER_SIGNATURE); len(got) != 0 {
+		t.Fatalf("non-matching flood raised %d signature findings", len(got))
+	}
+
+	w.OnExecEvent(ctx, netbpf.ExecEvent{HostPID: minerPID, PPID: 1, CgroupID: 42, Comm: "xmrig",
+		Filename: "/tmp/xmrig", Argv: []string{"./xmrig", "--donate-level", "1"}})
+	if n := minerStatOpens.Load(); n != 1 || len(killed) != 1 || killed[0] != minerPID {
+		t.Fatalf("matched exec: %d stat opens, kills %v; want 1 open and pid %d killed", n, killed, minerPID)
+	}
+}
+
+// TestExecWatcher_FanOutDropsSlowSubscriberWithoutBlocking: two subscribers,
+// one never reads. The fast one receives every event, the slow one is
+// dropped (its channel closed) once its buffer is full, and OnExecEvent
+// never blocks on it — the whole run completes inside a deadline far below
+// what a blocked send would take.
+func TestExecWatcher_FanOutDropsSlowSubscriberWithoutBlocking(t *testing.T) {
+	procRoot, cgroupRoot, ino := fakeTree(t, map[int64]string{100: "lxc.payload.box-a"})
+	w := newTestWatcher(t, procRoot, cgroupRoot, newFakeCgroupMap())
+	w.Reconcile([]incus.ContainerInfo{running("box-a", 100)})
+	cg := ino["lxc.payload.box-a"]
+
+	_, fast, cancelFast := w.Subscribe("", 0, 64)
+	defer cancelFast()
+	_, slow, cancelSlow := w.Subscribe("", 0, 2)
+	defer cancelSlow()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 10; i++ {
+			w.OnExecEvent(context.Background(), kernelEvent(cg, uint32(100+i), "sh", "sh")) // #nosec G115 -- small test loop
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnExecEvent blocked on a slow subscriber")
+	}
+
+	if n := len(fast); n != 10 {
+		t.Fatalf("fast subscriber buffered %d events, want 10", n)
+	}
+	// The slow subscriber got the first 2, then was dropped: its channel is
+	// closed after those.
+	var slowGot int
+	for ev := range slow {
+		slowGot++
+		if ev.Container != "box-a" {
+			t.Errorf("slow event container = %q", ev.Container)
+		}
+	}
+	if slowGot != 2 {
+		t.Fatalf("slow subscriber received %d before being dropped, want 2", slowGot)
+	}
+	if w.SubscribersDropped() != 1 {
+		t.Fatalf("dropped subscribers = %d, want 1", w.SubscribersDropped())
+	}
+	// The fast one is still live.
+	w.OnExecEvent(context.Background(), kernelEvent(cg, 999, "sh", "sh"))
+	select {
+	case ev := <-fast:
+		_ = ev
+	case <-time.After(time.Second):
+		t.Fatal("fast subscriber stopped receiving after the slow one was dropped")
+	}
+}
+
+// TestExecWatcher_SubscribeFiltersAndReplays: a container filter delivers
+// only that box's events; `since` replays the in-memory ring (newest-last)
+// for the window, atomically with the subscription so nothing is duplicated
+// or missed between replay and live.
+func TestExecWatcher_SubscribeFiltersAndReplays(t *testing.T) {
+	procRoot, cgroupRoot, ino := fakeTree(t, map[int64]string{100: "lxc.payload.box-a", 200: "lxc.payload.box-b"})
+	w := newTestWatcher(t, procRoot, cgroupRoot, newFakeCgroupMap())
+	now := time.Unix(1700000000, 0)
+	w.now = func() time.Time { return now }
+	w.Reconcile([]incus.ContainerInfo{running("box-a", 100), running("box-b", 200)})
+	a, b := ino["lxc.payload.box-a"], ino["lxc.payload.box-b"]
+
+	w.OnExecEvent(context.Background(), kernelEvent(a, 1, "old", "old")) // 10 min ago
+	now = now.Add(10 * time.Minute)
+	w.OnExecEvent(context.Background(), kernelEvent(a, 2, "sh", "sh"))
+	w.OnExecEvent(context.Background(), kernelEvent(b, 3, "sh", "sh"))
+	now = now.Add(time.Second)
+
+	replay, ch, cancel := w.Subscribe("box-a", 5*time.Minute, 8)
+	defer cancel()
+	if len(replay) != 1 || replay[0].Event.HostPID != 2 || replay[0].Container != "box-a" {
+		t.Fatalf("replay = %+v, want only box-a's event from the last 5 minutes", replay)
+	}
+	w.OnExecEvent(context.Background(), kernelEvent(b, 4, "sh", "sh"))
+	w.OnExecEvent(context.Background(), kernelEvent(a, 5, "sh", "sh"))
+	select {
+	case ev := <-ch:
+		if ev.Event.HostPID != 5 {
+			t.Fatalf("live event pid = %d, want 5 (box-b's 4 filtered out)", ev.Event.HostPID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no live event delivered")
+	}
+	if len(ch) != 0 {
+		t.Fatalf("filtered subscriber has %d extra events buffered", len(ch))
+	}
+
+	all, _, cancelAll := w.Subscribe("", time.Hour, 8)
+	defer cancelAll()
+	if len(all) != 5 {
+		t.Fatalf("unfiltered hour replay = %d events, want 5", len(all))
+	}
+	for i := 1; i < len(all); i++ {
+		if all[i].At.Before(all[i-1].At) {
+			t.Fatalf("replay not oldest-first: %+v", all)
+		}
+	}
+	none, _, cancelNone := w.Subscribe("", 0, 8)
+	defer cancelNone()
+	if len(none) != 0 {
+		t.Fatalf("since=0 replayed %d events, want none", len(none))
+	}
+}
+
+// The replay ring is bounded: after more events than it holds, only the most
+// recent execReplayRing remain.
+func TestExecWatcher_ReplayRingIsBounded(t *testing.T) {
+	procRoot, cgroupRoot, ino := fakeTree(t, map[int64]string{100: "lxc.payload.box-a"})
+	w := newTestWatcher(t, procRoot, cgroupRoot, newFakeCgroupMap())
+	w.Reconcile([]incus.ContainerInfo{running("box-a", 100)})
+	cg := ino["lxc.payload.box-a"]
+	for i := 0; i < execReplayRing+10; i++ {
+		w.OnExecEvent(context.Background(), kernelEvent(cg, uint32(i), "sh", "sh")) // #nosec G115 -- bounded test loop
+	}
+	replay, _, cancel := w.Subscribe("", time.Hour, 1)
+	defer cancel()
+	if len(replay) != execReplayRing {
+		t.Fatalf("replay = %d, want the ring size %d", len(replay), execReplayRing)
+	}
+	if replay[0].Event.HostPID != 10 || replay[len(replay)-1].Event.HostPID != uint32(execReplayRing+9) {
+		t.Fatalf("replay window = pids %d..%d, want 10..%d", replay[0].Event.HostPID, replay[len(replay)-1].Event.HostPID, execReplayRing+9)
+	}
+}
+
+// Status strings: not started, running, failed, stopped.
+func TestExecWatcher_Status(t *testing.T) {
+	w := NewExecWatcher(nil)
+	if got := w.Status(); got != execTelemetryNotStartedStatus {
+		t.Fatalf("initial status = %q", got)
+	}
+	w.setStatus(execTelemetryUnavailable(fmt.Errorf("netbpf: execwatch: load collection: BTF not found")))
+	if got := w.Status(); got != "unavailable (netbpf: execwatch: load collection: BTF not found)" {
+		t.Fatalf("failed status = %q", got)
+	}
+	if !strings.HasPrefix(w.Status(), "unavailable") {
+		t.Fatal("unavailable status must start with the word the health loop keys on")
+	}
+	w.setStatus(execTelemetryOK)
+	if got := w.Status(); got != "ok" {
+		t.Fatalf("running status = %q", got)
+	}
+	if w.Lost() != 0 {
+		t.Fatalf("Lost() = %d with no kernel object, want 0", w.Lost())
+	}
+}
+
+// fakeExecRing is an execRingReader. With err set it reports data and
+// returns err from ReadInto (a failing ring). With no err it is an empty
+// ring; the consumer leaves on ctx cancellation either way. Like the real
+// ringbuf.Reader, whose AvailableBytes dereferences the mapping Close unmaps,
+// it PANICS when ReadInto or AvailableBytes is called after Close: the
+// consumer must close the reader only after its drain loop has returned
+// (#2812 review), and a fake that tolerated the old order would hide that.
+type fakeExecRing struct {
+	err    error
+	once   sync.Once
+	closed chan struct{}
+}
+
+func newFakeExecRing(err error) *fakeExecRing {
+	return &fakeExecRing{err: err, closed: make(chan struct{})}
+}
+
+func (r *fakeExecRing) useAfterClose(method string) {
+	select {
+	case <-r.closed:
+		panic("fakeExecRing." + method + " called after Close: the consumer must close the reader only after its loop has returned")
+	default:
+	}
+}
+
+func (r *fakeExecRing) ReadInto(*ringbuf.Record) error {
+	r.useAfterClose("ReadInto")
+	if r.err != nil {
+		return r.err
+	}
+	return os.ErrDeadlineExceeded
+}
+
+func (r *fakeExecRing) SetDeadline(time.Time) {}
+
+func (r *fakeExecRing) AvailableBytes() int {
+	r.useAfterClose("AvailableBytes")
+	if r.err != nil {
+		return 1
+	}
+	return 0
+}
+
+func (r *fakeExecRing) Close() error {
+	r.once.Do(func() { close(r.closed) })
+	return nil
+}
+
+func (r *fakeExecRing) isClosed() bool {
+	select {
+	case <-r.closed:
+		return true
+	case <-time.After(2 * time.Second):
+		return false
+	}
+}
+
+// A ring consumer that dies on a read error while the watcher is meant to be
+// running must not leave the status at "ok": it flips to
+// `unavailable (ring consumer exited: …)`, GetSentryStatus reports it, the
+// health loop's predicate sees it as down, and open streams are ended.
+func TestExecWatcher_ConsumerExitFlipsStatusUnavailable(t *testing.T) {
+	w := NewExecWatcher(nil)
+	w.setStatus(execTelemetryOK)
+	_, ch, cancel := w.Subscribe("", 0, 0)
+	defer cancel()
+
+	rd := newFakeExecRing(errors.New("read ring: bad file descriptor"))
+	w.wg.Add(1)
+	w.consume(context.Background(), rd)
+
+	got := w.Status()
+	if !strings.HasPrefix(got, "unavailable (ring consumer exited: ") || !strings.Contains(got, "bad file descriptor") {
+		t.Fatalf("status after consumer exit = %q, want unavailable (ring consumer exited: …bad file descriptor…)", got)
+	}
+	if w.Running() {
+		t.Fatal("Running() = true after the consumer exited")
+	}
+	if !rd.isClosed() {
+		t.Fatal("reader not closed after the consumer exited")
+	}
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("subscriber received an event, want its channel closed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber channel still open after the consumer exited")
+	}
+
+	s := NewThreatDetectionServer(threatdetect.NewEngine(&fakeFindingSink{}, "b", false, nil, nil), true, true, "")
+	s.SetExecTelemetry(w)
+	resp, err := s.GetSentryStatus(secReadCtx(), &pb.GetSentryStatusRequest{})
+	if err != nil {
+		t.Fatalf("GetSentryStatus: %v", err)
+	}
+	if resp.GetExecTelemetry() != got {
+		t.Fatalf("exec_telemetry = %q, want the watcher's %q", resp.GetExecTelemetry(), got)
+	}
+	if !execTelemetryDown(resp) {
+		t.Fatalf("health loop does not see %q as down; no %q finding would be raised", resp.GetExecTelemetry(), execTelemetrySubject)
+	}
+}
+
+// A consumer that returns because the watcher is stopping (ctx cancelled)
+// leaves the status to Stop.
+func TestExecWatcher_ConsumerExitOnShutdownKeepsStatus(t *testing.T) {
+	w := NewExecWatcher(nil)
+	w.setStatus(execTelemetryOK)
+	ctx, cancel := context.WithCancel(context.Background())
+	rd := newFakeExecRing(nil)
+	w.wg.Add(1)
+	go w.consume(ctx, rd)
+	cancel()
+	w.wg.Wait()
+	if got := w.Status(); got != execTelemetryOK {
+		t.Fatalf("status after a shutdown exit = %q, want it untouched (%q)", got, execTelemetryOK)
+	}
+	if !rd.isClosed() {
+		t.Fatal("reader not closed on shutdown")
+	}
+}
+
+// closeRacingRing is shaped like cilium/ebpf v0.22's ringbuf.Reader where it
+// matters (#2812 review): AvailableBytes takes no lock and reads the ring
+// mapping, which Close unmaps and nils under the reader's lock. On its
+// second call AvailableBytes cancels the consumer's ctx and lingers, the
+// way a cancel landing mid-call would; if anyone Closes the reader while
+// that call is still reading the ring, that is the shutdown crash, and it
+// is recorded (and, under -race, reported as a race on ring).
+type closeRacingRing struct {
+	mu        sync.Mutex
+	ring      *int // nil once closed, like Reader.ring
+	calls     atomic.Int32
+	cancel    func()
+	violation atomic.Bool
+	closed    chan struct{}
+}
+
+func newCloseRacingRing(cancel func()) *closeRacingRing {
+	v := 0
+	return &closeRacingRing{ring: &v, cancel: cancel, closed: make(chan struct{})}
+}
+
+func (r *closeRacingRing) AvailableBytes() int {
+	ring := r.ring // unlocked, as in cilium/ebpf
+	if ring == nil {
+		r.violation.Store(true) // the real reader would nil-deref here
+		return 0
+	}
+	if r.calls.Add(1) == 2 {
+		r.cancel()
+		select { // give a concurrent closer every chance to run
+		case <-r.closed:
+			r.violation.Store(true) // closed while this call was reading the ring
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return *ring
+}
+
+func (r *closeRacingRing) ReadInto(*ringbuf.Record) error { return os.ErrDeadlineExceeded }
+func (r *closeRacingRing) SetDeadline(time.Time)          {}
+
+func (r *closeRacingRing) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ring != nil {
+		r.ring = nil
+		close(r.closed)
+	}
+	return nil
+}
+
+// The reader is closed only after the drain loop has returned, never while
+// it may still call the reader's unlocked AvailableBytes; and a cancel still
+// ends the consumer promptly and closes the reader.
+func TestExecWatcher_ConsumeClosesReaderOnlyAfterLoop(t *testing.T) {
+	w := NewExecWatcher(nil)
+	w.setStatus(execTelemetryOK)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rd := newCloseRacingRing(cancel)
+	w.wg.Add(1)
+	start := time.Now()
+	go w.consume(ctx, rd)
+	waited := make(chan struct{})
+	go func() { w.wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("consumer did not return after its ctx was cancelled")
+	}
+	if rd.violation.Load() {
+		t.Fatal("reader closed while the drain loop was still using it (AvailableBytes raced Close)")
+	}
+	select {
+	case <-rd.closed:
+	default:
+		t.Fatal("reader not closed after the consumer returned")
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Fatalf("consumer took %s to stop after cancel, want about one drain interval", el)
+	}
+	if got := w.Status(); got != execTelemetryOK {
+		t.Fatalf("status after a shutdown exit = %q, want it untouched", got)
+	}
+}
+
+// Stop ends every subscription (after the status has left "ok") and forgets
+// the attribution tables, so a later Start would re-register every box.
+func TestExecWatcher_StopEndsSubscriptionsAndClearsTables(t *testing.T) {
+	procRoot, cgroupRoot, ino := fakeTree(t, map[int64]string{100: "lxc.payload.box-a"})
+	w := newTestWatcher(t, procRoot, cgroupRoot, newFakeCgroupMap())
+	w.Reconcile([]incus.ContainerInfo{running("box-a", 100)})
+	if _, ok := w.lookup(ino["lxc.payload.box-a"]); !ok {
+		t.Fatal("box-a not registered before Stop")
+	}
+	_, ch, cancel := w.Subscribe("", 0, 0)
+	w.Stop()
+	defer cancel() // after Stop: must not double-close
+	if _, ok := <-ch; ok {
+		t.Fatal("subscriber channel delivered an event after Stop, want it closed")
+	}
+	if got := w.Status(); got != execTelemetryStoppedStatus {
+		t.Fatalf("status after Stop = %q, want %q", got, execTelemetryStoppedStatus)
+	}
+	if _, ok := w.lookup(ino["lxc.payload.box-a"]); ok || w.watchedCount() != 0 {
+		t.Fatal("attribution tables survived Stop")
+	}
+}
+
+// blockingCgroupMap parks WatchCgroup until released, to prove Reconcile
+// does not hold w.mu across the kernel map write.
+type blockingCgroupMap struct {
+	*fakeCgroupMap
+	block   bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (m *blockingCgroupMap) WatchCgroup(id uint64, idx uint32) error {
+	if m.block {
+		m.entered <- struct{}{}
+		<-m.release
+	}
+	return m.fakeCgroupMap.WatchCgroup(id, idx)
+}
+
+// OnExecEvent (the ring consumer) must keep running while Reconcile is
+// parked in a kernel map write: the resolve and the map syscalls happen
+// outside w.mu.
+func TestExecWatcher_OnExecEventNotBlockedByReconcileMapWrite(t *testing.T) {
+	procRoot, cgroupRoot, ino := fakeTree(t, map[int64]string{100: "lxc.payload.box-a", 200: "lxc.payload.box-b"})
+	m := &blockingCgroupMap{fakeCgroupMap: newFakeCgroupMap(), entered: make(chan struct{}), release: make(chan struct{})}
+	var engineCalls sync.WaitGroup
+	w := NewExecWatcher(func(threatdetect.ExecEvent) { engineCalls.Done() })
+	w.procRoot, w.cgroupRoot = procRoot, cgroupRoot
+	w.maps = m
+	w.setStatus(execTelemetryOK)
+	w.Reconcile([]incus.ContainerInfo{running("box-a", 100)})
+
+	m.block = true
+	reconciled := make(chan struct{})
+	go func() {
+		defer close(reconciled)
+		w.Reconcile([]incus.ContainerInfo{running("box-a", 100), running("box-b", 200)})
+	}()
+	select {
+	case <-m.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Reconcile never reached the map write")
+	}
+
+	engineCalls.Add(1)
+	delivered := make(chan struct{})
+	go func() {
+		w.OnExecEvent(context.Background(), kernelEvent(ino["lxc.payload.box-a"], 7, "sh", "sh"))
+		close(delivered)
+	}()
+	select {
+	case <-delivered:
+	case <-time.After(2 * time.Second):
+		close(m.release)
+		t.Fatal("OnExecEvent blocked while Reconcile was in a kernel map write (w.mu held across the write)")
+	}
+	engineCalls.Wait()
+
+	close(m.release)
+	<-reconciled
+	if _, ok := w.lookup(ino["lxc.payload.box-b"]); !ok {
+		t.Fatal("box-b not committed after the map write was released")
+	}
+}
+
+// When a stopped box's cgroup inode is reused by a box that started in the
+// same pass, the stale id's removal must reach the kernel map BEFORE the new
+// box's addition — the other order deletes the new box's entry.
+func TestWatchedCgroupsReconcile_RemovalBeforeAddOnReusedID(t *testing.T) {
+	procRoot, cgroupRoot, ino := fakeTree(t, map[int64]string{100: "lxc.payload.box-old"})
+	// box-new's init (pid 200) lives in a cgroup that resolves to the same
+	// inode as box-old's (a recycled kernfs id): a symlink to the same dir.
+	if err := os.MkdirAll(filepath.Join(procRoot, "200"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(procRoot, "200", "cgroup"), []byte("0::/lxc.payload.box-new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("lxc.payload.box-old", filepath.Join(cgroupRoot, "lxc.payload.box-new")); err != nil {
+		t.Fatal(err)
+	}
+	id := ino["lxc.payload.box-old"]
+	if got, err := cgroupIDForPID(procRoot, cgroupRoot, 200); err != nil || got != id {
+		t.Fatalf("fixture: box-new id = %d (%v), want the reused %d", got, err, id)
+	}
+
+	m := newFakeCgroupMap()
+	w := newTestWatcher(t, procRoot, cgroupRoot, m)
+	w.Reconcile([]incus.ContainerInfo{running("box-old", 100)})
+	m.ops = nil
+
+	w.Reconcile([]incus.ContainerInfo{
+		running("box-old", 0, func(c *incus.ContainerInfo) { c.State = "Stopped" }),
+		running("box-new", 200),
+	})
+	want := []string{fmt.Sprintf("unwatch %d", id), fmt.Sprintf("watch %d", id)}
+	if fmt.Sprint(m.ops) != fmt.Sprint(want) {
+		t.Fatalf("map ops = %v, want %v (removal before addition)", m.ops, want)
+	}
+	if ids := m.ids(); len(ids) != 1 || ids[0] != id {
+		t.Fatalf("kernel map = %v, want the reused id %d watched", ids, id)
+	}
+	if tgt, ok := w.lookup(id); !ok || tgt.Container != "box-new" {
+		t.Fatalf("id %d → %+v (%v), want box-new", id, tgt, ok)
+	}
+}

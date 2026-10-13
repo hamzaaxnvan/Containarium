@@ -61,3 +61,129 @@ func TestGenerateVPAWebhookSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(secret)
+	for _, must := range []string{"name: vpa-tls-certs", "namespace: kube-system", "caCert.pem:", "serverCert.pem:", "serverKey.pem:"} {
+		if !strings.Contains(text, must) {
+			t.Fatalf("secret manifest missing %q", must)
+		}
+	}
+
+	// The serving cert verifies against the CA and carries the
+	// webhook service SAN — what the kube-apiserver will check.
+	field := func(key string) []byte {
+		re := regexp.MustCompile(key + `: (\S+)`)
+		m := re.FindStringSubmatch(text)
+		if m == nil {
+			t.Fatalf("missing %s", key)
+		}
+		raw, err := base64.StdEncoding.DecodeString(m[1])
+		if err != nil {
+			t.Fatalf("%s not base64: %v", key, err)
+		}
+		return raw
+	}
+	caBlock, _ := pem.Decode(field("caCert.pem"))
+	srvBlock, _ := pem.Decode(field("serverCert.pem"))
+	if caBlock == nil || srvBlock == nil {
+		t.Fatal("certs are not PEM")
+	}
+	ca, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := x509.ParseCertificate(srvBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(ca)
+	if _, err := srv.Verify(x509.VerifyOptions{
+		Roots:     pool,
+		DNSName:   "vpa-webhook.kube-system.svc",
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}); err != nil {
+		t.Fatalf("serving cert does not verify for the webhook service: %v", err)
+	}
+
+	// Two clusters never share webhook certs.
+	secret2, err := GenerateVPAWebhookSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(secret) == string(secret2) {
+		t.Fatal("webhook secrets are identical across generations")
+	}
+}
+
+func TestDeployVPA(t *testing.T) {
+	f := newFakeHost()
+	f.readErr = errNotDeployed{}
+	m := testManager(f)
+
+	if err := m.DeployVPA("alice", "demo"); err != nil {
+		t.Fatalf("DeployVPA: %v", err)
+	}
+	cp := "alice-k8s-demo-cp"
+	if _, ok := f.files[cp+":"+VPAManifestPath]; !ok {
+		t.Fatal("VPA manifests not pushed")
+	}
+	if _, ok := f.files[cp+":"+VPACertsPath]; !ok {
+		t.Fatal("VPA certs manifest not pushed")
+	}
+
+	// Idempotent: a second deploy must NOT regenerate the secret —
+	// that would rotate the webhook's certs under the running
+	// admission controller.
+	f.readErr = nil // certs file now readable
+	before := string(f.files[cp+":"+VPACertsPath])
+	if err := m.DeployVPA("alice", "demo"); err != nil {
+		t.Fatalf("second DeployVPA: %v", err)
+	}
+	if string(f.files[cp+":"+VPACertsPath]) != before {
+		t.Fatal("second deploy rotated the webhook secret")
+	}
+}
+
+type errNotDeployed struct{}
+
+func (errNotDeployed) Error() string { return "no such file" }
+
+// The VPA bundle is three Deployments. Asserting on the manifest as
+// *text* is not enough and this is how we learned it: the previous
+// check looked for the string "vpa-admission-controller", which
+// appears in its ServiceAccount and RBAC, so it passed while the
+// admission-controller Deployment was being silently discarded by a
+// missing `---` separator (#1473). Parse the documents and count the
+// objects Kubernetes would actually get.
+func TestVPAManifestsCarryAllThreeDeployments(t *testing.T) {
+	raw, err := VPAManifests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	type object struct {
+		Kind     string `yaml:"kind"`
+		Metadata struct {
+			Name string `yaml:"name"`
+		} `yaml:"metadata"`
+	}
+	got := map[string]bool{}
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	for {
+		var o object
+		err := dec.Decode(&o)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("VPA manifests are not valid YAML: %v", err)
+		}
+		if o.Kind == "Deployment" {
+			got[o.Metadata.Name] = true
+		}
+	}
+	for _, want := range []string{"vpa-recommender", "vpa-updater", "vpa-admission-controller"} {
+		if !got[want] {
+			t.Errorf("Deployment %q is missing from the parsed manifests (got %v) — "+
+				"without the admission controller a recommendation is computed and never applied", want, got)
+		}
+	}
+}
