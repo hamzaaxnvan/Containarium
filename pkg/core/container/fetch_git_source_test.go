@@ -60,3 +60,66 @@ func TestFetchGitSource_ErrorSurfacesStderrNotCredential(t *testing.T) {
 	}
 	mgr := NewWithBackend(backend)
 
+	commit, err := mgr.FetchGitSource("agent-x-container", GitSourceSpec{
+		Source:     "https://github.com/org/private",
+		Credential: "super-secret-token",
+	})
+	if err == nil {
+		t.Fatal("expected an error when the box exec fails")
+	}
+	if commit != "" {
+		t.Errorf("commit = %q on error, want empty", commit)
+	}
+	if !strings.Contains(err.Error(), "fatal: could not read Username") {
+		t.Errorf("error = %q, want the box's stderr surfaced", err.Error())
+	}
+	if strings.Contains(err.Error(), "super-secret-token") {
+		t.Errorf("error must never contain the credential: %q", err.Error())
+	}
+}
+
+func TestFetchGitSource_CredentialNeverInErrorEvenViaStdoutFallback(t *testing.T) {
+	backend := &fakeExecBackend{
+		stdout: "some stdout mentioning nothing sensitive",
+		err:    errTest,
+	}
+	mgr := NewWithBackend(backend)
+
+	_, err := mgr.FetchGitSource("agent-x-container", GitSourceSpec{
+		Source:     "https://github.com/org/private",
+		Credential: "super-secret-token",
+	})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "super-secret-token") {
+		t.Errorf("error must never contain the credential: %q", err.Error())
+	}
+}
+
+// errTest is a stand-in exec failure; its message is deliberately unrelated
+// to any credential so the "must not leak" assertions above are meaningful.
+var errTest = fetchTestError("exec failed")
+
+type fetchTestError string
+
+func (e fetchTestError) Error() string { return string(e) }
+
+// TestProvisionGitSource_StillWorks pins that the existing CreateContainer
+// call site (opts.GitSource/.GitRef/.GitCredential/.WorkspacePath) still
+// fetches correctly now that it is a thin wrapper over FetchGitSource.
+func TestProvisionGitSource_StillWorks(t *testing.T) {
+	backend := &fakeExecBackend{stdout: "abc123\n"}
+	mgr := NewWithBackend(backend)
+
+	err := mgr.provisionGitSource("some-container", CreateOptions{
+		GitSource: "https://github.com/org/repo",
+		GitRef:    "v1.0.0",
+	})
+	if err != nil {
+		t.Fatalf("provisionGitSource: %v", err)
+	}
+	if backend.gotContainer != "some-container" {
+		t.Errorf("exec ran against %q, want %q", backend.gotContainer, "some-container")
+	}
+}
