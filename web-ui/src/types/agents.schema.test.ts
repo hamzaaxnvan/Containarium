@@ -31,3 +31,36 @@ describe('ListAgentEnginesResponseSchema', () => {
     expect(parsed.engines[0].isDefault).toBe(true);
     expect(parsed.engines[0].skillIds).toEqual(['hello-agent']);
     expect(parsed.engines[1].readiness).toBe('AGENT_ENGINE_READINESS_NOT_READY');
+  });
+
+  it('fills in protojson-omitted zero-value fields with their proto defaults', () => {
+    // protojson omits a field entirely when it equals the proto3 zero value
+    // (an UNSPECIFIED enum, "", false, []) — a real wire response can look
+    // like this for e.g. a row whose reason is empty or skillIds is empty.
+    const parsed = ListAgentEnginesResponseSchema.parse({
+      engines: [{ engine: 'AGENT_ENGINE_GEMINI' }],
+    });
+    expect(parsed.keyOwner).toBe('');
+    expect(parsed.engines[0].reason).toBe('');
+    expect(parsed.engines[0].isDefault).toBe(false);
+    expect(parsed.engines[0].skillIds).toEqual([]);
+    expect(parsed.engines[0].readiness).toBe('AGENT_ENGINE_READINESS_UNSPECIFIED');
+    expect(parsed.engines[0].source).toBe('AGENT_CREDENTIAL_SOURCE_UNSPECIFIED');
+  });
+
+  it('rejects an unknown enum value rather than silently accepting it', () => {
+    expect(() =>
+      ListAgentEnginesResponseSchema.parse({
+        engines: [{ engine: 'AGENT_ENGINE_SOME_FUTURE_VALUE' }],
+      })
+    ).toThrow();
+  });
+
+  it('rejects a response missing the engines array entirely only if not an object', () => {
+    // An empty object is a legitimate "no engines" shape (shouldn't happen in
+    // practice, but the schema must not throw on it) — only a non-object body
+    // should fail.
+    expect(() => ListAgentEnginesResponseSchema.parse({})).not.toThrow();
+    expect(() => ListAgentEnginesResponseSchema.parse('not an object')).toThrow();
+  });
+});

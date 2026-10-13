@@ -36,3 +36,16 @@ func TestRecordToProto_CarriesHookFormat(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		rec  *backup.Record
+		want pb.HookFormat
+	}{
+		{"pg_custom hook", &backup.Record{Engine: backup.EngineHook, HookFormat: backup.HookFormatPGCustom}, pb.HookFormat_HOOK_FORMAT_PG_CUSTOM},
+		{"opaque hook", &backup.Record{Engine: backup.EngineHook, HookFormat: backup.HookFormatOpaque}, pb.HookFormat_HOOK_FORMAT_OPAQUE},
+		{"pg_dump record", &backup.Record{Engine: backup.EnginePostgres}, pb.HookFormat_HOOK_FORMAT_UNSPECIFIED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recordToProto(tc.rec).HookFormat; got != tc.want {
+				t.Errorf("HookFormat = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

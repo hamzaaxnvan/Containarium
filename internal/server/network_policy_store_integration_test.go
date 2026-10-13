@@ -34,3 +34,21 @@ func TestNetworkPolicyStore_PostgresEgressMode(t *testing.T) {
 	}
 
 	got, err := s.Get(ctx, "alice")
+	if err != nil || got.GetEgressMode() != logOnly || got.GetMode() != enforce {
+		t.Fatalf("Get alice = %v, %v; want mode=ENFORCE egress_mode=LOG_ONLY", got, err)
+	}
+	got, err = s.Get(ctx, "bob")
+	if err != nil || got.GetEgressMode() != pb.NetworkPolicyMode_NETWORK_POLICY_MODE_UNSPECIFIED {
+		t.Fatalf("Get bob = %v, %v; want egress_mode UNSPECIFIED", got, err)
+	}
+	list, err := s.List(ctx)
+	if err != nil || len(list) != 2 || list[0].GetEgressMode() != logOnly {
+		t.Fatalf("List = %v, %v", list, err)
+	}
+	mut, err := s.MutateDenyRules(ctx, "alice", func(r []*pb.NetworkPolicyDenyRule) ([]*pb.NetworkPolicyDenyRule, error) {
+		return append(r, &pb.NetworkPolicyDenyRule{Cidr: "192.0.2.1/32"}), nil
+	})
+	if err != nil || mut.GetEgressMode() != logOnly {
+		t.Fatalf("MutateDenyRules = %v, %v; want egress_mode kept", mut, err)
+	}
+}
