@@ -24,3 +24,108 @@ import (
 //
 // The fix keeps infinite retry (that part was deliberate: a pool member
 // that stays dead is worse than one that retries) and adds geometric
+// backoff, so the two properties stop being conflated.
+
+// unitSources returns each unit template with a label. The daemon
+// template is a package const; the sibling shipped as a plain file and
+// the sentinel's inline template are read from source, because nothing
+// else in the build would notice them regressing.
+func unitSources(t *testing.T) map[string]string {
+	t.Helper()
+
+	read := func(parts ...string) string {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(parts...))
+		if err != nil {
+			t.Fatalf("read %v: %v", parts, err)
+		}
+		return string(raw)
+	}
+
+	// The sentinel entry is the GENERATED unit, not its source text. It used
+	// to be read("sentinel_service.go"); when #1350 moved the template into
+	// sentinel_unit.go, that read kept succeeding against a file that no
+	// longer held a unit, and every guard below silently stopped covering the
+	// sentinel. Rendering it makes these tests immune to where the template
+	// lives — and is closer to what actually ships anyway.
+	sentinelUnit, err := buildSentinelUnit(sentinelUnitConfig{
+		SpotVM:     "spot-vm",
+		Zone:       "zone",
+		Project:    "project",
+		MemoryHigh: defaultSentinelMemoryHigh,
+		MemoryMax:  defaultSentinelMemoryMax,
+	})
+	if err != nil {
+		t.Fatalf("buildSentinelUnit: %v", err)
+	}
+
+	return map[string]string{
+		"daemon (systemdServiceTemplate)":       systemdServiceTemplate,
+		"daemon (scripts/containarium.service)": read("..", "..", "scripts", "containarium.service"),
+		"sentinel (generated unit)":             sentinelUnit,
+	}
+}
+
+// Every unit must bound its retry rate. Without these, a persistent
+// failure retries 12 times a minute forever.
+func TestUnitsHaveRestartBackoff(t *testing.T) {
+	for name, unit := range unitSources(t) {
+		t.Run(name, func(t *testing.T) {
+			for _, directive := range []string{"RestartSteps=", "RestartMaxDelaySec="} {
+				if !strings.Contains(unit, directive) {
+					t.Errorf("%s is missing %s — a persistent start failure would retry at a flat "+
+						"interval forever, which is #1152 (1655 restarts in 4 hours)", name, directive)
+				}
+			}
+			// The floor must survive too: without RestartSec the
+			// geometric series has nothing to start from.
+			if !strings.Contains(unit, "RestartSec=") {
+				t.Errorf("%s lost RestartSec", name)
+			}
+		})
+	}
+}
+
+// Infinite retry must be preserved. This is the half of the original
+// design that was correct and is easy to "fix" by mistake: a
+// StartLimitBurst that gives up leaves a pool member silently dead,
+// which is worse than one retrying slowly.
+func TestUnitsStillRetryForever(t *testing.T) {
+	for name, unit := range unitSources(t) {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(unit, "StartLimitIntervalSec=0") {
+				t.Errorf("%s no longer disables the start rate limit: a unit that gives up leaves "+
+					"a pool member dead until someone notices, which is what the 0 was for", name)
+			}
+			// systemd's rate limiter is what makes a unit enter
+			// "failed" and stop retrying. Reintroducing a burst limit
+			// alongside the backoff would undo that deliberately-kept
+			// property.
+			if strings.Contains(unit, "StartLimitBurst=") {
+				t.Errorf("%s sets StartLimitBurst — combined with a start limit that would make the "+
+					"unit give up permanently; backoff is the mechanism here, not a cap", name)
+			}
+		})
+	}
+}
+
+// The backoff has to actually widen: a max delay at or below the initial
+// delay is the flat-retry behaviour with extra words.
+func TestBackoffCeilingIsAboveTheFloor(t *testing.T) {
+	for name, unit := range unitSources(t) {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(unit, "RestartSec=5s") {
+				t.Errorf("%s: expected a 5s floor", name)
+			}
+			if !strings.Contains(unit, "RestartMaxDelaySec=5min") {
+				t.Errorf("%s: expected a 5min ceiling, well above the 5s floor", name)
+			}
+			// RestartSteps interpolates between them; 1 step would be
+			// a single jump rather than a ramp, defeating the "a
+			// transient hiccup still recovers in seconds" property.
+			if strings.Contains(unit, "RestartSteps=1\n") || strings.Contains(unit, "RestartSteps=0") {
+				t.Errorf("%s: RestartSteps must ramp, so an early transient failure still retries fast", name)
+			}
+		})
+	}
+}
