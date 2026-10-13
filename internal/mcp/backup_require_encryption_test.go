@@ -32,3 +32,37 @@ func TestCreateBackup_RequireEncryptionParam(t *testing.T) {
 				t.Fatalf("request = %+v, want RequireEncryption=%v", api.got, tc.want)
 			}
 		})
+	}
+}
+
+// The wire name must be the proto field name, and omitted when false so an
+// older daemon never sees it.
+func TestCreateBackupRequest_RequireEncryptionWire(t *testing.T) {
+	b, _ := json.Marshal(CreateBackupRequest{Username: "a", RequireEncryption: true})
+	var m map[string]interface{}
+	_ = json.Unmarshal(b, &m)
+	if m["require_encryption"] != true {
+		t.Errorf("wire body = %s, want require_encryption:true", b)
+	}
+	b, _ = json.Marshal(CreateBackupRequest{Username: "a"})
+	m = nil
+	_ = json.Unmarshal(b, &m)
+	if _, ok := m["require_encryption"]; ok {
+		t.Errorf("false must be omitted, got %s", b)
+	}
+}
+
+func TestCreateBackupSchema_DeclaresRequireEncryption(t *testing.T) {
+	for _, tool := range backupTools() {
+		if tool.Name != "create_backup" {
+			continue
+		}
+		props, _ := tool.InputSchema["properties"].(map[string]interface{})
+		p, ok := props["require_encryption"].(map[string]interface{})
+		if !ok || p["type"] != "boolean" {
+			t.Fatalf("create_backup schema require_encryption = %v, want a boolean property", props["require_encryption"])
+		}
+		return
+	}
+	t.Fatal("create_backup tool not found")
+}
