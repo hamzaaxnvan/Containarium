@@ -340,3 +340,345 @@ func DiffRequires(base, head GoMod) []ModuleChange {
 // for both paths and versions, which share the rule.
 func EscapePath(s string) string {
 	var b strings.Builder
+	for _, r := range s {
+		if r >= 'A' && r <= 'Z' {
+			b.WriteByte('!')
+			r += 'a' - 'A'
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// SumRecord is the checksum database's record for one module version.
+type SumRecord struct {
+	Hash      string // h1: of the module zip
+	GoModHash string // h1: of its go.mod
+}
+
+// SumDB looks a module version up in the checksum database. found=false with
+// a nil error means the database has no record; any other trouble is an
+// error, never "not found" or "found".
+type SumDB interface {
+	Lookup(ctx context.Context, path, version string) (rec SumRecord, found bool, err error)
+}
+
+// Origin is the VCS origin the module proxy records for a version.
+type Origin struct {
+	VCS string `json:"VCS"`
+	URL string `json:"URL"`
+}
+
+// ModuleInfo is the proxy's .info document.
+type ModuleInfo struct {
+	Version string    `json:"Version"`
+	Time    time.Time `json:"Time"`
+	Origin  *Origin   `json:"Origin,omitempty"`
+}
+
+// Proxy fetches a module version's .info document.
+type Proxy interface {
+	Info(ctx context.Context, path, version string) (ModuleInfo, error)
+}
+
+const maxBody = 1 << 20
+
+// HTTPSumDB queries a checksum database's /lookup endpoint. It does not
+// verify the signed tree note: TLS to the named database is the trust anchor
+// here, and the go command verifies the tree itself on every download.
+type HTTPSumDB struct {
+	BaseURL  string
+	Client   *http.Client
+	Attempts int // default 3; retried on transport errors and 5xx only
+}
+
+func (s HTTPSumDB) Lookup(ctx context.Context, path, version string) (SumRecord, bool, error) {
+	url := strings.TrimRight(s.BaseURL, "/") + "/lookup/" + EscapePath(path) + "@" + EscapePath(version)
+	status, body, err := get(ctx, s.Client, url, s.Attempts)
+	if err != nil {
+		return SumRecord{}, false, err
+	}
+	switch status {
+	case http.StatusOK:
+	case http.StatusNotFound, http.StatusGone:
+		return SumRecord{}, false, nil
+	default:
+		return SumRecord{}, false, fmt.Errorf("checksum database %s: HTTP %d", url, status)
+	}
+	var rec SumRecord
+	for _, line := range strings.Split(string(body), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 || f[0] != path {
+			continue
+		}
+		switch f[1] {
+		case version:
+			rec.Hash = f[2]
+		case version + "/go.mod":
+			rec.GoModHash = f[2]
+		}
+	}
+	if rec.GoModHash == "" {
+		return SumRecord{}, false, fmt.Errorf("checksum database %s: no record for %s %s in a 200 response", url, path, version)
+	}
+	return rec, true, nil
+}
+
+// HTTPProxy queries a module proxy's .info endpoint.
+type HTTPProxy struct {
+	BaseURL  string
+	Client   *http.Client
+	Attempts int
+}
+
+func (p HTTPProxy) Info(ctx context.Context, path, version string) (ModuleInfo, error) {
+	url := strings.TrimRight(p.BaseURL, "/") + "/" + EscapePath(path) + "/@v/" + EscapePath(version) + ".info"
+	status, body, err := get(ctx, p.Client, url, p.Attempts)
+	if err != nil {
+		return ModuleInfo{}, err
+	}
+	if status != http.StatusOK {
+		return ModuleInfo{}, fmt.Errorf("module proxy %s: HTTP %d", url, status)
+	}
+	var info ModuleInfo
+	if err := json.Unmarshal(body, &info); err != nil {
+		return ModuleInfo{}, fmt.Errorf("module proxy %s: %w", url, err)
+	}
+	return info, nil
+}
+
+func get(ctx context.Context, c *http.Client, url string, attempts int) (int, []byte, error) {
+	if c == nil {
+		c = http.DefaultClient
+	}
+	if attempts <= 0 {
+		attempts = 3
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			case <-time.After(time.Duration(i) * time.Second):
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return 0, nil, err
+		}
+		resp, err := c.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+		_ = resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("%s: HTTP %d", url, resp.StatusCode)
+			continue
+		}
+		return resp.StatusCode, body, nil
+	}
+	return 0, nil, lastErr
+}
+
+// ModuleRow is one line of the report.
+type ModuleRow struct {
+	Change    ModuleChange
+	Published time.Time // zero: unknown (the proxy did not answer)
+	Source    string    // the proxy's recorded VCS origin URL; empty if none
+	Age       time.Duration
+}
+
+// Young reports whether the row is bold: published under YoungAge ago, or of
+// unknown age (which deserves the same second look).
+func (r ModuleRow) Young() bool { return r.Published.IsZero() || r.Age < YoungAge }
+
+// Report is the guard's verdict and its evidence.
+type Report struct {
+	Findings []Finding
+	Modules  []ModuleRow
+}
+
+// Failed reports whether the gate fails.
+func (r Report) Failed() bool { return len(r.Findings) > 0 }
+
+// Checker runs the policy against the network services.
+type Checker struct {
+	SumDB SumDB
+	Proxy Proxy
+	Now   func() time.Time
+}
+
+// Check compares head with base. An error means the verdict could not be
+// reached (the checksum database was unreachable), not that it failed.
+func (c Checker) Check(ctx context.Context, base, head GoMod, sum GoSum) (Report, error) {
+	now := time.Now
+	if c.Now != nil {
+		now = c.Now
+	}
+	rep := Report{Findings: CheckReplaces(base, head)}
+	for _, key := range sum.Conflicts {
+		rep.Findings = append(rep.Findings, Finding{Kind: FindingSumConflict, Module: key,
+			Detail: "go.sum lists this module version more than once with different hashes"})
+	}
+	for _, ch := range DiffRequires(base, head) {
+		id := ch.Path + "@" + ch.NewVersion
+		rec, found, err := c.SumDB.Lookup(ctx, ch.Path, ch.NewVersion)
+		if err != nil {
+			return Report{}, err
+		}
+		if !found {
+			rep.Findings = append(rep.Findings, Finding{Kind: FindingNotInSumDB, Module: id,
+				Detail: "sum.golang.org has no record of this module version"})
+		} else {
+			for key, want := range map[string]string{
+				ch.Path + " " + ch.NewVersion:             rec.Hash,
+				ch.Path + " " + ch.NewVersion + "/go.mod": rec.GoModHash,
+			} {
+				if slices.Contains(sum.Conflicts, key) {
+					continue // already a gosum-conflict finding
+				}
+				if got, ok := sum.Hashes[key]; ok && want != "" && got != want {
+					rep.Findings = append(rep.Findings, Finding{Kind: FindingSumMismatch, Module: id,
+						Detail:   "go.sum hash differs from sum.golang.org (entry, go.sum, sum.golang.org)",
+						Evidence: key + "  " + got + "  " + want})
+				}
+			}
+		}
+		row := ModuleRow{Change: ch}
+		if info, err := c.Proxy.Info(ctx, ch.Path, ch.NewVersion); err == nil && !info.Time.IsZero() {
+			row.Published = info.Time
+			row.Age = now().Sub(info.Time)
+			if info.Origin != nil {
+				row.Source = info.Origin.URL
+			}
+		}
+		rep.Modules = append(rep.Modules, row)
+	}
+	sort.SliceStable(rep.Findings, func(i, j int) bool {
+		if rep.Findings[i].Kind != rep.Findings[j].Kind {
+			return rep.Findings[i].Kind < rep.Findings[j].Kind
+		}
+		return rep.Findings[i].Module < rep.Findings[j].Module
+	})
+	return rep, nil
+}
+
+// code renders untrusted text as an inline code span, the one Markdown
+// construct in which links, autolinks, @mentions, emphasis and raw HTML are
+// all inert. The fence is one backtick longer than the longest backtick run
+// in the text, so the text cannot close it; control characters are escaped
+// first so it stays on one line; and | is escaped because GitHub splits
+// table cells on it even inside a code span.
+func code(s string) string {
+	s = strings.ReplaceAll(LogSafe(s), "|", `\|`)
+	longest, run := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			longest = max(longest, run)
+		} else {
+			run = 0
+		}
+	}
+	fence := strings.Repeat("`", longest+1)
+	if strings.HasPrefix(s, "`") || strings.HasSuffix(s, "`") || strings.HasPrefix(s, " ") || strings.HasSuffix(s, " ") {
+		s = " " + s + " "
+	}
+	return fence + s + fence
+}
+
+func source(r ModuleRow) string {
+	switch {
+	case r.Published.IsZero():
+		return "unknown"
+	case r.Source == "":
+		return "proxy.golang.org (no VCS origin recorded)"
+	default:
+		return code(r.Source)
+	}
+}
+
+func age(r ModuleRow) string {
+	if r.Published.IsZero() {
+		return "unknown"
+	}
+	d := int(r.Age.Hours() / 24)
+	if d == 1 {
+		return "1 day"
+	}
+	return fmt.Sprintf("%d days", d)
+}
+
+// RenderMarkdown renders the report for the job summary and the sticky PR
+// comment.
+func RenderMarkdown(rep Report) string {
+	var b strings.Builder
+	b.WriteString(Marker + "\n### deps-guard: Go dependency changes\n\n")
+	if rep.Failed() {
+		fmt.Fprintf(&b, "**Fails: %d finding(s).** A new or changed `replace`, or a module that "+
+			"sum.golang.org does not know, is a hard fail with no label. The only override is a "+
+			"code-owner approval of this PR (#2649, decision 4).\n\n", len(rep.Findings))
+		b.WriteString("| Rule | Module | Detail |\n|---|---|---|\n")
+		for _, f := range rep.Findings {
+			detail := f.Detail
+			if f.Evidence != "" {
+				detail += ": " + code(f.Evidence)
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s |\n", f.Kind, code(f.Module), detail)
+		}
+		b.WriteString("\n")
+	} else {
+		b.WriteString("**Passes:** no new or changed `replace`, and every new or changed module is on sum.golang.org with matching hashes.\n\n")
+	}
+	bold := func(young bool, s string) string {
+		if young {
+			return "**" + s + "**"
+		}
+		return s
+	}
+	var added, bumped []ModuleRow
+	for _, r := range rep.Modules {
+		if r.Change.Added() {
+			added = append(added, r)
+		} else {
+			bumped = append(bumped, r)
+		}
+	}
+	if len(added) == 0 && len(bumped) == 0 {
+		b.WriteString("No new or changed modules in go.mod.\n")
+		return b.String()
+	}
+	if len(added) > 0 {
+		b.WriteString("#### New modules\n\n| Module | Change | Version | Age | Source |\n|---|---|---|---|---|\n")
+		for _, r := range added {
+			y := r.Young()
+			change := "added"
+			if r.Change.Indirect {
+				change = "added (indirect)"
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n",
+				bold(y, code(r.Change.Path)), bold(y, change), bold(y, code(r.Change.NewVersion)),
+				bold(y, age(r)), bold(y, source(r)))
+		}
+		b.WriteString("\n")
+	}
+	if len(bumped) > 0 {
+		b.WriteString("#### Version changes\n\n| Module | Version | Age | Source |\n|---|---|---|---|\n")
+		for _, r := range bumped {
+			y := r.Young()
+			fmt.Fprintf(&b, "| %s | %s | %s | %s |\n",
+				bold(y, code(r.Change.Path)), bold(y, code(r.Change.OldVersion)+" → "+code(r.Change.NewVersion)),
+				bold(y, age(r)), bold(y, source(r)))
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("Age is from the module proxy's publication timestamp. Rows in **bold** were published less than 14 days ago, or their age is unknown.\n")
+	return b.String()
+}

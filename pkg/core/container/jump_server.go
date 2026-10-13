@@ -726,3 +726,367 @@ func retryUseraddWithLockWait(username string, verbose bool) error {
 			forceRemoveLockFiles(lockFiles, verbose)
 		} else {
 			fmt.Printf("       ✓ All lock files cleared\n")
+		}
+	} else if verbose {
+		fmt.Printf("       Skipping google-guest-agent / pwd-lock dance: host is not a GCP VM\n")
+	}
+
+	// Retry useradd with flock for serialization
+	var lastErr error
+	var lastOutput string // Captured stdout/stderr of the last useradd
+	// attempt — surfaced in the final error when
+	// all retries exhaust. Without this, callers
+	// see only "exit status 1", which is actively
+	// misleading when the real cause was e.g.
+	// /etc/passwd locked by another process.
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// Cloud #163 — exponential backoff with jitter so concurrent
+			// CI provisioning bursts don't dogpile. Cap at 60s per wait.
+			// Was previously linear (attempt*1s) → total 10s across 5
+			// retries, which the lab observed wasn't enough to outlast
+			// stale-lock cleanup by external tools (google_guest_agent).
+			baseDelay := time.Duration(1<<uint(attempt-1)) * time.Second
+			if baseDelay > 60*time.Second {
+				baseDelay = 60 * time.Second
+			}
+			// #nosec G404 -- jitter for retry backoff; not security-sensitive.
+			// math/rand is fine here — we want variance to break up
+			// thundering-herd patterns, not unguessable output.
+			jitter := time.Duration(float64(baseDelay) * 0.3 * (rand.Float64()*2 - 1))
+			delay := baseDelay + jitter
+			if delay < time.Second {
+				delay = time.Second
+			}
+			fmt.Printf("       Retry attempt %d/%d after %v...\n", attempt+1, maxRetries, delay)
+			time.Sleep(delay)
+
+			// Re-check + force-remove any lock files that appeared
+			// during the retry window. The pre-loop forceRemoveLockFiles
+			// only handles the initial state; a process that died
+			// mid-loop (or google-guest-agent restarting against our
+			// defer) can leave a fresh stale lock that the previous
+			// useradd attempt just hit. Cleaning here unsticks it
+			// before the next attempt rather than burning more retries.
+			forceRemoveLockFiles(lockFiles, verbose)
+		}
+
+		// Create user using flock for serialization
+		// flock -w 30 ensures we wait up to 30 seconds to acquire the lock
+		fmt.Printf("       Creating user %s (with flock)...\n", username)
+		shell := getUserShell()
+		// #nosec G204 -- `username` is validated by isValidUsername at the
+		// CreateJumpServerAccount entry point (alphanumeric, dash, underscore
+		// only). `shell` is a fixed-path constant from getUserShell(). No
+		// untrusted input reaches the subprocess invocation.
+		cmd := exec.Command("flock", "-w", "30", "/var/lock/containarium-useradd.lock",
+			"useradd", username,
+			"-s", shell, // nologin (ProxyJump) or containarium-shell (exec into container)
+			"-m",                    // Create home directory
+			"-K", "SUB_UID_COUNT=0", // Don't allocate subordinate UIDs
+			"-K", "SUB_GID_COUNT=0", // Don't allocate subordinate GIDs
+			"-c", fmt.Sprintf("Containarium user - %s", username))
+
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			fmt.Printf("       ✓ User %s created successfully\n", username)
+			return nil
+		}
+
+		lastErr = err
+		errMsg := string(output)
+		lastOutput = errMsg
+
+		// Permission-denied is a permanent error — fail-fast with a
+		// pointed message. useradd emits BOTH "Permission denied" and
+		// "cannot lock /etc/passwd; try again later" when run as a
+		// non-root user: the privileged read+lock fails first, then
+		// useradd's generic fallback prints the lock line. Without
+		// this guard the lock-error retry branch below catches both
+		// lines and we burn 5 retries on a condition that won't fix
+		// itself — observed in cloud CI (containarium-run issue #15)
+		// where the cloud-daemon process didn't have the capability
+		// to add a system user.
+		if strings.Contains(errMsg, "Permission denied") {
+			fmt.Printf("       useradd failed with Permission denied — daemon process lacks the privilege to add a system user.\n")
+			fmt.Printf("       Output: %s\n", errMsg)
+			return fmt.Errorf("failed to create user %s: %w\nuseradd requires root (or CAP_CHOWN+CAP_DAC_OVERRIDE on /etc/passwd). Check the daemon's deploy unit (systemd User= directive) or container privileges. Output: %s", username, err, errMsg)
+		}
+
+		// Check if it's a lock-related error (retry) or something else (fail immediately)
+		if !strings.Contains(errMsg, "cannot lock") && !strings.Contains(errMsg, "try again later") {
+			// Not a lock error - fail immediately
+			fmt.Printf("       useradd failed (non-lock error)!\n")
+			fmt.Printf("       Error: %v\n", err)
+			fmt.Printf("       Output: %s\n", errMsg)
+			return fmt.Errorf("failed to create user %s: %w\nOutput: %s", username, err, errMsg)
+		}
+
+		// Lock error - will retry
+		fmt.Printf("       useradd failed with lock error, will retry...\n")
+		fmt.Printf("       Output: %s\n", errMsg)
+
+		// Kill any google processes that might have restarted
+		killGoogleProcesses(verbose)
+	}
+
+	// All retries exhausted — surface the last attempt's useradd output
+	// so the operator sees what actually failed (e.g. "cannot lock
+	// /etc/passwd; try again later"), not just "exit status 1".
+	fmt.Printf("       useradd failed after %d attempts!\n", maxRetries)
+	if trimmed := strings.TrimSpace(lastOutput); trimmed != "" {
+		return fmt.Errorf("failed to create user %s after %d attempts: %w\nLast useradd output: %s", username, maxRetries, lastErr, trimmed)
+	}
+	return fmt.Errorf("failed to create user %s after %d attempts: %w", username, maxRetries, lastErr)
+}
+
+// killGoogleProcesses kills any google-related processes that might be holding /etc/passwd locks
+func killGoogleProcesses(verbose bool) {
+	// Find and kill google_guest_agent and related processes
+	processes := []string{"google_guest_ag", "google_osconfig", "google_oslogin"}
+
+	for _, procName := range processes {
+		cmd := exec.Command("pkill", "-9", "-f", procName)
+		if err := cmd.Run(); err == nil && verbose {
+			fmt.Printf("       Killed %s processes\n", procName)
+		}
+	}
+
+	// Also check for any process holding /etc/passwd.lock
+	lsofCmd := exec.Command("lsof", "/etc/passwd.lock")
+	if output, err := lsofCmd.CombinedOutput(); err == nil && len(output) > 0 {
+		// Parse PIDs from lsof output and kill them
+		lines := strings.Split(string(output), "\n")
+		for _, line := range lines[1:] { // Skip header
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				pid := fields[1]
+				if verbose {
+					fmt.Printf("       Killing process %s holding passwd.lock\n", pid)
+				}
+				if err := exec.Command("kill", "-9", pid).Run(); err != nil && verbose {
+					fmt.Printf("       Failed to kill process %s: %v\n", pid, err)
+				}
+			}
+		}
+	}
+
+	// Brief pause to let processes die
+	time.Sleep(500 * time.Millisecond)
+}
+
+// forceRemoveLockFiles forcibly removes lock files (used after stopping google-guest-agent)
+func forceRemoveLockFiles(lockFiles []string, verbose bool) {
+	for _, lockFile := range lockFiles {
+		if _, err := os.Stat(lockFile); err == nil {
+			fmt.Printf("       Removing lock file: %s\n", lockFile)
+			if err := os.Remove(lockFile); err != nil {
+				fmt.Printf("       Warning: Could not remove %s: %v\n", lockFile, err)
+			} else {
+				fmt.Printf("       ✓ Removed %s\n", lockFile)
+			}
+		}
+	}
+}
+
+// authorizedKeysHomeRoot is the host's home-directory root. Overridable
+// in tests so the authorized_keys helpers don't touch the real /home.
+// Production callers should never set this — they want /home.
+var authorizedKeysHomeRoot = "/home"
+
+// authorizedKeysUserExists wraps userExists so tests can opt out of the
+// "is this username a real host user?" check (test-side users don't
+// exist in the OS's passwd database). Production stays bound to
+// userExists — invalid usernames should be rejected.
+var authorizedKeysUserExists = userExists
+
+// AddAuthorizedKey appends a single SSH public key to the host-side
+// /home/<username>/.ssh/authorized_keys, creating the directory + file
+// with correct ownership and 0600 mode if missing. Idempotent —
+// returns nil without changes if the exact key is already present.
+//
+// Scope note: this writes the HOST-side keys file (consumed by the
+// sentinel's sshpiper keysync via /authorized-keys), not the
+// container-internal authorized_keys. For the demo / prod sshpiper
+// architecture, that's the right scope — sshpiper terminates the
+// client SSH session at the sentinel using these keys, then opens a
+// downstream connection to the backend host using its own upstream
+// key. Adding to the container-internal file would have no effect on
+// who can SSH in via sshpiper.
+func AddAuthorizedKey(username, pubKey string) error {
+	if !isValidUsername(username) {
+		return fmt.Errorf("invalid username: %s", username)
+	}
+	pubKey = strings.TrimSpace(pubKey)
+	if pubKey == "" {
+		return fmt.Errorf("empty public key")
+	}
+	if err := ValidateSSHPublicKey(pubKey); err != nil {
+		return fmt.Errorf("invalid public key: %w", err)
+	}
+	if !authorizedKeysUserExists(username) {
+		return fmt.Errorf("host user %q does not exist (was the container created?)", username)
+	}
+
+	defer LockAuthorizedKeys(username)()
+
+	sshDir := filepath.Join(authorizedKeysHomeRoot, username, ".ssh")
+	akPath := filepath.Join(sshDir, "authorized_keys")
+
+	// Ensure .ssh exists with 0700.
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		return fmt.Errorf("mkdir %s: %w", sshDir, err)
+	}
+
+	// Read existing content (file may not exist yet).
+	var existing []byte
+	if b, err := os.ReadFile(akPath); err == nil {
+		existing = b
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", akPath, err)
+	}
+
+	// Idempotency: skip if exact key is already a line.
+	for _, line := range strings.Split(string(existing), "\n") {
+		if strings.TrimSpace(line) == pubKey {
+			return nil
+		}
+	}
+
+	// Append + ensure trailing newline.
+	var buf strings.Builder
+	buf.Write(existing)
+	if len(existing) > 0 && !strings.HasSuffix(string(existing), "\n") {
+		buf.WriteString("\n")
+	}
+	buf.WriteString(pubKey)
+	buf.WriteString("\n")
+
+	// Atomic write: temp file in same dir + rename.
+	tmp, err := os.CreateTemp(sshDir, ".authorized_keys.tmp.*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod tmp: %w", err)
+	}
+	if _, err := tmp.WriteString(buf.String()); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write tmp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	if err := os.Rename(tmpPath, akPath); err != nil {
+		return fmt.Errorf("rename tmp -> %s: %w", akPath, err)
+	}
+
+	// Best-effort chown so sshd reads the file as the user (it normally
+	// does, but if we created the file as root, the ownership matters
+	// for some configurations). Errors are non-fatal — sshd reads as
+	// root and the mode is 0600, so the worst case is a slightly
+	// surprising owner the operator may want to fix manually.
+	_ = exec.Command("chown", "-R", username+":"+username, sshDir).Run()
+
+	return nil
+}
+
+// RemoveAuthorizedKey strips a single SSH public key from the host-side
+// /home/<username>/.ssh/authorized_keys. No-op (returns nil) if the
+// key isn't there. Pairs with AddAuthorizedKey for the
+// container-server's add/remove RPCs.
+func RemoveAuthorizedKey(username, pubKey string) error {
+	if !isValidUsername(username) {
+		return fmt.Errorf("invalid username: %s", username)
+	}
+	pubKey = strings.TrimSpace(pubKey)
+	if pubKey == "" {
+		return fmt.Errorf("empty public key")
+	}
+	if !authorizedKeysUserExists(username) {
+		return fmt.Errorf("host user %q does not exist", username)
+	}
+
+	defer LockAuthorizedKeys(username)()
+
+	akPath := filepath.Join(authorizedKeysHomeRoot, username, ".ssh", "authorized_keys")
+	existing, err := os.ReadFile(akPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", akPath, err)
+	}
+
+	var out strings.Builder
+	changed := false
+	for _, line := range strings.Split(string(existing), "\n") {
+		if strings.TrimSpace(line) == pubKey {
+			changed = true
+			continue
+		}
+		out.WriteString(line)
+		out.WriteString("\n")
+	}
+	if !changed {
+		return nil
+	}
+
+	// Trim the extra trailing newline our reconstruction adds when the
+	// input had no terminating newline. Easier than tracking it.
+	result := strings.TrimRight(out.String(), "\n") + "\n"
+	if strings.TrimSpace(result) == "" {
+		result = ""
+	}
+
+	sshDir := filepath.Dir(akPath)
+	tmp, err := os.CreateTemp(sshDir, ".authorized_keys.tmp.*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod tmp: %w", err)
+	}
+	if _, err := tmp.WriteString(result); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write tmp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close tmp: %w", err)
+	}
+	if err := os.Rename(tmpPath, akPath); err != nil {
+		return fmt.Errorf("rename tmp -> %s: %w", akPath, err)
+	}
+	return nil
+}
+
+// CountAuthorizedKeys returns how many non-empty lines are in the
+// host-side authorized_keys file for the user. Used by AddSSHKeyResponse
+// so the caller can show "you now have N keys" feedback.
+func CountAuthorizedKeys(username string) (int32, error) {
+	if !isValidUsername(username) {
+		return 0, fmt.Errorf("invalid username: %s", username)
+	}
+	akPath := filepath.Join(authorizedKeysHomeRoot, username, ".ssh", "authorized_keys")
+	b, err := os.ReadFile(akPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read %s: %w", akPath, err)
+	}
+	n := int32(0)
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.TrimSpace(line) != "" {
+			n++
+		}
+	}
+	return n, nil
+}
