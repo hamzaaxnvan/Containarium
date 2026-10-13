@@ -295,3 +295,597 @@ func (m *Manager) now() time.Time {
 // act on (#2402). "" is plaintext — only reachable with no wrapper and no
 // recipient. Every refusal here happens before pg_dump runs, so a
 // mis-specified request leaves nothing behind.
+func (m *Manager) resolveKeyMode(requested KeyMode, recipient string) (KeyMode, error) {
+	hasRecipient := strings.TrimSpace(recipient) != ""
+	switch requested {
+	case "":
+		switch {
+		case m.wrapper != nil && hasRecipient:
+			return KeyModeBoth, nil
+		case m.wrapper != nil:
+			return KeyModeManaged, nil
+		case hasRecipient:
+			return KeyModeAgeRecipient, nil
+		default:
+			return "", nil
+		}
+	case KeyModeAgeRecipient:
+		if !hasRecipient {
+			return "", fmt.Errorf("key mode %s requires an age recipient", requested)
+		}
+		return requested, nil
+	case KeyModeManaged:
+		if m.wrapper == nil {
+			return "", fmt.Errorf("key mode %s requested but this daemon has no key wrapper configured (CONTAINARIUM_BACKUP_KMS_KEY_NAME)", requested)
+		}
+		return requested, nil
+	case KeyModeBoth:
+		if m.wrapper == nil {
+			return "", fmt.Errorf("key mode %s requested but this daemon has no key wrapper configured (CONTAINARIUM_BACKUP_KMS_KEY_NAME)", requested)
+		}
+		if !hasRecipient {
+			return "", fmt.Errorf("key mode %s requires an age recipient alongside the managed key", requested)
+		}
+		return requested, nil
+	default:
+		return "", fmt.Errorf("unknown key mode %q", requested)
+	}
+}
+
+// Create dumps the container's database and stores it at the chosen
+// destination, returning the committed record.
+func (m *Manager) Create(opts CreateOptions) (*Record, error) {
+	if opts.ContainerName == "" {
+		return nil, fmt.Errorf("container name is required")
+	}
+	// Hook mode (#1831): the tenant's own program produces the dump, so no
+	// database name or credential is required — or used.
+	hookMode := strings.TrimSpace(opts.Hook) != ""
+	conn := opts.Conn.withDefaults()
+	var dbLabel string
+	if hookMode {
+		if err := validateHook(opts.Hook); err != nil {
+			return nil, err
+		}
+		dbLabel = strings.TrimSpace(opts.Label)
+		if dbLabel == "" {
+			dbLabel = hookLabel(opts.Hook)
+		}
+	} else {
+		if conn.Database == "" {
+			return nil, fmt.Errorf("database is required")
+		}
+		dbLabel = conn.Database
+	}
+	if err := validateHookFormat(opts.HookFormat, hookMode); err != nil {
+		return nil, err
+	}
+	hookFormat := opts.HookFormat
+	if hookMode && hookFormat == "" {
+		hookFormat = HookFormatOpaque
+	}
+	if opts.AgeRecipient != "" {
+		if _, err := parseRecipient(opts.AgeRecipient); err != nil {
+			return nil, err
+		}
+	}
+	mode, err := m.resolveKeyMode(opts.KeyMode, opts.AgeRecipient)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.checkDestination(opts.Destination, opts.GCSBucket); err != nil {
+		return nil, err
+	}
+
+	id := fmt.Sprintf("%s-%s-%s", opts.Username, dbLabel, m.now().UTC().Format("20060102T150405Z"))
+	// The id becomes a path component (sidecar, temp files). A
+	// username or database carrying a separator would let it
+	// escape m.dir — reject rather than silently mangle.
+	if err := validateBackupID(id); err != nil {
+		return nil, fmt.Errorf("cannot derive a safe backup id: %w", err)
+	}
+	inContainerPath := "/tmp/containarium-backup-" + id + ".dump"
+
+	// 1. Produce the dump inside the container, writing to the same staging
+	//    path either way so step 2 (pull + clean up) is shared.
+	if hookMode {
+		// The hook's stdout is the dump. `set -euo pipefail` (from wrapPg)
+		// means a failing hook fails the backup instead of staging an empty
+		// or truncated file. The path is single-quoted; it is a program to
+		// run, never a shell fragment.
+		hookScript := shellQuote(strings.TrimSpace(opts.Hook)) + " > " + shellQuote(inContainerPath)
+		if _, stderr, err := m.ops.ExecWithOutput(opts.ContainerName, wrapPg("", hookScript)); err != nil {
+			return nil, fmt.Errorf("backup hook %s failed: %w: %s", opts.Hook, err, strings.TrimSpace(stderr))
+		}
+	} else {
+		// pg_dump (custom format = compressed + selective restore). Password
+		// travels via PGPASSWORD, not argv.
+		dumpScript := fmt.Sprintf(
+			"pg_dump -h %s -p %d -U %s -d %s -Fc -f %s",
+			shellQuote(conn.Host), conn.Port, shellQuote(conn.User),
+			shellQuote(conn.Database), shellQuote(inContainerPath),
+		)
+		if _, stderr, err := m.ops.ExecWithOutput(opts.ContainerName, wrapPg(conn.Password, dumpScript)); err != nil {
+			return nil, fmt.Errorf("pg_dump failed: %w: %s", err, strings.TrimSpace(stderr))
+		}
+	}
+
+	// 2. Pull the archive to the host, then clean up the in-container copy
+	//    (after the manifest step below, which for a pg_custom hook reads it).
+	defer func() { _ = m.ops.Exec(opts.ContainerName, []string{"rm", "-f", inContainerPath}) }()
+	data, err := m.ops.ReadFileStream(opts.ContainerName, inContainerPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read dump from container: %w", err)
+	}
+	defer func() { _ = data.Close() }()
+
+	// Record the source's user-relation count as a manifest for later
+	// restore tests to compare against. Best-effort: a source that
+	// cannot be queried still produced a valid dump, so a failure here
+	// leaves the manifest unset rather than failing the backup.
+	var relationCount *int64
+	engine := EnginePostgres
+	if hookMode {
+		engine = EngineHook
+		// An opaque hook stream has no Postgres catalog to read a manifest
+		// from. A declared pg_custom archive carries its own table of
+		// contents (#2405): read it from the staged copy, still in the
+		// container. pg_restore may be absent there — then, as for a
+		// source that cannot be queried, the manifest is simply unset.
+		if hookFormat == HookFormatPGCustom {
+			if n, err := m.countArchiveTables(opts.ContainerName, inContainerPath); err != nil {
+				log.Printf("[backup] could not record relation manifest for %s hook %s: %v (verification will have nothing to compare against)",
+					opts.Username, opts.Hook, err)
+			} else {
+				relationCount = &n
+			}
+		}
+	} else if n, err := m.countUserRelations(opts.ContainerName, conn, conn.Database); err != nil {
+		log.Printf("[backup] could not record relation manifest for %s/%s: %v (verification will have nothing to compare against)",
+			opts.Username, conn.Database, err)
+	} else {
+		relationCount = &n
+	}
+
+	// Wrap the managed identity before staging any bytes. Encryption and
+	// hashing below stream directly to the staging file.
+	plan, err := m.planEncryption(mode, opts.AgeRecipient)
+	if err != nil {
+		return nil, err
+	}
+	ext := ".dump"
+	if plan.encrypted() {
+		ext = ".dump.age"
+	}
+	localDump, size, checksum, err := m.stageDump(data, id, ext, plan.recipients, m.maxDumpBytes)
+	if err != nil {
+		return nil, err
+	}
+	record := &Record{
+		ID:            id,
+		Username:      opts.Username,
+		Database:      dbLabel,
+		CreatedAt:     m.now().UTC(),
+		SizeBytes:     size,
+		SHA256:        checksum,
+		Destination:   opts.Destination,
+		Engine:        engine,
+		RelationCount: relationCount,
+	}
+	plan.apply(record)
+	if hookMode {
+		record.Hook = strings.TrimSpace(opts.Hook)
+		record.HookFormat = hookFormat
+	}
+	if err := m.commit(record, localDump, opts.GCSBucket, ext); err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
+// checkDestination refuses a destination this daemon cannot write to,
+// before anything is produced.
+func (m *Manager) checkDestination(dest Destination, gcsBucket string) error {
+	switch dest {
+	case DestLocal:
+		return nil
+	case DestGCS:
+		if m.uploader == nil {
+			return fmt.Errorf("gcs destination requested but no object-store uploader is configured on this daemon")
+		}
+		if !strings.HasPrefix(gcsBucket, "gs://") {
+			return fmt.Errorf("gcs_bucket must be a gs:// URI, got %q", gcsBucket)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown or unspecified destination %q", dest)
+	}
+}
+
+// encryptionPlan is what a resolved key mode turns into: the age recipients
+// the stored file is encrypted to, and the key fields the record carries.
+type encryptionPlan struct {
+	mode              KeyMode
+	recipients        []string
+	recordedRecipient string
+	wrappedKey        []byte
+	kekID             string
+}
+
+func (p encryptionPlan) encrypted() bool { return len(p.recipients) > 0 }
+
+// planEncryption wraps a fresh managed identity when the mode needs one
+// (#2402). It runs before any bytes are staged.
+func (m *Manager) planEncryption(mode KeyMode, ageRecipient string) (encryptionPlan, error) {
+	plan := encryptionPlan{mode: mode, recordedRecipient: strings.TrimSpace(ageRecipient)}
+	if mode == KeyModeManaged || mode == KeyModeBoth {
+		managedRecipient, wrapped, kek, err := wrapNewIdentity(context.Background(), m.wrapper)
+		if err != nil {
+			return encryptionPlan{}, err
+		}
+		plan.wrappedKey, plan.kekID = wrapped, kek
+		plan.recipients = append(plan.recipients, managedRecipient)
+		if mode == KeyModeManaged {
+			// No legacy recipient on the file; the record names the
+			// ephemeral one so an operator can check an unwrapped
+			// identity against it.
+			plan.recordedRecipient = managedRecipient
+		}
+	}
+	if mode == KeyModeBoth || mode == KeyModeAgeRecipient {
+		plan.recipients = append(plan.recipients, ageRecipient)
+	}
+	return plan, nil
+}
+
+// apply sets the record's encryption fields from the plan.
+func (p encryptionPlan) apply(r *Record) {
+	r.Encrypted = p.encrypted()
+	if r.Encrypted {
+		r.AgeRecipient = p.recordedRecipient
+	}
+	if p.mode == KeyModeManaged || p.mode == KeyModeBoth {
+		r.WrappedKey = p.wrappedKey
+		r.KEKID = p.kekID
+		r.KeyMode = p.mode
+	}
+}
+
+// commit moves a staged file to its destination and writes the record.
+//
+// For off-host destinations it ships the staged file and drops the local
+// copy. The sidecar index stays local for every destination; for GCS a copy
+// also goes next to the dump (#2402), so the bucket alone (dump plus
+// wrapped key) is enough to restore after a host loss. Dump first, then
+// sidecar: a sidecar in the bucket always describes an object that is
+// already there.
+func (m *Manager) commit(record *Record, localDump, gcsBucket, ext string) error {
+	id := record.ID
+	switch record.Destination {
+	case DestLocal:
+		record.Location = localDump
+	case DestGCS:
+		destURI := strings.TrimRight(gcsBucket, "/") + "/" + id + ext
+		if err := m.uploader.Upload(localDump, destURI); err != nil {
+			_ = os.Remove(localDump)
+			return fmt.Errorf("failed to upload dump to %s: %w", destURI, err)
+		}
+		_ = os.Remove(localDump)
+		record.Location = destURI
+	}
+
+	if err := m.writeSidecar(record); err != nil {
+		return err
+	}
+	if record.Destination == DestGCS {
+		sidecarURI := sidecarObjectURI(record.Location, id)
+		if err := m.uploader.Upload(m.sidecarPath(id), sidecarURI); err != nil {
+			// A dump object without its sidecar is not something the
+			// bucket can restore from, so leave nothing half-done: the
+			// caller retries and gets a complete backup or a clean error.
+			_ = m.uploader.Delete(record.Location)
+			_ = os.Remove(m.sidecarPath(id))
+			return fmt.Errorf("failed to upload backup metadata to %s: %w", sidecarURI, err)
+		}
+	}
+	return nil
+}
+
+// sidecarObjectURI is where a GCS record's sidecar lives in the bucket:
+// next to the dump, as "<id>.meta.json". Derived from the dump's own URI
+// rather than from a bucket setting so Delete can find it for any record,
+// including one created under a different bucket prefix than the daemon
+// is configured with today. (path.Dir would collapse the "gs://" scheme.)
+func sidecarObjectURI(dumpLocation, id string) string {
+	prefix := dumpLocation
+	if i := strings.LastIndex(dumpLocation, "/"); i >= 0 {
+		prefix = dumpLocation[:i]
+	}
+	return prefix + "/" + id + ".meta.json"
+}
+
+// ListDatabases enumerates the non-template databases visible inside the
+// container's Postgres — the same connection info used for pg_dump/
+// pg_restore, just pointed at the always-present "postgres" maintenance
+// database to run a catalog query instead of a dump. Used by CreateAll so
+// a backup never requires the caller to already know a database name (#954).
+func (m *Manager) ListDatabases(containerName string, conn PgConn) ([]string, error) {
+	conn = conn.withDefaults()
+	if containerName == "" {
+		return nil, fmt.Errorf("container name is required")
+	}
+	const query = "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname;"
+	script := fmt.Sprintf(
+		"psql -h %s -p %d -U %s -d postgres -Atc %s",
+		shellQuote(conn.Host), conn.Port, shellQuote(conn.User), shellQuote(query),
+	)
+	stdout, stderr, err := m.ops.ExecWithOutput(containerName, wrapPg(conn.Password, script))
+	if err != nil {
+		return nil, fmt.Errorf("list databases: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	var dbs []string
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			dbs = append(dbs, line)
+		}
+	}
+	return dbs, nil
+}
+
+// CreateAll backs up every non-template database in the container — the
+// default, no-guessing path (#954): the caller doesn't need to already
+// know a database name, and a scheduled backup can't fail because of a
+// typo'd one, since no name is ever supplied. opts.Conn.Database is
+// ignored (overwritten per database); every other CreateOptions field
+// (container, destination, credentials) applies to each dump the same way
+// a single Create call would.
+//
+// Reuses Create as-is per database rather than duplicating its dump/stage/
+// upload logic, so the two paths can never drift. One failing database
+// doesn't abort the others — errs collects a per-database failure
+// alongside the record for every database that DID succeed, so a caller
+// can surface "7 of 8 databases backed up, orders_db failed: <reason>"
+// instead of an all-or-nothing result.
+func (m *Manager) CreateAll(opts CreateOptions) ([]*Record, []error) {
+	dbs, err := m.ListDatabases(opts.ContainerName, opts.Conn)
+	if err != nil {
+		return nil, []error{fmt.Errorf("list databases: %w", err)}
+	}
+	if len(dbs) == 0 {
+		return nil, []error{fmt.Errorf("no databases found to back up")}
+	}
+
+	var records []*Record
+	var errs []error
+	for _, db := range dbs {
+		o := opts
+		o.Conn.Database = db
+		r, err := m.Create(o)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("database %q: %w", db, err))
+			continue
+		}
+		records = append(records, r)
+	}
+	return records, errs
+}
+
+// List returns stored records, newest first, optionally filtered by
+// tenant.
+func (m *Manager) List(username string) ([]*Record, error) {
+	entries, err := os.ReadDir(m.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read backup directory: %w", err)
+	}
+	var out []*Record
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".meta.json") {
+			continue
+		}
+		r, err := m.readSidecar(filepath.Join(m.dir, e.Name()))
+		if err != nil {
+			continue // a corrupt sidecar shouldn't hide the rest
+		}
+		if username != "" && r.Username != username {
+			continue
+		}
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// Get returns a single record by ID.
+func (m *Manager) Get(id string) (*Record, error) {
+	if err := validateBackupID(id); err != nil {
+		return nil, err
+	}
+	return m.readSidecar(m.sidecarPath(id))
+}
+
+// validateBackupID rejects ids that could escape the backup
+// directory once joined into a path. Ids are generated as
+// "<username>-<database>-<timestamp>" (see Create), but on the
+// Get / Delete / Restore paths the id arrives from the API
+// caller, so we re-check it before it ever reaches
+// filepath.Join. The filepath.Base equality check catches any
+// separator or "." / ".." component on every platform.
+func validateBackupID(id string) error {
+	if id == "" {
+		return fmt.Errorf("id is required")
+	}
+	if strings.ContainsAny(id, `/\`) || strings.Contains(id, "..") || id != filepath.Base(id) {
+		return fmt.Errorf("invalid backup id %q", id)
+	}
+	return nil
+}
+
+// Delete removes a stored dump and its index entry. For a GCS record the
+// bucket holds two objects (#2402): the dump is deleted first, then its
+// sidecar, so a sidecar never outlives its dump by design — only by a
+// failure, which is returned (and so reported by Prune), never swallowed.
+// A sidecar object that is simply not there (a record written before
+// sidecars were uploaded) is not a failure: there was nothing to delete.
+func (m *Manager) Delete(id string) error {
+	r, err := m.Get(id)
+	if err != nil {
+		return err
+	}
+	var sidecarErr error
+	switch r.Destination {
+	case DestGCS:
+		if m.uploader == nil {
+			return fmt.Errorf("cannot delete GCS object: no object-store uploader configured")
+		}
+		if err := m.uploader.Delete(r.Location); err != nil {
+			return fmt.Errorf("failed to delete %s: %w", r.Location, err)
+		}
+		sidecarURI := sidecarObjectURI(r.Location, r.ID)
+		if err := m.uploader.Delete(sidecarURI); err != nil && !errors.Is(err, ErrObjectNotFound) {
+			// The dump is gone, so the index entry goes too (below) —
+			// a record that lists a deleted dump is worse than an orphan
+			// sidecar object — but the caller hears about it.
+			sidecarErr = fmt.Errorf("dump deleted but failed to delete its sidecar %s: %w", sidecarURI, err)
+		}
+	default:
+		if err := os.Remove(r.Location); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to delete dump %s: %w", r.Location, err)
+		}
+	}
+	if err := os.Remove(m.sidecarPath(id)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to delete index entry: %w", err)
+	}
+	return sidecarErr
+}
+
+// Restore streams a stored dump back into a container's database:
+// opts.TargetContainer when set, otherwise opts.ContainerName (in place).
+func (m *Manager) Restore(opts RestoreOptions) error {
+	if opts.ContainerName == "" {
+		return fmt.Errorf("container name is required")
+	}
+	r, err := m.Get(opts.ID)
+	if err != nil {
+		return err
+	}
+
+	target := opts.ContainerName
+	if t := strings.TrimSpace(opts.TargetContainer); t != "" {
+		target = t
+	}
+
+	if r.Engine == EngineBox {
+		return errBoxRecordNotDatabase(r.ID, "restored")
+	}
+	if r.Engine == EngineHook {
+		// An opaque hook backup is a stream the platform never understood;
+		// it cannot be pg_restore'd. Refuse before touching the target (#1831).
+		if r.HookFormat != HookFormatPGCustom {
+			return fmt.Errorf("backup %s was produced by tenant hook %s and is an opaque stream: fetch it and apply it with the tenant's own tooling (automatic restore is only supported for %s dumps)",
+				r.ID, r.Hook, EnginePostgres)
+		}
+		// A declared pg_custom hook dump loads like any pg_dump archive, but
+		// only into a target the caller named explicitly (#2405). In place
+		// stays refused: the hook exists because the daemon cannot reach the
+		// source's Postgres, and a restore hook is a separate feature.
+		if target == opts.ContainerName {
+			return fmt.Errorf("backup %s was produced by tenant hook %s as a pg_custom dump: in-place restore into the source container is not supported; restore it into an explicitly named target container other than %s",
+				r.ID, r.Hook, opts.ContainerName)
+		}
+	}
+
+	// Fetch the dump bytes to the host and integrity-check them before
+	// we overwrite a live database. For an encrypted record the checksum
+	// covers the ciphertext, so integrity is verified BEFORE decryption.
+	data, err := m.fetchDump(r)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = data.Close() }()
+	if r.Encrypted && strings.TrimSpace(opts.AgeIdentity) == "" {
+		return fmt.Errorf("backup %s is encrypted to %s: supply the matching age identity to restore (the platform holds no decryption key)", r.ID, r.AgeRecipient)
+	}
+
+	conn := opts.Conn.withDefaults()
+	if conn.Database == "" {
+		conn.Database = r.Database
+	}
+
+	inContainerPath := "/tmp/containarium-restore-" + r.ID + ".dump"
+	if _, err := m.writeDump(target, inContainerPath, data, r.Encrypted, opts.AgeIdentity); err != nil {
+		return fmt.Errorf("failed to push dump into container: %w", err)
+	}
+
+	defer func() { _ = m.ops.Exec(target, []string{"rm", "-f", inContainerPath}) }()
+
+	cleanFlag := ""
+	if opts.Clean {
+		cleanFlag = "--clean --if-exists "
+	}
+	restoreScript := fmt.Sprintf(
+		"pg_restore -h %s -p %d -U %s -d %s %s%s",
+		shellQuote(conn.Host), conn.Port, shellQuote(conn.User),
+		shellQuote(conn.Database), cleanFlag, shellQuote(inContainerPath),
+	)
+	if _, stderr, err := m.ops.ExecWithOutput(target, wrapPg(conn.Password, restoreScript)); err != nil {
+		return fmt.Errorf("pg_restore failed: %w: %s", err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+func (m *Manager) sidecarPath(id string) string { return filepath.Join(m.dir, id+".meta.json") }
+
+func (m *Manager) writeSidecar(r *Record) error {
+	b, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to encode backup metadata: %w", err)
+	}
+	if err := os.WriteFile(m.sidecarPath(r.ID), b, 0o600); err != nil {
+		return fmt.Errorf("failed to write backup metadata: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) readSidecar(path string) (*Record, error) {
+	b, err := os.ReadFile(path) // #nosec G304 -- path is m.sidecarPath(id); id validated in Get/Create via validateBackupID
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("backup not found")
+		}
+		return nil, fmt.Errorf("failed to read backup metadata: %w", err)
+	}
+	var r Record
+	if err := json.Unmarshal(b, &r); err != nil {
+		return nil, fmt.Errorf("corrupt backup metadata at %s: %w", path, err)
+	}
+	// A hook record written before #2405 declared nothing about its
+	// output: it is opaque, exactly as it was treated when it was taken.
+	if r.Engine == EngineHook && r.HookFormat == "" {
+		r.HookFormat = HookFormatOpaque
+	}
+	return &r, nil
+}
+
+// wrapPg builds the bash invocation that exports PGPASSWORD (when set)
+// and runs the given pg command under strict mode. Returns the argv for
+// ExecWithOutput.
+func wrapPg(password, pgCmd string) []string {
+	var b strings.Builder
+	b.WriteString("set -euo pipefail; ")
+	if password != "" {
+		fmt.Fprintf(&b, "export PGPASSWORD=%s; ", shellQuote(password))
+	}
+	b.WriteString(pgCmd)
+	return []string{"bash", "-c", b.String()}
+}
+
+// shellQuote single-quotes s for safe interpolation into a bash command,
+// escaping embedded single quotes the POSIX way ('\” closes, escapes,
+// reopens).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
