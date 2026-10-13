@@ -44,3 +44,49 @@ type ConntrackEvent struct {
 
 	// Protocol is the connection protocol (tcp, udp, icmp)
 	Protocol string
+
+	// SrcIP is the source IP address
+	SrcIP string
+
+	// SrcPort is the source port (0 for ICMP)
+	SrcPort uint16
+
+	// DstIP is the destination IP address
+	DstIP string
+
+	// DstPort is the destination port (0 for ICMP)
+	DstPort uint16
+
+	// State is the TCP connection state (empty for UDP/ICMP)
+	State string
+
+	// BytesOrig is bytes from source to destination (original direction)
+	BytesOrig int64
+
+	// BytesReply is bytes from destination to source (reply direction)
+	BytesReply int64
+
+	// PacketsOrig is packets from source to destination
+	PacketsOrig int64
+
+	// PacketsReply is packets from destination to source
+	PacketsReply int64
+
+	// Timeout is seconds until the connection expires
+	Timeout int32
+
+	// Timestamp is when the event was received
+	Timestamp time.Time
+}
+
+// ConntrackMonitor defines the interface for connection tracking
+type ConntrackMonitor interface {
+	// Events returns a channel of conntrack events
+	Events() <-chan *ConntrackEvent
+
+	// Snapshot returns all current connections
+	Snapshot() ([]*ConntrackEvent, error)
+
+	// Close stops monitoring and releases resources
+	Close() error
+}

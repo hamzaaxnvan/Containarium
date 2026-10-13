@@ -113,3 +113,81 @@ func TestMinerSignatureE2E_FindingKillAndAudit(t *testing.T) {
 	defer watcher.Stop()
 	watcher.Reconcile([]incus.ContainerInfo{{Name: name, State: "Running", Pid: initPID, Tenant: "e2e"}})
 
+	sigFindings := func() []*threatdetect.Finding {
+		return findings.byRule(pb.ThreatRuleId_THREAT_RULE_ID_MINER_SIGNATURE)
+	}
+	// killedPIDFor returns the pid of the audited kill of filename, 0 if none.
+	killedPIDFor := func(filename string) uint32 {
+		for _, d := range auditDetails(auditLog, "kill") {
+			if !strings.Contains(d, "filename="+strconv.Quote(filename)) {
+				continue
+			}
+			for _, f := range strings.Fields(d) {
+				if v, ok := strings.CutPrefix(f, "pid="); ok {
+					if n, err := strconv.ParseUint(v, 10, 32); err == nil {
+						return uint32(n)
+					}
+				}
+			}
+		}
+		return 0
+	}
+	waitFor := func(what string, d time.Duration, cond func() bool) time.Duration {
+		t.Helper()
+		start := time.Now()
+		for !cond() {
+			if time.Since(start) > d {
+				t.Fatalf("%s: not within %s", what, d)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		return time.Since(start)
+	}
+
+	// 1. `gcc` with the same CPU profile: no signature finding.
+	run("/tmp/launch-b")
+	time.Sleep(3 * time.Second)
+	if got := sigFindings(); len(got) != 0 {
+		t.Fatalf("gcc stub raised %+v, want no signature finding", got[0])
+	}
+
+	// 2. `xmrig --donate-level 1`: finding within 10 s with the exec in
+	// evidence, killed and audited by pid.
+	run("/tmp/launch-a")
+	took := waitFor("MINER_SIGNATURE finding for xmrig", 10*time.Second, func() bool { return len(sigFindings()) > 0 })
+	f := sigFindings()[0]
+	t.Logf("finding after %s: subject=%s", took.Round(time.Millisecond), f.Subject)
+	if f.Severity != pb.ThreatSeverity_THREAT_SEVERITY_HIGH || f.Container != name || len(f.Evidence.Execs) == 0 {
+		t.Fatalf("finding = %+v", f)
+	}
+	if ex := f.Evidence.Execs[0]; ex.Filename != "/tmp/xmrig" || !strings.Contains(ex.Argv, "--donate-level 1") || ex.PID == 0 {
+		t.Fatalf("exec evidence = %+v, want the xmrig stub itself", ex)
+	}
+	waitFor("audited kill of /tmp/xmrig", 10*time.Second, func() bool { return killedPIDFor("/tmp/xmrig") != 0 })
+	pid := killedPIDFor("/tmp/xmrig")
+	if pid != f.Evidence.Execs[0].PID {
+		t.Fatalf("killed pid %d, but the matched exec was pid %d", pid, f.Evidence.Execs[0].PID)
+	}
+	waitFor("killed pid gone from /proc", 5*time.Second, func() bool {
+		_, err := os.Stat(filepath.Join("/proc", strconv.FormatUint(uint64(pid), 10)))
+		return os.IsNotExist(err)
+	})
+	if _, _, code, err := client.ExecWithExitCode(name, []string{"pgrep", "-f", "/tmp/xmrig"}); err == nil && code == 0 {
+		t.Fatal("an xmrig process is still running in the box")
+	}
+	waitFor("finding marked process_killed", 5*time.Second, func() bool {
+		g := sigFindings()[0]
+		return g.Response != nil && g.Response.ProcessKilled
+	})
+
+	// 3. A renamed binary with stratum+tcp:// in argv is still caught.
+	run("/tmp/launch-c")
+	waitFor("argv:stratum+tcp:// finding for the renamed binary", 10*time.Second, func() bool {
+		for _, g := range sigFindings() {
+			if g.Subject == "argv:stratum+tcp://" {
+				return true
+			}
+		}
+		return false
+	})
+}
