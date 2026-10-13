@@ -31,3 +31,37 @@ func TestPolicyHealthEndpoint_ServedThroughGatewayWithoutToken(t *testing.T) {
 	}
 	lis := auth.NewInternalListener()
 	go func() { _ = srv.Serve(lis) }()
+	defer srv.Stop()
+
+	conn, err := grpc.NewClient("passthrough:///containarium-internal",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(lis.DialContext))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	httpMux := http.NewServeMux()
+	// Everything else on the mux requires auth; the health path must not.
+	httpMux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	MountPolicyHealth(httpMux, NewRESTMux(), healthpb.NewHealthClient(conn))
+	web := httptest.NewServer(httpMux)
+	defer web.Close()
+
+	check := policyreadiness.HTTPCheck(web.Client(), web.URL)
+	for _, r := range policyreadiness.Run(context.Background(), check) {
+		if r.Err != nil || r.Status != healthpb.HealthCheckResponse_NOT_SERVING {
+			t.Fatalf("%s before recovery = %v, %v; want NOT_SERVING", r.Service, r.Status, r.Err)
+		}
+	}
+	for _, svc := range policyreadiness.Services() {
+		h.SetServingStatus(svc, healthpb.HealthCheckResponse_SERVING)
+	}
+	for _, r := range policyreadiness.Run(context.Background(), check) {
+		if !r.Ready() {
+			t.Fatalf("%s after recovery = %v, %v; want SERVING", r.Service, r.Status, r.Err)
+		}
+	}
+}

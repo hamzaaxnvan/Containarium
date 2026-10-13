@@ -149,3 +149,41 @@ describe("POST /tasks authentication (#2125)", () => {
     // Fail closed: a box the daemon never seeded a secret to serves nothing,
     // rather than accepting everything.
     { name: "any credential when the box was seeded no secret", headers: { authorization: `Bearer ${BOX_SECRET}` }, want: 401, seeded: "" },
+  ];
+
+  for (const c of refusals) {
+    it(`refuses ${c.name} with ${c.want}, before the engine or the journal`, async () => {
+      const h = await startHarness(c.seeded ?? BOX_SECRET);
+      const res = await postTask(h.url, c.headers);
+      expect(res.status).toBe(c.want);
+      const art = (await res.json()) as { state: string; error: string };
+      expect(art.state).toBe("AGENT_TASK_STATE_FAILED");
+      expect(art.error).not.toBe("");
+      // The refusal is the whole point: no engine invocation, and NO journal
+      // line under the run_id the caller named (#2125's acceptance criterion).
+      expect(h.engineCalls()).toBe(0);
+      expect(readdirSync(h.journalRoot)).toEqual([]);
+    });
+  }
+
+  it("never echoes the expected secret in a refusal", async () => {
+    const h = await startHarness(BOX_SECRET);
+    const res = await postTask(h.url, { authorization: "Bearer nope" });
+    expect(await res.text()).not.toContain(BOX_SECRET);
+  });
+
+  it("serves the agent card unauthenticated (discovery, no engine, no journal)", async () => {
+    const h = await startHarness(BOX_SECRET);
+    const res = await fetch(`${h.url}/agent-card`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ name: "hello-agent" });
+    expect(h.engineCalls()).toBe(0);
+    expect(readdirSync(h.journalRoot)).toEqual([]);
+  });
+
+  it("still 404s an unknown path for an authenticated caller", async () => {
+    const h = await startHarness(BOX_SECRET);
+    const res = await fetch(`${h.url}/nope`, { headers: { authorization: `Bearer ${BOX_SECRET}` } });
+    expect(res.status).toBe(404);
+  });
+});
