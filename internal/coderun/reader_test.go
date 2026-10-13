@@ -153,3 +153,81 @@ func TestStreamOutput_SurvivesTwentyForcedDrops(t *testing.T) {
 
 	if out.String() != want.String() {
 		// Report the first divergent byte offset, not the whole (large) strings.
+		got := out.String()
+		i := 0
+		for i < len(got) && i < want.Len() && got[i] == want.String()[i] {
+			i++
+		}
+		t.Fatalf("diverges at byte %d: got %q..., want %q...", i, safeSlice(got, i), safeSlice(want.String(), i))
+	}
+	if r.calls < 20 {
+		t.Errorf("only %d Read calls; want enough to actually exercise repeated drops", r.calls)
+	}
+}
+
+func safeSlice(s string, from int) string {
+	end := from + 20
+	if end > len(s) {
+		end = len(s)
+	}
+	if from > len(s) {
+		from = len(s)
+	}
+	return s[from:end]
+}
+
+// TestStreamOutput_TruncatedRereadsImmediately is the explicit AC: on
+// truncated:true the client re-reads immediately rather than sleeping the
+// poll interval. Uses a long follow/poll duration and a small capBytes —
+// if StreamOutput slept between the capped reads, catching up would take
+// several multiples of that duration; asserts it doesn't.
+func TestStreamOutput_TruncatedRereadsImmediately(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 10_000)
+	r := &fakeReader{data: data, capBytes: 500}
+	var out syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+
+	longPoll := 2 * time.Second
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := StreamOutput(ctx, r, &out, "log", 0, longPoll, nil)
+		done <- err
+	}()
+
+	waitForContentLen(t, &out, len(data))
+	elapsed := time.Since(start)
+	cancel()
+	<-done
+
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("catching up 20 capped reads took %s — truncated:true must re-read immediately, not sleep %s each time", elapsed, longPoll)
+	}
+	if out.Len() != len(data) {
+		t.Errorf("out.Len() = %d, want %d (nothing silently dropped at the cap)", out.Len(), len(data))
+	}
+}
+
+func waitForContent(t *testing.T, out *syncBuffer, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(out.String(), want) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for output to contain %q, got %q", want, out.String())
+}
+
+func waitForContentLen(t *testing.T, out *syncBuffer, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if out.Len() >= n {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d bytes of output, got %d", n, out.Len())
+}

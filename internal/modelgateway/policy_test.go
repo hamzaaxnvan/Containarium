@@ -333,3 +333,338 @@ func TestPolicy_RateSpikeAgainstLearnedBaseline(t *testing.T) {
 			found = &d.Signals[i]
 		}
 	}
+	if found == nil {
+		t.Fatalf("no baseline signal on a 100x spike; signals=%+v state=%s", d.Signals, d.State)
+	}
+	if found.Severity <= 0 {
+		t.Errorf("severity = %v, want > 0", found.Severity)
+	}
+	if d.State < StateAlert {
+		t.Errorf("state = %s, want at least alert", d.State)
+	}
+}
+
+// A baseline that keeps learning during an incident eventually accepts the
+// attack as normal. It must freeze while the tenant is off the observe rung.
+func TestPolicy_BaselineFrozenWhileEscalated(t *testing.T) {
+	clk := newFakeClock()
+	p := NewPolicy(PolicyConfig{
+		Quota: QuotaLimits{Window: time.Minute, MaxTotalTokens: 1000},
+		Anomaly: AnomalyConfig{
+			Enabled: true, BaselineWindow: time.Minute, BaselineMinSamples: 2, NoveltyTTL: time.Hour,
+		},
+		CircuitBreakFor: time.Hour, // hold the tenant off observe
+		Now:             clk.now,
+	})
+
+	// Establish a baseline, then blow the budget so the tenant leaves observe.
+	for i := 0; i < 3; i++ {
+		p.RecordUsage("acme", Usage{InputTokens: 10})
+		p.Check(req("acme"))
+		clk.advance(61 * time.Second)
+	}
+	before := statusFor(t, p, "acme")
+
+	p.RecordUsage("acme", Usage{InputTokens: 100_000})
+	if d := p.Check(req("acme")); d.State == StateObserve {
+		t.Fatal("expected the tenant to leave observe after exceeding budget")
+	}
+	for i := 0; i < 5; i++ {
+		p.RecordUsage("acme", Usage{InputTokens: 100_000})
+		clk.advance(61 * time.Second)
+		p.Check(req("acme"))
+	}
+
+	after := statusFor(t, p, "acme")
+	if after.Samples != before.Samples {
+		t.Errorf("baseline kept learning while escalated: samples %d → %d", before.Samples, after.Samples)
+	}
+}
+
+func TestPolicy_NoveltyAndConcurrencySignals(t *testing.T) {
+	clk := newFakeClock()
+	p := NewPolicy(PolicyConfig{
+		Anomaly: AnomalyConfig{
+			Enabled:              true,
+			NoveltyTTL:           time.Hour,
+			ConcurrentWindow:     time.Minute,
+			ConcurrentSourceNets: 2,
+			BaselineWindow:       time.Minute,
+			BaselineMinSamples:   1,
+			BaselineFactor:       1e9, // keep the rate signal out of this test
+		},
+		Now: clk.now,
+	})
+
+	base := RequestInfo{Tenant: "acme", Provider: "anthropic", Model: "haiku", Endpoint: "/v1/messages", RemoteAddr: "10.0.0.5:1"}
+
+	// Cold start: while the tenant is still being learned, "first ever model" is
+	// not a switch and must not fire. Priming past BaselineMinSamples is what
+	// turns the novelty detectors on.
+	if d := p.Check(base); hasSignal(d.Signals, SignalNewModel) || hasSignal(d.Signals, SignalNewEndpoint) {
+		t.Fatalf("novelty fired on an unlearned tenant's first call: %+v", d.Signals)
+	}
+	clk.advance(61 * time.Second)
+	p.Check(base) // folds the quiet window into the baseline
+
+	// Established now, and the primed model/endpoint are no longer novel.
+	d := p.Check(base)
+	if hasSignal(d.Signals, SignalNewModel) || hasSignal(d.Signals, SignalNewEndpoint) {
+		t.Errorf("repeat call flagged as novel: %+v", d.Signals)
+	}
+
+	// A model the tenant has never used — the "model-tier switch" shape.
+	up := base
+	up.Model = "opus"
+	if d = p.Check(up); !hasSignal(d.Signals, SignalNewModel) {
+		t.Errorf("switch to an unseen model not flagged: %+v", d.Signals)
+	}
+
+	// The same token arriving from more networks than a box population explains.
+	for _, addr := range []string{"203.0.113.7:1", "198.51.100.9:1", "192.0.2.11:1"} {
+		n := base
+		n.RemoteAddr = addr
+		d = p.Check(n)
+	}
+	if !hasSignal(d.Signals, SignalConcurrentNets) {
+		t.Errorf("four distinct source networks not flagged: %+v", d.Signals)
+	}
+}
+
+func TestPolicy_AuthFailureRatioSignal(t *testing.T) {
+	clk := newFakeClock()
+	p := NewPolicy(PolicyConfig{
+		Quota: QuotaLimits{Window: time.Minute},
+		Anomaly: AnomalyConfig{
+			Enabled:            true,
+			AuthFailureRatio:   0.5,
+			AuthFailureMin:     4,
+			BaselineMinSamples: 1000,
+			NoveltyTTL:         time.Hour,
+		},
+		Now: clk.now,
+	})
+
+	p.RecordUsage("acme", Usage{InputTokens: 1})
+	p.RecordUsage("acme", Usage{InputTokens: 1})
+	for i := 0; i < 6; i++ {
+		p.RecordDenial("acme") // probing: rejected provider/model
+	}
+
+	d := p.Check(req("acme"))
+	if !hasSignal(d.Signals, SignalAuthFailureRate) {
+		t.Fatalf("6 denials against 2 calls not flagged: %+v", d.Signals)
+	}
+}
+
+// Automatic revocation is destructive and needs a human to undo, so it must not
+// happen unless the operator opted in by setting RevokeAt.
+func TestPolicy_NoAutoRevokeUnlessConfigured(t *testing.T) {
+	clk := newFakeClock()
+	mk := func(revokeAt float64) *Policy {
+		return NewPolicy(PolicyConfig{
+			Anomaly: AnomalyConfig{
+				Enabled: true, NoveltyTTL: time.Hour,
+				ConcurrentSourceNets: 1, ConcurrentWindow: time.Minute,
+				BaselineMinSamples: 1000,
+			},
+			AlertAt: 0.01, BreakAt: 0.02, RevokeAt: revokeAt,
+			Now: clk.now,
+		})
+	}
+
+	drive := func(p *Policy) PolicyState {
+		var d Decision
+		for _, addr := range []string{"10.0.0.1:1", "203.0.113.1:1", "198.51.100.1:1", "192.0.2.1:1"} {
+			i := req("acme")
+			i.RemoteAddr = addr
+			i.Model = addr // also trip novelty, to push the score up
+			d = p.Check(i)
+		}
+		return d.State
+	}
+
+	if got := drive(mk(0)); got == StateRevoke {
+		t.Error("auto-revoked with RevokeAt unset")
+	}
+	if got := drive(mk(0.05)); got != StateRevoke {
+		t.Errorf("state = %s with RevokeAt configured, want revoke", got)
+	}
+}
+
+func TestPolicy_StatusReportsWorstFirst(t *testing.T) {
+	clk := newFakeClock()
+	p := NewPolicy(PolicyConfig{
+		Quota: QuotaLimits{Window: time.Minute, MaxTotalTokens: 100},
+		Now:   clk.now,
+	})
+
+	p.Check(req("quiet"))
+	p.RecordUsage("loud", Usage{InputTokens: 900})
+	p.Check(req("loud"))
+
+	st := p.Status()
+	if len(st) != 2 {
+		t.Fatalf("want 2 tenants, got %d", len(st))
+	}
+	if st[0].Tenant != "loud" {
+		t.Errorf("worst tenant not first: %+v", st)
+	}
+	if st[0].State != StateCircuitBreak {
+		t.Errorf("loud state = %s, want circuit_break", st[0].State)
+	}
+	if st[0].Tokens != 900 {
+		t.Errorf("tokens in window = %d, want 900", st[0].Tokens)
+	}
+	if st[1].State != StateObserve {
+		t.Errorf("quiet state = %s, want observe", st[1].State)
+	}
+}
+
+// An empty tenant means an unauthenticated or malformed call the gateway
+// rejects elsewhere; the ladder must not accumulate state under "".
+func TestPolicy_EmptyTenantIsPassthrough(t *testing.T) {
+	p := NewPolicy(PolicyConfig{Quota: QuotaLimits{Window: time.Minute, MaxTotalTokens: 1}})
+	p.RecordUsage("", Usage{InputTokens: 10_000})
+	p.RecordDenial("")
+	if d := p.Check(RequestInfo{}); !d.Allow {
+		t.Fatalf("empty-tenant request denied: %+v", d)
+	}
+	if len(p.Status()) != 0 {
+		t.Errorf("empty tenant accumulated state: %+v", p.Status())
+	}
+}
+
+func TestPolicy_ConcurrentCheckIsRaceFree(t *testing.T) {
+	p := NewPolicy(PolicyConfig{
+		Quota:   QuotaLimits{Window: time.Minute, MaxTotalTokens: 10_000},
+		Anomaly: AnomalyConfig{Enabled: true, NoveltyTTL: time.Minute},
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				p.RecordUsage("acme", Usage{InputTokens: 1})
+				p.Check(req("acme"))
+				p.RecordDenial("acme")
+				_ = p.Status()
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func hasSignal(sigs []Signal, name string) bool {
+	for _, s := range sigs {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func statusFor(t *testing.T, p *Policy, tenant string) TenantStatus {
+	t.Helper()
+	for _, s := range p.Status() {
+		if s.Tenant == tenant {
+			return s
+		}
+	}
+	t.Fatalf("no status for tenant %q", tenant)
+	return TenantStatus{}
+}
+
+// Automatic revocation must be as sticky as the manual kind. Gating stickiness
+// on a manual reason left an auto-revoked tenant walking back down the ladder
+// one rung per cooldown, so a token cut off for a high anomaly score regained
+// access by going quiet for five minutes.
+func TestPolicy_AutoRevokeIsStickyToo(t *testing.T) {
+	clk := newFakeClock()
+	p := NewPolicy(PolicyConfig{
+		Anomaly: AnomalyConfig{
+			Enabled: true, NoveltyTTL: time.Hour,
+			ConcurrentSourceNets: 1, ConcurrentWindow: time.Minute,
+			BaselineMinSamples: 1000,
+		},
+		AlertAt: 0.01, BreakAt: 0.02, RevokeAt: 0.05,
+		Cooldown: time.Minute,
+		Now:      clk.now,
+	})
+
+	var d Decision
+	for _, addr := range []string{"10.0.0.1:1", "203.0.113.1:1", "198.51.100.1:1", "192.0.2.1:1"} {
+		i := req("acme")
+		i.RemoteAddr = addr
+		d = p.Check(i)
+	}
+	if d.State != StateRevoke {
+		t.Fatalf("state = %s, want revoke", d.State)
+	}
+
+	// Long quiet stretches from a single clean network must not lift it.
+	for i := 0; i < 10; i++ {
+		clk.advance(10 * time.Minute)
+		d = p.Check(req("acme"))
+		if d.Allow || d.State != StateRevoke {
+			t.Fatalf("auto-revocation lifted itself after %d quiet cycles: %+v", i+1, d)
+		}
+	}
+
+	p.Clear("acme")
+	if d := p.Check(req("acme")); !d.Allow {
+		t.Errorf("Clear did not restore an auto-revoked tenant: %+v", d)
+	}
+}
+
+// The ladder's own refusals must not feed the auth-failure signal. Counting
+// them made enforcement self-amplifying: throttling a tenant raised its failure
+// ratio, which raised its score, which escalated it further — laundering a
+// budget overrun into "this token is being probed".
+func TestPolicy_PolicyDenialsDoNotFeedTheAuthFailureSignal(t *testing.T) {
+	clk := newFakeClock()
+	p := NewPolicy(PolicyConfig{
+		Quota: QuotaLimits{Window: time.Minute, MaxTotalTokens: 100},
+		Anomaly: AnomalyConfig{
+			Enabled:            true,
+			AuthFailureRatio:   0.5,
+			AuthFailureMin:     4,
+			BaselineMinSamples: 1000,
+			NoveltyTTL:         time.Hour,
+		},
+		ThrottleMinInterval: time.Hour, // every call past the first is refused
+		CircuitBreakFor:     time.Hour,
+		Now:                 clk.now,
+	})
+
+	// Blow the budget, then keep calling: each call is refused by the ladder.
+	p.RecordUsage("acme", Usage{InputTokens: 500})
+	var d Decision
+	for i := 0; i < 20; i++ {
+		d = p.Check(req("acme"))
+		if d.Allow {
+			t.Fatalf("call %d admitted while over budget", i)
+		}
+	}
+
+	if hasSignal(d.Signals, SignalAuthFailureRate) {
+		t.Errorf("the ladder's own denials tripped the auth-failure signal: %+v", d.Signals)
+	}
+
+	st := statusFor(t, p, "acme")
+	if st.PolicyDenials == 0 {
+		t.Error("policy denials not recorded")
+	}
+	if st.AuthDenials != 0 {
+		t.Errorf("auth denials = %d, want 0 — no token-authorization failure occurred", st.AuthDenials)
+	}
+
+	// A genuine authorization failure still trips it.
+	for i := 0; i < 10; i++ {
+		p.RecordDenial("acme")
+	}
+	if d := p.Check(req("acme")); !hasSignal(d.Signals, SignalAuthFailureRate) {
+		t.Errorf("real auth failures no longer trip the signal: %+v", d.Signals)
+	}
+}
