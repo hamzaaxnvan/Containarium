@@ -33,3 +33,74 @@ func registerCookieSession(mux *http.ServeMux, authMW *auth.AuthMiddleware) {
 		switch r.Method {
 		case http.MethodPost:
 			handleSessionCookieSet(w, r, authMW)
+		case http.MethodDelete:
+			handleSessionCookieClear(w, r)
+		default:
+			w.Header().Set("Allow", "POST, DELETE")
+			http.Error(w, `{"error": "method not allowed", "code": 405}`, http.StatusMethodNotAllowed)
+		}
+	})
+}
+
+func handleSessionCookieSet(w http.ResponseWriter, r *http.Request, authMW *auth.AuthMiddleware) {
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		http.Error(w, `{"error": "missing authorization header", "code": 401}`, http.StatusUnauthorized)
+		return
+	}
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+	claims, err := authMW.ValidateToken(token)
+	if err != nil {
+		http.Error(w, `{"error": "invalid token", "code": 401}`, http.StatusUnauthorized)
+		return
+	}
+
+	// Cookie lifetime tracks the JWT's own expiry — never longer.
+	// If exp is in the past or missing, we'd have failed ValidateToken
+	// already, so this is just translating the time math.
+	maxAge := 0
+	if claims.ExpiresAt != nil {
+		if remaining := time.Until(claims.ExpiresAt.Time); remaining > 0 {
+			maxAge = int(remaining.Seconds())
+		}
+	}
+
+	// Secure is unconditional: the daemon's JWT is a high-value
+	// credential and we don't want it crossing plain HTTP under any
+	// configuration. Browsers treat localhost as a secure context
+	// even over HTTP, so local development still works. In prod the
+	// outer leg is always HTTPS via Caddy; the inner leg between
+	// Caddy and the daemon is loopback / VPC, so the browser never
+	// sees the cookie over a plaintext hop.
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.SessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":        true,
+		"expiresAt": claims.ExpiresAt.Unix(),
+	})
+}
+
+func handleSessionCookieClear(w http.ResponseWriter, _ *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     auth.SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"ok": true}`))
+}

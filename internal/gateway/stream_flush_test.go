@@ -50,3 +50,56 @@ func TestStreamingResponseThroughProductionChain(t *testing.T) {
 	}
 
 	tm, err := auth.NewTokenManager(streamFlushTestSecret, "containarium")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	tok, err := tm.GenerateToken("alice", []string{"admin"}, time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	handler, rest := wrapHTTPHandler(mux, auth.NewAuthMiddleware(tm).HTTPMiddleware, noopAuditLogger{})
+	if rest == nil {
+		t.Fatal("wrapHTTPHandler returned a nil rest handler")
+	}
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	// Proof this is the real chain: without a bearer the auth layer refuses.
+	unauth, err := http.Get(srv.URL + "/v1/security/exec-events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauth.Body.Close()
+	if unauth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want 401 (auth layer missing from chain?)", unauth.StatusCode)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/security/exec-events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var lines []string
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	if len(lines) != events {
+		t.Fatalf("got %d chunks, want %d: %q", len(lines), events, lines)
+	}
+	for _, l := range lines {
+		if strings.Contains(l, "unexpected type of web server") || !strings.Contains(l, `"result"`) {
+			t.Fatalf("bad chunk %q", l)
+		}
+	}
+}
