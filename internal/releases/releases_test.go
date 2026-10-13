@@ -97,3 +97,37 @@ func TestLatest_ServesStaleOnError(t *testing.T) {
 
 func TestLatest_ErrorWhenNoCache(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(WithURL(srv.URL))
+	if _, _, err := c.Latest(context.Background()); err == nil {
+		t.Fatal("expected error with no cache to fall back to")
+	}
+}
+
+func TestCompareAndIsBehind(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"0.22.10", "0.22.10", 0},
+		{"v0.22.10", "0.22.10", 0}, // leading v ignored
+		{"0.22.9", "0.22.10", -1},  // numeric, not lexical (9 < 10)
+		{"0.23.0", "0.22.10", 1},
+		{"1.0.0", "0.99.99", 1},
+		{"0.22.10-rc1", "0.22.10", 0}, // pre-release suffix ignored
+		{"0.22", "0.22.0", 0},         // missing patch == 0
+	}
+	for _, tc := range cases {
+		if got := Compare(tc.a, tc.b); got != tc.want {
+			t.Errorf("Compare(%q,%q) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+	if !IsBehind("0.22.9", "0.22.10") {
+		t.Error("0.22.9 should be behind 0.22.10")
+	}
+	if IsBehind("0.23.0", "0.22.10") {
+		t.Error("0.23.0 should not be behind 0.22.10")
+	}
+}

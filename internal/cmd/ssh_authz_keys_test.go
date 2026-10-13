@@ -141,3 +141,51 @@ func TestSSHAuthzKeys_HTTPAuthorizerSendsTokenToDaemon(t *testing.T) {
 	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth, gotPath = r.Header.Get("Authorization"), r.URL.Path
 		body, _ := io.ReadAll(r.Body)
+		if err := protojson.Unmarshal(body, &gotReq); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		b, _ := protojson.Marshal(allowResp())
+		_, _ = w.Write(b)
+	}))
+	defer daemon.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("jwt-value\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	fp, kt, k := sshdArgs(t)
+	out, code := runKeys(t, sshAuthzKeysOptions{
+		Login: "alice", Fingerprint: fp, KeyType: kt, Key: k,
+		Authorize: httpSSHAuthorizer(daemon.URL, tokenFile),
+	})
+	if code != 0 || out != kt+" "+k+"\n" {
+		t.Fatalf("code = %d stdout = %q, want the key line", code, out)
+	}
+	if gotPath != "/v1/ssh/authorize" || gotAuth != "Bearer jwt-value" || gotReq.GetLogin() != "alice" {
+		t.Fatalf("path = %q auth = %q login = %q", gotPath, gotAuth, gotReq.GetLogin())
+	}
+}
+
+// A refused token or a missing token file is "no decision", not a deny.
+func TestSSHAuthzKeys_HTTPAuthorizerFailuresAreNoDecision(t *testing.T) {
+	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":"sentinel auth failed","code":401}`, http.StatusUnauthorized)
+	}))
+	defer refusing.Close()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("jwt-value"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	fp, kt, k := sshdArgs(t)
+	for name, authz := range map[string]sshAuthorizer{
+		"401 from daemon":    httpSSHAuthorizer(refusing.URL, tokenFile),
+		"missing token file": httpSSHAuthorizer(refusing.URL, filepath.Join(t.TempDir(), "absent")),
+	} {
+		out, code := runKeys(t, sshAuthzKeysOptions{
+			Login: "alice", Fingerprint: fp, KeyType: kt, Key: k, Enforce: true, Authorize: authz,
+		})
+		if code != 1 || out != "" {
+			t.Errorf("%s: code = %d stdout = %q, want 1 (enforce, no decision) and nothing", name, code, out)
+		}
+	}
+}
