@@ -22,3 +22,16 @@ func TestMissingCaps(t *testing.T) {
 	got := MissingCaps(noSetuid)
 	if len(got) != 1 || got[0] != "CAP_SETUID" {
 		t.Errorf("no-setuid: missing=%v, want [CAP_SETUID]", got)
+	}
+}
+
+func TestAllRequiredPass(t *testing.T) {
+	pass := []Check{{Name: "a", OK: true, Required: true}, {Name: "b", OK: false, Required: false}}
+	if !AllRequiredPass(pass) {
+		t.Error("optional failure should not flip AllRequiredPass")
+	}
+	fail := []Check{{Name: "a", OK: false, Required: true}}
+	if AllRequiredPass(fail) {
+		t.Error("required failure should flip AllRequiredPass")
+	}
+}
