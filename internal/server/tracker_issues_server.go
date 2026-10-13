@@ -61,3 +61,130 @@ func (s *ContainerServer) GetTrackerIssue(ctx context.Context, req *pb.GetTracke
 	if req.Username == "" {
 		return nil, status.Error(codes.InvalidArgument, "username is required")
 	}
+	if err := auth.AuthorizeTrackerTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	provider, conn, err := s.resolveReaderConn(ctx, req.Username, req.Connection)
+	if err != nil {
+		return nil, err
+	}
+
+	issue, err := provider.GetIssue(ctx, conn, req.Number)
+	if err != nil {
+		return nil, mapProviderError(err)
+	}
+	return &pb.GetTrackerIssueResponse{Issue: toProtoIssue(issue)}, nil
+}
+
+// ListTrackerIssues enumerates issues, optionally filtered.
+func (s *ContainerServer) ListTrackerIssues(ctx context.Context, req *pb.ListTrackerIssuesRequest) (*pb.ListTrackerIssuesResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrackerRead); err != nil {
+		return nil, err
+	}
+	if s.trackerStore == nil {
+		return nil, status.Error(codes.Unavailable, "tracker store not configured on this daemon")
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTrackerTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	provider, conn, err := s.resolveReaderConn(ctx, req.Username, req.Connection)
+	if err != nil {
+		return nil, err
+	}
+
+	issues, err := provider.ListIssues(ctx, conn, tracker.IssueFilter{
+		State:  req.State,
+		Labels: req.Labels,
+		Search: req.Search,
+	})
+	if err != nil {
+		return nil, mapProviderError(err)
+	}
+	out := make([]*pb.TrackerIssue, 0, len(issues))
+	for _, i := range issues {
+		out = append(out, toProtoIssue(i))
+	}
+	return &pb.ListTrackerIssuesResponse{Issues: out}, nil
+}
+
+// GetTrackerChange reads a single change request's state and CI
+// verdict.
+func (s *ContainerServer) GetTrackerChange(ctx context.Context, req *pb.GetTrackerChangeRequest) (*pb.GetTrackerChangeResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrackerRead); err != nil {
+		return nil, err
+	}
+	if s.trackerStore == nil {
+		return nil, status.Error(codes.Unavailable, "tracker store not configured on this daemon")
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTrackerTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	provider, conn, err := s.resolveReaderConn(ctx, req.Username, req.Connection)
+	if err != nil {
+		return nil, err
+	}
+
+	change, err := provider.GetChange(ctx, conn, req.Number)
+	if err != nil {
+		return nil, mapProviderError(err)
+	}
+	return &pb.GetTrackerChangeResponse{Change: toProtoChange(change)}, nil
+}
+
+// mapProviderError maps a tracker.Provider adapter's sentinel errors to
+// gRPC status codes.
+func mapProviderError(err error) error {
+	switch {
+	case errors.Is(err, tracker.ErrNotFound):
+		return status.Error(codes.NotFound, "not found on tracker")
+	case errors.Is(err, tracker.ErrCredentialInvalid):
+		return status.Errorf(codes.FailedPrecondition, "credential rejected by tracker: %v", err)
+	case errors.Is(err, tracker.ErrUnreachable):
+		return status.Errorf(codes.Unavailable, "tracker unreachable: %v", err)
+	default:
+		return status.Errorf(codes.Internal, "%v", err)
+	}
+}
+
+func toProtoComment(c tracker.Comment) *pb.TrackerComment {
+	return &pb.TrackerComment{
+		Author:    c.Author,
+		CreatedAt: timestamppb.New(c.CreatedAt),
+		Body:      c.Body,
+	}
+}
+
+func toProtoIssue(i tracker.Issue) *pb.TrackerIssue {
+	comments := make([]*pb.TrackerComment, 0, len(i.Comments))
+	for _, c := range i.Comments {
+		comments = append(comments, toProtoComment(c))
+	}
+	return &pb.TrackerIssue{
+		Number:   i.Number,
+		Title:    i.Title,
+		Body:     i.Body,
+		State:    i.State,
+		Labels:   i.Labels,
+		Assignee: i.Assignee,
+		Comments: comments,
+	}
+}
+
+func toProtoChange(c tracker.Change) *pb.TrackerChange {
+	return &pb.TrackerChange{
+		Number:    c.Number,
+		State:     c.State,
+		CiVerdict: c.CIVerdict,
+		Url:       c.URL,
+		Branch:    c.Branch,
+	}
+}

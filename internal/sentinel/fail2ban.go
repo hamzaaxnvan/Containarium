@@ -133,3 +133,94 @@ func fail2banJailBanned(runner Fail2BanRunner, jail string) ([]string, error) {
 	}
 	return parseBannedIPList(out)
 }
+
+// parseBannedIPList extracts the space-separated banned-IP list from
+// `fail2ban-client status <jail>` output, e.g.:
+//
+//	Status for the jail: sshd
+//	|- Filter
+//	|  ...
+//	`- Actions
+//	   |- Currently banned:	1
+//	   |- Total banned:	3
+//	   `- Banned IP list:	203.0.113.7 198.51.100.9
+func parseBannedIPList(out string) ([]string, error) {
+	const marker = "Banned IP list:"
+	for _, line := range strings.Split(out, "\n") {
+		idx := strings.Index(line, marker)
+		if idx == -1 {
+			continue
+		}
+		rest := strings.TrimSpace(line[idx+len(marker):])
+		if rest == "" {
+			return []string{}, nil
+		}
+		return strings.Fields(rest), nil
+	}
+	return nil, fmt.Errorf("%w: could not find %q in fail2ban-client status output: %s", errFail2BanUnavailable, marker, strings.TrimSpace(out))
+}
+
+// fail2banJailIgnoreIP returns jail's configured ignoreip exemptions,
+// parsed from `fail2ban-client get <jail> ignoreip`. Returning this
+// alongside the ban list matters as much as the bans themselves: it
+// answers "why was I bannable at all" (#1962).
+func fail2banJailIgnoreIP(runner Fail2BanRunner, jail string) ([]string, error) {
+	out, err := fail2banClientRun(runner, jail, "get", jail, "ignoreip")
+	if err != nil {
+		return nil, err
+	}
+	return parseIgnoreIPList(out), nil
+}
+
+// parseIgnoreIPList parses `fail2ban-client get <jail> ignoreip`
+// output. With no exemptions it prints a single line:
+//
+//	No IP address/network is ignored
+//
+// With one or more, a tree-drawing list:
+//
+//	These IP addresses/networks are ignored:
+//	|- 127.0.0.0/8
+//	`- 10.0.0.0/8
+func parseIgnoreIPList(out string) []string {
+	entries := []string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "":
+		case strings.HasPrefix(line, "No IP address"):
+		case strings.HasPrefix(line, "These IP addresses"):
+		case strings.HasPrefix(line, "|-") || strings.HasPrefix(line, "`-"):
+			line = strings.TrimPrefix(line, "|-")
+			line = strings.TrimPrefix(line, "`-")
+			if line = strings.TrimSpace(line); line != "" {
+				entries = append(entries, line)
+			}
+		default:
+			entries = append(entries, line)
+		}
+	}
+	return entries
+}
+
+// fail2banUnban attempts `fail2ban-client set <jail> unbanip <ip>` and
+// reports whether ip was actually banned on jail. Unbanning an address
+// that wasn't banned there is success with unbanned=false, not an
+// error (#1962): a multi-sentinel deployment normally has the ban on
+// only one host, and a caller clearing an address everywhere shouldn't
+// have to treat "wasn't banned here" as a failure.
+func fail2banUnban(runner Fail2BanRunner, jail, ip string) (bool, error) {
+	out, err := fail2banClientRun(runner, jail, "set", jail, "unbanip", ip)
+	if err != nil {
+		return false, err
+	}
+	return parseUnbanCount(out), nil
+}
+
+// parseUnbanCount parses `fail2ban-client set <jail> unbanip <ip>`'s
+// output, which on success is just the count of IPs actually unbanned
+// (0 or 1, for a single-IP call).
+func parseUnbanCount(out string) bool {
+	trimmed := strings.TrimSpace(out)
+	return trimmed != "" && trimmed != "0"
+}
