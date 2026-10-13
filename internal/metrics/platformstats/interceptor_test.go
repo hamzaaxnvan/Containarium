@@ -38,3 +38,43 @@ func TestUnaryInterceptor_ClassifiesByFinalStatus(t *testing.T) {
 				t.Errorf("interceptor changed the error: got %v, want %v", err, tc.handlerErr)
 			}
 			if tc.handlerErr == nil && resp != "resp" {
+				t.Errorf("interceptor changed the response: got %v", resp)
+			}
+
+			snap := stats.SnapshotAPI()
+			if snap.RequestsByClass[tc.wantClass] != 1 {
+				t.Errorf("requests[%s] = %d, want 1 (full snapshot: %+v)", tc.wantClass, snap.RequestsByClass[tc.wantClass], snap.RequestsByClass)
+			}
+			for class, n := range snap.RequestsByClass {
+				if class != tc.wantClass && n != 0 {
+					t.Errorf("unexpected count in unrelated class %s: %d", class, n)
+				}
+			}
+		})
+	}
+}
+
+// TestUnaryInterceptor_PassesThroughHandler guards that the interceptor
+// is purely an observer — it must never alter the request, response, or
+// error the wrapped handler produces.
+func TestUnaryInterceptor_PassesThroughHandler(t *testing.T) {
+	stats := New()
+	interceptor := UnaryInterceptor(stats)
+
+	sentinelErr := status.Error(codes.PermissionDenied, "no")
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		if req != "the request" {
+			t.Fatalf("handler received %v, want %q", req, "the request")
+		}
+		return "the response", sentinelErr
+	}
+	info := &grpc.UnaryServerInfo{FullMethod: "/x/Y"}
+
+	resp, err := interceptor(context.Background(), "the request", info, handler)
+	if resp != "the response" {
+		t.Errorf("resp = %v, want %q", resp, "the response")
+	}
+	if err != sentinelErr {
+		t.Errorf("err = %v, want the exact sentinel error passed through unmodified", err)
+	}
+}
