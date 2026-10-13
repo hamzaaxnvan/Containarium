@@ -53,3 +53,41 @@ bundle="/opt/offline-verification/containarium-bundle-${tag}-linux-amd64"
 [ "$(cat "$bundle/VERSION")" = "${tag#v}" ]
 [ ! -d "$bundle/images" ]
 for pkg in incus incus-extra zfsutils-linux jq curl; do
+  debs=("$bundle/apt/${pkg}_"*.deb)
+  [ -f "${debs[0]}" ] || { echo "FAIL: missing bundled package $pkg"; exit 1; }
+done
+echo "Bundled deb count: $(find "$bundle/apt" -name '*.deb' | wc -l)"
+
+# Exercise the real installer on an otherwise untouched guest first. The
+# checksum opt-out is required only for this deliberately damaged copy.
+mv "$bundle/apt" "$bundle/apt.saved"
+mkdir "$bundle/apt"
+set +e
+bash "$bundle/offline-install.sh" --skip-checksum-verify >empty-apt.log 2>&1
+rc=$?
+set -e
+cat empty-apt.log
+[ "$rc" -ne 0 ]
+grep -F -- 'No .deb packages' empty-apt.log
+grep -F -- '--skip-apt' empty-apt.log
+echo "PASS: empty apt/ rejected with exit $rc and --skip-apt guidance"
+rmdir "$bundle/apt"
+mv "$bundle/apt.saved" "$bundle/apt"
+
+# Default flags, real local packages, real Incus/systemd; no package update,
+# preinstallation, installer patching or network access in the guest.
+set +e
+bash "$bundle/offline-install.sh" >install.log 2>&1
+rc=$?
+set -e
+cat install.log
+[ "$rc" -eq 0 ] || { echo "FAIL: offline installer exited $rc"; exit 1; }
+check_install install.log
+dpkg-query -W -f='${Package} ${Version} ${db:Status-Status}\n' incus incus-extra zfsutils-linux jq curl
+incus --version
+incus info
+containariumd version --verbose >version.txt
+cat version.txt
+grep -F "${commit:0:7}" version.txt
+systemctl cat containarium.service
+echo "OFFLINE_INSTALL_PASS $tag $commit $bundle_sha"

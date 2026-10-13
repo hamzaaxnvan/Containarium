@@ -1,0 +1,138 @@
+//go:build !windows
+
+// agent-box is the in-the-box MCP server. It runs inside every Containarium
+// box and exposes Linux-native operations (shell, files, logs, services,
+// deployment) to a remote MCP client over stdio.
+//
+// Usage on the user's laptop, in ~/.cursor/mcp.json or ~/.claude.json:
+//
+//	{
+//	  "mcpServers": {
+//	    "containarium": {
+//	      "command": "ssh",
+//	      "args": ["user@my-box.containarium.app", "agent-box"]
+//	    }
+//	  }
+//	}
+//
+// The MCP transport is stdio; the SSH command on the user side wraps it.
+//
+// A pool member (#1488 Phase 2, not yet in production — nothing sets
+// AGENTBOX_SPAWN_SOCKET today) also serves SpawnService over a resident
+// gRPC listener on a unix socket, in parallel with stdio MCP. This
+// removes the daemon's per-call Incus round-trip (~50-150ms) for the two
+// operations a claimed sandbox needs on its hot path: spawning the task's
+// process and running commands in it.
+//
+// Tools (imperative): shell_exec, read_file, write_file, list_directory,
+// move_file, delete_file, tail_log, process_start, process_list,
+// process_kill. See internal/agentbox/server.go for the canonical list.
+//
+// Resources (read-only data):
+//   - containarium://ci-context — JSON metadata about the current CI run
+//     when the box is kept alive after a failed CI run by the
+//     FootprintAI/containarium-run GitHub Action. Returns a stub
+//     `{"available": false}` object when the box isn't a CI box.
+//   - containarium://ci-prompt  — static markdown playbook that tells an
+//     agent how to behave when debugging that failing CI run. Same
+//     content on every box; pair with ci-context for the per-run data.
+//
+// Distinct from cmd/mcp-server/, which is the *platform* MCP for outside-the-
+// box admin operations (create_container, list_containers, etc.). agent-box
+// is the *inside-the-box* MCP — agents working on a single project use this.
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/mark3labs/mcp-go/server"
+
+	"github.com/footprintai/containarium/internal/agentbox"
+	"github.com/footprintai/containarium/pkg/version"
+)
+
+func main() {
+	// MCP requires stdout to be clean (it's the protocol stream); send our
+	// own logs to stderr so they don't poison the channel.
+	log.SetOutput(os.Stderr)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	// Subcommand dispatch — `agent-box compose <verb>` runs the CLI form
+	// of the compose tools (same Go funcs the MCP handlers call, but
+	// arguments via flags + result as JSON on stdout). Used by the
+	// platform daemon to drive these operations from outside the LXC
+	// (Containarium#317 Phase C). No subcommand → start the MCP server
+	// as before.
+	if len(os.Args) >= 2 && os.Args[1] == "compose" {
+		os.Exit(agentbox.RunComposeCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
+	// `agent-box frame <stream> <log>` — the child-side framer for framed
+	// capture (#1701). Not a user-facing verb: spawnBackgroundProcess starts
+	// it inside the run's own setsid'd shell so framing survives agent-box
+	// exiting, which is precisely what the in-process frameWriter did not.
+	if len(os.Args) >= 2 && os.Args[1] == "frame" {
+		os.Exit(agentbox.RunFrameCLI(os.Args[2:], os.Stdin, os.Stderr))
+	}
+
+	// `agent-box approval-mcp --run <name>` — the permission-prompt tool a
+	// `code run --approvals ask` run's Claude Code starts as a stdio MCP
+	// server (#2183). Not a user-facing verb either.
+	if len(os.Args) >= 2 && os.Args[1] == "approval-mcp" {
+		os.Exit(agentbox.RunApprovalCLI(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
+
+	mcpServer := server.NewMCPServer(
+		"containarium-agent-box",
+		version.Version,
+		server.WithToolCapabilities(true),
+		// listChanged=false: our resource set is static for the lifetime
+		// of the process (ci-context is always advertised; its body just
+		// changes based on whether the file exists at read time).
+		server.WithResourceCapabilities(false, false),
+	)
+
+	agentbox.RegisterTools(mcpServer)
+	agentbox.RegisterResources(mcpServer)
+
+	// Second transport (#1488 Phase 2): opt-in via AGENTBOX_SPAWN_SOCKET,
+	// unset on every box today. Runs alongside stdio MCP, not instead of
+	// it — see the package doc comment above.
+	if socketPath := os.Getenv(agentbox.SpawnSocketEnv); socketPath != "" {
+		spawnServer, err := agentbox.StartSpawnListener(socketPath)
+		if err != nil {
+			log.Fatalf("[agent-box] failed to start SpawnService listener: %v", err)
+		}
+		defer spawnServer.GracefulStop()
+	}
+
+	log.Printf("[agent-box] starting MCP server on stdio (version %s)", version.Version)
+	if err := serveStdio(mcpServer); err != nil {
+		log.Fatalf("[agent-box] stdio serve error: %v", err)
+	}
+}
+
+// serveStdio is server.ServeStdio with the stdio pair routed through
+// agentbox.DrainingStdio: EOF on stdin is withheld until every request the
+// server already read has been answered. Without it, a request sent
+// immediately before the client closes stdin (a one-shot pipe, or an SSH
+// session dropping right after process_start) can be dropped by the
+// library's worker pool under load. See DrainingStdio's doc.
+func serveStdio(mcpServer *server.MCPServer) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigChan
+		cancel()
+	}()
+
+	stdio := agentbox.NewDrainingStdio(os.Stdin, os.Stdout, agentbox.DefaultStdioDrainGrace)
+	return server.NewStdioServer(mcpServer).Listen(ctx, stdio, stdio)
+}

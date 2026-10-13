@@ -46,3 +46,15 @@ func TestListenerEvidence_MergedKeepsBothSightings(t *testing.T) {
 }
 
 func TestListenerEvidence_Capped(t *testing.T) {
+	var ev Evidence
+	for i := 0; i < EvidenceCap+5; i++ {
+		ev.Listeners = append(ev.Listeners, ListenerEvidence{Port: uint32(1000 + i)})
+	}
+	got := ev.Capped()
+	if len(got.Listeners) != EvidenceCap {
+		t.Fatalf("len = %d, want %d", len(got.Listeners), EvidenceCap)
+	}
+	if got.Listeners[len(got.Listeners)-1].Port != uint32(1000+EvidenceCap+4) {
+		t.Error("cap must keep the most recent entries")
+	}
+}
