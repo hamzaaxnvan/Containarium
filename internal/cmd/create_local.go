@@ -79,3 +79,57 @@ func createLocal(username, image, cpu, memory, disk, staticIP string, sshKeys []
 		Labels:                 labelMap,
 		EnablePodman:           enablePodman,
 		EnablePodmanPrivileged: enablePodmanPrivileged, // Enable privileged mode for proper Podman-in-LXC
+		AutoStart:              true,
+		Verbose:                verbose,
+		Stack:                  stack,
+		OSType:                 osType,
+		Isolation:              isolation,
+		Monitoring:             monitoring,
+		GitSource:              git.Source,
+		GitRef:                 git.Ref,
+		GitCredential:          git.Credential,
+		WorkspacePath:          git.WorkspacePath,
+	}
+
+	info, err := mgr.Create(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// Birth TTL (#523), local path. The daemon's CreateContainer stamps this
+	// server-side; in local Incus mode we stamp the same key+format directly
+	// so the box is born with its death date (reaped by whichever daemon
+	// manages this host's ttlsweeper). On failure delete the box rather than
+	// leave an ephemeral box that would leak — default-dead (#522), matching
+	// the server path.
+	if ttlSeconds > 0 {
+		expiresAt := time.Now().Add(time.Duration(ttlSeconds) * time.Second).UTC()
+		if serr := mgr.SetConfig(info.Name, incus.TTLExpiresAtKey, expiresAt.Format(time.RFC3339)); serr != nil {
+			_ = deleteLocal(username, true)
+			return nil, fmt.Errorf("failed to set birth TTL on %s (box deleted to avoid a leak): %w", info.Name, serr)
+		}
+	}
+
+	// Birth idle-stop (#524), local path. Mirror the daemon's best-effort
+	// stamp: enable auto-sleep with the requested threshold so the box is
+	// born with its idle→stop timer. Best-effort — auto-sleep is an
+	// optimization, not a leak contract, so a failed stamp warns and the box
+	// keeps running (unlike the TTL path, we do NOT delete the box).
+	if idleStopMinutes > 0 {
+		if serr := mgr.SetConfig(info.Name, incus.AutoSleepEnabledKey, "true"); serr != nil {
+			fmt.Printf("warning: failed to enable birth auto-sleep on %s: %v (continuing; box has no idle-stop)\n", info.Name, serr)
+		} else if serr := mgr.SetConfig(info.Name, incus.IdleThresholdMinutesKey, fmt.Sprintf("%d", idleStopMinutes)); serr != nil {
+			fmt.Printf("warning: enabled auto-sleep on %s but failed to set idle threshold: %v\n", info.Name, serr)
+		}
+	}
+
+	// Birth stopped→delete (#525), local path. Best-effort, same as the
+	// server path — persist the window; the clock starts when the box stops.
+	if deleteAfterStoppedSeconds > 0 {
+		if serr := mgr.SetConfig(info.Name, incus.DeleteAfterStoppedSecondsKey, fmt.Sprintf("%d", deleteAfterStoppedSeconds)); serr != nil {
+			fmt.Printf("warning: failed to set birth stopped→delete on %s: %v (continuing; box has no stopped→delete)\n", info.Name, serr)
+		}
+	}
+
+	return info, nil
+}
