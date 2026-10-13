@@ -37,3 +37,17 @@ func TestManager_BoxOps(t *testing.T) {
 	}
 	if _, err := m.ExportInstance("ghost-container"); err == nil {
 		t.Error("export of a missing box succeeded")
+	}
+
+	if n, err := m.BoxDiskUsage("alice-container"); err != nil || n != 4096 {
+		t.Errorf("BoxDiskUsage = %d, %v; want 4096", n, err)
+	}
+	backend.GetContainerMetricsFunc = func(string) (*incus.ContainerMetrics, error) { return nil, nil }
+	if n, err := m.BoxDiskUsage("alice-container"); err != nil || n != 0 {
+		t.Errorf("no metrics: BoxDiskUsage = %d, %v; want 0 (unknown), nil", n, err)
+	}
+	backend.GetContainerMetricsFunc = func(string) (*incus.ContainerMetrics, error) { return nil, errors.New("state down") }
+	if _, err := m.BoxDiskUsage("alice-container"); err == nil {
+		t.Error("a metrics error was swallowed")
+	}
+}
