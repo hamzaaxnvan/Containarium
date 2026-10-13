@@ -184,3 +184,189 @@ func TestCredentialWatcher_AlertCarriesNamesOnly(t *testing.T) {
 		PreviousSource:   srcInteractive,
 		ObservedAt:       fixed,
 	}
+	if got != want {
+		t.Errorf("alert = %+v, want %+v", got, want)
+	}
+
+	body, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire credentialExpiredWire
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields() // a field added later must be added here on purpose
+	if err := dec.Decode(&wire); err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	wantWire := credentialExpiredWire{
+		Alert:            CredentialExpiredAlertName,
+		SkillID:          "s1",
+		Box:              "agent-s1-container",
+		Engine:           "AGENT_ENGINE_CLAUDE",
+		CredentialSource: "CODE_CREDENTIAL_SOURCE_EXPIRED",
+		PreviousSource:   "CODE_CREDENTIAL_SOURCE_INTERACTIVE",
+		ObservedAt:       fixed,
+	}
+	if wire != wantWire {
+		t.Errorf("wire payload = %+v, want %+v", wire, wantWire)
+	}
+}
+
+// TestCredentialWatcher_ProbeErrorKeepsState: a box that cannot be probed
+// this sweep (stopped mid-sweep, exec failure) neither alerts nor
+// overwrites its last-seen state — so the flip is still caught next time.
+func TestCredentialWatcher_ProbeErrorKeepsState(t *testing.T) {
+	prober := oneTargetProber(srcInteractive)
+	store := newMemStateStore()
+	notifier := &recordingNotifier{}
+	w := NewCredentialWatcher(prober, store, notifier)
+
+	w.Sweep(context.Background())
+	prober.errs["s1"] = errors.New("exec failed")
+	w.Sweep(context.Background())
+	if src, _, _ := store.LastSeen(context.Background(), "s1"); src != srcInteractive {
+		t.Fatalf("last-seen after a probe error = %v, want unchanged INTERACTIVE", src)
+	}
+	delete(prober.errs, "s1")
+	prober.set("s1", srcExpired)
+	w.Sweep(context.Background())
+	if notifier.count() != 1 {
+		t.Fatalf("alerts fired = %d, want 1", notifier.count())
+	}
+}
+
+// TestCredentialWatcher_UnpersistedFlipDoesNotNotify: state is written
+// BEFORE the alert goes out, so a store failure means no alert this sweep
+// (it retries next sweep) rather than an alert that repeats every sweep.
+func TestCredentialWatcher_UnpersistedFlipDoesNotNotify(t *testing.T) {
+	prober := oneTargetProber(srcExpired)
+	store := newMemStateStore()
+	store.recordErr = errors.New("db down")
+	notifier := &recordingNotifier{}
+	w := NewCredentialWatcher(prober, store, notifier)
+
+	w.Sweep(context.Background())
+	w.Sweep(context.Background())
+	if notifier.count() != 0 {
+		t.Fatalf("alerts fired while the flip could not be persisted = %d, want 0", notifier.count())
+	}
+	store.recordErr = nil
+	w.Sweep(context.Background())
+	w.Sweep(context.Background())
+	if notifier.count() != 1 {
+		t.Fatalf("alerts fired once the store recovered = %d, want 1", notifier.count())
+	}
+}
+
+// TestCredentialWatcher_StartSweepsAndStopEnds: Start runs a sweep right
+// away (no 15-minute wait for the first one) and Stop returns only once the
+// loop has exited, so daemon shutdown leaves no goroutine behind.
+func TestCredentialWatcher_StartSweepsAndStopEnds(t *testing.T) {
+	prober := oneTargetProber(srcExpired)
+	notifier := &recordingNotifier{}
+	w := NewCredentialWatcher(prober, newMemStateStore(), notifier)
+	w.Start(context.Background())
+	deadline := time.Now().Add(5 * time.Second)
+	for notifier.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if notifier.count() != 1 {
+		t.Fatalf("alerts after Start = %d, want 1 from the immediate first sweep", notifier.count())
+	}
+	stopped := make(chan struct{})
+	go func() { w.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return")
+	}
+	select {
+	case <-w.done:
+	default:
+		t.Fatal("Stop returned before the loop exited")
+	}
+}
+
+type mapConfig map[string]string
+
+func (m mapConfig) Get(_ context.Context, key string) (string, error) { return m[key], nil }
+
+// TestCredentialWebhookNotifier_SignsWithOperatorSecret: delivery reuses the
+// operator webhook URL/secret config keys and the same "sha256=<hex>" HMAC
+// header the threat-detection notifier and the alert relay send.
+func TestCredentialWebhookNotifier_SignsWithOperatorSecret(t *testing.T) {
+	var gotBody []byte
+	var gotSig string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		gotSig = r.Header.Get("X-Containarium-Signature")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	n := NewCredentialWebhookNotifier(mapConfig{
+		WebhookURLConfigKey:    srv.URL + "/hook",
+		WebhookSecretConfigKey: "s3cret",
+	}, nil)
+	n.NotifyCredentialExpired(context.Background(), CredentialExpiredAlert{SkillID: "s1", CredentialSource: srcExpired})
+
+	if len(gotBody) == 0 {
+		t.Fatal("webhook received no body")
+	}
+	mac := hmac.New(sha256.New, []byte("s3cret"))
+	mac.Write(gotBody)
+	if want := "sha256=" + hex.EncodeToString(mac.Sum(nil)); gotSig != want {
+		t.Errorf("signature = %q, want %q", gotSig, want)
+	}
+}
+
+// TestCredentialWebhookNotifier_RetriesThenStops: a failing webhook is
+// retried a bounded number of times within one delivery, never forever.
+func TestCredentialWebhookNotifier_RetriesThenStops(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	n := NewCredentialWebhookNotifier(mapConfig{WebhookURLConfigKey: srv.URL}, nil)
+	n.backoff = func(int) time.Duration { return 0 }
+	n.NotifyCredentialExpired(context.Background(), CredentialExpiredAlert{SkillID: "s1"})
+	if calls != credentialWebhookMaxAttempts {
+		t.Errorf("POST attempts = %d, want %d", calls, credentialWebhookMaxAttempts)
+	}
+}
+
+// TestCredentialWebhookNotifier_NoURLIsANoop: no webhook configured means
+// nothing to deliver — not an error, and no request anywhere.
+func TestCredentialWebhookNotifier_NoURLIsANoop(t *testing.T) {
+	n := NewCredentialWebhookNotifier(mapConfig{}, nil)
+	n.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("no webhook URL configured, but a request was sent")
+		return nil, nil
+	})}
+	n.NotifyCredentialExpired(context.Background(), CredentialExpiredAlert{SkillID: "s1"})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func (s *memStateStore) RecordEpisode(_ context.Context, skillID, id string, _ time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recordErr != nil {
+		return false, s.recordErr
+	}
+	if s.episodes == nil {
+		s.episodes = map[string]bool{}
+	}
+	key := skillID + ":" + id
+	fresh := !s.episodes[key]
+	s.episodes[key] = true
+	return fresh, nil
+}
