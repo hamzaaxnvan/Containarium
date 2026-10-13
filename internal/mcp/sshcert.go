@@ -83,3 +83,88 @@ func issueCertForBox(client API, box string) (*issuedCert, error) {
 
 	var resp struct {
 		Certificate string   `json:"certificate"`
+		Principals  []string `json:"principals"`
+		ValidBefore string   `json:"validBefore"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode certificate response: %w", err)
+	}
+	if strings.TrimSpace(resp.Certificate) == "" {
+		// A 200 with no certificate is not something to fall back from
+		// quietly: the server claimed to sign and produced nothing.
+		return nil, errors.New("the server returned an empty certificate")
+	}
+
+	dir, err := os.MkdirTemp("", "containarium-cert-")
+	if err != nil {
+		return nil, fmt.Errorf("create identity dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+
+	keyPath := filepath.Join(dir, "id_ed25519")
+	// 0600 — ssh refuses a looser private key, and is right to.
+	if err := os.WriteFile(keyPath, privPEM, 0o600); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("write ephemeral key: %w", err)
+	}
+	cert := resp.Certificate
+	if !strings.HasSuffix(cert, "\n") {
+		cert += "\n"
+	}
+	// OpenSSH only presents a certificate that sits next to its private key
+	// as "<key>-cert.pub"; anywhere else and it is silently ignored.
+	if err := os.WriteFile(keyPath+"-cert.pub", []byte(cert), 0o600); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("write certificate: %w", err)
+	}
+
+	out := &issuedCert{
+		PrivateKeyPath: keyPath,
+		Principals:     resp.Principals,
+		Cleanup:        cleanup,
+	}
+	if resp.ValidBefore != "" {
+		if t, perr := time.Parse(time.RFC3339, resp.ValidBefore); perr == nil {
+			out.ValidBefore = t
+		}
+	}
+	return out, nil
+}
+
+// isCertUnsupported reports whether an error means the endpoint is not there,
+// as opposed to being there and refusing.
+//
+// Matching on the message is unlovely, but doRequest flattens the status code
+// into an error string, and widening that seam for this one caller would touch
+// every backend implementation. The trade is contained by failing toward
+// "supported": anything unrecognised is surfaced to the operator rather than
+// silently downgraded to the long-lived-key path, so a real failure cannot
+// hide behind the fallback.
+func isCertUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"404",
+		"not found",
+		"501",
+		"not implemented",
+		"unimplemented",
+		"unknown method",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// certTTLNote renders the remaining lifetime for the human-facing config-mode
+// output, so it is obvious the invocation is perishable.
+func certTTLNote(c *issuedCert, now time.Time) string {
+	if c.ValidBefore.IsZero() {
+		return "a short-lived certificate"
+	}
+	return fmt.Sprintf("a certificate valid for %s", c.ValidBefore.Sub(now).Round(time.Second))
+}

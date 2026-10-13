@@ -178,3 +178,63 @@ func TestFailback_AFailedSwitchLeavesThePrimaryAndRetries(t *testing.T) {
 			r.mu.Lock()
 			r.calls = append(r.calls, "gcp(refused)")
 			r.mu.Unlock()
+			return errors.New("iptables refused")
+		}
+		return inner(b)
+	}
+
+	var logs syncBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	r.set("10.0.0.1", true)
+	r.tick(4)
+	assert.Equal(t, "tunnel-a", r.primaryID(), "a refused switch leaves the primary where it was")
+	assert.EqualValues(t, 0, r.m.FailbackCount(), "a switch that did not happen is not a failback")
+	assert.NotContains(t, logs.String(), "failback:", "a refused switch must not be logged as a failback")
+	assert.Contains(t, logs.String(), "refused, staying on tunnel-a")
+
+	fail = false
+	r.tick(1)
+	assert.Equal(t, "gcp", r.primaryID(), "it retries on the next check and succeeds")
+	assert.EqualValues(t, 1, r.m.FailbackCount())
+	assert.Contains(t, logs.String(), "failback: tunnel-a → gcp", "the successful switch is logged once, after it happened")
+}
+
+func TestFailback_NegativeThresholdDisablesIt(t *testing.T) {
+	r := newFailbackRig(t, -1)
+	r.set("10.0.0.1", false)
+	r.tick(2)
+	require.Equal(t, "tunnel-a", r.primaryID())
+	r.set("10.0.0.1", true)
+	r.tick(20)
+	assert.Equal(t, []string{"tunnel-a"}, r.switches(), "disabled: the old behaviour is preserved")
+}
+
+func TestFailback_ZeroUsesTheDefaultAndNeverRacesAheadOfHealthyThreshold(t *testing.T) {
+	assert.Equal(t, defaultFailbackChecks, NewManager(Config{HealthyThreshold: 2}, &fakeRecoveryProvider{}).failbackChecks())
+	// A configured value below HealthyThreshold would fail back before the
+	// backend is even marked healthy: it is raised to HealthyThreshold.
+	assert.Equal(t, 5, NewManager(Config{HealthyThreshold: 5, FailbackChecks: 2}, &fakeRecoveryProvider{}).failbackChecks())
+}
+
+// Ordinary failover is unchanged.
+func TestFailback_DoesNotDisturbOrdinaryFailover(t *testing.T) {
+	r := newFailbackRig(t, 4)
+	r.set("10.0.0.1", false)
+	r.tick(1)
+	assert.Empty(t, r.switches(), "one failed check is below UnhealthyThreshold")
+	r.tick(1)
+	assert.Equal(t, []string{"tunnel-a"}, r.switches())
+	assert.EqualValues(t, 1, r.m.FailoverCount())
+	assert.EqualValues(t, 0, r.m.FailbackCount())
+}
+
+func TestRenderFailbackMetrics(t *testing.T) {
+	out := renderFailbackMetrics(3, false)
+	assert.Contains(t, out, "# TYPE sentinel_failback_total counter\n")
+	assert.Contains(t, out, "sentinel_failback_total 3\n")
+	assert.Contains(t, out, "# TYPE sentinel_primary_preferred gauge\n")
+	assert.Contains(t, out, "sentinel_primary_preferred 0\n")
+	assert.True(t, strings.Contains(renderFailbackMetrics(0, true), "sentinel_primary_preferred 1\n"))
+}
