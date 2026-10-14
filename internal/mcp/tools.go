@@ -1246,3 +1246,2501 @@ func (s *Server) registerTools() {
 				"type":     "object",
 				"required": []string{"box"},
 				"properties": map[string]interface{}{
+					"box":  map[string]interface{}{"type": "string", "description": "Box (owner username) the run is on."},
+					"name": map[string]interface{}{"type": "string", "description": "Run name (default \"code\")."},
+				},
+			},
+			Handler: handleCodePending,
+		},
+		{
+			Name: "code_answer",
+			Description: "Answer one open permission request of a code run: allow or deny. " +
+				"Pass `tool` and `input` exactly as code_pending's JSON returned them for this " +
+				"request: an allow permits exactly that tool call, the answer is signed for it, and the run " +
+				"acts on it only if that is the tool call it asked. If the request has changed " +
+				"since, nothing is sent and the call fails with the new request. Answering a request already closed or expired changes " +
+				"nothing and reports how it was closed, as an error. Same signing as " +
+				"`containarium code answer`. Needs a token carrying both the code:answer and ssh:write scopes.",
+			InputSchema: map[string]interface{}{
+				"type":     "object",
+				"required": []string{"box", "request_id", "tool", "input", "answer"},
+				"properties": map[string]interface{}{
+					"box":        map[string]interface{}{"type": "string", "description": "Box (owner username) the run is on."},
+					"name":       map[string]interface{}{"type": "string", "description": "Run name (default \"code\")."},
+					"request_id": map[string]interface{}{"type": "string", "description": "Request id, from code_pending."},
+					"tool":       map[string]interface{}{"type": "string", "description": "The request's tool exactly as the JSON part of code_pending returned it."},
+					"input":      map[string]interface{}{"type": "string", "description": "The request's complete tool input exactly as the JSON part of code_pending returned it."},
+					"answer":     map[string]interface{}{"type": "string", "enum": []string{"allow", "deny"}, "description": "allow or deny."},
+				},
+			},
+			Handler: handleCodeAnswer,
+		},
+		{
+			Name: "connect",
+			Description: "Get SSH access to one of your boxes using the token you're already " +
+				"authenticated with — connect authorizes a managed key for you, so there's " +
+				"no SSH-key setup. Two modes:\n\n" +
+				"  - Config (default, omit `exec`): authorizes the key and returns the ready " +
+				"    `ssh user@host` command for a human to run in their terminal. An MCP " +
+				"    call has no interactive terminal, so this hands the connection off.\n" +
+				"  - Exec (set `exec`): runs that one command on the box over SSH and returns " +
+				"    its stdout, stderr, and exit_code. Use this to operate the box — run a " +
+				"    build, tail a log, check a process — without a terminal.\n\n" +
+				"By default each `exec` call is independent (stateless), so make commands " +
+				"self-contained (e.g. `cd /app && make`). For state that must persist across " +
+				"calls (a working dir, env vars, a background process), pass `session` with a " +
+				"name: the command runs inside a named tmux session ON THE BOX, so a later call " +
+				"with the same `session` sees the same shell — `cd /app` then `pwd` returns " +
+				"/app. A human can `tmux attach` to that session too. The SSH target is the " +
+				"box's ssh_host (or its IP if the daemon reports none) and its SSH username.\n\n" +
+				"Credential: against a control plane that can sign SSH certificates, connect uses a " +
+				"short-lived certificate scoped to this box and installs NOTHING on it — nothing to " +
+				"rotate and nothing left behind after a restart. Against a plain daemon it falls back " +
+				"to authorizing a managed key, as before. You do not configure which; it is detected.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"box": map[string]interface{}{
+						"type":        "string",
+						"description": "Name of the box to connect to.",
+					},
+					"exec": map[string]interface{}{
+						"type":        "string",
+						"description": "A single command to run on the box; returns its stdout/stderr/exit_code. Omit for config mode (returns the ready ssh command instead).",
+					},
+					"session": map[string]interface{}{
+						"type":        "string",
+						"description": "Run inside a named tmux session on the box (stateful — cd/env/background jobs persist across calls with the same name). Requires `exec`. Needs tmux on the box.",
+					},
+					"user": map[string]interface{}{
+						"type":        "string",
+						"description": "Override the SSH login user (default: the box's SSH username).",
+					},
+					"host": map[string]interface{}{
+						"type":        "string",
+						"description": "Override the SSH host (default: the box's ssh_host, else its IP).",
+					},
+				},
+				"required": []interface{}{"box"},
+			},
+			Handler: handleConnect,
+		},
+		{
+			Name: "list_routes",
+			Description: "List the proxy routes currently registered on the sentinel — the " +
+				"domain → container:port mappings that `expose_port` creates. Returns each " +
+				"route's domain (`fullDomain`), target container IP + port, active state, " +
+				"and any associated app metadata.\n\n" +
+				"Use this to:\n" +
+				"  - Audit what's currently exposed (e.g. before adding a new route, check " +
+				"    that the intended hostname isn't already claimed).\n" +
+				"  - Recover after a session loses track of which containers have which " +
+				"    public URLs.\n" +
+				"  - Filter by `username` to see only one container's routes, or " +
+				"    `active_only=true` to skip disabled ones.\n\n" +
+				"An inactive entry (`active: false`) is a subdomain reservation that has " +
+				"been claimed but not yet bound to a container, and it still counts " +
+				"against the caller's route quota. After a quota error, list without " +
+				"`active_only` to see which reservations are using it.\n\n" +
+				"Read-only — no side effects. For TCP/UDP passthrough routes (raw L4, not " +
+				"HTTPS), those live on a different daemon endpoint — use " +
+				"list_passthrough_routes instead.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"username": map[string]interface{}{
+						"type":        "string",
+						"description": "Restrict to routes whose target container belongs to this username. Empty = no filter.",
+					},
+					"active_only": map[string]interface{}{
+						"type":        "boolean",
+						"description": "If true, omit disabled routes. Default false (include all).",
+					},
+				},
+			},
+			Handler: handleListRoutes,
+		},
+		{
+			Name: "network_guard_status",
+			Description: "Report the backend's tenant-isolation posture: the two Incus NIC-ACL " +
+				"guards (`core`: tenants kept off core-role containers; `tenant`: tenants kept " +
+				"off each other — docs/architecture/tenant-network-guard.md). For each: `mode` " +
+				"(GUARD_MODE_ENFORCE is the default, GUARD_MODE_OFF means the operator disabled " +
+				"it), `firewallDriver`, `unsupported` (this host cannot carry bridge NIC ACLs at " +
+				"all — wrong driver or Incus without network_bridge_acl_devices — so nothing is " +
+				"guarded), `lastPass`, `lastError`, and one entry per guarded container.\n\n" +
+				"Use this before relying on isolation between boxes, or when a box cannot " +
+				"reach a sibling (same tenant) or a core service it should. Wraps the same " +
+				"endpoint as `containarium network-guard status`. Admin role required.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+			Handler: handleNetworkGuardStatus,
+		},
+		{
+			Name: "delete_route",
+			Description: "Remove a proxy route by its domain — the unexpose counterpart of " +
+				"`expose_port`. After this, https://<domain>/ no longer reaches any container, " +
+				"and (on the cloud) the subdomain's quota slot is freed for reuse.\n\n" +
+				"Use this to:\n" +
+				"  - Take an app offline / retire a public hostname.\n" +
+				"  - Clean up a stale route left by a deleted container.\n" +
+				"  - Free a subdomain slot when you've hit your route quota and need to " +
+				"    expose something else.\n\n" +
+				"Idempotent: deleting an already-gone route succeeds (no error). Pass the " +
+				"full domain as shown by `list_routes` (`fullDomain`).",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"domain": map[string]interface{}{
+						"type":        "string",
+						"description": "The route's domain to remove, e.g. 'blog-acme.containarium.dev' (the `fullDomain` from list_routes).",
+					},
+				},
+				"required": []string{"domain"},
+			},
+			Handler: handleDeleteRoute,
+		},
+		{
+			Name: "add_collaborator",
+			Description: "Grant a teammate SSH access to a container — the same capability a " +
+				"human has via `containarium collaborator add`, the REST API, or the dashboard " +
+				"(#1145). The collaborator gets their own account on the container plus a jump-" +
+				"server account for ProxyJump access, and can `sudo su - <owner>` (or full sudo " +
+				"with grant_sudo) once connected. Sessions are logged for auditing.\n\n" +
+				"All keys in ssh_public_keys are authorized, so a collaborator with several " +
+				"machines can connect from any of them.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"owner_username": map[string]interface{}{
+						"type":        "string",
+						"description": "Username of the container's owner (same value used by create_container).",
+					},
+					"collaborator_username": map[string]interface{}{
+						"type":        "string",
+						"description": "Username to grant access to.",
+					},
+					"ssh_public_keys": map[string]interface{}{
+						"type":        "array",
+						"items":       map[string]interface{}{"type": "string"},
+						"description": "The collaborator's SSH public key(s), full authorized_keys line(s) (e.g. 'ssh-ed25519 AAAA...'). At least one is required.",
+					},
+					"grant_sudo": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Grant full sudo (all commands), not just `sudo su - <owner>`. Default false.",
+					},
+					"grant_container_runtime": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Add the collaborator to the docker/podman groups for container-runtime access. Default false.",
+					},
+				},
+				"required": []string{"owner_username", "collaborator_username", "ssh_public_keys"},
+			},
+			Handler: handleAddCollaborator,
+		},
+		{
+			Name: "list_collaborators",
+			Description: "List everyone with SSH access to a container — the owner plus every " +
+				"collaborator added via `add_collaborator` / `containarium collaborator add`. " +
+				"Returns each collaborator's account name, authorized keys, sudo/container-" +
+				"runtime grants, and when they were added. Read-only.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"owner_username": map[string]interface{}{
+						"type":        "string",
+						"description": "Username of the container's owner (same value used by create_container).",
+					},
+				},
+				"required": []string{"owner_username"},
+			},
+			Handler: handleListCollaborators,
+		},
+		{
+			Name: "remove_collaborator",
+			Description: "Revoke a collaborator's SSH access to a container — the inverse of " +
+				"`add_collaborator`. Removes their account on the container and their jump-" +
+				"server account; their sessions end and they can no longer connect.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"owner_username": map[string]interface{}{
+						"type":        "string",
+						"description": "Username of the container's owner (same value used by create_container).",
+					},
+					"collaborator_username": map[string]interface{}{
+						"type":        "string",
+						"description": "Username whose access to revoke (same value passed to add_collaborator).",
+					},
+				},
+				"required": []string{"owner_username", "collaborator_username"},
+			},
+			Handler: handleRemoveCollaborator,
+		},
+		{
+			Name: "expose_port",
+			Description: "Expose a container's port on a public hostname. Resolves the " +
+				"container's IP, then registers a domain → container:port route in the " +
+				"sentinel reverse proxy. After this completes, https://<domain>/ reaches " +
+				"the container's port (the sentinel handles TLS via automatic ACME).\n\n" +
+				"This is typically the LAST step of a deploy flow:\n" +
+				"  create_container → ssh in via Bash → install/configure service → expose_port → curl the URL.\n\n" +
+				"Make sure DNS for <domain> already points at the sentinel (a wildcard A " +
+				"record for `*.<your-subdomain>.<your-zone>` covers all the apps you'll " +
+				"expose during a session). The agent doesn't have to wait for DNS; that's " +
+				"a one-time operator setup.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"username": map[string]interface{}{
+						"type":        "string",
+						"description": "Container identifier (same value used by create_container / get_container).",
+					},
+					"container_port": map[string]interface{}{
+						"type":        "integer",
+						"description": "Port the app listens on inside the container, e.g. 8080.",
+					},
+					"domain": map[string]interface{}{
+						"type":        "string",
+						"description": "Public hostname to route from, e.g. 'blog.example.com'. The sentinel must already be DNS-pointed at this hostname or a wildcard parent.",
+					},
+					"description": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional human-readable note for the route (shown in route_list).",
+					},
+				},
+				"required": []string{"username", "container_port", "domain"},
+			},
+			Handler: handleExposePort,
+		},
+		{
+			Name: "list_passthrough_routes",
+			Description: "List the TCP/UDP passthrough routes currently registered on the " +
+				"daemon — raw L4 port-forwarding rules (no TLS termination) created by " +
+				"`add_passthrough_route`. This is the passthrough counterpart of " +
+				"`list_routes`, which only covers HTTPS proxy routes.\n\n" +
+				"Use this to audit what raw ports are currently forwarded before adding a " +
+				"new one, or to find the external port/protocol of a stale passthrough " +
+				"route you need to remove.\n\n" +
+				"Read-only — no side effects.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+			Handler: handleListPassthroughRoutes,
+		},
+		{
+			Name: "add_passthrough_route",
+			Description: "Create a TCP/UDP passthrough route: forwards an external port on " +
+				"the daemon's host directly to a container's IP:port, with no TLS " +
+				"termination (raw L4). Use this instead of `expose_port` when the traffic " +
+				"needs end-to-end encryption the sentinel shouldn't terminate (e.g. mTLS " +
+				"gRPC) or isn't HTTP at all.\n\n" +
+				"You'll typically need the container's IP from `get_container` first.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"external_port": map[string]interface{}{
+						"type":        "integer",
+						"description": "Port to open on the daemon's host, e.g. 9443. Must be a whole number in 1..65535.",
+					},
+					"target_ip": map[string]interface{}{
+						"type":        "string",
+						"description": "Target container's IP address (from get_container).",
+					},
+					"target_port": map[string]interface{}{
+						"type":        "integer",
+						"description": "Port the app listens on inside the container. Must be a whole number in 1..65535.",
+					},
+					"protocol": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"tcp", "udp"},
+						"description": "Protocol to forward. Defaults to 'tcp' if omitted.",
+					},
+					"container_name": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional: associated container name, shown in list_passthrough_routes.",
+					},
+					"description": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional human-readable note for the route.",
+					},
+				},
+				"required": []string{"external_port", "target_ip", "target_port"},
+			},
+			Handler: handleAddPassthroughRoute,
+		},
+		{
+			Name: "delete_passthrough_route",
+			Description: "Remove a TCP/UDP passthrough route by its external port and " +
+				"protocol — the unexpose counterpart of `add_passthrough_route`. After " +
+				"this, the external port no longer forwards to any container.\n\n" +
+				"Idempotent: deleting an already-gone route succeeds (no error). Pass the " +
+				"`externalPort`/`protocol` shown by `list_passthrough_routes`.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"external_port": map[string]interface{}{
+						"type":        "integer",
+						"description": "External port to remove (the `externalPort` from list_passthrough_routes). Must be a whole number in 1..65535.",
+					},
+					"protocol": map[string]interface{}{
+						"type":        "string",
+						"enum":        []string{"tcp", "udp"},
+						"description": "Protocol of the route to remove. Defaults to 'tcp' if omitted.",
+					},
+				},
+				"required": []string{"external_port"},
+			},
+			Handler: handleDeletePassthroughRoute,
+		},
+		{
+			Name: "list_recipes",
+			Description: "List the platform's built-in recipes. A recipe is a " +
+				"one-command deployment of a GPU/app workload (e.g. ollama, " +
+				"llama.cpp): it provisions a new dedicated container, runs the " +
+				"recipe's image inside it, and exposes its ports. Use this to " +
+				"discover deployable recipe IDs before calling deploy_recipe.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+			Handler: handleListRecipes,
+		},
+		{
+			Name: "deploy_recipe",
+			Description: "Deploy a recipe as a new dedicated container. Provisions " +
+				"the container (with optional GPU passthrough), runs the recipe's " +
+				"image inside it, and exposes the configured ports. In v1 the " +
+				"recipe deploys on the backend this MCP server's daemon manages; " +
+				"GPU recipes require the `gpu` argument. Discover recipe IDs and " +
+				"their parameters with list_recipes. For a guardrail-gated recipe, " +
+				"provide guardrail_input with both staging_ref (a relative dataset " +
+				"directory under the daemon's staging root/<your authenticated subject>, not <name>) and attestation " +
+				"(the signed protobuf JSON from containarium guardrail apply). " +
+				"The daemon verifies the gate before creating the container.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"recipe_id": map[string]interface{}{
+						"type":        "string",
+						"description": "Recipe to deploy, e.g. 'ollama' (see list_recipes).",
+					},
+					"name": map[string]interface{}{
+						"type":        "string",
+						"description": "Identity for the new container (container is named '<name>-container').",
+					},
+					"gpu": map[string]interface{}{
+						"type":        "string",
+						"description": "GPU device ID for passthrough, e.g. '0'. Required for GPU recipes.",
+					},
+					"parameters": map[string]interface{}{
+						"type":        "object",
+						"description": "Recipe parameters as key→value (e.g. {\"model\": \"llama3\"}). See the recipe's declared parameters via list_recipes / get.",
+					},
+					"guardrail_input": map[string]interface{}{
+						"type":        "object",
+						"description": "Optional dataset input for a guardrail-gated recipe; staging_ref and attestation must be provided together.",
+						"properties": map[string]interface{}{
+							"staging_ref": map[string]interface{}{
+								"type": "string", "minLength": 1,
+								"description": "Clean relative dataset directory beneath the daemon's staging root/<your authenticated subject> (not <name>); the dataset must already be staged there.",
+							},
+							"attestation": map[string]interface{}{
+								"type":        "object",
+								"description": "Signed GuardrailAttestation protobuf JSON produced by containarium guardrail apply for the staged dataset; pass the JSON contents, not a local file path.",
+							},
+						},
+						"required": []string{"staging_ref", "attestation"},
+					},
+				},
+				"required": []string{"recipe_id", "name"},
+			},
+			Handler: handleDeployRecipe,
+		},
+		{
+			Name: "list_agent_skills",
+			Description: "List the platform's built-in agent skills. A skill is a " +
+				"packaged, runnable agent: a box (a recipe) plus a typed manifest " +
+				"(system prompt, allowed scopes, allowed peers). Use this to " +
+				"discover skill IDs before calling run_agent_skill.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+			Handler: handleListAgentSkills,
+		},
+		{
+			Name: "list_agent_engines",
+			Description: "Report, for each agent engine (claude/codex/gemini), whether " +
+				"a skill naming it in run_agent_skill would be refused right now, and " +
+				"why not. The same check the daemon enforces on the run itself — no " +
+				"live model call, no bundle inspection. Use this before run_agent_skill " +
+				"to pick an engine that is actually ready, or to explain a refusal.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+			Handler: handleListAgentEngines,
+		},
+		{
+			Name: "run_agent_skill",
+			Description: "Run an agent skill in a box. Provisions the skill's box, " +
+				"mints a token scoped to exactly the skill's allowed_scopes, and " +
+				"seeds the system prompt + token + task input into the box. In " +
+				"Phase 0 the in-box agent loop is the box image's job, so the " +
+				"returned artifact is empty. Discover skill IDs with " +
+				"list_agent_skills.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"skill_id": map[string]interface{}{
+						"type":        "string",
+						"description": "Skill to run, e.g. 'hello-agent' (see list_agent_skills).",
+					},
+					"input_json": map[string]interface{}{
+						"type":        "string",
+						"description": "Task input as a JSON string (defaults to {}).",
+					},
+					"git_source": map[string]interface{}{
+						"type":        "string",
+						"description": "Git clone URL fetched into the run's workspace before the agent starts (e.g. https://github.com/org/repo). Empty = no fetch.",
+					},
+					"git_ref": map[string]interface{}{
+						"type":        "string",
+						"description": "Exact ref to check out for git_source: full SHA (preferred), branch, tag, or refs/pull/N/merge. Empty = the remote's default branch.",
+					},
+					"engine": map[string]interface{}{
+						"type":        "string",
+						"description": "Override the skill manifest's own engine for this run: one of claude, codex, gemini. Refused with the same error a manifest-named engine gets when its provider has no key. Empty = use the manifest.",
+					},
+				},
+				"required": []string{"skill_id"},
+			},
+			Handler: handleRunAgentSkill,
+		},
+		{
+			Name: "call_agent",
+			Description: "Delegate a task to a running peer agent over the " +
+				"agent-to-agent (A2A) transport and return its artifact. The peer " +
+				"must already be running (run_agent_skill). In Phase 1 the peer's " +
+				"in-box A2A server receives the task; until that ships a call " +
+				"returns an error. Discover peer IDs with list_agent_skills.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"to_peer_id": map[string]interface{}{
+						"type":        "string",
+						"description": "Peer skill/agent id to deliver the task to (see list_agent_skills).",
+					},
+					"from_skill_id": map[string]interface{}{
+						"type":        "string",
+						"description": "Calling skill id, for attribution and the future allowed_peers check.",
+					},
+					"input_json": map[string]interface{}{
+						"type":        "string",
+						"description": "Task input as a JSON string (defaults to {}).",
+					},
+				},
+				"required": []string{"to_peer_id"},
+			},
+			Handler: handleCallAgent,
+		},
+		{
+			Name: "list_crews",
+			Description: "List the platform's built-in crews. A crew is a " +
+				"collaborating set of agent skills wired by a topology " +
+				"(pipeline/orchestrator/freeform). Use this to discover crew IDs " +
+				"before calling run_crew.",
+			InputSchema: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+			Handler: handleListCrews,
+		},
+		{
+			Name: "run_crew",
+			Description: "Run a crew: validate its topology against the members' " +
+				"allowed_peers, provision each member's box under one trace id, and " +
+				"return the run handle. Discover crew IDs with list_crews.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"crew_id": map[string]interface{}{
+						"type":        "string",
+						"description": "Crew to run, e.g. 'hello-crew' (see list_crews).",
+					},
+					"input_json": map[string]interface{}{
+						"type":        "string",
+						"description": "Crew input as a JSON string (defaults to {}).",
+					},
+					"model_overrides": map[string]interface{}{
+						"type": "object",
+						"description": "Optional per-member model override, an object of skill id to model id " +
+							"(same as `containarium crew run --model <skill-id>=<model-id>`). The id is passed " +
+							"through as is; a member with no entry keeps its skill's own model. The member needs " +
+							"a named engine. The daemon refuses unusable entries.",
+						"additionalProperties": map[string]interface{}{"type": "string"},
+					},
+				},
+				"required": []string{"crew_id"},
+			},
+			Handler: handleRunCrew,
+		},
+		{
+			Name: "crew_logs",
+			Description: "Read one window of a run's journal (crew or single-skill run): " +
+				"the JSON lines its agent wrote (status, assistant, tool_use, " +
+				"tool_result, error). Returns the bytes plus end_offset; pass " +
+				"end_offset back as start_offset to continue, like tail_log. " +
+				"ended=true once the run's last line is 'run ended'. Same function " +
+				"as `containarium crew logs`.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"run_id": map[string]interface{}{
+						"type":        "string",
+						"description": "Run id (from run_crew or run_agent_skill).",
+					},
+					"skill_id": map[string]interface{}{
+						"type":        "string",
+						"description": "Member whose journal to read. Default: the only member, or the crew's entry skill.",
+					},
+					"start_offset": map[string]interface{}{
+						"type":        "number",
+						"description": "Byte offset to read from (default 0).",
+					},
+					"follow_seconds": map[string]interface{}{
+						"type":        "number",
+						"description": "Wait up to this many seconds (0-10) for new bytes when none are available.",
+					},
+					"gateway_after_seq": map[string]interface{}{
+						"type":        "number",
+						"description": "Return model-gateway call events after this sequence number (default 0); pass the previous gateway_next_seq to continue.",
+					},
+				},
+				"required": []string{"run_id"},
+			},
+			Handler: handleCrewLogs,
+		},
+		{
+			Name: "revoke_token",
+			Description: "Admin: revoke a JWT by its jti. The token is rejected " +
+				"on the next request that names it. Pairs with the daemon's " +
+				"revocation list (Phase 1.2). Idempotent — repeated revokes " +
+				"preserve the original reason. Use when a token leaks, when " +
+				"rotating an agent credential, or when terminating an active " +
+				"session. The jti is in the audit-log entry of any request the " +
+				"token made; you can also base64-decode the JWT payload to find " +
+				"it. Requires admin role AND tokens:write scope.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"jti": map[string]interface{}{
+						"type":        "string",
+						"description": "The token's jti claim (required).",
+					},
+					"reason": map[string]interface{}{
+						"type":        "string",
+						"description": "Free-form reason recorded for forensics (e.g. 'leaked_to_public_gist', 'rotate'). Default: 'operator_revoke'.",
+					},
+					"expires_at": map[string]interface{}{
+						"type":        "string",
+						"description": "RFC3339 timestamp matching the token's own exp claim. Sets the cleanup horizon so the revocation row prunes when the token would have naturally expired. Default: now + daemon max lifetime.",
+					},
+				},
+				"required": []string{"jti"},
+			},
+			Handler: handleRevokeToken,
+		},
+	}
+
+	// Append compose-autostart tools (Phase C — daemon RPC is
+	// shipped in PR #324; these MCP wrappers are the §4 piece of
+	// issue #317). Defined in compose_tools.go so the giant tools
+	// literal above stays readable.
+	s.tools = append(s.tools, composeTools()...)
+
+	// Runner-provision tools (CLI-mirrored). Appended here so the
+	// tools.go slice literal stays focused on container/secret/
+	// route lifecycle; the actual Tool definitions live in
+	// runner_tools.go alongside their handlers.
+	s.tools = append(s.tools, runnerTools()...)
+
+	// Database-backup tools (CLI-mirrored). Defined in backup_tools.go
+	// alongside their handlers; thin wrappers over the BackupService
+	// gateway that `containarium backup` also calls.
+	s.tools = append(s.tools, backupTools()...)
+
+	// KMS admin tools (kms_tools.go) — thin wrappers over the
+	// KmsService gateway that `containarium kms` also calls.
+	s.tools = append(s.tools, kmsTools()...)
+
+	// Guardrail policy read (#2368, guardrail_tools.go); no write tool.
+	s.tools = append(s.tools, guardrailTools()...)
+
+	// Replace-all SSH keys (#2945, ssh_keys_tools.go).
+	s.tools = append(s.tools, sshKeysTools()...)
+
+	// Process policy get/set/release (#2666, process_policy_tools.go) —
+	// thin wrappers over the routes `containarium security process-policy`
+	// also calls.
+	s.tools = append(s.tools, processPolicyTools()...)
+	s.tools = append(s.tools, minerSignatureTools()...)
+
+	// Tracker broker agent-facing verbs (#1922 step 7, tracker_tools.go)
+	// — thin wrappers over the TrackerService gateway that
+	// `containarium tracker issue/change ...` also calls.
+	s.tools = append(s.tools, trackerTools()...)
+	s.tools = append(s.tools, sprintTools()...)
+
+	// Model-gateway mint (#1726, gateway_tools.go) — one thin wrapper over the
+	// ModelGatewayService gateway that `containarium gateway mint` also calls.
+	// The key verbs are operator-gated and deliberately absent.
+	s.tools = append(s.tools, gatewayTools()...)
+	// Coding-tool egress allowlist (#2378): read only; writes are admin CLI.
+	s.tools = append(s.tools, codeEgressTools()...)
+	// SSH session control (#2522): wraps `containarium sessions terminate`.
+	s.tools = append(s.tools, sessionTools()...)
+
+	// Phase 1.7 — assign required scope per tool. Done as a
+	// post-pass so the slice literals above stay short and
+	// the security policy lives in one auditable spot. New
+	// tools added to the slice above MUST also gain an
+	// entry here or they default to `""` (no-scope, allowed
+	// to any token) — see TestEveryToolHasScope which
+	// enforces this in CI.
+	s.tools = append(s.tools, networkTenantCapabilityTool())
+	s.tools = append(s.tools, tenantNetworkTools()...)
+	scopeByTool := toolScopeAssignments()
+	for i := range s.tools {
+		s.tools[i].RequiredScope = scopeByTool[s.tools[i].Name]
+	}
+}
+
+// toolScopeAssignments is the canonical scope-per-tool
+// table. Kept as a function so tests can assert
+// completeness against the registered tool list.
+func toolScopeAssignments() map[string]string {
+	return map[string]string{
+		// coding runs on a box (#1698). code:write is the scope the CLI's
+		// own `code` surface is gated by — starting or stopping an agent
+		// run executes arbitrary code on the box, so it is deliberately NOT
+		// covered by containers:read. code_status/code_attach are reads of
+		// a run's output, but they read a run only this scope could have
+		// started, so they share it rather than widening the read surface.
+		"code_run":    auth.ScopeCodeWrite,
+		"code_attach": auth.ScopeCodeWrite,
+
+		// tracker broker (#1922) — read verbs need tracker:read, write
+		// verbs need tracker:write. Connection CRUD / status are
+		// tracker:admin and deliberately not exposed as MCP tools at
+		// all (see trackerTools's own doc comment).
+		"tracker_get_issue":     auth.ScopeTrackerRead,
+		"tracker_list_issues":   auth.ScopeTrackerRead,
+		"tracker_get_change":    auth.ScopeTrackerRead,
+		"sprint_board":          auth.ScopeTrackerRead,
+		"sprint_list":           auth.ScopeTrackerRead,
+		"tracker_comment":       auth.ScopeTrackerWrite,
+		"tracker_claim":         auth.ScopeTrackerWrite,
+		"tracker_set_labels":    auth.ScopeTrackerWrite,
+		"tracker_submit_change": auth.ScopeTrackerWrite,
+		// #2021: route reads are tracker:admin like the RPC itself, so a
+		// run's tracker:read/write token never sees this tool.
+		// model gateway (#1726): minting a scoped, expiring token for a box
+		// the caller owns is gateway:mint. gateway:admin — which writes the
+		// REAL upstream provider key — has no tool at all, so no agent token
+		// can reach it through MCP however it is scoped.
+		"mint_gateway_token": auth.ScopeGatewayMint,
+		// #2378: reading the coding tool's egress allowlist.
+		"code_egress_policy": auth.ScopeCodeEgressRead,
+
+		"tracker_route_list":   auth.ScopeTrackerAdmin,
+		"tracker_create_issue": auth.ScopeTrackerWrite,
+		"code_status":          auth.ScopeCodeWrite,
+		"code_runs":            auth.ScopeSSHWrite,
+		"code_logs":            auth.ScopeSSHWrite,
+		"code_pending":         auth.ScopeSSHWrite,
+		"code_answer":          auth.ScopeCodeAnswer, // #3191: the daemon also needs ssh:write
+		"code_stop":            auth.ScopeCodeWrite,
+
+		// container lifecycle
+		"create_container":   auth.ScopeContainersWrite,
+		"delete_container":   auth.ScopeContainersWrite,
+		"start_container":    auth.ScopeContainersWrite,
+		"stop_container":     auth.ScopeContainersWrite,
+		"resize_container":   auth.ScopeContainersWrite,
+		"move_container":     auth.ScopeContainersWrite,
+		"toggle_monitoring":  auth.ScopeContainersWrite,
+		"toggle_auto_sleep":  auth.ScopeContainersWrite,
+		"list_containers":    auth.ScopeContainersRead,
+		"get_container":      auth.ScopeContainersRead,
+		"debug_container":    auth.ScopeContainersRead,
+		"get_metrics":        auth.ScopeContainersRead,
+		"get_system_info":    auth.ScopeContainersRead,
+		"check_for_updates":  auth.ScopeContainersRead,
+		"upgrade_backend":    auth.ScopeContainersWrite,
+		"get_upgrade_status": auth.ScopeContainersRead,
+		"list_backends":      auth.ScopeContainersRead,
+		"get_backend":        auth.ScopeContainersRead,
+		// cloud-native metrics export toggle — a system/daemon-level
+		// setting, scoped the same as its closest sibling
+		// (toggle_monitoring / get_system_info) rather than introducing
+		// a new scope for one feature.
+		"set_metrics_export": auth.ScopeContainersWrite,
+		"get_metrics_export": auth.ScopeContainersRead,
+		// validate-gpu creates+deletes a throwaway container (a write op);
+		// the daemon additionally enforces admin role.
+		"backend_validate_gpu": auth.ScopeContainersWrite,
+		// secrets
+		"set_secret":      auth.ScopeSecretsWrite,
+		"delete_secret":   auth.ScopeSecretsWrite,
+		"refresh_secrets": auth.ScopeSecretsWrite,
+		"get_secret":      auth.ScopeSecretsRead,
+		"list_secrets":    auth.ScopeSecretsRead,
+		// routes / network exposure
+		"list_routes": auth.ScopeRoutesRead,
+		// network guards (#2353): read-only security posture.
+		"network_guard_status":        auth.ScopeSecurityRead,
+		"network_tenant_capabilities": auth.ScopeContainersRead,
+		"list_network_policies":       auth.ScopeNetworkPolicyRead,
+		"get_network_policy":          auth.ScopeNetworkPolicyRead,
+		"patch_tenant_access":         auth.ScopeNetworkPolicyWrite,
+		"expose_port":                 auth.ScopeRoutesWrite,
+		"delete_route":                auth.ScopeRoutesWrite,
+		// collaborators (#1145) — container access control, scoped like any
+		// other container write/read (the RPCs themselves gate on
+		// AuthorizeTenant, same as create/delete container).
+		"add_collaborator":    auth.ScopeContainersWrite,
+		"list_collaborators":  auth.ScopeContainersRead,
+		"remove_collaborator": auth.ScopeContainersWrite,
+		// passthrough routes (raw L4, #1550) — scoped the same as their
+		// HTTPS proxy-route siblings above rather than introducing a new
+		// scope for one feature (see set_metrics_export for the same call).
+		"list_passthrough_routes":  auth.ScopeRoutesRead,
+		"add_passthrough_route":    auth.ScopeRoutesWrite,
+		"delete_passthrough_route": auth.ScopeRoutesWrite,
+		// recipes — declarative GPU/app deploys
+		"list_recipes":  auth.ScopeContainersRead,
+		"deploy_recipe": auth.ScopeContainersWrite,
+
+		"list_agent_skills":  auth.ScopeAgentsRead,
+		"list_agent_engines": auth.ScopeAgentsRead,
+		"run_agent_skill":    auth.ScopeAgentsRun,
+		"call_agent":         auth.ScopeAgentsCall,
+		"list_crews":         auth.ScopeCrewsRead,
+		"run_crew":           auth.ScopeCrewsRun,
+		"crew_logs":          auth.ScopeAgentsRead,
+		// database backups
+		"create_backup":  auth.ScopeBackupsWrite,
+		"restore_backup": auth.ScopeBackupsWrite,
+		// A restore test creates and drops a scratch database in an isolated
+		// target container. Only backups:verify authorizes it after the
+		// v0.120.1 deprecation window; backups:write grants no verify access
+		// (#3219).
+		"verify_backup": auth.ScopeBackupsVerify,
+		"list_backups":  auth.ScopeBackupsRead,
+		// KMS envelope-encryption administration (admin-only)
+		"kms_status":              auth.ScopeKMSAdmin,
+		"kms_envelope_coverage":   auth.ScopeKMSAdmin,
+		"kms_migrate_to_envelope": auth.ScopeKMSAdmin,
+		// server-side guardrail policy (#2368): a read of security config,
+		// gated like security_findings. The write has no tool.
+		"guardrail_policy_get": auth.ScopeSecurityRead,
+		// process policy (#2666): get is a read, set/release change what the
+		// responder does to a box — same split as the bad-destination list.
+		"security_process_policy_get":     auth.ScopeSecurityRead,
+		"security_process_policy_set":     auth.ScopeSecurityWrite,
+		"security_process_policy_release": auth.ScopeSecurityWrite,
+		// miner-signature list (#2763): list is a read; add/remove change what
+		// the miner rule matches.
+		"list_miner_signatures":  auth.ScopeSecurityRead,
+		"add_miner_signature":    auth.ScopeSecurityWrite,
+		"remove_miner_signature": auth.ScopeSecurityWrite,
+		// security tools
+		"security_scan":          auth.ScopeSecurityWrite,
+		"security_remediate":     auth.ScopeSecurityWrite,
+		"security_findings":      auth.ScopeSecurityRead,
+		"security_sentry_status": auth.ScopeSecurityRead,
+		// bad-destination list (#1641): list is a read, add/remove mutate
+		// detection config — same split as security_findings vs
+		// security_scan/security_remediate above.
+		"list_bad_destinations":  auth.ScopeSecurityRead,
+		"add_bad_destination":    auth.ScopeSecurityWrite,
+		"remove_bad_destination": auth.ScopeSecurityWrite,
+		// findings delivery + triage (#1643): listing is a read,
+		// resolving mutates a finding's lifecycle state — same split as
+		// the bad-destination list above.
+		"list_security_sentry_findings":   auth.ScopeSecurityRead,
+		"resolve_security_sentry_finding": auth.ScopeSecurityWrite,
+		// install_zap is admin-only (the daemon also enforces
+		// RoleAdmin server-side); scope-gated the same as the other
+		// security-write tools at the MCP layer.
+		"install_zap": auth.ScopeSecurityWrite,
+		// install_clamav runs a package install inside one box; the daemon
+		// authorizes the box owner.
+		"install_clamav": auth.ScopeSecurityWrite,
+		// developer-loop tools
+		"push":            auth.ScopeCodeWrite,
+		"sync":            auth.ScopeCodeWrite,
+		"sync_ssh_config": auth.ScopeSSHWrite,
+		"connect":         auth.ScopeSSHWrite,
+		"set_ssh_keys":    auth.ScopeSSHWrite,
+		// #2522: ending a user's SSH sessions; the daemon also limits a
+		// non-admin caller to its own sessions.
+		"terminate_user_sessions": auth.ScopeSSHWrite,
+		// JWT lifecycle (admin)
+		"revoke_token": auth.ScopeTokensWrite,
+		// Runner provisioning — provision/remove create or delete
+		// boxes; list is read-only. Reuses the containers:* scopes
+		// since the underlying operations are box-level CRUD.
+		"provision_runners": auth.ScopeContainersWrite,
+		"remove_runner":     auth.ScopeContainersWrite,
+		"list_runners":      auth.ScopeContainersRead,
+		// Compose-autostart (platform MCP tools added in #325).
+		// Discovery is read-only; enable/disable + status mutate or
+		// inspect the LXC's systemd-user units. Reuses containers:*
+		// scopes since the operations are box-local lifecycle.
+		"compose_discover": auth.ScopeContainersRead,
+		"compose_status":   auth.ScopeContainersRead,
+		"compose_enable":   auth.ScopeContainersWrite,
+		"compose_disable":  auth.ScopeContainersWrite,
+	}
+}
+
+// Tool handlers
+
+func handleCreateContainer(client API, args map[string]interface{}) (string, error) {
+	if value, exists := args["network_tenant"]; exists {
+		if _, ok := value.(string); !ok {
+			return "", fmt.Errorf("network_tenant must be a string")
+		}
+	}
+	username, ok := args["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+
+	// The REST shim takes the enum by name; UNSPECIFIED is simply not sent.
+	isolation, err := ostype.ParseIsolation(getStringArg(args, "isolation", ""))
+	if err != nil {
+		return "", err
+	}
+	var isolationWire string
+	if isolation != pb.IsolationType_ISOLATION_TYPE_UNSPECIFIED {
+		isolationWire = isolation.String()
+	}
+
+	var osTypeWire string
+	if osTypeStr := getStringArg(args, "os_type", ""); osTypeStr != "" {
+		parsedOSType := ostype.OSTypeFromString(osTypeStr)
+		if parsedOSType == pb.OSType_OS_TYPE_UNSPECIFIED {
+			return "", fmt.Errorf("unknown os_type %q: expected ubuntu, rocky9, rhel9, or windows2022", osTypeStr)
+		}
+		osTypeWire = parsedOSType.String()
+	}
+
+	req := CreateContainerRequest{
+		NetworkTenant: getStringArg(args, "network_tenant", ""),
+		Username:      username,
+		Resources: &ResourceLimits{
+			CPU:    getStringArg(args, "cpu", "4"),
+			Memory: getStringArg(args, "memory", "4GB"),
+			Disk:   getStringArg(args, "disk", "50GB"),
+		},
+		Image:            getStringArg(args, "image", "images:ubuntu/24.04"),
+		EnablePodman:     getBoolArg(args, "enable_podman", true),
+		DisableAutoSleep: getBoolArg(args, "disable_auto_sleep", false),
+		GPU:              getStringArg(args, "gpu", ""),
+		GPUs:             getStringSliceArg(args, "gpus"),
+		Monitoring:       getBoolArg(args, "monitoring", false),
+		Encrypted:        getBoolArg(args, "encrypted", false),
+		TenantID:         getStringArg(args, "tenant_id", ""),
+		Pool:             getStringArg(args, "pool", ""),
+		BackendID:        getStringArg(args, "backend_id", ""),
+		Region:           getStringArg(args, "region", ""),
+		Isolation:        isolationWire,
+		OSType:           osTypeWire,
+	}
+
+	// Handle SSH keys. If the caller passes ssh_keys explicitly we use
+	// them as-is. If they don't, we generate an ephemeral ed25519
+	// keypair CLIENT-SIDE (the private key never travels the network)
+	// and return it in the response. This is the common case for
+	// agent-driven workflows: the agent doesn't have to know about
+	// local file paths or the operator's existing keys.
+	var ephemeralPrivKey []byte
+	if sshKeys, ok := args["ssh_keys"].([]interface{}); ok && len(sshKeys) > 0 {
+		for _, key := range sshKeys {
+			if keyStr, ok := key.(string); ok {
+				req.SSHKeys = append(req.SSHKeys, keyStr)
+			}
+		}
+	} else {
+		pubKey, privKey, err := generateEphemeralSSHKey(
+			fmt.Sprintf("containarium-%s ephemeral key", username),
+		)
+		if err != nil {
+			return "", fmt.Errorf("generate ephemeral ssh key: %w", err)
+		}
+		req.SSHKeys = []string{pubKey}
+		ephemeralPrivKey = privKey
+	}
+
+	resp, err := client.CreateContainer(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to create container: %w", err)
+	}
+
+	result := "✅ Container created successfully!\n\n"
+	result += fmt.Sprintf("Name: %s\n", resp.Container.Name)
+	result += fmt.Sprintf("Username: %s\n", resp.Container.Username)
+	result += fmt.Sprintf("State: %s\n", resp.Container.State)
+	// Surface the RESOLVED backend/pool the box actually landed on. If a
+	// requested backend_id didn't match any host, placement silently falls back
+	// to the default (cloud #686) — showing where it really landed makes that
+	// immediately visible instead of discovering it later via an egress test.
+	if resp.Container.BackendID != "" {
+		result += fmt.Sprintf("Backend: %s\n", resp.Container.BackendID)
+	}
+	if resp.Container.Pool != "" {
+		result += fmt.Sprintf("Pool: %s\n", resp.Container.Pool)
+	}
+	if reqBackend := getStringArg(args, "backend_id", ""); reqBackend != "" && resp.Container.BackendID != "" && resp.Container.BackendID != reqBackend {
+		result += fmt.Sprintf("⚠️  Requested backend_id %q but the box landed on %q (the requested id matched no host; placement used the default).\n",
+			reqBackend, resp.Container.BackendID)
+	}
+	if resp.Container.Network != nil && resp.Container.Network.IPAddress != "" {
+		result += fmt.Sprintf("IP Address: %s\n", resp.Container.Network.IPAddress)
+	}
+	if resp.Container.Resources != nil {
+		result += fmt.Sprintf("CPU: %s\n", resp.Container.Resources.CPU)
+		result += fmt.Sprintf("Memory: %s\n", resp.Container.Resources.Memory)
+		result += fmt.Sprintf("Disk: %s\n", resp.Container.Resources.Disk)
+	}
+	result += fmt.Sprintf("\n%s", resp.Message)
+
+	// Always tell the caller how to reach the box and which tool to use —
+	// independent of whether we generated a key. The daemon stamps ssh_host
+	// with the reachable SSH target (the sentinel this container belongs to,
+	// or empty for a direct deployment), so the caller never has to discover
+	// a host or set CONTAINARIUM_SENTINEL_HOST. Without this, agents that pass
+	// their own ssh_keys got no connection guidance at all and tended to go
+	// hunting for the env var and give up (see issue #658).
+	result += "\n\n--- CONNECTING ---\n"
+	result += "⏳ PROVISIONING TAKES MINUTES: the create is async — the box installs\n"
+	result += "packages and SSH keys AFTER this response returns. Poll get_container\n"
+	result += "until state is RUNNING before attempting SSH; an early SSH failure is\n"
+	result += "NOT an error, and deleting the box because of one aborts a create that\n"
+	result += "was still in progress.\n\n"
+	if resp.Container.SSHHost != "" {
+		result += fmt.Sprintf("SSH target: %s@%s  (resolved from ssh_host — no env/config needed)\n",
+			resp.Container.Username, resp.Container.SSHHost)
+	} else {
+		result += "SSH target: direct / no-sentinel deployment — the daemon reported no\n"
+		result += "ssh_host. Reach the container at its IP"
+		if resp.Container.Network != nil && resp.Container.Network.IPAddress != "" {
+			result += fmt.Sprintf(" (%s)", resp.Container.Network.IPAddress)
+		}
+		result += ", or call sync_ssh_config for an alias.\n"
+	}
+	result += "\nTo run code on this box, prefer the MCP tools — they resolve the SSH\n"
+	result += "target from ssh_host automatically (you do NOT need to know a hostname\n"
+	result += "or set CONTAINARIUM_SENTINEL_HOST):\n"
+	result += "  - connect (exec mode): run a command inside the box.\n"
+	result += "  - push / sync: transfer code into the box.\n"
+
+	if ephemeralPrivKey != nil {
+		// Write the key to the local filesystem ourselves rather than
+		// asking the agent to do it. The agent could forget the save step
+		// (or its context could be compacted between create_container and
+		// the next ssh call), at which point the key is gone — the daemon
+		// never stores a copy. Doing the write here makes "container
+		// created" and "key on disk" a single atomic-from-the-caller's-
+		// perspective operation.
+		savedPath, saveErr := saveEphemeralPrivateKey(resp.Container.Username, ephemeralPrivKey)
+
+		result += "\n\n--- EPHEMERAL SSH PRIVATE KEY ---\n"
+		result += "Caller did not provide ssh_keys, so an ed25519 keypair was\n"
+		result += "generated locally. The public half is already on the container.\n\n"
+		if saveErr == nil {
+			result += fmt.Sprintf("✅ Private key saved: %s (mode 0600)\n\n", savedPath)
+		} else {
+			result += fmt.Sprintf("⚠️  Could not auto-save the private key: %v\n", saveErr)
+			result += "    Save the key text below to a file with mode 0600 yourself.\n\n"
+			result += "Suggested save path:\n"
+			result += fmt.Sprintf("  ~/.containarium/keys/%s\n\n", resp.Container.Username)
+		}
+		result += "To SSH in:\n"
+		// The daemon stamps ssh_host with the sentinel this container belongs
+		// to (from its --ssh-host), so the agent gets a reachable host straight
+		// from create_container — no env, no config. Empty means a direct /
+		// no-sentinel deployment, where the container IP is the way in.
+		sentinelHost := resp.Container.SSHHost
+		if sentinelHost == "" {
+			sentinelHost = "<sentinel-host>"
+		}
+		result += fmt.Sprintf("  ssh -i ~/.containarium/keys/%s \\\n"+
+			"      -o IdentitiesOnly=yes -o PreferredAuthentications=publickey \\\n"+
+			"      %s@%s\n\n",
+			resp.Container.Username, resp.Container.Username, sentinelHost)
+		result += "IdentitiesOnly=yes is REQUIRED — without it ssh offers every key in\n"
+		result += "~/.ssh/, and sshpiper's failtoban counts each rejected offer toward\n"
+		result += "the ban quota. Workstations with several keys can get banned on a\n"
+		result += "single ssh attempt.\n\n"
+		if resp.Container.SSHHost == "" {
+			result += "(The daemon reported no ssh_host for this container — a direct /\n"
+			result += "no-sentinel deployment. SSH to the container's IP directly, or call\n"
+			result += "sync_ssh_config for an alias-based setup.)\n\n"
+		}
+		// Include the key text regardless of save outcome — even on success
+		// it's useful for one-off copy to other machines (vendor laptop,
+		// CI runner, etc.) without re-exporting from the auto-saved file.
+		result += string(ephemeralPrivKey)
+	}
+
+	return result, nil
+}
+
+func handleListContainers(client API, args map[string]interface{}) (string, error) {
+	resp, err := client.ListContainers()
+	if err != nil {
+		return "", fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	if len(resp.Containers) == 0 {
+		return "No containers found.", nil
+	}
+
+	// Count what is actually rendered, not what the daemon claimed (#1214).
+	//
+	// resp.TotalCount is a separate field that can disagree with the list
+	// below — most easily against a daemon that doesn't populate it, since
+	// the MCP server and the daemon are released and upgraded separately.
+	// A summary line that contradicts its own body is a trap for an agent:
+	// "Found 0 container(s)" is the kind of thing a caller acts on, and
+	// concluding a backend is empty (and therefore safe to wipe) has already
+	// cost a live container here once.
+	//
+	// len() cannot drift from what follows it.
+	result := fmt.Sprintf("Found %d container(s):\n\n", len(resp.Containers))
+	for _, container := range resp.Containers {
+		result += fmt.Sprintf("📦 %s\n", container.Name)
+		result += fmt.Sprintf("   Username: %s\n", container.Username)
+		if container.NetworkTenant != "" {
+			result += fmt.Sprintf("   Network Tenant: %s (%s)\n", container.NetworkTenant, container.NetworkTenantSource)
+		}
+		result += fmt.Sprintf("   State: %s\n", container.State)
+		// Show WHERE the box actually runs. A wrong/typo'd backend_id silently
+		// falls back to the default pool, so surfacing the resolved backend is
+		// the fastest way to catch a misplacement (see cloud #686).
+		if container.BackendID != "" {
+			result += fmt.Sprintf("   Backend: %s\n", container.BackendID)
+		}
+		if container.Pool != "" {
+			result += fmt.Sprintf("   Pool: %s\n", container.Pool)
+		}
+		if container.Network != nil && container.Network.IPAddress != "" {
+			result += fmt.Sprintf("   IP: %s\n", container.Network.IPAddress)
+		}
+		if container.Resources != nil {
+			result += fmt.Sprintf("   Resources: CPU=%s, Memory=%s, Disk=%s\n",
+				container.Resources.CPU, container.Resources.Memory, container.Resources.Disk)
+		}
+		result += "\n"
+	}
+
+	return result, nil
+}
+
+func handleGetContainer(client API, args map[string]interface{}) (string, error) {
+	username, ok := args["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+
+	resp, err := client.GetContainer(username)
+	if err != nil {
+		return "", fmt.Errorf("failed to get container: %w", err)
+	}
+
+	// Pretty print as JSON
+	jsonData, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+
+	return string(jsonData), nil
+}
+
+func handleDebugContainer(client API, args map[string]interface{}) (string, error) {
+	username, ok := args["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+
+	resp, err := client.DebugContainer(username)
+	if err != nil {
+		return "", fmt.Errorf("failed to debug container: %w", err)
+	}
+
+	jsonData, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+
+	return string(jsonData), nil
+}
+
+func handleRevokeToken(client API, args map[string]interface{}) (string, error) {
+	jti, _ := args["jti"].(string)
+	if jti == "" {
+		return "", fmt.Errorf("jti is required")
+	}
+	reason, _ := args["reason"].(string)
+	expiresAt, _ := args["expires_at"].(string)
+	msg, err := client.RevokeToken(jti, reason, expiresAt)
+	if err != nil {
+		return "", fmt.Errorf("revoke token: %w", err)
+	}
+	return fmt.Sprintf("✅ revoked jti=%s — %s", jti, msg), nil
+}
+
+func handleSetSecret(client API, args map[string]interface{}) (string, error) {
+	username, _ := args["username"].(string)
+	name, _ := args["name"].(string)
+	value, _ := args["value"].(string)
+	if username == "" || name == "" {
+		return "", fmt.Errorf("username and name are required")
+	}
+	resp, err := client.SetSecret(username, name, value)
+	if err != nil {
+		return "", fmt.Errorf("failed to set secret: %w", err)
+	}
+	return fmt.Sprintf("✅ %s", resp.Message), nil
+}
+
+func handleGetSecret(client API, args map[string]interface{}) (string, error) {
+	username, _ := args["username"].(string)
+	name, _ := args["name"].(string)
+	if username == "" || name == "" {
+		return "", fmt.Errorf("username and name are required")
+	}
+	value, err := client.GetSecret(username, name)
+	if err != nil {
+		return "", fmt.Errorf("failed to get secret: %w", err)
+	}
+	return value, nil
+}
+
+func handleListSecrets(client API, args map[string]interface{}) (string, error) {
+	username, _ := args["username"].(string)
+	if username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	list, err := client.ListSecrets(username)
+	if err != nil {
+		return "", fmt.Errorf("failed to list secrets: %w", err)
+	}
+	if len(list) == 0 {
+		return fmt.Sprintf("(no secrets for %s)", username), nil
+	}
+	b, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal: %w", err)
+	}
+	return string(b), nil
+}
+
+func handleDeleteSecret(client API, args map[string]interface{}) (string, error) {
+	username, _ := args["username"].(string)
+	name, _ := args["name"].(string)
+	if username == "" || name == "" {
+		return "", fmt.Errorf("username and name are required")
+	}
+	if err := client.DeleteSecret(username, name); err != nil {
+		return "", fmt.Errorf("failed to delete secret: %w", err)
+	}
+	return fmt.Sprintf("✅ secret %s deleted", name), nil
+}
+
+func handleRefreshSecrets(client API, args map[string]interface{}) (string, error) {
+	username, _ := args["username"].(string)
+	if username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	resp, err := client.RefreshSecrets(username)
+	if err != nil {
+		return "", fmt.Errorf("failed to refresh secrets: %w", err)
+	}
+	return fmt.Sprintf("✅ %s", resp.Message), nil
+}
+
+func handleResizeContainer(client API, args map[string]interface{}) (string, error) {
+	username, ok := args["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	cpu, _ := args["cpu"].(string)
+	memory, _ := args["memory"].(string)
+	disk, _ := args["disk"].(string)
+	cpuRequest, _ := args["cpu_request"].(string)
+	memoryRequest, _ := args["memory_request"].(string)
+	if cpu == "" && memory == "" && disk == "" && cpuRequest == "" && memoryRequest == "" {
+		return "", fmt.Errorf("at least one of cpu, memory, disk, cpu_request, or memory_request must be provided")
+	}
+
+	resp, err := client.ResizeContainer(username, cpu, memory, disk, memoryRequest, cpuRequest)
+	if err != nil {
+		return "", fmt.Errorf("failed to resize container: %w", err)
+	}
+	return fmt.Sprintf("✅ %s", resp.Message), nil
+}
+
+func handleToggleMonitoring(client API, args map[string]interface{}) (string, error) {
+	username, ok := args["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	enabled, ok := args["enabled"].(bool)
+	if !ok {
+		return "", fmt.Errorf("enabled (bool) is required")
+	}
+
+	resp, err := client.ToggleMonitoring(username, enabled)
+	if err != nil {
+		return "", fmt.Errorf("failed to toggle monitoring: %w", err)
+	}
+	return fmt.Sprintf("✅ %s (monitoring_enabled=%v)", resp.Message, resp.MonitoringEnabled), nil
+}
+
+// handleSetMetricsExport is a thin wrapper over client.SetMetricsExport
+// (#1069) — the same client method the CLI's `containarium monitoring
+// export enable/disable` calls (internal/cmd/monitoring_export.go),
+// per the repo's CLI-first convention.
+func handleSetMetricsExport(client API, args map[string]interface{}) (string, error) {
+	enabled, ok := args["enabled"].(bool)
+	if !ok {
+		return "", fmt.Errorf("enabled (bool) is required")
+	}
+	provider, _ := args["provider"].(string)
+	if enabled && provider == "" {
+		return "", fmt.Errorf("provider is required when enabled=true (e.g. \"gcp\")")
+	}
+	groups := getStringSliceArg(args, "groups")
+
+	resp, err := client.SetMetricsExport(enabled, provider, groups)
+	if err != nil {
+		return "", fmt.Errorf("failed to set metrics export: %w", err)
+	}
+	return fmt.Sprintf("✅ %s (enabled=%v, provider=%s, groups=%s, interval_seconds=%d)",
+		resp.Message, resp.Enabled, resp.Provider, metricsExportGroupsDisplay(resp.Groups), resp.IntervalSeconds), nil
+}
+
+// metricsExportGroupsDisplay renders the wire group-enum names as the
+// lowercase tokens an operator uses on the CLI (#1081); an empty set
+// shows as "host", the server's effective default.
+func metricsExportGroupsDisplay(groups []string) string {
+	if len(groups) == 0 {
+		return "host"
+	}
+	out := make([]string, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, strings.ToLower(strings.TrimPrefix(g, "CLOUD_METRICS_GROUP_")))
+	}
+	return strings.Join(out, ",")
+}
+
+// handleGetMetricsExport is a thin wrapper over client.GetMetricsExport
+// (#1069) — the same client method the CLI's `containarium monitoring
+// export status` calls.
+func handleGetMetricsExport(client API, args map[string]interface{}) (string, error) {
+	resp, err := client.GetMetricsExport()
+	if err != nil {
+		return "", fmt.Errorf("failed to get metrics export status: %w", err)
+	}
+	if !resp.Enabled {
+		return "cloud metrics export: disabled", nil
+	}
+	msg := fmt.Sprintf("cloud metrics export: enabled (provider=%s, groups=%s, interval_seconds=%d)", resp.Provider, metricsExportGroupsDisplay(resp.Groups), resp.IntervalSeconds)
+	if resp.LastSuccessAt != "" {
+		msg += fmt.Sprintf(", last_success_at=%s", resp.LastSuccessAt)
+	}
+	if resp.LastError != "" {
+		msg += fmt.Sprintf(", last_error=%s", resp.LastError)
+	}
+	if resp.ExportFailures > 0 {
+		msg += fmt.Sprintf(", export_failures=%d", resp.ExportFailures)
+	}
+	return msg, nil
+}
+
+func handleDeleteContainer(client API, args map[string]interface{}) (string, error) {
+	username, ok := args["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+
+	force := getBoolArg(args, "force", false)
+
+	// Best-effort: capture WHERE the box ran before deleting, so the
+	// confirmation states which backend/pool it was removed from. The delete
+	// response doesn't carry placement, and a lookup failure is non-fatal — the
+	// delete still proceeds.
+	var backend, pool string
+	if info, gerr := client.GetContainer(username); gerr == nil && info != nil {
+		backend, pool = info.Container.BackendID, info.Container.Pool
+	}
+
+	resp, err := client.DeleteContainer(username, force)
+	if err != nil {
+		return "", fmt.Errorf("failed to delete container: %w", err)
+	}
+
+	out := fmt.Sprintf("✅ %s", resp.Message)
+	if backend != "" {
+		out += fmt.Sprintf("\n   Backend: %s", backend)
+	}
+	if pool != "" {
+		out += fmt.Sprintf("\n   Pool: %s", pool)
+	}
+	return out, nil
+}
+
+func handleStartContainer(client API, args map[string]interface{}) (string, error) {
+	username, ok := args["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	waitForReady := getBoolArg(args, "waitForReady", false)
+
+	resp, err := client.StartContainer(username, waitForReady)
+	if err != nil {
+		return "", fmt.Errorf("failed to start container: %w", err)
+	}
+
+	if resp.ReadyTimedOut {
+		return fmt.Sprintf("⚠ %s (readiness probe timed out)\nContainer state: %s", resp.Message, resp.Container.State), nil
+	}
+	return fmt.Sprintf("✅ %s\nContainer state: %s", resp.Message, resp.Container.State), nil
+}
+
+func handleToggleAutoSleep(client API, args map[string]interface{}) (string, error) {
+	username, ok := args["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	enabled, ok := args["enabled"].(bool)
+	if !ok {
+		return "", fmt.Errorf("enabled (bool) is required")
+	}
+	idle := int32(0)
+	if n, ok := getIntArg(args, "idleThresholdMinutes"); ok {
+		idle = safecast.I32(n)
+	}
+
+	resp, err := client.ToggleAutoSleep(username, enabled, idle)
+	if err != nil {
+		return "", fmt.Errorf("failed to toggle auto-sleep: %w", err)
+	}
+	return fmt.Sprintf("✅ %s (auto_sleep_enabled=%v, idle_threshold_minutes=%d)",
+		resp.Message, resp.AutoSleepEnabled, resp.IdleThresholdMinutes), nil
+}
+
+func handleStopContainer(client API, args map[string]interface{}) (string, error) {
+	username, ok := args["username"].(string)
+	if !ok || username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+
+	force := getBoolArg(args, "force", false)
+
+	resp, err := client.StopContainer(username, force)
+	if err != nil {
+		return "", fmt.Errorf("failed to stop container: %w", err)
+	}
+
+	return fmt.Sprintf("✅ %s\nContainer state: %s", resp.Message, resp.Container.State), nil
+}
+
+func handleGetMetrics(client API, args map[string]interface{}) (string, error) {
+	username := getStringArg(args, "username", "")
+
+	resp, err := client.GetMetrics(username)
+	if err != nil {
+		return "", fmt.Errorf("failed to get metrics: %w", err)
+	}
+
+	if len(resp.Metrics) == 0 {
+		return "No metrics available.", nil
+	}
+
+	result := fmt.Sprintf("Container Metrics (%d container(s)):\n\n", len(resp.Metrics))
+	for _, m := range resp.Metrics {
+		result += fmt.Sprintf("📊 %s\n", m.Name)
+		result += fmt.Sprintf("   CPU Usage: %d seconds\n", m.CPUUsageSeconds)
+		result += fmt.Sprintf("   Memory: %d MB / %d MB peak\n",
+			m.MemoryUsageBytes/1024/1024, m.MemoryPeakBytes/1024/1024)
+		result += fmt.Sprintf("   Disk: %d MB\n", m.DiskUsageBytes/1024/1024)
+		result += fmt.Sprintf("   Network: ↓%d MB ↑%d MB\n",
+			m.NetworkRxBytes/1024/1024, m.NetworkTxBytes/1024/1024)
+		result += fmt.Sprintf("   Processes: %d\n", m.ProcessCount)
+		result += formatCPUThrottling(m)
+		result += "\n"
+	}
+
+	return result, nil
+}
+
+// formatCPUThrottling renders the CFS throttling counters as a one-line
+// diagnostic (#1573).
+//
+// This is the line that separates a *throttled* box from an *idle* one. CPU
+// usage alone reads as the same low number in both cases, which is what made
+// "give the box more CPU" look like a plausible remedy for a slow box — a
+// remedy that cannot work, because Containarium's CPU numbers are ceilings
+// rather than reservations (#1571).
+//
+// A zero period count means the runtime reported no signal at all (K8s boxes,
+// a cgroup with no bandwidth limit, a stopped container) — say so explicitly
+// rather than printing "0% throttled", which would read as a positive finding
+// of "not throttled" when nothing was actually measured.
+func formatCPUThrottling(m ContainerMetrics) string {
+	if m.CPUNrPeriods == 0 {
+		return "   CPU Throttling: not reported\n"
+	}
+	pct := float64(m.CPUNrThrottled) / float64(m.CPUNrPeriods) * 100
+	return fmt.Sprintf("   CPU Throttling: %d/%d periods (%.1f%%), %.1fs throttled\n",
+		m.CPUNrThrottled, m.CPUNrPeriods, pct, float64(m.CPUThrottledUsec)/1e6)
+}
+
+func handleGetSystemInfo(client API, args map[string]interface{}) (string, error) {
+	resp, err := client.GetSystemInfo()
+	if err != nil {
+		return "", fmt.Errorf("failed to get system info: %w", err)
+	}
+
+	result := "🖥️  System Information:\n\n"
+	result += fmt.Sprintf("Hostname: %s\n", resp.Info.Hostname)
+	result += fmt.Sprintf("OS: %s\n", resp.Info.OS)
+	result += fmt.Sprintf("Kernel: %s\n", resp.Info.KernelVersion)
+	result += fmt.Sprintf("Incus Version: %s\n", resp.Info.IncusVersion)
+	if resp.Info.DaemonVersion != "" {
+		result += fmt.Sprintf("Daemon Version: %s\n", resp.Info.DaemonVersion)
+	}
+	result += "\nContainers:\n"
+	result += fmt.Sprintf("  Running: %d\n", resp.Info.ContainersRunning)
+	result += fmt.Sprintf("  Stopped: %d\n", resp.Info.ContainersStopped)
+	result += fmt.Sprintf("  Total: %d\n", resp.Info.ContainersTotal)
+
+	result += "\n" + formatCPUBudget(resp.Info)
+	result += formatStoragePools(resp.Info.StoragePools)
+
+	// OTLP endpoint: where monitoring=true containers ship telemetry.
+	// Point docker-in-LXC apps here when they can't inherit the
+	// env-stamped OTEL_EXPORTER_OTLP_ENDPOINT. See #370.
+	if resp.Info.OTelCollectorEndpoint != "" {
+		result += fmt.Sprintf("\nOTel collector (OTLP/HTTP): %s\n", resp.Info.OTelCollectorEndpoint)
+	} else {
+		result += "\nOTel collector: not configured (app monitoring unavailable)\n"
+	}
+
+	return result, nil
+}
+
+func handleBackendValidateGPU(client API, args map[string]interface{}) (string, error) {
+	backendID, _ := args["backend_id"].(string)
+	pci, _ := args["pci"].(string)
+
+	resp, err := client.ValidateGPU(backendID, pci)
+	if err != nil {
+		return "", fmt.Errorf("validate GPU: %w", err)
+	}
+
+	target := resp.BackendID
+	if target == "" {
+		target = "(local)"
+	}
+	if resp.Status == "GPU_STATUS_OK" {
+		return fmt.Sprintf("✓ GPU passthrough OK on %s: %s (driver %s)", target, resp.GpuModel, resp.DriverVersion), nil
+	}
+	status := strings.TrimPrefix(resp.Status, "GPU_STATUS_")
+	return fmt.Sprintf("✗ GPU passthrough %s on %s: %s", status, target, resp.Detail), nil
+}
+
+func handleCheckForUpdates(client API, args map[string]interface{}) (string, error) {
+	resp, err := client.GetLatestRelease()
+	if err != nil {
+		return "", fmt.Errorf("failed to check for updates: %w", err)
+	}
+	result := fmt.Sprintf("Running version:  %s\n", resp.CurrentVersion)
+	result += fmt.Sprintf("Sentinel serves:  %s\n", releasecheck.TargetSummary(resp.TargetVersion, resp.LatestRelease))
+	if resp.LatestRelease == "" {
+		result += "Latest release:   unknown (GitHub lookup unavailable)\n"
+		return result, nil
+	}
+	result += fmt.Sprintf("Latest release:   %s\n", resp.LatestRelease)
+	if resp.UpdateAvailable {
+		result += fmt.Sprintf("\n⚠ Update available: %s → %s\n", resp.CurrentVersion, resp.LatestRelease)
+	} else {
+		result += "\n✓ Up to date\n"
+	}
+	return result, nil
+}
+
+func handleUpgradeBackend(client API, args map[string]interface{}) (string, error) {
+	backendID, _ := args["backend_id"].(string)
+	force, _ := args["force"].(bool)
+	githubTag, _ := args["github_tag"].(string)
+	allowDowngrade, _ := args["allow_downgrade"].(bool)
+	resp, err := client.TriggerUpgrade(TriggerUpgradeRequest{
+		BackendID: backendID, Force: force, GithubTag: githubTag, AllowDowngrade: allowDowngrade,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to trigger upgrade: %w", err)
+	}
+	target := resp.BackendID
+	if target == "" {
+		target = "(local)"
+	}
+	result := fmt.Sprintf("Upgrade %s on %s (job %s)\n", resp.Status, target, resp.UpgradeID)
+	if resp.CurrentVersion != "" {
+		result += fmt.Sprintf("  from version: %s\n", resp.CurrentVersion)
+	}
+	if resp.TargetVersion != "" {
+		result += fmt.Sprintf("  to version:   %s\n", resp.TargetVersion)
+	}
+	if resp.Message != "" {
+		result += fmt.Sprintf("  %s\n", resp.Message)
+	}
+	return result, nil
+}
+
+func handleGetUpgradeStatus(client API, args map[string]interface{}) (string, error) {
+	upgradeID, _ := args["upgrade_id"].(string)
+	if upgradeID == "" {
+		return "", fmt.Errorf("upgrade_id is required")
+	}
+	resp, err := client.GetUpgradeStatus(upgradeID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get upgrade status: %w", err)
+	}
+	result := fmt.Sprintf("Status:   %s\n", resp.Status)
+	if resp.CurrentVersion != "" {
+		result += fmt.Sprintf("Version:  %s\n", resp.CurrentVersion)
+	}
+	if resp.TargetVersion != "" {
+		result += fmt.Sprintf("Target:   %s\n", resp.TargetVersion)
+	}
+	if resp.CompletedAt != "" {
+		result += fmt.Sprintf("Done at:  %s\n", resp.CompletedAt)
+	}
+	if resp.Error != "" {
+		result += fmt.Sprintf("Error:    %s\n", resp.Error)
+	}
+	if resp.Status == "unknown" {
+		result += "\n(unknown id — if you just triggered a local upgrade, the daemon restarted and dropped the job; confirm via list_backends.)\n"
+	}
+	return result, nil
+}
+
+func handleListBackends(client API, args map[string]interface{}) (string, error) {
+	resp, err := client.ListBackends()
+	if err != nil {
+		return "", fmt.Errorf("failed to list backends: %w", err)
+	}
+	if len(resp.Backends) == 0 {
+		return "No backends registered (running standalone, no peers).", nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Found %d backend(s):\n\n", len(resp.Backends))
+	for i := range resp.Backends {
+		writeBackendDetail(&b, &resp.Backends[i])
+		b.WriteString("\n")
+	}
+	return b.String(), nil
+}
+
+func handleGetBackend(client API, args map[string]interface{}) (string, error) {
+	id, ok := args["id"].(string)
+	if !ok || id == "" {
+		return "", fmt.Errorf("id is required")
+	}
+	bk, err := client.GetBackend(id)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	writeBackendDetail(&b, bk)
+	return b.String(), nil
+}
+
+// writeBackendDetail renders one Backend in the same shape used by both
+// list_backends and get_backend so the agent sees a consistent format.
+func writeBackendDetail(b *strings.Builder, bk *Backend) {
+	health := "✓ healthy"
+	if !bk.Healthy {
+		health = "✗ unhealthy"
+	}
+	fmt.Fprintf(b, "🖥️  %s  (%s, %s)\n", bk.ID, bk.Type, health)
+	if bk.Hostname != "" {
+		fmt.Fprintf(b, "   Hostname:   %s\n", bk.Hostname)
+	}
+	if bk.OS != "" {
+		fmt.Fprintf(b, "   OS:         %s\n", bk.OS)
+	}
+	if bk.Version != "" {
+		fmt.Fprintf(b, "   Version:    %s\n", bk.Version)
+	}
+	if bk.IncusVersion != "" {
+		fmt.Fprintf(b, "   Incus:      %s\n", bk.IncusVersion)
+	}
+	fmt.Fprintf(b, "   Containers: %d running\n", bk.ContainerCount)
+	if bk.UptimeSeconds > 0 {
+		fmt.Fprintf(b, "   Uptime:     %s\n", formatUptime(int64(bk.UptimeSeconds)))
+	}
+	if bk.LastSeenAt != "" && bk.Type != "local" {
+		fmt.Fprintf(b, "   Last seen:  %s\n", bk.LastSeenAt)
+	}
+	if len(bk.GPUs) > 0 {
+		fmt.Fprintf(b, "   GPUs:\n")
+		for _, g := range bk.GPUs {
+			vram := ""
+			if g.VRAMBytes > 0 {
+				vram = fmt.Sprintf(" — %s VRAM", humanBytes(int64(g.VRAMBytes)))
+			}
+			fmt.Fprintf(b, "     - %s %s%s\n", g.Vendor, g.ModelName, vram)
+		}
+	}
+}
+
+// formatUptime converts seconds into a human string like "3d4h" or "1h30m".
+// Bias toward terse — agents render this verbatim.
+func formatUptime(seconds int64) string {
+	d := seconds / 86400
+	h := (seconds % 86400) / 3600
+	m := (seconds % 3600) / 60
+	switch {
+	case d > 0:
+		return fmt.Sprintf("%dd%dh", d, h)
+	case h > 0:
+		return fmt.Sprintf("%dh%dm", h, m)
+	default:
+		return fmt.Sprintf("%dm", m)
+	}
+}
+
+// humanBytes formats sizes like "24 GiB" for VRAM, where the source
+// is a power-of-two byte count.
+func humanBytes(n int64) string {
+	const k = 1024
+	switch {
+	case n >= k*k*k*k:
+		return fmt.Sprintf("%.1f TiB", float64(n)/float64(k*k*k*k))
+	case n >= k*k*k:
+		return fmt.Sprintf("%.0f GiB", float64(n)/float64(k*k*k))
+	case n >= k*k:
+		return fmt.Sprintf("%.0f MiB", float64(n)/float64(k*k))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+func handleListRoutes(client API, args map[string]interface{}) (string, error) {
+	username := getStringArg(args, "username", "")
+	activeOnly := getBoolArg(args, "active_only", false)
+
+	resp, err := client.ListRoutes(username, activeOnly)
+	if err != nil {
+		return "", fmt.Errorf("failed to list routes: %w", err)
+	}
+
+	out, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+	return string(out), nil
+}
+
+func handleNetworkGuardStatus(client API, _ map[string]interface{}) (string, error) {
+	resp, err := client.GetNetworkGuardStatus()
+	if err != nil {
+		return "", fmt.Errorf("failed to read network guard status: %w", err)
+	}
+	out, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+	return string(out), nil
+}
+
+func handleDeleteRoute(client API, args map[string]interface{}) (string, error) {
+	domain := getStringArg(args, "domain", "")
+	if domain == "" {
+		return "", fmt.Errorf("domain is required")
+	}
+	if err := client.DeleteRoute(domain); err != nil {
+		return "", fmt.Errorf("failed to delete route %s: %w", domain, err)
+	}
+	return fmt.Sprintf("✅ Deleted route %s — it no longer reaches any container.", domain), nil
+}
+
+func handleAddCollaborator(client API, args map[string]interface{}) (string, error) {
+	ownerUsername := getStringArg(args, "owner_username", "")
+	if ownerUsername == "" {
+		return "", fmt.Errorf("owner_username is required")
+	}
+	collaboratorUsername := getStringArg(args, "collaborator_username", "")
+	if collaboratorUsername == "" {
+		return "", fmt.Errorf("collaborator_username is required")
+	}
+	sshPublicKeys := getStringSliceArg(args, "ssh_public_keys")
+	if len(sshPublicKeys) == 0 {
+		return "", fmt.Errorf("ssh_public_keys is required (at least one key)")
+	}
+
+	resp, err := client.AddCollaborator(AddCollaboratorRequest{
+		OwnerUsername:         ownerUsername,
+		CollaboratorUsername:  collaboratorUsername,
+		SSHPublicKeys:         sshPublicKeys,
+		GrantSudo:             getBoolArg(args, "grant_sudo", false),
+		GrantContainerRuntime: getBoolArg(args, "grant_container_runtime", false),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to add collaborator: %w", err)
+	}
+
+	out, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+	return string(out), nil
+}
+
+func handleListCollaborators(client API, args map[string]interface{}) (string, error) {
+	ownerUsername := getStringArg(args, "owner_username", "")
+	if ownerUsername == "" {
+		return "", fmt.Errorf("owner_username is required")
+	}
+
+	resp, err := client.ListCollaborators(ownerUsername)
+	if err != nil {
+		return "", fmt.Errorf("failed to list collaborators: %w", err)
+	}
+
+	out, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+	return string(out), nil
+}
+
+func handleRemoveCollaborator(client API, args map[string]interface{}) (string, error) {
+	ownerUsername := getStringArg(args, "owner_username", "")
+	if ownerUsername == "" {
+		return "", fmt.Errorf("owner_username is required")
+	}
+	collaboratorUsername := getStringArg(args, "collaborator_username", "")
+	if collaboratorUsername == "" {
+		return "", fmt.Errorf("collaborator_username is required")
+	}
+
+	if _, err := client.RemoveCollaborator(ownerUsername, collaboratorUsername); err != nil {
+		return "", fmt.Errorf("failed to remove collaborator: %w", err)
+	}
+	return fmt.Sprintf("✅ Removed %s's access to %s's container.", collaboratorUsername, ownerUsername), nil
+}
+
+func handleExposePort(client API, args map[string]interface{}) (string, error) {
+	port, _ := getIntArg(args, "container_port")
+	res, err := expose.Run(context.Background(), &mcpExposeAdapter{c: client}, expose.Options{
+		Username:      getStringArg(args, "username", ""),
+		ContainerPort: port,
+		Domain:        getStringArg(args, "domain", ""),
+		Description:   getStringArg(args, "description", ""),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	out := fmt.Sprintf("✅ Exposed %s:%d → %s\n\n",
+		getStringArg(args, "username", ""), port, res.Domain)
+	out += fmt.Sprintf("Domain:    %s\n", res.Domain)
+	out += fmt.Sprintf("Target:    %s:%d\n", res.ContainerIP, res.Port)
+	if res.ContainerName != "" {
+		out += fmt.Sprintf("Container: %s\n", res.ContainerName)
+	}
+	if res.Message != "" {
+		out += fmt.Sprintf("\n%s", res.Message)
+	}
+	out += "\n\nNext: confirm DNS for this hostname points at the sentinel, then\n"
+	out += fmt.Sprintf("`curl https://%s/` should reach the app inside %s.",
+		res.Domain, getStringArg(args, "username", ""))
+	return out, nil
+}
+
+// passthroughProtocolToProto maps the tool's friendly "tcp"/"udp" input to
+// the proto enum's wire name, matching how the daemon's grpc-gateway
+// (UseEnumNumbers: false) both emits and accepts RouteProtocol. Empty
+// defaults to TCP — the same default network_server.go's AddPassthroughRoute
+// applies when the protocol is unset.
+func passthroughProtocolToProto(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "tcp":
+		return "ROUTE_PROTOCOL_TCP", nil
+	case "udp":
+		return "ROUTE_PROTOCOL_UDP", nil
+	default:
+		return "", fmt.Errorf("protocol must be 'tcp' or 'udp', got %q", s)
+	}
+}
+
+// protoProtocolToFriendly is the inverse of passthroughProtocolToProto, for
+// rendering a route's protocol back to callers as "tcp"/"udp" instead of
+// the proto enum name.
+func protoProtocolToFriendly(s string) string {
+	switch s {
+	case "ROUTE_PROTOCOL_UDP":
+		return "udp"
+	case "ROUTE_PROTOCOL_TCP":
+		return "tcp"
+	default:
+		return s
+	}
+}
+
+// getPortArg reads a TCP/UDP port argument as a validated int32: present,
+// a whole number (a JSON float like 9443.7 would otherwise silently
+// truncate to 9443 via getIntArg — routing traffic to a port the caller
+// never actually specified, with no error to say so), and in 1..65535.
+func getPortArg(args map[string]interface{}, key string) (int32, error) {
+	if f, ok := args[key].(float64); ok && f != math.Trunc(f) {
+		return 0, fmt.Errorf("%s must be a whole number, got %v", key, f)
+	}
+	v, ok := getIntArg(args, key)
+	if !ok {
+		return 0, fmt.Errorf("%s is required", key)
+	}
+	if v <= 0 || v > 65535 {
+		return 0, fmt.Errorf("%s must be between 1 and 65535, got %d", key, v)
+	}
+	return safecast.I32(v), nil
+}
+
+func handleListPassthroughRoutes(client API, _ map[string]interface{}) (string, error) {
+	resp, err := client.ListPassthroughRoutes()
+	if err != nil {
+		return "", fmt.Errorf("failed to list passthrough routes: %w", err)
+	}
+
+	out, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal response: %w", err)
+	}
+	return string(out), nil
+}
+
+func handleAddPassthroughRoute(client API, args map[string]interface{}) (string, error) {
+	externalPort, err := getPortArg(args, "external_port")
+	if err != nil {
+		return "", err
+	}
+	targetIP := getStringArg(args, "target_ip", "")
+	if targetIP == "" {
+		return "", fmt.Errorf("target_ip is required")
+	}
+	targetPort, err := getPortArg(args, "target_port")
+	if err != nil {
+		return "", err
+	}
+	protocol, err := passthroughProtocolToProto(getStringArg(args, "protocol", ""))
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := client.AddPassthroughRoute(AddPassthroughRouteRequest{
+		ExternalPort:  externalPort,
+		TargetIP:      targetIP,
+		TargetPort:    targetPort,
+		Protocol:      protocol,
+		ContainerName: getStringArg(args, "container_name", ""),
+		Description:   getStringArg(args, "description", ""),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to add passthrough route: %w", err)
+	}
+
+	out := fmt.Sprintf("✅ Passthrough route added: %s:%d → %s:%d\n\n",
+		protoProtocolToFriendly(protocol), externalPort, targetIP, targetPort)
+	out += fmt.Sprintf("External:  %d\n", resp.Route.ExternalPort)
+	out += fmt.Sprintf("Target:    %s:%d\n", resp.Route.TargetIP, resp.Route.TargetPort)
+	if resp.Route.ContainerName != "" {
+		out += fmt.Sprintf("Container: %s\n", resp.Route.ContainerName)
+	}
+	if resp.Message != "" {
+		out += fmt.Sprintf("\n%s", resp.Message)
+	}
+	return out, nil
+}
+
+func handleDeletePassthroughRoute(client API, args map[string]interface{}) (string, error) {
+	externalPort, err := getPortArg(args, "external_port")
+	if err != nil {
+		return "", err
+	}
+	protocol, err := passthroughProtocolToProto(getStringArg(args, "protocol", ""))
+	if err != nil {
+		return "", err
+	}
+	if err := client.DeletePassthroughRoute(externalPort, protocol); err != nil {
+		return "", fmt.Errorf("failed to delete passthrough route %d/%s: %w", externalPort, protoProtocolToFriendly(protocol), err)
+	}
+	return fmt.Sprintf("✅ Deleted passthrough route %s:%d — it no longer forwards to any container.",
+		protoProtocolToFriendly(protocol), externalPort), nil
+}
+
+func handleListRecipes(client API, _ map[string]interface{}) (string, error) {
+	resp, err := client.ListRecipes()
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Recipes) == 0 {
+		return "No recipes available.", nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%-12s %-10s %-30s %s\n", "ID", "GPU", "IMAGE", "DESCRIPTION")
+	for _, r := range resp.Recipes {
+		gpu := "no"
+		if r.RequiresGPU {
+			gpu = "required"
+		}
+		fmt.Fprintf(&b, "%-12s %-10s %-30s %s\n", r.ID, gpu, r.Image, r.Description)
+	}
+	return b.String(), nil
+}
+
+// deployRecipeArgs decodes the MCP boundary; guardrail_input is decoded
+// with protojson so its attestation retains protobuf wire semantics.
+type deployRecipeArgs struct {
+	RecipeID       string                 `json:"recipe_id"`
+	Name           string                 `json:"name"`
+	GPU            string                 `json:"gpu"`
+	Parameters     map[string]interface{} `json:"parameters"`
+	GuardrailInput json.RawMessage        `json:"guardrail_input"`
+}
+
+// handleDeployRecipe validates the optional gate input before calling the
+// same typed recipe deploy used by the CLI.
+func handleDeployRecipe(client API, args map[string]interface{}) (string, error) {
+	raw, err := json.Marshal(args)
+	if err != nil {
+		return "", fmt.Errorf("encode deploy_recipe arguments: %w", err)
+	}
+	var input deployRecipeArgs
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return "", fmt.Errorf("decode deploy_recipe arguments: %w", err)
+	}
+	var gate *pb.GuardrailGateInput
+	if len(input.GuardrailInput) != 0 && string(input.GuardrailInput) != "null" {
+		gate = &pb.GuardrailGateInput{}
+		if err := protojson.Unmarshal(input.GuardrailInput, gate); err != nil {
+			return "", fmt.Errorf("decode guardrail_input: %w", err)
+		}
+		if gate.GetStagingRef() == "" || gate.GetAttestation() == nil {
+			return "", fmt.Errorf("guardrail_input.staging_ref and guardrail_input.attestation must be provided together")
+		}
+	}
+	params := map[string]string{}
+	for k, v := range input.Parameters {
+		params[k] = fmt.Sprintf("%v", v)
+	}
+	resp, err := client.DeployRecipe(DeployRecipeRequest{
+		RecipeID:       input.RecipeID,
+		Name:           input.Name,
+		GPU:            input.GPU,
+		Parameters:     params,
+		GuardrailInput: gate,
+	})
+	if err != nil {
+		return "", err
+	}
+	out := fmt.Sprintf("✅ %s\n", resp.Message)
+	if resp.URL != "" {
+		out += fmt.Sprintf("URL:       %s\n", resp.URL)
+	}
+	if resp.Container != nil {
+		out += fmt.Sprintf("Container: %s (%s)\n", resp.Container.Name, resp.Container.State)
+	}
+	return out, nil
+}
+
+func handleListAgentSkills(client API, _ map[string]interface{}) (string, error) {
+	resp, err := client.ListAgentSkills()
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Skills) == 0 {
+		return "No agent skills available.", nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%-16s %-16s %-24s %s\n", "ID", "BOX", "SCOPES", "DESCRIPTION")
+	for _, s := range resp.Skills {
+		fmt.Fprintf(&b, "%-16s %-16s %-24s %s\n",
+			s.ID, s.RecipeID, strings.Join(s.AllowedScopes, ","), s.Description)
+	}
+	return b.String(), nil
+}
+
+func handleListAgentEngines(client API, _ map[string]interface{}) (string, error) {
+	resp, err := client.ListAgentEngines()
+	if err != nil {
+		return "", err
+	}
+	owner := resp.KeyOwner
+	if owner == "" {
+		owner = "(global — admin view, or direct mode)"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Key owner: %s\n\n", owner)
+	fmt.Fprintf(&b, "%-8s %-10s %-20s %-8s %-20s %s\n", "ENGINE", "PROVIDER", "READY", "DEFAULT", "SKILLS", "REASON")
+	for _, e := range resp.Engines {
+		skills := strings.Join(e.SkillIDs, ",")
+		if skills == "" {
+			skills = "-"
+		}
+		fmt.Fprintf(&b, "%-8s %-10s %-20s %-8v %-20s %s\n",
+			trimEnumString(e.Engine, "AGENT_ENGINE_"),
+			trimEnumString(e.Provider, "GATEWAY_PROVIDER_"),
+			trimEnumString(e.Readiness, "AGENT_ENGINE_READINESS_"),
+			e.IsDefault,
+			skills,
+			e.Reason,
+		)
+	}
+	return b.String(), nil
+}
+
+// trimEnumString strips a grpc-gateway-encoded proto enum NAME's prefix,
+// lowercased, e.g. "AGENT_ENGINE_CLAUDE" -> "claude". Mirrors
+// internal/cmd's trimEnumPrefix for the same display purpose, duplicated
+// rather than imported: this package's enum values arrive as plain JSON
+// strings (no generated Go enum type here), while the CLI's trims a typed
+// enum's own String().
+func trimEnumString(s, prefix string) string {
+	if trimmed := strings.TrimPrefix(s, prefix); trimmed != s && trimmed != "" {
+		return strings.ToLower(trimmed)
+	}
+	return strings.ToLower(s)
+}
+
+// parseAgentSkillEngineArg validates and normalizes run_agent_skill's
+// "engine" tool argument into the wire shape protojson expects for an enum
+// field (the proto enum's NAME string, e.g. "AGENT_ENGINE_CODEX") — the same
+// REST-shim-takes-the-enum-by-name convention as os_type/isolation above.
+// Empty input means "no override, use the manifest", not an error; only an
+// unknown name is (agentengine.Parse's own contract, which lists the valid
+// ones). Split out from handleRunAgentSkill so #2228's validation is
+// unit-testable without a fake implementing the whole API interface.
+func parseAgentSkillEngineArg(args map[string]interface{}) (string, error) {
+	engineStr := getStringArg(args, "engine", "")
+	if engineStr == "" {
+		return "", nil
+	}
+	engine, err := agentengine.Parse(engineStr)
+	if err != nil {
+		return "", err
+	}
+	return engine.String(), nil
+}
+
+func handleRunAgentSkill(client API, args map[string]interface{}) (string, error) {
+	engineWire, err := parseAgentSkillEngineArg(args)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.RunAgentSkill(RunAgentSkillRequest{
+		SkillID:   getStringArg(args, "skill_id", ""),
+		InputJSON: getStringArg(args, "input_json", ""),
+		GitSource: getStringArg(args, "git_source", ""),
+		GitRef:    getStringArg(args, "git_ref", ""),
+		Engine:    engineWire,
+	})
+	if err != nil {
+		return "", err
+	}
+	var out string
+	if resp.Container != nil {
+		out = fmt.Sprintf("✅ box ready: %s (%s)\n", resp.Container.Name, resp.Container.State)
+	}
+	if resp.GitCommit != "" {
+		out += fmt.Sprintf("Git:       %s\n", resp.GitCommit)
+		out += fmt.Sprintf("Workspace: %s\n", resp.WorkspacePath)
+	}
+	if resp.RunID != "" {
+		out += fmt.Sprintf("Run:       %s\n", resp.RunID)
+	}
+	if resp.Message != "" {
+		out += fmt.Sprintf("Message:   %s\n", resp.Message)
+	}
+	switch {
+	case resp.ArtifactJSON != "":
+		out += fmt.Sprintf("Artifact:  %s\n", resp.ArtifactJSON)
+	case resp.RunID != "":
+		out += fmt.Sprintf("(no artifact yet — follow the run with crew_logs run_id=%s)\n", resp.RunID)
+	default:
+		out += "(no artifact returned)\n"
+	}
+	return out, nil
+}
+
+func handleCallAgent(client API, args map[string]interface{}) (string, error) {
+	resp, err := client.CallAgent(CallAgentRequest{
+		ToPeerID:    getStringArg(args, "to_peer_id", ""),
+		FromSkillID: getStringArg(args, "from_skill_id", ""),
+		InputJSON:   getStringArg(args, "input_json", ""),
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp.Artifact == nil {
+		return "Peer returned no artifact.", nil
+	}
+	out := fmt.Sprintf("✅ task %s — %s\n", resp.Artifact.TaskID, resp.Artifact.State)
+	if resp.Artifact.Error != "" {
+		out += fmt.Sprintf("error:    %s\n", resp.Artifact.Error)
+	}
+	if resp.Artifact.OutputJSON != "" {
+		out += fmt.Sprintf("artifact: %s\n", resp.Artifact.OutputJSON)
+	}
+	return out, nil
+}
+
+func handleListCrews(client API, _ map[string]interface{}) (string, error) {
+	resp, err := client.ListCrews()
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Crews) == 0 {
+		return "No crews available.", nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%-16s %-14s %-28s %s\n", "ID", "TOPOLOGY", "SKILLS", "DESCRIPTION")
+	for _, c := range resp.Crews {
+		fmt.Fprintf(&b, "%-16s %-14s %-28s %s\n", c.ID, c.Topology, strings.Join(c.SkillIDs, ","), c.Description)
+	}
+	return b.String(), nil
+}
+
+// getModelOverridesArg reads the optional model_overrides object (skill id ->
+// model id) off the JSON-RPC arguments, the same shape `crew run --model
+// <skill-id>=<model-id>` builds. Absent or empty yields nil (nothing sent); a
+// non-object, a non-string value, or an empty skill or model id is an error
+// naming the argument. The ids are otherwise passed through as is.
+func getModelOverridesArg(args map[string]interface{}) (map[string]string, error) {
+	raw, ok := args["model_overrides"]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	obj, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("model_overrides must be an object of skill id to model id, got %T", raw)
+	}
+	if len(obj) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(obj))
+	for skillID, v := range obj {
+		model, isStr := v.(string)
+		if !isStr {
+			return nil, fmt.Errorf("model_overrides[%q] must be a string model id, got %T", skillID, v)
+		}
+		if skillID == "" || model == "" {
+			return nil, fmt.Errorf("model_overrides needs a non-empty skill id and model id (got %q=%q)", skillID, model)
+		}
+		out[skillID] = model
+	}
+	return out, nil
+}
+
+func handleRunCrew(client API, args map[string]interface{}) (string, error) {
+	modelOverrides, err := getModelOverridesArg(args)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.RunCrew(RunCrewRequest{
+		CrewID:         getStringArg(args, "crew_id", ""),
+		InputJSON:      getStringArg(args, "input_json", ""),
+		ModelOverrides: modelOverrides,
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp.Run == nil {
+		return "Crew run returned no handle.", nil
+	}
+	out := fmt.Sprintf("✅ crew run %s — %s (trace %s)\n", resp.Run.ID, resp.Run.State, resp.Run.TraceID)
+	if resp.Run.Error != "" {
+		out += fmt.Sprintf("error: %s\n", resp.Run.Error)
+	}
+	return out, nil
+}
+
+// handleCrewLogs is a thin wrapper over runlog.Window, the function
+// `containarium crew logs` reads through: one bounded window plus end_offset.
+func handleCrewLogs(client API, args map[string]interface{}) (string, error) {
+	req := &pb.TailRunLogRequest{
+		RunId:   getStringArg(args, "run_id", ""),
+		SkillId: getStringArg(args, "skill_id", ""),
+	}
+	if v, ok := getInt64Arg(args, "start_offset"); ok {
+		req.StartOffset = v
+	}
+	if v, ok := getInt64Arg(args, "gateway_after_seq"); ok {
+		req.GatewayAfterSeq = v
+	}
+	if v, ok := getIntArg(args, "follow_seconds"); ok {
+		req.FollowSeconds = int32(min(max(v, 0), runlog.FollowSeconds)) // #nosec G115 -- clamped to 0..10
+	}
+	resp, err := runlog.Window(client, req)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "end_offset: %d\nended: %v\ntruncated: %v\nskill_ids: %s\n",
+		resp.GetEndOffset(), resp.GetEnded(), resp.GetTruncated(), strings.Join(resp.GetSkillIds(), ","))
+	if n := resp.GetGatewayNextSeq(); n > 0 { // absent for a run with no recorded calls: the header is as before
+		fmt.Fprintf(&b, "gateway_next_seq: %d\n", n)
+	}
+	b.WriteString("---\n")
+	b.Write(resp.GetChunk())
+	// After the chunk, which may end mid-line; each event carries its own time.
+	if calls := resp.GetGatewayCalls(); len(calls) > 0 {
+		b.WriteString("\n--- gateway calls ---\n")
+		if err := runlog.WriteGatewayCalls(&b, calls); err != nil {
+			return "", err
+		}
+	}
+	return b.String(), nil
+}
+
+// handleCodeRuns is a thin wrapper over runlog.WriteBoxRuns, the formatter
+// `containarium code runs` prints with.
+func handleCodeRuns(client API, args map[string]interface{}) (string, error) {
+	box := strings.TrimSpace(getStringArg(args, "box", ""))
+	if box == "" {
+		return "", fmt.Errorf("`box` is required")
+	}
+	runs, err := client.ListBoxRuns(box)
+	if err != nil {
+		return "", fmt.Errorf("list code runs on %s: %w", box, err)
+	}
+	var b strings.Builder
+	if err := runlog.WriteBoxRuns(&b, box, runs); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+// handleCodeLogs is a thin wrapper over runlog.BoxWindow, the reader
+// `containarium code logs` copies through: one bounded window plus
+// end_offset.
+func handleCodeLogs(client API, args map[string]interface{}) (string, error) {
+	req := &pb.TailBoxRunLogRequest{
+		Username: strings.TrimSpace(getStringArg(args, "box", "")),
+		RunName:  strings.TrimSpace(getStringArg(args, "run", "")),
+	}
+	if req.Username == "" || req.RunName == "" {
+		return "", fmt.Errorf("`box` and `run` are required")
+	}
+	if v, ok := getInt64Arg(args, "start_offset"); ok {
+		req.StartOffset = v
+	}
+	if v, ok := getIntArg(args, "follow_seconds"); ok {
+		req.FollowSeconds = int32(min(max(v, 0), runlog.FollowSeconds)) // #nosec G115 -- clamped to 0..10
+	}
+	resp, err := runlog.BoxWindow(client, req)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "end_offset: %d\nended: %v\ntruncated: %v\nstderr_dropped: %v\n---\n",
+		resp.GetEndOffset(), resp.GetEnded(), resp.GetTruncated(), resp.GetStderrDropped())
+	b.Write(resp.GetChunk())
+	return b.String(), nil
+}
+
+// handleCodePending lists a run's open permission requests (#2184) through
+// the formatter `code pending` uses.
+func handleCodePending(client API, args map[string]interface{}) (string, error) {
+	box := strings.TrimSpace(getStringArg(args, "box", ""))
+	if box == "" {
+		return "", fmt.Errorf("`box` is required")
+	}
+	run := codeRunNameArg(args)
+	resp, err := client.ListRunInputs(&pb.ListRunInputsRequest{Username: box, RunName: run})
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	if err := runlog.WriteRunInputs(&b, run, resp, time.Now()); err != nil {
+		return "", err
+	}
+	// The table escapes control characters for reading and shows only the
+	// one-line prompt; code_answer needs the raw, complete input, which the
+	// JSON form carries losslessly.
+	raw, err := protojson.Marshal(resp)
+	if err != nil {
+		return "", err
+	}
+	b.WriteString("---\n")
+	b.Write(raw)
+	b.WriteString("\n")
+	return b.String(), nil
+}
+
+// handleCodeAnswer answers one permission request (#2184) through
+// runlog.Answer, the function `code answer` calls, signed for the input the
+// caller got from code_pending.
+func handleCodeAnswer(client API, args map[string]interface{}) (string, error) {
+	box := strings.TrimSpace(getStringArg(args, "box", ""))
+	id := strings.TrimSpace(getStringArg(args, "request_id", ""))
+	if box == "" || id == "" {
+		return "", fmt.Errorf("`box` and `request_id` are required")
+	}
+	a, err := runlog.ParseRunInputAnswer(getStringArg(args, "answer", ""))
+	if err != nil {
+		return "", err
+	}
+	tool, ok := args["tool"].(string)
+	if !ok {
+		return "", fmt.Errorf("`tool` is required: the request's tool as code_pending returned it")
+	}
+	input, ok := args["input"].(string)
+	if !ok {
+		return "", fmt.Errorf("`input` is required: the request's input as code_pending returned it")
+	}
+	run := codeRunNameArg(args)
+	current, err := runlog.OpenRequest(client, box, run, id)
+	if err != nil {
+		return "", err
+	}
+	// The caller saw this request with this tool and input; runlog.Answer
+	// refuses if either is no longer what the request carries.
+	var seen *pb.RunInput
+	if current != nil {
+		seen = &pb.RunInput{RequestId: id, Tool: tool, Prompt: current.GetPrompt(), Input: input}
+	}
+	res, err := runlog.Answer(client, box, run, id, seen, a)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	if err := runlog.WriteAnswerResult(&b, res); err != nil {
+		return "", fmt.Errorf("%s", strings.TrimSpace(b.String()))
+	}
+	return b.String(), nil
+}
+
+// mcpExposeAdapter implements expose.APIClient against this package's
+// HTTP Client. Identical responsibilities to the CLI's grpcExposeAdapter
+// in internal/cmd/expose_port.go — both transports speak through the
+// same expose.Run() so behavior can never drift.
+type mcpExposeAdapter struct{ c API }
+
+func (a *mcpExposeAdapter) LookupContainer(_ context.Context, username string) (string, string, string, error) {
+	got, err := a.c.GetContainer(username)
+	if err != nil {
+		return "", "", "", err
+	}
+	ip := ""
+	if got.Container.Network != nil {
+		ip = got.Container.Network.IPAddress
+	}
+	return got.Container.Name, ip, got.Container.State, nil
+}
+
+func (a *mcpExposeAdapter) CreateRoute(_ context.Context, p expose.AddRouteParams) (*expose.RouteResult, error) {
+	resp, err := a.c.AddRoute(AddRouteRequest{
+		Domain:        p.Domain,
+		TargetIP:      p.TargetIP,
+		TargetPort:    p.TargetPort,
+		ContainerName: p.ContainerName,
+		Description:   p.Description,
+	})
+	if err != nil {
+		return nil, err
+	}
+	domain := resp.Route.Domain
+	if domain == "" {
+		domain = p.Domain
+	}
+	containerName := resp.Route.ContainerName
+	if containerName == "" {
+		containerName = p.ContainerName
+	}
+	return &expose.RouteResult{
+		Domain:        domain,
+		ContainerName: containerName,
+		ContainerIP:   resp.Route.ContainerIP,
+		Port:          resp.Route.Port,
+		Message:       resp.Message,
+	}, nil
+}
+
+// Helper functions
+
+func getStringArg(args map[string]interface{}, key, defaultValue string) string {
+	if val, ok := args[key].(string); ok && val != "" {
+		return val
+	}
+	return defaultValue
+}
+
+// getStringSliceArg reads a JSON array argument into a []string, dropping
+// non-string and empty entries. Returns nil when the key is absent or not an
+// array — JSON-RPC decodes arrays as []interface{}.
+func getStringSliceArg(args map[string]interface{}, key string) []string {
+	raw, ok := args[key].([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func getBoolArg(args map[string]interface{}, key string, defaultValue bool) bool {
+	if val, ok := args[key].(bool); ok {
+		return val
+	}
+	return defaultValue
+}
+
+// getIntArg pulls an integer-shaped argument. JSON unmarshaling presents
+// integers as float64 by default, so we accept both. Returns ok=false when
+// the key is absent or the value is non-numeric — callers distinguish
+// "missing" from "set to zero" by inspecting ok.
+func getIntArg(args map[string]interface{}, key string) (int, bool) {
+	switch v := args[key].(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	default:
+		return 0, false
+	}
+}
