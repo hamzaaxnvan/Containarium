@@ -60,3 +60,45 @@ func TestCodeEgressPolicy_DurableFollowsInstall(t *testing.T) {
 	s := startupServer(t)
 	if s.Durable() {
 		t.Fatal("Durable() = true on the stand-in")
+	}
+	if err := s.InstallDurableStore(func() (CodingToolEgressPolicyStore, error) {
+		return NewMemCodingToolEgressPolicyStore(), nil
+	}); err != nil {
+		t.Fatalf("InstallDurableStore: %v", err)
+	}
+	if !s.Durable() {
+		t.Fatal("Durable() = false after install")
+	}
+}
+
+// The swap happens while RPCs are in flight; run with -race.
+func TestPolicyStoreSwap_ConcurrentWithReads(t *testing.T) {
+	gp := NewGuardrailPolicyServer(guardrailPolicyStartupStore(true, nil))
+	ce := startupServer(t)
+	provider := gp.Provider()
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, _ = provider.Get(context.Background())
+				_, _ = ce.GetCodingToolEgressPolicy(ceAdminCtx(), &pb.GetCodingToolEgressPolicyRequest{Tenant: "alice"})
+			}
+		}()
+	}
+	if err := gp.InstallDurableStore(func() (guardrailpolicy.Store, error) { return guardrailpolicy.NewMemoryStore(), nil }); err != nil {
+		t.Errorf("guardrail install: %v", err)
+	}
+	if err := ce.InstallDurableStore(func() (CodingToolEgressPolicyStore, error) { return NewMemCodingToolEgressPolicyStore(), nil }); err != nil {
+		t.Errorf("egress install: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+}
