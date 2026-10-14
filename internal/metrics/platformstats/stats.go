@@ -90,3 +90,95 @@ type Stats struct {
 	apiRequestsServerError atomic.Int64
 	apiErrorsClientError   atomic.Int64
 	apiErrorsServerError   atomic.Int64
+
+	provisionAttemptsCreate      atomic.Int64
+	provisionAttemptsDelete      atomic.Int64
+	provisionFailuresCreate      atomic.Int64
+	provisionFailuresDelete      atomic.Int64
+	provisionDurationNanosCreate atomic.Int64
+	provisionDurationNanosDelete atomic.Int64
+}
+
+// New returns a zeroed Stats. (atomic.Int64 is itself zero-value-usable,
+// so &Stats{} works too — New exists for call-site clarity and to leave
+// room for future non-zero defaults without an API break.)
+func New() *Stats {
+	return &Stats{}
+}
+
+// RecordAPIRequest classifies one completed API call and increments the
+// matching counters: requests[class] always, plus errors[class] when
+// class is a client or server error.
+func (s *Stats) RecordAPIRequest(class CodeClass) {
+	switch class {
+	case CodeClassOK:
+		s.apiRequestsOK.Add(1)
+	case CodeClassClientError:
+		s.apiRequestsClientError.Add(1)
+		s.apiErrorsClientError.Add(1)
+	case CodeClassServerError:
+		s.apiRequestsServerError.Add(1)
+		s.apiErrorsServerError.Add(1)
+	}
+}
+
+// SnapshotAPI returns the current cumulative API counters. The result is
+// a fresh map on every call — mutating it never affects Stats, and
+// Stats is never affected by anything done to a previously returned
+// snapshot.
+func (s *Stats) SnapshotAPI() APISnapshot {
+	return APISnapshot{
+		RequestsByClass: map[CodeClass]int64{
+			CodeClassOK:          s.apiRequestsOK.Load(),
+			CodeClassClientError: s.apiRequestsClientError.Load(),
+			CodeClassServerError: s.apiRequestsServerError.Load(),
+		},
+		ErrorsByClass: map[CodeClass]int64{
+			CodeClassClientError: s.apiErrorsClientError.Load(),
+			CodeClassServerError: s.apiErrorsServerError.Load(),
+		},
+	}
+}
+
+// RecordProvisionAttempt records the outcome of one provisioning attempt
+// (a container create or delete): attempts[op] always increments;
+// failures[op] increments when success is false; duration is added to
+// durationSecondsSum[op] regardless of outcome, so a slow failure still
+// shows up in the mean-latency signal derivable from
+// durationSecondsSum/attempts.
+func (s *Stats) RecordProvisionAttempt(op Operation, success bool, duration time.Duration) {
+	nanos := duration.Nanoseconds()
+	switch op {
+	case OperationCreate:
+		s.provisionAttemptsCreate.Add(1)
+		if !success {
+			s.provisionFailuresCreate.Add(1)
+		}
+		s.provisionDurationNanosCreate.Add(nanos)
+	case OperationDelete:
+		s.provisionAttemptsDelete.Add(1)
+		if !success {
+			s.provisionFailuresDelete.Add(1)
+		}
+		s.provisionDurationNanosDelete.Add(nanos)
+	}
+}
+
+// SnapshotProvision returns the current cumulative provisioning
+// counters. Same copy contract as SnapshotAPI.
+func (s *Stats) SnapshotProvision() ProvisionSnapshot {
+	return ProvisionSnapshot{
+		Attempts: map[Operation]int64{
+			OperationCreate: s.provisionAttemptsCreate.Load(),
+			OperationDelete: s.provisionAttemptsDelete.Load(),
+		},
+		Failures: map[Operation]int64{
+			OperationCreate: s.provisionFailuresCreate.Load(),
+			OperationDelete: s.provisionFailuresDelete.Load(),
+		},
+		DurationSecondsSum: map[Operation]float64{
+			OperationCreate: time.Duration(s.provisionDurationNanosCreate.Load()).Seconds(),
+			OperationDelete: time.Duration(s.provisionDurationNanosDelete.Load()).Seconds(),
+		},
+	}
+}

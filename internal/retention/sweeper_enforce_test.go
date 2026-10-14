@@ -231,3 +231,62 @@ func TestReporter_APreviewDoesNotReplaceAnEnforcedReport(t *testing.T) {
 		t.Error("the refresh report claims it enforced; a refresh must be count-only")
 	}
 	if kept := r.Last(); !kept.GetEnforced() || kept.GetStores()[0].GetRemoved() != 3 {
+		t.Errorf("kept report = %v, want the enforced sweep's evidence kept", kept)
+	}
+	if len(src.calls) != 1 {
+		t.Errorf("Remove ran %d times, want only the periodic sweep's", len(src.calls))
+	}
+}
+
+// Without an auditor an enforced sweep would delete data with no record of it,
+// so it deletes nothing and says why.
+func TestSweeper_EnforceWithoutAnAuditorRemovesNothing(t *testing.T) {
+	src := &removerSource{fakeSource: fakeSource{class: pb.RetentionClass_RETENTION_CLASS_PROMPTS, store: "agent_tasks", count: Count{Older: 2, Eligible: 2}}, removed: 2}
+	_, err := newTestSweeper(t, enforcing(t), []Source{src}, nil).Sweep(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "audit") {
+		t.Fatalf("Sweep = %v, want an error naming the missing audit store", err)
+	}
+	if len(src.calls) != 0 {
+		t.Errorf("Remove ran %d times with no auditor wired, want never", len(src.calls))
+	}
+}
+
+// DRY_RUN needs no auditor: it records nothing because it changes nothing.
+func TestSweeper_DryRunWithoutAnAuditorStillCounts(t *testing.T) {
+	src := &removerSource{fakeSource: fakeSource{class: pb.RetentionClass_RETENTION_CLASS_PROMPTS, store: "agent_tasks", count: Count{Older: 2, Eligible: 2}}}
+	if _, err := newTestSweeper(t, NewMemoryStore(), []Source{src}, nil).Sweep(context.Background()); err != nil {
+		t.Fatalf("dry-run Sweep with no auditor: %v", err)
+	}
+}
+
+// An hourly sweep that finds nothing to delete writes no audit entry.
+func TestSweeper_NothingEligibleWritesNoAuditEntryAndRemovesNothing(t *testing.T) {
+	src := &removerSource{fakeSource: fakeSource{class: pb.RetentionClass_RETENTION_CLASS_PROMPTS, store: "agent_tasks", count: Count{Older: 3, Eligible: 0}}}
+	audited := 0
+	sw := newTestSweeper(t, enforcing(t), []Source{src}, nil)
+	sw.SetAuditor(func(context.Context, *pb.RetentionReport) error { audited++; return nil })
+	rep, err := sw.Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if audited != 0 || len(src.calls) != 0 {
+		t.Errorf("audited %d times and removed %d times with nothing eligible, want neither", audited, len(src.calls))
+	}
+	if !rep.GetEnforced() {
+		t.Error("the sweep ran in ENFORCE mode and found nothing; the report should still say so")
+	}
+}
+
+// A store that could not remove (a missing table) says so on its entry.
+func TestSweeper_ASkippedRemovalIsNotedOnTheEntry(t *testing.T) {
+	src := &removerSource{fakeSource: fakeSource{class: pb.RetentionClass_RETENTION_CLASS_PROMPTS, store: "agent_tasks", count: Count{Older: 2, Eligible: 2}},
+		skipped: `relation "retention_legal_holds" does not exist`}
+	rep, err := auditedSweeper(t, enforcing(t), []Source{src}, nil).Sweep(context.Background())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	got := findStore(t, rep, src.class, "agent_tasks")
+	if got.GetRemoved() != 0 || !strings.Contains(got.GetNote(), "not removed") || !strings.Contains(got.GetNote(), "retention_legal_holds") {
+		t.Errorf("entry = %v, want nothing removed and a note saying why", got)
+	}
+}
