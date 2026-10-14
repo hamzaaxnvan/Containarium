@@ -572,3 +572,386 @@ func (l *lane) stepVPA() error {
 			},
 			"updatePolicy": map[string]interface{}{
 				"updateMode":  "InPlaceOrRecreate",
+				"minReplicas": int64(1),
+			},
+		},
+	}}
+	if _, err := l.dyn.Resource(vpaGVR).Namespace("default").Create(ctx, vpa, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create VPA object (is the VPA bundle deployed?): %w", err)
+	}
+
+	before, err := l.restartCounts(ctx, "app=burner")
+	if err != nil {
+		return err
+	}
+	origCPU := resource.MustParse("100m")
+
+	var loopErr error
+	waitErr := l.waitFor("burner request raised, no restart loop", vpaTimeout, 15*time.Second, func() (bool, string) {
+		pods, err := l.cs.CoreV1().Pods("default").List(ctx, metav1.ListOptions{LabelSelector: "app=burner"})
+		if err != nil {
+			return false, err.Error()
+		}
+		raised := false
+		var seen []string
+		for _, p := range pods.Items {
+			for _, c := range p.Spec.Containers {
+				req := c.Resources.Requests[corev1.ResourceCPU]
+				seen = append(seen, fmt.Sprintf("%s=%s", p.Name, req.String()))
+				if req.Cmp(origCPU) > 0 {
+					raised = true
+				}
+			}
+		}
+		after, err := l.restartCounts(ctx, "app=burner")
+		if err != nil {
+			return false, err.Error()
+		}
+		delta := MaxRestartDelta(before, after)
+		if delta > 1 {
+			// Abort the wait with a real error: a raised request via
+			// crash-looping is precisely the failure under test.
+			loopErr = fmt.Errorf("burner restart-looping: max restart delta %d (requests: %s)", delta, strings.Join(seen, " "))
+			return true, "restart loop detected"
+		}
+		return raised, fmt.Sprintf("requests: %s (restart delta %d)", strings.Join(seen, " "), delta)
+	})
+	if loopErr != nil {
+		return loopErr
+	}
+	return waitErr
+}
+
+// --- step 5: scale to zero → drained node, deleted VM -------------------
+
+func (l *lane) stepScaleToZero() error {
+	scaledownTimeout := timeoutEnv("CONTAINARIUM_E2E_SCALEDOWN_TIMEOUT", 30*time.Minute)
+	ctx := context.Background()
+
+	// Remove all tenant load. The surplus nodes must drain and their
+	// VMs disappear, back to the baseline shape (small group at min=1).
+	if err := l.cs.CoreV1().Pods("default").Delete(ctx, "big", metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("delete big pod: %w", err)
+	}
+	if err := l.dyn.Resource(vpaGVR).Namespace("default").Delete(ctx, "burner", metav1.DeleteOptions{}); err != nil {
+		return fmt.Errorf("delete VPA: %w", err)
+	}
+	for _, name := range []string{"burner", "overflow"} {
+		if err := l.cs.AppsV1().Deployments("default").Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+			return fmt.Errorf("delete %s: %w", name, err)
+		}
+	}
+
+	baseline := map[string]bool{}
+	for _, v := range l.baselineInstances {
+		baseline[v] = true
+	}
+
+	return l.waitFor("surplus nodes drained and instances deleted", scaledownTimeout, 20*time.Second, func() (bool, string) {
+		// Observed k8s state: no surplus node is Ready anymore. (The
+		// Node *object* may linger NotReady after its instance dies —
+		// k3s has no cloud node-lifecycle controller to reap it — so
+		// Ready-ness plus the instance check below is the robust
+		// signal.)
+		ready, _ := l.readyNodes()
+		surplusNodes := NewReadyNodes(l.baselineNodes, ready)
+
+		// Observed Incus state: no instance beyond the baseline set.
+		var surplusInstances []string
+		for _, name := range l.clusterInstances() {
+			if !baseline[name] {
+				surplusInstances = append(surplusInstances, name)
+			}
+		}
+		return len(surplusNodes) == 0 && len(surplusInstances) == 0,
+			fmt.Sprintf("surplus nodes=%v surplus instances=%v", surplusNodes, surplusInstances)
+	})
+}
+
+// --- step 6: delete leaves nothing --------------------------------------
+
+func (l *lane) stepDelete() error {
+	deleteTimeout := timeoutEnv("CONTAINARIUM_E2E_DELETE_TIMEOUT", 10*time.Minute)
+
+	apiHost, err := KubeconfigServerHost(l.kubeconfig)
+	if err != nil {
+		return err
+	}
+
+	if out, err := l.runCLI("cluster", "delete", clusterName); err != nil {
+		return fmt.Errorf("cluster delete: %v\n%s", err, out)
+	}
+
+	return l.waitFor("no rows, no instances, no passthrough", deleteTimeout, 10*time.Second, func() (bool, string) {
+		// No rows, observed through the product API.
+		out, err := l.runCLI("cluster", "get", clusterName)
+		if err == nil {
+			return false, "cluster get still succeeds"
+		}
+		if !strings.Contains(strings.ToLower(out), "not") {
+			return false, fmt.Sprintf("cluster get: %s", strings.TrimSpace(out))
+		}
+
+		// No instances of either class, observed through Incus.
+		if insts := l.clusterInstances(); len(insts) > 0 {
+			return false, fmt.Sprintf("instances remain: %v", insts)
+		}
+
+		// No passthrough rule: the published API endpoint stopped
+		// accepting connections.
+		conn, dialErr := net.DialTimeout("tcp", apiHost, 3*time.Second)
+		if dialErr == nil {
+			_ = conn.Close()
+			return false, fmt.Sprintf("%s still accepts connections", apiHost)
+		}
+		return true, "gone"
+	})
+}
+
+// --- sabotage ------------------------------------------------------------
+
+// sabotageJoinTokens continuously corrupts the pre-pushed join token on
+// every worker instance and kills any running agent, so no worker can
+// ever register: the lane MUST go red. This is the #1418 guardrail — a
+// lane that stays green under this cannot fail, and proves nothing. It
+// is isolation-agnostic: Incus exec reaches a system container the same
+// way it reaches a VM, so the container lane proves itself the same way
+// (#1430).
+func (l *lane) sabotageJoinTokens(stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case <-time.After(3 * time.Second):
+		}
+		for _, vm := range l.clusterInstances() {
+			if strings.HasSuffix(vm, "-cp") {
+				continue
+			}
+			_, _, _ = l.incus.ExecWithOutput(vm, []string{"sh", "-c",
+				"echo sabotaged > " + clusterpkg.AgentTokenPath + "; pkill -f 'k3s agent' || true"})
+		}
+	}
+}
+
+// --- observation helpers -------------------------------------------------
+
+// readyNodes returns node name → Ready as observed through the tenant
+// kubeconfig, plus a status line for logs.
+func (l *lane) readyNodes() (map[string]bool, string) {
+	nodes, err := l.cs.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err.Error()
+	}
+	out := map[string]bool{}
+	var parts []string
+	for _, n := range nodes.Items {
+		ready := false
+		for _, c := range n.Status.Conditions {
+			if c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue {
+				ready = true
+			}
+		}
+		out[n.Name] = ready
+		parts = append(parts, fmt.Sprintf("%s ready=%v", n.Name, ready))
+	}
+	return out, strings.Join(parts, ", ")
+}
+
+// clusterInstances lists the lane cluster's Incus instances as Incus
+// sees them: VMs in VM mode, system containers in container mode.
+// ListContainers asks Incus for InstanceTypeAny and ClusterInstanceNames
+// matches on the name prefix alone, so one assertion sees both classes
+// (#1430) — see TestClusterInstanceNames for why the type is never a
+// filter.
+func (l *lane) clusterInstances() []string {
+	return ClusterInstanceNames(l.observedInstances(), instancePrefix)
+}
+
+// observedInstances is every instance Incus reports, name and class.
+// ListContainers asks for InstanceTypeAny, so containers and VMs are
+// both in here and the filtering is the caller's (and the pure
+// helpers') business.
+func (l *lane) observedInstances() []ClusterInstance {
+	all, err := l.incus.ListContainers()
+	if err != nil {
+		l.t.Logf("incus list: %v", err)
+		return nil
+	}
+	observed := make([]ClusterInstance, 0, len(all))
+	for _, c := range all {
+		observed = append(observed, ClusterInstance{Name: c.Name, Type: c.InstanceType})
+	}
+	return observed
+}
+
+func (l *lane) restartCounts(ctx context.Context, selector string) (map[string]int32, error) {
+	pods, err := l.cs.CoreV1().Pods("default").List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]int32{}
+	for _, p := range pods.Items {
+		for _, cs := range p.Status.ContainerStatuses {
+			out[p.Name+"/"+cs.Name] = cs.RestartCount
+		}
+	}
+	return out, nil
+}
+
+func (l *lane) waitFor(what string, timeout, interval time.Duration, probe func() (bool, string)) error {
+	deadline := time.Now().Add(timeout)
+	last := ""
+	for {
+		ok, status := probe()
+		if ok {
+			l.t.Logf("%s: %s", what, status)
+			return nil
+		}
+		if status != last {
+			l.t.Logf("waiting for %s: %s", what, status)
+			last = status
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for %s (last: %s)", timeout, what, status)
+		}
+		time.Sleep(interval)
+	}
+}
+
+// dumpDiagnostics prints what the platform and Incus believe on
+// failure — the operator's first three commands, run for them.
+func (l *lane) dumpDiagnostics() {
+	out, err := l.runCLI("cluster", "status", clusterName)
+	l.t.Logf("cluster status (err=%v):\n%s", err, out)
+	l.t.Logf("incus instances with prefix %s: %v", instancePrefix, l.clusterInstances())
+	if l.cs != nil {
+		if evs, err := l.cs.CoreV1().Events("default").List(context.Background(), metav1.ListOptions{Limit: 30}); err == nil {
+			var lines []string
+			for _, e := range evs.Items {
+				lines = append(lines, fmt.Sprintf("%s %s/%s: %s", e.Reason, e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Message))
+			}
+			l.t.Logf("recent k8s events:\n%s", strings.Join(lines, "\n"))
+		}
+	}
+	l.dumpNodeJournals()
+	l.dumpVPA()
+}
+
+// dumpVPA prints what the VPA stack is doing. The components live in
+// kube-system and the VPA object carries its recommendation in status,
+// so a plain look at the default namespace — which is all the rest of
+// dumpDiagnostics does — shows a workload sitting at its original
+// requests with no hint as to why.
+//
+// Three distinct failures look identical from the workload's side: the
+// recommender never ran, it ran and produced no recommendation (no
+// metrics to work from), or it recommended and the updater never
+// applied it. These are the three things that tell them apart.
+func (l *lane) dumpVPA() {
+	if l.cs == nil {
+		return
+	}
+	ctx := context.Background()
+	pods, err := l.cs.CoreV1().Pods("kube-system").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		l.t.Logf("kube-system pods: %v", err)
+	} else {
+		var lines []string
+		for _, p := range pods.Items {
+			restarts := 0
+			for _, cs := range p.Status.ContainerStatuses {
+				restarts += int(cs.RestartCount)
+			}
+			lines = append(lines, fmt.Sprintf("%s %s restarts=%d %s",
+				p.Name, p.Status.Phase, restarts, p.Status.Reason))
+		}
+		l.t.Logf("kube-system pods:\n%s", strings.Join(lines, "\n"))
+	}
+	// The recommendation itself: present means the recommender has
+	// metrics and the updater is the suspect; absent means the
+	// recommender is.
+	if l.dyn != nil {
+		obj, err := l.dyn.Resource(vpaGVR).Namespace("default").
+			Get(ctx, "burner", metav1.GetOptions{})
+		if err != nil {
+			l.t.Logf("VPA object: %v", err)
+		} else {
+			status, _, _ := unstructured.NestedMap(obj.Object, "status")
+			l.t.Logf("VPA burner status: %v", status)
+		}
+	}
+	// Node metrics are what the recommender consumes. If this is empty
+	// or errors, no recommendation was ever possible and the VPA
+	// components are not the bug.
+	raw, err := l.cs.RESTClient().Get().
+		AbsPath("/apis/metrics.k8s.io/v1beta1/nodes").DoRaw(ctx)
+	if err != nil {
+		l.t.Logf("metrics.k8s.io nodes: %v", err)
+	} else {
+		l.t.Logf("metrics.k8s.io nodes: %s", truncate(string(raw), 1200))
+	}
+	for _, ns := range []string{"kube-system"} {
+		evs, err := l.cs.CoreV1().Events(ns).List(ctx, metav1.ListOptions{Limit: 30})
+		if err != nil {
+			continue
+		}
+		var lines []string
+		for _, e := range evs.Items {
+			lines = append(lines, fmt.Sprintf("%s %s/%s: %s",
+				e.Reason, e.InvolvedObject.Kind, e.InvolvedObject.Name, e.Message))
+		}
+		l.t.Logf("%s events:\n%s", ns, strings.Join(lines, "\n"))
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "... (truncated)"
+}
+
+// dumpNodeJournals prints each node's systemd journal for the units
+// that actually run the cluster. Without this a failure inside k3s or
+// the autoscaler is invisible: run 15 lost ten minutes to an
+// autoscaler that never scaled, and the log that would have said why
+// was on the control plane, uncollected.
+//
+// The autoscaler is a systemd unit (`ctr run` task) on the control
+// plane, not a pod, so it appears in no kubectl output at all — it is
+// the unit most likely to be missed and the one hardest to reach after
+// the run is torn down.
+func (l *lane) dumpNodeJournals() {
+	units := map[string][]string{
+		"cp":     {"k3s", "k3s-cluster-autoscaler"},
+		"worker": {"k3s-agent"},
+	}
+	for _, name := range l.clusterInstances() {
+		role := "worker"
+		if strings.HasSuffix(name, "-cp") {
+			role = "cp"
+		}
+		args := []string{"journalctl", "--no-pager", "-n", "120"}
+		for _, u := range units[role] {
+			args = append(args, "-u", u)
+		}
+		stdout, stderr, err := l.incus.ExecWithOutput(name, args)
+		if err != nil {
+			l.t.Logf("journal %s: %v\n%s", name, err, stderr)
+			continue
+		}
+		l.t.Logf("journal %s (%s):\n%s", name, strings.Join(units[role], ","), stdout)
+	}
+	// Unit state separately: a unit that never started has an empty
+	// journal, which reads identically to a unit that started and said
+	// nothing. `is-active` tells those two apart.
+	for _, name := range l.clusterInstances() {
+		if !strings.HasSuffix(name, "-cp") {
+			continue
+		}
+		stdout, _, _ := l.incus.ExecWithOutput(name,
+			[]string{"systemctl", "is-active", "k3s-cluster-autoscaler"})
+		l.t.Logf("autoscaler unit on %s: %s", name, strings.TrimSpace(stdout))
+	}
+}
