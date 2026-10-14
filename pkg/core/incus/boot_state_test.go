@@ -30,3 +30,35 @@ func TestBootState(t *testing.T) {
 			t.Errorf("bootState(%q) = %v, want %v", strings.TrimSpace(tc.stdout), got, tc.want)
 		}
 	}
+}
+
+// bootPhase is what one `systemctl is-system-running` answer means for a
+// test waiting on a box's boot.
+type bootPhase int
+
+const (
+	bootPending bootPhase = iota // still booting, or no answer yet: ask again
+	bootDone                     // running or degraded: the boot jobs have finished
+	bootFailed                   // a state a booting box does not pass through
+)
+
+func (p bootPhase) String() string {
+	return [...]string{"pending", "done", "failed"}[p]
+}
+
+// bootState reads the first line of `systemctl is-system-running`. The exit
+// code is not used: the command exits 1 for "degraded", which a container
+// often is, and for every state before "running".
+func bootState(stdout string) bootPhase {
+	state, _, _ := strings.Cut(strings.TrimSpace(stdout), "\n")
+	switch strings.TrimSpace(state) {
+	case "running", "degraded":
+		return bootDone
+	case "maintenance", "stopping":
+		return bootFailed
+	default:
+		// "", "initializing", "starting", "offline", "unknown": systemd
+		// is not up yet, or the exec reached the box before its init did.
+		return bootPending
+	}
+}
