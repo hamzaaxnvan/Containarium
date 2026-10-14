@@ -66,3 +66,38 @@ func TestAddRoute_WAFDisabledByteIdentical(t *testing.T) {
 		Upstreams: []CaddyUpstreamTyped{{Dial: "10.0.0.5:8080"}},
 	}
 	// WAF off → single reverse_proxy handler.
+	route := caddyRouteJSON{
+		ID:     "alice",
+		Match:  []CaddyMatchTyped{{Host: []string{"alice.example.com"}}},
+		Handle: PrependWAF([]CaddyHandler{handler}, false, ""),
+	}
+	b, _ := json.Marshal(route)
+	got := string(b)
+	if strings.Contains(got, `"waf"`) {
+		t.Fatalf("WAF-disabled route should carry no waf handler: %s", got)
+	}
+	if !strings.Contains(got, `"handler":"reverse_proxy"`) || !strings.Contains(got, `10.0.0.5:8080`) {
+		t.Fatalf("reverse_proxy route malformed: %s", got)
+	}
+
+	// WAF on → waf handler appears before reverse_proxy.
+	route.Handle = PrependWAF([]CaddyHandler{handler}, true, DefaultWAFDirectives(true))
+	b2, _ := json.Marshal(route)
+	got2 := string(b2)
+	wafIdx := strings.Index(got2, `"handler":"waf"`)
+	rpIdx := strings.Index(got2, `"handler":"reverse_proxy"`)
+	if wafIdx < 0 || rpIdx < 0 || wafIdx > rpIdx {
+		t.Fatalf("WAF handler should precede reverse_proxy in JSON: %s", got2)
+	}
+}
+
+func TestProxyManager_WithWAF(t *testing.T) {
+	pm := NewProxyManager("http://127.0.0.1:2019", "example.com")
+	if pm.WAFEnabled() {
+		t.Fatal("WAF should be off by default")
+	}
+	pm.WithWAF(DefaultWAFDirectives(false))
+	if !pm.WAFEnabled() {
+		t.Fatal("WithWAF should enable it")
+	}
+}
