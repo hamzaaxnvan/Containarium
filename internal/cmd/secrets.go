@@ -142,3 +142,292 @@ secrets:write scope granted explicitly on the token.`,
 // (planned tmpfs delivery, Phase B will wire behavior).
 var secretsDelivery string
 
+func init() {
+	rootCmd.AddCommand(secretsCmd)
+	secretsCmd.AddCommand(secretsSetCmd)
+	secretsSetCmd.Flags().StringVar(&secretsDelivery, "delivery", "",
+		`How the secret reaches the container. "env" (default) stamps `+
+			`environment.<NAME>=<value> on the LXC; "file" writes a per-`+
+			`secret tmpfs file at /run/secrets/<NAME>; "compose" writes a `+
+			`shared dotenv file at /run/containarium/secrets.env that nested `+
+			`docker/docker-compose apps consume via env_file: (single-line `+
+			`values only); "broker" never delivers the value to any box — `+
+			`write-only, readable only by the daemon's own brokered calls `+
+			`(e.g. "containarium tracker connect --credential-secret"). `+
+			`Changing a secret's mode away from "broker" is rejected; `+
+			`delete and re-set instead. See docs/security/SECRETS-ENV-VAR-RISK.md `+
+			`and docs/architecture/agent-tracker-broker.md.`)
+	secretsCmd.AddCommand(secretsGetCmd)
+	secretsCmd.AddCommand(secretsListCmd)
+	secretsCmd.AddCommand(secretsDeleteCmd)
+	secretsCmd.AddCommand(secretsRefreshCmd)
+	secretsCmd.AddCommand(secretsSetKMSKeyCmd)
+	secretsCmd.AddCommand(secretsClearKMSKeyCmd)
+}
+
+func runSecretsSet(cmd *cobra.Command, args []string) error {
+	username, name, value := args[0], args[1], args[2]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for secrets commands (daemon owns the master key)")
+	}
+
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		msg, err := h.SetSecret(username, name, value, secretsDelivery)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("✓ %s\n", msg)
+		return nil
+	}
+	g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = g.Close() }()
+	meta, msg, err := g.SetSecret(username, name, value, secretsDelivery)
+	if err != nil {
+		return err
+	}
+	deliverySuffix := ""
+	if label := secretDeliveryLabel(meta.GetDeliveryMode()); label != "" && label != "env" {
+		deliverySuffix = fmt.Sprintf(" delivery=%s", label)
+	}
+	fmt.Printf("✓ %s (version=%d%s)\n", msg, meta.Version, deliverySuffix)
+	return nil
+}
+
+func runSecretsGet(cmd *cobra.Command, args []string) error {
+	username, name := args[0], args[1]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for secrets commands")
+	}
+
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		value, err := h.GetSecret(username, name)
+		if err != nil {
+			return err
+		}
+		// Print only the value, no trailing newline — so callers
+		// can `containarium secrets get ... | clip` cleanly.
+		fmt.Print(value)
+		return nil
+	}
+	g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = g.Close() }()
+	_, value, err := g.GetSecret(username, name)
+	if err != nil {
+		return err
+	}
+	fmt.Print(value)
+	return nil
+}
+
+func runSecretsList(cmd *cobra.Command, args []string) error {
+	username := args[0]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for secrets commands")
+	}
+
+	// Both transports return []*pb.SecretMetadata, so the two branches
+	// differ only in how the client is built — the rendering is shared.
+	// It used to be duplicated, and the copies had drifted: the HTTP one
+	// read `updated_at` from an untyped map while grpc-gateway emits
+	// `updatedAt`, so its UPDATED column printed <nil> (#1219).
+	var list []*pb.SecretMetadata
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if list, err = h.ListSecrets(username); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if list, err = g.ListSecrets(username); err != nil {
+			return err
+		}
+	}
+
+	if len(list) == 0 {
+		fmt.Printf("(no secrets for %s)\n", username)
+		return nil
+	}
+	// #1604 — delivery mode was already on SecretMetadata but never
+	// surfaced here, so an operator had no way to see which of their
+	// secrets are still in the env (Incus-config-visible) mode short of
+	// reading the daemon's own database.
+	fmt.Printf("%-32s %-8s %-9s %s\n", "NAME", "VERSION", "DELIVERY", "UPDATED")
+	for _, row := range list {
+		fmt.Printf("%-32s %-8d %-9s %s\n", row.GetName(), row.GetVersion(),
+			secretDeliveryLabel(row.GetDeliveryMode()), strings.TrimSuffix(row.GetUpdatedAt(), "Z"))
+	}
+	return nil
+}
+
+func runSecretsDelete(cmd *cobra.Command, args []string) error {
+	username, name := args[0], args[1]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for secrets commands")
+	}
+
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if err := h.DeleteSecret(username, name); err != nil {
+			return err
+		}
+		fmt.Printf("✓ secret %s deleted\n", name)
+		return nil
+	}
+	g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = g.Close() }()
+	msg, err := g.DeleteSecret(username, name)
+	if err != nil {
+		return err
+	}
+	if msg == "" {
+		msg = fmt.Sprintf("secret %s deleted", name)
+	}
+	fmt.Printf("✓ %s\n", msg)
+	return nil
+}
+
+func runSecretsRefresh(cmd *cobra.Command, args []string) error {
+	username := args[0]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for secrets commands")
+	}
+
+	var msg string
+	var stamped int32
+	var err error
+
+	if httpMode {
+		h, herr := client.NewHTTPClient(serverAddr, authToken)
+		if herr != nil {
+			return herr
+		}
+		defer func() { _ = h.Close() }()
+		msg, stamped, err = h.RefreshSecrets(username)
+	} else {
+		g, gerr := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if gerr != nil {
+			return gerr
+		}
+		defer func() { _ = g.Close() }()
+		msg, stamped, err = g.RefreshSecrets(username)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ %s (stamped=%d)\n", msg, stamped)
+	return nil
+}
+
+// secretDeliveryLabel renders the delivery enum as the short operator-facing
+// word ("env" / "file" / "compose") rather than its proto name. Mirrors
+// destLabel in backup.go.
+//
+// Reads the typed field rather than the deprecated `delivery` string: both
+// are populated and always agree, but the string is the one scheduled for
+// removal, so new reads go through the enum.
+func secretDeliveryLabel(d pb.SecretDelivery) string {
+	switch d {
+	case pb.SecretDelivery_SECRET_DELIVERY_ENV:
+		return "env"
+	case pb.SecretDelivery_SECRET_DELIVERY_FILE:
+		return "file"
+	case pb.SecretDelivery_SECRET_DELIVERY_COMPOSE:
+		return "compose"
+	case pb.SecretDelivery_SECRET_DELIVERY_BROKER_ONLY:
+		return "broker"
+	default:
+		return ""
+	}
+}
+
+func runSecretsSetKMSKey(cmd *cobra.Command, args []string) error {
+	username, keyResourceName := args[0], args[1]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for secrets commands")
+	}
+
+	var msg string
+	var hasKey bool
+	var err error
+	if httpMode {
+		h, herr := client.NewHTTPClient(serverAddr, authToken)
+		if herr != nil {
+			return herr
+		}
+		defer func() { _ = h.Close() }()
+		msg, hasKey, err = h.SetTenantKMSKey(username, keyResourceName)
+	} else {
+		g, gerr := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if gerr != nil {
+			return gerr
+		}
+		defer func() { _ = g.Close() }()
+		msg, hasKey, err = g.SetTenantKMSKey(username, keyResourceName)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ %s (has_tenant_key=%v)\n", msg, hasKey)
+	return nil
+}
+
+func runSecretsClearKMSKey(cmd *cobra.Command, args []string) error {
+	username := args[0]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required for secrets commands")
+	}
+
+	var msg string
+	var err error
+	if httpMode {
+		h, herr := client.NewHTTPClient(serverAddr, authToken)
+		if herr != nil {
+			return herr
+		}
+		defer func() { _ = h.Close() }()
+		msg, _, err = h.SetTenantKMSKey(username, "")
+	} else {
+		g, gerr := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if gerr != nil {
+			return gerr
+		}
+		defer func() { _ = g.Close() }()
+		msg, _, err = g.SetTenantKMSKey(username, "")
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ %s\n", msg)
+	return nil
+}
