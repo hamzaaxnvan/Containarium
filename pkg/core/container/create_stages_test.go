@@ -213,3 +213,111 @@ func TestCreate_FailedStageIsStillObserved(t *testing.T) {
 // TestCreate_LabelsRideInTheCreateRequest pins the fold: labels (including
 // the OS-type label) arrive in CreateContainer's own ExtraConfig, and
 // SetLabels is never called from Create — there is no longer a separate
+// GetInstance+UpdateInstance round-trip pair on the create path.
+func TestCreate_LabelsRideInTheCreateRequest(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	backend := &stagesBackend{}
+	m := NewWithBackend(backend)
+	opts := stagesOpts()
+	opts.Labels = map[string]string{"team": "infra"}
+
+	if _, err := m.Create(opts); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if backend.setLabelsCalled {
+		t.Error("SetLabels was called; labels should ride in CreateContainer's ExtraConfig instead")
+	}
+
+	got := backend.createdConfig.ExtraConfig
+	if got[incus.LabelPrefix+"team"] != "infra" {
+		t.Errorf("ExtraConfig[%q] = %q, want %q", incus.LabelPrefix+"team", got[incus.LabelPrefix+"team"], "infra")
+	}
+	if _, ok := got[incus.LabelPrefix+ostype.OSTypeLabelKey]; !ok {
+		t.Errorf("ExtraConfig missing the OS-type label (key %q): %v", incus.LabelPrefix+ostype.OSTypeLabelKey, got)
+	}
+}
+
+// TestCreate_StackPersistedAsConfigKey: the requested stack is stamped into
+// the instance config at create so list/get can report it later (#2163).
+// A create with no stack writes no key.
+func TestCreate_StackPersistedAsConfigKey(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	for _, tc := range []struct {
+		name, stack string
+		wantKey     bool
+	}{
+		{"with stack", "nodejs", true},
+		{"no stack", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &stagesBackend{}
+			m := NewWithBackend(backend)
+			opts := stagesOpts()
+			opts.Stack = tc.stack
+			if _, err := m.Create(opts); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			want := ""
+			if tc.wantKey {
+				want = tc.stack
+			}
+			got, ok := backend.createdConfig.ExtraConfig[incus.StackKey]
+			if ok != tc.wantKey || got != want {
+				t.Errorf("ExtraConfig[%q] = %q (present=%v), want %q (present=%v)", incus.StackKey, got, ok, want, tc.wantKey)
+			}
+		})
+	}
+}
+
+// TestCreate_UnknownStackRejectedBeforeAnythingIsCreated (#2860): defence in
+// depth behind the RPC check. installPackages silently skips an unknown ID, so
+// the create must fail up front rather than produce a box with nothing
+// installed.
+func TestCreate_UnknownStackRejectedBeforeAnythingIsCreated(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	backend := &stagesBackend{}
+	m := NewWithBackend(backend)
+	opts := stagesOpts()
+	opts.Stack = "no-such-stack"
+	_, err := m.Create(opts)
+	if err == nil || !strings.Contains(err.Error(), "no-such-stack") || !strings.Contains(err.Error(), "nodejs") {
+		t.Fatalf("Create err = %v, want an error naming the bad stack and listing valid IDs", err)
+	}
+	if backend.createdConfig.Name != "" {
+		t.Errorf("CreateContainer was called for %q despite the unknown stack", backend.createdConfig.Name)
+	}
+}
+
+// assertSubsequence fails unless want appears in got in order (other
+// elements may be interleaved).
+func assertSubsequence(t *testing.T, got, want []CreateStage) {
+	t.Helper()
+	i := 0
+	for _, s := range got {
+		if i < len(want) && s == want[i] {
+			i++
+		}
+	}
+	if i != len(want) {
+		t.Errorf("stage order mismatch: missing %q\n  got:  %v\n  want subsequence: %v", want[i], got, want)
+	}
+}
+
+// The baked-image path skips installPackages, but the box must still be
+// stamped as provisioned under the sshd policy (#2424); otherwise the posture
+// reconciler would silently backfill a tenant edit made before its first pass.
+func TestCreate_BakedPathMarksSSHDPolicy(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	b := &stagesBackend{}
+	if _, err := NewWithBackend(b).Create(stagesOpts()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if got := b.config[sshdpolicy.MarkerKey]; got != sshdpolicy.MarkerValue {
+		t.Errorf("%s = %q, want %q", sshdpolicy.MarkerKey, got, sshdpolicy.MarkerValue)
+	}
+}

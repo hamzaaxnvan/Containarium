@@ -82,3 +82,87 @@ func (x *IntOrString) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
+// Deprecated: Use IntOrString.ProtoReflect.Descriptor instead.
+func (*IntOrString) Descriptor() ([]byte, []int) {
+	return file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *IntOrString) GetType() int64 {
+	if x != nil && x.Type != nil {
+		return *x.Type
+	}
+	return 0
+}
+
+func (x *IntOrString) GetIntVal() int32 {
+	if x != nil && x.IntVal != nil {
+		return *x.IntVal
+	}
+	return 0
+}
+
+func (x *IntOrString) GetStrVal() string {
+	if x != nil && x.StrVal != nil {
+		return *x.StrVal
+	}
+	return ""
+}
+
+var File_k8s_io_apimachinery_pkg_util_intstr_generated_proto protoreflect.FileDescriptor
+
+const file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDesc = "" +
+	"\n" +
+	"3k8s.io/apimachinery/pkg/util/intstr/generated.proto\x12#k8s.io.apimachinery.pkg.util.intstr\"Q\n" +
+	"\vIntOrString\x12\x12\n" +
+	"\x04type\x18\x01 \x01(\x03R\x04type\x12\x16\n" +
+	"\x06intVal\x18\x02 \x01(\x05R\x06intVal\x12\x16\n" +
+	"\x06strVal\x18\x03 \x01(\tR\x06strValB\xc8\x02\n" +
+	"'com.k8s.io.apimachinery.pkg.util.intstrB\x0eGeneratedProtoP\x01ZYgithub.com/footprintai/containarium/pkg/pb/thirdparty/k8s.io/apimachinery/pkg/util/intstr\xa2\x02\x06KIAPUI\xaa\x02#K8s.Io.Apimachinery.Pkg.Util.Intstr\xca\x02#K8s\\Io\\Apimachinery\\Pkg\\Util\\Intstr\xe2\x02/K8s\\Io\\Apimachinery\\Pkg\\Util\\Intstr\\GPBMetadata\xea\x02(K8s::Io::Apimachinery::Pkg::Util::Intstr"
+
+var (
+	file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDescOnce sync.Once
+	file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDescData []byte
+)
+
+func file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDescGZIP() []byte {
+	file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDescOnce.Do(func() {
+		file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDesc), len(file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDesc)))
+	})
+	return file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDescData
+}
+
+var file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
+var file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_goTypes = []any{
+	(*IntOrString)(nil), // 0: k8s.io.apimachinery.pkg.util.intstr.IntOrString
+}
+var file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_depIdxs = []int32{
+	0, // [0:0] is the sub-list for method output_type
+	0, // [0:0] is the sub-list for method input_type
+	0, // [0:0] is the sub-list for extension type_name
+	0, // [0:0] is the sub-list for extension extendee
+	0, // [0:0] is the sub-list for field type_name
+}
+
+func init() { file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_init() }
+func file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_init() {
+	if File_k8s_io_apimachinery_pkg_util_intstr_generated_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDesc), len(file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   1,
+			NumExtensions: 0,
+			NumServices:   0,
+		},
+		GoTypes:           file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_goTypes,
+		DependencyIndexes: file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_depIdxs,
+		MessageInfos:      file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_msgTypes,
+	}.Build()
+	File_k8s_io_apimachinery_pkg_util_intstr_generated_proto = out.File
+	file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_goTypes = nil
+	file_k8s_io_apimachinery_pkg_util_intstr_generated_proto_depIdxs = nil
+}
