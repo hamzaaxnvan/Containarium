@@ -77,3 +77,82 @@ type BakeOptions struct {
 	Verbose      bool
 }
 
+// BakeResult reports what a bake produced.
+type BakeResult struct {
+	Alias       string
+	Fingerprint string
+	SourceImage string
+}
+
+// BakeBaseImage provisions a throwaway container from the source image with
+// the exact same installPackages a create would run (no stack, no user),
+// then publishes it as a local image under BakedImageAliasFor(source).
+// Subsequent stackless creates for the same (image, podman) clone the baked
+// image and skip the in-container install entirely.
+func (m *Manager) BakeBaseImage(opts BakeOptions) (*BakeResult, error) {
+	image := opts.Image
+	if opts.OSType != pb.OSType_OS_TYPE_UNSPECIFIED {
+		image = ostype.ImageForOSType(opts.OSType)
+	}
+	if image == "" {
+		return nil, fmt.Errorf("bake: an image (or os-type) is required")
+	}
+	if ostype.IsWindows(opts.OSType) {
+		return nil, fmt.Errorf("bake: Windows VMs are not bakeable (no in-container package install to skip)")
+	}
+
+	tempName := fmt.Sprintf("containarium-bake-%d", time.Now().Unix())
+	if opts.Verbose {
+		fmt.Printf("Baking base image from %s (podman=%v) via %s...\n", image, opts.EnablePodman, tempName)
+	}
+
+	if err := m.incus.CreateContainer(incus.ContainerConfig{
+		Name:          tempName,
+		Image:         image,
+		EnableNesting: opts.EnablePodman,
+	}); err != nil {
+		return nil, fmt.Errorf("bake: create %s: %w", tempName, err)
+	}
+	// The temp container is always removed — the bake's product is the
+	// image, never the container.
+	defer func() {
+		_ = m.incus.DeleteContainer(tempName)
+	}()
+
+	if err := m.incus.StartContainer(tempName); err != nil {
+		return nil, fmt.Errorf("bake: start %s: %w", tempName, err)
+	}
+	if _, err := m.incus.WaitForNetwork(tempName, 60*time.Second); err != nil {
+		return nil, fmt.Errorf("bake: network on %s: %w", tempName, err)
+	}
+
+	family := ostype.FamilyForOSType(opts.OSType)
+	if opts.Verbose {
+		fmt.Println("  Provisioning (same install a create runs)...")
+	}
+	if err := m.installPackages(tempName, opts.EnablePodman, "", nil, "", family); err != nil {
+		return nil, fmt.Errorf("bake: provisioning %s: %w", tempName, err)
+	}
+
+	if err := m.incus.StopContainer(tempName, true); err != nil {
+		return nil, fmt.Errorf("bake: stop %s: %w", tempName, err)
+	}
+
+	alias := BakedImageAliasFor(image)
+	props := map[string]string{
+		bakedPropBaked:         "true",
+		bakedPropSource:        image,
+		bakedPropPodman:        strconv.FormatBool(opts.EnablePodman),
+		bakedPropFamily:        string(family),
+		bakedPropAt:            time.Now().UTC().Format(time.RFC3339),
+		bakedPropDaemonVersion: version.GetVersion(),
+	}
+	if opts.Verbose {
+		fmt.Printf("  Publishing as %s...\n", alias)
+	}
+	fingerprint, err := m.incus.PublishImage(tempName, alias, props)
+	if err != nil {
+		return nil, fmt.Errorf("bake: publish: %w", err)
+	}
+	return &BakeResult{Alias: alias, Fingerprint: fingerprint, SourceImage: image}, nil
+}
