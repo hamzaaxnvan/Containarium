@@ -1,3 +1,15 @@
 #cloud-config
 # Provisioning for the #301 sshpiper-reload repro VM (see multipass-up.sh).
 # Minimal: the harness fetches sshpiperd itself and runs its own throwaway
+# upstream sshd, so the VM only needs the SSH tooling + curl.
+package_update: true
+package_upgrade: false
+packages:
+  - openssh-server   # provides sshd, which the harness runs as a throwaway upstream
+  - openssh-client   # ssh, ssh-keygen
+  - curl
+  - ca-certificates
+runcmd:
+  # The harness uses its OWN dedicated sshd instance on a high port; the
+  # system ssh service is left enabled only so `multipass exec` keeps working.
+  - [ systemctl, enable, --now, ssh ]
