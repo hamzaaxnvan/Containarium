@@ -205,3 +205,142 @@ func TestWriteRunRecord_ExitCodeZeroDistinctFromAbsent(t *testing.T) {
 	}
 }
 
+func TestReadRunRecord_VersionMismatchIsRejectedCleanly(t *testing.T) {
+	dir := t.TempDir()
+	restore := setProcessLogDirForTest(dir)
+	defer restore()
+
+	future := RunRecord{Version: RunRecordVersion + 1, Name: "future-run", PID: 1, BootID: "boot-a", StartedAt: time.Now()}
+	if err := writeRunRecord(future); err != nil {
+		t.Fatalf("writeRunRecord: %v", err)
+	}
+	_, _, err := readRunRecord("future-run")
+	if err == nil {
+		t.Error("expected an error for a run record with an unsupported version")
+	}
+}
+
+// ----- listRunRecords -----
+
+func TestListRunRecords_SkipsRotatedFiles(t *testing.T) {
+	dir := t.TempDir()
+	restore := setProcessLogDirForTest(dir)
+	defer restore()
+
+	// An old run under the name "svc", rotated aside (as name reuse does).
+	old := RunRecord{Version: RunRecordVersion, Name: "svc", PID: 2, BootID: "boot-a", StartedAt: time.Now().Add(-time.Hour)}
+	if err := writeRunRecord(old); err != nil {
+		t.Fatalf("setup writeRunRecord(old): %v", err)
+	}
+	if err := rotateFinishedRun(old); err != nil {
+		t.Fatalf("setup rotateFinishedRun: %v", err)
+	}
+
+	// The current run reusing that same name.
+	current := RunRecord{Version: RunRecordVersion, Name: "svc", PID: 1, BootID: "boot-a", StartedAt: time.Now()}
+	if err := writeRunRecord(current); err != nil {
+		t.Fatalf("writeRunRecord(current): %v", err)
+	}
+
+	records, err := listRunRecords()
+	if err != nil {
+		t.Fatalf("listRunRecords: %v", err)
+	}
+	if len(records) != 1 || records[0].Name != "svc" || records[0].PID != 1 {
+		t.Errorf("listRunRecords = %+v, want exactly 1 current record named svc with pid 1", records)
+	}
+}
+
+// ----- rotateFinishedRun -----
+
+func TestRotateFinishedRun_MovesRecordAndLogAside(t *testing.T) {
+	dir := t.TempDir()
+	restore := setProcessLogDirForTest(dir)
+	defer restore()
+
+	started := time.Unix(1780000000, 0).UTC()
+	record := RunRecord{
+		Version:   RunRecordVersion,
+		Name:      "old-run",
+		PID:       42,
+		BootID:    "boot-a",
+		StartedAt: started,
+		LogPath:   logPathForName("old-run"),
+	}
+	if err := writeRunRecord(record); err != nil {
+		t.Fatalf("writeRunRecord: %v", err)
+	}
+	if err := writeFileForTest(record.LogPath, "old output"); err != nil {
+		t.Fatalf("setup log: %v", err)
+	}
+
+	if err := rotateFinishedRun(record); err != nil {
+		t.Fatalf("rotateFinishedRun: %v", err)
+	}
+
+	if _, found, _ := readRunRecord("old-run"); found {
+		t.Error("old-run record should no longer be readable under its original name after rotation")
+	}
+	if fileExistsForTest(record.LogPath) {
+		t.Error("old-run.log should have been renamed aside, not left in place")
+	}
+
+	rotatedRecordPath := filepath.Join(dir, "old-run.1780000000.json")
+	if !fileExistsForTest(rotatedRecordPath) {
+		t.Errorf("expected rotated record at %s", rotatedRecordPath)
+	}
+	rotatedLogPath := filepath.Join(dir, "old-run.1780000000.log")
+	if !fileExistsForTest(rotatedLogPath) {
+		t.Errorf("expected rotated log at %s", rotatedLogPath)
+	}
+}
+
+// ----- parseCaptureMode / captureModeFromProto -----
+
+func TestParseCaptureMode(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    CaptureMode
+		wantErr bool
+	}{
+		{"", CaptureCombined, false},
+		{"combined", CaptureCombined, false},
+		{"framed", CaptureFramed, false},
+		{"bogus", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := parseCaptureMode(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseCaptureMode(%q): expected an error", tc.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseCaptureMode(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("parseCaptureMode(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCaptureModeFromProto(t *testing.T) {
+	cases := []struct {
+		in   pb.CaptureMode
+		want CaptureMode
+	}{
+		{pb.CaptureMode_CAPTURE_MODE_UNSPECIFIED, CaptureCombined},
+		{pb.CaptureMode_CAPTURE_MODE_COMBINED, CaptureCombined},
+		{pb.CaptureMode_CAPTURE_MODE_FRAMED, CaptureFramed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in.String(), func(t *testing.T) {
+			if got := captureModeFromProto(tc.in); got != tc.want {
+				t.Errorf("captureModeFromProto(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
