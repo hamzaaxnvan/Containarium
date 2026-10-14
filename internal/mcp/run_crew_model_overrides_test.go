@@ -41,3 +41,46 @@ func TestHandleRunCrew_ModelOverridesReachDaemonUnchanged(t *testing.T) {
 		"model_overrides": map[string]interface{}{
 			"hello-agent-claude": "model-a",
 			"hello-agent-codex":  "model-b",
+		},
+	})
+	require.NoError(t, err)
+	want := &pb.RunCrewRequest{
+		CrewId:         "two-engine-crew",
+		ModelOverrides: map[string]string{"hello-agent-claude": "model-a", "hello-agent-codex": "model-b"},
+	}
+	assert.True(t, proto.Equal(want, got), "got %v want %v", got, want)
+}
+
+// An absent argument sends nothing.
+func TestHandleRunCrew_NoModelOverridesSendsNothing(t *testing.T) {
+	for name, args := range map[string]map[string]interface{}{
+		"absent": {"crew_id": "c"},
+		"empty":  {"crew_id": "c", "model_overrides": map[string]interface{}{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, raw, err := runCrewCapture(t, args)
+			require.NoError(t, err)
+			assert.NotContains(t, raw, "model_overrides")
+			assert.Empty(t, got.GetModelOverrides())
+		})
+	}
+}
+
+// A malformed value is a clear tool error and never reaches the daemon.
+func TestHandleRunCrew_MalformedModelOverrides(t *testing.T) {
+	cases := map[string]interface{}{
+		"a string":          "skill=model",
+		"an array":          []interface{}{"skill=model"},
+		"a non-string id":   map[string]interface{}{"skill": float64(3)},
+		"an empty model id": map[string]interface{}{"skill": ""},
+		"an empty skill id": map[string]interface{}{"": "model"},
+	}
+	for name, v := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, _, err := runCrewCapture(t, map[string]interface{}{"crew_id": "c", "model_overrides": v})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "model_overrides")
+			assert.Nil(t, got, "daemon must not be called")
+		})
+	}
+}
