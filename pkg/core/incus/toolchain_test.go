@@ -27,3 +27,11 @@ func TestEnsureToolchainVolume(t *testing.T) {
 			}
 			if readonly == "true" {
 				if len(fake.updates) != 0 {
+					t.Fatal("converged volume must be a no-op")
+				}
+			} else if len(fake.updates) != 1 || !reflect.DeepEqual(fake.updates[0].Devices["toolchains"], want) {
+				t.Fatalf("must repair a writable mount: %+v", fake.updates)
+			}
+		})
+	}
+}
