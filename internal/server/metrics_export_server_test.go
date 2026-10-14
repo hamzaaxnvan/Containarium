@@ -391,3 +391,397 @@ func TestGetMetricsExport_ReflectsRealHealth(t *testing.T) {
 	afterFail, err := s.GetMetricsExport(testCtx(), &pb.GetMetricsExportRequest{})
 	if err != nil {
 		t.Fatalf("status: %v", err)
+	}
+	if afterFail.ExportFailures != 1 {
+		t.Errorf("expected 1 export failure, got %d", afterFail.ExportFailures)
+	}
+	if afterFail.LastError == "" {
+		t.Error("expected last_error set after a failed export")
+	}
+}
+
+// TestSetMetricsExport_NoSinkRegistered_Unimplemented covers a host
+// where SetMetricsExportSinks was never called (e.g. an older daemon
+// build or a runtime with no sinks wired) — enabling GCP must fail
+// closed, not panic on a nil map lookup.
+func TestSetMetricsExport_NoSinkRegistered_Unimplemented(t *testing.T) {
+	s := &ContainerServer{}
+	_, err := s.SetMetricsExport(testCtx(), &pb.SetMetricsExportRequest{
+		Enabled:  true,
+		Provider: pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_GCP,
+	})
+	if status.Code(err) != codes.Unimplemented {
+		t.Fatalf("error = %v, want Unimplemented", err)
+	}
+}
+
+// groupSet turns an unordered slice of groups into a set for
+// order-independent comparison in the group assertions below.
+func groupSet(groups []pb.CloudMetricsGroup) map[pb.CloudMetricsGroup]bool {
+	m := map[pb.CloudMetricsGroup]bool{}
+	for _, g := range groups {
+		m[g] = true
+	}
+	return m
+}
+
+// TestSetMetricsExport_EmptyGroupsDefaultsHost pins the backward-compat
+// acceptance criterion: enabling without naming any groups keeps today's
+// behavior — the effective set is [HOST] on both the enable response and
+// a follow-up status read.
+func TestSetMetricsExport_EmptyGroupsDefaultsHost(t *testing.T) {
+	s, _ := newMetricsExportTestServer(nil)
+
+	resp, err := s.SetMetricsExport(testCtx(), &pb.SetMetricsExportRequest{
+		Enabled:  true,
+		Provider: pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_GCP,
+		// Groups intentionally omitted.
+	})
+	if err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	wantHost := []pb.CloudMetricsGroup{pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST}
+	if !reflect.DeepEqual(resp.Groups, wantHost) {
+		t.Errorf("enable response groups = %v, want %v", resp.Groups, wantHost)
+	}
+
+	statusResp, err := s.GetMetricsExport(testCtx(), &pb.GetMetricsExportRequest{})
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !reflect.DeepEqual(statusResp.Groups, wantHost) {
+		t.Errorf("status groups = %v, want %v", statusResp.Groups, wantHost)
+	}
+}
+
+// TestSetMetricsExport_EnablesExactlyRequestedGroups covers the headline
+// #1081 acceptance criterion: --groups host,platform enables exactly
+// those two groups (typed on the wire), reflected on the enable response
+// and the status read.
+func TestSetMetricsExport_EnablesExactlyRequestedGroups(t *testing.T) {
+	s, _ := newMetricsExportTestServer(nil)
+
+	want := groupSet([]pb.CloudMetricsGroup{
+		pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST,
+		pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_PLATFORM,
+	})
+
+	resp, err := s.SetMetricsExport(testCtx(), &pb.SetMetricsExportRequest{
+		Enabled:  true,
+		Provider: pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_GCP,
+		Groups: []pb.CloudMetricsGroup{
+			pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_PLATFORM,
+			pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST,
+		},
+	})
+	if err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	if got := groupSet(resp.Groups); !reflect.DeepEqual(got, want) {
+		t.Errorf("enable response groups = %v, want %v", resp.Groups, want)
+	}
+
+	statusResp, err := s.GetMetricsExport(testCtx(), &pb.GetMetricsExportRequest{})
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if got := groupSet(statusResp.Groups); !reflect.DeepEqual(got, want) {
+		t.Errorf("status groups = %v, want %v", statusResp.Groups, want)
+	}
+}
+
+// TestSetMetricsExport_RejectsInvalidGroups pins the typed-input guard: a
+// request naming CLOUD_METRICS_GROUP_UNSPECIFIED (or an out-of-range
+// value) is rejected with InvalidArgument before anything is persisted.
+func TestSetMetricsExport_RejectsInvalidGroups(t *testing.T) {
+	s, _ := newMetricsExportTestServer(nil)
+
+	_, err := s.SetMetricsExport(testCtx(), &pb.SetMetricsExportRequest{
+		Enabled:  true,
+		Provider: pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_GCP,
+		Groups: []pb.CloudMetricsGroup{
+			pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_UNSPECIFIED,
+		},
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("error = %v, want InvalidArgument", err)
+	}
+
+	// Nothing persisted: status still reports disabled.
+	statusResp, statusErr := s.GetMetricsExport(testCtx(), &pb.GetMetricsExportRequest{})
+	if statusErr != nil {
+		t.Fatalf("status: %v", statusErr)
+	}
+	if statusResp.Enabled {
+		t.Errorf("export enabled after a rejected groups request, want disabled")
+	}
+}
+
+// TestSetMetricsExport_GroupsPersistAndResume pins that the enabled
+// groups survive a daemon restart exactly like the enable toggle: enable
+// [host,platform] on one server persists to the store; a fresh server
+// sharing that store resumes with both groups.
+func TestSetMetricsExport_GroupsPersistAndResume(t *testing.T) {
+	kv := &fakeDaemonConfigKV{}
+
+	first, _ := newMetricsExportTestServer(nil)
+	first.daemonConfigStore = kv
+	if _, err := first.SetMetricsExport(testCtx(), &pb.SetMetricsExportRequest{
+		Enabled:  true,
+		Provider: pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_GCP,
+		Groups: []pb.CloudMetricsGroup{
+			pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST,
+			pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_PLATFORM,
+		},
+	}); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+
+	restarted, _ := newMetricsExportTestServer(nil)
+	restarted.daemonConfigStore = kv
+	restarted.StartMetricsExportIfEnabled(context.Background())
+
+	got, err := restarted.GetMetricsExport(testCtx(), &pb.GetMetricsExportRequest{})
+	if err != nil {
+		t.Fatalf("status after resume: %v", err)
+	}
+	want := groupSet([]pb.CloudMetricsGroup{
+		pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST,
+		pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_PLATFORM,
+	})
+	if gotSet := groupSet(got.Groups); !reflect.DeepEqual(gotSet, want) {
+		t.Errorf("resumed groups = %v, want %v", got.Groups, want)
+	}
+}
+
+// TestGetMetricsExport_V060ConfigDefaultsHost pins the JSON
+// compatibility path: a config persisted by v0.60.0 (no groups field)
+// reports [HOST] rather than an empty group set.
+func TestGetMetricsExport_V060ConfigDefaultsHost(t *testing.T) {
+	kv := &fakeDaemonConfigKV{}
+	kv.m = map[string]string{
+		cloudexport.ConfigStoreKey: `{"enabled":true,"provider":1,"interval_seconds":60}`,
+	}
+
+	s, _ := newMetricsExportTestServer(nil)
+	s.daemonConfigStore = kv
+
+	got, err := s.GetMetricsExport(testCtx(), &pb.GetMetricsExportRequest{})
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	wantHost := []pb.CloudMetricsGroup{pb.CloudMetricsGroup_CLOUD_METRICS_GROUP_HOST}
+	if !reflect.DeepEqual(got.Groups, wantHost) {
+		t.Errorf("v0.60.0 config groups = %v, want %v", got.Groups, wantHost)
+	}
+}
+
+// fakeDaemonConfigKV backs daemonConfigKV with an in-memory map so
+// persist/resume tests cover the real store round trip without
+// Postgres.
+type fakeDaemonConfigKV struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (f *fakeDaemonConfigKV) Get(ctx context.Context, key string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.m[key], nil
+}
+
+func (f *fakeDaemonConfigKV) Set(ctx context.Context, key, value string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.m == nil {
+		f.m = map[string]string{}
+	}
+	f.m[key] = value
+	return nil
+}
+
+// TestStartMetricsExportIfEnabled_ResumesFromPersistedConfig pins the
+// restart round trip end to end: enable on one server persists to the
+// store; a fresh server sharing that store (a restarted daemon) must
+// resume the collector from StartMetricsExportIfEnabled alone, with no
+// operator re-enable.
+func TestStartMetricsExportIfEnabled_ResumesFromPersistedConfig(t *testing.T) {
+	kv := &fakeDaemonConfigKV{}
+
+	first, _ := newMetricsExportTestServer(nil)
+	first.daemonConfigStore = kv
+	if _, err := first.SetMetricsExport(testCtx(), &pb.SetMetricsExportRequest{
+		Enabled:  true,
+		Provider: pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_GCP,
+	}); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+
+	restarted, _ := newMetricsExportTestServer(nil)
+	restarted.daemonConfigStore = kv
+	restarted.StartMetricsExportIfEnabled(context.Background())
+
+	restarted.metricsExportMu.RLock()
+	running := restarted.metricsExportCollector
+	restarted.metricsExportMu.RUnlock()
+	if running == nil {
+		t.Fatal("restarted server did not resume the export collector from the persisted config")
+	}
+
+	got, err := restarted.GetMetricsExport(testCtx(), &pb.GetMetricsExportRequest{})
+	if err != nil {
+		t.Fatalf("GetMetricsExport after resume: %v", err)
+	}
+	if !got.Enabled || got.Provider != pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_GCP {
+		t.Errorf("after resume: enabled=%v provider=%v, want enabled GCP", got.Enabled, got.Provider)
+	}
+}
+
+// TestMetricsExport_LateStoreWiring_NotCachedAsDisabled pins the exact
+// live-caught #1070 bug: StartMetricsExportIfEnabled used to run before
+// the daemon-config store was wired (it arrived only via
+// SetAlertManager, much later in NewDualServer), hydrate the disabled
+// default from the nil store, and cache it as loaded — so both resume
+// AND every later status read reported disabled even though the DB row
+// said enabled. A nil-store hydration must not poison the config once
+// the store shows up.
+func TestMetricsExport_LateStoreWiring_NotCachedAsDisabled(t *testing.T) {
+	kv := &fakeDaemonConfigKV{}
+	kv.m = map[string]string{
+		cloudexport.ConfigStoreKey: `{"enabled":true,"provider":1,"interval_seconds":60}`,
+	}
+
+	s, _ := newMetricsExportTestServer(nil)
+	// Startup ordering bug: resume runs with no store wired. It must
+	// no-op without caching "disabled" as authoritative.
+	s.StartMetricsExportIfEnabled(context.Background())
+
+	// Store gets wired later in startup.
+	s.daemonConfigStore = kv
+
+	got, err := s.GetMetricsExport(testCtx(), &pb.GetMetricsExportRequest{})
+	if err != nil {
+		t.Fatalf("GetMetricsExport: %v", err)
+	}
+	if !got.Enabled {
+		t.Fatal("persisted enabled=true was shadowed by a cached nil-store hydration")
+	}
+}
+
+// TestCurrentExportLabels pins the label snapshot a collector is built
+// with: it must read the daemon's identity as of the call, so identity
+// wired after the ContainerServer is constructed (as DualServer.Start
+// does) is reflected — not frozen at construction. This is the #1080
+// invariant: the resumed and runtime-enabled collectors share this one
+// snapshot function, so both carry the same backend_id/region.
+func TestCurrentExportLabels(t *testing.T) {
+	tests := []struct {
+		name       string
+		setup      func(*ContainerServer)
+		wantBackID string
+		wantRegion string
+	}{
+		{
+			name: "pooled backend with region -> real identity",
+			setup: func(s *ContainerServer) {
+				s.SetPeerPool(NewPeerPool("backend-live-7", "", nil, "us-central1"))
+				s.SetCapabilityIdentity("us-central1", "us-central1")
+			},
+			wantBackID: "backend-live-7",
+			wantRegion: "us-central1",
+		},
+		{
+			name: "identity applied after construction is reflected (not frozen early)",
+			setup: func(s *ContainerServer) {
+				// Emulate DualServer.Start wiring identity onto an
+				// already-constructed server, the exact sequence the
+				// #1080 fix depends on.
+				s.SetCapabilityIdentity("eu-west1", "eu-west1")
+				s.SetPeerPool(NewPeerPool("backend-eu-2", "", nil, "eu-west1"))
+			},
+			wantBackID: "backend-eu-2",
+			wantRegion: "eu-west1",
+		},
+		{
+			name:       "no pool, empty region -> documented single-host placeholder",
+			setup:      func(s *ContainerServer) {},
+			wantBackID: "local",
+			wantRegion: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &ContainerServer{}
+			tc.setup(s)
+			got := s.currentExportLabels("host-1")
+			if got.BackendID != tc.wantBackID || got.Region != tc.wantRegion {
+				t.Errorf("currentExportLabels() = {backend_id:%q region:%q}, want {backend_id:%q region:%q}",
+					got.BackendID, got.Region, tc.wantBackID, tc.wantRegion)
+			}
+			if got.Hostname != "host-1" {
+				t.Errorf("hostname = %q, want the passed-in host-1", got.Hostname)
+			}
+		})
+	}
+}
+
+// TestStartMetricsExportIfEnabled_ResumeCapturesLiveIdentity is the
+// #1080 regression. The live bug: StartMetricsExportIfEnabled ran inline
+// in NewDualServer, before SetPeerPool/SetCapabilityIdentity, so the
+// resumed collector snapshotted the "local"/"" placeholders instead of
+// the daemon's real backend_id/region — every daemon restart re-emitted
+// the host's series under a second identity, splitting dashboards and
+// alerts keyed on backend_id. This drives the real resume path and
+// observes, via the builder seam, exactly the identity the collector is
+// built with. The fix sequences resume after identity is wired
+// (DualServer.Start), so the "identity wired" case is the post-fix world
+// and the "identity absent" case documents what the old ordering emitted.
+func TestStartMetricsExportIfEnabled_ResumeCapturesLiveIdentity(t *testing.T) {
+	newEnabledResumeServer := func() (*ContainerServer, *cloudexport.Labels) {
+		s := &ContainerServer{}
+		s.SetMetricsExportSinks(map[pb.CloudMetricsProvider]cloudexport.Sink{
+			pb.CloudMetricsProvider_CLOUD_METRICS_PROVIDER_GCP: &fakeMetricsExportSink{},
+		})
+		s.daemonConfigStore = &fakeDaemonConfigKV{m: map[string]string{
+			cloudexport.ConfigStoreKey: `{"enabled":true,"provider":1,"interval_seconds":60}`,
+		}}
+		captured := &cloudexport.Labels{}
+		s.metricsExportBuilder = func(ctx context.Context, cfg cloudexport.Config, sink cloudexport.Sink) (*cloudexport.CloudExportCollector, error) {
+			// Snapshot identity the same way the real
+			// buildMetricsExportCollector does, at invoke time.
+			*captured = s.currentExportLabels("host-1")
+			return cloudexport.NewCollector(cloudexport.CollectorOptions{
+				Sources:  fakeExportSources{},
+				Exporter: &fakeExportExporter{},
+				Labels:   *captured,
+			}), nil
+		}
+		return s, captured
+	}
+
+	t.Run("identity wired before resume -> real labels (post-#1080-fix ordering)", func(t *testing.T) {
+		s, captured := newEnabledResumeServer()
+		s.SetPeerPool(NewPeerPool("backend-live-7", "", nil, "us-central1"))
+		s.SetCapabilityIdentity("us-central1", "us-central1")
+
+		s.StartMetricsExportIfEnabled(context.Background())
+
+		if captured.BackendID != "backend-live-7" || captured.Region != "us-central1" {
+			t.Fatalf("resumed collector labels = {backend_id:%q region:%q}, want the daemon's live identity {backend-live-7 us-central1}",
+				captured.BackendID, captured.Region)
+		}
+	})
+
+	t.Run("identity absent -> placeholder labels (the pre-fix NewDualServer ordering)", func(t *testing.T) {
+		s, captured := newEnabledResumeServer()
+		// No SetPeerPool / SetCapabilityIdentity: reproduces resume
+		// running before the daemon's identity was wired.
+		s.StartMetricsExportIfEnabled(context.Background())
+
+		if captured.BackendID != "local" || captured.Region != "" {
+			t.Fatalf("with identity unwired, labels = {backend_id:%q region:%q}, want the placeholder {local \"\"} the #1080 bug emitted",
+				captured.BackendID, captured.Region)
+		}
+	})
+}
