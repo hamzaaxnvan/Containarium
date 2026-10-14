@@ -50,3 +50,21 @@ func handleTerminateUserSessions(api API, args map[string]interface{}) (string, 
 // prove the MCP path goes through the shared client.
 var newSessionsAPI = func(c *Client) (client.SessionsAPI, error) {
 	if c.tlsConfigErr != nil {
+		return nil, fmt.Errorf("MCP client refuses to send request: %w", c.tlsConfigErr)
+	}
+	token, err := c.readToken()
+	if err != nil {
+		return nil, fmt.Errorf("authenticate: %w", err)
+	}
+	return client.NewHTTPClient(c.baseURL, token, client.WithHTTPClient(c.httpClient))
+}
+
+// TerminateUserSessions calls the shared client's TerminateUserSessions.
+func (c *Client) TerminateUserSessions(username string) (*pb.TerminateUserSessionsResponse, error) {
+	api, err := newSessionsAPI(c)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = api.Close() }()
+	return api.TerminateUserSessions(username)
+}
