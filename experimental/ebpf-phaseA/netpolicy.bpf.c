@@ -778,3 +778,199 @@ int netpolicy_ingress(struct __sk_buff *skb) {
         account_flow(skb, ifindex, saddr, daddr, sport, dport, ip->protocol);
 
     // A managed box may only send with its own address. A forged source is never
+    // allowed by anything below — not the allow-list, not a reply — because a
+    // neighbour forging another box's or an external address is how the
+    // inbound-flow map could be seeded with lies. 0.0.0.0 is exempt from the
+    // DENY (DHCP discover/request before the box has an address) but is not
+    // VALIDATED above. Only when the loader told us the address; `mode` decides
+    // the verdict (the mark above is withheld either way).
+    int spoofed = cfg->box_ip && saddr != cfg->box_ip && saddr != 0;
+
+    // Virtual-patch deny rules (#660) override EVERYTHING: a destination that
+    // matches a tenant's deny rule (optionally scoped to dport/proto) is blocked
+    // regardless of the allow-list or metadata opt-in. Checked first so neither
+    // an allow CIDR nor allow_metadata can win against an explicit virtual patch.
+    //
+    // The port match shares parse_l4's guard (#3166): a TCP/UDP packet whose
+    // ports cannot be read (IP options, a fragment, a truncated header) matches
+    // a port-scoped rule on its address and proto alone — it fails closed, so
+    // an IP option or fragmentation cannot evade the rule. The proto scope is
+    // the IP header's own field and always applies.
+    __u8 deny_reason = DENY_REASON_POLICY;
+    int vpatch_deny = 0;
+    int port_unknown = !l4.ok &&
+        (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP);
+    {
+        struct egress_key dk = {};
+        dk.prefixlen = 32 + 32; // full tenant match + /32 dst (LPM shortens to the rule's prefix)
+        dk.tenant_id = cfg->tenant_id;
+        dk.addr = daddr;
+        struct deny_val *dv = bpf_map_lookup_elem(&deny_cidr, &dk);
+        if (dv &&
+            (dv->port == 0 || port_unknown || dv->port == dport) &&
+            (dv->proto == 0 || dv->proto == ip->protocol)) {
+            vpatch_deny = 1;
+            deny_reason = DENY_REASON_VIRTUAL_PATCH;
+        }
+    }
+
+    // Decide whether this flow is allowed under the sender's policy.
+    int allowed = 0;
+    // Which mode decides a would-deny: `mode` for every check except a miss on
+    // the egress allow-list, which uses egress_mode (falling back to `mode`).
+    __u8 deny_mode = cfg->mode;
+
+    if (spoofed) {
+        allowed = 0; // forged source — nothing below may allow it (#2618).
+        deny_reason = DENY_REASON_SPOOFED_SOURCE;
+    } else if (vpatch_deny) {
+        allowed = 0; // explicit virtual-patch deny — skip the allow checks entirely.
+    } else
+    // Cloud metadata service is deny-by-default and overrides the egress
+    // allow-list: even a broad allow CIDR must not expose 169.254.169.254
+    // unless the tenant explicitly opted in (#315 Phase D). Checked first so an
+    // allow can't win.
+    if (daddr == bpf_htonl(METADATA_IPV4)) {
+        allowed = cfg->allow_metadata ? 1 : 0;
+    } else if (inbound_reply(ifindex, saddr, daddr, ip->protocol, &l4)) {
+        // An answer on a flow a validated peer opened toward the box (#2618):
+        // SYN-ACK, data, FIN, RST, a UDP answer, an echo reply. After the
+        // virtual-patch and metadata checks (they win), before the cross-tenant,
+        // intra-tenant and allow-list checks (which judge what the box OPENS).
+        allowed = 1;
+    } else {
+        __u32 *dst_tenant = bpf_map_lookup_elem(&ip_tenant, &daddr);
+        if (dst_tenant) {
+            // Intra-backend: destination is another managed container. Allowed
+            // only if it's the same tenant and intra-tenant traffic is permitted.
+            if (*dst_tenant == cfg->tenant_id && cfg->allow_intra)
+                allowed = 1;
+        } else {
+            // External destination: allowed iff it matches the tenant's egress
+            // allow-list.
+            struct egress_key k = {};
+            k.prefixlen = 32 + 32; // full tenant match + full /32 dst (LPM shortens)
+            k.tenant_id = cfg->tenant_id;
+            k.addr = daddr;
+            if (bpf_map_lookup_elem(&egress_cidr, &k))
+                allowed = 1;
+            else if (cfg->egress_mode)
+                deny_mode = cfg->egress_mode; // allow-list miss: its own mode
+        }
+    }
+
+    if (allowed)
+        return TC_ACT_OK;
+
+    // Would-deny. Record + emit, but only drop in ENFORCE (Phase B).
+    bump(STAT_WOULD_DENY);
+
+    struct deny_event ev = {};
+    ev.ifindex = ifindex;
+    ev.tenant_id = cfg->tenant_id;
+    ev.saddr = saddr;
+    ev.daddr = daddr;
+    ev.proto = ip->protocol;
+    ev.dport = dport; // parsed once above
+    ev.reason = deny_reason; // policy miss vs. explicit virtual-patch deny (#660)
+    // The verdict applied below, so a split mode/egress_mode is audited from
+    // the packet's real fate rather than the tenant-wide mode (#2970).
+    ev.verdict = (deny_mode == MODE_ENFORCE) ? DENY_VERDICT_DROPPED : DENY_VERDICT_LOGGED;
+
+    bpf_perf_event_output(skb, &events, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
+
+    if (deny_mode == MODE_ENFORCE)
+        return TC_ACT_SHOT; // Phase B path; Phase A never sets ENFORCE here.
+    return TC_ACT_OK;
+}
+
+// netpolicy_egress runs on the container veth's TC_EGRESS hook — packets the
+// host transmits TOWARD the container, i.e. the container's RECEIVE direction
+// (#631). It does accounting, the Tier 2 signature scan (#661) and the
+// inbound-flow bookkeeping (#2618); enforcement of what the box sends happens on
+// the sender's hook above. It passes everything but a signature match.
+//
+// The reply packet's tuple is the mirror of the request: src=peer, dst=container.
+// To land the rx bytes on the same flow entry the request created, rebuild the
+// request-oriented key by swapping — saddr=ip->daddr (container), daddr=ip->saddr
+// (peer), sport=reply dport, dport=reply sport.
+SEC("classifier/netpolicy_egress")
+int netpolicy_egress(struct __sk_buff *skb) {
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return TC_ACT_OK;
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
+        return TC_ACT_OK;
+
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return TC_ACT_OK;
+
+    // On the egress hook the veth is the transmit interface: skb->ifindex
+    // (ingress_ifindex is 0 here). Only manage known veths.
+    __u32 ifindex = skb->ifindex;
+    struct policy_cfg *cfg = bpf_map_lookup_elem(&veth_policy, &ifindex);
+    if (!cfg)
+        return TC_ACT_OK;
+    if (cfg->flags & POLICY_FLAG_VALIDATE_ONLY)
+        return TC_ACT_OK; // not policed: no accounting, scan or inbound tracking
+
+    struct l4_info l4 = {};
+    parse_l4(ip, data_end, &l4);
+    __u16 sport = l4.sport, dport = l4.dport;
+
+    // Swap to request orientation: container is the reply's destination.
+    // Fragments are skipped, as on the sender hook (#3166).
+    if (!ip_is_fragment(ip))
+        account_reply(skb, ifindex,
+                      ip->daddr,  // saddr (request) = reply dst = container
+                      ip->saddr,  // daddr (request) = reply src = peer
+                      dport,      // sport (request) = reply dport = container port
+                      sport,      // dport (request) = reply sport = peer port
+                      ip->protocol);
+
+    // Tier 2 (#661): scan the INBOUND payload (peer→container) for cleartext
+    // exploit signatures and virtually-patch the container's service. TCP only,
+    // and only when the operator has enabled scanning (gates the bpf_loop cost).
+    if (ip->protocol == IPPROTO_TCP && sig_scan_enabled()) {
+        struct tcphdr *tcp = (void *)ip + sizeof(*ip);
+        if ((void *)(tcp + 1) <= data_end) {
+            __u32 tcp_hlen = tcp->doff * 4;
+            __u32 payload_off = sizeof(*eth) + sizeof(*ip) + tcp_hlen;
+            __u32 skb_len = skb->len;
+            if (tcp_hlen >= sizeof(*tcp) && payload_off < skb_len) {
+                __u32 sig = scan_inbound(skb, payload_off, skb_len - payload_off);
+                if (sig) {
+                    bump(STAT_WOULD_DENY);
+                    struct deny_event ev = {};
+                    ev.ifindex = ifindex;
+                    ev.tenant_id = cfg->tenant_id;
+                    ev.saddr = ip->saddr; // peer (the attacker)
+                    ev.daddr = ip->daddr; // the container
+                    ev.proto = ip->protocol;
+                    ev.dport = dport; // the container's service port (tcp->dest)
+                    ev.reason = DENY_REASON_SIGNATURE;
+                    ev.sig_id = (__u16)sig;
+                    ev.verdict = (cfg->mode == MODE_ENFORCE) ? DENY_VERDICT_DROPPED : DENY_VERDICT_LOGGED;
+                    bpf_perf_event_output(skb, &events, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
+                    if (cfg->mode == MODE_ENFORCE)
+                        return TC_ACT_SHOT; // drop the exploit before it reaches the service
+                }
+            }
+        }
+    }
+
+    // #2618: remember the flow this packet opens or continues toward the box, so
+    // the sender hook can recognise the box's answers. After the signature scan:
+    // a dropped exploit does not count as the peer still talking.
+    track_inbound(skb, ifindex,
+                  ip->saddr,  // peer
+                  ip->daddr,  // the box
+                  ip->protocol, &l4);
+    return TC_ACT_OK;
+}
+
+char LICENSE[] SEC("license") = "Dual MIT/GPL";
