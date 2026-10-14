@@ -57,3 +57,62 @@ func TestIntegrationIncus_ManagedToolchainVolume(t *testing.T) {
 			}
 			if err := client.CreateContainer(cfg); err != nil {
 				t.Fatal(err)
+			}
+			t.Cleanup(func() { incusenv.DeleteInstance(t, name) })
+			if err := client.StartContainer(name); err != nil {
+				t.Fatal(err)
+			}
+			if lazy {
+				if err := client.EnsureToolchainVolume(name, root); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := client.EnsureToolchainVolume(name, root); err != nil {
+				t.Fatalf("idempotent mount: %v", err)
+			}
+			execRoot := func(script string) string {
+				t.Helper()
+				out, stderr, code, err := client.ExecWithExitCode(name, []string{"sh", "-c", script})
+				if err != nil || code != 0 {
+					t.Fatalf("box command: %v exit=%d stdout=%s stderr=%s", err, code, out, stderr)
+				}
+				return out
+			}
+			execRoot(toolchain.SetupScript() + "\nuseradd -m -s /bin/sh ctn-run\n")
+			for _, version := range []string{"v1", "v2", "v1"} {
+				activate(version)
+				command := ""
+				for _, tool := range toolchain.Tools {
+					command += tool + " --version; "
+				}
+				out := execRoot("su -s /bin/sh ctn-run -c " + shellSingleQuote("env -i PATH=/usr/local/bin:/usr/bin:/bin sh -c "+shellSingleQuote(command)))
+				if out != strings.Repeat(version+"\n", len(toolchain.Tools)) {
+					t.Fatalf("existing box saw %q after switch to %s", out, version)
+				}
+			}
+			_, stderr, code, err := client.ExecWithExitCode(name, []string{"sh", "-c", "LC_ALL=C; export LC_ALL; echo write > " + toolchain.HostRoot + "/write-probe"})
+			if err != nil || code == 0 || !strings.Contains(stderr, "Read-only file system") {
+				t.Fatalf("kernel must reject a write even as root: exit=%d stderr=%s err=%v", code, stderr, err)
+			}
+			// Exercise the actual run wrapper's report as the unprivileged user.
+			// Boot-time systemd-tmpfiles can still clear /tmp here. Real runs
+			// keep their sidecars in the run directory, so use the user's home.
+			const reportPath = "/home/ctn-run/managed.tools"
+			probe := boxRunToolsPreProbe(reportPath+".tmp") + boxRunToolsPostProbe(reportPath+".tmp", reportPath)
+			execRoot("su -s /bin/sh ctn-run -c " + shellSingleQuote(probe))
+			tools := parseBoxRunTools([]byte(execRoot("cat " + shellSingleQuote(reportPath))))
+			found := map[string]bool{}
+			for _, tool := range tools {
+				found[tool.GetName()] = true
+				if tool.GetProvenance() != pb.BoxRunToolProvenance_BOX_RUN_TOOL_PROVENANCE_PRESENT_AT_START || tool.GetLocation() != pb.BoxRunToolLocation_BOX_RUN_TOOL_LOCATION_SYSTEM {
+					t.Fatalf("managed tool provenance: %+v", tool)
+				}
+			}
+			for _, tool := range []string{"go", "node", "npm", "pnpm", "buf", "protoc", "staticcheck"} {
+				if !found[tool] {
+					t.Errorf("missing tool in wrapper report: %s", tool)
+				}
+			}
+		})
+	}
+}
