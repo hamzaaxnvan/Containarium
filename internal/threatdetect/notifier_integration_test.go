@@ -102,3 +102,55 @@ func TestWebhookNotifier_RecordsSuccessfulDeliveryInRealDeliveryStore(t *testing
 	}
 	if found == nil {
 		t.Fatal("no webhook_deliveries row with source=threatdetect")
+	}
+	if !found.Success {
+		t.Errorf("Success = false, want true (HTTPStatus=%d ErrorMessage=%q)", found.HTTPStatus, found.ErrorMessage)
+	}
+	if found.HTTPStatus != http.StatusOK {
+		t.Errorf("HTTPStatus = %d, want %d", found.HTTPStatus, http.StatusOK)
+	}
+	if found.AlertName != f.Rule.String() {
+		t.Errorf("AlertName = %q, want %q", found.AlertName, f.Rule.String())
+	}
+	if found.PayloadSize != len(gotBody) {
+		t.Errorf("PayloadSize = %d, want %d (actual payload received)", found.PayloadSize, len(gotBody))
+	}
+}
+
+// A failed delivery (dead webhook) is also recorded — an operator triaging
+// "why didn't I get alerted" needs the failure visible, not silently
+// dropped once retries are exhausted.
+func TestWebhookNotifier_RecordsFailedDeliveryInRealDeliveryStore(t *testing.T) {
+	ctx := context.Background()
+	pool := deliveryPool(t)
+	deliveryStore, err := alert.NewDeliveryStore(ctx, pool)
+	if err != nil {
+		t.Fatalf("alert.NewDeliveryStore: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cfg := newFakeConfigSource(srv.URL, "")
+	n := NewWebhookNotifier(cfg, deliveryStore)
+	notifyCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	n.Start(notifyCtx)
+
+	n.Notify(testFinding(pb.ThreatSeverity_THREAT_SEVERITY_CRITICAL))
+
+	waitFor(t, 3*time.Second, func() bool {
+		deliveries, _, err := deliveryStore.List(ctx, 10, 0)
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		for _, d := range deliveries {
+			if d.Source == "threatdetect" && !d.Success {
+				return true
+			}
+		}
+		return false
+	})
+}
