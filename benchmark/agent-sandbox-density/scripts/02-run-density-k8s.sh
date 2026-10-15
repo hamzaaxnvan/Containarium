@@ -62,3 +62,36 @@ create_sandbox() {
 }
 
 sandbox_ready() {
+	local name="$1"
+	local status
+	status=$(ssh_or_local "kubectl get sandbox ${name} -n ${NAMESPACE} -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null" || true)
+	[[ "$status" == "True" ]]
+}
+
+cleanup_sandbox() {
+	local name="$1"
+	ssh_or_local "kubectl delete sandbox ${name} -n ${NAMESPACE} --ignore-not-found --wait=false" >/dev/null 2>&1 || true
+}
+
+resource_snapshot "before" "$RESULTS_FILE"
+{
+	echo "profile: cpu ${SANDBOX_CPU_REQUEST}/${SANDBOX_CPU_LIMIT}, mem ${SANDBOX_MEM_REQUEST}/${SANDBOX_MEM_LIMIT}, runtimeClass=${GVISOR_RUNTIME_CLASS}"
+	echo
+} >>"$RESULTS_FILE"
+
+run_density_loop "sbdens" create_sandbox sandbox_ready cleanup_sandbox "$RESULTS_FILE"
+
+resource_snapshot "after (${DENSITY_RESULT_COUNT} ready)" "$RESULTS_FILE"
+{
+	echo "kubectl top nodes (if metrics-server installed):"
+	echo '```'
+	ssh_or_local "kubectl top nodes 2>&1" || true
+	echo '```'
+	echo "pods by RuntimeClass (sanity check that sandboxes really landed on gVisor):"
+	echo '```'
+	ssh_or_local "kubectl get pods -n ${NAMESPACE} -o custom-columns=NAME:.metadata.name,RUNTIMECLASS:.spec.runtimeClassName 2>&1" || true
+	echo '```'
+} >>"$RESULTS_FILE"
+
+log "k8s control group result: ${DENSITY_RESULT_COUNT} sandboxes reached Ready"
+log "full log: ${RESULTS_FILE}"

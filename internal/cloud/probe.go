@@ -39,3 +39,87 @@ type DefaultStatusProbe struct {
 // its hardened systemd unit (same caveat as `containarium doctor`).
 func (p DefaultStatusProbe) Probe(ctx context.Context) (HostStatus, error) {
 	totalRAM, availRAM := readMemInfoMB()
+	totalDisk, availDisk := diskGB()
+	gpuCount, gpuSpec := gpuInfo()
+	raw := hostcheck.Run()
+	// Timestamp the start of the actual measurement, so slow probes cannot
+	// make older evidence appear freshly measured at send time (#2328).
+	measuredAt := time.Now()
+	posture := hostcheck.RunPosture()
+	st := HostStatus{
+		AgentVersion:  version.GetVersion(),
+		CPUCores:      safecast.I32(runtime.NumCPU()),
+		TotalRAMMB:    totalRAM,
+		AvailRAMMB:    availRAM,
+		TotalDiskGB:   totalDisk,
+		AvailDiskGB:   availDisk,
+		TotalGPUCount: gpuCount,
+		// No host-local in-use tracking; the cloud scheduler accounts for
+		// assigned GPUs. Report all detected GPUs as available headroom.
+		AvailGPUCount: gpuCount,
+		GPUSpec:       gpuSpec,
+	}
+	populateHostChecks(&st, raw, posture, measuredAt)
+	if p.Readiness != nil {
+		for _, r := range policyreadiness.Run(ctx, p.Readiness) {
+			st.Checks = append(st.Checks, HostCheck{Name: "readiness: " + r.Service, OK: r.Ready(), Detail: r.Detail()})
+		}
+	}
+	return st, nil
+}
+
+// populateHostChecks retains the legacy check order/names while exposing the
+// same posture measurement separately. Only capability checks drive
+// SelfCheckOK; hardening and readiness remain advisory (#1103).
+func populateHostChecks(st *HostStatus, raw, posture []hostcheck.Check, measuredAt time.Time) {
+	st.SelfCheckOK = hostcheck.AllRequiredPass(raw)
+	st.Checks = make([]HostCheck, 0, len(raw)+len(posture))
+	st.Posture = nil
+	for _, c := range raw {
+		st.Checks = append(st.Checks, HostCheck{Name: c.WireName(), OK: c.OK, Detail: c.Detail})
+	}
+	if len(posture) == 0 {
+		return // e.g. Windows has no posture probe; do not fabricate a pass.
+	}
+	st.Posture = &HostSecurityPosture{MeasuredAt: measuredAt, Checks: make([]HostCheck, 0, len(posture))}
+	for _, c := range posture {
+		st.Checks = append(st.Checks, HostCheck{Name: c.WireName(), OK: c.OK, Detail: c.Detail})
+		st.Posture.Checks = append(st.Posture.Checks, HostCheck{Name: c.Name, OK: c.OK, Detail: c.Detail})
+	}
+}
+
+// readMemInfoMB reads MemTotal + MemAvailable from /proc/meminfo (Linux) and
+// returns them in MB. Returns (0, 0) on any non-Linux / unreadable host — the
+// report still goes out, just without RAM numbers.
+func readMemInfoMB() (total, avail int32) {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		return 0, 0
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "MemTotal:"):
+			total = kbFieldToMB(line)
+		case strings.HasPrefix(line, "MemAvailable:"):
+			avail = kbFieldToMB(line)
+		}
+	}
+	return total, avail
+}
+
+// kbFieldToMB parses a "/proc/meminfo" line like "MemTotal:  32791234 kB" and
+// returns the value in MB (0 on parse failure).
+func kbFieldToMB(line string) int32 {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return 0
+	}
+	kb, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return safecast.I32(int(kb / 1024))
+}
