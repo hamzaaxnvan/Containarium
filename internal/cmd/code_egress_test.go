@@ -104,3 +104,57 @@ func TestCodeEgressPolicyGetAndDelete(t *testing.T) {
 	}
 	out.Reset()
 	if err := runCodeEgressDelete(&out, []string{"alice"}); err != nil {
+		t.Fatal(err)
+	}
+	if f.del.GetTenant() != "alice" {
+		t.Errorf("delete sent %+v", f.del)
+	}
+}
+
+// runCodeEgressSetCmd drives `code egress-policy set` the way cobra's
+// Execute does (parse flags, check required flags, run), so the flag
+// declarations themselves are under test. It does not call rootCmd.Execute,
+// which would add cobra's default help/completion commands to the shared
+// tree and trip the client command-tree golden.
+func runCodeEgressSetCmd(t *testing.T, args ...string) error {
+	t.Helper()
+	cmd := codeEgressPolicySetCmd
+	t.Cleanup(func() { codeEgressMode, codeEgressCIDRs, codeEgressDomains = "", nil, nil })
+	mode := cmd.Flags().Lookup("mode")
+	_ = mode.Value.Set("")
+	mode.Changed = false
+	codeEgressCIDRs, codeEgressDomains = nil, nil
+	if err := cmd.ParseFlags(args); err != nil {
+		return err
+	}
+	if err := cmd.ValidateRequiredFlags(); err != nil {
+		return err
+	}
+	return cmd.RunE(cmd, cmd.Flags().Args())
+}
+
+// There is no default mode: forgetting --mode must not store a policy that
+// drops nothing.
+func TestCodeEgressPolicySet_ModeIsRequired(t *testing.T) {
+	f := withFakeCodeEgressClient(t)
+	err := runCodeEgressSetCmd(t, "alice", "--egress-cidr", "192.0.2.0/24")
+	if err == nil || !strings.Contains(err.Error(), `required flag(s) "mode" not set`) {
+		t.Fatalf("set without --mode: err=%v; want the required-flag error", err)
+	}
+	if f.set != nil {
+		t.Errorf("set without --mode reached the daemon: %+v", f.set)
+	}
+	if def := codeEgressPolicySetCmd.Flags().Lookup("mode").DefValue; def != "" {
+		t.Errorf("--mode default = %q, want none", def)
+	}
+}
+
+func TestCodeEgressPolicySet_ExplicitModeThroughCobra(t *testing.T) {
+	f := withFakeCodeEgressClient(t)
+	if err := runCodeEgressSetCmd(t, "alice", "--mode", "enforce", "--egress-cidr", "192.0.2.0/24"); err != nil {
+		t.Fatal(err)
+	}
+	if f.set.GetPolicy().GetMode() != pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE {
+		t.Errorf("sent %+v, want ENFORCE", f.set.GetPolicy())
+	}
+}
