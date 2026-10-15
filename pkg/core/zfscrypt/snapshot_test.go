@@ -166,3 +166,87 @@ func TestRollbackReportsNewerSnapshotsDistinctly(t *testing.T) {
 		t.Fatalf("err = %v, want ErrNewerSnapshotsExist", err)
 	}
 	if !strings.Contains(err.Error(), "pool/c/alice@later") {
+		t.Errorf("the error should name what stands in the way, got %q", err)
+	}
+}
+
+func TestRollbackRejectsANonSnapshot(t *testing.T) {
+	f := newFakeRunner()
+	if err := NewManager(f).RollbackToSnapshot(context.Background(), "pool/c/alice", false); err == nil {
+		t.Error("accepted a dataset where a snapshot reference was required")
+	}
+	if len(f.calls) != 0 {
+		t.Error("a rejected reference must not reach zfs")
+	}
+}
+
+// A forgotten snapshot silently pins disk, so the number a caller needs is
+// `used` — what destroying it would free — not `referenced`, which is mostly
+// shared with the live dataset.
+func TestSnapshotUsageParsesBothNumbers(t *testing.T) {
+	f := newFakeRunner()
+	f.stdout["get"] = "1048576\t5242880\n"
+	used, referenced, err := NewManager(f).SnapshotUsage(context.Background(), "pool/c/alice@snap")
+	if err != nil {
+		t.Fatalf("SnapshotUsage: %v", err)
+	}
+	if used != 1048576 || referenced != 5242880 {
+		t.Errorf("used=%d referenced=%d", used, referenced)
+	}
+	// -p is what makes these exact bytes rather than "1M".
+	if !strings.Contains(f.allArgs(), "-Hp") {
+		t.Errorf("usage must be read in parseable bytes (-p), got: %s", f.allArgs())
+	}
+}
+
+func TestSnapshotUsageRejectsUnparseableOutput(t *testing.T) {
+	f := newFakeRunner()
+	f.stdout["get"] = "1M\t5M\n" // human-readable: what -p exists to prevent
+	if _, _, err := NewManager(f).SnapshotUsage(context.Background(), "pool/c/alice@snap"); err == nil {
+		t.Error("accepted human-readable sizes as byte counts")
+	}
+}
+
+// An UNENCRYPTED snapshot's contents are readable, so inspecting one must
+// pass (#1160b).
+//
+// This is not hypothetical tidying. EnsureInspectable propagated KeyStatus's
+// error verbatim, and KeyStatus errors on an unencrypted dataset — so the
+// guard would have refused inspection and rollback for essentially every
+// container on the platform, while the tests above (which only ever supply an
+// encrypted dataset) stayed green.
+func TestEnsureInspectablePassesForAnUnencryptedDataset(t *testing.T) {
+	f := newFakeRunner()
+	f.stdout["get"] = "-" // what ZFS reports for a dataset with no encryption
+	if err := NewManager(f).EnsureInspectable(context.Background(), "pool/c/bob@snap"); err != nil {
+		t.Fatalf("EnsureInspectable on an unencrypted dataset = %v, want nil — its contents can "+
+			"be read, which is the question this asks", err)
+	}
+}
+
+// "zfs did not answer" is not "there is no key here". A guard that treats
+// them alike either blocks the fleet or fails open on a broken pool.
+func TestEnsureInspectableStillFailsWhenZFSCannotAnswer(t *testing.T) {
+	f := newFakeRunner()
+	f.errs["get"] = errors.New("exit status 1")
+	f.stderr["get"] = "cannot open 'pool/c/bob': dataset does not exist"
+
+	err := NewManager(f).EnsureInspectable(context.Background(), "pool/c/bob@snap")
+	if err == nil {
+		t.Fatal("an unreadable keystatus was reported as inspectable")
+	}
+	if errors.Is(err, ErrNotEncrypted) {
+		t.Errorf("a zfs failure was classified as 'not encrypted': %v", err)
+	}
+}
+
+func TestKeyStatusMarksAnUnencryptedDatasetDistinctly(t *testing.T) {
+	f := newFakeRunner()
+	f.stdout["get"] = "-"
+
+	_, err := NewManager(f).KeyStatus(context.Background(), "pool/c/bob")
+	if !errors.Is(err, ErrNotEncrypted) {
+		t.Fatalf("err = %v, want ErrNotEncrypted — callers distinguish this from a real failure, "+
+			"and matching on the message instead is what the sentinel exists to avoid", err)
+	}
+}
