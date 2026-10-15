@@ -14,3 +14,19 @@ export function usePageVisibility(): boolean {
   const update = useCallback(() => {
     const visible = !document.hidden && document.hasFocus();
     console.log('[usePageVisibility]', visible ? 'ACTIVE' : 'INACTIVE', '| hidden:', document.hidden, 'hasFocus:', document.hasFocus());
+    setIsVisible(visible);
+  }, []);
+
+  useEffect(() => {
+    document.addEventListener('visibilitychange', update);
+    window.addEventListener('focus', update);
+    window.addEventListener('blur', update);
+    return () => {
+      document.removeEventListener('visibilitychange', update);
+      window.removeEventListener('focus', update);
+      window.removeEventListener('blur', update);
+    };
+  }, [update]);
+
+  return isVisible;
+}
