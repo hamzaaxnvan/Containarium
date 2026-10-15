@@ -95,3 +95,36 @@ func TestInstallClamav(t *testing.T) {
 		{"install ran but result is not verifiable", func(b *installBox) { b.freshGets = false }, failed, "apt,freshclam"},
 		{"box unreachable", func(b *installBox) { b.execErr = errors.New("socket wedged") }, failed, ""},
 		{"lookup failure", func(b *installBox) { b.infoErr = errors.New("no such box") }, failed, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newInstallBox()
+			tc.mutate(b)
+			got, msg := InstallClamav(b, "alice-container")
+			if got != tc.want {
+				t.Fatalf("outcome = %v (%q), want %v", got, msg, tc.want)
+			}
+			if strings.Join(b.ran, ",") != tc.wantRan {
+				t.Errorf("ran %v, want %q", b.ran, tc.wantRan)
+			}
+			if strings.Contains(msg, "SECRET PACKAGE OUTPUT") || strings.Contains(msg, "/home/") {
+				t.Errorf("box output leaked into the message: %q", msg)
+			}
+		})
+	}
+}
+
+// Idempotent: a second call after a successful install runs nothing.
+func TestInstallClamav_SecondCallIsANoOp(t *testing.T) {
+	b := newInstallBox()
+	if got, _ := InstallClamav(b, "alice-container"); got != pb.ClamavInstallOutcome_CLAMAV_INSTALL_OUTCOME_INSTALLED {
+		t.Fatalf("first call: %v", got)
+	}
+	b.ran = nil
+	if got, _ := InstallClamav(b, "alice-container"); got != pb.ClamavInstallOutcome_CLAMAV_INSTALL_OUTCOME_ALREADY_PRESENT {
+		t.Fatalf("second call: %v", got)
+	}
+	if len(b.ran) != 0 {
+		t.Fatalf("second call ran %v", b.ran)
+	}
+}
