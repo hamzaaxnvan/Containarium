@@ -80,3 +80,31 @@ func TestValidateImageRegistry_AcceptsAllowedRegistry(t *testing.T) {
 	}
 	for _, in := range cases {
 		if err := validateImageRegistry(in); err != nil {
+			t.Errorf("%q should be accepted under allowlist {ubuntu, images, incus}: %v", in, err)
+		}
+	}
+}
+
+func TestValidateImageRegistry_ErrorMessageNamesEnvVar(t *testing.T) {
+	t.Setenv(allowedImageRegistriesEnv, "ubuntu")
+	resetImageAllowlist(t)
+
+	err := validateImageRegistry("docker:bad")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	if !strings.Contains(err.Error(), allowedImageRegistriesEnv) {
+		t.Fatalf("error should name the env var so the operator can fix: %v", err)
+	}
+}
+
+func TestValidateImageRegistry_EmptyImageStillAccepted(t *testing.T) {
+	t.Setenv(allowedImageRegistriesEnv, "ubuntu")
+	resetImageAllowlist(t)
+
+	// Empty image is permitted — the manager substitutes a default
+	// based on OSType. Don't break that flow.
+	if err := validateImageRegistry(""); err != nil {
+		t.Fatalf("empty image must be accepted: %v", err)
+	}
+}
