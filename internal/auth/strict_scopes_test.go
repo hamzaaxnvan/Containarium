@@ -41,3 +41,18 @@ func TestUnscopedTokenCalls_TracksCountAndSince(t *testing.T) {
 	if got.Since.IsZero() {
 		t.Fatal("Since is zero after recording a call, want the time of the first call")
 	}
+}
+
+func TestUnscopedTokenCalls_SinceIsStableAcrossCalls(t *testing.T) {
+	ResetUnscopedTokenCallsForTest()
+
+	recordUnscopedCall()
+	first := UnscopedTokenCalls().Since
+
+	recordUnscopedCall()
+	second := UnscopedTokenCalls().Since
+
+	if !first.Equal(second) {
+		t.Fatalf("Since changed from %v to %v across calls; want the FIRST call's timestamp to stick", first, second)
+	}
+}

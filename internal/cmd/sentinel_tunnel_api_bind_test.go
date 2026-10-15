@@ -32,3 +32,21 @@ func TestApplyTunnelAPIBindAddr(t *testing.T) {
 			}
 			continue
 		}
+		if err != nil {
+			t.Errorf("applyTunnelAPIBindAddr(%q): %v", tc.in, err)
+		}
+		if ts.APIBindAddr != tc.want {
+			t.Errorf("applyTunnelAPIBindAddr(%q): APIBindAddr = %q, want %q", tc.in, ts.APIBindAddr, tc.want)
+		}
+	}
+}
+
+func TestSentinelFlag_TunnelAPIBindAddrDefaultsToLoopback(t *testing.T) {
+	f := sentinelCmd.Flags().Lookup("tunnel-api-bind-addr")
+	if f == nil {
+		t.Fatal("sentinel has no --tunnel-api-bind-addr flag")
+	}
+	if f.DefValue != "127.0.0.1" {
+		t.Errorf("--tunnel-api-bind-addr default = %q, want 127.0.0.1", f.DefValue)
+	}
+}
