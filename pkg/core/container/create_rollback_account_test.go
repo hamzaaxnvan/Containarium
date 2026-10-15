@@ -141,3 +141,75 @@ func TestCreate_SuccessKeepsTheAccount(t *testing.T) {
 	if strings.Contains(log.joined(), "delete:") {
 		t.Fatalf("events = %v: a successful create removed its account", log.snapshot())
 	}
+}
+
+// A failed account creation can leave a partial account; the existing contract
+// (the create fails and the container is cleaned up) now also removes it.
+func TestCreate_FailedAccountCreationAlsoRemovesAnyPartialAccount(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	log := stubAccountLifecycle(t, false, 0)
+	createJumpServerAccountFn = func(string, string, bool) error {
+		log.add("create:partial")
+		return errors.New("useradd exploded")
+	}
+	opts := stagesOpts()
+	opts.SSHKeys = []string{testSSHKey}
+
+	_, err := NewWithBackend(&stagesBackend{}).Create(opts)
+	if err == nil || !strings.Contains(err.Error(), "useradd exploded") {
+		t.Fatalf("Create = %v, want the account failure", err)
+	}
+	if got := log.joined(); got != "create:partial,delete:alice" {
+		t.Fatalf("events = %q, want the partial account removed", got)
+	}
+}
+
+// The removal is best-effort: if it fails, the caller still sees the real
+// cause of the failed create, not the cleanup's error.
+func TestCreate_AccountRemovalFailureDoesNotMaskTheCause(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stubAccountLifecycle(t, false, 0)
+	deleteJumpServerAccountFn = func(string, bool) error { return errors.New("userdel: user alice is currently used") }
+	backend := &stagesBackend{waitNetworkErr: errors.New("timeout waiting for container network")}
+	opts := stagesOpts()
+	opts.SSHKeys = []string{testSSHKey}
+
+	_, err := NewWithBackend(backend).Create(opts)
+	if err == nil || !strings.Contains(err.Error(), "timeout waiting for container network") || strings.Contains(err.Error(), "userdel") {
+		t.Fatalf("Create = %v, want only the network failure", err)
+	}
+}
+
+// A hung account step must not hang a failing create: past the backstop the
+// create reports its real cause, and the account (which may still be being
+// made) is left alone rather than removed under the goroutine.
+func TestCreate_FailureDoesNotWaitForeverOnAHungAccountStep(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	log := stubAccountLifecycle(t, false, 0)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	createJumpServerAccountFn = func(string, string, bool) error {
+		log.add("create:start")
+		<-release
+		return nil
+	}
+	prev := jumpAccountJoinTimeout
+	jumpAccountJoinTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { jumpAccountJoinTimeout = prev })
+
+	backend := &stagesBackend{waitNetworkErr: errors.New("timeout waiting for container network")}
+	opts := stagesOpts()
+	opts.SSHKeys = []string{testSSHKey}
+
+	start := time.Now()
+	_, err := NewWithBackend(backend).Create(opts)
+	if err == nil || !strings.Contains(err.Error(), "timeout waiting for container network") {
+		t.Fatalf("Create = %v, want the network failure", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("took %s: the failing create waited for the hung account step", time.Since(start))
+	}
+	if strings.Contains(log.joined(), "delete:") {
+		t.Fatalf("events = %v: removed an account that was still being created", log.snapshot())
+	}
+}
