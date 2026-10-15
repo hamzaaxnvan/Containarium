@@ -120,3 +120,126 @@ func TestLoadRejectsRefsOutsideTheKeysDir(t *testing.T) {
 
 // AC: path traversal via tenant ID cannot escape the keys dir.
 func TestWrapRejectsUnsafeTenantIDs(t *testing.T) {
+	p, dir := newTestProvider(t)
+	ctx := context.Background()
+
+	for _, id := range []string{
+		"", "..", "../escape", "a/b", `a\b`, "../../etc/shadow", ".", "alice/../bob",
+	} {
+		t.Run("id="+id, func(t *testing.T) {
+			if _, _, err := p.Wrap(ctx, id); err == nil {
+				t.Errorf("Wrap accepted unsafe tenant id %q", id)
+			}
+		})
+	}
+
+	// Nothing should have been created outside the keys dir.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("rejected ids still created files: %v", entries)
+	}
+}
+
+// AC: FileKeyProvider rejects a key file with unsafe permissions and a
+// key of the wrong length, rather than proceeding.
+func TestLoadRejectsUnsafeKeyFiles(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("group or world readable", func(t *testing.T) {
+		p, dir := newTestProvider(t)
+		_, ref, err := p.Wrap(ctx, "alice")
+		if err != nil {
+			t.Fatalf("Wrap: %v", err)
+		}
+		if err := os.Chmod(filepath.Join(dir, "alice.key"), 0o644); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		_, err = p.Load(ctx, ref)
+		if err == nil {
+			t.Fatal("Load accepted a world-readable key file")
+		}
+		if !strings.Contains(err.Error(), "permission") {
+			t.Errorf("error should name the permission problem, got %q", err)
+		}
+	})
+
+	t.Run("wrong length", func(t *testing.T) {
+		p, dir := newTestProvider(t)
+		_, ref, err := p.Wrap(ctx, "alice")
+		if err != nil {
+			t.Fatalf("Wrap: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "alice.key"), []byte("too short"), 0o600); err != nil {
+			t.Fatalf("truncate key: %v", err)
+		}
+		if _, err := p.Load(ctx, ref); err == nil {
+			t.Error("Load accepted a key of the wrong length")
+		}
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		p, dir := newTestProvider(t)
+		_, ref, err := p.Wrap(ctx, "alice")
+		if err != nil {
+			t.Fatalf("Wrap: %v", err)
+		}
+		if err := os.Remove(filepath.Join(dir, "alice.key")); err != nil {
+			t.Fatalf("remove: %v", err)
+		}
+		if _, err := p.Load(ctx, ref); err == nil {
+			t.Error("Load succeeded with no key file")
+		}
+	})
+}
+
+// An operator who pre-places a key file keeps custody: Wrap adopts it
+// rather than overwriting it.
+func TestWrapAdoptsAPreProvisionedKey(t *testing.T) {
+	p, dir := newTestProvider(t)
+	ctx := context.Background()
+
+	preplaced := bytes.Repeat([]byte{0x5A}, KeyLen)
+	if err := os.WriteFile(filepath.Join(dir, "alice.key"), preplaced, 0o600); err != nil {
+		t.Fatalf("pre-place key: %v", err)
+	}
+
+	got, _, err := p.Wrap(ctx, "alice")
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	if !bytes.Equal(got.Bytes(), preplaced) {
+		t.Error("Wrap overwrote an operator-provided key")
+	}
+}
+
+// Generated key files must not be readable by anyone but the daemon user.
+func TestGeneratedKeyFilesAreNotGroupOrWorldReadable(t *testing.T) {
+	p, dir := newTestProvider(t)
+	if _, _, err := p.Wrap(context.Background(), "alice"); err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+
+	fi, err := os.Stat(filepath.Join(dir, "alice.key"))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("key file mode = %#o, want no group/other bits", perm)
+	}
+
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat dir: %v", err)
+	}
+	if perm := di.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("keys dir mode = %#o, want no group/other bits", perm)
+	}
+}
+
+// FileKeyProvider must satisfy the interface the daemon depends on.
+func TestFileKeyProviderImplementsKeyProvider(t *testing.T) {
+	var _ KeyProvider = (*FileKeyProvider)(nil)
+}
