@@ -124,3 +124,66 @@ func TestDeleteRemovesPipe(t *testing.T) {
 	}
 	getPipe(t, dyn, "carol") // present
 	if err := b.Delete(ctx, ref, true); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := dyn.Resource(pipeGVR).Namespace("sshpiper").Get(ctx, pipeName("carol"), metav1.GetOptions{}); err == nil {
+		t.Error("pipe still present after Delete")
+	}
+}
+
+func TestGatewayUpstreamCredential(t *testing.T) {
+	scheme := runtime.NewScheme()
+	dyn := dynfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
+		map[schema.GroupVersionResource]string{pipeGVR: "PipeList"})
+	cs := fake.NewSimpleClientset()
+	b := NewWithClients(cs, sandboxfake.NewSimpleClientset(), dyn, Config{
+		GatewayNamespace:         "sshpiper",
+		GatewayHost:              "gw.example.com",
+		GatewayUpstreamPublicKey: "ssh-ed25519 GATEWAYPUB gateway",
+		GatewayUpstreamKeySecret: "sshpiper-upstream-key",
+	})
+	ctx := context.Background()
+	if _, err := b.Create(ctx, box.BoxSpec{
+		Ref:       box.BoxRef{Tenant: "alice"},
+		Image:     "x",
+		SSHKeys:   []string{"ssh-ed25519 AGENTPUB agent"},
+		AutoStart: true,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The box authorizes the GATEWAY's key (so sshpiper can log in), NOT the
+	// agent's key.
+	sec, err := cs.CoreV1().Secrets("tenant-alice").Get(ctx, secretName("alice"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get box secret: %v", err)
+	}
+	if got := string(sec.Data[authorizedKeysKey]); got != "ssh-ed25519 GATEWAYPUB gateway\n" {
+		t.Errorf("box authorized_keys = %q, want the gateway key", got)
+	}
+
+	// The Pipe authenticates the client with the agent's key (from) and
+	// references the upstream private key (to.private_key_secret).
+	p := getPipe(t, dyn, "alice")
+	from, _, _ := unstructured.NestedSlice(p.Object, "spec", "from")
+	wantAgent := base64.StdEncoding.EncodeToString([]byte("ssh-ed25519 AGENTPUB agent\n"))
+	if f0 := from[0].(map[string]any); f0["authorized_keys_data"] != wantAgent {
+		t.Errorf("from.authorized_keys_data = %v, want agent key", f0["authorized_keys_data"])
+	}
+	keyName, _, _ := unstructured.NestedString(p.Object, "spec", "to", "private_key_secret", "name")
+	if keyName != "sshpiper-upstream-key" {
+		t.Errorf("to.private_key_secret.name = %q, want sshpiper-upstream-key", keyName)
+	}
+}
+
+func TestGatewayDisabledSkipsPipe(t *testing.T) {
+	// No dynamic client (NewWithClientset) → gateway off → Create still succeeds
+	// and programs no Pipe.
+	b := NewWithClientset(fake.NewSimpleClientset(), sandboxfake.NewSimpleClientset(), Config{GatewayNamespace: "sshpiper"})
+	if b.router.Enabled() {
+		t.Fatal("gateway should be disabled without a dynamic client")
+	}
+	if _, err := b.Create(context.Background(), box.BoxSpec{Ref: box.BoxRef{Tenant: "dave"}, Image: "x", AutoStart: true}); err != nil {
+		t.Fatalf("Create with gateway off: %v", err)
+	}
+}
