@@ -65,3 +65,70 @@ func TestSprintBoard_PrintsMarkdownAndSummary(t *testing.T) {
 
 func TestSprintBoard_GitLabProvider(t *testing.T) {
 	var seen http.Request
+	_, err := runSprint(t, 200, `{"mirror":{"state":"SPRINT_MIRROR_STATE_PROVIDER_NOT_SUPPORTED"}}`, &seen,
+		"board", "--org", "o", "--project", "g/p", "--number", "3", "--provider", "gitlab")
+	require.NoError(t, err)
+	assert.Equal(t, "TRACKER_PROVIDER_GITLAB", seen.URL.Query().Get("umbrella.provider"))
+}
+
+func TestSprintBoard_NotEnabledPrintsAndExitsZero(t *testing.T) {
+	out, err := runSprint(t, 200, `{"mirror":{"state":"SPRINT_MIRROR_STATE_NOT_ENABLED"}}`, nil,
+		"board", "--org", "o", "--project", "p", "--number", "3")
+	require.NoError(t, err)
+	assert.Contains(t, out, "NOT_ENABLED")
+}
+
+func TestSprintBoard_RejectedExitsNonZero(t *testing.T) {
+	_, err := runSprint(t, 200, `{"mirror":{"state":"SPRINT_MIRROR_STATE_REJECTED"}}`, nil,
+		"board", "--org", "o", "--project", "p", "--number", "3")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "REJECTED")
+}
+
+func TestSprintBoard_RejectsBadFlags(t *testing.T) {
+	for name, args := range map[string][]string{
+		"no org":       {"board", "--project", "p", "--number", "3"},
+		"no project":   {"board", "--org", "o", "--number", "3"},
+		"zero number":  {"board", "--org", "o", "--project", "p"},
+		"bad provider": {"board", "--org", "o", "--project", "p", "--number", "3", "--provider", "svn"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := runSprint(t, 200, sprintBoardBody, nil, args...)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestSprint_StandaloneDaemonNeedsHostedControlPlane(t *testing.T) {
+	for _, args := range [][]string{
+		{"board", "--org", "o", "--project", "p", "--number", "3"},
+		{"list", "--org", "o"},
+	} {
+		_, err := runSprint(t, 404, `{"code":5,"message":"Not Found","details":[]}`, nil, args...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "hosted control plane")
+	}
+}
+
+func TestSprint_OtherServerErrorsAreNotRelabelled(t *testing.T) {
+	_, err := runSprint(t, 503, `{"message":"rate limited"}`, nil, "list", "--org", "o")
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "hosted control plane")
+	assert.Contains(t, err.Error(), "503")
+}
+
+func TestSprintList_Prints(t *testing.T) {
+	out, err := runSprint(t, 200, `{"sprints":[{"umbrella":{"project":"acme/app","number":"120"},"title":"Sprint 120","state":"SPRINT_MIRROR_STATE_PRESENT"}]}`, nil, "list", "--org", "o")
+	require.NoError(t, err)
+	assert.True(t, strings.Contains(out, "acme/app#120") && strings.Contains(out, "PRESENT"), out)
+}
+
+func TestSprint_RequiresServer(t *testing.T) {
+	old := serverAddr
+	t.Cleanup(func() { serverAddr = old })
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CONTAINARIUM_SERVER", "")
+	_, err := execSprint(t, []string{"list", "--org", "o", "--server", ""})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--server")
+}
