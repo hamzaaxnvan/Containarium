@@ -111,3 +111,116 @@ func buildPprofURL(base, profile string, seconds, debug int, gc, list bool) (str
 		q.Set("gc", "1")
 	}
 	if seconds > 0 {
+		q.Set("seconds", strconv.Itoa(seconds))
+	}
+
+	out := base + path
+	if len(q) > 0 {
+		out += "?" + q.Encode()
+	}
+	return out, nil
+}
+
+// pprofOutputPath resolves where the profile lands. Text and list output go to
+// stdout by default (you want to read it); a binary profile defaults to a file
+// because dumping gzip to a terminal is never what anyone meant. Pure.
+func pprofOutputPath(explicit, profile string, debug int, list bool) string {
+	if explicit != "" {
+		return explicit
+	}
+	if list || debug > 0 {
+		return "-"
+	}
+	return profile + ".pb.gz"
+}
+
+// pprofClientTimeout leaves room for a CPU profile to run its full window plus
+// transfer, without letting a stuck sentinel hang the operator forever.
+func pprofClientTimeout(seconds int) time.Duration {
+	const slack = 30 * time.Second
+	if seconds > 0 {
+		return time.Duration(seconds)*time.Second + slack
+	}
+	return 60 * time.Second
+}
+
+func runSentinelPprof(cmd *cobra.Command, args []string) error {
+	if sentinelPprofSecret == "" {
+		return fmt.Errorf("sentinel admin secret is required — pass --secret or set %s", config.EnvSentinelAdminSecret)
+	}
+	if sentinelPprofDebug < 0 || sentinelPprofDebug > 2 {
+		return fmt.Errorf("--debug must be 0, 1, or 2")
+	}
+	if sentinelPprofSeconds != 0 && sentinelPprofProfile != "profile" {
+		return fmt.Errorf("--seconds applies only to --profile profile (the CPU profile)")
+	}
+
+	endpoint, err := buildPprofURL(sentinelPprofURL, sentinelPprofProfile, sentinelPprofSeconds, sentinelPprofDebug, sentinelPprofGC, sentinelPprofList)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(cmd.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	auth.SignSentinelRequest(req, []byte(sentinelPprofSecret))
+
+	if sentinelPprofSeconds > 0 {
+		fmt.Fprintf(cmd.ErrOrStderr(), "profiling CPU for %ds…\n", sentinelPprofSeconds)
+	}
+
+	client := &http.Client{Timeout: pprofClientTimeout(sentinelPprofSeconds)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", endpoint, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		msg := strings.TrimSpace(string(body))
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("sentinel returned 401 — check %s matches the value on the sentinel host, and that both clocks are within 5 minutes (%s)",
+				config.EnvSentinelAdminSecret, msg)
+		}
+		return fmt.Errorf("sentinel returned %d: %s", resp.StatusCode, msg)
+	}
+
+	outPath := pprofOutputPath(sentinelPprofOutput, sentinelPprofProfile, sentinelPprofDebug, sentinelPprofList)
+	if outPath == "-" {
+		if _, err := io.Copy(cmd.OutOrStdout(), resp.Body); err != nil {
+			return fmt.Errorf("write to stdout: %w", err)
+		}
+		return nil
+	}
+
+	// 0600: the profile may contain tokens and key material lifted straight
+	// out of the sentinel's heap.
+	//
+	// #nosec G304 -- outPath is the operator's own --output flag on a CLI they
+	// are already running under their own uid. Choosing where the file lands
+	// is the flag's entire purpose; there is no fixed root to scope it under,
+	// and the traversal G304 warns about would only reach paths the caller can
+	// already write by hand. Same shape as internal/cmd/recover.go's config
+	// path.
+	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", outPath, err)
+	}
+	n, copyErr := io.Copy(f, resp.Body)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return fmt.Errorf("write %s: %w", outPath, copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close %s: %w", outPath, closeErr)
+	}
+
+	fmt.Fprintf(cmd.ErrOrStderr(), "wrote %s (%d bytes, mode 0600 — contains sentinel heap contents)\n", outPath, n)
+	fmt.Fprintf(cmd.ErrOrStderr(), "inspect with: go tool pprof %s\n", outPath)
+	if sentinelPprofProfile == "heap" {
+		fmt.Fprintf(cmd.ErrOrStderr(), "to find a leak, capture a second snapshot later and diff: go tool pprof -base %s <later>.pb.gz\n", outPath)
+	}
+	return nil
+}

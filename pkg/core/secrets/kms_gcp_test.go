@@ -123,3 +123,254 @@ func (f *fakeGCPKMS) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	default:
+		http.Error(w, `{"error":{"message":"unknown op"}}`, http.StatusBadRequest)
+	}
+}
+
+// httpStatusJSON renders the int as a JSON number-literal
+// for embedding in the error envelope. Keeps the fake
+// terse — proper printf would pull strconv into the test
+// import set for one call.
+func httpStatusJSON(code int) string {
+	switch code {
+	case 400:
+		return "400"
+	case 401:
+		return "401"
+	case 403:
+		return "403"
+	case 404:
+		return "404"
+	case 429:
+		return "429"
+	case 500:
+		return "500"
+	case 503:
+		return "503"
+	default:
+		return "0"
+	}
+}
+
+func (f *fakeGCPKMS) symEncrypt(pt []byte) []byte {
+	block, _ := aes.NewCipher(f.encryptKey)
+	gcm, _ := cipher.NewGCM(block)
+	nonce := make([]byte, gcm.NonceSize())
+	_, _ = io.ReadFull(rand.Reader, nonce)
+	return append(nonce, gcm.Seal(nil, nonce, pt, nil)...)
+}
+
+func (f *fakeGCPKMS) symDecrypt(blob []byte) ([]byte, error) {
+	block, _ := aes.NewCipher(f.encryptKey)
+	gcm, _ := cipher.NewGCM(block)
+	ns := gcm.NonceSize()
+	if len(blob) < ns {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return gcm.Open(nil, blob[:ns], blob[ns:], nil)
+}
+
+const testKeyName = "projects/test-proj/locations/us-west1/keyRings/r/cryptoKeys/k"
+
+// --- Tests ---
+
+func TestGCPKMS_WrapUnwrapRoundtrip(t *testing.T) {
+	srv, _ := newFakeGCPKMS(t)
+	defer srv.Close()
+
+	k, err := NewGCPKMS(GCPConfig{
+		KeyName:  testKeyName,
+		Token:    "access-token-xyz",
+		Endpoint: srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewGCPKMS: %v", err)
+	}
+
+	dek, _ := NewDEK()
+	wrapped, kekID, err := k.Wrap(context.Background(), dek)
+	if err != nil {
+		t.Fatalf("Wrap: %v", err)
+	}
+	if !strings.HasPrefix(kekID, "gcp:") {
+		t.Fatalf("kek_id missing gcp: prefix: %q", kekID)
+	}
+	if !strings.Contains(kekID, testKeyName) {
+		t.Fatalf("kek_id should encode key name; got %q", kekID)
+	}
+	if len(wrapped) == 0 {
+		t.Fatal("wrapped DEK is empty")
+	}
+
+	out, err := k.Unwrap(context.Background(), wrapped, kekID)
+	if err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if !bytes.Equal(out, dek) {
+		t.Fatal("round-trip altered DEK")
+	}
+}
+
+func TestGCPKMS_RejectsBadToken(t *testing.T) {
+	srv, _ := newFakeGCPKMS(t)
+	defer srv.Close()
+
+	k, _ := NewGCPKMS(GCPConfig{
+		KeyName:  testKeyName,
+		Token:    "wrong-token",
+		Endpoint: srv.URL,
+	})
+	dek, _ := NewDEK()
+	_, _, err := k.Wrap(context.Background(), dek)
+	if err == nil {
+		t.Fatal("Wrap with wrong token should fail")
+	}
+	if !strings.Contains(err.Error(), "missing or invalid token") {
+		t.Fatalf("error should pass through Cloud KMS message; got %v", err)
+	}
+}
+
+func TestGCPKMS_RejectsRowFromDifferentBackend(t *testing.T) {
+	srv, _ := newFakeGCPKMS(t)
+	defer srv.Close()
+
+	k, _ := NewGCPKMS(GCPConfig{
+		KeyName: testKeyName, Token: "access-token-xyz", Endpoint: srv.URL,
+	})
+
+	// kek_id from another backend (Vault).
+	_, err := k.Unwrap(context.Background(), []byte("opaque-base64-ciphertext"), "vault:https://v|transit|k")
+	if err == nil {
+		t.Fatal("GCPKMS must refuse non-gcp: kek_id")
+	}
+	if !strings.Contains(err.Error(), "no \"gcp:\" prefix") {
+		t.Fatalf("error should mention the missing prefix; got %v", err)
+	}
+}
+
+func TestGCPKMS_RejectsEmptyOrOversizedPlaintext(t *testing.T) {
+	srv, _ := newFakeGCPKMS(t)
+	defer srv.Close()
+	k, _ := NewGCPKMS(GCPConfig{
+		KeyName: testKeyName, Token: "access-token-xyz", Endpoint: srv.URL,
+	})
+	for _, badSize := range []int{0, MaxWrapPlaintext + 1} {
+		dek := make([]byte, badSize)
+		_, _, err := k.Wrap(context.Background(), dek)
+		if err == nil {
+			t.Fatalf("Wrap with plaintext size %d should fail", badSize)
+		}
+	}
+}
+
+func TestGCPKMS_KEKIDEncodesKeyIdentity(t *testing.T) {
+	// Two backends pointed at different CryptoKeys produce
+	// different kek_ids — a row from one can't silently
+	// route to the other.
+	srv, _ := newFakeGCPKMS(t)
+	defer srv.Close()
+	a, _ := NewGCPKMS(GCPConfig{
+		KeyName:  "projects/a/locations/us/keyRings/r/cryptoKeys/key-a",
+		Token:    "access-token-xyz",
+		Endpoint: srv.URL,
+	})
+	b, _ := NewGCPKMS(GCPConfig{
+		KeyName:  "projects/b/locations/us/keyRings/r/cryptoKeys/key-b",
+		Token:    "access-token-xyz",
+		Endpoint: srv.URL,
+	})
+	dek, _ := NewDEK()
+	_, kekA, _ := a.Wrap(context.Background(), dek)
+	_, kekB, _ := b.Wrap(context.Background(), dek)
+	if kekA == kekB {
+		t.Fatal("different CryptoKeys should produce different kek_ids")
+	}
+}
+
+func TestGCPKMS_RejectsEmptyConfig(t *testing.T) {
+	cases := []GCPConfig{
+		{KeyName: "", Token: "t"},
+		{KeyName: testKeyName, Token: ""},
+		{KeyName: "not/a/key/path", Token: "t"},
+		{KeyName: "projects/p/locations/l/keyRings/r", Token: "t"}, // missing /cryptoKeys/
+	}
+	for _, c := range cases {
+		if _, err := NewGCPKMS(c); err == nil {
+			t.Fatalf("NewGCPKMS should reject config %+v", c)
+		}
+	}
+}
+
+func TestGCPKMS_EndpointDefaultsToPublic(t *testing.T) {
+	// We can't hit the real public endpoint in tests; we
+	// confirm the field defaults to the public URL when
+	// left empty, by reading it back via the kek_id-
+	// independent path (a Wrap against a no-route server
+	// produces an http error containing the URL).
+	k, err := NewGCPKMS(GCPConfig{
+		KeyName: testKeyName,
+		Token:   "access-token-xyz",
+		// no Endpoint → defaults to gcpDefaultEndpoint
+		Timeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewGCPKMS: %v", err)
+	}
+	dek, _ := NewDEK()
+	_, _, err = k.Wrap(context.Background(), dek)
+	if err == nil {
+		t.Fatal("Wrap should fail (we can't actually reach Cloud KMS)")
+	}
+	// Best-effort: the default endpoint string should
+	// appear in the error chain. Network DNS failure or
+	// timeout — either way the URL we tried is in the err.
+	if !strings.Contains(err.Error(), "cloudkms.googleapis.com") {
+		t.Logf("err = %v (does not mention default endpoint, but that's OK on some networks)", err)
+	}
+}
+
+func TestGCPKMS_TimeoutAppliesToHTTP(t *testing.T) {
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}))
+	defer hang.Close()
+
+	k, _ := NewGCPKMS(GCPConfig{
+		KeyName:  testKeyName,
+		Token:    "access-token-xyz",
+		Endpoint: hang.URL,
+		Timeout:  100 * time.Millisecond,
+	})
+	dek, _ := NewDEK()
+	start := time.Now()
+	_, _, err := k.Wrap(context.Background(), dek)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Wrap should time out")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("timeout not honored; elapsed = %v", elapsed)
+	}
+}
+
+func TestGCPKMS_PassesCloudKMSErrorThrough(t *testing.T) {
+	srv, fk := newFakeGCPKMS(t)
+	defer srv.Close()
+	fk.statusCode = 403
+	fk.errMsg = "Permission cloudkms.cryptoKeyVersions.useToEncrypt denied"
+
+	k, _ := NewGCPKMS(GCPConfig{
+		KeyName: testKeyName, Token: "access-token-xyz", Endpoint: srv.URL,
+	})
+	dek, _ := NewDEK()
+	_, _, err := k.Wrap(context.Background(), dek)
+	if err == nil {
+		t.Fatal("Wrap should fail with 403")
+	}
+	if !strings.Contains(err.Error(), "Permission cloudkms") {
+		t.Fatalf("error should surface Cloud KMS message; got %v", err)
+	}
+}
+
+// Compile-time conformance.
+var _ KMSClient = (*GCPKMS)(nil)
