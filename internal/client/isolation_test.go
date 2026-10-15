@@ -29,3 +29,14 @@ func TestContainerToIncusInfo_Isolation(t *testing.T) {
 		}
 	}
 }
+
+func TestIsolationMarshalsAsItsNumericEnumValue(t *testing.T) {
+	b, err := json.Marshal(createContainerRequest{Isolation: pb.IsolationType_ISOLATION_TYPE_VM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `"isolation":` + itoa(int(pb.IsolationType_ISOLATION_TYPE_VM))
+	if !strings.Contains(string(b), want) {
+		t.Errorf("marshaled %s, want it to contain %s", b, want)
+	}
+}
