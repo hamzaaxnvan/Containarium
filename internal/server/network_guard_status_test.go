@@ -63,3 +63,36 @@ func TestGuardStatusToProto_UnsupportedAndOff(t *testing.T) {
 	}
 	cs = coreguard.Status{Mode: nicguard.ModeEnforce, LastError: "coreguard: list containers: boom"}
 	if got := coreGuardStatusToProto(cs); got.Unsupported {
+		t.Errorf("an ordinary error must not read as unsupported: %+v", got)
+	}
+	off := tenantguard.Status{Mode: nicguard.ModeOff}
+	if got := tenantGuardStatusToProto(off); got.Mode != pb.GuardMode_GUARD_MODE_OFF {
+		t.Errorf("off mode = %v", got.Mode)
+	}
+	cs = coreguard.Status{Mode: nicguard.ModeEnforce, Entries: []coreguard.Entry{{Container: "containarium-core-postgres", Role: incus.RolePostgres, Attached: true}}, UnknownRoles: []incus.Role{"core-mystery"}}
+	got := coreGuardStatusToProto(cs)
+	if got.Subjects != 1 || got.Entries[0].Subject != string(incus.RolePostgres) || len(got.Unresolved) != 1 || got.Unresolved[0] != "core-mystery" {
+		t.Errorf("core conversion = %+v", got)
+	}
+}
+
+// Admin only, and a host without guards (no incus client) answers with
+// both halves unset rather than an error.
+func TestGetNetworkGuardStatus_AdminOnlyAndNilGuards(t *testing.T) {
+	s := &NetworkServer{}
+	_, err := s.GetNetworkGuardStatus(context.Background(), &pb.GetNetworkGuardStatusRequest{})
+	if status.Code(err) != codes.PermissionDenied && status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("expected an auth error without an admin principal, got %v", err)
+	}
+	ctx := auth.ContextWithClaims(context.Background(), &auth.Claims{Username: "root", Roles: []string{auth.RoleAdmin}})
+	got, err := s.GetNetworkGuardStatus(ctx, &pb.GetNetworkGuardStatusRequest{})
+	if err != nil {
+		t.Fatalf("admin: %v", err)
+	}
+	if got.Core != nil || got.Tenant != nil {
+		t.Errorf("nil guards must yield unset halves: %+v", got)
+	}
+	if errors.Is(err, nil) && got == nil {
+		t.Fatal("nil response")
+	}
+}
