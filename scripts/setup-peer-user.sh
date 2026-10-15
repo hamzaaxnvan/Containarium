@@ -47,3 +47,101 @@ if [[ ! -f /usr/local/bin/containarium-shell ]]; then
 USERNAME="$(whoami)"
 CONTAINER="${USERNAME}-container"
 
+# Collaborator accounts use the pattern <owner>-container-<collaborator>.
+# If the derived container doesn't exist, try stripping the collaborator suffix.
+if ! sudo incus info "$CONTAINER" &>/dev/null; then
+    STRIPPED="${USERNAME%-*}"
+    if [ "$STRIPPED" != "$USERNAME" ] && sudo incus info "$STRIPPED" &>/dev/null; then
+        CONTAINER="$STRIPPED"
+    fi
+fi
+
+if ! sudo incus info "$CONTAINER" &>/dev/null; then
+    echo "Error: Container $CONTAINER not found" >&2
+    exit 1
+fi
+
+STATE=$(sudo incus info "$CONTAINER" 2>/dev/null | grep "^Status:" | awk '{print $2}')
+if [ "$STATE" != "RUNNING" ]; then
+    echo "Error: Container $CONTAINER is not running (status: $STATE)" >&2
+    exit 1
+fi
+
+COMMAND="${SSH_ORIGINAL_COMMAND}"
+if [ -z "$COMMAND" ] && [ "$1" = "-c" ]; then
+    COMMAND="$2"
+fi
+
+# Verify the in-container account exists before handing off to su. A box
+# whose in-container provisioning never completed (#1487) otherwise dies
+# several layers down with a bare "su: user X does not exist", which says
+# nothing about which half of provisioning is missing or what to run next.
+if ! sudo incus exec "$CONTAINER" --mode non-interactive -- id "$USERNAME" >/dev/null 2>&1; then
+    cat >&2 <<MSG
+Error: account '$USERNAME' does not exist inside $CONTAINER.
+  Host-side login succeeded, but the in-container half of provisioning
+  never completed, so there is no account to log in to.
+  Diagnose:  containarium debug $USERNAME
+  Details:   https://github.com/FootprintAI/Containarium/issues/1487
+MSG
+    exit 1
+fi
+
+if [ -n "$COMMAND" ]; then
+    exec sudo incus exec "$CONTAINER" --mode non-interactive -- su - "$USERNAME" -c "$COMMAND"
+fi
+
+exec sudo incus exec "$CONTAINER" -t -- su -l "$USERNAME"
+SHELL
+    chmod +x /usr/local/bin/containarium-shell
+    echo "  containarium-shell installed"
+else
+    echo "==> containarium-shell already installed"
+fi
+
+# 2. Create or update host user
+if id "$USERNAME" &>/dev/null; then
+    echo "==> User $USERNAME exists, updating shell..."
+    usermod -s /usr/local/bin/containarium-shell "$USERNAME"
+else
+    echo "==> Creating user $USERNAME..."
+    useradd -m -s /usr/local/bin/containarium-shell "$USERNAME"
+fi
+
+# Unlock the account (useradd creates locked accounts by default, sshd rejects them)
+passwd -d "$USERNAME" >/dev/null 2>&1
+chmod 755 "/home/$USERNAME"
+
+# 3. Setup authorized_keys
+echo "==> Setting up SSH keys..."
+mkdir -p "/home/$USERNAME/.ssh"
+
+# Start with sentinel upstream key
+echo "$SENTINEL_PUBKEY" > "/home/$USERNAME/.ssh/authorized_keys"
+
+# Try to copy user's SSH key from the container
+if incus info "$CONTAINER" &>/dev/null; then
+    CONTAINER_KEY=$(incus exec "$CONTAINER" -- cat "/home/$USERNAME/.ssh/authorized_keys" 2>/dev/null | grep -v "sentinel" || true)
+    if [[ -n "$CONTAINER_KEY" ]]; then
+        echo "$CONTAINER_KEY" >> "/home/$USERNAME/.ssh/authorized_keys"
+        echo "  Added user key from container"
+    else
+        echo "  Warning: no user SSH key found in container, add manually later"
+    fi
+fi
+
+chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/.ssh"
+chmod 700 "/home/$USERNAME/.ssh"
+chmod 600 "/home/$USERNAME/.ssh/authorized_keys"
+
+# 4. Sudoers for incus access
+echo "==> Setting up sudoers..."
+echo "$USERNAME ALL=(root) NOPASSWD: /usr/bin/incus" > "/etc/sudoers.d/containarium-$USERNAME"
+chmod 440 "/etc/sudoers.d/containarium-$USERNAME"
+
+echo ""
+echo "=== Done ==="
+echo "  User: $USERNAME"
+echo "  Shell: /usr/local/bin/containarium-shell"
+echo "  Container: $CONTAINER"
+echo "  Keys: $(wc -l < /home/$USERNAME/.ssh/authorized_keys) entries"
