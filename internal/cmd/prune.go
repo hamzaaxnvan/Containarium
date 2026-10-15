@@ -55,3 +55,174 @@ Examples:
 func init() {
 	rootCmd.AddCommand(pruneCmd)
 	pruneCmd.Flags().StringVar(&pruneState, "state", "", "Only containers in this state: running | stopped")
+	pruneCmd.Flags().StringVar(&pruneNameContains, "name-contains", "", "Only containers whose name/username contains this substring")
+	pruneCmd.Flags().StringVar(&pruneOlderThan, "older-than", "", "Only containers created longer ago than this (Go duration: '1h', '24h', '7d' is not valid — use '168h')")
+	pruneCmd.Flags().StringSliceVar(&pruneLabels, "label", nil, "Only containers with this label (key=value); repeatable, all must match")
+	pruneCmd.Flags().BoolVar(&pruneDryRun, "dry-run", false, "Show what would be deleted and exit without deleting")
+	pruneCmd.Flags().BoolVarP(&pruneYes, "yes", "y", false, "Skip the confirmation prompt (delete immediately)")
+	pruneCmd.Flags().BoolVar(&pruneForce, "force", false, "Force-stop running containers before deleting (passed to each delete)")
+}
+
+func runPrune(_ *cobra.Command, _ []string) error {
+	// Require at least one narrowing filter. Without this guard a bare
+	// `prune` would match (and offer to delete) every container — exactly the
+	// foot-gun bulk delete must not have.
+	if pruneState == "" && pruneNameContains == "" && pruneOlderThan == "" && len(pruneLabels) == 0 {
+		return fmt.Errorf("refusing to prune without a filter: pass at least one of --state, --name-contains, --older-than, --label (they combine with AND to narrow the set)")
+	}
+
+	switch pruneState {
+	case "", "running", "stopped":
+	default:
+		return fmt.Errorf("--state must be 'running' or 'stopped', got %q", pruneState)
+	}
+
+	var olderThan time.Duration
+	if pruneOlderThan != "" {
+		d, err := time.ParseDuration(pruneOlderThan)
+		if err != nil {
+			return fmt.Errorf("invalid --older-than %q: %w (expected Go duration like '1h', '24h', '168h')", pruneOlderThan, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("--older-than must be positive, got %s", pruneOlderThan)
+		}
+		olderThan = d
+	}
+
+	labelFilter := parseLabels(pruneLabels)
+
+	containers, err := pruneList()
+	if err != nil {
+		return fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	now := time.Now()
+	matches := filterForPrune(containers, pruneState, pruneNameContains, olderThan, labelFilter, now)
+
+	if len(matches) == 0 {
+		fmt.Println("No containers match the filter — nothing to prune.")
+		return nil
+	}
+
+	fmt.Printf("%d container(s) match:\n", len(matches))
+	for _, c := range matches {
+		fmt.Printf("  - %-24s state=%-8s %s\n", pruneDeleteKey(c), c.State, ageString(now, c.CreatedAt))
+	}
+
+	if pruneDryRun {
+		fmt.Printf("\ndry-run: would delete %d container(s). Re-run without --dry-run to delete.\n", len(matches))
+		return nil
+	}
+
+	if !pruneYes {
+		fmt.Printf("\nDelete these %d container(s)? [y/N]: ", len(matches))
+		reader := bufio.NewReader(os.Stdin)
+		resp, _ := reader.ReadString('\n')
+		if r := strings.TrimSpace(strings.ToLower(resp)); r != "y" && r != "yes" {
+			fmt.Println("Cancelled — nothing deleted.")
+			return nil
+		}
+	}
+
+	var deleted, failed int
+	for _, c := range matches {
+		key := pruneDeleteKey(c)
+		if err := pruneDelete(key, pruneForce); err != nil {
+			fmt.Printf("  ✗ %s: %v\n", key, err)
+			failed++
+			continue
+		}
+		fmt.Printf("  ✓ %s deleted\n", key)
+		deleted++
+	}
+	fmt.Printf("\nPruned %d/%d container(s).\n", deleted, len(matches))
+	if failed > 0 {
+		return fmt.Errorf("%d container(s) failed to delete", failed)
+	}
+	return nil
+}
+
+// filterForPrune is the pure selection logic: which containers match the
+// filters. Core containers and protected boxes (#284) are NEVER matched
+// (infrastructure + runner safety, regardless of the other filters). Filters
+// combine with AND. olderThan == 0 / state == "" / nameContains == "" /
+// empty labels each mean "don't filter on that". A box with no CreatedAt is
+// excluded by an olderThan filter (can't prove it's old enough). Pure — no IO,
+// `now` injected — so it's unit-tested directly.
+func filterForPrune(containers []incus.ContainerInfo, state, nameContains string, olderThan time.Duration, labels map[string]string, now time.Time) []incus.ContainerInfo {
+	var matches []incus.ContainerInfo
+	for _, c := range containers {
+		if c.Role.IsCoreRole() {
+			continue
+		}
+		// Protected boxes (#284, e.g. persistent runners) are never bulk-deleted
+		// — a "clean up leaked boxes" sweep must not take out a runner. Removing
+		// one takes a deliberate single-box `containarium delete`.
+		if c.DeletePolicy == incus.DeletePolicyProtected {
+			continue
+		}
+		if state == "running" && !strings.EqualFold(c.State, "Running") {
+			continue
+		}
+		if state == "stopped" && !strings.EqualFold(c.State, "Stopped") {
+			continue
+		}
+		if nameContains != "" &&
+			!strings.Contains(c.Name, nameContains) &&
+			!strings.Contains(c.Username, nameContains) {
+			continue
+		}
+		if olderThan > 0 {
+			if c.CreatedAt.IsZero() || now.Sub(c.CreatedAt) < olderThan {
+				continue
+			}
+		}
+		if len(labels) > 0 && !incus.MatchLabels(c.Labels, labels) {
+			continue
+		}
+		matches = append(matches, c)
+	}
+	return matches
+}
+
+// pruneDeleteKey is the identifier delete is addressed by: the container's
+// Username (the cloud-assigned cld-<id> on a cloud backend, or the bare
+// username on an OSS daemon) — NOT the friendly name. Falls back to the
+// name with the "-container" suffix stripped when Username is empty.
+func pruneDeleteKey(c incus.ContainerInfo) string {
+	if c.Username != "" {
+		return c.Username
+	}
+	return strings.TrimSuffix(c.Name, "-container")
+}
+
+// ageString renders how long ago the box was created, for the preview list.
+func ageString(now, created time.Time) string {
+	if created.IsZero() {
+		return "age=unknown"
+	}
+	return fmt.Sprintf("age=%s", now.Sub(created).Round(time.Minute))
+}
+
+// pruneList / pruneDelete reuse the exact gRPC / HTTP / local dispatch the
+// list and delete commands use, so prune is purely a filter+loop over the
+// existing per-container surface — no new server endpoint.
+func pruneList() ([]incus.ContainerInfo, error) {
+	if httpMode && serverAddr != "" {
+		return listRemoteHTTP()
+	}
+	if serverAddr != "" {
+		return listRemote()
+	}
+	return listLocal()
+}
+
+func pruneDelete(username string, force bool) error {
+	if httpMode && serverAddr != "" {
+		return deleteRemoteHTTP(username, force)
+	}
+	if serverAddr != "" {
+		return deleteRemote(username, force)
+	}
+	return deleteLocal(username, force)
+}
