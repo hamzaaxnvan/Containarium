@@ -125,3 +125,130 @@ func TestUpgradeRunbook_CommandsAndLinksResolve(t *testing.T) {
 		for _, p := range checkRunbook(rootCmd, doc, md) {
 			t.Errorf("%s:%d: %s", filepath.Base(doc), p.Line, p.Detail)
 		}
+	}
+	md := readDriftFile(t, runbookPath)
+	fenced, inline := len(extractInvocationsFor(md, runbookBinaries)), len(inlineInvocations(md))
+	if fenced < 8 || inline < 8 {
+		t.Fatalf("found %d fenced and %d inline invocations in the runbook — the extractor is broken, not the runbook", fenced, inline)
+	}
+}
+
+// The bad fixture proves the runbook gate can fail: every planted mistake
+// must be reported, by line, and nothing else.
+func TestUpgradeRunbookChecker_CatchesBadFixture(t *testing.T) {
+	const doc = "testdata/runbook_drift/bad.md"
+	got := checkRunbook(rootCmd, doc, readDriftFile(t, doc))
+	want := []struct {
+		line int
+		sub  string
+	}{
+		{6, `"--no-such-flag"`},
+		{8, `"frobnicate"`},
+		{11, `"--not-a-flag"`},
+		{13, `does-not-exist.md: file not found`},
+		{15, `good-target.md#no-such-heading`},
+		{19, `#nope`},
+	}
+	for _, w := range want {
+		found := false
+		for _, p := range got {
+			if p.Line == w.line && strings.Contains(p.Detail, w.sub) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("bad.md:%d: expected a problem mentioning %s; got %+v", w.line, w.sub, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("expected exactly %d problems, got %d: %+v", len(want), len(got), got)
+	}
+}
+
+// policyBlock returns the text between the support-policy markers.
+func policyBlock(markdown string) (string, error) {
+	_, rest, ok := strings.Cut(markdown, policyBegin)
+	if !ok {
+		return "", fmt.Errorf("no %s marker", policyBegin)
+	}
+	block, _, ok := strings.Cut(rest, policyEnd)
+	if !ok {
+		return "", fmt.Errorf("no %s marker", policyEnd)
+	}
+	block = strings.TrimSpace(block)
+	if !strings.Contains(block, "| ---") {
+		return "", fmt.Errorf("support-policy block has no table")
+	}
+	return block, nil
+}
+
+// comparePolicy reports why SECURITY.md's and the runbook's policy blocks
+// disagree, or nothing when they are identical.
+func comparePolicy(security, runbook string) []string {
+	s, errS := policyBlock(security)
+	r, errR := policyBlock(runbook)
+	var out []string
+	if errS != nil {
+		out = append(out, "SECURITY.md: "+errS.Error())
+	}
+	if errR != nil {
+		out = append(out, "runbook: "+errR.Error())
+	}
+	if out != nil {
+		return out
+	}
+	sl, rl := strings.Split(s, "\n"), strings.Split(r, "\n")
+	for i := 0; i < max(len(sl), len(rl)); i++ {
+		var a, b string
+		if i < len(sl) {
+			a = sl[i]
+		}
+		if i < len(rl) {
+			b = rl[i]
+		}
+		if a != b {
+			out = append(out, fmt.Sprintf("policy line %d differs:\n  SECURITY.md: %q\n  runbook:     %q", i+1, a, b))
+		}
+	}
+	return out
+}
+
+func TestSupportPolicy_SecurityMDAndRunbookAgree(t *testing.T) {
+	for _, p := range comparePolicy(readDriftFile(t, securityPolicyPath), readDriftFile(t, runbookPath)) {
+		t.Error(p)
+	}
+}
+
+// Seeded failures: the agreement check must fail when either side drifts or
+// loses its markers, including on the real files with one row changed.
+func TestSupportPolicyChecker_CatchesDrift(t *testing.T) {
+	security := readDriftFile(t, securityPolicyPath)
+	runbook := readDriftFile(t, runbookPath)
+	block, err := policyBlock(security)
+	if err != nil {
+		t.Fatalf("SECURITY.md: %v", err)
+	}
+	row := ""
+	for _, l := range strings.Split(block, "\n") {
+		if strings.HasPrefix(l, "| ") && !strings.HasPrefix(l, "| ---") {
+			row = l // the last table row
+		}
+	}
+	tests := []struct {
+		name, security, runbook, want string
+	}{
+		{"row changed in runbook", security, strings.Replace(runbook, row, row+" edited", 1), "differs"},
+		{"row dropped from SECURITY.md", strings.Replace(security, row+"\n", "", 1), runbook, "differs"},
+		{"runbook lost its markers", security, strings.ReplaceAll(runbook, policyBegin, ""), "runbook: no"},
+		{"SECURITY.md lost its table", strings.ReplaceAll(security, "| ---", "|"), runbook, "has no table"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := comparePolicy(tt.security, tt.runbook)
+			if len(got) == 0 || !strings.Contains(strings.Join(got, "\n"), tt.want) {
+				t.Errorf("expected a problem mentioning %q, got %q", tt.want, got)
+			}
+		})
+	}
+}

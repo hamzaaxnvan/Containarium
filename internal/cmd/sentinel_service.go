@@ -35,3 +35,153 @@ func hostHasSwap() bool {
 	for _, line := range strings.Split(string(data), "\n") {
 		rest, ok := strings.CutPrefix(line, "SwapTotal:")
 		if !ok {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			return false
+		}
+		kb, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil {
+			return false
+		}
+		return kb > 0
+	}
+	return false
+}
+
+var (
+	sentinelSvcSpotVM     string
+	sentinelSvcZone       string
+	sentinelSvcProject    string
+	sentinelSvcMemoryHigh string
+	sentinelSvcMemoryMax  string
+)
+
+var sentinelServiceCmd = &cobra.Command{
+	Use:   "service",
+	Short: "Manage the Containarium sentinel systemd service",
+}
+
+var sentinelServiceInstallCmd = &cobra.Command{
+	Use:   "install",
+	Short: "Install the sentinel systemd service file and enable it",
+	Long: `Install the Containarium sentinel systemd service to /etc/systemd/system/.
+
+The sentinel service monitors a backend spot VM and forwards traffic via iptables DNAT.
+When the backend is unavailable, it serves a maintenance page.
+
+Requires root privileges.`,
+	RunE: runSentinelServiceInstall,
+}
+
+var sentinelServiceUninstallCmd = &cobra.Command{
+	Use:   "uninstall",
+	Short: "Stop and remove the sentinel systemd service",
+	RunE:  runSentinelServiceUninstall,
+}
+
+var sentinelServiceStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show the sentinel systemd service status",
+	RunE:  runSentinelServiceStatus,
+}
+
+func init() {
+	sentinelCmd.AddCommand(sentinelServiceCmd)
+	sentinelServiceCmd.AddCommand(sentinelServiceInstallCmd)
+	sentinelServiceCmd.AddCommand(sentinelServiceUninstallCmd)
+	sentinelServiceCmd.AddCommand(sentinelServiceStatusCmd)
+
+	sentinelServiceInstallCmd.Flags().StringVar(&sentinelSvcSpotVM, "spot-vm", "", "Name of the backend spot VM instance (required)")
+	sentinelServiceInstallCmd.Flags().StringVar(&sentinelSvcZone, "zone", "", "GCP zone (required)")
+	sentinelServiceInstallCmd.Flags().StringVar(&sentinelSvcProject, "project", "", "GCP project ID (required)")
+	sentinelServiceInstallCmd.Flags().StringVar(&sentinelSvcMemoryHigh, "memory-high", defaultSentinelMemoryHigh,
+		"Soft memory limit; past it the kernel reclaims inside the sentinel's cgroup instead of stalling the host (#1350). "+
+			"Defaults to --memory-max: a lower value is refused unless the host has swap, because a swapless cgroup stalls "+
+			"between the two limits instead of restarting (#1454). Percentage of RAM or a size like 512M.")
+	sentinelServiceInstallCmd.Flags().StringVar(&sentinelSvcMemoryMax, "memory-max", defaultSentinelMemoryMax,
+		"Hard memory limit; exceeding it restarts the sentinel (Restart=always) rather than letting the OOM killer take the host down (#1350).")
+}
+
+func runSentinelServiceInstall(cmd *cobra.Command, args []string) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("this command requires root privileges (use sudo)")
+	}
+
+	if sentinelSvcSpotVM == "" || sentinelSvcZone == "" || sentinelSvcProject == "" {
+		return fmt.Errorf("--spot-vm, --zone, and --project are required")
+	}
+
+	serviceContent, err := buildSentinelUnit(sentinelUnitConfig{
+		SpotVM:      sentinelSvcSpotVM,
+		Zone:        sentinelSvcZone,
+		Project:     sentinelSvcProject,
+		MemoryHigh:  sentinelSvcMemoryHigh,
+		MemoryMax:   sentinelSvcMemoryMax,
+		HostHasSwap: hostHasSwap(),
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(sentinelSystemdServicePath, []byte(serviceContent), 0644); err != nil {
+		return fmt.Errorf("failed to write service file: %w", err)
+	}
+	log.Printf("Service file written: %s", sentinelSystemdServicePath)
+	if err := ensureCompatSymlink("/"); err != nil {
+		return err
+	}
+
+	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+		return fmt.Errorf("failed to reload systemd: %w", err)
+	}
+
+	if err := exec.Command("systemctl", "enable", "containarium-sentinel").Run(); err != nil {
+		return fmt.Errorf("failed to enable service: %w", err)
+	}
+	log.Printf("Service enabled")
+
+	if err := exec.Command("systemctl", "start", "containarium-sentinel").Run(); err != nil {
+		return fmt.Errorf("failed to start service: %w", err)
+	}
+	log.Printf("Service started")
+
+	fmt.Println()
+	fmt.Println("Containarium sentinel service installed and running.")
+	fmt.Println()
+	fmt.Println("  Status:  sudo systemctl status containarium-sentinel")
+	fmt.Println("  Logs:    sudo journalctl -u containarium-sentinel -f")
+	fmt.Println("  Stop:    sudo systemctl stop containarium-sentinel")
+	fmt.Println("  Restart: sudo systemctl restart containarium-sentinel")
+
+	return nil
+}
+
+func runSentinelServiceUninstall(cmd *cobra.Command, args []string) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("this command requires root privileges (use sudo)")
+	}
+
+	_ = exec.Command("systemctl", "stop", "containarium-sentinel").Run()
+	_ = exec.Command("systemctl", "disable", "containarium-sentinel").Run()
+
+	if err := os.Remove(sentinelSystemdServicePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove service file: %w", err)
+	}
+	removeCompatSymlink("/")
+
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+
+	log.Printf("Sentinel service stopped, disabled, and removed")
+	return nil
+}
+
+func runSentinelServiceStatus(cmd *cobra.Command, args []string) error {
+	out, err := exec.Command("systemctl", "status", "containarium-sentinel", "--no-pager").CombinedOutput()
+	fmt.Print(string(out))
+	if err != nil {
+		return nil
+	}
+	return nil
+}
