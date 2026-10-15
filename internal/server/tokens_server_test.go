@@ -188,3 +188,383 @@ func TestRevokeToken_UnavailableWhenStoreNil(t *testing.T) {
 		t.Fatalf("nil store: got %v want Unavailable", err)
 	}
 }
+
+// --- happy path + idempotency ---
+
+func TestRevokeToken_AdminSucceeds(t *testing.T) {
+	store := newFakeRevocationStore()
+	srv := newTestTokensServer(t, store)
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+
+	resp, err := srv.RevokeToken(ctx, &pb.RevokeTokenRequest{
+		Jti:    "test-jti-123",
+		Reason: "leaked",
+	})
+	if err != nil {
+		t.Fatalf("RevokeToken: %v", err)
+	}
+	if !resp.NewlyRevoked {
+		t.Fatal("expected NewlyRevoked=true")
+	}
+	if reason, ok := store.revoked["test-jti-123"]; !ok {
+		t.Fatal("jti not present in store")
+	} else if reason != "leaked" {
+		t.Fatalf("reason = %q, want %q", reason, "leaked")
+	}
+}
+
+func TestRevokeToken_DefaultReason(t *testing.T) {
+	store := newFakeRevocationStore()
+	srv := newTestTokensServer(t, store)
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+
+	_, err := srv.RevokeToken(ctx, &pb.RevokeTokenRequest{Jti: "x"})
+	if err != nil {
+		t.Fatalf("RevokeToken: %v", err)
+	}
+	if reason := store.revoked["x"]; reason != "operator_revoke" {
+		t.Fatalf("default reason = %q, want %q", reason, "operator_revoke")
+	}
+}
+
+func TestRevokeToken_Idempotent(t *testing.T) {
+	store := newFakeRevocationStore()
+	srv := newTestTokensServer(t, store)
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+
+	for i := 0; i < 3; i++ {
+		if _, err := srv.RevokeToken(ctx, &pb.RevokeTokenRequest{
+			Jti:    "x",
+			Reason: "first",
+		}); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+	}
+	if reason := store.revoked["x"]; reason != "first" {
+		t.Fatalf("reason = %q; want first (idempotency must preserve original reason)", reason)
+	}
+}
+
+func TestRevokeToken_StoreErrorIsInternal(t *testing.T) {
+	store := newFakeRevocationStore()
+	store.failNext = true
+	srv := newTestTokensServer(t, store)
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+	_, err := srv.RevokeToken(ctx, &pb.RevokeTokenRequest{Jti: "x"})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("store error: got %v want Internal", err)
+	}
+}
+
+func TestRevokeToken_AcceptsRFC3339Expiry(t *testing.T) {
+	store := newFakeRevocationStore()
+	srv := newTestTokensServer(t, store)
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+
+	_, err := srv.RevokeToken(ctx, &pb.RevokeTokenRequest{
+		Jti:       "x",
+		ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatalf("RFC3339 expiry should parse; got %v", err)
+	}
+}
+
+// --- Phase 1.6 part B — RefreshToken RPC ---
+
+func TestRefreshToken_RejectsEmpty(t *testing.T) {
+	srv := newTestTokensServer(t, newFakeRevocationStore())
+	_, err := srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty refresh_token: got %v want InvalidArgument", err)
+	}
+}
+
+func TestRefreshToken_RejectsAccessToken(t *testing.T) {
+	// A request bearing an access token where a refresh is
+	// expected must be rejected with Unauthenticated.
+	srv := newTestTokensServer(t, newFakeRevocationStore())
+	access, err := srv.tokenManager.GenerateAccessToken("alice", []string{"user"}, time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateAccessToken: %v", err)
+	}
+	_, err = srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{RefreshToken: access})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("access at refresh: got %v want Unauthenticated", err)
+	}
+}
+
+func TestRefreshToken_RejectsLegacyToken(t *testing.T) {
+	srv := newTestTokensServer(t, newFakeRevocationStore())
+	legacy, _ := srv.tokenManager.GenerateToken("alice", []string{"user"}, time.Hour)
+	_, err := srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{RefreshToken: legacy})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("legacy at refresh: got %v want Unauthenticated", err)
+	}
+}
+
+func TestRefreshToken_HappyPath_MintsNewPair(t *testing.T) {
+	store := newFakeRevocationStore()
+	srv := newTestTokensServer(t, store)
+	refresh, _ := srv.tokenManager.GenerateRefreshToken("alice", []string{"user"}, time.Hour, auth.ScopeContainersRead)
+
+	resp, err := srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{RefreshToken: refresh})
+	if err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	if resp.AccessToken == "" || resp.RefreshToken == "" {
+		t.Fatal("response should carry both new tokens")
+	}
+	if resp.AccessTokenExpiresAt == 0 || resp.RefreshTokenExpiresAt == 0 {
+		t.Fatal("response should carry expiry timestamps")
+	}
+
+	// New access token validates as access; new refresh
+	// validates as refresh. Scope passes through.
+	ac, err := srv.tokenManager.ValidateAccessToken(resp.AccessToken)
+	if err != nil {
+		t.Fatalf("new access invalid: %v", err)
+	}
+	if ac.TokenType != auth.TokenTypeAccess {
+		t.Fatalf("new access tt=%q", ac.TokenType)
+	}
+	if len(ac.Scopes) != 1 || ac.Scopes[0] != auth.ScopeContainersRead {
+		t.Fatalf("new access scopes=%v; should pass through", ac.Scopes)
+	}
+	rc, err := srv.tokenManager.ValidateRefreshToken(resp.RefreshToken)
+	if err != nil {
+		t.Fatalf("new refresh invalid: %v", err)
+	}
+	if rc.TokenType != auth.TokenTypeRefresh {
+		t.Fatalf("new refresh tt=%q", rc.TokenType)
+	}
+}
+
+// --- ListRevokedTokens admin enumeration ---
+
+func TestListRevokedTokens_RejectsNoSubject(t *testing.T) {
+	srv := newTestTokensServer(t, newFakeRevocationStore())
+	_, err := srv.ListRevokedTokens(context.Background(), &pb.ListRevokedTokensRequest{})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("missing subject: got %v want Unauthenticated", err)
+	}
+}
+
+func TestListRevokedTokens_RejectsNonAdmin(t *testing.T) {
+	srv := newTestTokensServer(t, newFakeRevocationStore())
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"alice", []string{"user"}, []string{auth.ScopeTokensWrite},
+	)
+	_, err := srv.ListRevokedTokens(ctx, &pb.ListRevokedTokensRequest{})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("non-admin: got %v want PermissionDenied", err)
+	}
+}
+
+// #621: ListRevokedTokens is a read path. An admin reaches it by role —
+// no scope needed. (Previously it required admin AND tokens:write; the
+// write-scope gate on a read RPC was relaxed to admin-OR-tokens:read.)
+func TestListRevokedTokens_AdminByRoleSucceeds(t *testing.T) {
+	store := newFakeRevocationStore()
+	_ = store.Revoke(context.Background(), "abc123", time.Now().Add(time.Hour), "test")
+	srv := newTestTokensServer(t, store)
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"ops", []string{auth.RoleAdmin}, []string{auth.ScopeContainersRead},
+	)
+	resp, err := srv.ListRevokedTokens(ctx, &pb.ListRevokedTokensRequest{})
+	if err != nil {
+		t.Fatalf("admin by role (no tokens scope): %v", err)
+	}
+	if len(resp.Revocations) != 1 {
+		t.Fatalf("len(revocations) = %d, want 1", len(resp.Revocations))
+	}
+}
+
+// #621: a non-admin least-privilege token reaches the read path with an
+// explicit tokens:read scope (e.g. a compliance/evidence collector).
+func TestListRevokedTokens_NonAdminWithReadScopeSucceeds(t *testing.T) {
+	store := newFakeRevocationStore()
+	_ = store.Revoke(context.Background(), "abc123", time.Now().Add(time.Hour), "test")
+	srv := newTestTokensServer(t, store)
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"collector", []string{"user"}, []string{auth.ScopeTokensRead},
+	)
+	resp, err := srv.ListRevokedTokens(ctx, &pb.ListRevokedTokensRequest{})
+	if err != nil {
+		t.Fatalf("non-admin with tokens:read: %v", err)
+	}
+	if len(resp.Revocations) != 1 {
+		t.Fatalf("len(revocations) = %d, want 1", len(resp.Revocations))
+	}
+	if resp.Revocations[0].Jti != "abc123" {
+		t.Fatalf("jti = %q, want %q", resp.Revocations[0].Jti, "abc123")
+	}
+}
+
+func TestListRevokedTokens_UnavailableWhenStoreNil(t *testing.T) {
+	srv := newTestTokensServer(t, nil)
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"ops", []string{auth.RoleAdmin}, []string{auth.ScopeTokensWrite},
+	)
+	_, err := srv.ListRevokedTokens(ctx, &pb.ListRevokedTokensRequest{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("nil store: got %v want Unavailable", err)
+	}
+}
+
+func TestRefreshToken_RotationRevokesPriorJTI(t *testing.T) {
+	// Single-use semantics: after a successful exchange,
+	// replaying the same refresh token must fail.
+	store := newFakeRevocationStore()
+	srv := newTestTokensServer(t, store)
+	refresh, _ := srv.tokenManager.GenerateRefreshToken("alice", []string{"user"}, time.Hour)
+
+	// First exchange succeeds.
+	if _, err := srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{RefreshToken: refresh}); err != nil {
+		t.Fatalf("first exchange: %v", err)
+	}
+
+	// The prior jti is now revoked. Validate the old
+	// refresh token through the same path — the
+	// revocation list check inside ValidateRefreshToken's
+	// chain trips and returns invalid.
+	srv.tokenManager.SetRevocationStore(store)
+	_, err := srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{RefreshToken: refresh})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("replay should be rejected; got %v", err)
+	}
+}
+
+// Trenyx audit finding #1 (2026-09-16): RefreshToken used to mint the new
+// pair BEFORE revoking the presented jti, so two concurrent exchanges of
+// the same refresh token could both pass ValidateRefreshToken (neither
+// had been revoked yet at that point) and both walk away with a valid new
+// pair — contradicting the documented single-use contract. This test
+// fires the same refresh token from two goroutines at once; with the
+// fixed claim-before-mint ordering exactly one may succeed.
+func TestRefreshToken_ConcurrentExchange_OnlyOneWins(t *testing.T) {
+	store := newFakeRevocationStore()
+	srv := newTestTokensServer(t, store)
+	refresh, _ := srv.tokenManager.GenerateRefreshToken("alice", []string{"user"}, time.Hour)
+
+	const racers = 8
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	results := make([]error, racers)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, err := srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{RefreshToken: refresh})
+			results[i] = err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	successes := 0
+	for _, err := range results {
+		if err == nil {
+			successes++
+		} else if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("loser got %v, want Unauthenticated", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successes = %d, want exactly 1 (single-use refresh token exchanged by %d concurrent racers)", successes, racers)
+	}
+}
+
+// Trenyx audit finding #1: reuse of an already-rotated refresh token (a
+// concurrent racer losing the claim, or a genuine stolen-token replay) must
+// revoke the entire rotation family — including whatever pair the winning
+// exchange already minted — not just the replayed jti. This is the
+// "revoke the family" half of the fix the report called for.
+func TestRefreshToken_ReuseRevokesWholeFamily(t *testing.T) {
+	store := newFakeRevocationStore()
+	srv := newTestTokensServer(t, store)
+	original, _ := srv.tokenManager.GenerateRefreshToken("alice", []string{"user"}, time.Hour)
+
+	// Legitimate first exchange.
+	resp, err := srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{RefreshToken: original})
+	if err != nil {
+		t.Fatalf("first exchange: %v", err)
+	}
+	rotatedRefresh := resp.RefreshToken
+
+	// The original token gets replayed (e.g. it was stolen before the
+	// legitimate rotation). This must fail...
+	if _, err := srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{RefreshToken: original}); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("replay of original: got %v, want Unauthenticated", err)
+	}
+
+	// ...and must also have killed the legitimately rotated token, since
+	// from the server's point of view it can't tell which of the two
+	// presenters (the real client vs. the thief) is legitimate.
+	if _, err := srv.RefreshToken(context.Background(), &pb.RefreshTokenRequest{RefreshToken: rotatedRefresh}); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("rotated token after family revocation: got %v, want Unauthenticated", err)
+	}
+}
+
+// --- GetUnscopedTokenReport (#1679) ---
+
+func TestGetUnscopedTokenReport_RejectsNoSubject(t *testing.T) {
+	srv := newTestTokensServer(t, newFakeRevocationStore())
+	_, err := srv.GetUnscopedTokenReport(context.Background(), &pb.GetUnscopedTokenReportRequest{})
+	if status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("missing subject: got %v want Unauthenticated", err)
+	}
+}
+
+func TestGetUnscopedTokenReport_RejectsNonAdmin(t *testing.T) {
+	srv := newTestTokensServer(t, newFakeRevocationStore())
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"alice", []string{"user"}, []string{auth.ScopeTokensWrite},
+	)
+	_, err := srv.GetUnscopedTokenReport(ctx, &pb.GetUnscopedTokenReportRequest{})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("non-admin, no tokens:read: got %v want PermissionDenied", err)
+	}
+}
+
+// Same admin-OR-tokens:read read-path gate as ListRevokedTokens (#621).
+func TestGetUnscopedTokenReport_TokensReadScopeSucceeds(t *testing.T) {
+	srv := newTestTokensServer(t, newFakeRevocationStore())
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"auditor", []string{"user"}, []string{auth.ScopeTokensRead},
+	)
+	if _, err := srv.GetUnscopedTokenReport(ctx, &pb.GetUnscopedTokenReportRequest{}); err != nil {
+		t.Fatalf("tokens:read scope should pass; got %v", err)
+	}
+}
+
+func TestGetUnscopedTokenReport_ReportsCurrentCountAndStrictMode(t *testing.T) {
+	defer auth.SetStrictScopes(false)
+	auth.ResetUnscopedTokenCallsForTest()
+
+	// Generate two unscoped-token calls through the real gate, the same
+	// way any handler's auth.RequireScope call would.
+	unscopedCtx := auth.ContextWithTestSubject(context.Background(), "bob", "user")
+	_ = auth.RequireScope(unscopedCtx, auth.ScopeContainersRead)
+	_ = auth.RequireScope(unscopedCtx, auth.ScopeContainersWrite)
+	auth.SetStrictScopes(true)
+
+	srv := newTestTokensServer(t, newFakeRevocationStore())
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(),
+		"ops", []string{auth.RoleAdmin}, nil,
+	)
+	resp, err := srv.GetUnscopedTokenReport(ctx, &pb.GetUnscopedTokenReportRequest{})
+	if err != nil {
+		t.Fatalf("GetUnscopedTokenReport: %v", err)
+	}
+	if resp.UnscopedCallCount != 2 {
+		t.Fatalf("UnscopedCallCount = %d, want 2", resp.UnscopedCallCount)
+	}
+	if resp.Since == "" {
+		t.Fatal("Since is empty, want the RFC3339 time of the first unscoped call")
+	}
+	if !resp.StrictModeEnabled {
+		t.Fatal("StrictModeEnabled = false, want true (SetStrictScopes(true) was called)")
+	}
+}

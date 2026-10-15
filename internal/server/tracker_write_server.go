@@ -192,3 +192,198 @@ func (s *ContainerServer) ClaimTrackerIssue(ctx context.Context, req *pb.ClaimTr
 
 	// Serialize claims on this (username, connection, number) within
 	// this daemon process — the cross-daemon race is handled by
+	// tracker.ClaimTrackerIssue's own re-read-and-yield step.
+	lock := s.claimLocks.Lock(req.Username, req.Connection, req.Number)
+	lock.Lock()
+	defer lock.Unlock()
+
+	id := s.identityFromContext(ctx)
+	result, err := tracker.ClaimTrackerIssue(ctx, provider, conn, req.Number, id, s.runResolver(), tracker.SystemClock, staleAfter)
+	if err != nil {
+		return nil, mapProviderError(err)
+	}
+
+	s.auditTrackerWrite(ctx, "tracker.claim", req.Username, req.Connection, req.Number, trackerClaimAuditDetail{
+		Connection:            req.Connection,
+		Number:                req.Number,
+		RunID:                 id.RunID,
+		SkillID:               id.SkillID,
+		Claimed:               result.Claimed,
+		AlreadyClaimedByRunID: result.AlreadyClaimedByRunID,
+		Assigned:              result.Assigned,
+	})
+	return &pb.ClaimTrackerIssueResponse{
+		Claimed:               result.Claimed,
+		AlreadyClaimedByRunId: result.AlreadyClaimedByRunID,
+		Assigned:              result.Assigned,
+	}, nil
+}
+
+// SetTrackerIssueLabels adds and/or removes labels on an issue, both
+// lists checked against the connection's label allow-list first (#2024);
+// a run token's scope labels, and its removal of the approval gate, are
+// further bound to its own lineage (#2060, #2068), and a run token may
+// remove the approval gate at all only under auto_chain (#2025).
+func (s *ContainerServer) SetTrackerIssueLabels(ctx context.Context, req *pb.SetTrackerIssueLabelsRequest) (*pb.SetTrackerIssueLabelsResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrackerWrite); err != nil {
+		return nil, err
+	}
+	if s.trackerStore == nil {
+		return nil, status.Error(codes.Unavailable, "tracker store not configured on this daemon")
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTrackerTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+	if len(req.AddLabels) == 0 && len(req.RemoveLabels) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "add_labels or remove_labels is required")
+	}
+
+	// Allow-list (#2024): both lists, against the connection's policy,
+	// BEFORE resolving a credential or making any upstream call. A
+	// run-scoped token can never touch the dispatcher's state labels.
+	if err := enforceConnectionBinding(ctx, req.Connection); err != nil {
+		return nil, err
+	}
+	record, err := s.trackerStore.Get(ctx, req.Username, req.Connection)
+	if err != nil {
+		return nil, mapTrackerError(err)
+	}
+	runID, isRun := auth.RunIDFromGRPCContext(ctx)
+	isRun = isRun && runID != ""
+	policy := tracker.PolicyFromProto(record.Policy)
+	// Trim first (same as CreateTrackerIssue), so "agent:done " is judged —
+	// and rejected — as the reserved label it is (review of #2034).
+	add, remove := trimLabels(req.AddLabels), trimLabels(req.RemoveLabels)
+	if err := policy.CheckLabels(append(append([]string(nil), add...), remove...), isRun); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	// Approval gate (#2025): with auto_chain off, only a human releases an
+	// agent-filed follow-up. A run token removing agent:needs-approval is
+	// refused on every issue, its own follow-ups included; otherwise a run
+	// could release its own children and chain itself, hop after hop, up
+	// to max_depth with no human involved, which is exactly what auto_chain
+	// off is meant to prevent. With auto_chain on, the lineage check below
+	// still bounds where a run may remove it.
+	if isRun && !policy.AutoChain && anyGateLabel(remove) {
+		return nil, status.Errorf(codes.PermissionDenied,
+			"a run-scoped token may not remove %s: this connection does not enable auto_chain, so only a human releases a follow-up", tracker.LabelNeedsApproval)
+	}
+	// Lineage (#2060, #2068), on top of the allow-list and whatever it
+	// admits: a run token may add or remove a scope:<role> label, or remove
+	// agent:needs-approval, only on an issue in its own lineage — the issue
+	// it was dispatched for, or a follow-up it filed. Routing any other
+	// issue, or releasing one already routed and parked behind the gate,
+	// would dispatch it at depth 0, past the approval gate and uncounted
+	// against max_children_per_run. Adding the gate is not bound: it only
+	// holds an issue back.
+	if isRun && (anyScopeLabel(add, remove) || anyGateLabel(remove)) {
+		in, err := s.trackerStore.IssueInRunLineage(ctx, req.Username, req.Connection, runID, req.Number)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "check run lineage: %v", err)
+		}
+		if !in {
+			return nil, status.Errorf(codes.PermissionDenied,
+				"a run-scoped token may set scope labels or remove %s only on the issue it was dispatched for or a follow-up it filed; #%d is outside run %s's lineage", tracker.LabelNeedsApproval, req.Number, runID)
+		}
+	}
+
+	provider, conn, err := s.writerConnFor(ctx, record)
+	if err != nil {
+		return nil, err
+	}
+	if err := provider.SetLabels(ctx, conn, req.Number, add, remove); err != nil {
+		return nil, mapProviderError(err)
+	}
+
+	s.auditTrackerWrite(ctx, "tracker.set_labels", req.Username, req.Connection, req.Number, trackerLabelsAuditDetail{
+		Connection:   req.Connection,
+		Number:       req.Number,
+		AddLabels:    add,
+		RemoveLabels: remove,
+	})
+	return &pb.SetTrackerIssueLabelsResponse{Message: "labels updated"}, nil
+}
+
+// anyScopeLabel reports whether any label in either list is a
+// scope:<role> label.
+func anyScopeLabel(lists ...[]string) bool {
+	for _, labels := range lists {
+		for _, l := range labels {
+			if tracker.IsScopeLabel(l) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// anyGateLabel reports whether any label in labels is the approval gate,
+// agent:needs-approval (any case).
+func anyGateLabel(labels []string) bool {
+	for _, l := range labels {
+		if tracker.IsGateLabel(l) {
+			return true
+		}
+	}
+	return false
+}
+
+// ---- tracker write audit rows (#1922) --------------------------------
+//
+// One row per write, ResourceType "tracker_issue", Detail marshalled from
+// the named structs below rather than a map — same idiom as
+// agent_server.go's run-lease audit rows.
+
+type trackerCommentAuditDetail struct {
+	Connection string `json:"connection"`
+	Number     int64  `json:"number"`
+	RunID      string `json:"run_id"`
+	SkillID    string `json:"skill_id,omitempty"`
+}
+
+type trackerClaimAuditDetail struct {
+	Connection            string `json:"connection"`
+	Number                int64  `json:"number"`
+	RunID                 string `json:"run_id"`
+	SkillID               string `json:"skill_id,omitempty"`
+	Claimed               bool   `json:"claimed"`
+	AlreadyClaimedByRunID string `json:"already_claimed_by_run_id,omitempty"`
+	Assigned              bool   `json:"assigned"`
+}
+
+type trackerLabelsAuditDetail struct {
+	Connection   string   `json:"connection"`
+	Number       int64    `json:"number"`
+	AddLabels    []string `json:"add_labels,omitempty"`
+	RemoveLabels []string `json:"remove_labels,omitempty"`
+}
+
+// auditTrackerWrite records a tracker write verb's outcome. Best-effort
+// — audit must never fail the call. No-op until the audit store is
+// wired. detail is one of the named structs above.
+func (s *ContainerServer) auditTrackerWrite(ctx context.Context, action, username, connection string, number int64, detail any) {
+	if s.auditStore == nil {
+		return
+	}
+	payload, err := json.Marshal(detail)
+	if err != nil {
+		log.Printf("[tracker] marshal audit detail for %s: %v", action, err)
+		return
+	}
+	// Use the authenticated claim, not the visible stamp's operator fallback
+	// (which uses the username as an identity when no run is present).
+	runID, _ := auth.RunIDFromGRPCContext(ctx)
+	if err := s.auditStore.Log(ctx, &audit.AuditEntry{
+		Username:     username,
+		Action:       action,
+		ResourceType: "tracker_issue",
+		ResourceID:   fmt.Sprintf("%s/%s#%d", username, connection, number),
+		Detail:       string(payload),
+		RunID:        runID,
+	}); err != nil {
+		log.Printf("[tracker] audit %s %s/%s#%d: %v", action, username, connection, number, err)
+	}
+}
