@@ -50,3 +50,55 @@ func TestStateWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 	want := &api.InstanceState{Status: "Running"}
 	state, _, err := stateWithRetry("test", func() (*api.InstanceState, string, error) {
 		calls++
+		if calls < 3 {
+			return nil, "", errTransientState
+		}
+		return want, "etag", nil
+	})
+	if err != nil {
+		t.Fatalf("err = %v, want nil after transient retries", err)
+	}
+	if state != want {
+		t.Errorf("state = %v, want %v", state, want)
+	}
+	if calls != 3 {
+		t.Errorf("attempts = %d, want 3 (2 transient + 1 success)", calls)
+	}
+}
+
+// TestStateWithRetry_DoesNotRetryRealError: a genuine (non-transient)
+// failure must return immediately, on the first attempt.
+func TestStateWithRetry_DoesNotRetryRealError(t *testing.T) {
+	noStateBackoff(t)
+	calls := 0
+	realErr := errors.New("connection refused")
+	_, _, err := stateWithRetry("test", func() (*api.InstanceState, string, error) {
+		calls++
+		return nil, "", realErr
+	})
+	if !errors.Is(err, realErr) {
+		t.Fatalf("err = %v, want the real error", err)
+	}
+	if calls != 1 {
+		t.Errorf("attempts = %d, want 1 (no retry on a real failure)", calls)
+	}
+}
+
+// TestStateWithRetry_ExhaustsAndReturnsLast: a persistently transient error
+// (a genuinely deleted instance) is retried up to the cap, then the same
+// error is returned — this must NEVER be silently swallowed into a fake
+// success.
+func TestStateWithRetry_ExhaustsAndReturnsLast(t *testing.T) {
+	noStateBackoff(t)
+	calls := 0
+	_, _, err := stateWithRetry("test", func() (*api.InstanceState, string, error) {
+		calls++
+		return nil, "", errTransientState
+	})
+	if !isTransientStateErr(err) {
+		t.Fatalf("err = %v, want the transient error after exhaustion", err)
+	}
+	if calls != stateMaxAttempts {
+		t.Errorf("attempts = %d, want stateMaxAttempts (%d)", calls, stateMaxAttempts)
+	}
+}
