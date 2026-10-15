@@ -190,3 +190,388 @@ type SandboxServiceServer interface {
 	// SpawnSandbox caller needs to poll first — RESOURCE_EXHAUSTED on an
 	// actual claim attempt remains the source of truth for whether a
 	// specific call would succeed right now. Returns an empty templates
+	// list when no pool is configured (the current production default —
+	// see SandboxServer's own type doc).
+	GetPoolStatus(context.Context, *GetPoolStatusRequest) (*GetPoolStatusResponse, error)
+	mustEmbedUnimplementedSandboxServiceServer()
+}
+
+// UnimplementedSandboxServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSandboxServiceServer struct{}
+
+func (UnimplementedSandboxServiceServer) SpawnSandbox(context.Context, *SpawnSandboxRequest) (*SpawnSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SpawnSandbox not implemented")
+}
+func (UnimplementedSandboxServiceServer) ExecInSandbox(context.Context, *ExecInSandboxRequest) (*ExecInSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExecInSandbox not implemented")
+}
+func (UnimplementedSandboxServiceServer) WriteFileInSandbox(context.Context, *WriteFileInSandboxRequest) (*WriteFileInSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method WriteFileInSandbox not implemented")
+}
+func (UnimplementedSandboxServiceServer) ReadFileInSandbox(context.Context, *ReadFileInSandboxRequest) (*ReadFileInSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReadFileInSandbox not implemented")
+}
+func (UnimplementedSandboxServiceServer) DeleteSandbox(context.Context, *DeleteSandboxRequest) (*DeleteSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSandbox not implemented")
+}
+func (UnimplementedSandboxServiceServer) GetPoolStatus(context.Context, *GetPoolStatusRequest) (*GetPoolStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetPoolStatus not implemented")
+}
+func (UnimplementedSandboxServiceServer) mustEmbedUnimplementedSandboxServiceServer() {}
+func (UnimplementedSandboxServiceServer) testEmbeddedByValue()                        {}
+
+// UnsafeSandboxServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SandboxServiceServer will
+// result in compilation errors.
+type UnsafeSandboxServiceServer interface {
+	mustEmbedUnimplementedSandboxServiceServer()
+}
+
+func RegisterSandboxServiceServer(s grpc.ServiceRegistrar, srv SandboxServiceServer) {
+	// If the following call panics, it indicates UnimplementedSandboxServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&SandboxService_ServiceDesc, srv)
+}
+
+func _SandboxService_SpawnSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SpawnSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).SpawnSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_SpawnSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).SpawnSandbox(ctx, req.(*SpawnSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_ExecInSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExecInSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).ExecInSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_ExecInSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).ExecInSandbox(ctx, req.(*ExecInSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_WriteFileInSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WriteFileInSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).WriteFileInSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_WriteFileInSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).WriteFileInSandbox(ctx, req.(*WriteFileInSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_ReadFileInSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReadFileInSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).ReadFileInSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_ReadFileInSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).ReadFileInSandbox(ctx, req.(*ReadFileInSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_DeleteSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).DeleteSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_DeleteSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).DeleteSandbox(ctx, req.(*DeleteSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxService_GetPoolStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPoolStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxServiceServer).GetPoolStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxService_GetPoolStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxServiceServer).GetPoolStatus(ctx, req.(*GetPoolStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// SandboxService_ServiceDesc is the grpc.ServiceDesc for SandboxService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SandboxService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.SandboxService",
+	HandlerType: (*SandboxServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "SpawnSandbox",
+			Handler:    _SandboxService_SpawnSandbox_Handler,
+		},
+		{
+			MethodName: "ExecInSandbox",
+			Handler:    _SandboxService_ExecInSandbox_Handler,
+		},
+		{
+			MethodName: "WriteFileInSandbox",
+			Handler:    _SandboxService_WriteFileInSandbox_Handler,
+		},
+		{
+			MethodName: "ReadFileInSandbox",
+			Handler:    _SandboxService_ReadFileInSandbox_Handler,
+		},
+		{
+			MethodName: "DeleteSandbox",
+			Handler:    _SandboxService_DeleteSandbox_Handler,
+		},
+		{
+			MethodName: "GetPoolStatus",
+			Handler:    _SandboxService_GetPoolStatus_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/sandbox.proto",
+}
+
+const (
+	SpawnService_Spawn_FullMethodName = "/containarium.v1.SpawnService/Spawn"
+	SpawnService_Exec_FullMethodName  = "/containarium.v1.SpawnService/Exec"
+)
+
+// SpawnServiceClient is the client API for SpawnService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// SpawnService is agent-box's resident, low-latency counterpart to
+// SandboxService's per-call Incus round-trips (#1488 Phase 2). Each Incus
+// exec websocket-upgrades at ~50-150ms; a warm gRPC connection straight to
+// the box does the same work in ~3ms. The daemon reaches this over a
+// bind-mounted unix socket (see the design note's "Transport" section),
+// never over the network.
+//
+// This is deliberately the only service in this package with NO
+// google.api.http annotations: it is not part of the public API surface —
+// SandboxService is what external callers (CLI, MCP, SDK) talk to, and its
+// implementation is what will route through SpawnService once a warm pool
+// exists (Phase 3). Nothing here is reachable through the REST gateway,
+// and it must not be registered there.
+//
+// agent-box runs as PID 1 inside a pool member (see the design note's flow
+// diagram), so it owns reaping every process it forks — a design this
+// service inherits from the existing process_start/shell_exec MCP tools in
+// internal/agentbox, not a new mechanism.
+type SpawnServiceClient interface {
+	// Spawn starts a long-running background process and returns immediately
+	// with its pid. The process is reaped (waited on), never left a zombie,
+	// when it exits.
+	Spawn(ctx context.Context, in *SpawnRequest, opts ...grpc.CallOption) (*SpawnResponse, error)
+	// Exec runs one command to completion and returns its stdout, stderr,
+	// and exit code — the fast-path equivalent of
+	// SandboxService.ExecInSandbox, minus the Incus round-trip.
+	Exec(ctx context.Context, in *AgentExecRequest, opts ...grpc.CallOption) (*AgentExecResponse, error)
+}
+
+type spawnServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewSpawnServiceClient(cc grpc.ClientConnInterface) SpawnServiceClient {
+	return &spawnServiceClient{cc}
+}
+
+func (c *spawnServiceClient) Spawn(ctx context.Context, in *SpawnRequest, opts ...grpc.CallOption) (*SpawnResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SpawnResponse)
+	err := c.cc.Invoke(ctx, SpawnService_Spawn_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *spawnServiceClient) Exec(ctx context.Context, in *AgentExecRequest, opts ...grpc.CallOption) (*AgentExecResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AgentExecResponse)
+	err := c.cc.Invoke(ctx, SpawnService_Exec_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SpawnServiceServer is the server API for SpawnService service.
+// All implementations must embed UnimplementedSpawnServiceServer
+// for forward compatibility.
+//
+// SpawnService is agent-box's resident, low-latency counterpart to
+// SandboxService's per-call Incus round-trips (#1488 Phase 2). Each Incus
+// exec websocket-upgrades at ~50-150ms; a warm gRPC connection straight to
+// the box does the same work in ~3ms. The daemon reaches this over a
+// bind-mounted unix socket (see the design note's "Transport" section),
+// never over the network.
+//
+// This is deliberately the only service in this package with NO
+// google.api.http annotations: it is not part of the public API surface —
+// SandboxService is what external callers (CLI, MCP, SDK) talk to, and its
+// implementation is what will route through SpawnService once a warm pool
+// exists (Phase 3). Nothing here is reachable through the REST gateway,
+// and it must not be registered there.
+//
+// agent-box runs as PID 1 inside a pool member (see the design note's flow
+// diagram), so it owns reaping every process it forks — a design this
+// service inherits from the existing process_start/shell_exec MCP tools in
+// internal/agentbox, not a new mechanism.
+type SpawnServiceServer interface {
+	// Spawn starts a long-running background process and returns immediately
+	// with its pid. The process is reaped (waited on), never left a zombie,
+	// when it exits.
+	Spawn(context.Context, *SpawnRequest) (*SpawnResponse, error)
+	// Exec runs one command to completion and returns its stdout, stderr,
+	// and exit code — the fast-path equivalent of
+	// SandboxService.ExecInSandbox, minus the Incus round-trip.
+	Exec(context.Context, *AgentExecRequest) (*AgentExecResponse, error)
+	mustEmbedUnimplementedSpawnServiceServer()
+}
+
+// UnimplementedSpawnServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSpawnServiceServer struct{}
+
+func (UnimplementedSpawnServiceServer) Spawn(context.Context, *SpawnRequest) (*SpawnResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Spawn not implemented")
+}
+func (UnimplementedSpawnServiceServer) Exec(context.Context, *AgentExecRequest) (*AgentExecResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Exec not implemented")
+}
+func (UnimplementedSpawnServiceServer) mustEmbedUnimplementedSpawnServiceServer() {}
+func (UnimplementedSpawnServiceServer) testEmbeddedByValue()                      {}
+
+// UnsafeSpawnServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SpawnServiceServer will
+// result in compilation errors.
+type UnsafeSpawnServiceServer interface {
+	mustEmbedUnimplementedSpawnServiceServer()
+}
+
+func RegisterSpawnServiceServer(s grpc.ServiceRegistrar, srv SpawnServiceServer) {
+	// If the following call panics, it indicates UnimplementedSpawnServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&SpawnService_ServiceDesc, srv)
+}
+
+func _SpawnService_Spawn_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SpawnRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SpawnServiceServer).Spawn(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SpawnService_Spawn_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SpawnServiceServer).Spawn(ctx, req.(*SpawnRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SpawnService_Exec_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AgentExecRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SpawnServiceServer).Exec(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SpawnService_Exec_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SpawnServiceServer).Exec(ctx, req.(*AgentExecRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// SpawnService_ServiceDesc is the grpc.ServiceDesc for SpawnService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SpawnService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.SpawnService",
+	HandlerType: (*SpawnServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Spawn",
+			Handler:    _SpawnService_Spawn_Handler,
+		},
+		{
+			MethodName: "Exec",
+			Handler:    _SpawnService_Exec_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/sandbox.proto",
+}
