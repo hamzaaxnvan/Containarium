@@ -74,3 +74,157 @@ require_file() {
     log_error "Hint: $2"
     exit 1
   fi
+}
+
+# ---- 1. Validate prerequisites ----
+log_info "Bundle: $BUNDLE_NAME"
+log_info "Repo:   $REPO_ROOT"
+log_info "Cache:  $CACHE_DIR"
+
+require_file "$REPO_ROOT/bin/containariumd-${OS}-${ARCH}" \
+  "run 'make build-release' first"
+require_file "$REPO_ROOT/bin/mcp-server-${OS}-${ARCH}" \
+  "run 'make build-release' first"
+require_file "$REPO_ROOT/bin/agent-box-${OS}-${ARCH}" \
+  "run 'make build-release' first"
+
+# Toolchain cache. Soft-warn rather than fail — the bundle is still
+# useful with the binaries alone for testing the offline installer.
+if [ ! -d "$CACHE_DIR/toolchains" ] || [ -z "$(ls -A "$CACHE_DIR/toolchains" 2>/dev/null)" ]; then
+  log_warn "toolchain cache empty at $CACHE_DIR/toolchains"
+  log_warn "run scripts/bundle/download-deps.sh OS=$OS ARCH=$ARCH first"
+  log_warn "continuing anyway — bundle will be missing the runner-kit toolchains"
+fi
+
+# ---- 2. Clean + create staging tree ----
+log_info "Preparing staging tree at $STAGING"
+rm -rf "$STAGING"
+mkdir -p \
+  "$STAGING/bin" \
+  "$STAGING/sidecars" \
+  "$STAGING/toolchains" \
+  "$STAGING/apt" \
+  "$STAGING/docs"
+
+# ---- 3. Core binaries ----
+log_info "Copying core binaries (containariumd, mcp-server, agent-box)"
+# Strip the -${OS}-${ARCH} suffix inside the bundle — once extracted on
+# the target host the user expects `bin/containariumd`, not
+# `bin/containariumd-linux-amd64`. #1784 (design doc, Rollout Phase 2): the
+# source is the containariumd-* server build — containarium-* is the client
+# build from Phase 2 on and must never be staged as the daemon.
+install -m 0755 "$REPO_ROOT/bin/containariumd-${OS}-${ARCH}" "$STAGING/bin/containariumd"
+install -m 0755 "$REPO_ROOT/bin/mcp-server-${OS}-${ARCH}"   "$STAGING/bin/mcp-server"
+install -m 0755 "$REPO_ROOT/bin/agent-box-${OS}-${ARCH}"    "$STAGING/bin/agent-box"
+
+# ---- 4. Actions-runner tarball (from cache) ----
+if [ -d "$CACHE_DIR/bin" ]; then
+  for f in "$CACHE_DIR/bin"/actions-runner-*.tar.gz; do
+    if [ -f "$f" ]; then
+      cp "$f" "$STAGING/bin/"
+      log_info "  + $(basename "$f")"
+    fi
+  done
+fi
+
+# ---- 5. Toolchains ----
+if [ -d "$CACHE_DIR/toolchains" ]; then
+  log_info "Copying toolchains"
+  cp -r "$CACHE_DIR/toolchains/." "$STAGING/toolchains/"
+fi
+
+# ---- 6. APT packages ----
+# Only .deb files are copied, and an apt/ without one fails the build (#3061):
+# a release once shipped an empty apt/, and the installer then had nothing to
+# install on an air-gapped host.
+shopt -s nullglob
+debs=("$CACHE_DIR/apt"/*.deb)
+shopt -u nullglob
+if [ "${#debs[@]}" -gt 0 ]; then
+  log_info "Copying ${#debs[@]} apt packages"
+  cp "${debs[@]}" "$STAGING/apt/"
+elif [ "${BUNDLE_ALLOW_EMPTY_APT:-}" = "1" ]; then
+  log_warn "no .deb in $CACHE_DIR/apt — continuing (BUNDLE_ALLOW_EMPTY_APT=1, dev build)"
+  log_warn "the installer needs --skip-apt for this bundle"
+else
+  log_error "no .deb files in $CACHE_DIR/apt"
+  log_error "run DEPS_ONLY=apt scripts/bundle/download-deps.sh on an Ubuntu 24.04 builder"
+  log_error "(dev builds only: BUNDLE_ALLOW_EMPTY_APT=1 builds without them)"
+  exit 1
+fi
+
+# ---- 7. Sidecar images ----
+# Per PRD, each sidecar ships as a `docker save` tarball so the offline
+# installer can `docker load` (or `incus image import`) it. We only have
+# one sidecar today (otel-sidecar); generalize the loop for future ones.
+log_info "Exporting sidecar images"
+SIDECAR_DIR="$REPO_ROOT/sidecars"
+if [ -d "$SIDECAR_DIR" ]; then
+  for sc in "$SIDECAR_DIR"/*/; do
+    sc_name="$(basename "$sc")"
+    # Sidecar images are tagged ${name}:v${VERSION_NO_V} by
+    # `make sidecar-build-*`. If the image isn't present locally we
+    # skip with a warning — bundle is still functional, just no OTel.
+    tag="containarium-${sc_name}:v${VERSION_NO_V}"
+    out="$STAGING/sidecars/${sc_name}.tar"
+    if command -v docker >/dev/null 2>&1 && docker image inspect "$tag" >/dev/null 2>&1; then
+      log_info "  docker save $tag → $out"
+      docker save "$tag" -o "$out"
+    else
+      log_warn "  skip $sc_name: image $tag not found locally"
+      log_warn "  (run 'make sidecar-build-${sc_name#*-}' to build, then re-run bundle)"
+    fi
+  done
+fi
+
+# ---- 8. Offline installer + docs ----
+log_info "Copying offline-install.sh and docs"
+install -m 0755 "$REPO_ROOT/hacks/offline-install/install.sh" "$STAGING/offline-install.sh"
+cp "$REPO_ROOT/hacks/offline-install/README.md" "$STAGING/README.md"
+
+# Per-doc files inside docs/ subdirectory (matches PRD layout). Generate
+# placeholders if the maintainers haven't authored them yet — the bundle
+# is shippable without them but they're customer-facing.
+for doc in INSTALL.md VERIFY.md GHES.md; do
+  src="$REPO_ROOT/hacks/offline-install/docs/$doc"
+  if [ -f "$src" ]; then
+    cp "$src" "$STAGING/docs/$doc"
+  else
+    log_warn "  missing $src — writing placeholder"
+    printf '# %s\n\nTODO: document this section.\n' "$doc" > "$STAGING/docs/$doc"
+  fi
+done
+
+# ---- 9. VERSION file ----
+echo "$VERSION_NO_V" > "$STAGING/VERSION"
+
+# ---- 10. CHECKSUMS ----
+log_info "Computing SHA256 checksums"
+(
+  cd "$STAGING"
+  # Reproducible order: sort by path. Skip CHECKSUMS itself.
+  find . -type f ! -name 'CHECKSUMS.sha256*' -print0 \
+    | sort -z \
+    | xargs -0 sha256sum > CHECKSUMS.sha256
+)
+
+# ---- 11. Tar + gzip ----
+mkdir -p "$DIST_DIR"
+TARBALL="$DIST_DIR/$BUNDLE_NAME.tar.gz"
+log_info "Creating tarball: $TARBALL"
+# --owner=0 --group=0 for reproducibility (cross-host bit-identical
+# output if mtime is also fixed; we don't go that far in v0).
+tar -C "$DIST_DIR" \
+    --owner=0 --group=0 \
+    -czf "$TARBALL" \
+    "$BUNDLE_NAME"
+
+SIZE="$(du -h "$TARBALL" | cut -f1)"
+log_success "Bundle ready: $TARBALL ($SIZE)"
+
+# ---- 12. Bundle-level checksum (for the GH release page) ----
+(
+  cd "$DIST_DIR"
+  sha256sum "$BUNDLE_NAME.tar.gz" > "$BUNDLE_NAME.tar.gz.sha256"
+)
+log_success "Outer checksum: $DIST_DIR/$BUNDLE_NAME.tar.gz.sha256"

@@ -135,3 +135,140 @@ func (s *ctxRunStarter) snapshot() (int, map[string]bool) {
 	}
 	return s.calls, out
 }
+
+// requireNoStrandedRow fails if any active row has no live run behind it.
+func requireNoStrandedRow(t *testing.T, store *Store, ctx context.Context, user string, live map[string]bool) {
+	t.Helper()
+	rows, err := store.ListDispatches(ctx, user, "default", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED)
+	if err != nil {
+		t.Fatalf("ListDispatches: %v", err)
+	}
+	for _, r := range rows {
+		active := r.State == pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_QUEUED ||
+			r.State == pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_RUNNING
+		if active && !live[r.RunID] {
+			t.Fatalf("row %s is %v with no run behind it: the issue is locked forever", r.ID, r.State)
+		}
+	}
+}
+
+func TestDispatch_CancelledTickNeverStrandsRow(t *testing.T) {
+	const noRow = pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED
+	for i, tc := range []struct {
+		name        string
+		at          cancelPoint
+		forgeErr    error
+		reportStart bool
+		wantState   pb.TrackerDispatchState // noRow: the row was removed
+		wantCalls   int                     // StartRun calls on the cancelled tick
+		wantLabel   string                  // state label on the issue afterwards ("" = none)
+	}{
+		{name: "after insert", at: cancelAfterInsert, wantState: noRow},
+		{name: "inside re-read", at: cancelInsideReread, wantState: noRow},
+		{name: "inside queued label write", at: cancelInsideQueuedLabel,
+			wantState: pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED, wantLabel: LabelAgentFailed},
+		{name: "inside queued label write, forge also fails", at: cancelInsideQueuedLabel, forgeErr: errors.New("forge unreachable"),
+			wantState: pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED, wantLabel: LabelAgentFailed},
+		{name: "after queued label, before start", at: cancelAfterQueuedLabel,
+			wantState: pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED, wantLabel: LabelAgentFailed},
+		{name: "inside StartRun", at: cancelInsideStartRun, wantCalls: 1,
+			wantState: pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED, wantLabel: LabelAgentFailed},
+		{name: "after a successful start, start reported", at: cancelAfterStart, reportStart: true, wantCalls: 1,
+			wantState: pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_RUNNING, wantLabel: LabelAgentRunning},
+		{name: "after a successful start, start not yet reported", at: cancelAfterStart, wantCalls: 1,
+			wantState: pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_QUEUED, wantLabel: LabelAgentQueued},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user := fmt.Sprintf("tracker-dispatch-cancel-%d", i)
+			base := newFakeDispatchProvider(Issue{Number: 9, Labels: []string{"scope:product"}})
+			d, store, ctx := newDispatchFixture(t, user, base, &fakeRunStarter{})
+			tickCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			p := &cancellingProvider{fakeDispatchProvider: base, cancel: cancel, at: tc.at, forgeErr: tc.forgeErr}
+			runs := &ctxRunStarter{p: p, reportStart: tc.reportStart}
+			d.Provider, d.Runs = p, runs
+			d.Store = cancelAfterInsertStore{DispatchStore: store, p: p}
+
+			_, _ = d.Tick(tickCtx, user, "default")
+
+			calls, live := runs.snapshot()
+			if calls != tc.wantCalls {
+				t.Errorf("StartRun calls = %d, want %d", calls, tc.wantCalls)
+			}
+			requireNoStrandedRow(t, store, ctx, user, live)
+			rows, err := store.ListDispatches(ctx, user, "default", noRow)
+			if err != nil {
+				t.Fatalf("ListDispatches: %v", err)
+			}
+			switch {
+			case tc.wantState == noRow && len(rows) != 0:
+				t.Fatalf("rows = %+v, want the never-started row removed", rows)
+			case tc.wantState != noRow && (len(rows) != 1 || rows[0].State != tc.wantState):
+				t.Fatalf("rows = %+v, want one %v row", rows, tc.wantState)
+			}
+			labels := base.labels(9)
+			for _, l := range ReservedStateLabels {
+				if has := containsString(labels, l); has != (l == tc.wantLabel) {
+					t.Errorf("labels = %v, want state label %q only", labels, tc.wantLabel)
+					break
+				}
+			}
+
+			// A later, healthy tick.
+			if tc.wantState == pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED {
+				base.relabel(9, "scope:product") // a human retries a failed start
+			}
+			res, err := d.Tick(ctx, user, "default")
+			if err != nil {
+				t.Fatalf("later tick: %v", err)
+			}
+			total, _ := runs.snapshot()
+			if tc.wantState == pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_QUEUED || tc.wantState == pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_RUNNING {
+				if len(res.Started) != 0 || total != tc.wantCalls {
+					t.Fatalf("later tick = %+v (StartRun calls %d), want no second run while the first is live", res, total)
+				}
+				return
+			}
+			if len(res.Started) != 1 || total != tc.wantCalls+1 {
+				t.Fatalf("later tick = %+v (StartRun calls %d), want the issue dispatched", res, total)
+			}
+		})
+	}
+}
+
+// failingPendingStore fails the labels_pending write, as a store outage
+// between the insert and the start would.
+type failingPendingStore struct {
+	DispatchStore
+	failed bool
+}
+
+func (s *failingPendingStore) SetDispatchLabelsPending(ctx context.Context, id string, pending bool) error {
+	if !s.failed {
+		s.failed = true
+		return errors.New("store unavailable")
+	}
+	return s.DispatchStore.SetDispatchLabelsPending(ctx, id, pending)
+}
+
+// TestDispatch_PreStartBookkeepingFailureFailsRow: the label write fails
+// and so does recording labels_pending. The tick reports the store
+// error, but the row it inserted must not be left QUEUED with no run.
+func TestDispatch_PreStartBookkeepingFailureFailsRow(t *testing.T) {
+	const user = "tracker-dispatch-prestart-store"
+	provider := newFakeDispatchProvider(Issue{Number: 4, Labels: []string{"scope:product"}})
+	runs := &ctxRunStarter{}
+	d, store, ctx := newDispatchFixture(t, user, provider, &fakeRunStarter{})
+	d.Runs = runs
+	d.Store = &failingPendingStore{DispatchStore: store}
+	provider.labelErr = errors.New("forge unreachable")
+
+	if _, err := d.Tick(ctx, user, "default"); err == nil {
+		t.Fatal("Tick succeeded, want the store error reported")
+	}
+	calls, live := runs.snapshot()
+	if calls != 0 {
+		t.Fatalf("StartRun calls = %d, want 0", calls)
+	}
+	requireNoStrandedRow(t, store, ctx, user, live)
+}
