@@ -76,3 +76,30 @@ func TestPlatformCPUWeightCheck(t *testing.T) {
 
 // The check rides along in RunPosture — non-blocking like every posture
 // check — so `doctor`, `pool join` and the cloud probe all report it.
+func TestRunPosture_IncludesPlatformCPUWeight(t *testing.T) {
+	p, _ := tempPaths(t)
+	for _, c := range runPosture(p) {
+		if c.Name == "platform daemons CPU weight" {
+			if c.Required || c.Kind != KindPosture {
+				t.Errorf("must be a non-blocking posture check, got Required=%v Kind=%q", c.Required, c.Kind)
+			}
+			return
+		}
+	}
+	t.Fatal("runPosture does not include the platform CPU weight check")
+}
+
+func TestPlatformCPUUnits(t *testing.T) {
+	want := []string{"incus.service", "containarium.service"}
+	if len(PlatformCPUUnits) != len(want) {
+		t.Fatalf("PlatformCPUUnits = %v, want %v", PlatformCPUUnits, want)
+	}
+	for i := range want {
+		if PlatformCPUUnits[i] != want[i] {
+			t.Errorf("PlatformCPUUnits[%d] = %q, want %q", i, PlatformCPUUnits[i], want[i])
+		}
+	}
+	if PlatformCPUWeight <= 100 {
+		t.Errorf("PlatformCPUWeight = %d must sit well above systemd's default 100 (the tenant weight)", PlatformCPUWeight)
+	}
+}
