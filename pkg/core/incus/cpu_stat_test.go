@@ -62,3 +62,133 @@ throttled_usec 0
 			// key; we normalize it to microseconds so callers see one unit.
 			name:    "cgroup v1 throttled_time (ns) normalizes to usec",
 			content: "nr_periods 10\nnr_throttled 3\nthrottled_time 5000000\n",
+			want:    cpuThrottle{NrPeriods: 10, NrThrottled: 3, ThrottledUsec: 5000},
+			wantOK:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseCPUStat(tt.content)
+			if ok != tt.wantOK {
+				t.Fatalf("parseCPUStat() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if got != tt.want {
+				t.Errorf("parseCPUStat() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCgroupV2PathFromProc(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "incus container under lxc.payload scope",
+			content: "0::/lxc.payload.alice-container\n",
+			want:    "lxc.payload.alice-container",
+		},
+		{
+			name:    "systemd-managed nested path",
+			content: "0::/lxc.payload.bob-container/system.slice/sshd.service\n",
+			want:    "lxc.payload.bob-container/system.slice/sshd.service",
+		},
+		{
+			// A hybrid host lists v1 controllers first; only the unified 0:: line
+			// is usable for a cgroup v2 cpu.stat read.
+			name:    "hybrid hierarchy picks the unified line",
+			content: "12:memory:/lxc.payload.carol\n11:cpu,cpuacct:/lxc.payload.carol\n0::/lxc.payload.carol\n",
+			want:    "lxc.payload.carol",
+		},
+		{
+			name:    "root cgroup yields no relative path",
+			content: "0::/\n",
+			want:    "",
+		},
+		{
+			name:    "cgroup v1 only — no unified line",
+			content: "11:cpu,cpuacct:/lxc.payload.dave\n",
+			want:    "",
+		},
+		{
+			name:    "empty",
+			content: "",
+			want:    "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cgroupV2PathFromProc(tt.content); got != tt.want {
+				t.Errorf("cgroupV2PathFromProc() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReadCPUThrottle(t *testing.T) {
+	// Build a fake cgroup hierarchy plus a fake /proc/<pid>/cgroup pointing into
+	// it, so the whole resolve-then-read path is exercised without a live host.
+	newTree := func(t *testing.T, procLine, cgroupRel, statBody string) (string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		procPath := filepath.Join(dir, "proc-cgroup")
+		if err := os.WriteFile(procPath, []byte(procLine), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		root := filepath.Join(dir, "cgroup")
+		if cgroupRel != "" {
+			leaf := filepath.Join(root, cgroupRel)
+			if err := os.MkdirAll(leaf, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(leaf, "cpu.stat"), []byte(statBody), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return procPath, root
+	}
+
+	t.Run("reads the container's counters", func(t *testing.T) {
+		proc, root := newTree(t, "0::/lxc.payload.alice-container\n", "lxc.payload.alice-container",
+			"usage_usec 10\nnr_periods 900\nnr_throttled 120\nthrottled_usec 3400\n")
+		got, ok := readCPUThrottle(proc, root)
+		if !ok {
+			t.Fatal("readCPUThrottle() ok = false, want true")
+		}
+		want := cpuThrottle{NrPeriods: 900, NrThrottled: 120, ThrottledUsec: 3400}
+		if got != want {
+			t.Errorf("readCPUThrottle() = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("missing proc file is a silent no-signal", func(t *testing.T) {
+		_, root := newTree(t, "", "", "")
+		if _, ok := readCPUThrottle(filepath.Join(t.TempDir(), "absent"), root); ok {
+			t.Error("readCPUThrottle() ok = true, want false")
+		}
+	})
+
+	t.Run("missing cpu.stat is a silent no-signal", func(t *testing.T) {
+		proc, root := newTree(t, "0::/lxc.payload.bob-container\n", "", "")
+		if _, ok := readCPUThrottle(proc, root); ok {
+			t.Error("readCPUThrottle() ok = true, want false")
+		}
+	})
+
+	t.Run("path traversal in the cgroup line is refused", func(t *testing.T) {
+		proc, root := newTree(t, "0::/../../etc\n", "", "")
+		if _, ok := readCPUThrottle(proc, root); ok {
+			t.Error("readCPUThrottle() ok = true, want false — traversal must be refused")
+		}
+	})
+
+	t.Run("stopped container has no pid to resolve", func(t *testing.T) {
+		if _, ok := containerCPUThrottle(0); ok {
+			t.Error("containerCPUThrottle(0) ok = true, want false")
+		}
+	})
+}
