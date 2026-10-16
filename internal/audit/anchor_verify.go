@@ -232,3 +232,159 @@ func (r BucketAnchorReport) OK() bool { return len(r.Failures) == 0 }
 //     turning the bucket on never weakens the local-file check; the bucket
 //     does not vouch for it, which is a warning;
 //   - a bucket without a locked retention policy is a warning.
+//
+// ErrNoAnchor means nothing is anchored locally or in the bucket. A gcloud
+// failure is an error, never a clean result.
+func VerifyAnchorsAgainstBucket(ctx context.Context, chain ChainStore, local *FileSink, bucket AnchorBucket) (BucketAnchorReport, error) {
+	var r BucketAnchorReport
+
+	bucketCPs, unrecognised, err := bucket.ListCheckpoints(ctx)
+	if err != nil {
+		return r, err
+	}
+	localCPs, err := local.Checkpoints()
+	if err != nil {
+		return r, err
+	}
+	if len(bucketCPs) == 0 && len(localCPs) == 0 {
+		return r, ErrNoAnchor
+	}
+	maxID, err := chain.MaxRowID(ctx)
+	if err != nil {
+		return r, fmt.Errorf("audit: max row id: %w", err)
+	}
+	// After a retention purge (#2878) the rows below the base are gone. A
+	// checkpoint there is not a deleted row; the base itself is served by
+	// RowHashAt as the hash of the last purged row.
+	var base ChainBase
+	var purged bool
+	if br, ok := chain.(ChainBaseReader); ok {
+		if base, purged, err = br.ChainBase(ctx); err != nil {
+			return r, err
+		}
+	}
+	belowBase := func(cp int64) bool { return purged && cp < base.ID }
+	belowSeen := map[int64]bool{}
+
+	localRoots := make(map[int64][]string, len(localCPs))
+	for _, c := range localCPs {
+		localRoots[c.Checkpoint] = append(localRoots[c.Checkpoint], c.Root)
+	}
+
+	for _, uri := range unrecognised {
+		r.Warnings = append(r.Warnings, BucketAnchorFinding{Kind: FindingUnrecognisedObject,
+			Detail: fmt.Sprintf("%s is not named like an anchor and is ignored", uri)})
+	}
+
+	for _, b := range bucketCPs {
+		switch {
+		case b.Problem != "":
+			r.Failures = append(r.Failures, BucketAnchorFinding{Kind: FindingContentMismatch, Checkpoint: b.Checkpoint, Detail: b.Problem})
+			continue
+		case b.Checkpoint > maxID:
+			r.Failures = append(r.Failures, BucketAnchorFinding{Kind: FindingAboveChainTip, Checkpoint: b.Checkpoint,
+				Detail: fmt.Sprintf("the bucket holds a checkpoint above the database's highest row id %d; the daemon cannot have anchored it", maxID)})
+			continue
+		}
+		if belowBase(b.Checkpoint) {
+			belowSeen[b.Checkpoint] = true
+		} else {
+			r.CheckedCheckpoints++
+			if b.Checkpoint > r.LatestCheckpoint {
+				r.LatestCheckpoint, r.LatestRoot = b.Checkpoint, b.Root
+			}
+			if b.Checkpoint > r.TailCheckpoint {
+				r.TailCheckpoint, r.TailRoot = b.Checkpoint, b.Root
+			}
+
+			dbRoot, found, err := chain.RowHashAt(ctx, b.Checkpoint)
+			if err != nil {
+				return r, fmt.Errorf("audit: row hash at anchored checkpoint %d: %w", b.Checkpoint, err)
+			}
+			switch {
+			case !found:
+				r.Failures = append(r.Failures, BucketAnchorFinding{Kind: FindingDatabaseRootDiffers, Checkpoint: b.Checkpoint,
+					Detail: "the anchored row no longer exists in the database"})
+			case dbRoot != b.Root:
+				r.Failures = append(r.Failures, BucketAnchorFinding{Kind: FindingDatabaseRootDiffers, Checkpoint: b.Checkpoint,
+					Detail: "the database row's hash differs from the anchored root"})
+			}
+		}
+
+		roots := localRoots[b.Checkpoint]
+		if len(roots) == 0 {
+			r.Failures = append(r.Failures, BucketAnchorFinding{Kind: FindingMissingLocally, Checkpoint: b.Checkpoint,
+				Detail: "the bucket holds this checkpoint but the local anchor file does not"})
+			continue
+		}
+		for _, root := range roots {
+			if root != b.Root {
+				r.Failures = append(r.Failures, BucketAnchorFinding{Kind: FindingLocalRootDiffers, Checkpoint: b.Checkpoint,
+					Detail: "the local anchor file records a different root than the bucket"})
+				break
+			}
+		}
+	}
+
+	// Checkpoints only the local file holds. The bucket does not vouch for
+	// them, but the database still must agree with them.
+	inBucket := make(map[int64]bool, len(bucketCPs))
+	for _, b := range bucketCPs {
+		if b.Problem == "" {
+			inBucket[b.Checkpoint] = true
+		}
+	}
+	localOnly := make([]int64, 0, len(localRoots))
+	for cp := range localRoots {
+		if !inBucket[cp] {
+			localOnly = append(localOnly, cp)
+		}
+	}
+	sort.Slice(localOnly, func(i, j int) bool { return localOnly[i] < localOnly[j] })
+	for _, cp := range localOnly {
+		if belowBase(cp) {
+			belowSeen[cp] = true
+			continue
+		}
+		dbRoot, found, err := chain.RowHashAt(ctx, cp)
+		if err != nil {
+			return r, fmt.Errorf("audit: row hash at anchored checkpoint %d: %w", cp, err)
+		}
+		switch {
+		case cp > maxID || !found:
+			r.Failures = append(r.Failures, BucketAnchorFinding{Kind: FindingDatabaseRootDiffers, Checkpoint: cp,
+				Detail: "the locally anchored row no longer exists in the database"})
+		case rootsDiffer(localRoots[cp], dbRoot):
+			r.Failures = append(r.Failures, BucketAnchorFinding{Kind: FindingDatabaseRootDiffers, Checkpoint: cp,
+				Detail: "the database row's hash differs from the locally anchored root"})
+		}
+		if cp <= maxID && cp > r.TailCheckpoint {
+			r.TailCheckpoint, r.TailRoot = cp, localRoots[cp][0]
+		}
+	}
+	if n := len(localOnly); n > 0 {
+		r.Warnings = append(r.Warnings, BucketAnchorFinding{Kind: FindingLocalNewerThanBucket, Checkpoint: localOnly[n-1],
+			Detail: fmt.Sprintf("%d local checkpoint(s) are not in the bucket (latest bucket checkpoint %d), so the bucket does not vouch for them; they were checked against the database only. A failed upload is retried on the next anchoring tick", n, r.LatestCheckpoint)})
+	}
+
+	if r.BelowChainBase = len(belowSeen); r.BelowChainBase > 0 {
+		r.Warnings = append(r.Warnings, BucketAnchorFinding{Kind: FindingBelowChainBase,
+			Detail: fmt.Sprintf("%d anchored checkpoint(s) lie below the chain base id=%d (rows purged by retention); they are compared between the bucket and the local file, not with the database", r.BelowChainBase, base.ID)})
+	}
+
+	st, lockErr := bucket.CheckRetentionLock(ctx)
+	if msg := RetentionLockWarning(bucket.URI(), st, lockErr); msg != "" {
+		r.Warnings = append(r.Warnings, BucketAnchorFinding{Kind: FindingNoLockedRetention, Detail: msg})
+	}
+	return r, nil
+}
+
+// rootsDiffer reports whether any recorded root is not dbRoot.
+func rootsDiffer(roots []string, dbRoot string) bool {
+	for _, root := range roots {
+		if root != dbRoot {
+			return true
+		}
+	}
+	return false
+}
