@@ -116,3 +116,43 @@ func TestListBackends_ParallelProbesKeepResultsPerPeer(t *testing.T) {
 	}
 }
 
+// A wedged local GetSystemInfo must not block the listing: the local backend
+// keeps identity and health, with no load block.
+func TestListBackends_WedgedLocalSystemInfoIsBounded(t *testing.T) {
+	shrinkProbeTimeout(t, 200*time.Millisecond)
+	unwedge := make(chan struct{})
+	t.Cleanup(func() { close(unwedge) })
+
+	pool := NewPeerPool("local-spot", "", nil, "")
+	s := &ContainerServer{
+		peerPool:  pool,
+		manager:   nil,
+		startTime: time.Now(),
+	}
+	s.systemInfoFn = func(context.Context, *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error) {
+		<-unwedge
+		return &pb.GetSystemInfoResponse{Info: &pb.SystemInfo{Hostname: "late"}}, nil
+	}
+	ctx := auth.ContextWithTestSubject(context.Background(), "ops", auth.RoleAdmin)
+
+	info := s.probeLocalSystemInfo(ctx)
+	if info != nil {
+		t.Fatalf("wedged probe should yield nil, got %+v", info)
+	}
+	start := time.Now()
+	_ = s.probeLocalSystemInfo(ctx)
+	if d := time.Since(start); d > 600*time.Millisecond {
+		t.Fatalf("probe took %v, want about the 200ms budget", d)
+	}
+}
+
+func TestProbeLocalSystemInfo_ReturnsInfoWhenResponsive(t *testing.T) {
+	s := &ContainerServer{}
+	s.systemInfoFn = func(context.Context, *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error) {
+		return &pb.GetSystemInfoResponse{Info: &pb.SystemInfo{Hostname: "h"}}, nil
+	}
+	info := s.probeLocalSystemInfo(context.Background())
+	if info == nil || info.Hostname != "h" {
+		t.Fatalf("got %+v", info)
+	}
+}
