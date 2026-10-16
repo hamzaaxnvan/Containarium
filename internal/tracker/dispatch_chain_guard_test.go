@@ -137,3 +137,38 @@ func TestDispatch_NilPolicyUsesDefaults(t *testing.T) {
 		t.Fatalf("result = %+v, runs = %d; want the depth-4 issue skipped under the default max_depth", res, len(runs.started()))
 	}
 }
+
+// TestDispatch_GatedFollowUpIgnoredUntilHumanReleases pins criterion 1
+// end to end on the dispatcher side: an agent-filed follow-up (lineage
+// depth 1, gate label on it as CreateTrackerIssue forces) is skipped on
+// every tick; once a human removes agent:needs-approval it dispatches,
+// carrying its depth.
+func TestDispatch_GatedFollowUpIgnoredUntilHumanReleases(t *testing.T) {
+	const user = "tracker-dispatch-gated-child"
+	provider := newFakeDispatchProvider(Issue{Number: 401, Labels: []string{"scope:product", LabelNeedsApproval}})
+	runs := &fakeRunStarter{}
+	d, store, ctx := newDispatchFixture(t, user, provider, runs)
+	seedChain(t, store, ctx, user, 400, 1)
+
+	for i := 0; i < 3; i++ {
+		res, err := d.Tick(ctx, user, "default")
+		if err != nil {
+			t.Fatalf("Tick %d: %v", i, err)
+		}
+		if res.SkippedNeedsApproval != 1 || len(res.Started) != 0 {
+			t.Fatalf("Tick %d = %+v, want the gated follow-up skipped", i, res)
+		}
+	}
+	if n := len(runs.started()); n != 0 {
+		t.Fatalf("StartRun calls while gated = %d, want 0", n)
+	}
+
+	provider.relabel(401, "scope:product") // the human's one action per hop
+	res, err := d.Tick(ctx, user, "default")
+	if err != nil {
+		t.Fatalf("Tick after release: %v", err)
+	}
+	if len(res.Started) != 1 || res.Started[0].Depth != 1 {
+		t.Fatalf("started after release = %+v, want #401 at depth 1", res.Started)
+	}
+}
