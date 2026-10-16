@@ -19,3 +19,36 @@ func TestEngineToProto(t *testing.T) {
 	}{
 		{"the engine we support", backup.EnginePostgres, pb.BackupEngine_BACKUP_ENGINE_POSTGRES},
 		{"a record predating the enum", "", pb.BackupEngine_BACKUP_ENGINE_UNSPECIFIED},
+		{"an engine this build does not know", "mongodb", pb.BackupEngine_BACKUP_ENGINE_UNSPECIFIED},
+		{"a near miss", "postgress", pb.BackupEngine_BACKUP_ENGINE_UNSPECIFIED},
+		{"differing case is not the same value", "Postgres", pb.BackupEngine_BACKUP_ENGINE_UNSPECIFIED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := engineToProto(tc.stored); got != tc.want {
+				t.Errorf("engineToProto(%q) = %v, want %v", tc.stored, got, tc.want)
+			}
+		})
+	}
+}
+
+// The failure the enum exists to make impossible: an engine nobody recognises
+// must never present itself as Postgres. A caller reading POSTGRES will hand
+// the dump to pg_restore.
+func TestEngineToProto_NeverGuessesPostgres(t *testing.T) {
+	for _, stored := range []string{"", "mongodb", "mysql", "unknown", "POSTGRES", " postgres"} {
+		if got := engineToProto(stored); got == pb.BackupEngine_BACKUP_ENGINE_POSTGRES {
+			t.Errorf("engineToProto(%q) reported POSTGRES — a caller would hand this dump to "+
+				"pg_restore on the strength of a guess", stored)
+		}
+	}
+}
+
+// The constant the manifest writes and the case this maps must not drift
+// apart: if EnginePostgres changed, every existing record would start
+// reading as UNSPECIFIED and nothing else would notice.
+func TestEngineToProto_MatchesWhatTheManifestWrites(t *testing.T) {
+	if engineToProto(backup.EnginePostgres) != pb.BackupEngine_BACKUP_ENGINE_POSTGRES {
+		t.Fatalf("the mapping does not recognise backup.EnginePostgres (%q) — every record "+
+			"written by this daemon would read as UNSPECIFIED", backup.EnginePostgres)
+	}
+}
