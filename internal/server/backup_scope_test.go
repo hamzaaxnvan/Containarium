@@ -333,3 +333,87 @@ func fieldNumbers(md protoreflect.MessageDescriptor) map[string]protoreflect.Fie
 	return out
 }
 
+// Golden field numbers. Every field that existed before #2800 keeps its
+// name and number, and the new fields take fresh numbers. A renumbering
+// or rename is a wire break for every stored record and old client.
+func TestBackupScope_FieldNumbersAreAdditive(t *testing.T) {
+	for _, tc := range []struct {
+		msg  proto.Message
+		want map[string]protoreflect.FieldNumber
+	}{
+		{&pb.CreateBackupRequest{}, map[string]protoreflect.FieldNumber{
+			"username": 1, "connection": 2, "destination": 3, "gcs_bucket": 4,
+			"hook": 5, "label": 6, "age_recipient": 7, "key_mode": 8, "hook_format": 9,
+			"scope":              10, // #2800
+			"require_encryption": 11, // #3169
+		}},
+		{&pb.BackupRecord{}, map[string]protoreflect.FieldNumber{
+			"id": 1, "username": 2, "database": 3, "created_at": 4, "size_bytes": 5,
+			"sha256": 6, "destination": 7, "location": 8, "engine": 9,
+			"last_verification": 10, "relation_count": 11, "encrypted": 12,
+			"age_recipient": 13, "hook": 14, "wrapped_key": 15, "kek_id": 16,
+			"key_mode": 17, "hook_format": 18,
+			"scope": 19, // #2800
+		}},
+	} {
+		md := tc.msg.ProtoReflect().Descriptor()
+		got := fieldNumbers(md)
+		for name, num := range tc.want {
+			if got[name] != num {
+				t.Errorf("%s.%s = %d, want %d", md.Name(), name, got[name], num)
+			}
+		}
+		if len(got) != len(tc.want) {
+			t.Errorf("%s has %d fields, golden lists %d: update the golden deliberately", md.Name(), len(got), len(tc.want))
+		}
+	}
+
+	ed := pb.BackupScope(0).Descriptor()
+	for name, num := range map[string]protoreflect.EnumNumber{
+		"BACKUP_SCOPE_UNSPECIFIED": 0, "BACKUP_SCOPE_DATABASE": 1, "BACKUP_SCOPE_BOX": 2,
+	} {
+		v := ed.Values().ByName(protoreflect.Name(name))
+		if v == nil || v.Number() != num {
+			t.Errorf("enum value %s missing or renumbered: %v", name, v)
+		}
+	}
+}
+
+// A request encoded by a client that predates #2800 (bytes frozen here)
+// decodes with every field intact and scope UNSPECIFIED, i.e. DATABASE.
+func TestBackupScope_PreScopeWireBytesDecodeAsDatabase(t *testing.T) {
+	// username="alice", connection{database="app"}, destination=LOCAL,
+	// key_mode=MANAGED, hook_format=PG_CUSTOM — encoded before field 10
+	// existed.
+	const golden = "0a05616c69636512050a0361707018014002" + "4802"
+	raw, err := hex.DecodeString(golden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req pb.CreateBackupRequest
+	if err := proto.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("unmarshal pre-scope bytes: %v", err)
+	}
+	if req.GetUsername() != "alice" || req.GetConnection().GetDatabase() != "app" ||
+		req.GetDestination() != pb.BackupDestination_BACKUP_DESTINATION_LOCAL ||
+		req.GetKeyMode() != pb.BackupKeyMode_BACKUP_KEY_MODE_MANAGED ||
+		req.GetHookFormat() != pb.HookFormat_HOOK_FORMAT_PG_CUSTOM {
+		t.Errorf("pre-scope fields lost: %v", &req)
+	}
+	if req.GetScope() != pb.BackupScope_BACKUP_SCOPE_UNSPECIFIED {
+		t.Errorf("scope = %v, want UNSPECIFIED", req.GetScope())
+	}
+	if len(req.ProtoReflect().GetUnknown()) != 0 {
+		t.Errorf("pre-scope bytes left unknown fields: a field number moved")
+	}
+
+	// And the new field round-trips on its own number, not on top of an
+	// old one.
+	b, err := proto.Marshal(&pb.CreateBackupRequest{Scope: pb.BackupScope_BACKUP_SCOPE_BOX})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(b); got != "5002" {
+		t.Errorf("scope=BOX encodes as %s, want 5002 (field 10, varint 2)", got)
+	}
+}
