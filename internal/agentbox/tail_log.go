@@ -82,3 +82,87 @@ func handleTailLog(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 	}
 
 	info, err := os.Stat(path)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("tail_log: %v", err)), nil
+	}
+	if info.IsDir() {
+		return mcp.NewToolResultError(fmt.Sprintf("tail_log: %s is a directory", path)), nil
+	}
+
+	// Default start_offset is the file's current size — "tail -f from
+	// now". If the caller wants to backfill, they pass start_offset=0
+	// (or any earlier offset) explicitly. We don't reject offsets past
+	// EOF; they just mean "wait for the file to grow that far," which
+	// is fine for the use case but documented as agent-suspect.
+	startOffset := info.Size()
+	if v, ok := args["start_offset"].(float64); ok && v >= 0 {
+		startOffset = int64(v)
+	}
+
+	// #nosec G304 -- path was sanitized by validatePath; tail_log's
+	// contract is to read agent-supplied paths.
+	f, err := os.Open(path)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("tail_log: %v", err)), nil
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("tail_log: seek to %d: %v", startOffset, err)), nil
+	}
+
+	deadline := time.Now().Add(time.Duration(followSec * float64(time.Second)))
+	var buf bytes.Buffer
+	truncated := false
+	chunk := make([]byte, 64*1024)
+
+	for time.Now().Before(deadline) {
+		// Honor an outer cancellation (e.g. MCP transport closed) so
+		// we don't block past the host's wishes.
+		select {
+		case <-ctx.Done():
+			return mcp.NewToolResultError(fmt.Sprintf("tail_log: cancelled: %v", ctx.Err())), nil
+		default:
+		}
+
+		remaining := tailLogOutputLimit - buf.Len()
+		if remaining <= 0 {
+			truncated = true
+			break
+		}
+		readSize := len(chunk)
+		if readSize > remaining {
+			readSize = remaining
+		}
+		n, err := f.Read(chunk[:readSize])
+		if n > 0 {
+			buf.Write(chunk[:n])
+		}
+		if err == io.EOF {
+			// No more content available right now — sleep briefly,
+			// then retry. The Read returned io.EOF without a fatal
+			// error; the file descriptor is still good and the file
+			// may grow before the deadline.
+			//
+			// We don't seek to End here: the kernel keeps the file
+			// position, and io.EOF leaves it at the current size.
+			// When the file grows, the next Read picks up new bytes.
+			select {
+			case <-ctx.Done():
+				return mcp.NewToolResultError(fmt.Sprintf("tail_log: cancelled: %v", ctx.Err())), nil
+			case <-time.After(tailLogPollInterval):
+			}
+			continue
+		}
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("tail_log: read: %v", err)), nil
+		}
+	}
+
+	endOffset := startOffset + int64(buf.Len())
+	body := fmt.Sprintf(
+		"path: %s\nstart_offset: %d\nend_offset: %d\nbytes_returned: %d\ntruncated: %v\nfollow_seconds: %v\n--- content ---\n%s",
+		path, startOffset, endOffset, buf.Len(), truncated, followSec, buf.String(),
+	)
+	return mcp.NewToolResultText(body), nil
+}
