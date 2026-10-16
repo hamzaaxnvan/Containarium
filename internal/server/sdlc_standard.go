@@ -29,3 +29,19 @@ func loadSDLCBundle(path string) (skills.StandardProvider, error) {
 // is the normal "not configured" case and returns "".
 func applyPinnedStandard(m *skills.Manager, bundlePath string, load func(string) (skills.StandardProvider, error)) string {
 	if strings.TrimSpace(bundlePath) == "" {
+		return ""
+	}
+	p, err := load(bundlePath)
+	if err != nil {
+		return fmt.Sprintf("[agent-skill] %s=%s not applied (%v); hosted skills keep their inline prompt", sdlcBundleEnv, bundlePath, err)
+	}
+	applied, missing := m.ApplyStandard(p)
+	switch {
+	case len(missing) > 0:
+		return fmt.Sprintf("[agent-skill] pinned standard %s: applied to %v; section missing for %v, which keep their inline prompt", p.Pin(), applied, missing)
+	case len(applied) == 0:
+		return fmt.Sprintf("[agent-skill] pinned standard %s verified, but no skill declares one", p.Pin())
+	default:
+		return fmt.Sprintf("[agent-skill] pinned standard %s applied to %v", p.Pin(), applied)
+	}
+}
