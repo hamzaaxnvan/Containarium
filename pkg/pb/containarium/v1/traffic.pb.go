@@ -1193,3 +1193,601 @@ func (x *SubscribeTrafficRequest) ProtoReflect() protoreflect.Message {
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubscribeTrafficRequest.ProtoReflect.Descriptor instead.
+func (*SubscribeTrafficRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_traffic_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *SubscribeTrafficRequest) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+func (x *SubscribeTrafficRequest) GetEventTypes() []TrafficEventType {
+	if x != nil {
+		return x.EventTypes
+	}
+	return nil
+}
+
+func (x *SubscribeTrafficRequest) GetExternalOnly() bool {
+	if x != nil {
+		return x.ExternalOnly
+	}
+	return false
+}
+
+// QueryTrafficHistoryRequest queries persisted traffic data
+type QueryTrafficHistoryRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Container name. When empty the query spans every box on this backend
+	// (host-wide): that reveals other tenants' connection history, so it
+	// requires the admin role, an explicit start_time, and a window of at most
+	// 7 days.
+	ContainerName string `protobuf:"bytes,1,opt,name=container_name,json=containerName,proto3" json:"container_name,omitempty"`
+	// Start of the query range (inclusive: started_at >= start_time).
+	// Required for a host-wide query.
+	StartTime *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"`
+	// End of the query range (inclusive: started_at <= end_time).
+	// Defaults to now when unset.
+	EndTime *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=end_time,json=endTime,proto3" json:"end_time,omitempty"`
+	// Filter by destination IP (optional)
+	DestIp string `protobuf:"bytes,4,opt,name=dest_ip,json=destIp,proto3" json:"dest_ip,omitempty"`
+	// Filter by destination port (optional, 0 = all)
+	DestPort uint32 `protobuf:"varint,5,opt,name=dest_port,json=destPort,proto3" json:"dest_port,omitempty"`
+	// Pagination: offset
+	Offset int32 `protobuf:"varint,6,opt,name=offset,proto3" json:"offset,omitempty"`
+	// Pagination: limit (default: 100, max: 1000)
+	Limit         int32 `protobuf:"varint,7,opt,name=limit,proto3" json:"limit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *QueryTrafficHistoryRequest) Reset() {
+	*x = QueryTrafficHistoryRequest{}
+	mi := &file_containarium_v1_traffic_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *QueryTrafficHistoryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*QueryTrafficHistoryRequest) ProtoMessage() {}
+
+func (x *QueryTrafficHistoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_traffic_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use QueryTrafficHistoryRequest.ProtoReflect.Descriptor instead.
+func (*QueryTrafficHistoryRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_traffic_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *QueryTrafficHistoryRequest) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+func (x *QueryTrafficHistoryRequest) GetStartTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.StartTime
+	}
+	return nil
+}
+
+func (x *QueryTrafficHistoryRequest) GetEndTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.EndTime
+	}
+	return nil
+}
+
+func (x *QueryTrafficHistoryRequest) GetDestIp() string {
+	if x != nil {
+		return x.DestIp
+	}
+	return ""
+}
+
+func (x *QueryTrafficHistoryRequest) GetDestPort() uint32 {
+	if x != nil {
+		return x.DestPort
+	}
+	return 0
+}
+
+func (x *QueryTrafficHistoryRequest) GetOffset() int32 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+func (x *QueryTrafficHistoryRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type QueryTrafficHistoryResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Historical connections
+	Connections []*HistoricalConnection `protobuf:"bytes,1,rep,name=connections,proto3" json:"connections,omitempty"`
+	// Total count matching query
+	TotalCount int32 `protobuf:"varint,2,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	// started_at of the oldest record held in the queried scope (the box, or
+	// every box for a host-wide query), regardless of the filters. Lets a
+	// caller tell "no matching traffic" (set, but older than the window or
+	// simply not matching) from "nothing collected" (unset).
+	OldestRecordTime *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=oldest_record_time,json=oldestRecordTime,proto3" json:"oldest_record_time,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *QueryTrafficHistoryResponse) Reset() {
+	*x = QueryTrafficHistoryResponse{}
+	mi := &file_containarium_v1_traffic_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *QueryTrafficHistoryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*QueryTrafficHistoryResponse) ProtoMessage() {}
+
+func (x *QueryTrafficHistoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_traffic_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use QueryTrafficHistoryResponse.ProtoReflect.Descriptor instead.
+func (*QueryTrafficHistoryResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_traffic_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *QueryTrafficHistoryResponse) GetConnections() []*HistoricalConnection {
+	if x != nil {
+		return x.Connections
+	}
+	return nil
+}
+
+func (x *QueryTrafficHistoryResponse) GetTotalCount() int32 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+func (x *QueryTrafficHistoryResponse) GetOldestRecordTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.OldestRecordTime
+	}
+	return nil
+}
+
+// GetTrafficAggregatesRequest retrieves time-series traffic aggregates
+type GetTrafficAggregatesRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Container name (required)
+	ContainerName string `protobuf:"bytes,1,opt,name=container_name,json=containerName,proto3" json:"container_name,omitempty"`
+	// Start time
+	StartTime *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"`
+	// End time
+	EndTime *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=end_time,json=endTime,proto3" json:"end_time,omitempty"`
+	// Aggregation interval (e.g., "1m", "5m", "1h", "1d")
+	Interval string `protobuf:"bytes,4,opt,name=interval,proto3" json:"interval,omitempty"`
+	// Group by destination IP
+	GroupByDestIp bool `protobuf:"varint,5,opt,name=group_by_dest_ip,json=groupByDestIp,proto3" json:"group_by_dest_ip,omitempty"`
+	// Group by destination port
+	GroupByDestPort bool `protobuf:"varint,6,opt,name=group_by_dest_port,json=groupByDestPort,proto3" json:"group_by_dest_port,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *GetTrafficAggregatesRequest) Reset() {
+	*x = GetTrafficAggregatesRequest{}
+	mi := &file_containarium_v1_traffic_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTrafficAggregatesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTrafficAggregatesRequest) ProtoMessage() {}
+
+func (x *GetTrafficAggregatesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_traffic_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTrafficAggregatesRequest.ProtoReflect.Descriptor instead.
+func (*GetTrafficAggregatesRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_traffic_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *GetTrafficAggregatesRequest) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+func (x *GetTrafficAggregatesRequest) GetStartTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.StartTime
+	}
+	return nil
+}
+
+func (x *GetTrafficAggregatesRequest) GetEndTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.EndTime
+	}
+	return nil
+}
+
+func (x *GetTrafficAggregatesRequest) GetInterval() string {
+	if x != nil {
+		return x.Interval
+	}
+	return ""
+}
+
+func (x *GetTrafficAggregatesRequest) GetGroupByDestIp() bool {
+	if x != nil {
+		return x.GroupByDestIp
+	}
+	return false
+}
+
+func (x *GetTrafficAggregatesRequest) GetGroupByDestPort() bool {
+	if x != nil {
+		return x.GroupByDestPort
+	}
+	return false
+}
+
+type GetTrafficAggregatesResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Aggregated traffic data
+	Aggregates    []*TrafficAggregate `protobuf:"bytes,1,rep,name=aggregates,proto3" json:"aggregates,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetTrafficAggregatesResponse) Reset() {
+	*x = GetTrafficAggregatesResponse{}
+	mi := &file_containarium_v1_traffic_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetTrafficAggregatesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetTrafficAggregatesResponse) ProtoMessage() {}
+
+func (x *GetTrafficAggregatesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_traffic_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetTrafficAggregatesResponse.ProtoReflect.Descriptor instead.
+func (*GetTrafficAggregatesResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_traffic_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *GetTrafficAggregatesResponse) GetAggregates() []*TrafficAggregate {
+	if x != nil {
+		return x.Aggregates
+	}
+	return nil
+}
+
+var File_containarium_v1_traffic_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_traffic_proto_rawDesc = "" +
+	"\n" +
+	"\x1dcontainarium/v1/traffic.proto\x12\x0fcontainarium.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1cgoogle/api/annotations.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\"\xbb\x05\n" +
+	"\n" +
+	"Connection\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12%\n" +
+	"\x0econtainer_name\x18\x02 \x01(\tR\rcontainerName\x12!\n" +
+	"\fcontainer_ip\x18\x03 \x01(\tR\vcontainerIp\x125\n" +
+	"\bprotocol\x18\x04 \x01(\x0e2\x19.containarium.v1.ProtocolR\bprotocol\x12\x1b\n" +
+	"\tsource_ip\x18\x05 \x01(\tR\bsourceIp\x12\x1f\n" +
+	"\vsource_port\x18\x06 \x01(\rR\n" +
+	"sourcePort\x12\x17\n" +
+	"\adest_ip\x18\a \x01(\tR\x06destIp\x12\x1b\n" +
+	"\tdest_port\x18\b \x01(\rR\bdestPort\x126\n" +
+	"\x05state\x18\t \x01(\x0e2 .containarium.v1.ConnectionStateR\x05state\x12?\n" +
+	"\tdirection\x18\n" +
+	" \x01(\x0e2!.containarium.v1.TrafficDirectionR\tdirection\x12\x1d\n" +
+	"\n" +
+	"bytes_sent\x18\v \x01(\x03R\tbytesSent\x12%\n" +
+	"\x0ebytes_received\x18\f \x01(\x03R\rbytesReceived\x12!\n" +
+	"\fpackets_sent\x18\r \x01(\x03R\vpacketsSent\x12)\n" +
+	"\x10packets_received\x18\x0e \x01(\x03R\x0fpacketsReceived\x129\n" +
+	"\n" +
+	"first_seen\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\tfirstSeen\x127\n" +
+	"\tlast_seen\x18\x10 \x01(\v2\x1a.google.protobuf.TimestampR\blastSeen\x12'\n" +
+	"\x0ftimeout_seconds\x18\x11 \x01(\x05R\x0etimeoutSeconds\"\xbc\x01\n" +
+	"\fTrafficEvent\x125\n" +
+	"\x04type\x18\x01 \x01(\x0e2!.containarium.v1.TrafficEventTypeR\x04type\x12;\n" +
+	"\n" +
+	"connection\x18\x02 \x01(\v2\x1b.containarium.v1.ConnectionR\n" +
+	"connection\x128\n" +
+	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\xe5\x02\n" +
+	"\x11ConnectionSummary\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\x12-\n" +
+	"\x12active_connections\x18\x02 \x01(\x05R\x11activeConnections\x12'\n" +
+	"\x0ftcp_connections\x18\x03 \x01(\x05R\x0etcpConnections\x12'\n" +
+	"\x0fudp_connections\x18\x04 \x01(\x05R\x0eudpConnections\x12(\n" +
+	"\x10total_bytes_sent\x18\x05 \x01(\x03R\x0etotalBytesSent\x120\n" +
+	"\x14total_bytes_received\x18\x06 \x01(\x03R\x12totalBytesReceived\x12L\n" +
+	"\x10top_destinations\x18\a \x03(\v2!.containarium.v1.DestinationStatsR\x0ftopDestinations\"w\n" +
+	"\x10DestinationStats\x12\x17\n" +
+	"\adest_ip\x18\x01 \x01(\tR\x06destIp\x12)\n" +
+	"\x10connection_count\x18\x02 \x01(\x05R\x0fconnectionCount\x12\x1f\n" +
+	"\vbytes_total\x18\x03 \x01(\x03R\n" +
+	"bytesTotal\"\x9c\x04\n" +
+	"\x14HistoricalConnection\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12%\n" +
+	"\x0econtainer_name\x18\x02 \x01(\tR\rcontainerName\x125\n" +
+	"\bprotocol\x18\x03 \x01(\x0e2\x19.containarium.v1.ProtocolR\bprotocol\x12\x1b\n" +
+	"\tsource_ip\x18\x04 \x01(\tR\bsourceIp\x12\x1f\n" +
+	"\vsource_port\x18\x05 \x01(\rR\n" +
+	"sourcePort\x12\x17\n" +
+	"\adest_ip\x18\x06 \x01(\tR\x06destIp\x12\x1b\n" +
+	"\tdest_port\x18\a \x01(\rR\bdestPort\x12?\n" +
+	"\tdirection\x18\b \x01(\x0e2!.containarium.v1.TrafficDirectionR\tdirection\x12\x1d\n" +
+	"\n" +
+	"bytes_sent\x18\t \x01(\x03R\tbytesSent\x12%\n" +
+	"\x0ebytes_received\x18\n" +
+	" \x01(\x03R\rbytesReceived\x129\n" +
+	"\n" +
+	"started_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x125\n" +
+	"\bended_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\aendedAt\x12)\n" +
+	"\x10duration_seconds\x18\r \x01(\x03R\x0fdurationSeconds\"\xf3\x01\n" +
+	"\x10TrafficAggregate\x128\n" +
+	"\ttimestamp\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12\x17\n" +
+	"\adest_ip\x18\x02 \x01(\tR\x06destIp\x12\x1b\n" +
+	"\tdest_port\x18\x03 \x01(\rR\bdestPort\x12\x1d\n" +
+	"\n" +
+	"bytes_sent\x18\x04 \x01(\x03R\tbytesSent\x12%\n" +
+	"\x0ebytes_received\x18\x05 \x01(\x03R\rbytesReceived\x12)\n" +
+	"\x10connection_count\x18\x06 \x01(\x05R\x0fconnectionCount\"\xce\x01\n" +
+	"\x15GetConnectionsRequest\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\x125\n" +
+	"\bprotocol\x18\x02 \x01(\x0e2\x19.containarium.v1.ProtocolR\bprotocol\x12$\n" +
+	"\x0edest_ip_prefix\x18\x03 \x01(\tR\fdestIpPrefix\x12\x1b\n" +
+	"\tdest_port\x18\x04 \x01(\rR\bdestPort\x12\x14\n" +
+	"\x05limit\x18\x05 \x01(\x05R\x05limit\"x\n" +
+	"\x16GetConnectionsResponse\x12=\n" +
+	"\vconnections\x18\x01 \x03(\v2\x1b.containarium.v1.ConnectionR\vconnections\x12\x1f\n" +
+	"\vtotal_count\x18\x02 \x01(\x05R\n" +
+	"totalCount\"D\n" +
+	"\x1bGetConnectionSummaryRequest\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\"\\\n" +
+	"\x1cGetConnectionSummaryResponse\x12<\n" +
+	"\asummary\x18\x01 \x01(\v2\".containarium.v1.ConnectionSummaryR\asummary\"\xa9\x01\n" +
+	"\x17SubscribeTrafficRequest\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\x12B\n" +
+	"\vevent_types\x18\x02 \x03(\x0e2!.containarium.v1.TrafficEventTypeR\n" +
+	"eventTypes\x12#\n" +
+	"\rexternal_only\x18\x03 \x01(\bR\fexternalOnly\"\x99\x02\n" +
+	"\x1aQueryTrafficHistoryRequest\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\x129\n" +
+	"\n" +
+	"start_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\tstartTime\x125\n" +
+	"\bend_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\aendTime\x12\x17\n" +
+	"\adest_ip\x18\x04 \x01(\tR\x06destIp\x12\x1b\n" +
+	"\tdest_port\x18\x05 \x01(\rR\bdestPort\x12\x16\n" +
+	"\x06offset\x18\x06 \x01(\x05R\x06offset\x12\x14\n" +
+	"\x05limit\x18\a \x01(\x05R\x05limit\"\xd1\x01\n" +
+	"\x1bQueryTrafficHistoryResponse\x12G\n" +
+	"\vconnections\x18\x01 \x03(\v2%.containarium.v1.HistoricalConnectionR\vconnections\x12\x1f\n" +
+	"\vtotal_count\x18\x02 \x01(\x05R\n" +
+	"totalCount\x12H\n" +
+	"\x12oldest_record_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x10oldestRecordTime\"\xa8\x02\n" +
+	"\x1bGetTrafficAggregatesRequest\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\x129\n" +
+	"\n" +
+	"start_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\tstartTime\x125\n" +
+	"\bend_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\aendTime\x12\x1a\n" +
+	"\binterval\x18\x04 \x01(\tR\binterval\x12'\n" +
+	"\x10group_by_dest_ip\x18\x05 \x01(\bR\rgroupByDestIp\x12+\n" +
+	"\x12group_by_dest_port\x18\x06 \x01(\bR\x0fgroupByDestPort\"a\n" +
+	"\x1cGetTrafficAggregatesResponse\x12A\n" +
+	"\n" +
+	"aggregates\x18\x01 \x03(\v2!.containarium.v1.TrafficAggregateR\n" +
+	"aggregates*[\n" +
+	"\bProtocol\x12\x18\n" +
+	"\x14PROTOCOL_UNSPECIFIED\x10\x00\x12\x10\n" +
+	"\fPROTOCOL_TCP\x10\x01\x12\x10\n" +
+	"\fPROTOCOL_UDP\x10\x02\x12\x11\n" +
+	"\rPROTOCOL_ICMP\x10\x03*\xc8\x02\n" +
+	"\x0fConnectionState\x12 \n" +
+	"\x1cCONNECTION_STATE_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14CONNECTION_STATE_NEW\x10\x01\x12 \n" +
+	"\x1cCONNECTION_STATE_ESTABLISHED\x10\x02\x12\x1c\n" +
+	"\x18CONNECTION_STATE_RELATED\x10\x03\x12\x1e\n" +
+	"\x1aCONNECTION_STATE_TIME_WAIT\x10\x04\x12\x1f\n" +
+	"\x1bCONNECTION_STATE_CLOSE_WAIT\x10\x05\x12\x1d\n" +
+	"\x19CONNECTION_STATE_FIN_WAIT\x10\x06\x12\x1b\n" +
+	"\x17CONNECTION_STATE_CLOSED\x10\a\x12\x1d\n" +
+	"\x19CONNECTION_STATE_SYN_SENT\x10\b\x12\x1d\n" +
+	"\x19CONNECTION_STATE_SYN_RECV\x10\t*r\n" +
+	"\x10TrafficDirection\x12!\n" +
+	"\x1dTRAFFIC_DIRECTION_UNSPECIFIED\x10\x00\x12\x1d\n" +
+	"\x19TRAFFIC_DIRECTION_INGRESS\x10\x01\x12\x1c\n" +
+	"\x18TRAFFIC_DIRECTION_EGRESS\x10\x02*\x91\x01\n" +
+	"\x10TrafficEventType\x12\"\n" +
+	"\x1eTRAFFIC_EVENT_TYPE_UNSPECIFIED\x10\x00\x12\x1a\n" +
+	"\x16TRAFFIC_EVENT_TYPE_NEW\x10\x01\x12\x1d\n" +
+	"\x19TRAFFIC_EVENT_TYPE_UPDATE\x10\x02\x12\x1e\n" +
+	"\x1aTRAFFIC_EVENT_TYPE_DESTROY\x10\x032\xe6\f\n" +
+	"\x0eTrafficService\x12\x85\x02\n" +
+	"\x0eGetConnections\x12&.containarium.v1.GetConnectionsRequest\x1a'.containarium.v1.GetConnectionsResponse\"\xa1\x01\x92Ak\n" +
+	"\aTraffic\x12\x16Get active connections\x1aHReturns active network connections for a container tracked by conntrack.\x82\xd3\xe4\x93\x02-\x12+/v1/containers/{container_name}/connections\x12\x8f\x02\n" +
+	"\x14GetConnectionSummary\x12,.containarium.v1.GetConnectionSummaryRequest\x1a-.containarium.v1.GetConnectionSummaryResponse\"\x99\x01\x92A[\n" +
+	"\aTraffic\x12\x16Get connection summary\x1a8Returns aggregate connection statistics for a container.\x82\xd3\xe4\x93\x025\x123/v1/containers/{container_name}/connections/summary\x12\xea\x01\n" +
+	"\x10SubscribeTraffic\x12(.containarium.v1.SubscribeTrafficRequest\x1a\x1d.containarium.v1.TrafficEvent\"\x8a\x01\x92Aj\n" +
+	"\aTraffic\x12\x1bSubscribe to traffic events\x1aBOpens a Server-Sent Events stream for real-time connection events.\x82\xd3\xe4\x93\x02\x17\x12\x15/v1/traffic/subscribe0\x01\x12\xb6\x04\n" +
+	"\x13QueryTrafficHistory\x12+.containarium.v1.QueryTrafficHistoryRequest\x1a,.containarium.v1.QueryTrafficHistoryResponse\"\xc3\x03\x92A\xf1\x02\n" +
+	"\aTraffic\x12\x15Query traffic history\x1a\xce\x02Returns historical connection data from persistent storage. Without a container_name (GET /v1/traffic/history) the query spans every box on the backend; that form is admin-only, needs start_time, and is limited to a 7-day window. Each row names its box. Returns FAILED_PRECONDITION when traffic persistence is not enabled on the host.\x82\xd3\xe4\x93\x02HZ\x15\x12\x13/v1/traffic/history\x12//v1/containers/{container_name}/traffic/history\x12\x93\x02\n" +
+	"\x14GetTrafficAggregates\x12,.containarium.v1.GetTrafficAggregatesRequest\x1a-.containarium.v1.GetTrafficAggregatesResponse\"\x9d\x01\x92A`\n" +
+	"\aTraffic\x12\x16Get traffic aggregates\x1a=Returns aggregated traffic statistics over time for analysis.\x82\xd3\xe4\x93\x024\x122/v1/containers/{container_name}/traffic/aggregatesBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_traffic_proto_rawDescOnce sync.Once
+	file_containarium_v1_traffic_proto_rawDescData []byte
+)
+
+func file_containarium_v1_traffic_proto_rawDescGZIP() []byte {
+	file_containarium_v1_traffic_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_traffic_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_traffic_proto_rawDesc), len(file_containarium_v1_traffic_proto_rawDesc)))
+	})
+	return file_containarium_v1_traffic_proto_rawDescData
+}
+
+var file_containarium_v1_traffic_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_containarium_v1_traffic_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_containarium_v1_traffic_proto_goTypes = []any{
+	(Protocol)(0),                        // 0: containarium.v1.Protocol
+	(ConnectionState)(0),                 // 1: containarium.v1.ConnectionState
+	(TrafficDirection)(0),                // 2: containarium.v1.TrafficDirection
+	(TrafficEventType)(0),                // 3: containarium.v1.TrafficEventType
+	(*Connection)(nil),                   // 4: containarium.v1.Connection
+	(*TrafficEvent)(nil),                 // 5: containarium.v1.TrafficEvent
+	(*ConnectionSummary)(nil),            // 6: containarium.v1.ConnectionSummary
+	(*DestinationStats)(nil),             // 7: containarium.v1.DestinationStats
+	(*HistoricalConnection)(nil),         // 8: containarium.v1.HistoricalConnection
+	(*TrafficAggregate)(nil),             // 9: containarium.v1.TrafficAggregate
+	(*GetConnectionsRequest)(nil),        // 10: containarium.v1.GetConnectionsRequest
+	(*GetConnectionsResponse)(nil),       // 11: containarium.v1.GetConnectionsResponse
+	(*GetConnectionSummaryRequest)(nil),  // 12: containarium.v1.GetConnectionSummaryRequest
+	(*GetConnectionSummaryResponse)(nil), // 13: containarium.v1.GetConnectionSummaryResponse
+	(*SubscribeTrafficRequest)(nil),      // 14: containarium.v1.SubscribeTrafficRequest
+	(*QueryTrafficHistoryRequest)(nil),   // 15: containarium.v1.QueryTrafficHistoryRequest
+	(*QueryTrafficHistoryResponse)(nil),  // 16: containarium.v1.QueryTrafficHistoryResponse
+	(*GetTrafficAggregatesRequest)(nil),  // 17: containarium.v1.GetTrafficAggregatesRequest
+	(*GetTrafficAggregatesResponse)(nil), // 18: containarium.v1.GetTrafficAggregatesResponse
+	(*timestamppb.Timestamp)(nil),        // 19: google.protobuf.Timestamp
+}
+var file_containarium_v1_traffic_proto_depIdxs = []int32{
+	0,  // 0: containarium.v1.Connection.protocol:type_name -> containarium.v1.Protocol
+	1,  // 1: containarium.v1.Connection.state:type_name -> containarium.v1.ConnectionState
+	2,  // 2: containarium.v1.Connection.direction:type_name -> containarium.v1.TrafficDirection
+	19, // 3: containarium.v1.Connection.first_seen:type_name -> google.protobuf.Timestamp
+	19, // 4: containarium.v1.Connection.last_seen:type_name -> google.protobuf.Timestamp
+	3,  // 5: containarium.v1.TrafficEvent.type:type_name -> containarium.v1.TrafficEventType
+	4,  // 6: containarium.v1.TrafficEvent.connection:type_name -> containarium.v1.Connection
+	19, // 7: containarium.v1.TrafficEvent.timestamp:type_name -> google.protobuf.Timestamp
+	7,  // 8: containarium.v1.ConnectionSummary.top_destinations:type_name -> containarium.v1.DestinationStats
+	0,  // 9: containarium.v1.HistoricalConnection.protocol:type_name -> containarium.v1.Protocol
+	2,  // 10: containarium.v1.HistoricalConnection.direction:type_name -> containarium.v1.TrafficDirection
+	19, // 11: containarium.v1.HistoricalConnection.started_at:type_name -> google.protobuf.Timestamp
+	19, // 12: containarium.v1.HistoricalConnection.ended_at:type_name -> google.protobuf.Timestamp
+	19, // 13: containarium.v1.TrafficAggregate.timestamp:type_name -> google.protobuf.Timestamp
+	0,  // 14: containarium.v1.GetConnectionsRequest.protocol:type_name -> containarium.v1.Protocol
+	4,  // 15: containarium.v1.GetConnectionsResponse.connections:type_name -> containarium.v1.Connection
+	6,  // 16: containarium.v1.GetConnectionSummaryResponse.summary:type_name -> containarium.v1.ConnectionSummary
+	3,  // 17: containarium.v1.SubscribeTrafficRequest.event_types:type_name -> containarium.v1.TrafficEventType
+	19, // 18: containarium.v1.QueryTrafficHistoryRequest.start_time:type_name -> google.protobuf.Timestamp
+	19, // 19: containarium.v1.QueryTrafficHistoryRequest.end_time:type_name -> google.protobuf.Timestamp
+	8,  // 20: containarium.v1.QueryTrafficHistoryResponse.connections:type_name -> containarium.v1.HistoricalConnection
+	19, // 21: containarium.v1.QueryTrafficHistoryResponse.oldest_record_time:type_name -> google.protobuf.Timestamp
+	19, // 22: containarium.v1.GetTrafficAggregatesRequest.start_time:type_name -> google.protobuf.Timestamp
+	19, // 23: containarium.v1.GetTrafficAggregatesRequest.end_time:type_name -> google.protobuf.Timestamp
+	9,  // 24: containarium.v1.GetTrafficAggregatesResponse.aggregates:type_name -> containarium.v1.TrafficAggregate
+	10, // 25: containarium.v1.TrafficService.GetConnections:input_type -> containarium.v1.GetConnectionsRequest
+	12, // 26: containarium.v1.TrafficService.GetConnectionSummary:input_type -> containarium.v1.GetConnectionSummaryRequest
+	14, // 27: containarium.v1.TrafficService.SubscribeTraffic:input_type -> containarium.v1.SubscribeTrafficRequest
+	15, // 28: containarium.v1.TrafficService.QueryTrafficHistory:input_type -> containarium.v1.QueryTrafficHistoryRequest
+	17, // 29: containarium.v1.TrafficService.GetTrafficAggregates:input_type -> containarium.v1.GetTrafficAggregatesRequest
+	11, // 30: containarium.v1.TrafficService.GetConnections:output_type -> containarium.v1.GetConnectionsResponse
+	13, // 31: containarium.v1.TrafficService.GetConnectionSummary:output_type -> containarium.v1.GetConnectionSummaryResponse
+	5,  // 32: containarium.v1.TrafficService.SubscribeTraffic:output_type -> containarium.v1.TrafficEvent
+	16, // 33: containarium.v1.TrafficService.QueryTrafficHistory:output_type -> containarium.v1.QueryTrafficHistoryResponse
+	18, // 34: containarium.v1.TrafficService.GetTrafficAggregates:output_type -> containarium.v1.GetTrafficAggregatesResponse
+	30, // [30:35] is the sub-list for method output_type
+	25, // [25:30] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	25, // [25:25] is the sub-list for extension extendee
+	0,  // [0:25] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_traffic_proto_init() }
+func file_containarium_v1_traffic_proto_init() {
+	if File_containarium_v1_traffic_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_traffic_proto_rawDesc), len(file_containarium_v1_traffic_proto_rawDesc)),
+			NumEnums:      4,
+			NumMessages:   15,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_traffic_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_traffic_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_traffic_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_traffic_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_traffic_proto = out.File
+	file_containarium_v1_traffic_proto_goTypes = nil
+	file_containarium_v1_traffic_proto_depIdxs = nil
+}
