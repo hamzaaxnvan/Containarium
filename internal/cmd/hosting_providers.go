@@ -32,3 +32,37 @@ func runHostingProviders(cmd *cobra.Command, args []string) {
 	providerInfo := map[string]struct {
 		name    string
 		envVars []string
+		docURL  string
+	}{
+		"godaddy": {
+			name:    "GoDaddy",
+			envVars: []string{"GODADDY_API_KEY", "GODADDY_API_SECRET"},
+			docURL:  "https://developer.godaddy.com/keys",
+		},
+		// Future providers:
+		// "cloudflare": {
+		// 	name:    "Cloudflare",
+		// 	envVars: []string{"CF_API_TOKEN"},
+		// 	docURL:  "https://dash.cloudflare.com/profile/api-tokens",
+		// },
+	}
+
+	for _, p := range providers {
+		info, ok := providerInfo[p]
+		if !ok {
+			fmt.Printf("  - %s\n", p)
+			continue
+		}
+
+		fmt.Printf("  %s (%s)\n", info.name, p)
+		fmt.Printf("    Environment variables:\n")
+		for _, env := range info.envVars {
+			fmt.Printf("      - %s\n", env)
+		}
+		fmt.Printf("    Documentation: %s\n", info.docURL)
+		fmt.Println()
+	}
+
+	fmt.Println("Usage:")
+	fmt.Println("  containarium hosting setup --domain example.com --email admin@example.com --provider <provider>")
+}
