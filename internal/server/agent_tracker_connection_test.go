@@ -70,3 +70,52 @@ func TestValidateTrackerConnection_ValidatesAgainstCallerTenant(t *testing.T) {
 		t.Errorf("checked connection name = %q, want default", checker.gotName)
 	}
 }
+
+// TestRunAgentSkill_TrackerConnection_RejectedBeforeProvisioning mirrors
+// TestRunAgentSkill_ResponseCarriesRunID's boundary-check pattern: a
+// tracker_connection that doesn't belong to the caller's tenant must be
+// rejected before any box work, distinguishable from a provisioning
+// failure (which every RunAgentSkill call in this harness eventually hits
+// — see newSkillBoxHarness's doc comment) by its error code.
+func TestRunAgentSkill_TrackerConnection_RejectedBeforeProvisioning(t *testing.T) {
+	store := newFakeRevocationStore()
+	s, skill := newSkillBoxHarness(t, store)
+	s.trackerConnections = &fakeTrackerConnectionChecker{err: tracker.ErrNotFound}
+	ctx := ctxAs("admin", true)
+
+	_, err := s.RunAgentSkill(ctx, &pb.RunAgentSkillRequest{
+		SkillId: skill.Id, RunId: "run-bad-conn", TrackerConnection: "does-not-exist",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("bad tracker_connection: code = %v, want InvalidArgument", status.Code(err))
+	}
+}
+
+func TestRunAgentSkill_TrackerConnection_NoStoreConfigured_RejectedBeforeProvisioning(t *testing.T) {
+	store := newFakeRevocationStore()
+	s, skill := newSkillBoxHarness(t, store) // trackerConnections left nil
+	ctx := ctxAs("admin", true)
+
+	_, err := s.RunAgentSkill(ctx, &pb.RunAgentSkillRequest{
+		SkillId: skill.Id, RunId: "run-no-tracker-store", TrackerConnection: "default",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("tracker_connection with no store configured: code = %v, want FailedPrecondition", status.Code(err))
+	}
+}
+
+// TestRunAgentSkill_TrackerConnection_EmptyIsUnaffected pins that omitting
+// tracker_connection entirely (every pre-#1922 caller) is unaffected by
+// this validation: the run proceeds past it and fails later, in the box,
+// same as TestRunAgentSkill_ResponseCarriesRunID's "well-formed run_id"
+// case.
+func TestRunAgentSkill_TrackerConnection_EmptyIsUnaffected(t *testing.T) {
+	store := newFakeRevocationStore()
+	s, skill := newSkillBoxHarness(t, store) // trackerConnections left nil
+	ctx := ctxAs("admin", true)
+
+	_, err := s.RunAgentSkill(ctx, &pb.RunAgentSkillRequest{SkillId: skill.Id, RunId: "run-no-conn-field"})
+	if status.Code(err) == codes.InvalidArgument || status.Code(err) == codes.FailedPrecondition {
+		t.Errorf("omitting tracker_connection must not be rejected at the boundary: %v", err)
+	}
+}
