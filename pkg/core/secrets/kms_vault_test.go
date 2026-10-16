@@ -235,3 +235,83 @@ func TestVaultKMS_RejectsEmptyOrOversizedPlaintext(t *testing.T) {
 			t.Fatalf("Wrap with plaintext size %d should fail", badSize)
 		}
 	}
+}
+
+func TestVaultKMS_KEKIDEncodesDeploymentIdentity(t *testing.T) {
+	// Two backends pointed at different Vault deployments
+	// produce different kek_ids — a row from one can't be
+	// silently accepted by the other.
+	srv1, _ := newFakeVault(t)
+	srv2, _ := newFakeVault(t)
+	defer srv1.Close()
+	defer srv2.Close()
+	a, _ := NewVaultKMS(VaultConfig{Address: srv1.URL, Token: "root-token", KeyName: "k"})
+	b, _ := NewVaultKMS(VaultConfig{Address: srv2.URL, Token: "root-token", KeyName: "k"})
+	dek, _ := NewDEK()
+	_, kekA, _ := a.Wrap(context.Background(), dek)
+	_, kekB, _ := b.Wrap(context.Background(), dek)
+	if kekA == kekB {
+		t.Fatal("different Vault deployments should produce different kek_ids")
+	}
+}
+
+func TestVaultKMS_RejectsEmptyConfig(t *testing.T) {
+	cases := []VaultConfig{
+		{Address: "", Token: "t", KeyName: "k"},
+		{Address: "http://x", Token: "", KeyName: "k"},
+		{Address: "http://x", Token: "t", KeyName: ""},
+	}
+	for _, c := range cases {
+		if _, err := NewVaultKMS(c); err == nil {
+			t.Fatalf("NewVaultKMS should reject empty field in %+v", c)
+		}
+	}
+}
+
+func TestVaultKMS_MountDefault(t *testing.T) {
+	srv, fv := newFakeVault(t)
+	defer srv.Close()
+	fv.requireOp = "encrypt" // make sure mount path is "transit"
+	// The fake parses /v1/{mount}/{op}/{key} into parts[1]
+	// = mount. We don't have a direct way to assert the
+	// default here, but a successful round-trip with no
+	// explicit Mount confirms the default got used.
+	k, _ := NewVaultKMS(VaultConfig{
+		Address: srv.URL,
+		Token:   "root-token",
+		KeyName: "k",
+		// no Mount → defaults to "transit"
+	})
+	dek, _ := NewDEK()
+	if _, _, err := k.Wrap(context.Background(), dek); err != nil {
+		t.Fatalf("Wrap with default mount: %v", err)
+	}
+}
+
+func TestVaultKMS_TimeoutAppliesToHTTP(t *testing.T) {
+	// Server that hangs forever — Wrap must time out.
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}))
+	defer hang.Close()
+
+	k, _ := NewVaultKMS(VaultConfig{
+		Address: hang.URL,
+		Token:   "root-token",
+		KeyName: "k",
+		Timeout: 100 * time.Millisecond,
+	})
+	dek, _ := NewDEK()
+	start := time.Now()
+	_, _, err := k.Wrap(context.Background(), dek)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Wrap should time out")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("timeout not honored; elapsed = %v", elapsed)
+	}
+}
+
+// Compile-time conformance.
+var _ KMSClient = (*VaultKMS)(nil)
