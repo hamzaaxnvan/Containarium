@@ -61,3 +61,130 @@ func TestDestroyTenantStorage_RefusesWhileContainersRemain(t *testing.T) {
 	}
 	if len(pools.deleted) != 0 {
 		t.Errorf("the pool was deleted anyway: %v", pools.deleted)
+	}
+	if z.ran("destroy") {
+		t.Errorf("the dataset was destroyed anyway; calls=%v", z.calls)
+	}
+}
+
+// The order: pool first, dataset second.
+func TestDestroyTenantStorage_DeletesThePoolBeforeTheDataset(t *testing.T) {
+	z := newZFSFake()
+	z.stdout["list"] = "tank/tenants/alice" // empty: only the root itself
+	h, pools, _ := offboardHooks(t, z, map[string]zfskey.KeyRef{})
+
+	// Observe what had already happened when the pool was deleted. This is
+	// the ordering assertion; a flag the fake sets unconditionally would be
+	// true either way round and prove nothing.
+	datasetGoneFirst := false
+	pools.onDelete = func() { datasetGoneFirst = z.ran("destroy") }
+
+	if err := h.DestroyTenantStorage(context.Background(), "alice"); err != nil {
+		t.Fatalf("DestroyTenantStorage: %v", err)
+	}
+
+	if len(pools.deleted) != 1 || pools.deleted[0] != "containarium-tenant-alice" {
+		t.Fatalf("deleted pools = %v, want the tenant's", pools.deleted)
+	}
+	if !z.ran("destroy") || !z.ran("tank/tenants/alice") {
+		t.Fatalf("the tenant dataset was not destroyed; calls=%v", z.calls)
+	}
+	if datasetGoneFirst {
+		t.Error("the dataset was destroyed BEFORE the pool was deleted — the pool would then " +
+			"point at nothing, and EnsureStorage walks every pool at daemon start, so the next " +
+			"restart breaks for every tenant on this host")
+	}
+}
+
+// If the dataset survives a successful pool delete, the operator has to be
+// told exactly what is left: the pool is gone, so nothing will ever reference
+// that dataset again, and it holds the tenant's encrypted data.
+func TestDestroyTenantStorage_SaysWhatIsLeftWhenTheDatasetSurvives(t *testing.T) {
+	z := newZFSFake()
+	z.stdout["list"] = "tank/tenants/alice"
+	z.errs["destroy"] = errors.New("dataset is busy")
+	h, pools, _ := offboardHooks(t, z, map[string]zfskey.KeyRef{})
+
+	err := h.DestroyTenantStorage(context.Background(), "alice")
+	if err == nil {
+		t.Fatal("a surviving dataset was reported as a clean offboarding")
+	}
+	if len(pools.deleted) != 1 {
+		t.Errorf("the pool delete did not happen: %v", pools.deleted)
+	}
+	for _, want := range []string{"tank/tenants/alice", "manual"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %q, so the leftover is invisible: %v", want, err)
+		}
+	}
+}
+
+// A pool that is already gone must not stop the dataset being cleaned up —
+// offboarding has to be re-runnable after a partial failure.
+func TestDestroyTenantStorage_IsRerunnableAfterAPartialTeardown(t *testing.T) {
+	z := newZFSFake()
+	z.stdout["list"] = "tank/tenants/alice"
+	h, pools, _ := offboardHooks(t, z, map[string]zfskey.KeyRef{})
+	delete(pools.sources, "containarium-tenant-alice") // the pool went first time
+
+	if err := h.DestroyTenantStorage(context.Background(), "alice"); err != nil {
+		t.Fatalf("a re-run after a partial teardown failed: %v — an operator cannot finish what "+
+			"they started", err)
+	}
+	if !z.ran("destroy") {
+		t.Errorf("the leftover dataset was not cleaned up; calls=%v", z.calls)
+	}
+}
+
+func TestDestroyTenantStorage_RequiresEncryptionToBeConfigured(t *testing.T) {
+	var h *encryptionHooks
+	if err := h.DestroyTenantStorage(context.Background(), "alice"); err == nil {
+		t.Fatal("a daemon with no encryption claimed to have offboarded a tenant")
+	}
+}
+
+// --- the RPC ------------------------------------------------------------
+
+func TestDeleteTenantStorage_RequiresAdmin(t *testing.T) {
+	z := newZFSFake()
+	z.stdout["list"] = "tank/tenants/alice"
+	h, _, _ := offboardHooks(t, z, map[string]zfskey.KeyRef{})
+	s := &ContainerServer{encryption: h}
+
+	_, err := s.DeleteTenantStorage(
+		tenantWithScopes("alice", auth.ScopeContainersWrite),
+		&pb.DeleteTenantStorageRequest{Tenant: "alice"})
+	if err == nil {
+		t.Fatal("a non-admin destroyed a tenant's encrypted storage")
+	}
+	if got := status.Code(err); got != codes.PermissionDenied {
+		t.Errorf("code = %v, want PermissionDenied", got)
+	}
+}
+
+func TestDeleteTenantStorage_ReportsWhatItRemoved(t *testing.T) {
+	z := newZFSFake()
+	z.stdout["list"] = "tank/tenants/alice"
+	h, _, _ := offboardHooks(t, z, map[string]zfskey.KeyRef{})
+	s := &ContainerServer{encryption: h}
+
+	resp, err := s.DeleteTenantStorage(adminCtx(), &pb.DeleteTenantStorageRequest{Tenant: "alice"})
+	if err != nil {
+		t.Fatalf("DeleteTenantStorage: %v", err)
+	}
+	if resp.StoragePool == "" || resp.Dataset == "" {
+		t.Errorf("the response does not name what was destroyed (pool=%q dataset=%q) — an "+
+			"operator has no record of what this removed", resp.StoragePool, resp.Dataset)
+	}
+}
+
+func TestDeleteTenantStorage_RejectsAnEmptyTenant(t *testing.T) {
+	z := newZFSFake()
+	z.stdout["list"] = "tank/tenants/alice"
+	h, _, _ := offboardHooks(t, z, map[string]zfskey.KeyRef{})
+	s := &ContainerServer{encryption: h}
+
+	if _, err := s.DeleteTenantStorage(adminCtx(), &pb.DeleteTenantStorageRequest{}); err == nil {
+		t.Fatal("an empty tenant was accepted — tenantDataset would name the root itself")
+	}
+}
