@@ -36,3 +36,119 @@ func TestHelmChartSshpiperLabelMatchesNetworkPolicyContract(t *testing.T) {
 		"--show-only", "templates/sshpiper-deployment.yaml",
 		"--show-only", "templates/sshpiper-service.yaml",
 	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("helm template failed: %v\n%s", err, out)
+	}
+
+	want := sshpiperNameLabel + ": " + "sshpiper"
+	wrongPrefix := sshpiperNameLabel + ": containarium-k8s-sshpiper"
+
+	rendered := string(out)
+	if strings.Contains(rendered, wrongPrefix) {
+		t.Fatalf("chart still renders the chart-name-prefixed label (%q) instead of the contract label (%q) — this is exactly the #1492 regression:\n%s",
+			wrongPrefix, want, rendered)
+	}
+	if got := strings.Count(rendered, want); got < 3 {
+		t.Errorf("expected %q at least 3 times (Deployment selector.matchLabels, Deployment pod template labels, Service selector), got %d occurrences:\n%s", want, got, rendered)
+	}
+}
+
+// TestHelmChartRefusesGatewayWithoutUpstreamKey covers #1496: the chart
+// must refuse to render (not just let the daemon crash-loop later) when
+// gateway routing is enabled (gateway.namespace non-empty, the default) but
+// no upstream keypair is configured — that combination produces a Pipe
+// sshpiper can never authenticate through (it falls back to password auth,
+// which every box refuses). Also covers the two ways out: configuring the
+// keypair, or disabling gateway routing.
+func TestHelmChartRefusesGatewayWithoutUpstreamKey(t *testing.T) {
+	helmPath, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm not found on PATH, skipping chart-rendering test")
+	}
+	baseArgs := []string{"template", "test-release", "../../../../charts/containarium-k8s",
+		"--set", "daemon.jwtSecret=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdead"}
+
+	t.Run("default values refuse to render", func(t *testing.T) {
+		out, err := exec.Command(helmPath, baseArgs...).CombinedOutput()
+		if err == nil {
+			t.Fatalf("expected helm template to fail with default values (gateway enabled, no upstream key), it succeeded:\n%s", out)
+		}
+		if !strings.Contains(string(out), "1496") {
+			t.Errorf("expected the failure to reference #1496, got:\n%s", out)
+		}
+	})
+
+	t.Run("upstream key configured renders successfully", func(t *testing.T) {
+		args := append(append([]string{}, baseArgs...), "--set", "gateway.upstreamKeySecret=sshpiper-upstream-key")
+		if out, err := exec.Command(helmPath, args...).CombinedOutput(); err != nil {
+			t.Fatalf("helm template failed with an upstream key configured: %v\n%s", err, out)
+		}
+	})
+
+	t.Run("gateway disabled renders successfully without an upstream key", func(t *testing.T) {
+		args := append(append([]string{}, baseArgs...), "--set", "gateway.enabled=false", "--set", "gateway.namespace=")
+		out, err := exec.Command(helmPath, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("helm template failed with gateway routing disabled: %v\n%s", err, out)
+		}
+		for _, resource := range []string{
+			"kind: Namespace\nmetadata:\n  name: agent-gateway",
+			"kind: Deployment\nmetadata:\n  name: test-release-containarium-k8s-sshpiper",
+			"kind: Service\nmetadata:\n  name: test-release-containarium-k8s-sshpiper",
+			"kind: ServiceAccount\nmetadata:\n  name: test-release-containarium-k8s-sshpiper",
+			"kind: ClusterRole\nmetadata:\n  name: test-release-containarium-k8s-sshpiper",
+			"kind: ClusterRoleBinding\nmetadata:\n  name: test-release-containarium-k8s-sshpiper",
+		} {
+			if strings.Contains(string(out), resource) {
+				t.Errorf("gateway routing is disabled but rendered sshpiper resource:\n%s", resource)
+			}
+		}
+	})
+}
+
+// TestHelmChartPinsSshpiperToAppVersion asserts a chart stamped with a release
+// appVersion pins the sshpiper gateway image to that same tag instead of the
+// floating latest-stable (#2703), and that an explicit gateway.sshpiper.image
+// override still wins.
+func TestHelmChartPinsSshpiperToAppVersion(t *testing.T) {
+	helmPath, err := exec.LookPath("helm")
+	if err != nil {
+		t.Skip("helm not found on PATH, skipping chart-rendering test")
+	}
+	const chartDir = "../../../../charts/containarium-k8s"
+	// Package the chart the way a release does (version + appVersion stamped)
+	// so the .Chart.AppVersion default is exercised; a bare chart directory
+	// has no release appVersion and only ever reaches the dev fallback.
+	pkgDir := t.TempDir()
+	if out, err := exec.Command(helmPath, "package", chartDir,
+		"--version", "9.8.7", "--app-version", "v9.8.7", "--destination", pkgDir).CombinedOutput(); err != nil {
+		t.Fatalf("helm package failed: %v\n%s", err, out)
+	}
+	packaged := filepath.Join(pkgDir, "containarium-k8s-9.8.7.tgz")
+	render := func(chart string, extra ...string) string {
+		args := append([]string{"template", "test-release", chart,
+			"--set", "gateway.upstreamKeySecret=sshpiper-upstream-key",
+			"--show-only", "templates/sshpiper-deployment.yaml"}, extra...)
+		out, err := exec.Command(helmPath, args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("helm template failed: %v\n%s", err, out)
+		}
+		return string(out)
+	}
+	cases := []struct {
+		name  string
+		chart string
+		extra []string
+		want  string
+	}{
+		{"explicit tag override", chartDir, []string{"--set-string", "gateway.sshpiper.tag=v9.8.7"}, "image: ghcr.io/footprintai/containarium-sshpiper:v9.8.7\n"},
+		{"dev chart falls back to latest-stable", chartDir, nil, "image: ghcr.io/footprintai/containarium-sshpiper:latest-stable\n"},
+		{"explicit image override", chartDir, []string{"--set", "gateway.sshpiper.image=example.com/x/sshpiper:1"}, "image: example.com/x/sshpiper:1\n"},
+		{"packaged chart defaults to appVersion", packaged, nil, "image: ghcr.io/footprintai/containarium-sshpiper:v9.8.7\n"},
+	}
+	for _, c := range cases {
+		if got := render(c.chart, c.extra...); !strings.Contains(got, c.want) {
+			t.Errorf("%s: want %q in:\n%s", c.name, c.want, got)
+		}
+	}
+}
