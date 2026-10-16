@@ -72,3 +72,28 @@ state="$(cat "$FIXTURE_STATE")"
 case "${0##*/}" in
   gcloud)
     case "$*" in
+      *"instances stop"*) echo down > "$FIXTURE_STATE"; rm -f "$FIXTURE_STATE.ready" ;;
+      *"instances start"*) echo recovered > "$FIXTURE_STATE" ;;
+      *"instances describe"*)
+        if [[ "$FIXTURE_MODE" == changed-ip && "$state" == recovered ]]; then echo 192.0.2.3; else echo 192.0.2.2; fi ;;
+      *) exit 2 ;;
+    esac ;;
+  ssh)
+    if [[ "$*" == *"systemctl show"* ]]; then
+      if [[ "$FIXTURE_MODE" == restart && "$state" != initial ]]; then echo MainPID=2; else echo MainPID=1; fi
+      if [[ "$FIXTURE_MODE" == restart-count && "$state" != initial ]]; then echo NRestarts=1; else echo NRestarts=0; fi
+    elif [[ "$*" == *"http://localhost:"* ]]; then
+      [[ "$state" != down ]] || exit 1
+      [[ !( "$FIXTURE_MODE" == bad-health-baseline && "$state" == initial ) ]] || exit 1
+      [[ !( "$FIXTURE_MODE" == boot-stuck && "$state" == recovered ) ]] || exit 1
+      touch "$FIXTURE_STATE.ready"
+    else
+      [[ "$state" != down && !( "$state" == recovered && "$FIXTURE_MODE" == ssh-stuck ) ]] || exit 1
+      [[ "$FIXTURE_MODE" != slow-boot || "$state" == initial || -f "$FIXTURE_STATE.ready" ]] || exit 1
+      echo sentinel-outage-ssh-ok
+    fi ;;
+  curl)
+    [[ "$state" != down ]] || exit 1
+    if [[ "$FIXTURE_MODE" == https-stuck && "$state" == recovered ]]; then echo wrong-backend; else echo fixture-ok; fi ;;
+esac
+`

@@ -26,3 +26,61 @@ type EnvFile struct {
 	Path string
 
 	// Mode is the octal file mode as a string, e.g. "0644" for
+	// non-sensitive values or "0400" for secrets.
+	Mode string
+
+	// Header is written verbatim at the top of the file (already
+	// including any leading "# " comment markers and a trailing
+	// newline). Use it for a "generated, do not edit" banner.
+	Header string
+}
+
+// RenderEnvFile renders env as a dotenv file: the Header verbatim, then one
+// sorted KEY=value line per entry. Pure function so it's trivially testable.
+//
+// Values are written LITERALLY — there is no escaping. The caller owns the
+// contract that values are single-line and free of characters the consuming
+// `env_file:` parser can't represent; OTel's values are URLs / IDs / a
+// bearer header (no newlines), and the secrets path rejects multi-line
+// values at set-time for exactly this reason.
+func RenderEnvFile(header string, env map[string]string) []byte {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.WriteString(header)
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(env[k])
+		b.WriteByte('\n')
+	}
+	return []byte(b.String())
+}
+
+// WriteEnvFile renders env and writes it to f.Path inside the container at
+// f.Mode, creating the parent directory first (incus file-push doesn't).
+// An empty env map is a no-op (nothing to deliver).
+func (m *Manager) WriteEnvFile(containerName string, f EnvFile, env map[string]string) error {
+	if len(env) == 0 {
+		return nil
+	}
+	dir := filepath.Dir(f.Path)
+	if err := m.Exec(containerName, []string{"mkdir", "-p", dir}); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	if err := m.WriteFile(containerName, f.Path, RenderEnvFile(f.Header, env), f.Mode); err != nil {
+		return fmt.Errorf("write %s: %w", f.Path, err)
+	}
+	return nil
+}
+
+// RemoveEnvFile deletes f.Path inside the container. Used on the
+// disable/cleanup path so a stale file doesn't keep feeding values into a
+// compose stack after the feature is turned off.
+func (m *Manager) RemoveEnvFile(containerName string, f EnvFile) error {
+	return m.Exec(containerName, []string{"rm", "-f", f.Path})
+}
