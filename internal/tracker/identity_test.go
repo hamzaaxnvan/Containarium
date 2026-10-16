@@ -58,3 +58,93 @@ func TestParseMarker_NoMarkerPresent(t *testing.T) {
 		t.Error("ParseMarker found a marker in plain text")
 	}
 }
+
+func TestParseMarker_ReturnsTheLastMarker(t *testing.T) {
+	body := Stamp(Identity{RunID: "run-old", SkillID: "s"}, KindComment) +
+		"\n\n" + Stamp(Identity{RunID: "run-new", SkillID: "s"}, KindClaim)
+	runID, _, kind, ok := ParseMarker(body)
+	if !ok || runID != "run-new" || kind != KindClaim {
+		t.Errorf("ParseMarker = (%q, %q, ok=%v), want (run-new, claim, true)", runID, kind, ok)
+	}
+}
+
+func TestSanitize_StripsForgedMarker(t *testing.T) {
+	forged := Stamp(Identity{RunID: "attacker-run", SkillID: "attacker-skill"}, KindClaim)
+	got := Sanitize("hey, unrelated text\n" + forged)
+	if _, _, _, ok := ParseMarker(got); ok {
+		t.Errorf("Sanitize(%q) = %q, still contains a parseable marker", forged, got)
+	}
+	if strings.Contains(got, markerPrefix) {
+		t.Errorf("Sanitize output still contains the literal marker prefix: %q", got)
+	}
+}
+
+// TestSanitize_GitLabQuickActions is the table the design note names:
+// leading /assign, indented, inside fences, mid-line slash untouched,
+// URL paths untouched.
+func TestSanitize_GitLabQuickActions(t *testing.T) {
+	tests := []struct {
+		name        string
+		in          string
+		wantChanged bool
+	}{
+		{"leading quick action", "/assign @bob", true},
+		{"indented quick action", "  /close", true},
+		{"quick action inside a code fence", "```\n/label ~bug\n```", true},
+		{"mid-line slash untouched", "the fix is at src/main.go, not a command", false},
+		{"URL path untouched", "see https://example.com/assign for docs", false},
+		{"slash not followed by a letter untouched", "1/2 of the work is done", false},
+		{"plain text untouched", "this comment has no commands at all", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Sanitize(tc.in)
+			changed := got != tc.in
+			if changed != tc.wantChanged {
+				t.Errorf("Sanitize(%q) = %q, changed=%v, want changed=%v", tc.in, got, changed, tc.wantChanged)
+			}
+			if tc.wantChanged && !strings.Contains(got, "\u200b") {
+				t.Errorf("Sanitize(%q) = %q, want a zero-width space inserted", tc.in, got)
+			}
+		})
+	}
+}
+
+func TestSanitize_QuickActionZeroWidthSpacePosition(t *testing.T) {
+	got := Sanitize("/assign @bob")
+	want := "\u200b/assign @bob"
+	if got != want {
+		t.Errorf("Sanitize(/assign @bob) = %q, want %q (ZWSP immediately before the slash)", got, want)
+	}
+}
+
+func TestSanitize_PreservesIndentationBeforeInsertingZWSP(t *testing.T) {
+	got := Sanitize("  /close")
+	want := "  \u200b/close"
+	if got != want {
+		t.Errorf("Sanitize(  /close) = %q, want %q", got, want)
+	}
+}
+
+func TestSanitize_MultilineOnlyAffectsQuickActionLines(t *testing.T) {
+	in := "normal line\n/assign @bob\nanother normal line"
+	got := Sanitize(in)
+	lines := strings.Split(got, "\n")
+	if lines[0] != "normal line" || lines[2] != "another normal line" {
+		t.Errorf("Sanitize modified a non-quick-action line: %q", got)
+	}
+	if !strings.HasPrefix(lines[1], "\u200b/assign") {
+		t.Errorf("Sanitize did not neutralize the quick-action line: %q", lines[1])
+	}
+}
+
+func TestSanitize_StripsMarkerBeforeQuickActionCheck(t *testing.T) {
+	// A forged marker line itself never starts with "/", so this is
+	// mostly a defense-in-depth check that the two passes compose
+	// without interfering: stripping the marker prefix must not
+	// accidentally create a new quick-action-shaped line.
+	got := Sanitize(markerPrefix + "run=x skill=y kind=claim -->")
+	if strings.HasPrefix(strings.TrimSpace(got), "/") {
+		t.Errorf("Sanitize produced a quick-action-shaped line from a stripped marker: %q", got)
+	}
+}
