@@ -30,3 +30,36 @@ func TestBoxRunResponsesDiscardUnknownFields(t *testing.T) {
 
 	t.Run("ListBoxRuns", func(t *testing.T) {
 		runs, err := c.ListBoxRuns("alice")
+		if err != nil {
+			t.Fatalf("ListBoxRuns: %v", err)
+		}
+		if len(runs) != 1 {
+			t.Errorf("got %d runs, want 1", len(runs))
+		}
+	})
+	t.Run("TailBoxRunLog", func(t *testing.T) {
+		if _, err := c.TailBoxRunLog(&pb.TailBoxRunLogRequest{Username: "alice", RunName: "r1"}); err != nil {
+			t.Fatalf("TailBoxRunLog: %v", err)
+		}
+	})
+	t.Run("GetRunApprovalKey", func(t *testing.T) {
+		if _, err := c.GetRunApprovalKey("alice"); err != nil {
+			t.Fatalf("GetRunApprovalKey: %v", err)
+		}
+	})
+	t.Run("ListRunInputs", func(t *testing.T) {
+		if _, err := c.ListRunInputs(&pb.ListRunInputsRequest{Username: "alice", RunName: "r1"}); err != nil {
+			t.Fatalf("ListRunInputs: %v", err)
+		}
+	})
+	t.Run("AnswerRunInput", func(t *testing.T) {
+		if _, err := c.AnswerRunInput(&pb.AnswerRunInputRequest{Username: "alice", RunName: "r1", RequestId: "q1"}); err != nil {
+			t.Fatalf("AnswerRunInput: %v", err)
+		}
+	})
+	t.Run("GetBoxRunUserStatus", func(t *testing.T) {
+		if _, err := c.GetBoxRunUserStatus("alice"); err != nil {
+			t.Fatalf("GetBoxRunUserStatus: %v", err)
+		}
+	})
+}
