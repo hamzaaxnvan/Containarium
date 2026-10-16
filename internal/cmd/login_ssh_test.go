@@ -56,3 +56,238 @@ type fakeLoginAndSSHKeysServer struct {
 	sawAddSSHKey  atomic.Bool
 	receivedToken string
 }
+
+func newFakeLoginAndSSHKeysServer(t *testing.T, approveAfter int32) *fakeLoginAndSSHKeysServer {
+	t.Helper()
+	mux := http.NewServeMux()
+	f := &fakeLoginAndSSHKeysServer{approveAfter: approveAfter}
+
+	mux.HandleFunc("/v1/cli/sessions", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(createSessionResp{
+			SessionID:       "sess-A7",
+			UserCode:        "WXYZ-7777",
+			VerificationURL: "http://example.invalid/cli/authorize",
+			ExpiresIn:       600,
+		})
+	})
+	mux.HandleFunc("/v1/cli/sessions/sess-A7/status", func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&f.pollCount, 1)
+		resp := sessionStatusResp{Status: "pending"}
+		if n > f.approveAfter {
+			resp = sessionStatusResp{
+				Status:    "approved",
+				Token:     "tok-A7",
+				UserEmail: "alice@example.com",
+				OrgID:     "org_42",
+				ExpiresAt: time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+			}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	// SSH-key Add endpoint. Records the bearer token so the test can
+	// assert the login → ssh-setup handoff used the freshly-issued
+	// credential.
+	mux.HandleFunc("/v1/user/ssh-keys", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(listSSHKeysResp{Keys: f.keys})
+			return
+		}
+		f.receivedToken = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		f.sawAddSSHKey.Store(true)
+		var req addSSHKeyReq
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		f.addedKeys = append(f.addedKeys, req)
+		fp, _ := sshkey.Fingerprint(req.PublicKey)
+		_ = json.NewEncoder(w).Encode(addSSHKeyResp{
+			Key: sshkey.SSHKey{
+				Name:        req.Name,
+				PublicKey:   req.PublicKey,
+				Fingerprint: fp,
+				CreatedAt:   time.Now().UTC(),
+			},
+		})
+	})
+
+	f.srv = httptest.NewServer(mux)
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+// runLoginWithSSHFlagsHelper performs the common test-setup boilerplate
+// for the A7 cases: short poll interval, no browser, scripted stdin.
+func runLoginWithSSHFlagsHelper(t *testing.T, f *fakeLoginAndSSHKeysServer, promptInput string) (*bytes.Buffer, error) {
+	t.Helper()
+	loginServer = f.srv.URL
+	loginNoBrowser = true
+	loginPromptReader = strings.NewReader(promptInput)
+
+	old := loginPollIntervalForTest()
+	t.Cleanup(func() { restorePollInterval(old) })
+	setPollInterval(10 * time.Millisecond)
+
+	var out bytes.Buffer
+	loginCmd.SetOut(&out)
+	loginCmd.SetErr(&out)
+	err := runLogin(loginCmd, nil)
+	return &out, err
+}
+
+func TestLogin_NoSSHSetup_SkipsRegistration(t *testing.T) {
+	withSSHLoginHome(t)
+	f := newFakeLoginAndSSHKeysServer(t, 0)
+
+	loginNoSSHSetup = true
+	out, err := runLoginWithSSHFlagsHelper(t, f, "")
+	if err != nil {
+		t.Fatalf("runLogin: %v", err)
+	}
+
+	if f.sawAddSSHKey.Load() {
+		t.Errorf("--no-ssh-setup should have skipped AddSSHKey, but it was called")
+	}
+	// Login itself succeeded — credentials file written.
+	path, _ := credentials.DefaultPath()
+	cf, _ := credentials.Load(path)
+	if _, ok := cf.Get(f.srv.URL); !ok {
+		t.Errorf("login credentials missing after --no-ssh-setup login")
+	}
+	o := out.String()
+	if !strings.Contains(o, "Logged in as alice@example.com") {
+		t.Errorf("login success line missing:\n%s", o)
+	}
+	if strings.Contains(o, "Register this machine's SSH key") {
+		t.Errorf("--no-ssh-setup leaked the prompt:\n%s", o)
+	}
+}
+
+func TestLogin_WithSSHSetup_AutoRegisters(t *testing.T) {
+	withSSHLoginHome(t)
+	f := newFakeLoginAndSSHKeysServer(t, 0)
+
+	loginWithSSHSetup = true
+	loginDeviceName = "alice-laptop"
+	out, err := runLoginWithSSHFlagsHelper(t, f, "")
+	if err != nil {
+		t.Fatalf("runLogin: %v", err)
+	}
+
+	if !f.sawAddSSHKey.Load() {
+		t.Fatalf("--with-ssh-setup should have triggered AddSSHKey; output:\n%s", out.String())
+	}
+	if f.receivedToken != "tok-A7" {
+		t.Errorf("AddSSHKey called with token %s, want %s", tokenFingerprint(f.receivedToken), tokenFingerprint("tok-A7"))
+	}
+	if len(f.addedKeys) != 1 {
+		t.Fatalf("added = %+v, want 1 entry", f.addedKeys)
+	}
+	if f.addedKeys[0].Name != "alice-laptop" {
+		t.Errorf("registered key name = %q, want alice-laptop (from --device-name)", f.addedKeys[0].Name)
+	}
+}
+
+func TestLogin_PromptYDefault_RegistersOnEmptyInput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("interactive prompt behaviour is POSIX-only in this test")
+	}
+	withSSHLoginHome(t)
+	f := newFakeLoginAndSSHKeysServer(t, 0)
+
+	// Empty line = accept Y default.
+	out, err := runLoginWithSSHFlagsHelper(t, f, "\n")
+	if err != nil {
+		t.Fatalf("runLogin: %v", err)
+	}
+	if !f.sawAddSSHKey.Load() {
+		t.Fatalf("empty answer (Y default) should trigger AddSSHKey; output:\n%s", out.String())
+	}
+}
+
+func TestLogin_PromptN_SkipsRegistration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("interactive prompt behaviour is POSIX-only in this test")
+	}
+	withSSHLoginHome(t)
+	f := newFakeLoginAndSSHKeysServer(t, 0)
+
+	out, err := runLoginWithSSHFlagsHelper(t, f, "n\n")
+	if err != nil {
+		t.Fatalf("runLogin: %v", err)
+	}
+	if f.sawAddSSHKey.Load() {
+		t.Errorf("answer 'n' should NOT trigger AddSSHKey; output:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "skipped") {
+		t.Errorf("expected skip notice in output:\n%s", out.String())
+	}
+}
+
+func TestReadYesNo_Defaults(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		yes  bool
+		ok   bool
+	}{
+		{"empty line treated as yes", "\n", true, true},
+		{"y", "y\n", true, true},
+		{"Y", "Y\n", true, true},
+		{"yes", "yes\n", true, true},
+		{"n", "n\n", false, true},
+		{"N", "N\n", false, true},
+		{"no", "no\n", false, true},
+		{"unknown text parsed as no", "maybe\n", false, true},
+		{"EOF (no newline) is unknown", "", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			yes, ok := readYesNo(strings.NewReader(tc.in))
+			if yes != tc.yes || ok != tc.ok {
+				t.Errorf("readYesNo(%q) = (%v, %v), want (%v, %v)", tc.in, yes, ok, tc.yes, tc.ok)
+			}
+		})
+	}
+}
+
+// TestPostLoginSSHSetup_CloudSkipsKeyRegistration: against the cloud, box
+// access is token-based (`containarium connect`), so login must NOT prompt to
+// register a personal SSH key — it points at connect instead. Guards the
+// two-path model (cloud=API key, OSS=SSH key).
+func TestPostLoginSSHSetup_CloudSkipsKeyRegistration(t *testing.T) {
+	withSSHLoginHome(t)
+	loginWithSSHSetup = false
+	// A reader that WOULD answer "yes" — proves we never reach the prompt.
+	loginPromptReader = strings.NewReader("y\n")
+
+	var buf bytes.Buffer
+	maybeRunPostLoginSSHSetup(&buf, defaultLoginServer, credentials.AccessModelToken)
+
+	out := buf.String()
+	if !strings.Contains(out, "containarium connect") {
+		t.Errorf("cloud login should point at `containarium connect`; got:\n%s", out)
+	}
+	if strings.Contains(out, "Register this machine's SSH key") {
+		t.Errorf("cloud login must not prompt for SSH-key registration; got:\n%s", out)
+	}
+}
+
+// TestPostLoginSSHSetup_CloudWithFlagStillRegisters: --with-ssh-setup is the
+// escape hatch — a cloud user who wants plain `ssh` can still force key
+// registration. We assert we get PAST the connect-skip into the key flow
+// (it then fails to reach a real server, which is fine for this check).
+func TestPostLoginSSHSetup_CloudWithFlagStillRegisters(t *testing.T) {
+	withSSHLoginHome(t)
+	withSSHHome(t) // isolate ~/.ssh so a key can be located/generated
+	loginWithSSHSetup = true
+
+	var buf bytes.Buffer
+	maybeRunPostLoginSSHSetup(&buf, defaultLoginServer, credentials.AccessModelToken)
+
+	out := buf.String()
+	if strings.Contains(out, "containarium connect") {
+		t.Errorf("--with-ssh-setup should bypass the cloud connect-skip; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Registering as") && !strings.Contains(out, "Generated") && !strings.Contains(out, "Using existing key") {
+		t.Errorf("expected the key-registration flow to run; got:\n%s", out)
+	}
+}
