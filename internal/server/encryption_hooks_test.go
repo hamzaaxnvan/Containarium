@@ -619,3 +619,314 @@ func TestEnsureTenantStorage_KeysPerTenantNotPerContainer(t *testing.T) {
 
 	if alice == bob {
 		t.Errorf("two tenants share pool %q — one tenant's key would unlock the other's data, "+
+			"which is the whole boundary this design exists to draw", alice)
+	}
+	if sameRef(aliceRef, bobRef) {
+		t.Errorf("two tenants share a key ref (%v)", aliceRef)
+	}
+	for _, tenant := range p.wrapped {
+		if tenant != "alice" && tenant != "bob" {
+			t.Errorf("Wrap was called for %q, not a tenant", tenant)
+		}
+	}
+}
+
+// #1199 AC3. The key is resolved first precisely so a provider outage fails
+// having touched nothing — there is no dataset to clean up because none was
+// made, and no pool either.
+func TestEnsureTenantStorage_ResolvesTheKeyBeforeCreatingAnything(t *testing.T) {
+	z := newZFSFake()
+	p := &fakeKeyProvider{key: aKey(t), wrapErr: errors.New("kms unreachable")}
+	pools := newFakePools()
+
+	_, _, err := testHooksWith(t, z, p, &fakeRefStore{refs: map[string]zfskey.KeyRef{}}, pools).
+		EnsureTenantStorage(context.Background(), "alice")
+	if err == nil {
+		t.Fatal("EnsureTenantStorage succeeded with the key provider down")
+	}
+	if z.ran("create") {
+		t.Errorf("a dataset was created despite having no key; calls=%v", z.calls)
+	}
+	if len(pools.created) != 0 {
+		t.Errorf("a storage pool was created despite having no key: %v", pools.created)
+	}
+}
+
+// The rollback asymmetry, and the reason this issue carried a warning.
+//
+// PreCreate destroyed the dataset whenever the follow-up step failed, which
+// was right when the dataset belonged to one container. It is now the
+// TENANT's encryptionroot, shared by every container they own. Destroying it
+// because an unrelated container's create failed would destroy live data.
+//
+// So: roll back only what this call created.
+func TestEnsureTenantStorage_RollsBackOnlyADatasetItCreated(t *testing.T) {
+	t.Run("a dataset this call created is destroyed when the pool cannot be made", func(t *testing.T) {
+		z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+		pools := newFakePools()
+		pools.createErr = errors.New("incus unreachable")
+
+		_, _, err := testHooksWith(t, z, p, &fakeRefStore{refs: map[string]zfskey.KeyRef{}}, pools).
+			EnsureTenantStorage(context.Background(), "alice")
+		if err == nil {
+			t.Fatal("EnsureTenantStorage succeeded with no pool")
+		}
+		if !z.ran("destroy") {
+			t.Errorf("a dataset with no pool on it was left behind; calls=%v — nothing "+
+				"references it and the next attempt fails on a name that already exists", z.calls)
+		}
+	})
+
+	t.Run("a dataset that already existed is left alone", func(t *testing.T) {
+		z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+		// The tenant's encryptionroot is already there, from an earlier
+		// container that is very possibly running right now.
+		z.datasetPresent("tank/tenants/alice")
+		pools := newFakePools()
+		pools.createErr = errors.New("incus unreachable")
+
+		_, _, err := testHooksWith(t, z, p, &fakeRefStore{refs: map[string]zfskey.KeyRef{}}, pools).
+			EnsureTenantStorage(context.Background(), "alice")
+		if err == nil {
+			t.Fatal("EnsureTenantStorage succeeded with no pool")
+		}
+		if z.ran("destroy") {
+			t.Fatalf("the tenant's existing encryptionroot was DESTROYED because one "+
+				"container's create failed; calls=%v — every other container that tenant "+
+				"owns just lost its storage", z.calls)
+		}
+	})
+}
+
+// A pool name that is taken by a pool pointing somewhere else is not ours to
+// reuse and not ours to repoint. Repointing would move an existing pool's
+// containers onto a different encryptionroot underneath them.
+func TestEnsureTenantStorage_RefusesAPoolPointingSomewhereElse(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	pools := newFakePools()
+	h := testHooksWith(t, z, p, &fakeRefStore{refs: map[string]zfskey.KeyRef{}}, pools)
+
+	// Whatever pool name the hook derives, it is already taken by a pool on
+	// somebody else's dataset.
+	pools.sources[tenantPoolName("alice")] = "tank/somewhere/else"
+
+	if _, _, err := h.EnsureTenantStorage(context.Background(), "alice"); err == nil {
+		t.Fatal("a storage pool sourced at another dataset was silently reused — the tenant's " +
+			"containers would land outside the encryptionroot the daemon just recorded for them")
+	}
+	if pools.sources[tenantPoolName("alice")] != "tank/somewhere/else" {
+		t.Error("the existing pool was repointed; its current containers would be moved onto a " +
+			"different encryptionroot underneath them")
+	}
+}
+
+// A dataset already at the tenant's path but NOT encrypted is the quietest
+// possible failure: the pool would be built on plaintext and every container
+// on it reported as encrypted.
+func TestEnsureTenantStorage_RefusesAnExistingPlaintextDataset(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	// `zfs get encryptionroot` reports "-" for an unencrypted dataset.
+	z.datasetPresent("-")
+	pools := newFakePools()
+
+	_, _, err := testHooksWith(t, z, p, &fakeRefStore{refs: map[string]zfskey.KeyRef{}}, pools).
+		EnsureTenantStorage(context.Background(), "alice")
+	if err == nil {
+		t.Fatal("an unencrypted dataset was accepted as a tenant encryptionroot — the pool " +
+			"would be built on plaintext and its containers reported as encrypted")
+	}
+	if len(pools.created) != 0 {
+		t.Errorf("a pool was created on an unencrypted dataset: %v", pools.created)
+	}
+}
+
+func TestEnsureTenantStorage_RequiresAUsableTenantName(t *testing.T) {
+	for _, tenant := range []string{"", "../escape", "a/b", "-flag", "with space", "."} {
+		t.Run("tenant="+tenant, func(t *testing.T) {
+			z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+			pools := newFakePools()
+
+			_, _, err := testHooksWith(t, z, p, &fakeRefStore{refs: map[string]zfskey.KeyRef{}}, pools).
+				EnsureTenantStorage(context.Background(), tenant)
+			if err == nil {
+				t.Errorf("tenant %q was accepted — it is interpolated into a ZFS dataset path "+
+					"and an Incus pool name, so it must not be able to name something else", tenant)
+			}
+			if z.ran("create") || len(pools.created) != 0 {
+				t.Errorf("something was created for an invalid tenant; calls=%v pools=%v",
+					z.calls, pools.created)
+			}
+		})
+	}
+}
+
+// Encryption unconfigured must not fail a create — the flag defaults off and
+// existing deployments keep working.
+func TestEnsureTenantStorage_NoOpWhenEncryptionIsNotConfigured(t *testing.T) {
+	var h *encryptionHooks
+	pool, ref, err := h.EnsureTenantStorage(context.Background(), "alice")
+	if err != nil {
+		t.Errorf("a nil hooks receiver failed the create: %v", err)
+	}
+	if pool != "" || ref.URI != "" {
+		t.Errorf("returned placement with no provider configured: pool=%q ref=%v", pool, ref)
+	}
+}
+
+// --- placement is recorded so a restarted daemon can find the key ------
+
+func TestRecordPlacement_StoresBothTheRefAndThePool(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	refs := &fakeRefStore{refs: map[string]zfskey.KeyRef{}}
+	h := testHooksWith(t, z, p, refs, nil)
+
+	ref := zfskey.KeyRef{Scheme: zfskey.SchemeFile, URI: "/keys/alice.key"}
+	if err := h.RecordPlacement("alice-container", ref, "containarium-tenant-alice"); err != nil {
+		t.Fatalf("RecordPlacement: %v", err)
+	}
+
+	if !sameRef(refs.refs["alice-container"], ref) {
+		t.Errorf("stored ref %v, want %v", refs.refs["alice-container"], ref)
+	}
+	if refs.pools["alice-container"] != "containarium-tenant-alice" {
+		t.Errorf("stored pool %q, want %q — without it the daemon cannot find the container's "+
+			"encryptionroot after a restart", refs.pools["alice-container"], "containarium-tenant-alice")
+	}
+}
+
+// The ref is written before the pool, so a half-written record leaves a
+// container that REFUSES to start rather than one treated as unencrypted.
+// Encrypted-but-unstartable is legible and recoverable; silently-unencrypted
+// is the failure #1294 exists to prevent.
+func TestRecordPlacement_APartialWriteFailsClosed(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	refs := &fakeRefStore{refs: map[string]zfskey.KeyRef{}, setErr: errors.New("incus unreachable")}
+	h := testHooksWith(t, z, p, refs, nil)
+
+	if err := h.RecordPlacement("alice-container", zfskey.KeyRef{Scheme: zfskey.SchemeFile, URI: "/k"}, "p"); err == nil {
+		t.Fatal("a failed placement write was reported as success")
+	}
+}
+
+// A container carrying a key ref but no pool cannot have its encryptionroot
+// resolved. It must refuse to start, and say why — treating it as
+// unencrypted would start it on storage nobody can account for.
+func TestPreStart_RefusesAContainerWithARefButNoPool(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	refs := &fakeRefStore{
+		refs:  map[string]zfskey.KeyRef{"alice-container": {Scheme: zfskey.SchemeFile, URI: "/k"}},
+		pools: map[string]string{}, // no pool recorded
+	}
+
+	err := testHooksWith(t, z, p, refs, nil).PreStart(context.Background(), "alice-container")
+	if err == nil {
+		t.Fatal("a container with an encryption key ref and no recorded pool was started — " +
+			"nothing knows which dataset to unlock, so it would run on storage the daemon " +
+			"cannot account for")
+	}
+	if !strings.Contains(err.Error(), "pool") {
+		t.Errorf("the error does not name the missing pool, so an operator cannot act on it: %v", err)
+	}
+}
+
+// PreStart loads the key on the tenant's encryptionroot — the pool's source
+// dataset — not on the container's own dataset, which inherits it and has no
+// key of its own to load.
+func TestPreStart_LoadsTheKeyOnThePoolRootNotTheContainer(t *testing.T) {
+	z, p := newZFSFake(), &fakeKeyProvider{key: aKey(t)}
+	refs := &fakeRefStore{
+		refs:  map[string]zfskey.KeyRef{"alice-container": {Scheme: zfskey.SchemeFile, URI: "/keys/alice.key"}},
+		pools: map[string]string{"alice-container": "containarium-tenant-alice"},
+	}
+	pools := newFakePools()
+	pools.sources["containarium-tenant-alice"] = "tank/tenants/alice"
+
+	if err := testHooksWith(t, z, p, refs, pools).PreStart(context.Background(), "alice-container"); err != nil {
+		t.Fatalf("PreStart: %v", err)
+	}
+
+	if !z.ran("load-key") {
+		t.Fatalf("no key was loaded; calls=%v", z.calls)
+	}
+	if !z.ran("tank/tenants/alice") {
+		t.Errorf("the key was loaded on the wrong dataset; calls=%v — the encryptionroot is the "+
+			"pool's source, and the container's own dataset has no key to load", z.calls)
+	}
+	if z.ran("alice-container") {
+		t.Errorf("a zfs command named the container dataset; calls=%v", z.calls)
+	}
+}
+
+// The pool adapter is bound to whichever Incus client the daemon already
+// holds, so what needs pinning is that it passes both arguments through
+// untouched — a source that arrives altered points the tenant pool at the
+// wrong dataset, which is how a container ends up unencrypted while every
+// daemon-side signal says otherwise (#1336 was that class of bug).
+func TestIncusStoragePoolsPassesItsArgumentsThrough(t *testing.T) {
+	var gotName, gotSource string
+	p := incusStoragePools{
+		createPool: func(name, source string) error { gotName, gotSource = name, source; return nil },
+		poolSource: func(name string) (string, bool, error) { return "tank/tenants/" + name, true, nil },
+	}
+
+	if err := p.CreateZFSPool("containarium-tenant-alice", "tank/tenants/alice"); err != nil {
+		t.Fatalf("CreateZFSPool: %v", err)
+	}
+	if gotName != "containarium-tenant-alice" || gotSource != "tank/tenants/alice" {
+		t.Errorf("passed through (%q, %q), want (%q, %q)",
+			gotName, gotSource, "containarium-tenant-alice", "tank/tenants/alice")
+	}
+
+	src, exists, err := p.StoragePoolSource("alice")
+	if err != nil || !exists || src != "tank/tenants/alice" {
+		t.Errorf("StoragePoolSource = (%q, %v, %v)", src, exists, err)
+	}
+}
+
+// --- naming ------------------------------------------------------------
+
+func TestTenantDataset(t *testing.T) {
+	for _, tc := range []struct {
+		name, root, tenant, want string
+		wantErr                  bool
+	}{
+		{name: "nested root", root: "tank/tenants", tenant: "alice", want: "tank/tenants/alice"},
+		{name: "trailing slash is tolerated", root: "tank/tenants/", tenant: "alice", want: "tank/tenants/alice"},
+		{name: "empty root", root: "", tenant: "alice", wantErr: true},
+		{name: "bare pool root", root: "tank", tenant: "alice", want: "tank/alice"},
+		{name: "empty tenant", root: "tank/tenants", tenant: "", wantErr: true},
+		{name: "tenant with a slash", root: "tank/tenants", tenant: "a/b", wantErr: true},
+		{name: "tenant escaping upward", root: "tank/tenants", tenant: "..", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tenantDataset(tc.root, tc.tenant)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("tenantDataset(%q, %q) = %q, want an error", tc.root, tc.tenant, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("tenantDataset(%q, %q): %v", tc.root, tc.tenant, err)
+			}
+			if got != tc.want {
+				t.Errorf("tenantDataset(%q, %q) = %q, want %q", tc.root, tc.tenant, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTenantPoolName_IsStableAndTenantScoped(t *testing.T) {
+	alice, bob := tenantPoolName("alice"), tenantPoolName("bob")
+	if alice == bob {
+		t.Fatalf("two tenants derive the same pool name %q", alice)
+	}
+	if alice != tenantPoolName("alice") {
+		t.Error("the pool name is not stable across calls — a restarted daemon would not find " +
+			"the pool it created")
+	}
+	if !strings.Contains(alice, "alice") {
+		t.Errorf("pool name %q does not identify the tenant, which makes an operator's `incus "+
+			"storage list` unreadable", alice)
+	}
+}
