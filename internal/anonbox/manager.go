@@ -237,3 +237,242 @@ func New(boxes Boxes, acls ACLs, cfg Config) *Manager {
 		boxes: boxes, acls: acls, cfg: cfg, seen: map[string]time.Time{},
 		door:       NewDoorStore(cfg.DoorStatePath),
 		keyLimiter: ratelimit.New(cfg.Limits.PerKeyPerMinute/60, cfg.Limits.PerKeyBurst),
+		ipLimiter:  ratelimit.New(cfg.Limits.PerIPPerMinute/60, cfg.Limits.PerIPBurst),
+	}
+}
+
+// DoorConfig is the door's current operator state.
+func (m *Manager) DoorConfig() DoorConfig { return m.door.Get() }
+
+// SetDoorConfig replaces and persists the door's operator state.
+func (m *Manager) SetDoorConfig(cfg DoorConfig) error { return m.door.Set(cfg) }
+
+// DoorErr reports a poisoned door state file (malformed on disk).
+func (m *Manager) DoorErr() error { return m.door.Err() }
+
+// Limits echoes the fixed limits.
+func (m *Manager) Limits() Limits { return m.cfg.Limits }
+
+// IsUnclaimedAnonymous reports whether labels describe an anonymous box
+// nobody has claimed yet — the boxes that may not expose ports or routes.
+func IsUnclaimedAnonymous(labels map[string]string) bool {
+	return labels[LabelFingerprint] != "" && labels[LabelClaimedAt] == ""
+}
+
+// UsernameFor is the box's tenant/login name for a fingerprint: "anon-" +
+// the first 8 hex of sha256(fingerprint). Stable, a valid Linux username,
+// and not reversible to the key.
+func UsernameFor(fingerprint string) string {
+	return "anon-" + fpHash(fingerprint)[:8]
+}
+
+func fpHash(fingerprint string) string {
+	sum := sha256.Sum256([]byte(fingerprint))
+	return hex.EncodeToString(sum[:])
+}
+
+// Ensure returns the live box for the key, creating one when none exists.
+// Every error path that created an instance deletes it again: the door
+// never receives a half-provisioned upstream.
+func (m *Manager) Ensure(ctx context.Context, req EnsureRequest) (*EnsureResult, error) {
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(req.PublicKey))
+	if err != nil {
+		return nil, InvalidRequestError{Err: fmt.Errorf("anonbox: invalid public key: %w", err)}
+	}
+	fp := ssh.FingerprintSHA256(pub)
+	if req.Fingerprint != "" && req.Fingerprint != fp {
+		return nil, InvalidRequestError{Err: fmt.Errorf("anonbox: fingerprint %q does not match the presented key (%s)", req.Fingerprint, fp)}
+	}
+	username := UsernameFor(fp)
+	hash := fpHash(fp)
+	knock := m.cfg.Now()
+	m.record(FunnelEvent{Kind: FunnelConnect, FPHash: hash})
+
+	// Kill switch and bans come before everything, reconnects included:
+	// a closed door is closed for the key that already has a box too.
+	if door := m.door.Get(); !door.Enabled {
+		err := DoorClosedError{Message: door.DisabledMessage}
+		m.record(FunnelEvent{Kind: FunnelRejectedDoor, FPHash: hash, Reason: err.Error()})
+		return nil, err
+	}
+	if m.door.IsBanned(fp) {
+		m.record(FunnelEvent{Kind: FunnelRejectedDoor, FPHash: hash, Reason: ErrBanned.Error()})
+		return nil, ErrBanned
+	}
+
+	if existing, err := m.findLive(ctx, fp); err != nil {
+		return nil, err
+	} else if existing != nil {
+		// A claimed box reports its new tenant as Ref.Tenant; the login
+		// is still the box's own user (decision on #2199), and its TTL is
+		// gone.
+		m.record(FunnelEvent{Kind: FunnelReconnect, FPHash: hash, BoxName: existing.Ref.Name})
+		return &EnsureResult{
+			BoxName:      existing.Ref.Name,
+			SSHHost:      existing.IPAddress,
+			SSHPort:      22,
+			SSHUser:      boxRefFor(existing.Ref.Name).Tenant,
+			TTLExpiresAt: existing.TTLExpiresAt,
+			Reused:       true,
+		}, nil
+	}
+
+	// Creates are what cost us; a reconnect above is free.
+	if !m.keyLimiter.Allow(hash) || !m.ipLimiter.Allow(req.SourceIP) {
+		m.record(FunnelEvent{Kind: FunnelRejectedRateLimit, FPHash: hash, Reason: ErrRateLimited.Error()})
+		return nil, ErrRateLimited
+	}
+	if m.cfg.Limits.MaxBoxes > 0 {
+		live, err := m.countUnclaimed(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if live >= m.cfg.Limits.MaxBoxes {
+			m.record(FunnelEvent{Kind: FunnelRejectedCapacity, FPHash: hash, Reason: ErrAtCapacity.Error()})
+			return nil, ErrAtCapacity
+		}
+	}
+
+	m.mu.Lock()
+	_, previousExpired := m.seen[fp]
+	m.mu.Unlock()
+
+	now := m.cfg.Now()
+	tokenID, err := newTokenID()
+	if err != nil {
+		return nil, err
+	}
+	spec := box.BoxSpec{
+		Ref:       box.BoxRef{Tenant: username},
+		OSType:    pb.OSType_OS_TYPE_UBUNTU_2404,
+		Isolation: pb.IsolationType_ISOLATION_TYPE_VM,
+		Resources: box.ResourceLimits{CPU: m.cfg.Limits.CPU, Memory: m.cfg.Limits.Memory, Disk: m.cfg.Limits.Disk},
+		SSHKeys:   []string{req.PublicKey},
+		Labels: map[string]string{
+			LabelFingerprint:  fp,
+			LabelFPHash:       fpHash(fp),
+			LabelCreatedAt:    now.UTC().Format(time.RFC3339),
+			LabelSourceIP:     req.SourceIP,
+			LabelClaimTokenID: tokenID,
+			LabelPublicKey:    strings.TrimSpace(req.PublicKey),
+		},
+		AutoStart: true,
+	}
+	st, err := m.boxes.Create(ctx, spec)
+	if err != nil {
+		return nil, fmt.Errorf("anonbox: create %s: %w", username, err)
+	}
+	ref := st.Ref
+	expiresAt := now.Add(m.cfg.Limits.TTL)
+
+	if err := m.provision(ctx, ref, st, expiresAt, tokenID, previousExpired); err != nil {
+		if derr := m.boxes.Delete(ctx, ref, true); derr != nil {
+			err = errors.Join(err, fmt.Errorf("and cleanup of %s failed: %w", ref.Name, derr))
+		}
+		return nil, err
+	}
+
+	m.mu.Lock()
+	m.seen[fp] = now
+	if m.known != nil {
+		m.known[ref.Name] = knownBox{fpHash: hash, expiresAt: expiresAt}
+	}
+	m.mu.Unlock()
+	m.record(FunnelEvent{Kind: FunnelShellReady, FPHash: hash, BoxName: ref.Name, Duration: m.cfg.Now().Sub(knock)})
+
+	return &EnsureResult{
+		BoxName:         ref.Name,
+		SSHHost:         st.IPAddress,
+		SSHPort:         22,
+		SSHUser:         ref.Tenant,
+		TTLExpiresAt:    expiresAt,
+		PreviousExpired: previousExpired,
+	}, nil
+}
+
+// provision is everything after the instance exists: TTL, egress guard,
+// in-guest files. Ordered so the guard is in place before anything the
+// user can read lands.
+func (m *Manager) provision(ctx context.Context, ref box.BoxRef, st *box.BoxStatus, expiresAt time.Time, tokenID string, previousExpired bool) error {
+	if err := m.boxes.SetTTL(ctx, ref, &expiresAt); err != nil {
+		return fmt.Errorf("anonbox: stamp ttl on %s: %w", ref.Name, err)
+	}
+	if err := m.applyEgressGuard(ref.Name); err != nil {
+		return fmt.Errorf("anonbox: egress guard on %s: %w", ref.Name, err)
+	}
+	claimURL, err := m.claimURL(ref.Name, tokenID, expiresAt)
+	if err != nil {
+		return err
+	}
+	if err := m.writeGuestFiles(ctx, ref, guestFiles{
+		expiresAt:       expiresAt,
+		limits:          m.cfg.Limits,
+		previousExpired: previousExpired,
+		claimURL:        claimURL,
+	}); err != nil {
+		return fmt.Errorf("anonbox: guest files on %s: %w", ref.Name, err)
+	}
+	if claimURL != "" {
+		m.record(FunnelEvent{Kind: FunnelClaimLinkIssued, FPHash: st.Labels[LabelFPHash], BoxName: ref.Name})
+	}
+	return nil
+}
+
+// claimURL mints the box's claim token (#2199) and renders what goes into
+// the guest's claim-url file: "<base>?token=<token>", or the bare token
+// when no base is configured. "" when claims are not enabled.
+func (m *Manager) claimURL(boxName, tokenID string, expiresAt time.Time) (string, error) {
+	if m.cfg.ClaimSecret == nil {
+		return "", nil
+	}
+	fp := ""
+	if st, err := m.findByName(context.Background(), boxName); err == nil && st != nil {
+		fp = st.Labels[LabelFPHash]
+	}
+	token, err := MintClaimToken(m.cfg.ClaimSecret(boxName), ClaimToken{BoxName: boxName, FPHash: fp, ExpiresAt: expiresAt, TokenID: tokenID})
+	if err != nil {
+		return "", fmt.Errorf("anonbox: mint claim token for %s: %w", boxName, err)
+	}
+	if m.cfg.ClaimURLBase == "" {
+		return token, nil
+	}
+	return strings.TrimRight(m.cfg.ClaimURLBase, "/") + "?token=" + token, nil
+}
+
+// countUnclaimed is the global-cap denominator: anonymous boxes nobody
+// has claimed. A claimed box belongs to a tenant and no longer counts.
+func (m *Manager) countUnclaimed(ctx context.Context) (int, error) {
+	all, err := m.boxes.List(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("anonbox: list boxes: %w", err)
+	}
+	n := 0
+	for i := range all {
+		if IsUnclaimedAnonymous(all[i].Labels) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// findLive returns the box labelled with fp, or nil.
+func (m *Manager) findLive(ctx context.Context, fp string) (*box.BoxStatus, error) {
+	all, err := m.boxes.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("anonbox: list boxes: %w", err)
+	}
+	for i := range all {
+		if all[i].Labels[LabelFingerprint] == fp {
+			return &all[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func newTokenID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("anonbox: token id: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
