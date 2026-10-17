@@ -79,3 +79,85 @@ func TestRecentSet_NoveltyThenExpiry(t *testing.T) {
 	}
 	if n := s.len(base.Add(2 * time.Minute)); n != 1 {
 		t.Errorf("len = %d, want 1", n)
+	}
+}
+
+func TestRecentSet_PrunesExpiredFromLenAndValues(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := newRecentSet(time.Minute)
+	s.observe(base, "a")
+	s.observe(base, "b")
+	s.observe(base.Add(90*time.Second), "c")
+
+	now := base.Add(2 * time.Minute)
+	if n := s.len(now); n != 1 {
+		t.Errorf("len = %d, want 1 (a and b expired)", n)
+	}
+	if v := s.values(now); len(v) != 1 || v[0] != "c" {
+		t.Errorf("values = %v, want [c]", v)
+	}
+}
+
+func TestEWMA_FirstSampleSeedsThenWeights(t *testing.T) {
+	e := newEWMA(0.5)
+	if v, n := e.get(); v != 0 || n != 0 {
+		t.Errorf("zero value = %v/%d, want 0/0", v, n)
+	}
+
+	e.observe(100)
+	if v, n := e.get(); v != 100 || n != 1 {
+		t.Errorf("after first sample = %v/%d, want 100/1 (seed, not decay toward zero)", v, n)
+	}
+
+	e.observe(200)
+	if v, _ := e.get(); v != 150 {
+		t.Errorf("after second sample = %v, want 150", v)
+	}
+}
+
+func TestSourceNet(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"10.0.0.5:1234", "10.0.0.0/24"},
+		{"10.0.0.200:9", "10.0.0.0/24"},
+		{"203.0.113.7:80", "203.0.113.0/24"},
+		{"10.0.0.5", "10.0.0.0/24"}, // no port
+		{"[2001:db8:1:2::1]:443", "2001:db8:1::/48"},
+		{"", ""},
+		{"not-an-ip:80", ""},
+	}
+	for _, c := range cases {
+		if got := sourceNet(c.in); got != c.want {
+			t.Errorf("sourceNet(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// The endpoint and model sets are keyed on caller-controlled input, so an
+// unbounded map would let one box grow a tenant's state without limit for the
+// whole novelty TTL and make every observation's scan more expensive.
+func TestRecentSet_BoundedAndEvictsOldest(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := newRecentSet(24 * time.Hour)
+
+	now := base
+	for i := 0; i < maxRecentValues*20; i++ {
+		now = now.Add(time.Second)
+		s.observe(now, "/v1/"+strconv.Itoa(i))
+	}
+	if n := s.len(now); n > maxRecentValues {
+		t.Errorf("set grew to %d, want <= %d", n, maxRecentValues)
+	}
+
+	// The most recent values survive; the oldest were evicted.
+	vals := s.values(now)
+	found := map[string]bool{}
+	for _, v := range vals {
+		found[v] = true
+	}
+	if !found["/v1/"+strconv.Itoa(maxRecentValues*20-1)] {
+		t.Error("most recent value was evicted")
+	}
+	if found["/v1/0"] {
+		t.Error("oldest value survived eviction")
+	}
+}

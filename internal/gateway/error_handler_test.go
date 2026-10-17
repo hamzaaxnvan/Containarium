@@ -52,3 +52,31 @@ func TestErrorHandler_KeepsStatusDetails(t *testing.T) {
 			Subject string `json:"subject"`
 		} `json:"violations"`
 	}
+	if e := json.Unmarshal(body["details"], &details); e != nil || len(details) != 1 {
+		t.Fatalf("details = %s (%v)", body["details"], e)
+	}
+	d := details[0]
+	if d.Type != "type.googleapis.com/google.rpc.PreconditionFailure" || len(d.Violations) != 1 ||
+		d.Violations[0].Type != "RUN_USER_NOT_SIGNED_IN" || d.Violations[0].Subject != "alice-container" {
+		t.Errorf("detail = %+v", d)
+	}
+}
+
+// An error with no details keeps today's body: no details key.
+func TestErrorHandler_NoDetailsNoKey(t *testing.T) {
+	_, body := serveError(t, status.Error(codes.NotFound, "gone"))
+	if _, ok := body["details"]; ok {
+		t.Errorf("details present: %s", body["details"])
+	}
+	if _, ok := body["error"]; !ok {
+		t.Error("error field missing")
+	}
+}
+
+// A non-status error still gets a body, with no message or details.
+func TestErrorHandler_PlainError(t *testing.T) {
+	code, body := serveError(t, context.DeadlineExceeded)
+	if code == 0 || len(body["error"]) == 0 {
+		t.Fatalf("code=%d body=%v", code, body)
+	}
+}
