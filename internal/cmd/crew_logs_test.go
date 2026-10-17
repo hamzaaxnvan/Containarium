@@ -47,3 +47,16 @@ func TestCrewLogsFollow_ByteExact(t *testing.T) {
 	if err := crewLogs(cmd, f, "run-1", "hello-agent", true, &out); err != nil {
 		t.Fatal(err)
 	}
+	if !bytes.Equal(out.Bytes(), journal) {
+		t.Errorf("output =\n%q\nwant\n%q", out.Bytes(), journal)
+	}
+	if len(f.reqs) != 3 {
+		t.Fatalf("%d requests, want 3 (stop at ended)", len(f.reqs))
+	}
+	for i, want := range []int64{0, 20, 66} {
+		r := f.reqs[i]
+		if r.GetStartOffset() != want || r.GetRunId() != "run-1" || r.GetSkillId() != "hello-agent" || r.GetFollowSeconds() == 0 {
+			t.Errorf("request %d = %+v, want start_offset %d, follow set", i, r, want)
+		}
+	}
+}
