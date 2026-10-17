@@ -27,3 +27,11 @@ func TestValidateSSHKeyMode(t *testing.T) {
 				if err != nil {
 					t.Fatalf("validateSSHKeyMode(%v, %q) unexpected error: %v", tc.noSSHKey, tc.sshKeyPath, err)
 				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validateSSHKeyMode(%v, %q) = %v, want error containing %q", tc.noSSHKey, tc.sshKeyPath, err, tc.wantErr)
+			}
+		})
+	}
+}
