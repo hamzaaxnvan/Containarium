@@ -238,3 +238,83 @@ func TestSyncAccountsSummary(t *testing.T) {
 		},
 		{
 			name:     "some failed",
+			restored: 3,
+			skipped:  1,
+			failed:   2,
+			wantErr:  true,
+		},
+		{
+			name:     "all failed",
+			restored: 0,
+			skipped:  0,
+			failed:   5,
+			wantErr:  true,
+		},
+		{
+			name:     "no containers",
+			restored: 0,
+			skipped:  0,
+			failed:   0,
+			wantErr:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkSyncResult(tt.restored, tt.skipped, tt.failed)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("checkSyncResult() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// checkSyncResult determines if the sync operation should return an error
+func checkSyncResult(restored, skipped, failed int) error {
+	if failed > 0 {
+		return &syncError{failed: failed}
+	}
+	return nil
+}
+
+type syncError struct {
+	failed int
+}
+
+func (e *syncError) Error() string {
+	return "sync failed"
+}
+
+// Benchmark tests
+func BenchmarkExtractUsernameFromContainerName(b *testing.B) {
+	names := []string{
+		"alice-container",
+		"alice-dev-team-container",
+		"a-container",
+		"invalid-name",
+		"",
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, n := range names {
+			_, _ = extractUsernameFromContainerName(n)
+		}
+	}
+}
+
+func BenchmarkIsValidSSHKeyFormat(b *testing.B) {
+	keys := []string{
+		"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7... user@host",
+		"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGj... user@host",
+		"invalid key format",
+		"",
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, k := range keys {
+			_ = isValidSSHKeyFormat(k)
+		}
+	}
+}

@@ -44,3 +44,35 @@ func TestSaveIs0600(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("cloud config must be 0600 (holds a token), got %o", perm)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	if err := (&Config{ControlPlane: "x:443", HostID: "h", Token: "t"}).Validate(); err != nil {
+		t.Errorf("complete config should validate: %v", err)
+	}
+	if err := (&Config{HostID: "h", Token: "t"}).Validate(); err == nil {
+		t.Error("missing control_plane should fail validation")
+	}
+	if err := (*Config)(nil).Validate(); err == nil {
+		t.Error("nil config should fail validation")
+	}
+}
+
+func TestDeleteIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cloud.yaml")
+	if err := Delete(path); err != nil {
+		t.Errorf("delete of missing file must be nil, got %v", err)
+	}
+	if err := Save(path, &Config{ControlPlane: "x:443", HostID: "h", Token: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Delete(path); err != nil {
+		t.Errorf("delete: %v", err)
+	}
+	if got, _ := Load(path); got != nil {
+		t.Error("config should be gone after delete")
+	}
+}
