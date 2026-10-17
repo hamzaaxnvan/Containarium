@@ -120,3 +120,126 @@ func TestSealIntegration_VerifyOnRealChain(t *testing.T) {
 
 // TestSealIntegration_VerifyAfterSignerRotation (#2729): a pack sealed before
 // a guardrail signing key is rotated and then revoked still verifies after
+// both. Those changes are guardrail.policy.set rows appended after the seal
+// (the shape the policy server writes); the seal holds digests only.
+func TestSealIntegration_VerifyAfterSignerRotation(t *testing.T) {
+	s, _ := sealTestStore(t)
+	sealed := sealOnRealChain(t, s)
+	for _, detail := range []string{
+		`{"previous_revision":1,"revision":2,"policy_hash":"p","trusted_signer_key_ids":["old","new"]}`,
+		`{"previous_revision":2,"revision":3,"policy_hash":"p","trusted_signer_key_ids":["new"],"revoked_signer_key_ids":["old"]}`,
+	} {
+		if err := s.Log(context.Background(), &audit.AuditEntry{Username: "admin", Action: "guardrail.policy.set", ResourceType: "guardrail_policy", ResourceID: "cluster", Detail: detail, StatusCode: 200}); err != nil {
+			t.Fatalf("log: %v", err)
+		}
+	}
+	res, err := Verify(context.Background(), s, sealed)
+	if err != nil {
+		t.Fatalf("Verify after rotation and revocation: %v", err)
+	}
+	if res.ChainCheckedThrough != 13 {
+		t.Errorf("chain checked through %d, want the tip 13 (past both policy rows)", res.ChainCheckedThrough)
+	}
+}
+
+func TestSealIntegration_Tampering(t *testing.T) {
+	ctx := context.Background()
+	t.Run("one log byte in the pack", func(t *testing.T) {
+		s, _ := sealTestStore(t)
+		sealed := sealOnRealChain(t, s)
+		sealed.Pack.Steps[0].Log[0] ^= 1
+		_, err := Verify(ctx, s, sealed)
+		var tp *TamperedPart
+		if !errors.As(err, &tp) || tp.Name != "unit" {
+			t.Fatalf("err = %v, want step \"unit\" named", err)
+		}
+	})
+	t.Run("seal row edited, pack untouched: the edited part is named", func(t *testing.T) {
+		s, pool := sealTestStore(t)
+		sealed := sealOnRealChain(t, s)
+		if _, err := pool.Exec(ctx, `UPDATE audit_logs SET detail = replace(detail, $1, $2) WHERE id = 6`,
+			sealed.Seal.Parts[1].Sha256, strings.Repeat("0", 64)); err != nil {
+			t.Fatal(err)
+		}
+		// The pack is compared with the seal row before the chain is walked,
+		// so the pack no longer matching the edited row is what fires.
+		_, err := Verify(ctx, s, sealed)
+		var tp *TamperedPart
+		if !errors.As(err, &tp) || tp.Step != 1 || tp.Name != "lint" || errors.Is(err, ErrChainBroken) {
+			t.Fatalf("err = %v, want step 1 \"lint\" named as a mismatch, not a broken chain", err)
+		}
+	})
+	t.Run("seal row and pack edited to agree: the chain breaks at the seal row", func(t *testing.T) {
+		s, pool := sealTestStore(t)
+		sealed := sealOnRealChain(t, s)
+		// The attacker rewrites the pack and the seal row's detail
+		// consistently, so the comparison passes and the walk is reached.
+		sealed.Pack.Steps[1].Log = []byte("FAIL\n")
+		sealed.Pack.Steps[1].LogSha256 = LogDigest(sealed.Pack.Steps[1].Log)
+		forged, err := NewSeal(sealed.Pack)
+		if err != nil {
+			t.Fatal(err)
+		}
+		detail, err := protojson.Marshal(forged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE audit_logs SET detail = $1 WHERE id = 6`, string(detail)); err != nil {
+			t.Fatal(err)
+		}
+		_, err = Verify(ctx, s, sealed)
+		var tp *TamperedPart
+		if err == nil || !errors.Is(err, ErrChainBroken) || errors.As(err, &tp) || !strings.Contains(err.Error(), "broken at row 6") {
+			t.Fatalf("err = %v, want the chain broken at row 6 and no part mismatch", err)
+		}
+	})
+	t.Run("a chain row after the seal edited, pack matches: the chain breaks there", func(t *testing.T) {
+		s, pool := sealTestStore(t)
+		sealed := sealOnRealChain(t, s)
+		if _, err := pool.Exec(ctx, `UPDATE audit_logs SET username = 'x' WHERE id = 9`); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Verify(ctx, s, sealed)
+		if !errors.Is(err, ErrChainBroken) {
+			t.Fatalf("err = %v, want ErrChainBroken", err)
+		}
+	})
+	t.Run("seal row deleted", func(t *testing.T) {
+		s, pool := sealTestStore(t)
+		sealed := sealOnRealChain(t, s)
+		if _, err := pool.Exec(ctx, `DELETE FROM audit_logs WHERE id = 6`); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Verify(ctx, s, sealed)
+		if err == nil || errors.Is(err, ErrSealPurged) || !errors.Is(err, ErrSealNotFound) {
+			t.Fatalf("err = %v, want a missing seal row (ErrSealNotFound) that is not a purge", err)
+		}
+	})
+}
+
+func TestSealIntegration_RetentionPurge(t *testing.T) {
+	ctx := context.Background()
+	t.Run("rows below the seal purged: still verifies", func(t *testing.T) {
+		s, pool := sealTestStore(t)
+		sealed := sealOnRealChain(t, s)
+		purgePrefix(t, pool, 5)
+		if _, err := Verify(ctx, s, sealed); err != nil {
+			t.Fatalf("Verify after purging rows 1-5: %v", err)
+		}
+		// Tampering the retained seal row is still caught after the purge.
+		if _, err := pool.Exec(ctx, `UPDATE audit_logs SET username = 'x' WHERE id = 6`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Verify(ctx, s, sealed); err == nil {
+			t.Fatal("Verify passed a tampered seal row after a purge")
+		}
+	})
+	t.Run("seal row purged: ErrSealPurged", func(t *testing.T) {
+		s, pool := sealTestStore(t)
+		sealed := sealOnRealChain(t, s)
+		purgePrefix(t, pool, 7)
+		if _, err := Verify(ctx, s, sealed); !errors.Is(err, ErrSealPurged) {
+			t.Fatalf("err = %v, want ErrSealPurged", err)
+		}
+	})
+}
