@@ -148,3 +148,53 @@ func runDiff(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	proxyURL := fs.String("proxy", depsguard.DefaultProxy, "module proxy base URL (age and source only)")
 	if err := fs.Parse(args); err != nil {
 		return exitError
+	}
+	if *basePath == "" {
+		fmt.Fprintln(stderr, "deps-guard diff: -base is required")
+		return exitError
+	}
+	base, err := depsguard.LoadGoMod(ctx, *basePath)
+	if err != nil {
+		fail(stderr, "deps-guard: ", err)
+		return exitError
+	}
+	head, err := depsguard.LoadGoMod(ctx, *headPath)
+	if err != nil {
+		fail(stderr, "deps-guard: ", err)
+		return exitError
+	}
+	sumBytes, err := os.ReadFile(*sumPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		fail(stderr, "deps-guard: ", err)
+		return exitError
+	}
+	sum, err := depsguard.ParseGoSum(sumBytes)
+	if err != nil {
+		fail(stderr, "deps-guard: ", err)
+		return exitError
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	checker := depsguard.Checker{
+		SumDB: depsguard.HTTPSumDB{BaseURL: *sumdbURL, Client: client},
+		Proxy: depsguard.HTTPProxy{BaseURL: *proxyURL, Client: client},
+	}
+	rep, err := checker.Check(ctx, base, head, sum)
+	if err != nil {
+		fail(stderr, "deps-guard: no verdict: ", err)
+		return exitError
+	}
+	md := depsguard.RenderMarkdown(rep)
+	if *reportPath != "" {
+		// #nosec G703 -- the path is the CI caller's own -report flag, not PR data.
+		if err := os.WriteFile(*reportPath, []byte(md), 0o600); err != nil {
+			fail(stderr, "deps-guard: ", err)
+			return exitError
+		}
+	}
+	if rep.Failed() {
+		report(stderr, rep.Findings)
+		return exitFail
+	}
+	fmt.Fprintf(stdout, "deps-guard ok: %d new or changed module(s), no new or changed replace\n", len(rep.Modules))
+	return exitPass
+}
