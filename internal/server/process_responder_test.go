@@ -586,3 +586,199 @@ func TestProcessResponder_ActuatorFailure(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fx := newResponderFixture(t, false)
 			fx.act.fail = errors.New("incus: operation timed out")
+			fx.setDefault(t, tt.policy, "", 0)
+
+			f := fx.fire(t, "box-a", ruleMiningBehavior, pb.ThreatSeverity_THREAT_SEVERITY_HIGH)
+
+			if f.Response == nil || f.Response.State != pb.ResponseState_RESPONSE_STATE_FAILED || f.Response.Action != tt.policy {
+				t.Fatalf("response = %+v, want %v/FAILED", f.Response, tt.policy)
+			}
+			if !strings.Contains(f.Response.Error, "operation timed out") {
+				t.Errorf("response.error = %q, want the incus error", f.Response.Error)
+			}
+			if _, err := fx.actions.Open(context.Background(), "box-a"); !errors.Is(err, threatdetect.ErrNoOpenAction) {
+				t.Errorf("failed apply left an open action: %v", err)
+			}
+			if got := fx.audit.actions(); strings.Join(got, ",") != "fail" {
+				t.Errorf("audit ops = %v, want fail", got)
+			}
+			calls := len(fx.act.calls)
+			// Once the backoff has passed, the next re-fire is the retry;
+			// with Incus healthy again it applies.
+			fx.clock = fx.clock.Add(processActionRetryBackoff + time.Second)
+			fx.act.fail = nil
+			fx.act.count["box-a"], fx.act.allow["box-a"] = "1", ""
+			f2 := fx.fire(t, "box-a", ruleMiningBehavior, pb.ThreatSeverity_THREAT_SEVERITY_HIGH)
+			if f2.Response == nil || f2.Response.State != pb.ResponseState_RESPONSE_STATE_APPLIED {
+				t.Fatalf("re-fire after recovery: response = %+v, want APPLIED", f2.Response)
+			}
+			if len(fx.act.calls) <= calls {
+				t.Errorf("re-fire made no actuator call; calls: %v", fx.act.calls)
+			}
+		})
+	}
+}
+
+// A release that Incus refuses keeps the action open (the operator retries)
+// and reports the error.
+func TestProcessResponder_ReleaseFailureKeepsActionOpen(t *testing.T) {
+	fx := newResponderFixture(t, false)
+	fx.act.count["box-a"], fx.act.allow["box-a"] = "2", "200ms/100ms"
+	fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_FREEZE, "", 0)
+	fx.fire(t, "box-a", ruleMiningBehavior, pb.ThreatSeverity_THREAT_SEVERITY_HIGH)
+
+	fx.act.fail = errors.New("incus: not frozen")
+	if _, _, err := fx.r.Release(context.Background(), "box-a"); err == nil || !strings.Contains(err.Error(), "not frozen") {
+		t.Fatalf("Release with a failing actuator = %v, want the incus error", err)
+	}
+	if _, err := fx.actions.Open(context.Background(), "box-a"); err != nil {
+		t.Fatalf("action should still be open after a failed release: %v", err)
+	}
+	fx.act.fail = nil
+	if _, _, err := fx.r.Release(context.Background(), "box-a"); err != nil {
+		t.Fatalf("Release retry: %v", err)
+	}
+}
+
+// Per-container override beats the backend default at apply time.
+func TestProcessResponder_UsesContainerOverride(t *testing.T) {
+	fx := newResponderFixture(t, false)
+	fx.act.count["box-a"], fx.act.allow["box-a"] = "2", "200ms/100ms"
+	fx.act.count["box-b"], fx.act.allow["box-b"] = "2", "200ms/100ms"
+	fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_THROTTLE, "10%", 0)
+	if err := fx.policies.SetOverride(context.Background(), "box-b", &pb.ProcessPolicy{Action: pb.ProcessAction_PROCESS_ACTION_ALERT}); err != nil {
+		t.Fatalf("SetOverride: %v", err)
+	}
+	fx.fire(t, "box-a", ruleMiningBehavior, pb.ThreatSeverity_THREAT_SEVERITY_HIGH)
+	fx.fire(t, "box-b", ruleMiningBehavior, pb.ThreatSeverity_THREAT_SEVERITY_HIGH)
+	if fx.act.allow["box-a"] != "10ms/100ms" {
+		t.Errorf("box-a (backend default THROTTLE) allowance = %q, want 10ms/100ms (hard quota)", fx.act.allow["box-a"])
+	}
+	if fx.act.allow["box-b"] != "200ms/100ms" {
+		t.Errorf("box-b (override ALERT) allowance = %q, want untouched", fx.act.allow["box-b"])
+	}
+}
+
+// staleListStore lists a fixed (stale) row as expired, whatever the store
+// holds now: the window between SweepExpired's list and its lock.
+type staleListStore struct {
+	threatdetect.ActionStore
+	stale *threatdetect.SecurityAction
+}
+
+func (s staleListStore) ListExpired(context.Context, time.Time) ([]*threatdetect.SecurityAction, error) {
+	cp := *s.stale
+	return []*threatdetect.SecurityAction{&cp}, nil
+}
+
+// The sweep listed row A as expired, but by the time it holds the lock the
+// container's open action is a newer row B (A was released, then a fresh
+// throttle applied): the sweep must touch neither the box nor B.
+func TestProcessResponder_SweepSkipsRowSupersededSinceList(t *testing.T) {
+	fx := newResponderFixture(t, false)
+	ctx := context.Background()
+	rowA := &threatdetect.SecurityAction{FindingID: 1, Container: "box-a", TenantID: "tenant-a",
+		Action: pb.ProcessAction_PROCESS_ACTION_THROTTLE, PrevCPUCount: "1", AppliedAt: fx.clock.Add(-48 * time.Hour), ExpiresAt: fx.clock.Add(-24 * time.Hour)}
+	if err := fx.actions.Insert(ctx, rowA); err != nil {
+		t.Fatal(err)
+	}
+	stale := *rowA
+	if err := fx.actions.Release(ctx, rowA.ID, threatdetect.ReleasedByOperator, fx.clock.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	rowB := &threatdetect.SecurityAction{FindingID: 2, Container: "box-a", TenantID: "tenant-a",
+		Action: pb.ProcessAction_PROCESS_ACTION_THROTTLE, PrevCPUCount: "4", AppliedAt: fx.clock, ExpiresAt: fx.clock.Add(-time.Second)}
+	if err := fx.actions.Insert(ctx, rowB); err != nil {
+		t.Fatal(err)
+	}
+	fx.r.actions = staleListStore{ActionStore: fx.actions, stale: &stale}
+
+	if n := fx.r.SweepExpired(ctx, fx.clock); n != 0 {
+		t.Errorf("SweepExpired released %d, want 0", n)
+	}
+	if len(fx.act.calls) != 0 {
+		t.Errorf("actuator called for a stale row: %v", fx.act.calls)
+	}
+	got, err := fx.actions.Open(ctx, "box-a")
+	if err != nil || got.ID != rowB.ID || got.PrevCPUCount != "4" {
+		t.Errorf("row B disturbed: %+v, %v", got, err)
+	}
+	if len(fx.findings.byRule(pb.ThreatRuleId_THREAT_RULE_ID_PROCESS_ACTION_EXPIRED)) != 0 {
+		t.Error("raised an EXPIRED finding for a stale row")
+	}
+}
+
+// A crash after the row is written but before the box is confirmed leaves
+// a PENDING row; the sweep undoes it after PendingOrphanAfter and marks it
+// released_by=orphan-sweep.
+func TestProcessResponder_SweepReleasesOrphanedPendingRow(t *testing.T) {
+	fx := newResponderFixture(t, false)
+	ctx := context.Background()
+	fx.act.count["box-a"], fx.act.allow["box-a"] = "10%", "" // the throttle took effect before the crash
+	row := &threatdetect.SecurityAction{FindingID: 1, Container: "box-a", TenantID: "tenant-a", Pending: true,
+		Action: pb.ProcessAction_PROCESS_ACTION_THROTTLE, PrevCPUCount: "2", PrevCPUAllowance: "200ms/100ms",
+		AppliedAt: fx.clock, ExpiresAt: fx.clock.Add(24 * time.Hour)}
+	if err := fx.actions.Insert(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := fx.r.SweepExpired(ctx, fx.clock.Add(threatdetect.PendingOrphanAfter-time.Second)); n != 0 {
+		t.Fatalf("young pending row swept: %d", n)
+	}
+	if n := fx.r.SweepExpired(ctx, fx.clock.Add(threatdetect.PendingOrphanAfter+time.Second)); n != 1 {
+		t.Fatalf("orphan not released: %d", n)
+	}
+	if fx.act.count["box-a"] != "2" || fx.act.allow["box-a"] != "200ms/100ms" {
+		t.Errorf("limits = %q/%q, want the recorded 2/200ms/100ms", fx.act.count["box-a"], fx.act.allow["box-a"])
+	}
+	last, err := fx.actions.Latest(ctx, "box-a")
+	if err != nil || last.ReleasedBy != threatdetect.ReleasedByOrphanSweep {
+		t.Errorf("row = %+v, %v, want released_by=orphan-sweep", last, err)
+	}
+}
+
+// panicActuator dies in SetCPULimit, after the row was inserted.
+type panicActuator struct{ *fakeActuator }
+
+func (panicActuator) SetCPULimit(string, string, string) error { panic("daemon died mid-apply") }
+
+// The row is written before the box is touched: an apply that dies leaves
+// a PENDING row, which the sweep later releases.
+func TestProcessResponder_RowExistsBeforeApplyAndIsSweptAfterCrash(t *testing.T) {
+	fx := newResponderFixture(t, false)
+	fx.act.count["box-a"], fx.act.allow["box-a"] = "2", ""
+	fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_THROTTLE, "10%", 0)
+	fx.r.act = panicActuator{fx.act}
+
+	func() {
+		defer func() { _ = recover() }()
+		fx.fire(t, "box-a", ruleMiningBehavior, pb.ThreatSeverity_THREAT_SEVERITY_HIGH)
+	}()
+	row, err := fx.actions.Open(context.Background(), "box-a")
+	if err != nil || !row.Pending || row.PrevCPUCount != "2" {
+		t.Fatalf("after the crash: row = %+v, %v, want an open PENDING row recording the previous limit", row, err)
+	}
+	fx.r.act = fx.act
+	if n := fx.r.SweepExpired(context.Background(), fx.clock.Add(threatdetect.PendingOrphanAfter+time.Second)); n != 1 {
+		t.Fatalf("sweep released %d, want 1", n)
+	}
+}
+
+// A FAILED apply is not retried on every re-fire inside the backoff: three
+// HIGH re-fires make one actuator attempt and write one row.
+func TestProcessResponder_FailedApplyNotRetriedWithinBackoff(t *testing.T) {
+	fx := newResponderFixture(t, false)
+	fx.act.fail = errors.New("incus: operation timed out")
+	fx.setDefault(t, pb.ProcessAction_PROCESS_ACTION_FREEZE, "", 0)
+
+	for i := 0; i < 3; i++ {
+		fx.fire(t, "box-a", ruleMiningBehavior, pb.ThreatSeverity_THREAT_SEVERITY_HIGH)
+		fx.clock = fx.clock.Add(2 * time.Minute)
+	}
+	if len(fx.act.calls) != 1 {
+		t.Errorf("actuator calls = %v, want exactly 1", fx.act.calls)
+	}
+	if last, err := fx.actions.Latest(context.Background(), "box-a"); err != nil || last.ID != 1 {
+		t.Errorf("latest row = %+v, %v, want the single row (id 1)", last, err)
+	}
+}
