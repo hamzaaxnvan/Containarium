@@ -317,3 +317,322 @@ func runTokenGenerate(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to read JWT secret file: %w", err)
 		}
 		secret = strings.TrimSpace(string(secretBytes))
+	}
+
+	if secret == "" {
+		return fmt.Errorf("JWT secret is required. Use --secret or --secret-file")
+	}
+
+	// Create token manager
+	tm, err := auth.NewTokenManager(secret, "containarium")
+	if err != nil {
+		return fmt.Errorf("token manager: %w", err)
+	}
+
+	// Fail loud on an out-of-range lifetime (#2592): the auth layer would
+	// otherwise silently clamp it to the cap.
+	expiresIn, err := resolveTokenExpiry(tokenExpiry, tm.MaxTokenExpiry())
+	if err != nil {
+		return err
+	}
+
+	// Generate token. Phase 1.7 — scopes pass through as a
+	// variadic; an empty slice (no --scopes) leaves the
+	// claim unset, matching pre-1.7 behavior. Phase 1.6 —
+	// --token-type selects access/refresh; default is the
+	// legacy untagged path so existing scripts keep working.
+	var token string
+	switch tokenType {
+	case "", "any", "legacy":
+		token, err = tm.GenerateToken(tokenUsername, tokenRoles, expiresIn, tokenScopes...)
+	case auth.TokenTypeAccess:
+		token, err = tm.GenerateAccessToken(tokenUsername, tokenRoles, expiresIn, tokenScopes...)
+	case auth.TokenTypeRefresh:
+		token, err = tm.GenerateRefreshToken(tokenUsername, tokenRoles, expiresIn, tokenScopes...)
+	default:
+		return fmt.Errorf("invalid --token-type %q (expected: '', 'access', 'refresh')", tokenType)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	// Raw output mode for scripting
+	if tokenRaw {
+		fmt.Print(token)
+		return nil
+	}
+
+	// Output token information
+	fmt.Printf("\n")
+	fmt.Printf("═══════════════════════════════════════════════════════════════\n")
+	fmt.Printf("  API Token Generated Successfully\n")
+	fmt.Printf("═══════════════════════════════════════════════════════════════\n")
+	fmt.Printf("\n")
+	fmt.Printf("Token:\n%s\n", token)
+	fmt.Printf("\n")
+	fmt.Printf("Details:\n")
+	fmt.Printf("  Username: %s\n", tokenUsername)
+	fmt.Printf("  Roles:    %v\n", tokenRoles)
+	if len(tokenScopes) > 0 {
+		fmt.Printf("  Scopes:   %v\n", tokenScopes)
+	} else {
+		fmt.Printf("  Scopes:   <none> (unrestricted)\n")
+	}
+	if tokenType != "" {
+		fmt.Printf("  Type:     %s\n", tokenType)
+	}
+	expiryTime := time.Now().Add(expiresIn)
+	fmt.Printf("  Expires:  %s (%s from now)\n", expiryTime.Format(time.RFC3339), expiresIn)
+	fmt.Printf("\n")
+	fmt.Printf("Usage Examples:\n")
+	fmt.Printf("\n")
+	fmt.Printf("  # List containers\n")
+	fmt.Printf("  curl -H \"Authorization: Bearer %s\" \\\n", token)
+	fmt.Printf("    http://localhost:8080/v1/containers\n")
+	fmt.Printf("\n")
+	fmt.Printf("  # Create container\n")
+	fmt.Printf("  curl -X POST \\\n")
+	fmt.Printf("    -H \"Authorization: Bearer %s\" \\\n", token)
+	fmt.Printf("    -H \"Content-Type: application/json\" \\\n")
+	fmt.Printf("    -d '{\"username\":\"john\",\"resources\":{\"cpu\":\"4\",\"memory\":\"8GB\",\"disk\":\"100GB\"}}' \\\n")
+	fmt.Printf("    http://localhost:8080/v1/containers\n")
+	fmt.Printf("\n")
+	fmt.Printf("  # Environment variable (recommended)\n")
+	fmt.Printf("  export TOKEN=\"%s\"\n", token)
+	fmt.Printf("  curl -H \"Authorization: Bearer $TOKEN\" http://localhost:8080/v1/containers\n")
+	fmt.Printf("\n")
+	fmt.Printf("Security Reminder:\n")
+	fmt.Printf("  • Store this token securely\n")
+	fmt.Printf("  • Never commit tokens to version control\n")
+	fmt.Printf("  • Rotate tokens periodically\n")
+	fmt.Printf("  • Use HTTPS in production\n")
+	fmt.Printf("\n")
+	fmt.Printf("═══════════════════════════════════════════════════════════════\n")
+	fmt.Printf("\n")
+
+	return nil
+}
+
+// runTokenRefresh POSTs the refresh token to /v1/tokens/refresh
+// and prints the new (access, refresh) pair. The endpoint is
+// unauthenticated — no --token flag needed.
+func runTokenRefresh(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (the daemon does the exchange)")
+	}
+
+	refresh := refreshTokenIn
+	if refreshTokenFile != "" {
+		if refresh != "" {
+			return fmt.Errorf("--refresh-token and --refresh-token-file are mutually exclusive")
+		}
+		b, err := os.ReadFile(refreshTokenFile)
+		if err != nil {
+			return fmt.Errorf("read refresh token file: %w", err)
+		}
+		refresh = strings.TrimSpace(string(b))
+	}
+	if refresh == "" {
+		return fmt.Errorf("--refresh-token or --refresh-token-file is required")
+	}
+
+	// The refresh endpoint is unauthenticated; create an
+	// HTTP client with an empty Authorization to avoid
+	// surprising header propagation.
+	httpClient, err := client.NewHTTPClient(serverAddr, "")
+	if err != nil {
+		return fmt.Errorf("create http client: %w", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	access, newRefresh, accessExp, refreshExp, err := httpClient.RefreshToken(refresh)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\n═══════════════════════════════════════════════════════════════\n")
+	fmt.Printf("  Tokens rotated\n")
+	fmt.Printf("═══════════════════════════════════════════════════════════════\n\n")
+	fmt.Printf("Access token (use as Authorization: Bearer):\n%s\n\n", access)
+	if accessExp > 0 {
+		fmt.Printf("  Access expires:  %s\n", time.Unix(accessExp, 0).Format(time.RFC3339))
+	}
+	fmt.Printf("\nNEW refresh token (the one you sent is now revoked — save this):\n%s\n\n", newRefresh)
+	if refreshExp > 0 {
+		fmt.Printf("  Refresh expires: %s\n", time.Unix(refreshExp, 0).Format(time.RFC3339))
+	}
+	fmt.Printf("\n═══════════════════════════════════════════════════════════════\n\n")
+	return nil
+}
+
+// runTokenDelegate POSTs to /v1/tokens/delegate. Every safety decision —
+// scope intersection, actor construction, TTL capping — belongs to the
+// daemon; this handler only carries the request and reports what came back.
+func runTokenDelegate(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (the daemon holds the signing key, not the CLI)")
+	}
+	if authToken == "" {
+		return fmt.Errorf("--token is required (the delegated token is minted on ITS authority)")
+	}
+	subject := strings.TrimSpace(delegateSubject)
+	if subject == "" {
+		return fmt.Errorf("--subject is required")
+	}
+
+	var expiresIn time.Duration
+	if delegateExpiry != "" {
+		d, err := time.ParseDuration(delegateExpiry)
+		if err != nil {
+			return fmt.Errorf("invalid --expiry %q: %w", delegateExpiry, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("--expiry must be positive (a delegated token is deliberately short-lived)")
+		}
+		expiresIn = d
+	}
+
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return fmt.Errorf("create http client: %w", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	token, expiresAt, granted, grantedRoles, err := httpClient.ExchangeDelegatedToken(subject, delegateScopes, delegateRoles, expiresIn)
+	if err != nil {
+		return err
+	}
+
+	if delegateRawOutput {
+		fmt.Println(token)
+		return nil
+	}
+
+	fmt.Printf("\n═══════════════════════════════════════════════════════════════\n")
+	fmt.Printf("  Delegated token minted\n")
+	fmt.Printf("═══════════════════════════════════════════════════════════════\n\n")
+	fmt.Printf("Acting for:  %s\n", subject)
+	if !expiresAt.IsZero() {
+		fmt.Printf("Expires:     %s\n", expiresAt.Format(time.RFC3339))
+	}
+	// Print what was GRANTED, not what was asked for. The two differ whenever
+	// the request exceeded the caller's own authority, and a silent narrowing
+	// is exactly the kind of surprise that shows up later as a confusing 403.
+	fmt.Printf("Scopes:      %s\n", strings.Join(granted, ", "))
+	// Printed even when empty, because empty is the normal result and its
+	// meaning is not obvious: the token can act for its own subject but
+	// cannot reach admin-gated RPCs or another tenant's resources.
+	if len(grantedRoles) == 0 {
+		fmt.Printf("Roles:       (none — acts for its own subject only)\n")
+	} else {
+		fmt.Printf("Roles:       %s\n", strings.Join(grantedRoles, ", "))
+	}
+	if len(delegateRoles) > 0 && len(grantedRoles) < len(delegateRoles) {
+		fmt.Printf("\nNote: fewer roles granted than requested — you do not hold the rest.\n")
+	}
+	if len(delegateScopes) > 0 && len(granted) < len(delegateScopes) {
+		fmt.Printf("\nNote: fewer scopes granted than requested — your own token does not\n")
+		fmt.Printf("carry the rest. The exchange narrows; it never widens.\n")
+	}
+	fmt.Printf("\nToken (use as Authorization: Bearer):\n%s\n", token)
+	fmt.Printf("\n═══════════════════════════════════════════════════════════════\n\n")
+	return nil
+}
+
+// runTokenRevoke POSTs to /v1/tokens/revoke. The daemon does
+// the admin-role check and the actual revocation list write.
+func runTokenRevoke(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (the daemon does the revocation, not the CLI)")
+	}
+	if authToken == "" {
+		return fmt.Errorf("--token is required (must name an admin JWT)")
+	}
+	if strings.TrimSpace(revokeJTI) == "" {
+		return fmt.Errorf("--jti is required")
+	}
+
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return fmt.Errorf("create http client: %w", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	msg, err := httpClient.RevokeToken(revokeJTI, revokeReason, revokeExpiresAt)
+	if err != nil {
+		return err
+	}
+	if msg == "" {
+		msg = "jti added to revocation list"
+	}
+	fmt.Printf("Revoked: %s\n%s\n", revokeJTI, msg)
+	return nil
+}
+
+// runTokenListRevoked GETs /v1/tokens/revoked and prints
+// the rows. Admin-only on the server side; the CLI does
+// the same flag-validation gate as runTokenRevoke.
+func runTokenListRevoked(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required")
+	}
+	if authToken == "" {
+		return fmt.Errorf("--token is required (must name an admin JWT)")
+	}
+
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return fmt.Errorf("create http client: %w", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	revs, err := httpClient.ListRevokedTokens(listRevokedLimit, listRevokedIncludeExpired, listRevokedJTIPrefix)
+	if err != nil {
+		return err
+	}
+	if len(revs) == 0 {
+		fmt.Println("(no revocations match)")
+		return nil
+	}
+	fmt.Printf("%-24s  %-25s  %-25s  %s\n", "JTI", "REVOKED AT", "EXPIRES AT", "REASON")
+	for _, r := range revs {
+		fmt.Printf("%-24s  %-25s  %-25s  %s\n", r.JTI, r.RevokedAt, r.ExpiresAt, r.Reason)
+	}
+	return nil
+}
+
+// runTokenUnscopedReport GETs /v1/tokens/unscoped-report and
+// prints the measurement (#1679). Admin-only on the server
+// side; the CLI does the same flag-validation gate as
+// runTokenListRevoked.
+func runTokenUnscopedReport(cmd *cobra.Command, args []string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required")
+	}
+	if authToken == "" {
+		return fmt.Errorf("--token is required (must name an admin JWT)")
+	}
+
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return fmt.Errorf("create http client: %w", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	report, err := httpClient.GetUnscopedTokenReport()
+	if err != nil {
+		return err
+	}
+
+	mode := "off (permissive — unscoped tokens are treated as unrestricted)"
+	if report.StrictModeEnabled {
+		mode = "ON (unscoped tokens are rejected)"
+	}
+	fmt.Printf("Strict scopes mode: %s\n", mode)
+	if report.UnscopedCallCount == 0 {
+		fmt.Println("Unscoped-token calls observed: 0")
+		return nil
+	}
+	fmt.Printf("Unscoped-token calls observed: %d (since %s)\n", report.UnscopedCallCount, report.Since)
+	return nil
+}
