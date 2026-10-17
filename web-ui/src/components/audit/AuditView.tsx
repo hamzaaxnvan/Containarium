@@ -146,3 +146,53 @@ export default function AuditView({ server }: AuditViewProps) {
               {['Timestamp', 'Username', 'Action', 'Resource', 'Detail', 'Source IP', 'Status'].map(h => (
                 <th key={h} className="px-3 py-2.5 text-left font-medium text-[var(--text-secondary)] whitespace-nowrap">{h}</th>
               ))}
+            </tr>
+          </thead>
+          <tbody>
+            {logs.length === 0 && !isLoading ? (
+              <tr>
+                <td colSpan={7} className="py-10 text-center text-[var(--text-muted)]">No audit log entries found</td>
+              </tr>
+            ) : (
+              logs.map(entry => (
+                <tr key={entry.id} className="border-b border-[var(--border-subtle)] transition-colors hover:bg-[var(--surface)] last:border-0">
+                  <td className="px-3 py-2 whitespace-nowrap text-[var(--text-muted)]">{formatDate(entry.timestamp)}</td>
+                  <td className="px-3 py-2 text-[var(--text-secondary)]">{entry.username || '—'}</td>
+                  <td className="px-3 py-2"><ActionBadge action={entry.action} /></td>
+                  <td className="px-3 py-2">
+                    {entry.resourceType === 'api' ? (
+                      <span className="font-mono text-[var(--text-secondary)]">{entry.resourceId.replace(/^(GET|POST|PUT|DELETE|PATCH)\s+/, '') || '—'}</span>
+                    ) : (
+                      <span className="text-[var(--text-secondary)]">
+                        {entry.resourceType && <span className="text-[var(--text-muted)]">{entry.resourceType}/</span>}
+                        {entry.resourceId || '—'}
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 max-w-[250px] truncate text-[var(--text-muted)]" title={entry.detail}>{entry.detail || '—'}</td>
+                  <td className="px-3 py-2 font-mono text-[var(--text-muted)]">{entry.sourceIp || '—'}</td>
+                  <td className="px-3 py-2 text-[var(--text-muted)]">{entry.statusCode > 0 ? entry.statusCode : '—'}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+
+        {/* Pagination */}
+        <div className="flex items-center justify-between border-t border-[var(--border-subtle)] px-4 py-2">
+          <div className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
+            <span>Rows per page:</span>
+            <select value={rowsPerPage} onChange={e => { setRowsPerPage(parseInt(e.target.value)); setPage(0); }} className="rounded border border-[var(--border-subtle)] bg-[var(--surface-2)] px-2 py-0.5 text-xs text-[var(--text)] focus:outline-none">
+              {[25, 50, 100].map(n => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </div>
+          <div className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
+            <span>{page * rowsPerPage + 1}–{Math.min((page + 1) * rowsPerPage, totalCount)} of {totalCount}</span>
+            <button onClick={() => handlePageChange(page - 1)} disabled={page === 0} className="rounded px-2 py-1 hover:bg-[var(--surface-2)] disabled:opacity-40 transition-colors">‹</button>
+            <button onClick={() => handlePageChange(page + 1)} disabled={page >= totalPages - 1} className="rounded px-2 py-1 hover:bg-[var(--surface-2)] disabled:opacity-40 transition-colors">›</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
