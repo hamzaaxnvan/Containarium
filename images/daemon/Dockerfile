@@ -8,3 +8,45 @@
 # Published per-release as ghcr.io/footprintai/containarium:vX.Y.Z / :latest by
 # .github/workflows/containarium-daemon.yml (release tags), mirroring the
 # sidecar images. Build context is the repo root:
+#   docker build -f images/daemon/Dockerfile --build-arg VERSION=0.53.0 -t containarium .
+#
+# Note: built WITHOUT `-tags embed_bpf`. The eBPF network-isolation features
+# (phase A) need a pre-compiled BPF object; they're not part of the k8s-runtime
+# daemon image, which isolates tenants via NetworkPolicy. eBPF-embedded builds
+# remain the binary release (`make build-release`).
+
+# --- build the daemon ------------------------------------------------------
+FROM golang:1.26.10-bookworm AS build
+ARG VERSION=dev
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+# CGO_ENABLED=0 → a fully static binary (matches make build-release). The k8s
+# backend has no build tag on non-test sources, so a plain build includes it.
+# #1773: cmd/containarium is the client-only build now (//go:build
+# containarium_client); the full daemon this image ships is cmd/containariumd,
+# untagged, unchanged from what this Dockerfile always built. Output name
+# stays `containarium` — no observable change to the image's own binary path.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -ldflags="-s -w -X github.com/footprintai/containarium/pkg/version.Version=${VERSION}" \
+    -o /out/containarium ./cmd/containariumd
+
+# --- runtime ---------------------------------------------------------------
+FROM debian:bookworm-slim
+# apt-get upgrade: picks up security patches that shipped since
+# debian:bookworm-slim's last rebuild (e.g. libpcre2 deb12u2, which failed the
+# release Trivy gate on v0.99.0). Same fix as images/agent-box/Dockerfile.
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 --shell /usr/sbin/nologin containarium
+
+COPY --from=build /out/containarium /usr/local/bin/containarium
+
+USER containarium
+ENV HOME=/home/containarium
+# gRPC (50051) + REST (8080) — documentation only; the daemon binds these.
+EXPOSE 8080 50051
+ENTRYPOINT ["/usr/local/bin/containarium"]

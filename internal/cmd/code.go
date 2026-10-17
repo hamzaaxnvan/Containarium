@@ -399,3 +399,405 @@ func connectCodeSession(ctx context.Context, kw connectcore.KeyWait, probe []str
 // exited, polling process_list independently of the tail_log loop to
 // notice the exit. After noticing, it waits one more codeStreamFollow
 // cycle so a last in-flight read can flush trailing output before
+// stopping — tail_log has no "you've caught up, nothing more is coming"
+// signal of its own, so watching liveness is the only way to know when to
+// stop asking.
+//
+// #2011: the return value now carries the run's own exit status — nil for a
+// zero exit code, non-nil for a non-zero one — instead of always nil once the
+// run stopped. That is what lets `code run`/`code attach`'s process exit
+// status (main.go maps a non-nil RunE error to os.Exit(1)) reflect whether the
+// AGENT succeeded, so CI and shell scripts can gate on `$?` instead of having
+// to separately parse `code status`.
+func streamAndWait(ctx context.Context, sess *coderun.Session, name, logPath string, stdout, stderr io.Writer, streamJSON bool) error {
+	w := stdout
+	if streamJSON {
+		w = coderun.NewDemuxWriter(stdout, stderr)
+	}
+
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+
+	streamDone := make(chan error, 1)
+	go func() {
+		_, err := coderun.StreamOutput(streamCtx, sess, w, logPath, 0, codeStreamFollow, func(err error) {
+			fmt.Fprintf(stderr, "[containarium code] reconnecting after: %v\n", err)
+		})
+		streamDone <- err
+	}()
+
+	ticker := time.NewTicker(codeExitPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			listing, err := sess.ProcessList(ctx)
+			if err != nil {
+				continue // transient; the streaming loop's own retry handles reconnection
+			}
+			if _, running := coderun.RunOutcomeLine(listing, name); !running {
+				select {
+				case <-time.After(codeStreamFollow + time.Second):
+				case <-ctx.Done():
+				}
+				cancelStream()
+				<-streamDone
+				return codeRunExitErr(listing, name)
+			}
+		}
+	}
+}
+
+// codeRunExitErr turns name's recorded exit code — read from listing, captured
+// the moment streamAndWait noticed the run had stopped — into the process
+// status `code run`/`code attach` return (#2011).
+//
+// A zero exit code, and a finished run that recorded none at all (agent-box's
+// RunOutcomeUnknown: the box died mid-run before it could record one — see
+// ExitCodeFromListing's doc comment), both return nil: there is nothing solid
+// to gate a failure on either way, and reporting the second as a failure would
+// be a stronger claim than the record supports. Only a genuinely non-zero code
+// becomes a non-nil error, which main.go turns into os.Exit(1).
+func codeRunExitErr(listing, name string) error {
+	code, ok := coderun.ExitCodeFromListing(listing, name)
+	if !ok || code == 0 {
+		return nil
+	}
+	return fmt.Errorf("run %q exited with code %d", name, code)
+}
+
+// defaultAgentBoxRelease is the release the agent-box / mcp-server assets are
+// pulled from when --release is omitted: this CLI's own version, v-prefixed.
+// pkg/version carries a bare semver while release TAGS carry the v (see
+// docs/RELEASE-PROCESS.md), so the prefix is added here rather than assumed.
+func defaultAgentBoxRelease() string {
+	v := version.Version
+	if !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	return v
+}
+
+// codeInstallSkillSets resolves --skill-sets and its deprecated alias
+// --no-sdlc-skills (= none) into one validated selection (#3048).
+func codeInstallSkillSets() (sdlcskills.SkillSets, error) {
+	sets, err := sdlcskills.ParseSkillSets(codeSkillSets)
+	if err != nil {
+		return sdlcskills.SkillSets{}, fmt.Errorf("--skill-sets: %w", err)
+	}
+	if codeNoSDLCSkills {
+		if strings.TrimSpace(codeSkillSets) != "" && !sets.None() {
+			return sdlcskills.SkillSets{}, fmt.Errorf("--no-sdlc-skills means --skill-sets none; it conflicts with --skill-sets %q", codeSkillSets)
+		}
+		return sdlcskills.ParseSkillSets("none")
+	}
+	return sets, nil
+}
+
+func codeInstallRelease() (string, error) {
+	r := strings.TrimSpace(codeRelease)
+	if r == "" {
+		return defaultAgentBoxRelease(), nil
+	}
+	if !releaseTagPattern.MatchString(r) {
+		return "", fmt.Errorf("--release %q is not a release tag (expected something like v0.89.0)", r)
+	}
+	return r, nil
+}
+
+// claudeInstallScriptFor runs Anthropic's own installer, unmodified. The only
+// addition is the one bit the verify step needs: whether a credentials file
+// existed BEFORE the install, so "the install created one" can be told apart
+// from "the user signed in earlier", which is the supported path.
+//
+// claudeCodeVersion, when set, is passed to the installer as its argument —
+// the installer's own documented way to pin a version. The command line
+// itself is unchanged.
+// The body now lives on the claude engine (#1727); this is the package-local
+// name #2030's tests drive, delegating so there is one implementation of the
+// script that actually reaches a box.
+func claudeInstallScriptFor(claudeCodeVersion string) string {
+	return defaultClaudeEngine().InstallScript(engine.InstallOptions{Version: claudeCodeVersion})
+}
+
+// defaultClaudeEngine is the Claude engine on the default credential source —
+// i.e. exactly what `code install` with no #1727 flags resolves to.
+//
+// engine.For cannot fail for a known engine with a non-nil credential, so the
+// error is discarded here rather than propagated into call sites whose signatures
+// predate #1727. The panic-free guarantee is pinned by
+// TestCodeInstall_DefaultEngineConstantIsClaude driving the real install path.
+func defaultClaudeEngine() engine.Engine {
+	e, err := engine.For(engine.NameClaude, engine.Options{Credential: engine.SecretCredential{}})
+	if err != nil {
+		// Unreachable: NameClaude is a known engine and the credential is non-nil.
+		panic("containarium: claude engine unavailable: " + err.Error())
+	}
+	return e
+}
+
+// agentBoxInstallScript lands agent-box (and, best-effort, mcp-server) in
+// ~/.local/bin. User-level, so this stays a plain SSH exec with no privilege
+// escalation — the same reason Claude Code's own installer is usable here.
+//
+// mcp-server is best-effort on purpose, matching
+// scripts/install-agent-runtime.sh: a release missing that asset must not
+// take down code run/attach/status/stop, which only need agent-box. Both are
+// downloaded to a temp file and moved into place, so a failed or truncated
+// fetch never leaves a broken binary on PATH.
+func agentBoxInstallScript(release string) string {
+	base := "https://github.com/" + agentBoxRepo + "/releases/download/" + release
+	return `set -e
+mkdir -p "$HOME/.local/bin"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+curl -fsSL "` + base + `/agent-box-` + agentBoxAssetArch + `" -o "$tmp/agent-box" </dev/null
+chmod +x "$tmp/agent-box"
+mv "$tmp/agent-box" "$HOME/.local/bin/agent-box"
+if curl -fsSL "` + base + `/mcp-server-` + agentBoxAssetArch + `" -o "$tmp/mcp-server" </dev/null; then
+  chmod +x "$tmp/mcp-server"
+  mv "$tmp/mcp-server" "$HOME/.local/bin/mcp-server"
+else
+  echo "WARNING: no mcp-server-` + agentBoxAssetArch + ` in that release; runs bound to a tracker connection will have no tracker tools" >&2
+fi
+echo "agent-box installed at $HOME/.local/bin/agent-box"`
+}
+
+// sdlcSkillsInstallScript fetches the release's install-sdlc-skills.sh and runs
+// it as the box user (#2065), landing the pinned open-sdlc-skills role skills in
+// ~/.claude/skills. The release tag was already validated against
+// releaseTagPattern, so it is safe inside the double-quoted URL.
+//
+// Only a 404 means "this release predates the skills asset" and is skipped with
+// a message; any other fetch failure fails the install, so a network blip never
+// silently ships a box with no skills. A hash mismatch or unsafe archive is the
+// installer's own failure and propagates.
+//
+// sets is a validated selection (sdlcskills.SkillSets): its charset cannot carry
+// shell syntax, so it is safe inside the double quotes too. An installer that
+// predates SKILL_SETS would ignore it and install everything, so a narrowed
+// selection against one fails instead.
+func sdlcSkillsInstallScript(release string, sets sdlcskills.SkillSets) string {
+	return `set -e
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+code="$(curl -sSL -o "$tmp" -w '%{http_code}' "https://raw.githubusercontent.com/` + agentBoxRepo + `/` + release + `/scripts/install-sdlc-skills.sh" </dev/null)"
+case "$code" in
+  200)
+    if ! grep -q '^# skill-sets: v1$' "$tmp"; then
+      # An installer that predates skill sets would ignore SKILL_SETS and install everything.
+      case "` + sets.String() + `" in
+        all) ;;
+        none) echo "release ` + release + `'s SDLC skills installer predates skill sets; nothing to remove, skipping" >&2; exit 0 ;;
+        *) echo "release ` + release + `'s SDLC skills installer predates skill sets; cannot apply SKILL_SETS=` + sets.String() + `" >&2; exit 1 ;;
+      esac
+    fi
+    SKILL_SETS="` + sets.String() + `" RELEASE="` + release + `" REPO="` + agentBoxRepo + `" bash "$tmp" ;;
+  404)
+    case "` + sets.String() + `" in
+      all|none) echo "release ` + release + ` has no SDLC skills installer; skipping" >&2 ;;
+      *) echo "release ` + release + ` has no SDLC skills installer; cannot apply SKILL_SETS=` + sets.String() + `" >&2; exit 1 ;;
+    esac ;;
+  *) echo "fetching the SDLC skills installer failed: HTTP $code" >&2; exit 1 ;;
+esac`
+}
+
+// releaseTagPattern is what may be interpolated into the asset URL above.
+// The tag is a flag value and lands inside a double-quoted shell string, so
+// it is validated rather than quoted — a charset with no $, backtick, quote,
+// or backslash cannot be anything but a path segment there.
+var releaseTagPattern = regexp.MustCompile(`^v?[0-9A-Za-z][0-9A-Za-z._-]*$`)
+
+// bootstrapScript fetches url, unpacks it into a throwaway directory, and
+// runs its apply.sh as the box user — the seam a team uses to drop in skills,
+// an MCP config, or dotfiles without this command growing a flag per item.
+// No sudo anywhere: a bootstrap bundle is the user's own content and gets the
+// user's own privileges.
+func bootstrapScript(url string) string {
+	return `set -e
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+curl -fsSL ` + coderun.ShellQuoteSingle(url) + ` | tar -xz -C "$tmp"
+if [ ! -f "$tmp/apply.sh" ]; then
+  echo "bootstrap bundle has no apply.sh at its root" >&2
+  exit 4
+fi
+chmod +x "$tmp/apply.sh"
+cd "$tmp" && ./apply.sh`
+}
+
+// claudeVerifyScript replaces #1673's non-interactive prompt, which could not
+// run without a credential this command no longer supplies.
+//
+// It does three things: prints the installed binary's version, asserts the
+// install created no ~/.claude/.credentials.json (a platform must never mint
+// or store a Claude.ai credential), and reports which credential SOURCE the
+// box has. That last part is deliberately NAMES ONLY — every branch tests for
+// presence and echoes a literal, because expanding any of these would put a
+// live credential into the CLI's output and the user's scrollback.
+// The body now lives on the claude engine (#1727). #2030's tests drive this
+// name, including one that EXECUTES the script against a throwaway HOME — which
+// is why delegating rather than copying matters: that behavioural test now
+// covers the engine's own implementation.
+func claudeVerifyScript() string {
+	return defaultClaudeEngine().VerifyScript()
+}
+
+// buildClaudeSSHArgs wraps connectcore.BuildSSHArgs for this command's
+// call sites — a single seam so a future need to add flags common to both
+// the install and verify exec (e.g. a timeout) touches one place.
+func buildClaudeSSHArgs(target connectcore.Target, identity, execCmd string) []string {
+	return connectcore.BuildSSHArgs(target, identity, execCmd)
+}
+
+func runCodeInstall(cmd *cobra.Command, args []string) error {
+	box := args[0]
+	if err := validateBoxName(box); err != nil {
+		return err
+	}
+	release, err := codeInstallRelease()
+	if err != nil {
+		return err
+	}
+	diag := cmd.ErrOrStderr()
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// No secrets RPC and no --server: this command reaches the box over SSH
+	// and installs binaries. There is no credential for it to fetch (#2030).
+	target, privPath, err := resolveCodeTargetFn(ctx, box, diag)
+	if err != nil {
+		return err
+	}
+	// resolveCodeTarget just authorized the key: armed (#2013).
+	kw, err := newKeyWait(codeKeyWait, true, diag)
+	if err != nil {
+		return err
+	}
+	probe := probeSSHArgs(connectcore.BuildSSHArgs(target, privPath, ""))
+	run := func(script string) (string, error) {
+		var out string
+		err := sshWithKeyWait(ctx, kw, probe, func() error {
+			var e error
+			out, e = sshExec(diag, buildClaudeSSHArgs(target, privPath, script))
+			return e
+		})
+		return out, err
+	}
+
+	// #1727: resolve the engine and its credential source from the flags, and
+	// run the credential source's own install-time preflight BEFORE installing
+	// anything. Failing here costs the user nothing; failing at their first
+	// prompt costs them a debugging session.
+	plan, err := resolveCodeInstallPlan(box)
+	if err != nil {
+		return err
+	}
+	skillSets, err := codeInstallSkillSets()
+	if err != nil {
+		return err
+	}
+	mint, err := codeInstallPreflight(ctx, box, plan, diag)
+	if err != nil {
+		return err
+	}
+
+	// models.json needs the gateway base the preflight just resolved, so it is
+	// rendered here rather than in resolveCodeInstallPlan.
+	installOpts, err := plan.installOptions(mint)
+	if err != nil {
+		return err
+	}
+
+	if _, err := run(plan.engine.InstallScript(installOpts)); err != nil {
+		return fmt.Errorf("install %s on %q: %w", plan.engine.Name(), box, err)
+	}
+	fmt.Fprintf(diag, "✓ %s installed on %s\n", plan.engine.Name(), box)
+
+	if _, err := run(agentBoxInstallScript(release)); err != nil {
+		return fmt.Errorf("install agent-box (%s) on %q: %w", release, box, err)
+	}
+	fmt.Fprintf(diag, "✓ agent-box installed on %s (from %s)\n", box, release)
+
+	// The role skills are Claude Code skills (~/.claude/skills), so only the
+	// Claude engine gets them (#2065).
+	if plan.engine.Name() == engine.NameClaude {
+		if _, err := run(sdlcSkillsInstallScript(release, skillSets)); err != nil {
+			return fmt.Errorf("install SDLC skills (%s) on %q: %w", release, box, err)
+		}
+		fmt.Fprintf(diag, "✓ SDLC skills (%s) installed on %s (from %s)\n", skillSets, box, release)
+	}
+
+	if url := strings.TrimSpace(codeBootstrapURL); url != "" {
+		if _, err := run(bootstrapScript(url)); err != nil {
+			return fmt.Errorf("apply bootstrap bundle on %q: %w", box, err)
+		}
+		fmt.Fprintf(diag, "✓ bootstrap bundle applied on %s\n", box)
+	}
+
+	// Record the choices so `code run` never re-asks (contract C4).
+	if _, err := run(writeCodeConfigScript(plan.config)); err != nil {
+		return fmt.Errorf("write %s on %q: %w", engine.CodeConfigPath, box, err)
+	}
+	fmt.Fprintf(diag, "✓ recorded %s on %s (engine=%s credential=%s)\n",
+		engine.CodeConfigPath, box, plan.config.Engine, plan.config.Credential)
+
+	// A gateway-credentialled box needs a real token to verify with. It is
+	// deliberately SHORT-LIVED (codeVerifyTokenTTL): its only job is to prove the
+	// box can reach a model once, and `code run` mints its own per run.
+	if plan.credential.Kind() == engine.KindGateway {
+		if err := mintAndWriteVerifyToken(ctx, box, plan, run, diag); err != nil {
+			return err
+		}
+	}
+
+	out, err := run(plan.engine.VerifyScript())
+	if err != nil {
+		return fmt.Errorf("verify %s on %q: %w (output: %s)", plan.engine.Name(), box, err, strings.TrimSpace(out))
+	}
+	if strings.TrimSpace(out) == "" {
+		return fmt.Errorf("%s --version produced no output on %q", plan.engine.Name(), box)
+	}
+	stdout := cmd.OutOrStdout()
+	fmt.Fprintf(stdout, "✓ %s verified on %s:\n%s\n", plan.engine.Name(), box, strings.TrimSpace(out))
+	fmt.Fprint(stdout, codeNextStepsHelp(box, plan))
+	return nil
+}
+
+// codeSignInHelp is what replaces the credential this command used to require.
+// Both paths complete through Anthropic's own flow or the user's own key; the
+// platform is not in the middle of either.
+func codeSignInHelp(box string) string {
+	return fmt.Sprintf(`
+Claude Code is installed but not signed in. Pick one:
+
+  interactive — sign in inside the box (device code, no credential stored here):
+      containarium connect %s
+      claude
+
+  headless — place your own key in the "env" block of ~/.claude/settings.json
+  on the box (ANTHROPIC_API_KEY, or a Bedrock / Vertex / Foundry credential):
+      {"env": {"ANTHROPIC_API_KEY": "<your key>"}}
+
+Then: containarium code run %s --prompt "..."
+`, box, box)
+}
+
+// runSSHCaptured runs args non-interactively via the local ssh client and
+// returns its captured stdout. ssh's own diagnostics (connection,
+// host-key) go to diag, not the returned string, so a caller parsing the
+// result gets only the remote command's own bytes — same convention as
+// `connect --exec`.
+func runSSHCaptured(diag io.Writer, args []string) (string, error) {
+	var stdout bytes.Buffer
+	// runSSHTee classifies an exit-255 publickey denial so `code install`
+	// can wait out key propagation (#2013); the error text is unchanged.
+	if err := runSSHTee(context.Background(), nil, &stdout, diag, args); err != nil {
+		return stdout.String(), fmt.Errorf("ssh: %w", err)
+	}
+	return stdout.String(), nil
+}
