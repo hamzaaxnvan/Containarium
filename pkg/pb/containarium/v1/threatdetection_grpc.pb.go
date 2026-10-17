@@ -131,3 +131,536 @@ func (c *threatDetectionServiceClient) AddBadDestination(ctx context.Context, in
 		return nil, err
 	}
 	return out, nil
+}
+
+func (c *threatDetectionServiceClient) RemoveBadDestination(ctx context.Context, in *RemoveBadDestinationRequest, opts ...grpc.CallOption) (*RemoveBadDestinationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveBadDestinationResponse)
+	err := c.cc.Invoke(ctx, ThreatDetectionService_RemoveBadDestination_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *threatDetectionServiceClient) ListFindings(ctx context.Context, in *ListFindingsRequest, opts ...grpc.CallOption) (*ListFindingsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListFindingsResponse)
+	err := c.cc.Invoke(ctx, ThreatDetectionService_ListFindings_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *threatDetectionServiceClient) ResolveFinding(ctx context.Context, in *ResolveFindingRequest, opts ...grpc.CallOption) (*ResolveFindingResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResolveFindingResponse)
+	err := c.cc.Invoke(ctx, ThreatDetectionService_ResolveFinding_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *threatDetectionServiceClient) GetProcessPolicy(ctx context.Context, in *GetProcessPolicyRequest, opts ...grpc.CallOption) (*GetProcessPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetProcessPolicyResponse)
+	err := c.cc.Invoke(ctx, ThreatDetectionService_GetProcessPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *threatDetectionServiceClient) SetProcessPolicy(ctx context.Context, in *SetProcessPolicyRequest, opts ...grpc.CallOption) (*SetProcessPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetProcessPolicyResponse)
+	err := c.cc.Invoke(ctx, ThreatDetectionService_SetProcessPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *threatDetectionServiceClient) ReleaseProcessAction(ctx context.Context, in *ReleaseProcessActionRequest, opts ...grpc.CallOption) (*ReleaseProcessActionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseProcessActionResponse)
+	err := c.cc.Invoke(ctx, ThreatDetectionService_ReleaseProcessAction_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *threatDetectionServiceClient) ListMinerSignatures(ctx context.Context, in *ListMinerSignaturesRequest, opts ...grpc.CallOption) (*ListMinerSignaturesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListMinerSignaturesResponse)
+	err := c.cc.Invoke(ctx, ThreatDetectionService_ListMinerSignatures_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *threatDetectionServiceClient) AddMinerSignature(ctx context.Context, in *AddMinerSignatureRequest, opts ...grpc.CallOption) (*AddMinerSignatureResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AddMinerSignatureResponse)
+	err := c.cc.Invoke(ctx, ThreatDetectionService_AddMinerSignature_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *threatDetectionServiceClient) RemoveMinerSignature(ctx context.Context, in *RemoveMinerSignatureRequest, opts ...grpc.CallOption) (*RemoveMinerSignatureResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveMinerSignatureResponse)
+	err := c.cc.Invoke(ctx, ThreatDetectionService_RemoveMinerSignature_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *threatDetectionServiceClient) StreamExecEvents(ctx context.Context, in *StreamExecEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamExecEventsResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ThreatDetectionService_ServiceDesc.Streams[0], ThreatDetectionService_StreamExecEvents_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamExecEventsRequest, StreamExecEventsResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ThreatDetectionService_StreamExecEventsClient = grpc.ServerStreamingClient[StreamExecEventsResponse]
+
+// ThreatDetectionServiceServer is the server API for ThreatDetectionService service.
+// All implementations must embed UnimplementedThreatDetectionServiceServer
+// for forward compatibility.
+//
+// ThreatDetectionService serves the background security-sentry's status and
+// findings. GetSentryStatus ships with #1640 (background detection loop);
+// *BadDestination* ships with #1641 (known-bad destination rule);
+// ListFindings/ResolveFinding ship with #1643 (findings delivery + triage);
+// rule-config RPCs remain unimplemented — see
+// docs/architecture/continuous-threat-detection.md.
+type ThreatDetectionServiceServer interface {
+	// GetSentryStatus returns the detection engine's on/off state and the
+	// health of every registered rule.
+	GetSentryStatus(context.Context, *GetSentryStatusRequest) (*GetSentryStatusResponse, error)
+	// ListBadDestinations returns the merged baseline + operator-added
+	// known-bad-destination list the bad-destination rule matches against.
+	ListBadDestinations(context.Context, *ListBadDestinationsRequest) (*ListBadDestinationsResponse, error)
+	// AddBadDestination adds an operator-supplied entry to the known-bad
+	// destination list, persisted so it survives a daemon restart, without a
+	// daemon rebuild.
+	AddBadDestination(context.Context, *AddBadDestinationRequest) (*AddBadDestinationResponse, error)
+	// RemoveBadDestination removes a previously operator-added entry. Baseline
+	// (embedded) entries cannot be removed this way — a bare "not found" error
+	// covers the case since only additions are ever tracked as removable.
+	RemoveBadDestination(context.Context, *RemoveBadDestinationRequest) (*RemoveBadDestinationResponse, error)
+	// ListFindings lists security findings, most recently seen first.
+	// Tenant-scoped: a non-admin caller only ever sees their own tenant_id.
+	ListFindings(context.Context, *ListFindingsRequest) (*ListFindingsResponse, error)
+	// ResolveFinding transitions an open finding to resolved. Fails if the
+	// finding is already resolved or doesn't exist.
+	ResolveFinding(context.Context, *ResolveFindingRequest) (*ResolveFindingResponse, error)
+	// GetProcessPolicy returns the process policy stored at one level (backend
+	// default, or one container's override) and the effective policy the
+	// responder applies there (#2636).
+	GetProcessPolicy(context.Context, *GetProcessPolicyRequest) (*GetProcessPolicyResponse, error)
+	// SetProcessPolicy writes the backend default, or one container's
+	// override (clear_override removes it). Admin-only: the policy decides
+	// what happens to a tenant's box.
+	SetProcessPolicy(context.Context, *SetProcessPolicyRequest) (*SetProcessPolicyResponse, error)
+	// ReleaseProcessAction undoes the open action on a container: restores the
+	// recorded CPU limit or unfreezes it, and resolves the finding.
+	ReleaseProcessAction(context.Context, *ReleaseProcessActionRequest) (*ReleaseProcessActionResponse, error)
+	// ListMinerSignatures returns the merged baseline + operator-added
+	// miner-signature list the miner-signature rule (#2638) matches execs
+	// against.
+	ListMinerSignatures(context.Context, *ListMinerSignaturesRequest) (*ListMinerSignaturesResponse, error)
+	// AddMinerSignature adds an operator entry to the miner-signature list,
+	// effective immediately and persisted across restarts, without a rebuild.
+	AddMinerSignature(context.Context, *AddMinerSignatureRequest) (*AddMinerSignatureResponse, error)
+	// RemoveMinerSignature removes an operator-added entry; baseline entries
+	// cannot be removed. kind and pattern travel as query parameters, since an
+	// argv marker can hold slashes and spaces.
+	RemoveMinerSignature(context.Context, *RemoveMinerSignatureRequest) (*RemoveMinerSignatureResponse, error)
+	// StreamExecEvents streams process execs observed in tenant containers by
+	// the host-side eBPF exec telemetry (#2637), optionally replaying the
+	// daemon's short in-memory buffer first. Backs `containarium security
+	// exec-events`. UNAVAILABLE when exec telemetry is not running on this
+	// backend (see GetSentryStatus.exec_telemetry).
+	StreamExecEvents(*StreamExecEventsRequest, grpc.ServerStreamingServer[StreamExecEventsResponse]) error
+	mustEmbedUnimplementedThreatDetectionServiceServer()
+}
+
+// UnimplementedThreatDetectionServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedThreatDetectionServiceServer struct{}
+
+func (UnimplementedThreatDetectionServiceServer) GetSentryStatus(context.Context, *GetSentryStatusRequest) (*GetSentryStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSentryStatus not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) ListBadDestinations(context.Context, *ListBadDestinationsRequest) (*ListBadDestinationsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListBadDestinations not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) AddBadDestination(context.Context, *AddBadDestinationRequest) (*AddBadDestinationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AddBadDestination not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) RemoveBadDestination(context.Context, *RemoveBadDestinationRequest) (*RemoveBadDestinationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveBadDestination not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) ListFindings(context.Context, *ListFindingsRequest) (*ListFindingsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListFindings not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) ResolveFinding(context.Context, *ResolveFindingRequest) (*ResolveFindingResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResolveFinding not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) GetProcessPolicy(context.Context, *GetProcessPolicyRequest) (*GetProcessPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetProcessPolicy not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) SetProcessPolicy(context.Context, *SetProcessPolicyRequest) (*SetProcessPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetProcessPolicy not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) ReleaseProcessAction(context.Context, *ReleaseProcessActionRequest) (*ReleaseProcessActionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseProcessAction not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) ListMinerSignatures(context.Context, *ListMinerSignaturesRequest) (*ListMinerSignaturesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListMinerSignatures not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) AddMinerSignature(context.Context, *AddMinerSignatureRequest) (*AddMinerSignatureResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AddMinerSignature not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) RemoveMinerSignature(context.Context, *RemoveMinerSignatureRequest) (*RemoveMinerSignatureResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveMinerSignature not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) StreamExecEvents(*StreamExecEventsRequest, grpc.ServerStreamingServer[StreamExecEventsResponse]) error {
+	return status.Error(codes.Unimplemented, "method StreamExecEvents not implemented")
+}
+func (UnimplementedThreatDetectionServiceServer) mustEmbedUnimplementedThreatDetectionServiceServer() {
+}
+func (UnimplementedThreatDetectionServiceServer) testEmbeddedByValue() {}
+
+// UnsafeThreatDetectionServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ThreatDetectionServiceServer will
+// result in compilation errors.
+type UnsafeThreatDetectionServiceServer interface {
+	mustEmbedUnimplementedThreatDetectionServiceServer()
+}
+
+func RegisterThreatDetectionServiceServer(s grpc.ServiceRegistrar, srv ThreatDetectionServiceServer) {
+	// If the following call panics, it indicates UnimplementedThreatDetectionServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ThreatDetectionService_ServiceDesc, srv)
+}
+
+func _ThreatDetectionService_GetSentryStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSentryStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).GetSentryStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_GetSentryStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).GetSentryStatus(ctx, req.(*GetSentryStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_ListBadDestinations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListBadDestinationsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).ListBadDestinations(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_ListBadDestinations_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).ListBadDestinations(ctx, req.(*ListBadDestinationsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_AddBadDestination_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddBadDestinationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).AddBadDestination(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_AddBadDestination_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).AddBadDestination(ctx, req.(*AddBadDestinationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_RemoveBadDestination_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveBadDestinationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).RemoveBadDestination(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_RemoveBadDestination_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).RemoveBadDestination(ctx, req.(*RemoveBadDestinationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_ListFindings_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListFindingsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).ListFindings(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_ListFindings_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).ListFindings(ctx, req.(*ListFindingsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_ResolveFinding_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolveFindingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).ResolveFinding(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_ResolveFinding_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).ResolveFinding(ctx, req.(*ResolveFindingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_GetProcessPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetProcessPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).GetProcessPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_GetProcessPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).GetProcessPolicy(ctx, req.(*GetProcessPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_SetProcessPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetProcessPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).SetProcessPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_SetProcessPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).SetProcessPolicy(ctx, req.(*SetProcessPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_ReleaseProcessAction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseProcessActionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).ReleaseProcessAction(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_ReleaseProcessAction_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).ReleaseProcessAction(ctx, req.(*ReleaseProcessActionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_ListMinerSignatures_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListMinerSignaturesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).ListMinerSignatures(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_ListMinerSignatures_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).ListMinerSignatures(ctx, req.(*ListMinerSignaturesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_AddMinerSignature_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddMinerSignatureRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).AddMinerSignature(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_AddMinerSignature_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).AddMinerSignature(ctx, req.(*AddMinerSignatureRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_RemoveMinerSignature_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveMinerSignatureRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ThreatDetectionServiceServer).RemoveMinerSignature(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ThreatDetectionService_RemoveMinerSignature_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ThreatDetectionServiceServer).RemoveMinerSignature(ctx, req.(*RemoveMinerSignatureRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ThreatDetectionService_StreamExecEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamExecEventsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ThreatDetectionServiceServer).StreamExecEvents(m, &grpc.GenericServerStream[StreamExecEventsRequest, StreamExecEventsResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ThreatDetectionService_StreamExecEventsServer = grpc.ServerStreamingServer[StreamExecEventsResponse]
+
+// ThreatDetectionService_ServiceDesc is the grpc.ServiceDesc for ThreatDetectionService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ThreatDetectionService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.ThreatDetectionService",
+	HandlerType: (*ThreatDetectionServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetSentryStatus",
+			Handler:    _ThreatDetectionService_GetSentryStatus_Handler,
+		},
+		{
+			MethodName: "ListBadDestinations",
+			Handler:    _ThreatDetectionService_ListBadDestinations_Handler,
+		},
+		{
+			MethodName: "AddBadDestination",
+			Handler:    _ThreatDetectionService_AddBadDestination_Handler,
+		},
+		{
+			MethodName: "RemoveBadDestination",
+			Handler:    _ThreatDetectionService_RemoveBadDestination_Handler,
+		},
+		{
+			MethodName: "ListFindings",
+			Handler:    _ThreatDetectionService_ListFindings_Handler,
+		},
+		{
+			MethodName: "ResolveFinding",
+			Handler:    _ThreatDetectionService_ResolveFinding_Handler,
+		},
+		{
+			MethodName: "GetProcessPolicy",
+			Handler:    _ThreatDetectionService_GetProcessPolicy_Handler,
+		},
+		{
+			MethodName: "SetProcessPolicy",
+			Handler:    _ThreatDetectionService_SetProcessPolicy_Handler,
+		},
+		{
+			MethodName: "ReleaseProcessAction",
+			Handler:    _ThreatDetectionService_ReleaseProcessAction_Handler,
+		},
+		{
+			MethodName: "ListMinerSignatures",
+			Handler:    _ThreatDetectionService_ListMinerSignatures_Handler,
+		},
+		{
+			MethodName: "AddMinerSignature",
+			Handler:    _ThreatDetectionService_AddMinerSignature_Handler,
+		},
+		{
+			MethodName: "RemoveMinerSignature",
+			Handler:    _ThreatDetectionService_RemoveMinerSignature_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamExecEvents",
+			Handler:       _ThreatDetectionService_StreamExecEvents_Handler,
+			ServerStreams: true,
+		},
+	},
+	Metadata: "containarium/v1/threatdetection.proto",
+}
