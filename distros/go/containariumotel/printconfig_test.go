@@ -40,3 +40,46 @@ func TestPrintConfig_Populated(t *testing.T) {
 		"alice-container",
 		"node-7",
 		"v1.2.3",
+		"telemetry pipeline will be configured",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q; output:\n%s", want, out)
+		}
+	}
+}
+
+func TestPrintConfig_BearerRedactedByDefault(t *testing.T) {
+	var sb strings.Builder
+	err := printConfig(&sb, DistroConfig{
+		Endpoint: "http://x:4318",
+		Headers:  "Authorization=Bearer secret-token,X-Other=visible",
+	}, true)
+	if err != nil {
+		t.Fatalf("printConfig: %v", err)
+	}
+	out := sb.String()
+	if strings.Contains(out, "secret-token") {
+		t.Errorf("bearer not redacted; output:\n%s", out)
+	}
+	if !strings.Contains(out, "<redacted>") {
+		t.Errorf("missing <redacted> marker; output:\n%s", out)
+	}
+	if !strings.Contains(out, "X-Other=visible") {
+		t.Errorf("non-secret header not preserved; output:\n%s", out)
+	}
+}
+
+func TestPrintConfig_BearerVisibleWhenRedactOff(t *testing.T) {
+	var sb strings.Builder
+	err := printConfig(&sb, DistroConfig{
+		Endpoint: "http://x:4318",
+		Headers:  "Authorization=Bearer t",
+	}, false)
+	if err != nil {
+		t.Fatalf("printConfig: %v", err)
+	}
+	out := sb.String()
+	if !strings.Contains(out, "Bearer t") {
+		t.Errorf("bearer should be visible when redact off; output:\n%s", out)
+	}
+}
