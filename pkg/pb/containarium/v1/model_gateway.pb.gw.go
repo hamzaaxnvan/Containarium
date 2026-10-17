@@ -440,3 +440,114 @@ func RegisterModelGatewayServiceHandlerFromEndpoint(ctx context.Context, mux *ru
 // The handlers forward requests to the grpc endpoint over "conn".
 func RegisterModelGatewayServiceHandler(ctx context.Context, mux *runtime.ServeMux, conn *grpc.ClientConn) error {
 	return RegisterModelGatewayServiceHandlerClient(ctx, mux, NewModelGatewayServiceClient(conn))
+}
+
+// RegisterModelGatewayServiceHandlerClient registers the http handlers for service ModelGatewayService
+// to "mux". The handlers forward requests to the grpc endpoint over the given implementation of "ModelGatewayServiceClient".
+// Note: the gRPC framework executes interceptors within the gRPC handler. If the passed in "ModelGatewayServiceClient"
+// doesn't go through the normal gRPC flow (creating a gRPC client etc.) then it will be up to the passed in
+// "ModelGatewayServiceClient" to call the correct interceptors. This client ignores the HTTP middlewares.
+func RegisterModelGatewayServiceHandlerClient(ctx context.Context, mux *runtime.ServeMux, client ModelGatewayServiceClient) error {
+	mux.Handle(http.MethodPut, pattern_ModelGatewayService_SetTenantProviderKey_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.ModelGatewayService/SetTenantProviderKey", runtime.WithHTTPPathPattern("/v1/model-gateway/keys/{key_owner}/{provider}"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_ModelGatewayService_SetTenantProviderKey_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_ModelGatewayService_SetTenantProviderKey_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodDelete, pattern_ModelGatewayService_DeleteTenantProviderKey_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.ModelGatewayService/DeleteTenantProviderKey", runtime.WithHTTPPathPattern("/v1/model-gateway/keys/{key_owner}/{provider}"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_ModelGatewayService_DeleteTenantProviderKey_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_ModelGatewayService_DeleteTenantProviderKey_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodGet, pattern_ModelGatewayService_GetTenantProviderKeyStatus_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.ModelGatewayService/GetTenantProviderKeyStatus", runtime.WithHTTPPathPattern("/v1/model-gateway/keys/{key_owner}/{provider}"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_ModelGatewayService_GetTenantProviderKeyStatus_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_ModelGatewayService_GetTenantProviderKeyStatus_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_ModelGatewayService_MintGatewayToken_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.ModelGatewayService/MintGatewayToken", runtime.WithHTTPPathPattern("/v1/model-gateway/tokens"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_ModelGatewayService_MintGatewayToken_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_ModelGatewayService_MintGatewayToken_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodGet, pattern_ModelGatewayService_ListGatewayModels_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.ModelGatewayService/ListGatewayModels", runtime.WithHTTPPathPattern("/v1/model-gateway/{provider}/models"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_ModelGatewayService_ListGatewayModels_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_ModelGatewayService_ListGatewayModels_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	return nil
+}
+
+var (
+	pattern_ModelGatewayService_SetTenantProviderKey_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 1, 0, 4, 1, 5, 3, 1, 0, 4, 1, 5, 4}, []string{"v1", "model-gateway", "keys", "key_owner", "provider"}, ""))
+	pattern_ModelGatewayService_DeleteTenantProviderKey_0    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 1, 0, 4, 1, 5, 3, 1, 0, 4, 1, 5, 4}, []string{"v1", "model-gateway", "keys", "key_owner", "provider"}, ""))
+	pattern_ModelGatewayService_GetTenantProviderKeyStatus_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2, 1, 0, 4, 1, 5, 3, 1, 0, 4, 1, 5, 4}, []string{"v1", "model-gateway", "keys", "key_owner", "provider"}, ""))
+	pattern_ModelGatewayService_MintGatewayToken_0           = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "model-gateway", "tokens"}, ""))
+	pattern_ModelGatewayService_ListGatewayModels_0          = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 1, 0, 4, 1, 5, 2, 2, 3}, []string{"v1", "model-gateway", "provider", "models"}, ""))
+)
+
+var (
+	forward_ModelGatewayService_SetTenantProviderKey_0       = runtime.ForwardResponseMessage
+	forward_ModelGatewayService_DeleteTenantProviderKey_0    = runtime.ForwardResponseMessage
+	forward_ModelGatewayService_GetTenantProviderKeyStatus_0 = runtime.ForwardResponseMessage
+	forward_ModelGatewayService_MintGatewayToken_0           = runtime.ForwardResponseMessage
+	forward_ModelGatewayService_ListGatewayModels_0          = runtime.ForwardResponseMessage
+)
