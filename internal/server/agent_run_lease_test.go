@@ -333,3 +333,338 @@ func TestRunLeaseAuditPayloads(t *testing.T) {
 		if issue.Credentials[i].Kind != want.Kind || issue.Credentials[i].JTI != want.JTI {
 			t.Errorf("issue credential %d = %+v, want kind %q jti %q", i, issue.Credentials[i], want.Kind, want.JTI)
 		}
+		if issue.Credentials[i].Exp == "" {
+			t.Errorf("issue credential %d has no exp — an auditor cannot tell when it dies on its own", i)
+		}
+	}
+
+	out := runlease.Outcome{
+		Revoked:     []string{"jti-platform"},
+		Unrevoked:   []string{"jti-gateway"},
+		Wiped:       true,
+		DirsRemoved: true,
+		Errs:        []error{errors.New("runlease: revoke jti-gateway: boom")},
+	}
+	raw := runLeaseEndPayload(lease, runExitReason, out)
+	var end runLeaseEndDetail
+	if err := json.Unmarshal([]byte(raw), &end); err != nil {
+		t.Fatalf("unmarshal end payload: %v", err)
+	}
+	if end.RunID != "run-audit" || end.Reason != runExitReason {
+		t.Errorf("end run_id/reason = %q/%q, want run-audit/%s", end.RunID, end.Reason, runExitReason)
+	}
+	if len(end.Revoked) != 1 || end.Revoked[0] != "jti-platform" {
+		t.Errorf("end revoked = %v, want [jti-platform]", end.Revoked)
+	}
+	if len(end.Unrevoked) != 1 || end.Unrevoked[0] != "jti-gateway" {
+		t.Errorf("end unrevoked = %v, want [jti-gateway]", end.Unrevoked)
+	}
+	if !end.Wiped {
+		t.Error("end wiped = false, want true")
+	}
+	// #1860
+	if !end.DirsRemoved {
+		t.Error("end dirs_removed = false, want true")
+	}
+	if len(end.Errors) != 1 || !strings.Contains(end.Errors[0], "jti-gateway") {
+		t.Errorf("end errors = %v, want the revoke failure recorded", end.Errors)
+	}
+	// Empty slices must serialize as [], not null: an operator reading the row
+	// should see "nothing failed", not a missing field. DirsRemoved false is
+	// its own correct zero value here, not something to paper over.
+	clean := runLeaseEndPayload(lease, runExitReason, runlease.Outcome{Wiped: true})
+	for _, want := range []string{`"unrevoked":[]`, `"errors":[]`, `"revoked":[]`, `"dirs_removed":false`} {
+		if !strings.Contains(clean, want) {
+			t.Errorf("clean end payload %s must contain %s", clean, want)
+		}
+	}
+}
+
+// runLeaseCallerCtx is an authorized context that also carries a caller jti, so audit
+// attribution has something real to pick up. Username/roles come from the
+// claims (SubjectFromGRPCContext falls through to them when the metadata
+// carries no username), the jti from metadata — the path the HTTP→gateway→gRPC
+// hop actually uses.
+func runLeaseCallerCtx() context.Context {
+	return metadata.NewIncomingContext(ctxAs("operator", true), metadata.Pairs(auth.MDKeyJTI, "caller-jti"))
+}
+
+// TestRunLeaseAuditRows pins the ENVELOPE of the two run-lease rows — the half
+// of design §5 that runLeaseIssuePayload/runLeaseEndPayload do not cover.
+// `ResourceType: "agent_run"`, or RunID left empty, would ship green without
+// this: audit_logs.run_id has no other writer yet, and #1825's query is its
+// only reader.
+func TestRunLeaseAuditRows(t *testing.T) {
+	assertEnvelope := func(t *testing.T, e audit.AuditEntry, action, runID string) {
+		t.Helper()
+		if e.Action != action {
+			t.Errorf("action = %q, want %q", e.Action, action)
+		}
+		if e.ResourceType != "agent_skill_run" {
+			t.Errorf("resource_type = %q, want agent_skill_run", e.ResourceType)
+		}
+		if e.ResourceID != runID {
+			t.Errorf("resource_id = %q, want the run id %q", e.ResourceID, runID)
+		}
+		if e.RunID != runID {
+			t.Errorf("run_id column = %q, want %q — this row is its first writer", e.RunID, runID)
+		}
+		// The caller's jti, never a minted one: "what did this credential do"
+		// has to keep meaning the credential that made the call.
+		if e.TokenID != "caller-jti" {
+			t.Errorf("token_id = %q, want the caller's jti", e.TokenID)
+		}
+		if strings.Contains(e.TokenID, "jti-platform") || strings.Contains(e.TokenID, "jti-gateway") {
+			t.Errorf("token_id = %q must not be a minted jti", e.TokenID)
+		}
+	}
+
+	t.Run("end row through RunAgentSkill", func(t *testing.T) {
+		audits := &fakeAuditLogger{}
+		s, skill := newSkillBoxHarness(t, newFakeRevocationStore())
+		s.audit = audits
+
+		if _, err := s.RunAgentSkill(runLeaseCallerCtx(), &pb.RunAgentSkillRequest{SkillId: skill.Id, RunId: "run-rows"}); err == nil {
+			t.Fatal("expected the seed exec to fail on the fake backend")
+		}
+
+		end := audits.byAction("agent.run_lease_end")
+		if len(end) != 1 {
+			t.Fatalf("agent.run_lease_end rows = %d, want 1", len(end))
+		}
+		assertEnvelope(t, end[0], "agent.run_lease_end", "run-rows")
+
+		var detail runLeaseEndDetail
+		if err := json.Unmarshal([]byte(end[0].Detail), &detail); err != nil {
+			t.Fatalf("end detail is not the typed struct: %v", err)
+		}
+		if detail.Reason != provisionFailedReason {
+			t.Errorf("reason = %q, want %q", detail.Reason, provisionFailedReason)
+		}
+		// The orphan end row documented at the seed-failure branch: the issue
+		// row is written only after a successful seed, so this path has none.
+		if n := len(audits.byAction("agent.run_lease_issue")); n != 0 {
+			t.Errorf("issue rows on a failed provision = %d, want 0", n)
+		}
+	})
+
+	t.Run("issue row survives a cancelled caller", func(t *testing.T) {
+		audits := &fakeAuditLogger{}
+		s := &AgentSkillServer{audit: audits}
+		ctx, cancel := context.WithCancel(runLeaseCallerCtx())
+		cancel() // the caller is gone before the row is written
+
+		// Exactly the call provisionSkillBox makes after a successful seed.
+		lease := testLease("run-issue")
+		s.auditRunLease(ctx, "agent.run_lease_issue", lease.RunID, runLeaseIssuePayload(lease, pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED))
+
+		issue := audits.byAction("agent.run_lease_issue")
+		if len(issue) != 1 {
+			t.Fatalf("agent.run_lease_issue rows = %d, want 1 — a cancelled caller must not lose the row", len(issue))
+		}
+		assertEnvelope(t, issue[0], "agent.run_lease_issue", "run-issue")
+		if !strings.Contains(issue[0].Detail, "jti-platform") || !strings.Contains(issue[0].Detail, "jti-gateway") {
+			t.Errorf("issue detail must list both minted jtis, got %s", issue[0].Detail)
+		}
+	})
+
+	t.Run("a wedged store cannot hang the run", func(t *testing.T) {
+		// audit.Store.Log takes a global pg_advisory_xact_lock with no timeout
+		// of its own. Without auditWriteBudget this write inherits no deadline
+		// at all (context.WithoutCancel carries none), and RunAgentSkill blocks
+		// in its own defer for as long as Postgres takes.
+		s := &AgentSkillServer{audit: &fakeAuditLogger{blockUntilDone: true}}
+		done := make(chan time.Duration, 1)
+		go func() {
+			start := time.Now()
+			s.auditRunLease(context.Background(), "agent.run_lease_end", "run-wedged", "{}")
+			done <- time.Since(start)
+		}()
+		select {
+		case elapsed := <-done:
+			if elapsed < auditWriteBudget/2 {
+				t.Errorf("returned after %s — the write was not actually attempted", elapsed)
+			}
+			if elapsed > auditWriteBudget*2 {
+				t.Errorf("returned after %s, want bounded by auditWriteBudget (%s)", elapsed, auditWriteBudget)
+			}
+		case <-time.After(auditWriteBudget * 3):
+			t.Fatalf("audit write did not return within %s — it is unbounded", auditWriteBudget*3)
+		}
+	})
+}
+
+// newSkillBoxHarness wires an AgentSkillServer over a map-backed incus fake.
+// The box is pre-created so provisionSkillBox takes its reuse path (no deploy),
+// which puts the test straight on the mint→seed path under test.
+//
+// (*container.Manager).Exec type-asserts its backend to the concrete
+// *incus.Client, so the seed exec ALWAYS fails on a fake backend — which is
+// exactly the failure this harness exists to exercise. A test that needs the
+// seed to succeed sets s.boxOps (see TestProvisionSkillBox_GitFetch, #2161).
+func newSkillBoxHarness(t *testing.T, store auth.RevocationStore) (*AgentSkillServer, *pb.AgentSkill) {
+	t.Helper()
+	s, skill, _ := newSkillBoxHarnessInspectable(t, store)
+	return s, skill
+}
+
+// newSkillBoxHarnessInspectable is newSkillBoxHarness plus the fake backend
+// itself, for tests that need to assert on the SEQUENCE of commands issued
+// (cloud#1733's kill-then-launch fix) rather than just an outcome.
+func newSkillBoxHarnessInspectable(t *testing.T, store auth.RevocationStore) (*AgentSkillServer, *pb.AgentSkill, *fakeSandboxBackend) {
+	t.Helper()
+	tm, err := auth.NewTokenManager("test-secret-must-be-at-least-32-bytes-long-ok", "test")
+	if err != nil {
+		t.Fatalf("NewTokenManager: %v", err)
+	}
+	backend := newFakeSandboxBackend()
+	catalog := skills.GetDefault()
+	skill, err := catalog.Get("hello-agent")
+	if err != nil {
+		t.Fatalf("catalog hello-agent: %v", err)
+	}
+	if err := backend.CreateContainer(incus.ContainerConfig{Name: "agent-" + skill.Id + "-container"}); err != nil {
+		t.Fatalf("seed fake backend: %v", err)
+	}
+	cs := &ContainerServer{manager: container.NewWithBackend(backend)}
+	s := &AgentSkillServer{
+		catalog: catalog,
+		recipes: NewRecipeServer(cs, nil),
+		tokens:  tm,
+		gateway: &gatewayProvisioning{engines: agentengine.Gateway{DefaultProvider: "anthropic"}, httpPort: 8080, secret: []byte("test-shared-secret")},
+	}
+	s.SetRevocationStore(store)
+	return s, skill, backend
+}
+
+// TestProvisionSkillBox_EndsPartialLeaseOnSeedFailure: a run whose seed exec
+// fails after both credentials are minted must not leave live credentials
+// behind. provisionSkillBox owns that cleanup, because RunAgentSkill's defer
+// is only armed once provisioning has succeeded.
+func TestProvisionSkillBox_EndsPartialLeaseOnSeedFailure(t *testing.T) {
+	store := newFakeRevocationStore()
+	s, skill := newSkillBoxHarness(t, store)
+
+	_, _, lease, _, _, _, err := s.provisionSkillBox(ctxAs("admin", true), skill, "", "", "{}", "run-partial", "", "", "", "")
+	if err == nil {
+		t.Fatal("provisionSkillBox must fail when the seed exec fails")
+	}
+	if status.Code(err) != codes.Internal {
+		t.Errorf("seed failure code = %v, want Internal", status.Code(err))
+	}
+	if lease.RunID != "" || len(lease.Credentials) != 0 {
+		t.Errorf("a failed provision must return no live lease, got %+v", lease)
+	}
+
+	revoked, err := store.List(context.Background(), auth.ListRevocationsParams{})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(revoked) != 2 {
+		t.Fatalf("revoked %d credential(s), want both the platform JWT and the gateway token: %+v", len(revoked), revoked)
+	}
+	for _, r := range revoked {
+		if r.Reason != provisionFailedReason {
+			t.Errorf("jti %s revoked with reason %q, want %q", r.JTI, r.Reason, provisionFailedReason)
+		}
+	}
+}
+
+// TestRunAgentSkill_ResponseCarriesRunID pins the run_id half of the RPC
+// contract against the GENERATED pb types, so a stale regeneration fails to
+// compile rather than passing quietly.
+//
+// The RPC cannot be driven to a successful response from a unit test: the seed
+// step goes through (*container.Manager).Exec, which type-asserts its backend
+// to the concrete *incus.Client and so fails on every fake (see
+// newSkillBoxHarness). What is asserted here is that req.run_id is read and
+// validated BEFORE any box work, and that a resolved run id round-trips
+// through the generated response message. The returned value on a real run is
+// covered by the Verify-on-dev step of #1817.
+func TestRunAgentSkill_ResponseCarriesRunID(t *testing.T) {
+	store := newFakeRevocationStore()
+	s, skill := newSkillBoxHarness(t, store)
+	ctx := ctxAs("admin", true)
+
+	// A bad run id is rejected at the boundary, before the box is touched.
+	if _, err := s.RunAgentSkill(ctx, &pb.RunAgentSkillRequest{SkillId: skill.Id, RunId: "bad id"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("bad run_id: code = %v, want InvalidArgument", status.Code(err))
+	}
+	// A well-formed one is not: the run proceeds and fails later, in the box.
+	if _, err := s.RunAgentSkill(ctx, &pb.RunAgentSkillRequest{SkillId: skill.Id, RunId: "run-ok"}); status.Code(err) == codes.InvalidArgument {
+		t.Errorf("valid run_id must not be rejected: %v", err)
+	}
+
+	for _, in := range []string{"", "run-echoed"} {
+		runID, err := resolveRunID(in)
+		if err != nil {
+			t.Fatalf("resolveRunID(%q): %v", in, err)
+		}
+		resp := &pb.RunAgentSkillResponse{RunId: runID, ArtifactJson: "{}"}
+		if resp.GetRunId() != runID {
+			t.Errorf("response run_id = %q, want %q", resp.GetRunId(), runID)
+		}
+		if in != "" && resp.GetRunId() != in {
+			t.Errorf("response run_id = %q, want the caller's %q echoed", resp.GetRunId(), in)
+		}
+	}
+}
+
+// TestStartServeMode_StopsPriorInstanceBeforeLaunching is cloud#1733's fix: a
+// crew member box is reused across runs, and RunCrew re-mints a fresh gateway
+// token + reseeds it to disk on every call — but startServeMode used to
+// background a new agent-runtime unconditionally, with nothing to stop an
+// earlier instance first. Since the OSS image's A2A server binds a fixed
+// port, every relaunch after the first crashed on EADDRINUSE (confirmed
+// live: OSS agent-runtime.log on the asia workhorse), so the box kept
+// serving whatever token its FIRST-EVER launch read, until that token's
+// 30-minute TTL passed — after which every run against a box more than
+// agentTokenTTL old failed "invalid gateway token: expired" regardless of
+// what was actually reseeded.
+//
+// The launch used to go through ExecWithOutput, which type-asserts the concrete
+// incus client and always failed on a fake backend, so this test could only see
+// the kill step. It now goes through ExecWithExitCode like the kill (#2936), so
+// the whole kill-then-launch order is observable. That a kill actually frees
+// the port and lets a fresh process bind it was verified live on the asia
+// workhorse (restart both stale boxes, confirm a single fresh agent-runtime
+// process replaces the ~25h-old one) rather than in this unit test.
+func TestStartServeMode_StopsPriorInstanceBeforeLaunching(t *testing.T) {
+	store := newFakeRevocationStore()
+	s, _, backend := newSkillBoxHarnessInspectable(t, store)
+	ctx := context.Background()
+
+	if err := s.startServeMode(ctx, "agent-hello-agent", "/etc/containarium/agent/runs/run-1", "hello-agent", agentengine.Resolved{}, ""); err != nil {
+		t.Fatalf("startServeMode: %v", err)
+	}
+
+	if len(backend.execCalls) < 2 {
+		t.Fatalf("execCalls = %d, want the kill step then the launch; got %+v", len(backend.execCalls), backend.execCalls)
+	}
+	kill, launch := backend.execCalls[0], backend.execCalls[1]
+	if kill.ContainerName != "agent-hello-agent" {
+		t.Errorf("kill container = %q, want agent-hello-agent", kill.ContainerName)
+	}
+	killScript := strings.Join(kill.Command, " ")
+	if !strings.Contains(killScript, "agent-runtime") || !strings.Contains(killScript, "pkill") {
+		t.Errorf("kill command = %v, want it to pkill a prior agent-runtime instance", kill.Command)
+	}
+	if !strings.Contains(strings.Join(launch.Command, " "), "setsid agent-runtime") {
+		t.Errorf("second command = %v, want the launch, strictly after the kill", launch.Command)
+	}
+
+	// A second call (a later run against the same reused box) must kill
+	// again — the fix is not a one-shot guard, it runs on every call.
+	if err := s.startServeMode(ctx, "agent-hello-agent", "/etc/containarium/agent/runs/run-2", "hello-agent", agentengine.Resolved{}, ""); err != nil {
+		t.Fatalf("second startServeMode: %v", err)
+	}
+	kills := 0
+	for _, c := range backend.execCalls {
+		if strings.Contains(strings.Join(c.Command, " "), "pkill") {
+			kills++
+		}
+	}
+	if kills != 2 {
+		t.Fatalf("after a second call, kill steps = %d, want 2", kills)
+	}
+}

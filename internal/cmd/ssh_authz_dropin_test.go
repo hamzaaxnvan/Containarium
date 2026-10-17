@@ -110,3 +110,115 @@ func checkSSHAuthzKeysCommand(t *testing.T, script string) {
 			t.Errorf("enforce=%v: positional args = %v, want 4", enforce, got)
 		}
 		_ = flags.Set("enforce", "false")
+	}
+}
+
+// Opt-in, validated, and never touching the static authorized_keys path.
+func TestSSHAuthzDropIn_InstallIsOptInAndValidated(t *testing.T) {
+	for _, path := range sshAuthzStartupScripts {
+		t.Run(filepath.Base(path), func(t *testing.T) { checkSSHAuthzInstall(t, readStartupScript(t, path)) })
+	}
+}
+
+func checkSSHAuthzInstall(t *testing.T, script string) {
+	start := strings.Index(script, `if [ "$SSH_AUTHZ_KEYS_COMMAND" = "true" ]; then`)
+	if start < 0 {
+		t.Fatal("the AuthorizedKeysCommand install is not gated on ssh_authz_keys_command")
+	}
+	section := script[start:]
+	if !strings.Contains(section, `"$SSHD_BIN" -t`) {
+		t.Error("the drop-in must be validated with `sshd -t` before sshd restarts (#1137)")
+	}
+	if strings.Contains(section[:strings.Index(section, "SSHAUTHZEOF\n")], "AuthorizedKeysFile") {
+		t.Error("the install must leave AuthorizedKeysFile alone: the static files are the sentinel's upstream path")
+	}
+	for _, want := range []string{"--scopes ssh:authorize", "chmod 0400", "CONTAINARIUM_SSH_AUTHZ_KEYS_COMMAND=true"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("install section is missing %q", want)
+		}
+	}
+}
+
+// The real parser, where installed.
+func TestSSHAuthzDropIn_ParsesUnderRealSSHD(t *testing.T) {
+	sshd := findSSHD()
+	if sshd == "" {
+		t.Skip("sshd not installed; the structural checks above still apply")
+	}
+	keygen, err := exec.LookPath("ssh-keygen")
+	if err != nil {
+		t.Skip("ssh-keygen not installed, cannot mint a host key for sshd -t")
+	}
+	dir := t.TempDir()
+	hostKey := filepath.Join(dir, "hostkey")
+	if out, err := exec.Command(keygen, "-q", "-t", "ed25519", "-f", hostKey, "-N", "").CombinedOutput(); err != nil {
+		t.Skipf("ssh-keygen failed (%v): %s", err, out)
+	}
+	for _, script := range sshAuthzStartupScripts {
+		for _, enforce := range []bool{false, true} {
+			dropIn := filepath.Join(dir, "containarium-ssh-authz.conf")
+			if err := os.WriteFile(dropIn, []byte(renderSSHAuthzDropIn(t, script, enforce)+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			main := filepath.Join(dir, "sshd_config")
+			cfg := "Include " + dropIn + "\nHostKey " + hostKey + "\nUsePAM yes\n"
+			if err := os.WriteFile(main, []byte(cfg), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := exec.Command(sshd, "-t", "-f", main).CombinedOutput(); err != nil {
+				t.Errorf("%s enforce=%v: sshd rejected the drop-in:\n%s", filepath.Base(script), enforce, out)
+			}
+		}
+	}
+}
+
+// The daemon never accepts a non-expiring token (--expiry 0 on an access
+// token is the 15-minute default), so the install must keep re-minting it:
+// a timer that fires at boot and well inside the token's lifetime.
+func TestSSHAuthzDropIn_TokenIsRenewedBeforeItExpires(t *testing.T) {
+	for _, path := range sshAuthzStartupScripts {
+		t.Run(filepath.Base(path), func(t *testing.T) { checkSSHAuthzTokenRenewal(t, readStartupScript(t, path)) })
+	}
+}
+
+func checkSSHAuthzTokenRenewal(t *testing.T, script string) {
+	renew := regexp.MustCompile(`(?s)<<'SSHAUTHZRENEWEOF'\n(.*?)\nSSHAUTHZRENEWEOF`).FindStringSubmatch(script)
+	if renew == nil {
+		t.Fatal("found no SSHAUTHZRENEWEOF token-renewal script")
+	}
+	if regexp.MustCompile(`(?m)^[^#]*--expiry 0\b`).MatchString(script) {
+		t.Error("--expiry 0 mints a 15-minute access token, not a non-expiring one")
+	}
+	m := regexp.MustCompile(`--expiry (\S+)`).FindStringSubmatch(renew[1])
+	if m == nil {
+		t.Fatal("the renewal script does not set --expiry")
+	}
+	lifetime, err := time.ParseDuration(m[1])
+	if err != nil || lifetime <= 0 || lifetime > auth.DefaultMaxTokenExpiry {
+		t.Fatalf("--expiry %q: want a positive duration within the daemon's %s cap (err %v)", m[1], auth.DefaultMaxTokenExpiry, err)
+	}
+
+	timer := regexp.MustCompile(`(?s)containarium-ssh-authz-token\.timer <<'EOF'\n(.*?)\nEOF`).FindStringSubmatch(script)
+	if timer == nil {
+		t.Fatal("found no containarium-ssh-authz-token.timer unit")
+	}
+	d := sshdDirectives(strings.ReplaceAll(timer[1], "=", " "))
+	if d["OnBootSec"] == "" {
+		t.Error("the timer must renew at boot: a stopped VM comes back with an expired token")
+	}
+	every, err := time.ParseDuration(d["OnUnitActiveSec"])
+	if err != nil || every <= 0 || every > lifetime/2 {
+		t.Errorf("OnUnitActiveSec %q: want a renewal at most half of the %s lifetime, so one missed run is survivable", d["OnUnitActiveSec"], lifetime)
+	}
+	if !strings.Contains(script, "systemctl enable containarium-ssh-authz-token.timer") {
+		t.Error("the renewal timer is never enabled")
+	}
+
+	if sh, err := exec.LookPath("sh"); err == nil {
+		cmd := exec.Command(sh, "-n")
+		cmd.Stdin = strings.NewReader(renew[1])
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("the renewal script does not parse: %v\n%s", err, out)
+		}
+	}
+}
