@@ -24,3 +24,30 @@ func TestBackupCreate_HookFormatFlagReachesRequest(t *testing.T) {
 			backupCreateHook = "/opt/backup/db-dump.sh"
 			backupCreateHookFormat = tc.flag
 
+			if err := runBackupCreate(backupCreateCmd, []string{"alice"}); err != nil {
+				t.Fatalf("runBackupCreate: %v", err)
+			}
+			if f.gotCreate == nil {
+				t.Fatal("CreateBackup was not called")
+			}
+			if f.gotCreate.HookFormat != tc.want {
+				t.Errorf("HookFormat = %v, want %v", f.gotCreate.HookFormat, tc.want)
+			}
+		})
+	}
+}
+
+func TestBackupCreate_InvalidHookFormatIsAnErrorBeforeAnyCall(t *testing.T) {
+	f := withRecordingBackupClient(t)
+	resetBackupCreateFlags(t)
+	backupCreateHook = "/opt/backup/db-dump.sh"
+	backupCreateHookFormat = "plain_sql"
+
+	err := runBackupCreate(backupCreateCmd, []string{"alice"})
+	if err == nil || !strings.Contains(err.Error(), "--hook-format") {
+		t.Fatalf("err = %v, want one naming --hook-format", err)
+	}
+	if f.gotCreate != nil {
+		t.Error("create must not be attempted with an invalid --hook-format")
+	}
+}
