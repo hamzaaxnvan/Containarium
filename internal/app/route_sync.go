@@ -266,3 +266,272 @@ func (j *RouteSyncJob) syncTLSSubjects(dbRoutes []*RouteRecord) error {
 	seen := make(map[string]bool, len(dbRoutes))
 	domains := make([]string, 0, len(dbRoutes))
 	add := func(domain string) {
+		if domain == "" || seen[domain] {
+			return
+		}
+		seen[domain] = true
+		domains = append(domains, domain)
+	}
+
+	for _, r := range dbRoutes {
+		if r == nil || !r.Active || r.FullDomain == "" {
+			continue
+		}
+		if r.Protocol == string(RouteProtocolTLSPassthrough) {
+			continue
+		}
+		add(r.FullDomain)
+	}
+
+	if liveRoutes, err := j.proxyManager.ListRoutes(); err != nil {
+		log.Printf("[RouteSyncJob] TLS subject reconcile: list live Caddy routes: %v "+
+			"(continuing with dbRoutes-known domains only)", err)
+	} else {
+		for _, r := range liveRoutes {
+			add(r.FullDomain)
+		}
+	}
+
+	return j.proxyManager.EnsureTLSSubjects(domains)
+}
+
+// syncHTTPRoutes synchronizes HTTP/gRPC routes to the Caddy HTTP server
+func (j *RouteSyncJob) syncHTTPRoutes(dbRoutes []*RouteRecord) error {
+	// Get current routes from Caddy
+	caddyRoutes, err := j.proxyManager.ListRoutes()
+	if err != nil {
+		return err
+	}
+
+	// Build maps for efficient diffing
+	dbRouteMap := make(map[string]*RouteRecord)
+	for _, r := range dbRoutes {
+		dbRouteMap[r.FullDomain] = r
+	}
+
+	caddyRouteMap := make(map[string]Route)
+	for _, r := range caddyRoutes {
+		caddyRouteMap[r.FullDomain] = r
+	}
+
+	var added, removed, updated int
+
+	// Find routes to add or update (in DB but not in Caddy, or different)
+	for domain, dbRoute := range dbRouteMap {
+		caddyRoute, exists := caddyRouteMap[domain]
+
+		if !exists {
+			if err := j.addRouteToCaddy(dbRoute); err != nil {
+				log.Printf("[RouteSyncJob] Failed to add route %s: %v", domain, err)
+				continue
+			}
+			added++
+		} else {
+			if j.needsUpdate(dbRoute, caddyRoute) {
+				if err := j.updateRouteInCaddy(dbRoute); err != nil {
+					log.Printf("[RouteSyncJob] Failed to update route %s: %v", domain, err)
+					continue
+				}
+				updated++
+			}
+		}
+	}
+
+	// Find routes to remove (in Caddy but not in DB)
+	for domain := range caddyRouteMap {
+		if _, exists := dbRouteMap[domain]; !exists {
+			if err := j.proxyManager.RemoveRoute(domain); err != nil {
+				log.Printf("[RouteSyncJob] Failed to remove route %s: %v", domain, err)
+				continue
+			}
+			removed++
+
+			// The route is gone; its TLS automation subject must go too
+			// (#1618). RemoveRoute only deletes the route, and
+			// EnsureTLSSubjects is add-only by design, so without this the
+			// subject survives forever: Caddy keeps trying to obtain a
+			// certificate for a hostname that routes nowhere, and repeated
+			// failed validations accumulate against the ACME account — Let's
+			// Encrypt pauses accounts that rack them up. RemoveTLSSubject's
+			// own doc names that cost; previously only the container-delete
+			// cascade called it, so a route removed any other way leaked one.
+			//
+			// Deliberately AFTER a successful RemoveRoute: dropping the
+			// subject while the route still serves would strand a live
+			// hostname with no certificate, which is #1584's symptom.
+			//
+			// Wildcards are skipped. `*.<base-domain>` is per-cluster
+			// (ProvisionWildcardTLS), not route-derived, and covers every
+			// sibling host — removing it because one route disappeared would
+			// take TLS away from all of them.
+			if strings.HasPrefix(domain, "*.") {
+				continue
+			}
+			if err := j.proxyManager.RemoveTLSSubject(domain); err != nil {
+				// Non-fatal: the route is already gone, which is the
+				// user-visible half. A leftover subject costs ACME retries,
+				// not availability, and the next reap attempt will retry.
+				log.Printf("[RouteSyncJob] Removed route %s but failed to drop its TLS subject: %v "+
+					"— it will keep retrying ACME until cleaned up (#1618)", domain, err)
+			}
+		}
+	}
+
+	if added > 0 || removed > 0 || updated > 0 {
+		log.Printf("[RouteSyncJob] HTTP routes synced: +%d added, -%d removed, ~%d updated", added, removed, updated)
+	}
+
+	return nil
+}
+
+// syncL4Routes synchronizes TLS passthrough routes to the Caddy L4 layer.
+// L4 is lazily activated when passthrough routes exist and deactivated when empty.
+func (j *RouteSyncJob) syncL4Routes(dbRoutes []*RouteRecord) error {
+	// L4 ownership of :443 is a one-way latch. Activating L4 moves the HTTP
+	// server off :443 onto the fallback port and hands :443 to the layer4
+	// app; deactivating reverses it. BOTH rewrite the :443 listen address,
+	// which restarts the :443 listener and drops every in-flight TLS
+	// connection on it — including the response of a concurrent container
+	// create (issue #416: edge create returns "tls: internal error" while
+	// the box itself is provisioned). The 5s reconcile previously toggled
+	// activate/deactivate on every 0<->1 transition in the passthrough-route
+	// set, so any container's route churn bounced :443 for everyone.
+	//
+	// Fix: once L4 is active, keep it active. When the route set empties we
+	// drain the SNI routes down to the catch-all (handled by the diff below)
+	// instead of deactivating. A layer4 server holding only the catch-all is
+	// behaviourally identical to the HTTP-on-:443 baseline — non-matching SNI
+	// already falls through to the HTTP fallback — but it never rewrites the
+	// listen address, so the listener is never restarted under live traffic.
+	//
+	// The same latch also covers Caddy losing its config entirely (#1067).
+	// Once L4 has been up, a later tick finding the layer4 app gone means
+	// Caddy reverted to its stub — not that we should stay lazy — so it is
+	// rebuilt regardless of how many passthrough routes currently exist.
+	// The route set being empty at that moment is exactly the case that
+	// used to leave :443 as plain HTTP forever.
+	if !j.l4ProxyManager.IsL4Active() {
+		healing := j.l4WasActivated()
+		if len(dbRoutes) == 0 && !healing {
+			return nil // never activated and nothing to route — stay lazy
+		}
+		if err := j.l4ProxyManager.ActivateL4(); err != nil {
+			return fmt.Errorf("failed to activate L4: %w", err)
+		}
+		if healing {
+			log.Printf("[RouteSyncJob] layer4 app was missing though L4 had been active — Caddy "+
+				"reverted to its stub config; rebuilt L4 and reclaimed :443 for %d passthrough route(s) (#1067)",
+				len(dbRoutes))
+		} else {
+			log.Printf("[RouteSyncJob] L4 activated for %d passthrough route(s)", len(dbRoutes))
+		}
+	}
+	// L4 is up now, however it got there.
+	j.markL4Activated()
+
+	// Get current L4 routes from Caddy
+	caddyL4Routes, err := j.l4ProxyManager.ListL4Routes()
+	if err != nil {
+		return err
+	}
+
+	// Build maps for efficient diffing
+	dbRouteMap := make(map[string]*RouteRecord)
+	for _, r := range dbRoutes {
+		dbRouteMap[r.FullDomain] = r
+	}
+
+	caddyL4Map := make(map[string]L4Route)
+	for _, r := range caddyL4Routes {
+		caddyL4Map[r.SNI] = r
+	}
+
+	var added, removed, updated int
+
+	// Find routes to add or update
+	for domain, dbRoute := range dbRouteMap {
+		existing, exists := caddyL4Map[domain]
+
+		if !exists {
+			if err := j.l4ProxyManager.AddL4Route(dbRoute.FullDomain, dbRoute.TargetIP, dbRoute.TargetPort); err != nil {
+				log.Printf("[RouteSyncJob] Failed to add L4 route %s: %v", domain, err)
+				continue
+			}
+			added++
+		} else if existing.UpstreamIP != dbRoute.TargetIP || existing.UpstreamPort != dbRoute.TargetPort {
+			if err := j.l4ProxyManager.AddL4Route(dbRoute.FullDomain, dbRoute.TargetIP, dbRoute.TargetPort); err != nil {
+				log.Printf("[RouteSyncJob] Failed to update L4 route %s: %v", domain, err)
+				continue
+			}
+			updated++
+		}
+	}
+
+	// Find routes to remove (in Caddy but not in DB)
+	for sni := range caddyL4Map {
+		if _, exists := dbRouteMap[sni]; !exists {
+			if err := j.l4ProxyManager.RemoveL4Route(sni); err != nil {
+				log.Printf("[RouteSyncJob] Failed to remove L4 route %s: %v", sni, err)
+				continue
+			}
+			removed++
+		}
+	}
+
+	if added > 0 || removed > 0 || updated > 0 {
+		log.Printf("[RouteSyncJob] L4 routes synced: +%d added, -%d removed, ~%d updated", added, removed, updated)
+	}
+
+	return nil
+}
+
+// effectiveUpstream returns the (host, port) the sync job should push
+// to Caddy for the given route. If the container is currently in wake
+// mode, that's the daemon's wake handler address; otherwise it's the
+// route's direct target. Centralised here so addRouteToCaddy,
+// updateRouteInCaddy, and needsUpdate all agree.
+func (j *RouteSyncJob) effectiveUpstream(route *RouteRecord) (string, int) {
+	if j.wakeTracker != nil && route.ContainerName != "" {
+		if host, port, ok := j.wakeTracker.IsInWakeMode(route.ContainerName); ok {
+			return host, port
+		}
+	}
+	return route.TargetIP, route.TargetPort
+}
+
+// needsUpdate checks if a route needs to be updated in Caddy
+func (j *RouteSyncJob) needsUpdate(dbRoute *RouteRecord, caddyRoute Route) bool {
+	wantIP, wantPort := j.effectiveUpstream(dbRoute)
+	if wantIP != caddyRoute.UpstreamIP {
+		return true
+	}
+	if wantPort != caddyRoute.UpstreamPort {
+		return true
+	}
+	// Check if protocol changed
+	if dbRoute.Protocol == "grpc" && caddyRoute.Protocol != RouteProtocolGRPC {
+		return true
+	}
+	if dbRoute.Protocol == "http" && caddyRoute.Protocol != RouteProtocolHTTP {
+		return true
+	}
+	return false
+}
+
+// addRouteToCaddy adds a route to Caddy based on the database record
+func (j *RouteSyncJob) addRouteToCaddy(route *RouteRecord) error {
+	ip, port := j.effectiveUpstream(route)
+	if route.Protocol == "grpc" {
+		return j.proxyManager.AddGRPCRoute(route.FullDomain, ip, port)
+	}
+	return j.proxyManager.AddRoute(route.FullDomain, ip, port)
+}
+
+// updateRouteInCaddy updates a route in Caddy based on the database record
+func (j *RouteSyncJob) updateRouteInCaddy(route *RouteRecord) error {
+	ip, port := j.effectiveUpstream(route)
+	if route.Protocol == "grpc" {
+		return j.proxyManager.UpdateGRPCRoute(route.FullDomain, ip, port)
+	}
+	return j.proxyManager.UpdateRoute(route.FullDomain, ip, port)
+}
