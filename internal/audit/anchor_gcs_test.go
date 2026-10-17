@@ -345,3 +345,119 @@ func (r *recordingSink) PublishRoot(ctx context.Context, cp int64, root string) 
 func (r *recordingSink) LastPublished(ctx context.Context) (int64, string, bool, error) {
 	return r.inner.LastPublished(ctx)
 }
+
+func TestTeeSink_FileFirstThenBucket(t *testing.T) {
+	var order []string
+	file := &recordingSink{name: "file", order: &order, inner: tempSink(t)}
+	bucket := &recordingSink{name: "bucket", order: &order, inner: newTestGCSSink(t, newFakeGcloud())}
+	tee := NewTeeSink(file, bucket)
+	if err := tee.PublishRoot(context.Background(), 10, "hash-at-10"); err != nil {
+		t.Fatalf("PublishRoot: %v", err)
+	}
+	if strings.Join(order, ",") != "file:10,bucket:10" {
+		t.Fatalf("publish order = %v, want file then bucket", order)
+	}
+}
+
+func TestTeeSink_BucketFailureKeepsFileRecord(t *testing.T) {
+	var order []string
+	fileInner := tempSink(t)
+	file := &recordingSink{name: "file", order: &order, inner: fileInner}
+	bucket := &recordingSink{name: "bucket", order: &order, fail: errors.New("bucket unreachable"), inner: newTestGCSSink(t, newFakeGcloud())}
+	tee := NewTeeSink(file, bucket)
+	ctx := context.Background()
+
+	err := tee.PublishRoot(ctx, 10, "hash-at-10")
+	if err == nil || !strings.Contains(err.Error(), "bucket unreachable") {
+		t.Fatalf("err = %v, want the bucket failure", err)
+	}
+	cp, root, ok, _ := fileInner.LastPublished(ctx)
+	if !ok || cp != 10 || root != "hash-at-10" {
+		t.Fatalf("file after bucket failure = (%d, %q, %v), want the record kept", cp, root, ok)
+	}
+	// LastPublished reports the local file, which is what verify-anchor
+	// reads today.
+	if cp, _, _, _ := tee.LastPublished(ctx); cp != 10 {
+		t.Fatalf("tee.LastPublished checkpoint = %d, want 10 (the file)", cp)
+	}
+}
+
+func TestTeeSink_FileFailureSkipsBucket(t *testing.T) {
+	var order []string
+	g := newFakeGcloud()
+	file := &recordingSink{name: "file", order: &order, fail: errors.New("disk full"), inner: tempSink(t)}
+	bucket := &recordingSink{name: "bucket", order: &order, inner: newTestGCSSink(t, g)}
+	tee := NewTeeSink(file, bucket)
+	if err := tee.PublishRoot(context.Background(), 10, "hash-at-10"); err == nil {
+		t.Fatal("PublishRoot with a failing file returned nil")
+	}
+	if strings.Join(order, ",") != "file:10" || len(g.objectURIs()) != 0 {
+		t.Fatalf("order = %v, objects = %v: the bucket must never hold a checkpoint the file does not", order, g.objectURIs())
+	}
+}
+
+// What happens to a checkpoint whose bucket write failed: the manager does
+// not advance, so the next tick publishes again — the file write is an
+// idempotent no-op and the bucket gets the same checkpoint.
+func TestAnchorManager_TeeRetriesBucketOnNextTick(t *testing.T) {
+	g := newFakeGcloud()
+	fileSink := tempSink(t)
+	tee := NewTeeSink(fileSink, newTestGCSSink(t, g))
+	store := &fakeChainStore{hashes: map[int64]string{10: "hash-at-10"}, maxID: 10}
+	m := NewAnchorManager(store, tee, AnchorOptions{Interval: 1})
+	ctx := context.Background()
+
+	g.down = true
+	m.tick(ctx)
+	if cp, _, ok, _ := fileSink.LastPublished(ctx); !ok || cp != 10 {
+		t.Fatalf("file not advanced while the bucket was down: (%d, %v)", cp, ok)
+	}
+	if len(g.objectURIs()) != 0 {
+		t.Fatal("bucket has objects while down")
+	}
+
+	g.down = false
+	m.tick(ctx)
+	want := []string{"gs://example-bucket/audit-anchors/00000000000000000010.json"}
+	if got := g.objectURIs(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("objects after recovery = %v, want %v", got, want)
+	}
+	if lines := splitNonEmptyLines(readFile(t, fileSink.path)); len(lines) != 1 {
+		t.Fatalf("file has %d records after the retry, want 1 (republish is a no-op)", len(lines))
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+func TestAnchorSinkFor(t *testing.T) {
+	file := tempSink(t)
+	g := newFakeGcloud()
+	newBucket := func(uri string) (*GCSAnchorSink, error) { return newGCSAnchorSink(uri, g.run) }
+
+	// No bucket configured: the file sink itself, exactly as before #2880.
+	sink, bucket, err := AnchorSinkFor(file, "  ", newBucket)
+	if err != nil || bucket != nil || sink != RootSink(file) {
+		t.Fatalf("no bucket: got (%T, %v, %v), want the file sink alone", sink, bucket, err)
+	}
+
+	sink, bucket, err = AnchorSinkFor(file, "gs://example-bucket/audit-anchors", newBucket)
+	if err != nil || bucket == nil {
+		t.Fatalf("bucket configured: err = %v, bucket = %v", err, bucket)
+	}
+	if _, ok := sink.(*TeeSink); !ok {
+		t.Fatalf("bucket configured: sink is %T, want *TeeSink", sink)
+	}
+
+	// A bad bucket config falls back to the file alone and says why.
+	sink, bucket, err = AnchorSinkFor(file, "s3://not-gcs", newBucket)
+	if err == nil || bucket != nil || sink != RootSink(file) {
+		t.Fatalf("bad bucket: got (%T, %v, %v), want the file sink and an error", sink, bucket, err)
+	}
+}
