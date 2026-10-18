@@ -18,3 +18,23 @@ func TestPGKeyStore_RevokeWithoutHolderLookupErrors(t *testing.T) {
 	rec, err := NewKeyRecord(pub, "alice", SourceAPI, at)
 	if err != nil {
 		t.Fatal(err)
+	}
+	err = s.Revoke(context.Background(), rec, at)
+	if !errors.Is(err, ErrNoHolderLookup) {
+		t.Fatalf("Revoke without a HolderLookup = %v, want ErrNoHolderLookup", err)
+	}
+}
+
+// The constructor refuses a nil HolderLookup, so the unsafe store cannot be built.
+func TestNewPGKeyStore_RequiresHolderLookup(t *testing.T) {
+	// pgxpool.New connects lazily, so this needs no database.
+	pool, err := pgxpool.New(context.Background(), "postgres://unused@127.0.0.1:1/unused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	s, err := NewPGKeyStore(context.Background(), pool, nil)
+	if !errors.Is(err, ErrNoHolderLookup) || s != nil {
+		t.Fatalf("NewPGKeyStore(nil holders) = (%v, %v), want (nil, ErrNoHolderLookup)", s, err)
+	}
+}
