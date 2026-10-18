@@ -44,3 +44,34 @@ func TestRenderClaim(t *testing.T) {
 					t.Errorf("not valid JSON with the token: %s", out)
 				}
 			}
+		})
+	}
+}
+
+func TestClaimCmd_NotAnAnonymousBox(t *testing.T) {
+	old := claimURLFile
+	claimURLFile = filepath.Join(t.TempDir(), "missing")
+	t.Cleanup(func() { claimURLFile = old })
+
+	err := claimCmd.RunE(claimCmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "not an anonymous box") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestClaimCmd_PrintsFile(t *testing.T) {
+	old := claimURLFile
+	claimURLFile = filepath.Join(t.TempDir(), "claim-url")
+	t.Cleanup(func() { claimURLFile = old })
+	if err := os.WriteFile(claimURLFile, []byte(testClaimToken+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var sb strings.Builder
+	claimCmd.SetOut(&sb)
+	if err := claimCmd.RunE(claimCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sb.String(), testClaimToken) {
+		t.Errorf("output = %s", sb.String())
+	}
+}
