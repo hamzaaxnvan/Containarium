@@ -97,3 +97,36 @@ func TestRunComposeCLI_StatusMissingComposeFile(t *testing.T) {
 	var got map[string]any
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("stdout not valid JSON: %v", err)
+	}
+	if got["ok"] != false {
+		t.Errorf("ok = %v, want false", got["ok"])
+	}
+	if msg, _ := got["error"].(string); !strings.Contains(msg, "no compose file") {
+		t.Errorf("error missing 'no compose file': %q", msg)
+	}
+}
+
+func TestRunComposeCLI_DiscoverEmptyRoot(t *testing.T) {
+	// Empty tmp dir → discover returns empty stack list, ok=true.
+	tmp := t.TempDir()
+	var out, errBuf bytes.Buffer
+	code := RunComposeCLI([]string{"discover", "--root", tmp}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %q", code, errBuf.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout not valid JSON: %v", err)
+	}
+	if got["ok"] != true {
+		t.Errorf("ok = %v, want true", got["ok"])
+	}
+	// result.stacks must be empty or absent
+	result, _ := got["result"].(map[string]any)
+	if result == nil {
+		t.Fatal("result missing")
+	}
+	if stacks, ok := result["stacks"].([]any); ok && len(stacks) != 0 {
+		t.Errorf("expected empty stacks, got %d", len(stacks))
+	}
+}

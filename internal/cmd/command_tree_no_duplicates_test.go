@@ -22,3 +22,10 @@ func TestNoDuplicateTopLevelCommandNames(t *testing.T) {
 	seen := map[string]bool{}
 	for _, c := range rootCmd.Commands() {
 		name := c.Name()
+		if seen[name] {
+			t.Errorf("duplicate top-level command name %q registered on rootCmd — cobra.Command.Find has no defined tie-break for this", name)
+			continue
+		}
+		seen[name] = true
+	}
+}
