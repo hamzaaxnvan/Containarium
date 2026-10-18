@@ -146,3 +146,301 @@ func TestDetector_GenerateDockerfile(t *testing.T) {
 				"EXPOSE 3000",
 			},
 			wantErr: false,
+		},
+		{
+			name:     "Node.js Dockerfile with lock file",
+			langName: "Node.js",
+			opts: GenerateOptions{
+				Port:  3000,
+				Files: []string{"package.json", "package-lock.json", "index.js"},
+			},
+			wantContains: []string{
+				"FROM node:",
+				"WORKDIR /app",
+				"npm ci --omit=dev", // Has package-lock.json, so uses npm ci
+				"EXPOSE 3000",
+			},
+			wantErr: false,
+		},
+		{
+			name:     "Python Dockerfile",
+			langName: "Python",
+			opts: GenerateOptions{
+				Port:  8000,
+				Files: []string{"requirements.txt", "app.py"},
+			},
+			wantContains: []string{
+				"FROM python:",
+				"WORKDIR /app",
+				"pip install",
+				"EXPOSE 8000",
+			},
+			wantErr: false,
+		},
+		{
+			name:     "Go Dockerfile",
+			langName: "Go",
+			opts: GenerateOptions{
+				Port:  8080,
+				Files: []string{"go.mod", "main.go"},
+			},
+			wantContains: []string{
+				"FROM golang:",
+				"go build",
+				"CGO_ENABLED=0",
+				"EXPOSE 8080",
+			},
+			wantErr: false,
+		},
+		{
+			name:     "Static Dockerfile",
+			langName: "Static",
+			opts: GenerateOptions{
+				Port:  80,
+				Files: []string{"index.html", "styles.css"},
+			},
+			wantContains: []string{
+				"FROM nginx:",
+				"COPY",
+				"EXPOSE 80",
+			},
+			wantErr: false,
+		},
+		{
+			name:     "Unknown language",
+			langName: "Unknown",
+			opts:     GenerateOptions{Port: 3000},
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dockerfile, err := detector.GenerateDockerfile(tt.langName, tt.opts)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("GenerateDockerfile() expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("GenerateDockerfile() unexpected error: %v", err)
+				return
+			}
+
+			for _, want := range tt.wantContains {
+				if !strings.Contains(dockerfile, want) {
+					t.Errorf("GenerateDockerfile() missing %q in output:\n%s", want, dockerfile)
+				}
+			}
+		})
+	}
+}
+
+func TestNodeJSDetector_DetectStartCommand(t *testing.T) {
+	detector := &NodeJSDetector{}
+
+	tests := []struct {
+		name    string
+		files   []string
+		wantCmd string
+	}{
+		{
+			name:    "server.js present",
+			files:   []string{"package.json", "server.js"},
+			wantCmd: `["node", "server.js"]`,
+		},
+		{
+			name:    "index.js present",
+			files:   []string{"package.json", "index.js"},
+			wantCmd: `["node", "index.js"]`,
+		},
+		{
+			name:    "app.js present",
+			files:   []string{"package.json", "app.js"},
+			wantCmd: `["node", "app.js"]`,
+		},
+		{
+			name:    "main.js present",
+			files:   []string{"package.json", "main.js"},
+			wantCmd: `["node", "main.js"]`,
+		},
+		{
+			name:    "no entry file - defaults to npm start",
+			files:   []string{"package.json", "src/index.ts"},
+			wantCmd: `["npm", "start"]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := detector.detectStartCommand(tt.files)
+			if cmd != tt.wantCmd {
+				t.Errorf("detectStartCommand() = %q, want %q", cmd, tt.wantCmd)
+			}
+		})
+	}
+}
+
+func TestGoDetector_DetectMainPackage(t *testing.T) {
+	detector := &GoDetector{}
+
+	tests := []struct {
+		name    string
+		files   []string
+		wantPkg string
+	}{
+		{
+			name:    "main.go in root",
+			files:   []string{"go.mod", "main.go"},
+			wantPkg: ".",
+		},
+		{
+			name:    "cmd/server/main.go",
+			files:   []string{"go.mod", "cmd/server/main.go"},
+			wantPkg: "./cmd/server",
+		},
+		{
+			name:    "cmd/app/main.go",
+			files:   []string{"go.mod", "cmd/app/main.go"},
+			wantPkg: "./cmd/app",
+		},
+		{
+			name:    "generic cmd directory",
+			files:   []string{"go.mod", "cmd/other/main.go"},
+			wantPkg: "./cmd/...",
+		},
+		{
+			name:    "no main.go - defaults to current dir",
+			files:   []string{"go.mod", "pkg/lib/lib.go"},
+			wantPkg: ".",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkg := detector.detectMainPackage(tt.files)
+			if pkg != tt.wantPkg {
+				t.Errorf("detectMainPackage() = %q, want %q", pkg, tt.wantPkg)
+			}
+		})
+	}
+}
+
+func TestStaticDetector_DetectDocRoot(t *testing.T) {
+	detector := &StaticDetector{}
+
+	tests := []struct {
+		name    string
+		files   []string
+		wantDir string
+	}{
+		{
+			name:    "dist directory",
+			files:   []string{"dist/index.html", "dist/main.js"},
+			wantDir: "dist",
+		},
+		{
+			name:    "public directory",
+			files:   []string{"public/index.html", "public/styles.css"},
+			wantDir: "public",
+		},
+		{
+			name:    "build directory",
+			files:   []string{"build/index.html", "build/bundle.js"},
+			wantDir: "build",
+		},
+		{
+			name:    "out directory",
+			files:   []string{"out/index.html"},
+			wantDir: "out",
+		},
+		{
+			name:    "root directory",
+			files:   []string{"index.html", "styles.css"},
+			wantDir: ".",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := detector.detectDocRoot(tt.files)
+			if dir != tt.wantDir {
+				t.Errorf("detectDocRoot() = %q, want %q", dir, tt.wantDir)
+			}
+		})
+	}
+}
+
+func TestContainsFile(t *testing.T) {
+	tests := []struct {
+		name     string
+		files    []string
+		filename string
+		want     bool
+	}{
+		{
+			name:     "file exists at root",
+			files:    []string{"package.json", "index.js"},
+			filename: "package.json",
+			want:     true,
+		},
+		{
+			name:     "file exists in subdirectory",
+			files:    []string{"src/index.js", "src/app.js"},
+			filename: "index.js",
+			want:     true,
+		},
+		{
+			name:     "file does not exist",
+			files:    []string{"package.json", "index.js"},
+			filename: "go.mod",
+			want:     false,
+		},
+		{
+			name:     "empty file list",
+			files:    []string{},
+			filename: "package.json",
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := containsFile(tt.files, tt.filename)
+			if got != tt.want {
+				t.Errorf("containsFile() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNodeJSDetector_DefaultVersionIsPatched pins the default Node.js major to
+// a release with the CVE-2026-111497 (Brotli) fix. Node 20 has no fix.
+func TestNodeJSDetector_DefaultVersionIsPatched(t *testing.T) {
+	d := &NodeJSDetector{}
+
+	ok, version := d.Detect([]string{"package.json", "index.js"})
+	if !ok {
+		t.Fatal("Detect() did not detect a package.json project")
+	}
+	if version != "22" {
+		t.Errorf("Detect() default version = %q, want %q", version, "22")
+	}
+
+	dockerfile, err := d.GenerateDockerfile(GenerateOptions{
+		Port:  3000,
+		Files: []string{"package.json", "index.js"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateDockerfile() error = %v", err)
+	}
+	if !strings.Contains(dockerfile, "FROM node:22-alpine") {
+		t.Errorf("default Dockerfile does not use node:22-alpine:\n%s", dockerfile)
+	}
+	if strings.Contains(dockerfile, "node:20") {
+		t.Errorf("default Dockerfile still references EOL node:20:\n%s", dockerfile)
+	}
+}
