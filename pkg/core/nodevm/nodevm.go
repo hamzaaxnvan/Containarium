@@ -63,3 +63,101 @@ func (s Spec) Validate() error {
 	}
 	switch s.Kind {
 	case KindCPU, KindGPU:
+	default:
+		return fmt.Errorf("kind must be %q or %q, got %q", KindCPU, KindGPU, s.Kind)
+	}
+	if s.Kind == KindGPU && s.GPUPCI == "" {
+		return fmt.Errorf("kind %q requires --gpu pci=<addr>", KindGPU)
+	}
+	if s.CPU <= 0 {
+		return fmt.Errorf("cpu must be > 0")
+	}
+	if s.Memory == "" {
+		return fmt.Errorf("memory is required (e.g. 64GiB)")
+	}
+	if s.Sentinel == "" {
+		return fmt.Errorf("sentinel address is required")
+	}
+	if s.Pool == "" {
+		return fmt.Errorf("pool is required")
+	}
+	return nil
+}
+
+func (s Spec) image() string {
+	if s.Image == "" {
+		return DefaultImage
+	}
+	return s.Image
+}
+
+// SpotID is the tunnel/peer identity this node registers under — derived
+// from name+pool so it's stable and human-readable in `backends list`.
+func (s Spec) SpotID() string {
+	return s.Name + "-" + s.Pool
+}
+
+// launchArgs builds `incus launch <image> <name> --vm -c limits.cpu=N
+// -c limits.memory=X [--device root,size=<disk>]`.
+func launchArgs(s Spec) []string {
+	args := []string{
+		"launch", s.image(), s.Name, "--vm",
+		"-c", "limits.cpu=" + strconv.Itoa(s.CPU),
+		"-c", "limits.memory=" + s.Memory,
+	}
+	if s.Disk != "" {
+		args = append(args, "--device", "root,size="+s.Disk)
+	}
+	return args
+}
+
+// gpuDeviceArgs builds `incus config device add <name> gpu0 gpu pci=<addr>`.
+func gpuDeviceArgs(name, pci string) []string {
+	return []string{"config", "device", "add", name, gpuDeviceName, "gpu", "pci=" + pci}
+}
+
+func destroyArgs(name string) []string { return []string{"delete", "-f", name} }
+
+// listArgs lists only VMs. Note: `--vm` is a `launch`/`init` flag, NOT a
+// `list` flag — VM filtering on `list` uses the positional `type=` filter.
+func listArgs() []string {
+	return []string{"list", "type=virtual-machine", "--format", "csv", "-c", "ns"}
+}
+
+// RenderBootstrap produces the in-guest bootstrap script — the
+// setup-peer.sh-equivalent run inside the VM on first provision. It does
+// NOT contain the tunnel token (delivered separately as a file at
+// tokenPath); the script reads it from there. Pure function for testing.
+func RenderBootstrap(s Spec, tokenPath string) string {
+	var b strings.Builder
+	b.WriteString("set -euo pipefail\n")
+	b.WriteString("export DEBIAN_FRONTEND=noninteractive\n")
+	b.WriteString("# nested Incus (the node's container runtime)\n")
+	b.WriteString("apt-get update -qq\n")
+	b.WriteString("apt-get install -y -qq incus\n")
+	if s.Kind == KindGPU {
+		b.WriteString("# GPU node: the host VFIO-passed the card in; install the userspace driver\n")
+		b.WriteString("apt-get install -y -qq nvidia-driver-570-server || apt-get install -y -qq nvidia-utils-570-server || true\n")
+	}
+	b.WriteString("incus admin init --auto\n")
+	// KNOWN GAP (validated live 2026-06): this installs the daemon unit and
+	// launches the tunnel, but does NOT yet do the full daemon config+start
+	// that scripts/setup-peer.sh does — a jwt secret, the override.conf with
+	// --rest/--app-hosting/--network-subnet, `systemctl enable --now
+	// containarium`, and the tunnel's `--ports 22,8080`. Without those the
+	// node tunnels up but its REST /health is down, so the sentinel sees an
+	// unhealthy backend. Completing this (porting setup-peer.sh's daemon
+	// stanza) is the next step before a node-VM is a fully-healthy backend.
+	b.WriteString("# daemon + tunnel (see scripts/setup-peer.sh for the full daemon config this still needs)\n")
+	fmt.Fprintf(&b, "%s service install\n", guestBinaryPath)
+	fmt.Fprintf(&b, "export CONTAINARIUM_TUNNEL_TOKEN=\"$(cat %s)\"\n", tokenPath)
+	fmt.Fprintf(&b,
+		"%s tunnel --sentinel-addr %s --pool %s --spot-id %s &\n",
+		guestBinaryPath, shellQuote(s.Sentinel), shellQuote(s.Pool), shellQuote(s.SpotID()))
+	return b.String()
+}
+
+// shellQuote single-quotes s for safe interpolation into a bash command.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
