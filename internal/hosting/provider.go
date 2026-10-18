@@ -54,3 +54,32 @@ func NewProvider(cfg ProviderConfig) (DNSProvider, error) {
 		}, nil
 
 	// Future providers can be added here:
+	// case "cloudflare":
+	//     return newCloudflareProvider(cfg)
+
+	default:
+		return nil, fmt.Errorf("unsupported DNS provider: %s (supported: %v)", cfg.Provider, SupportedProviders())
+	}
+}
+
+// godaddyProvider wraps the GoDaddy client to implement DNSProvider
+type godaddyProvider struct {
+	client *godaddy.Client
+}
+
+func (p *godaddyProvider) Name() string {
+	return "godaddy"
+}
+
+func (p *godaddyProvider) VerifyCredentials(ctx context.Context) error {
+	return p.client.VerifyCredentials(ctx)
+}
+
+func (p *godaddyProvider) VerifyDomain(ctx context.Context, domain string) error {
+	_, err := p.client.GetDomain(ctx, domain)
+	return err
+}
+
+func (p *godaddyProvider) SetupHostingRecords(ctx context.Context, domain, serverIP string, includeWildcard bool) error {
+	return p.client.SetupHostingRecords(ctx, domain, serverIP, includeWildcard)
+}
