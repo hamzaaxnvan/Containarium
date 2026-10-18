@@ -120,3 +120,65 @@ func TestGuard_Admit(t *testing.T) {
 		{name: "past the default floor, snapshot", pools: []incus.StoragePoolUsage{gibPool("default", 99, 100)}, pool: "default", op: OperationSnapshot, refused: true},
 		{name: "a full pool elsewhere does not block this one", pools: []incus.StoragePoolUsage{gibPool("default", 10, 100), gibPool("other", 100, 100)}, pool: "default", op: OperationCreate},
 		{name: "per-pool floor lower than default", floors: Floors{"fast": 90}, pools: []incus.StoragePoolUsage{gibPool("fast", 92, 100)}, pool: "fast", op: OperationCreate, refused: true},
+		{name: "per-pool floor higher than default", floors: Floors{"fast": 98}, pools: []incus.StoragePoolUsage{gibPool("fast", 96, 100)}, pool: "fast", op: OperationSnapshot},
+		{name: "empty pool name means the default pool", pools: []incus.StoragePoolUsage{gibPool("default", 96, 100)}, pool: "", op: OperationCreate, refused: true},
+		{name: "pool never read: allow and warn", pools: []incus.StoragePoolUsage{gibPool("default", 99, 100)}, pool: "unread", op: OperationCreate, warned: true},
+		{name: "pool size not reported: allow and warn", pools: []incus.StoragePoolUsage{{Name: "default", UsedBytes: 5}}, pool: "default", op: OperationSnapshot, warned: true},
+		{name: "monitor has not read yet: allow and warn", pool: "default", op: OperationCreate, warned: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs []string
+			g := NewGuard(tt.floors, snapOf(tt.pools...), func() string { return "default" },
+				func(format string, a ...any) { logs = append(logs, fmt.Sprintf(format, a...)) })
+			err := g.Admit(tt.pool, tt.op)
+			if tt.refused {
+				var he *HeadroomError
+				if !errors.As(err, &he) {
+					t.Fatalf("Admit = %v, want a *HeadroomError", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Admit = %v, want allowed", err)
+			}
+			if tt.warned != (len(logs) == 1 && strings.Contains(logs[0], "WARN")) {
+				t.Errorf("warned = %v, want %v; logs = %q", len(logs) > 0, tt.warned, logs)
+			}
+		})
+	}
+}
+
+// The refusal names the pool, how full it is, the floor, and the headroom
+// left, and says which operation was refused.
+func TestGuard_RefusalMessage(t *testing.T) {
+	g := NewGuard(Floors{"tank": 90}, snapOf(gibPool("tank", 92, 100)), func() string { return "default" }, nil)
+	err := g.Admit("tank", OperationSnapshot)
+	if err == nil {
+		t.Fatal("want a refusal")
+	}
+	var he *HeadroomError
+	if !errors.As(err, &he) {
+		t.Fatalf("err = %T, want *HeadroomError", err)
+	}
+	if he.Pool != "tank" || he.FloorPercent != 90 || he.Op != OperationSnapshot || he.FreeBytes != 8<<30 {
+		t.Errorf("HeadroomError = %+v", he)
+	}
+	for _, needle := range []string{`"tank"`, "92.0% used", "floor 90%", "8.0 GiB", "snapshot"} {
+		if !strings.Contains(err.Error(), needle) {
+			t.Errorf("message lacks %q: %s", needle, err)
+		}
+	}
+	err = NewGuard(nil, snapOf(gibPool("default", 97, 100)), func() string { return "default" }, nil).Admit("", OperationCreate)
+	if err == nil || !strings.Contains(err.Error(), "container create") || !strings.Contains(err.Error(), `"default"`) {
+		t.Errorf("create refusal = %v, want it to name the operation and the resolved pool", err)
+	}
+}
+
+// A nil guard (daemon without a capacity monitor) admits everything.
+func TestGuard_NilAdmitsEverything(t *testing.T) {
+	var g *Guard
+	if err := g.Admit("default", OperationCreate); err != nil {
+		t.Fatalf("nil guard refused: %v", err)
+	}
+}
