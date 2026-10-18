@@ -30,3 +30,19 @@ func TestValidateTrustedProxyCIDRs_RejectsInvalidAndBlank(t *testing.T) {
 	if err := validateTrustedProxyCIDRs([]string{"10.0.0.0\\8"}); err == nil {
 		t.Error("malformed CIDR accepted")
 	}
+	if err := validateTrustedProxyCIDRs([]string{" "}); err == nil {
+		t.Error("blank entry accepted")
+	}
+}
+
+func TestValidateClientIPHeaders(t *testing.T) {
+	if err := validateClientIPHeaders(nil); err != nil {
+		t.Fatalf("nil headers should be fine (feature off): %v", err)
+	}
+	if err := validateClientIPHeaders([]string{"Cf-Connecting-Ip"}); err != nil {
+		t.Fatalf("real header rejected: %v", err)
+	}
+	if err := validateClientIPHeaders([]string{"Cf-Connecting-Ip", " "}); err == nil {
+		t.Error("blank header entry accepted")
+	}
+}
