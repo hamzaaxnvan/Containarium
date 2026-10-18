@@ -79,3 +79,24 @@ func buildResource(
 		return nil, fmt.Errorf("merge env attrs: %w", err)
 	}
 
+	// Layer 5: caller's extra attrs.
+	if len(extraAttrs) > 0 {
+		attrs := make([]attribute.KeyValue, 0, len(extraAttrs))
+		for k, v := range extraAttrs {
+			attrs = append(attrs, attribute.String(k, v))
+		}
+		extraRes := resource.NewSchemaless(attrs...)
+		base, err = resource.Merge(base, extraRes)
+		if err != nil {
+			return nil, fmt.Errorf("merge extra attrs: %w", err)
+		}
+	}
+
+	// Layer 6: defended distro stamp. Merged last so nothing in any
+	// prior layer can override it. This is a support signal —
+	// containarium.distro is intentionally not user-overridable.
+	stampRes := resource.NewSchemaless(
+		attribute.String(containariumDistroAttrKey, "go/"+distroVersion),
+	)
+	return resource.Merge(base, stampRes)
+}
