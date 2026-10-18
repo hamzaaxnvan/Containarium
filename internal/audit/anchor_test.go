@@ -208,3 +208,143 @@ func (f *fakeChainStore) RowHashAt(_ context.Context, id int64) (string, bool, e
 type fakeSink struct {
 	mu        sync.Mutex
 	published []struct {
+		checkpoint int64
+		root       string
+	}
+	publishErr error
+}
+
+func (f *fakeSink) PublishRoot(_ context.Context, checkpoint int64, root string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.publishErr != nil {
+		return f.publishErr
+	}
+	f.published = append(f.published, struct {
+		checkpoint int64
+		root       string
+	}{checkpoint, root})
+	return nil
+}
+
+func (f *fakeSink) LastPublished(context.Context) (int64, string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.published) == 0 {
+		return 0, "", false, nil
+	}
+	last := f.published[len(f.published)-1]
+	return last.checkpoint, last.root, true, nil
+}
+
+// Count and At are the synchronized accessors tests use — direct field
+// access on .published from more than one goroutine is exactly the bug
+// above; single-goroutine tests may still index .published directly since
+// nothing else touches it concurrently there.
+func (f *fakeSink) Count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.published)
+}
+
+func TestAnchorManager_PublishesNewCheckpoint(t *testing.T) {
+	store := &fakeChainStore{maxID: 42, hashes: map[int64]string{42: "root-42"}}
+	sink := &fakeSink{}
+	m := NewAnchorManager(store, sink, AnchorOptions{})
+	m.tick(context.Background())
+
+	if len(sink.published) != 1 {
+		t.Fatalf("published %d times, want 1", len(sink.published))
+	}
+	if sink.published[0].checkpoint != 42 || sink.published[0].root != "root-42" {
+		t.Errorf("published %+v, want checkpoint=42 root=root-42", sink.published[0])
+	}
+}
+
+// The whole reason a tick is cheap between real anchors: no new rows means
+// nothing to publish, so no sink write and no wasted round trip.
+func TestAnchorManager_SkipsWhenNoNewRows(t *testing.T) {
+	store := &fakeChainStore{maxID: 42, hashes: map[int64]string{42: "root-42"}}
+	sink := &fakeSink{}
+	m := NewAnchorManager(store, sink, AnchorOptions{})
+	m.tick(context.Background())
+	m.tick(context.Background())
+	m.tick(context.Background())
+
+	if len(sink.published) != 1 {
+		t.Fatalf("published %d times across 3 ticks with no new rows, want 1", len(sink.published))
+	}
+}
+
+func TestAnchorManager_PublishesAgainAfterNewRows(t *testing.T) {
+	store := &fakeChainStore{maxID: 42, hashes: map[int64]string{42: "root-42", 50: "root-50"}}
+	sink := &fakeSink{}
+	m := NewAnchorManager(store, sink, AnchorOptions{})
+	m.tick(context.Background())
+	store.maxID = 50
+	m.tick(context.Background())
+
+	if len(sink.published) != 2 {
+		t.Fatalf("published %d times, want 2", len(sink.published))
+	}
+	if sink.published[1].checkpoint != 50 {
+		t.Errorf("second publish checkpoint = %d, want 50", sink.published[1].checkpoint)
+	}
+}
+
+// An empty chain (nothing logged yet) has nothing to anchor — checkpoint 0
+// isn't a real row and publishing it would be meaningless.
+func TestAnchorManager_SkipsEmptyChain(t *testing.T) {
+	store := &fakeChainStore{maxID: 0}
+	sink := &fakeSink{}
+	m := NewAnchorManager(store, sink, AnchorOptions{})
+	m.tick(context.Background())
+
+	if len(sink.published) != 0 {
+		t.Fatalf("published %d times against an empty chain, want 0", len(sink.published))
+	}
+}
+
+// A failed publish must not wedge the manager — the next tick tries again.
+// This is the "loud, not fatal" half of #1706's "anchor failures are loud."
+func TestAnchorManager_RetriesAfterSinkFailure(t *testing.T) {
+	store := &fakeChainStore{maxID: 42, hashes: map[int64]string{42: "root-42"}}
+	sink := &fakeSink{publishErr: errors.New("disk full")}
+	m := NewAnchorManager(store, sink, AnchorOptions{})
+	m.tick(context.Background())
+	if len(sink.published) != 0 {
+		t.Fatalf("published %d times despite the sink erroring, want 0", len(sink.published))
+	}
+
+	sink.publishErr = nil
+	m.tick(context.Background())
+	if len(sink.published) != 1 {
+		t.Fatalf("published %d times after the sink recovered, want 1 — the manager must retry, not give up permanently", len(sink.published))
+	}
+}
+
+func TestAnchorManager_StartStop(t *testing.T) {
+	store := &fakeChainStore{maxID: 1, hashes: map[int64]string{1: "root-1"}}
+	sink := &fakeSink{}
+	fired := make(chan struct{}, 1)
+	clock := time.Now
+	m := NewAnchorManager(store, sink, AnchorOptions{Interval: time.Millisecond, Clock: clock})
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Start(ctx)
+	go func() {
+		for i := 0; i < 50; i++ {
+			if sink.Count() > 0 {
+				fired <- struct{}{}
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ticker never published within 2s")
+	}
+	cancel()
+	m.Stop()
+}
