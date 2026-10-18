@@ -60,3 +60,34 @@ func TestVethPolicyValue_BoxIPAppended(t *testing.T) {
 		t.Errorf("tenant_id = %d, want 7", got)
 	}
 	if b[4] != ModeEnforce || b[7] != ModeEnforce {
+		t.Errorf("mode/egress_mode = %d/%d, want %d/%d", b[4], b[7], ModeEnforce, ModeEnforce)
+	}
+	if got := b[8:12]; string(got) != string([]byte{10, 100, 0, 10}) {
+		t.Errorf("box_ip bytes = %v, want 10.100.0.10 in network order", got)
+	}
+	// Unknown IP: the program reads 0 and skips source validation for the veth.
+	z := vethPolicyValue(PolicyConfig{TenantID: 7, Mode: ModeEnforce})
+	if binary.NativeEndian.Uint32(z[8:12]) != 0 {
+		t.Errorf("box_ip without an IP = %v, want 0", z[8:12])
+	}
+}
+
+// fitVethPolicyValue adapts the 12-byte value to the loaded object's own
+// policy_cfg size: an object from before #2618 has an 8-byte value and must get
+// exactly 8 bytes (cilium/ebpf rejects a size mismatch); a larger one is
+// zero-padded, which is the "appended field reads as unset" convention.
+func TestFitVethPolicyValue(t *testing.T) {
+	v := vethPolicyValue(PolicyConfig{TenantID: 1, Mode: ModeLogOnly, BoxIP: [4]byte{10, 0, 0, 1}})
+	if got := fitVethPolicyValue(v, 8); len(got) != 8 || string(got) != string(v[:8]) {
+		t.Errorf("fit to 8 = %v, want the first 8 bytes %v", got, v[:8])
+	}
+	if got := fitVethPolicyValue(v, 12); len(got) != 12 || string(got) != string(v[:12]) {
+		t.Errorf("fit to 12 (box_ip, no flags) = %v, want %v", got, v[:12])
+	}
+	if got := fitVethPolicyValue(v, 16); string(got) != string(v[:]) {
+		t.Errorf("fit to 16 = %v, want %v", got, v[:])
+	}
+	if got := fitVethPolicyValue(v, 20); len(got) != 20 || string(got[:16]) != string(v[:]) || got[16] != 0 || got[19] != 0 {
+		t.Errorf("fit to 20 = %v, want %v then zeros", got, v[:])
+	}
+}
