@@ -4,3 +4,21 @@
       "name": "alice-container",
       "cpuUsageSeconds": "1234",
       "memoryUsageBytes": "536870912",
+      "memoryPeakBytes": "1073741824",
+      "diskUsageBytes": "5368709120",
+      "networkRxBytes": "104857600",
+      "networkTxBytes": "52428800",
+      "processCount": 42
+    },
+    {
+      "name": "bob-gpu-container",
+      "cpuUsageSeconds": "98765",
+      "memoryUsageBytes": "34359738368",
+      "memoryPeakBytes": "51539607552",
+      "diskUsageBytes": "214748364800",
+      "networkRxBytes": "10737418240",
+      "networkTxBytes": "5368709120",
+      "processCount": 187
+    }
+  ]
+}
