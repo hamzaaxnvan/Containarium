@@ -129,3 +129,134 @@ func TestCreateZFSPool_SurfacesTheIncusError(t *testing.T) {
 // StoragePoolSource must tell three states apart, and the middle one is why
 // this function exists rather than callers using GetStoragePool directly:
 //
+//   - the pool is not there          → create it
+//   - the pool is there, no source   → refuse; something else owns the name
+//   - the pool is there with a source → reuse it if the source matches
+//
+// Collapsing "absent" into "exists with no source" makes a name collision
+// look like an absent pool, and the hook would try to create over the top of
+// whatever is already there.
+func TestStoragePoolSource_ReportsAbsentDistinctlyFromEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pools      map[string]*api.StoragePool
+		wantSource string
+		wantExists bool
+	}{
+		{
+			name: "pool with a source",
+			pools: map[string]*api.StoragePool{
+				"containarium-tenant-alice": {
+					Name:           "containarium-tenant-alice",
+					Driver:         "zfs",
+					StoragePoolPut: api.StoragePoolPut{Config: map[string]string{"source": "tank/tenants/alice"}},
+				},
+			},
+			wantSource: "tank/tenants/alice", wantExists: true,
+		},
+		{
+			name: "pool with no source at all",
+			pools: map[string]*api.StoragePool{
+				"containarium-tenant-alice": {
+					Name:           "containarium-tenant-alice",
+					Driver:         "zfs",
+					StoragePoolPut: api.StoragePoolPut{Config: map[string]string{}},
+				},
+			},
+			wantSource: "", wantExists: true,
+		},
+		{
+			name: "pool with a nil config map",
+			pools: map[string]*api.StoragePool{
+				"containarium-tenant-alice": {Name: "containarium-tenant-alice", Driver: "zfs"},
+			},
+			wantSource: "", wantExists: true,
+		},
+		{
+			name:       "no such pool",
+			pools:      map[string]*api.StoragePool{},
+			wantSource: "", wantExists: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Client{server: &fakeStoragePoolServer{pools: tc.pools}}
+
+			source, exists, err := c.StoragePoolSource("containarium-tenant-alice")
+			if err != nil {
+				t.Fatalf("StoragePoolSource: %v", err)
+			}
+			if exists != tc.wantExists {
+				t.Errorf("exists = %v, want %v", exists, tc.wantExists)
+			}
+			if source != tc.wantSource {
+				t.Errorf("source = %q, want %q", source, tc.wantSource)
+			}
+		})
+	}
+}
+
+// A pool we could not read is not a pool that is absent. Reporting an
+// unreadable pool as missing would have the hook create over the top of one
+// that exists — the same "we could not check" vs "we checked and it is not
+// there" distinction reviewExistingStorage already makes for the driver.
+func TestStoragePoolSource_AnUnreadablePoolIsAnErrorNotAnAbsence(t *testing.T) {
+	boom := errors.New("connection reset")
+	c := &Client{server: &fakeStoragePoolServer{getErr: boom}}
+
+	_, exists, err := c.StoragePoolSource("containarium-tenant-alice")
+	if err == nil {
+		t.Fatal("a pool that could not be read was reported as a clean answer")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("err = %v, want it to wrap %v", err, boom)
+	}
+	if exists {
+		t.Error("exists = true alongside an error — callers must not act on this")
+	}
+}
+
+func TestDeleteStoragePool(t *testing.T) {
+	f := &fakeStoragePoolServer{}
+	c := &Client{server: f}
+
+	if err := c.DeleteStoragePool("containarium-tenant-alice"); err != nil {
+		t.Fatalf("DeleteStoragePool: %v", err)
+	}
+	if len(f.deleted) != 1 || f.deleted[0] != "containarium-tenant-alice" {
+		t.Errorf("deleted = %v, want [containarium-tenant-alice]", f.deleted)
+	}
+}
+
+// Deleting a pool that is already gone is the end state the caller wanted.
+// Tenant offboarding (#1343) has to be re-runnable after a partial failure,
+// and a hard error on the second run would leave the operator unable to
+// finish a teardown they already started.
+func TestDeleteStoragePool_AbsentIsNotAnError(t *testing.T) {
+	c := &Client{server: &fakeStoragePoolServer{deleteErr: notFoundErr()}}
+
+	if err := c.DeleteStoragePool("containarium-tenant-alice"); err != nil {
+		t.Errorf("deleting an absent pool returned %v, want nil — teardown must be re-runnable", err)
+	}
+}
+
+func TestDeleteStoragePool_SurfacesRealFailures(t *testing.T) {
+	boom := errors.New("storage pool is in use")
+	c := &Client{server: &fakeStoragePoolServer{deleteErr: boom}}
+
+	if err := c.DeleteStoragePool("containarium-tenant-alice"); !errors.Is(err, boom) {
+		t.Errorf("err = %v, want it to wrap %v — a pool still holding volumes must not "+
+			"look like a successful teardown", err, boom)
+	}
+}
+
+func TestDeleteStoragePool_RejectsAnEmptyName(t *testing.T) {
+	f := &fakeStoragePoolServer{}
+	c := &Client{server: f}
+
+	if err := c.DeleteStoragePool(""); err == nil {
+		t.Fatal("no error")
+	}
+	if len(f.deleted) != 0 {
+		t.Errorf("Incus was called with an empty pool name: %v", f.deleted)
+	}
+}

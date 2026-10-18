@@ -99,3 +99,104 @@ func TestHandleSprintBoard_RejectedIsError(t *testing.T) {
 	c := sprintServer(t, 200, `{"mirror":{"state":"SPRINT_MIRROR_STATE_REJECTED"}}`, nil)
 	_, err := handleSprintBoard(c, map[string]interface{}{"org_id": "o", "project": "acme/app", "number": float64(120)})
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "REJECTED")
+}
+
+func TestHandleSprintBoard_UnknownStateIsError(t *testing.T) {
+	c := sprintServer(t, 200, `{"mirror":{"state":"SPRINT_MIRROR_STATE_UNSPECIFIED"}}`, nil)
+	_, err := handleSprintBoard(c, map[string]interface{}{"org_id": "o", "project": "acme/app", "number": float64(120)})
+	require.Error(t, err)
+}
+
+func TestHandleSprintBoard_RequiresArgs(t *testing.T) {
+	c := sprintServer(t, 200, sprintPresentBody, nil)
+	for name, args := range map[string]map[string]interface{}{
+		"no org":     {"project": "a/b", "number": float64(1)},
+		"no project": {"org_id": "o", "number": float64(1)},
+		"no number":  {"org_id": "o", "project": "a/b"},
+		"bad prov":   {"org_id": "o", "project": "a/b", "number": float64(1), "provider": "svn"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := handleSprintBoard(c, args)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestHandleSprintBoard_GitLabProviderPassedThrough(t *testing.T) {
+	var seen http.Request
+	c := sprintServer(t, 200, `{"mirror":{"state":"SPRINT_MIRROR_STATE_PROVIDER_NOT_SUPPORTED"}}`, &seen)
+	_, err := handleSprintBoard(c, map[string]interface{}{"org_id": "o", "project": "g/p", "number": float64(3), "provider": "gitlab"})
+	require.NoError(t, err)
+	assert.Equal(t, "TRACKER_PROVIDER_GITLAB", seen.URL.Query().Get("umbrella.provider"))
+}
+
+func TestHandleSprintBoard_APIErrorPropagates(t *testing.T) {
+	c := sprintServer(t, 404, `{"message":"not found"}`, nil)
+	_, err := handleSprintBoard(c, map[string]interface{}{"org_id": "o", "project": "a/b", "number": float64(1)})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "404")
+}
+
+func TestHandleSprintList(t *testing.T) {
+	c := sprintServer(t, 200, `{"sprints":[
+	 {"umbrella":{"provider":"TRACKER_PROVIDER_GITHUB","project":"acme/app","number":"120"},"title":"Sprint 120","state":"SPRINT_MIRROR_STATE_PRESENT"},
+	 {"umbrella":{"provider":"TRACKER_PROVIDER_GITHUB","project":"acme/web","number":"7"},"title":"Sprint 7","state":"SPRINT_MIRROR_STATE_NO_MIRROR_YET"}]}`, nil)
+	out, err := handleSprintList(c, map[string]interface{}{"org_id": "o"})
+	require.NoError(t, err)
+	assert.Contains(t, out, "acme/app#120")
+	assert.Contains(t, out, "Sprint 120")
+	assert.Contains(t, out, "PRESENT")
+	assert.Contains(t, out, "acme/web#7")
+	assert.Contains(t, out, "NO_MIRROR_YET")
+
+	_, err = handleSprintList(c, map[string]interface{}{})
+	require.Error(t, err, "org_id is required")
+
+	c = sprintServer(t, 200, `{}`, nil)
+	out, err = handleSprintList(c, map[string]interface{}{"org_id": "o"})
+	require.NoError(t, err)
+	assert.Contains(t, out, "No sprints")
+}
+
+func TestSprintTools_RegisteredReadOnlyWithScope(t *testing.T) {
+	assert.Equal(t, auth.ScopeTrackerRead, toolScopeAssignments()["sprint_board"])
+	assert.Equal(t, auth.ScopeTrackerRead, toolScopeAssignments()["sprint_list"])
+	names := map[string]bool{}
+	for _, tl := range sprintTools() {
+		names[tl.Name] = true
+		assert.NotNil(t, tl.Handler)
+	}
+	assert.True(t, names["sprint_board"] && names["sprint_list"])
+}
+
+func TestClient_GetSprintBoard_DecodesTimestampsAndIdentity(t *testing.T) {
+	c := sprintServer(t, 200, `{"mirror":{"state":"SPRINT_MIRROR_STATE_PRESENT","board":{"sprintId":"s1","provider":"SPRINT_PROVIDER_GITHUB","contentHash":"h","project":"acme/app","umbrella":"0",
+	 "items":[{"number":"5","title":"T","rank":2,"state":"SPRINT_ITEM_STATE_RUNNING","runStatus":"SPRINT_RUN_STATUS_STARTED","runStartedAt":"2026-10-24T10:00:00Z","waitSince":"2026-10-24T09:00:00Z","prUrl":"https://example.com/pr/1","prState":"SPRINT_PR_STATE_OPEN","attention":["SPRINT_ATTENTION_PR_TO_MERGE"],"note":"n"}]}}}`, nil)
+	m, err := c.GetSprintBoard(GetSprintBoardRequest{OrgID: "o", Project: "acme/app", Number: 1})
+	require.NoError(t, err)
+	b := m.Board
+	require.NotNil(t, b)
+	assert.Equal(t, "s1", b.SprintID)
+	assert.Equal(t, "SPRINT_PROVIDER_GITHUB", b.Provider)
+	assert.Equal(t, "h", b.ContentHash)
+	it := b.Items[0]
+	assert.Equal(t, int32(2), it.Rank)
+	assert.Equal(t, "2026-10-24T10:00:00Z", it.RunStartedAt)
+	assert.Equal(t, "2026-10-24T09:00:00Z", it.WaitSince)
+	assert.Equal(t, []string{"SPRINT_ATTENTION_PR_TO_MERGE"}, it.Attention)
+}
+
+func TestSprintTools_ServerErrorsSurfaceStatusAndMessage(t *testing.T) {
+	for status, body := range map[int]string{
+		503: `{"code":14,"message":"the tracker is rate limiting reads; retry later"}`,
+		404: `{"code":5,"message":"repo not found"}`,
+	} {
+		c := sprintServer(t, status, body, nil)
+		_, err := handleSprintBoard(c, map[string]interface{}{"org_id": "o", "project": "a/b", "number": float64(1)})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), body[strings.Index(body, `"message":"`)+11:len(body)-2])
+		_, err = handleSprintList(c, map[string]interface{}{"org_id": "o"})
+		require.Error(t, err)
+	}
+}
