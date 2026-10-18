@@ -82,3 +82,46 @@ func GetCommitHash() string {
 	for _, setting := range bi.Settings {
 		switch setting.Key {
 		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+
+	if revision == "" {
+		return "unknown"
+	}
+
+	if modified {
+		return revision + "-dirty"
+	}
+
+	return revision
+}
+
+// Get returns the version information
+func Get() Info {
+	return Info{
+		Version:   Version,
+		GitCommit: GetCommitHash(),
+		BuildTime: BuildTime,
+		GoVersion: GoVersion,
+		Platform:  Platform,
+	}
+}
+
+// String returns a human-readable version string
+func String() string {
+	return fmt.Sprintf("Containarium v%s", Version)
+}
+
+// Verbose returns a detailed version string
+func Verbose() string {
+	return fmt.Sprintf(`Containarium Version Information:
+  Version:    %s
+  Git Commit: %s
+  Built:      %s
+  Go Version: %s
+  Platform:   %s`,
+		Version, GetCommitHash(), BuildTime, GoVersion, Platform)
+}

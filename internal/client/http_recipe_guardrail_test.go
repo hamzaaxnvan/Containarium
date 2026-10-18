@@ -36,3 +36,22 @@ func TestHTTPDeployRecipe_SendsGuardrailInput(t *testing.T) {
 		Attestation: &pb.GuardrailAttestation{
 			SubjectSha256: "abc", PolicyHash: "def", KeyId: "k", Signature: []byte{1, 2, 3},
 			Verdict:      pb.GuardrailVerdict_GUARDRAIL_VERDICT_PASS,
+			KindsScanned: []pb.GuardrailKind{pb.GuardrailKind_GUARDRAIL_KIND_PII},
+		},
+	}
+	if _, err := c.DeployRecipe("gated", "alice", "", "", "", nil, in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DeployRecipe("plain", "alice", "", "", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("got %d requests", len(bodies))
+	}
+	if !proto.Equal(bodies[0].GetGuardrailInput(), in) || bodies[0].GetRecipeId() != "gated" {
+		t.Fatalf("server decoded %v, want guardrail_input %v", bodies[0], in)
+	}
+	if bodies[1].GetGuardrailInput() != nil {
+		t.Fatalf("ungated deploy sent guardrail_input %v", bodies[1].GetGuardrailInput())
+	}
+}
