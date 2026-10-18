@@ -13,3 +13,19 @@ type StatusWriter struct {
 	StatusCode int
 }
 
+// NewStatusWriter wraps w. StatusCode starts at 200, which is what the server
+// sends when the handler never calls WriteHeader.
+func NewStatusWriter(w http.ResponseWriter) *StatusWriter {
+	return &StatusWriter{ResponseWriter: w, StatusCode: http.StatusOK}
+}
+
+// WriteHeader records the status and forwards it.
+func (sw *StatusWriter) WriteHeader(code int) {
+	sw.StatusCode = code
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap exposes the underlying writer so http.NewResponseController can
+// reach its Flusher/Hijacker. Without it, server-streaming responses (which
+// flush after every chunk) fail with http.ErrNotSupported (#2773).
+func (sw *StatusWriter) Unwrap() http.ResponseWriter { return sw.ResponseWriter }
