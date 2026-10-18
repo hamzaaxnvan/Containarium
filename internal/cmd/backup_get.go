@@ -16,3 +16,41 @@ var backupGetCmd = &cobra.Command{
 
 func init() {
 	backupCmd.AddCommand(backupGetCmd)
+}
+
+func runBackupGet(cmd *cobra.Command, args []string) error {
+	c, err := newBackupClientFn()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	r, err := c.GetBackup(args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Printf("ID:          %s\n", r.Id)
+	fmt.Printf("User:        %s\n", r.Username)
+	fmt.Printf("Database:    %s\n", r.Database)
+	fmt.Printf("Engine:      %s\n", engineLabel(r.Engine))
+	fmt.Printf("Created:     %s\n", r.CreatedAt)
+	fmt.Printf("Size:        %s\n", humanBytes(r.SizeBytes))
+	fmt.Printf("SHA-256:     %s\n", r.Sha256)
+	fmt.Printf("Destination: %s\n", destLabel(r.Destination))
+	fmt.Printf("Location:    %s\n", r.Location)
+	if r.Hook != "" {
+		fmt.Printf("Hook:        %s\n", r.Hook)
+	}
+	if r.Encrypted {
+		fmt.Printf("Encrypted:   yes (age recipient %s; restore needs --age-identity-file)\n", r.AgeRecipient)
+	} else {
+		// #3169: say so rather than leave the absence of a line to be noticed.
+		fmt.Printf("Encrypted:   NO (stored in plaintext)\n")
+	}
+	if r.KeyMode == pb.BackupKeyMode_BACKUP_KEY_MODE_MANAGED || r.KeyMode == pb.BackupKeyMode_BACKUP_KEY_MODE_BOTH {
+		fmt.Printf("Key mode:    %s\n", keyModeLabel(r.KeyMode))
+		fmt.Printf("Key version: %s\n", r.KekId)
+		fmt.Printf("Wrapped key: %d bytes (unwrap under your own KMS credentials to obtain the identity)\n", len(r.WrappedKey))
+	}
+	return nil
+}
