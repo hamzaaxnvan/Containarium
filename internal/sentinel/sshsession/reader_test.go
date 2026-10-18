@@ -162,3 +162,168 @@ func TestReadRecordsFile_ReadsWhatWasWritten(t *testing.T) {
 		t.Fatalf("ReadRecordsFile: %v", err)
 	}
 	if len(got) != 2 {
+		t.Fatalf("got %d records, want 2", len(got))
+	}
+}
+
+// TestFollow_PicksUpRecordAppendedAfterStart is the "tail -f" acceptance
+// criterion: Follow must observe a record written to the sink AFTER
+// following has already begun. Synchronization is entirely through the
+// buffered channel Follow sends on — no sleep-then-assert timing
+// dependency. FollowPollInterval is dialed down so the test doesn't wait
+// through the production polling cadence, but the assertion itself blocks
+// on the channel (bounded by a generous safety-net timeout), not on any
+// fixed sleep.
+func TestFollow_PicksUpRecordAppendedAfterStart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ssh-sessions.jsonl")
+
+	// The file exists with one record before Follow starts; Follow must
+	// NOT replay it (that's ReadRecordsFile's job), only report what's
+	// appended from here on.
+	writeJSONL(t, path, Record{SessionID: "pre-existing", Phase: SessionPhaseOpen})
+
+	origInterval := FollowPollInterval
+	FollowPollInterval = 5 * time.Millisecond
+	defer func() { FollowPollInterval = origInterval }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan Record, 8)
+	errc := make(chan error, 1)
+	go func() { errc <- Follow(ctx, path, Filter{}, out) }()
+
+	// Give Follow a moment to open the file and seek to its current end
+	// before we append — otherwise there is no ordering guarantee the
+	// open-at-end race requires. This is bounded and only affects when
+	// the append happens, not whether the test's assertion succeeds; the
+	// actual pass/fail synchronization is the channel receive below.
+	time.Sleep(20 * time.Millisecond)
+
+	writeJSONL(t, path, Record{
+		SessionID: "sess-new", Phase: SessionPhaseOpen,
+		Login: "carol", ClientIP: "192.0.2.44",
+	})
+
+	select {
+	case rec := <-out:
+		if rec.SessionID != "sess-new" {
+			t.Fatalf("got session_id %q, want sess-new", rec.SessionID)
+		}
+		if rec.Login != "carol" {
+			t.Fatalf("got login %q, want carol", rec.Login)
+		}
+	case err := <-errc:
+		t.Fatalf("Follow exited early: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Follow to deliver the appended record")
+	}
+
+	cancel()
+	select {
+	case <-errc:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Follow did not exit after context cancellation")
+	}
+}
+
+// TestFollow_FiltersByLogin confirms Follow applies the same Filter
+// semantics as ReadRecords, not just "everything new".
+func TestFollow_FiltersByLogin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ssh-sessions.jsonl")
+	writeJSONL(t, path) // create the (empty) file up front
+
+	origInterval := FollowPollInterval
+	FollowPollInterval = 5 * time.Millisecond
+	defer func() { FollowPollInterval = origInterval }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan Record, 8)
+	errc := make(chan error, 1)
+	go func() { errc <- Follow(ctx, path, Filter{Login: "carol"}, out) }()
+
+	time.Sleep(20 * time.Millisecond)
+
+	writeJSONL(t, path,
+		Record{SessionID: "sess-a", Phase: SessionPhaseOpen, Login: "alice", ClientIP: "203.0.113.11"},
+		Record{SessionID: "sess-b", Phase: SessionPhaseOpen, Login: "carol", ClientIP: "192.0.2.45"},
+	)
+
+	select {
+	case rec := <-out:
+		if rec.Login != "carol" || rec.SessionID != "sess-b" {
+			t.Fatalf("got %+v, want only carol's sess-b record", rec)
+		}
+	case err := <-errc:
+		t.Fatalf("Follow exited early: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the filtered record")
+	}
+
+	// Nothing else should arrive — alice's record must have been dropped
+	// by the filter, not merely delayed.
+	select {
+	case rec := <-out:
+		t.Fatalf("unexpected extra record delivered: %+v", rec)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	// Wait for Follow to actually observe cancellation and return before
+	// this test's deferred FollowPollInterval restore runs — otherwise
+	// that write can race Follow's own read of the same package var if
+	// the goroutine is still between poll ticks (caught by -race).
+	select {
+	case <-errc:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Follow did not exit after context cancellation")
+	}
+}
+
+// TestFollow_WaitsForFileToBeCreated matches `tail -f`'s own behavior on a
+// not-yet-existing path: Follow must not error out, it must pick the
+// record up once the file (and the plugin process that owns it) appears.
+func TestFollow_WaitsForFileToBeCreated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "not-created-yet.jsonl")
+
+	origInterval := FollowPollInterval
+	FollowPollInterval = 5 * time.Millisecond
+	defer func() { FollowPollInterval = origInterval }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out := make(chan Record, 8)
+	errc := make(chan error, 1)
+	go func() { errc <- Follow(ctx, path, Filter{}, out) }()
+
+	time.Sleep(20 * time.Millisecond)
+	writeJSONL(t, path, Record{SessionID: "sess-late", Phase: SessionPhaseOpen})
+
+	select {
+	case rec := <-out:
+		if rec.SessionID != "sess-late" {
+			t.Fatalf("got %q, want sess-late", rec.SessionID)
+		}
+	case err := <-errc:
+		t.Fatalf("Follow exited early: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Follow to notice the newly created file")
+	}
+
+	cancel()
+	// Wait for Follow to actually observe cancellation and return before
+	// this test's deferred FollowPollInterval restore runs — otherwise
+	// that write can race Follow's own read of the same package var if
+	// the goroutine is still between poll ticks (caught by -race).
+	select {
+	case <-errc:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Follow did not exit after context cancellation")
+	}
+}
