@@ -114,3 +114,120 @@ func TestGenerateToken_NoNonExpiringTokens(t *testing.T) {
 		tokenStr, err := tm.GenerateToken("testuser", []string{"admin"}, expiry)
 		if err != nil {
 			t.Fatalf("GenerateToken failed for expiry %v: %v", expiry, err)
+		}
+
+		claims, err := tm.ValidateToken(tokenStr)
+		if err != nil {
+			t.Fatalf("ValidateToken failed: %v", err)
+		}
+
+		if claims.ExpiresAt == nil {
+			t.Errorf("SECURITY VIOLATION: Token with requested expiry %v has no expiry set", expiry)
+		}
+	}
+}
+
+func TestValidateToken_RejectsExpiredTokens(t *testing.T) {
+	tm, _ := NewTokenManager("test-secret-must-be-at-least-32-bytes-long-ok", "test-issuer")
+
+	// Generate a token with very short expiry
+	tokenStr, err := tm.GenerateToken("testuser", []string{"admin"}, 1*time.Millisecond)
+	if err != nil {
+		t.Fatalf("GenerateToken failed: %v", err)
+	}
+
+	// Wait for it to expire
+	time.Sleep(10 * time.Millisecond)
+
+	// Should fail validation
+	_, err = tm.ValidateToken(tokenStr)
+	if err == nil {
+		t.Error("ValidateToken should reject expired tokens")
+	}
+}
+
+func TestValidateToken_RejectsInvalidTokens(t *testing.T) {
+	tm, _ := NewTokenManager("test-secret-must-be-at-least-32-bytes-long-ok", "test-issuer")
+
+	invalidTokens := []struct {
+		name  string
+		token string
+	}{
+		{"empty token", ""},
+		{"garbage", "not-a-token"},
+		{"malformed JWT", "eyJhbGciOiJIUzI1NiJ9.garbage.garbage"},
+	}
+
+	for _, tt := range invalidTokens {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tm.ValidateToken(tt.token)
+			if err == nil {
+				t.Errorf("ValidateToken should reject %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestValidateToken_RejectsWrongSecret(t *testing.T) {
+	tm1, _ := NewTokenManager("test-secret-1-must-be-at-least-32-bytes-long", "test-issuer")
+	tm2, _ := NewTokenManager("test-secret-2-must-be-at-least-32-bytes-long", "test-issuer")
+
+	// Generate token with tm1
+	tokenStr, err := tm1.GenerateToken("testuser", []string{"admin"}, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateToken failed: %v", err)
+	}
+
+	// Try to validate with tm2 (different secret)
+	_, err = tm2.ValidateToken(tokenStr)
+	if err == nil {
+		t.Error("ValidateToken should reject tokens signed with different secret")
+	}
+}
+
+func TestTokenClaims(t *testing.T) {
+	tm, _ := NewTokenManager("test-secret-must-be-at-least-32-bytes-long-ok", "test-issuer")
+
+	username := "testuser"
+	roles := []string{"admin", "user"}
+
+	tokenStr, err := tm.GenerateToken(username, roles, 1*time.Hour)
+	if err != nil {
+		t.Fatalf("GenerateToken failed: %v", err)
+	}
+
+	claims, err := tm.ValidateToken(tokenStr)
+	if err != nil {
+		t.Fatalf("ValidateToken failed: %v", err)
+	}
+
+	if claims.Username != username {
+		t.Errorf("expected username %s, got %s", username, claims.Username)
+	}
+
+	if len(claims.Roles) != len(roles) {
+		t.Errorf("expected %d roles, got %d", len(roles), len(claims.Roles))
+	}
+
+	for i, role := range roles {
+		if claims.Roles[i] != role {
+			t.Errorf("expected role %s at index %d, got %s", role, i, claims.Roles[i])
+		}
+	}
+
+	if claims.Issuer != "test-issuer" {
+		t.Errorf("expected issuer 'test-issuer', got %s", claims.Issuer)
+	}
+}
+
+// #2592: the CLI needs the effective cap to fail loud instead of clamping.
+func TestMaxTokenExpiry(t *testing.T) {
+	t.Setenv("CONTAINARIUM_MAX_TOKEN_EXPIRY_HOURS", "")
+	tm, err := NewTokenManager(string(make([]byte, MinSecretKeyLen)), "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tm.MaxTokenExpiry(); got != DefaultMaxTokenExpiry {
+		t.Fatalf("MaxTokenExpiry() = %v, want %v", got, DefaultMaxTokenExpiry)
+	}
+}

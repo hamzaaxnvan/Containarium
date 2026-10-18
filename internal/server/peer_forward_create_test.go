@@ -169,3 +169,61 @@ func TestForwardCreateContainer_ClearsBackendID(t *testing.T) {
 	_ = (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal([]byte(forwarded), &got)
 	if got.BackendId != "" {
 		t.Errorf("backend_id = %q was forwarded; the peer would try to route onwards", got.BackendId)
+	}
+
+	// The caller's own request must not be mutated — it is used after this
+	// returns, and clearing a field on it would be an invisible side effect.
+	if req.BackendId != "peer-a" {
+		t.Errorf("the caller's request was mutated: backend_id is now %q", req.BackendId)
+	}
+}
+
+// The response side had the same defect, and one field worse: `state` was
+// parsed into a struct field that was then never assigned, so a container
+// created on a peer came back reporting no state at all.
+func TestForwardCreateContainer_DecodesFullResponse(t *testing.T) {
+	var forwarded string
+	srv := capturingPeer(t, &forwarded)
+
+	resp, err := peerClientFor(srv).ForwardCreateContainer("token", fullCreateRequest())
+	if err != nil {
+		t.Fatalf("ForwardCreateContainer: %v", err)
+	}
+	if resp.Container == nil {
+		t.Fatal("no container in the response")
+	}
+
+	if resp.Container.State != pb.ContainerState_CONTAINER_STATE_RUNNING {
+		t.Errorf("state = %v, want RUNNING — it was parsed and then dropped on the floor", resp.Container.State)
+	}
+	if resp.Container.SshHost != "edge.example" {
+		t.Errorf("ssh_host = %q, want it preserved", resp.Container.SshHost)
+	}
+	if resp.Container.Pool != "gpu-pool" {
+		t.Errorf("pool = %q, want it preserved", resp.Container.Pool)
+	}
+	// Still stamped with which backend it landed on.
+	if resp.Container.BackendId != "peer-a" {
+		t.Errorf("backend_id = %q, want the peer's ID", resp.Container.BackendId)
+	}
+	if resp.Message != "created" || resp.SshCommand == "" {
+		t.Errorf("message/sshCommand lost: %q / %q", resp.Message, resp.SshCommand)
+	}
+}
+
+// A peer running a newer daemon sends fields this build has never heard of.
+// That must decode, not fail the create after the container already exists.
+func TestForwardCreateContainer_ToleratesUnknownResponseFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"container":{"name":"alice-container","somethingNew":true},"message":"ok","alsoNew":42}`))
+	}))
+	defer srv.Close()
+
+	resp, err := peerClientFor(srv).ForwardCreateContainer("token", fullCreateRequest())
+	if err != nil {
+		t.Fatalf("a newer peer's extra fields broke the decode: %v", err)
+	}
+	if resp.Container.GetName() != "alice-container" {
+		t.Errorf("name = %q", resp.Container.GetName())
+	}
+}
