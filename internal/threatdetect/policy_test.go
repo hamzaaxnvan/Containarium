@@ -165,3 +165,170 @@ func TestProcessPolicyStore_RoundTrip(t *testing.T) {
 	}
 	raw, ok := cfg.values[ProcessPolicyKey]
 	if !ok {
+		t.Fatalf("SetDefault did not persist under %q; keys: %v", ProcessPolicyKey, cfg.values)
+	}
+	var persisted pb.ProcessPolicy
+	if err := protojson.Unmarshal([]byte(raw), &persisted); err != nil {
+		t.Fatalf("persisted value is not protojson: %v (%q)", err, raw)
+	}
+	if !proto.Equal(&persisted, def) {
+		t.Fatalf("persisted = %v, want %v", &persisted, def)
+	}
+
+	ov := policy(pb.ProcessAction_PROCESS_ACTION_FREEZE, "", 0)
+	if err := s.SetOverride(ctx, "box-a", ov); err != nil {
+		t.Fatalf("SetOverride: %v", err)
+	}
+	if _, ok := cfg.values[ProcessPolicyContainerKey("box-a")]; !ok {
+		t.Fatalf("SetOverride did not persist under %q", ProcessPolicyContainerKey("box-a"))
+	}
+	got, err := s.Override(ctx, "box-a")
+	if err != nil || !proto.Equal(got, ov) {
+		t.Fatalf("Override(box-a) = %v, %v; want %v", got, err, ov)
+	}
+	if got, err := s.Override(ctx, "box-b"); err != nil || got != nil {
+		t.Fatalf("Override(box-b) = %v, %v; want nil, nil", got, err)
+	}
+
+	eff, err = s.Effective(ctx, "box-a")
+	if err != nil {
+		t.Fatalf("Effective(box-a): %v", err)
+	}
+	want := effective(pb.ProcessAction_PROCESS_ACTION_FREEZE, "5%", time.Hour)
+	if !proto.Equal(eff, want) {
+		t.Fatalf("Effective(box-a) = %v, want %v", eff, want)
+	}
+	eff, err = s.Effective(ctx, "box-b")
+	if err != nil || !proto.Equal(eff, effective(pb.ProcessAction_PROCESS_ACTION_THROTTLE, "5%", time.Hour)) {
+		t.Fatalf("Effective(box-b) = %v, %v; want backend default %v", eff, err, def)
+	}
+
+	if err := s.ClearOverride(ctx, "box-a"); err != nil {
+		t.Fatalf("ClearOverride: %v", err)
+	}
+	if got, err := s.Override(ctx, "box-a"); err != nil || got != nil {
+		t.Fatalf("Override after clear = %v, %v; want nil, nil", got, err)
+	}
+	eff, _ = s.Effective(ctx, "box-a")
+	if !proto.Equal(eff, effective(pb.ProcessAction_PROCESS_ACTION_THROTTLE, "5%", time.Hour)) {
+		t.Fatalf("Effective after clear = %v, want backend default %v", eff, def)
+	}
+}
+
+// A nil config store (no Postgres) keeps policies for the process lifetime
+// — same fallback BadDestinationRule uses for operator entries.
+func TestProcessPolicyStore_NilConfigStoreIsInMemory(t *testing.T) {
+	ctx := context.Background()
+	s := NewProcessPolicyStore(nil)
+	def := policy(pb.ProcessAction_PROCESS_ACTION_THROTTLE, "", 0)
+	if err := s.SetDefault(ctx, def); err != nil {
+		t.Fatalf("SetDefault: %v", err)
+	}
+	got, err := s.Default(ctx)
+	if err != nil || !proto.Equal(got, def) {
+		t.Fatalf("Default() = %v, %v; want %v", got, err, def)
+	}
+}
+
+// A database failure is an error, never a silent fall-through to the
+// built-in default: the daemon must not act on ALERT believing THROTTLE was
+// never configured.
+func TestProcessPolicyStore_BackendErrorSurfaces(t *testing.T) {
+	s := NewProcessPolicyStore(&fakeConfigStore{err: errors.New("db down")})
+	if _, err := s.Effective(context.Background(), "box-a"); err == nil {
+		t.Fatal("Effective() = nil error, want the store failure")
+	}
+}
+
+// TestResolveProcessPolicy_KillProcess (#2638): kill_process is off unless a
+// level sets it; an unset level inherits; an explicit false on an override
+// turns a backend-default true back off.
+func TestResolveProcessPolicy_KillProcess(t *testing.T) {
+	on, off := proto.Bool(true), proto.Bool(false)
+	tests := []struct {
+		name              string
+		override, backend *bool
+		want              bool
+	}{
+		{"nothing set", nil, nil, false},
+		{"backend true", nil, on, true},
+		{"override true", on, nil, true},
+		{"override false beats backend true", off, on, false},
+		{"unset override inherits backend true", nil, on, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var ov, be *pb.ProcessPolicy
+			if tt.override != nil {
+				ov = &pb.ProcessPolicy{KillProcess: tt.override}
+			}
+			if tt.backend != nil {
+				be = &pb.ProcessPolicy{KillProcess: tt.backend}
+			}
+			got := ResolveProcessPolicy(ov, be)
+			if got.KillProcess == nil || got.GetKillProcess() != tt.want {
+				t.Fatalf("kill_process = %v, want %v (explicitly set)", got.KillProcess, tt.want)
+			}
+		})
+	}
+	if BuiltinProcessPolicy().GetKillProcess() {
+		t.Fatal("built-in policy kills processes; kill_process must default to false")
+	}
+}
+
+func TestRespondsTo(t *testing.T) {
+	tests := []struct {
+		rule pb.ThreatRuleId
+		want bool
+	}{
+		{pb.ThreatRuleId_THREAT_RULE_ID_MINING_BEHAVIOR, true},
+		{pb.ThreatRuleId_THREAT_RULE_ID_MINER_SIGNATURE, true},
+		{pb.ThreatRuleId_THREAT_RULE_ID_BAD_DESTINATION, false},
+		{pb.ThreatRuleId_THREAT_RULE_ID_DENY_BURST, false},
+		{pb.ThreatRuleId_THREAT_RULE_ID_PROCESS_ACTION_EXPIRED, false},
+	}
+	for _, tt := range tests {
+		if got := RespondsTo(tt.rule); got != tt.want {
+			t.Errorf("RespondsTo(%v) = %v, want %v", tt.rule, got, tt.want)
+		}
+	}
+	if !KillsProcess(pb.ThreatRuleId_THREAT_RULE_ID_MINER_SIGNATURE) || KillsProcess(pb.ThreatRuleId_THREAT_RULE_ID_MINING_BEHAVIOR) {
+		t.Error("only the miner-signature rule may kill a process")
+	}
+}
+
+// THROTTLE must be a hard CFS quota. Incus reads a bare "N%" as a soft share
+// (cpu.weight) that does nothing on an uncontended host and drops the box's
+// existing hard cap, so "N%" means N percent of ONE core and is applied as
+// "Nms/100ms" (#2676).
+func TestHardThrottleAllowance(t *testing.T) {
+	tests := []struct {
+		name, in, prev, want string
+		wantErr              bool
+	}{
+		{name: "percent of one core becomes a hard quota", in: "10%", want: "10ms/100ms"},
+		{name: "100 percent is one whole core", in: "100%", want: "100ms/100ms"},
+		{name: "explicit quota is kept", in: "25ms/100ms", want: "25ms/100ms"},
+		{name: "explicit quota with another period is kept", in: "50ms/200ms", want: "50ms/200ms"},
+		{name: "never looser than the box's existing hard cap", in: "10%", prev: "5ms/100ms", want: "5ms/100ms"},
+		{name: "tighter than the existing cap wins", in: "10%", prev: "200ms/100ms", want: "10ms/100ms"},
+		{name: "a soft previous allowance does not loosen it", in: "10%", prev: "50%", want: "10ms/100ms"},
+		{name: "no previous allowance", in: "10%", prev: "", want: "10ms/100ms"},
+		{name: "garbage is rejected", in: "ten", wantErr: true},
+		{name: "zero percent is rejected", in: "0%", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := HardThrottleAllowance(tt.in, tt.prev)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("HardThrottleAllowance(%q, %q) err = %v, wantErr %v", tt.in, tt.prev, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("HardThrottleAllowance(%q, %q) = %q, want %q", tt.in, tt.prev, got, tt.want)
+			}
+			if err == nil && strings.Contains(got, "%") {
+				t.Errorf("result %q still a soft percentage share", got)
+			}
+		})
+	}
+}
