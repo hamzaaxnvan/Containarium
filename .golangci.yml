@@ -26,3 +26,61 @@ run:
 #                   which does `defer drainClose(resp)`; the linter cannot
 #                   trace through it
 #   nilerr         18 — sampled: deliberate skip-and-continue, already
+#                   carrying comments saying so ("skip unreadable entries")
+#   errorlint      33 — 26 are ==/!= on errors the stdlib returns unwrapped
+#                   by contract (io.EOF from io.ReadFull), so safe here
+#   noctx         448 — overwhelmingly httptest.NewRequest and exec.Command
+#                   in tests
+#
+# Each would cost more nolint annotations than it would catch bugs. Recorded
+# so the next person does not re-measure; re-check after any large refactor
+# rather than treating this as settled forever.
+linters:
+  default: standard
+  enable:
+    # gosec, scoped to G115 only (integer-overflow conversions). The rest of
+    # gosec's rules aren't enforced yet — enabling them wholesale would surface
+    # a separate debt. G115 is clean as of the safecast rollout, so gate it to
+    # prevent regressions: new unchecked int conversions must go through
+    # internal/safecast (or carry a justified //nolint:gosec).
+    - gosec
+  settings:
+    gosec:
+      includes:
+        - G115
+    errcheck:
+      # Conventionally-unchecked stdlib calls. Their errors are not actionable
+      # in the contexts we use them (deferred cleanup, best-effort writes to an
+      # already-failing response/stderr), so we exempt the functions rather
+      # than litter the tree with `_ =`. Domain calls (store/incus/exec/parse)
+      # are NOT here — those are fixed in code so a real error can't be dropped.
+      exclude-functions:
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (net/http.ResponseWriter).Write
+  exclusions:
+    # Generated code is not ours to lint — protoc output is gofmt-clean but
+    # trips errcheck/staticcheck on patterns we don't control.
+    generated: lax
+    paths:
+      - pkg/pb
+      - test/fixtures
+      # Vendored Go shipped inside JS tooling (flatted) — not our code.
+      - web-ui/node_modules
+
+# Formatters run during `golangci-lint run` (v2): an unformatted file fails
+# the lint job. gofmt runs with simplify on by default (== gofmt -s), matching
+# the standalone gofmt workflow's `gofmt -s -l` gate.
+formatters:
+  enable:
+    - gofmt
+  exclusions:
+    paths:
+      - pkg/pb
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
