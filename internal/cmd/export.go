@@ -51,3 +51,110 @@ func init() {
 	_ = exportCmd.MarkFlagRequired("jump-ip")
 }
 
+func runExport(cmd *cobra.Command, args []string) error {
+	username := args[0]
+
+	if verbose {
+		fmt.Printf("Exporting SSH configuration for user: %s\n", username)
+	}
+
+	// Get container information
+	var containerIP string
+	var err error
+
+	if serverAddr != "" {
+		return fmt.Errorf("export command is only available in local mode (direct Incus connection)")
+	}
+
+	// Get container info from local Incus
+	mgr, err := container.New()
+	if err != nil {
+		return fmt.Errorf("failed to connect to Incus: %w (is Incus running?)", err)
+	}
+
+	info, err := mgr.Get(username)
+	if err != nil {
+		return fmt.Errorf("failed to get container info: %w\nNote: Container must exist before exporting SSH config", err)
+	}
+
+	containerIP = info.IPAddress
+	if containerIP == "" {
+		return fmt.Errorf("container has no IP address - is it running?")
+	}
+
+	// Generate SSH config content
+	config := generateSSHConfig(username, jumpServerIP, containerIP, exportKeyPath)
+
+	// Output to file or stdout
+	if exportOutputPath != "" {
+		// Expand home directory
+		expandedPath := exportOutputPath
+		if len(exportOutputPath) >= 2 && exportOutputPath[:2] == "~/" {
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				return fmt.Errorf("failed to get home directory: %w", err)
+			}
+			expandedPath = filepath.Join(homeDir, exportOutputPath[2:])
+		}
+
+		// Create parent directory if needed
+		parentDir := filepath.Dir(expandedPath)
+		if err := os.MkdirAll(parentDir, 0755); err != nil { //nolint:gosec // G301: user-chosen export dir; 0755 matches mkdir default
+			return fmt.Errorf("failed to create directory %s: %w", parentDir, err)
+		}
+
+		// Write config to file
+		if err := os.WriteFile(expandedPath, []byte(config), 0600); err != nil {
+			return fmt.Errorf("failed to write config file: %w", err)
+		}
+
+		fmt.Printf("✓ SSH configuration exported to: %s\n", expandedPath)
+		fmt.Println()
+		fmt.Println("To use this configuration:")
+		fmt.Println()
+		fmt.Println("  Option 1: Include in your main SSH config")
+		fmt.Printf("    echo 'Include %s' >> ~/.ssh/config\n", expandedPath)
+		fmt.Println()
+		fmt.Println("  Option 2: Append to your SSH config")
+		fmt.Printf("    cat %s >> ~/.ssh/config\n", expandedPath)
+		fmt.Println()
+		fmt.Printf("Then connect with: ssh %s-dev\n", username)
+	} else {
+		// Output to stdout
+		fmt.Println(config)
+		fmt.Println()
+		fmt.Println("# To use this configuration, add it to your ~/.ssh/config:")
+		fmt.Println("#   containarium export " + username + " --jump-ip " + jumpServerIP + " >> ~/.ssh/config")
+		fmt.Println()
+		fmt.Printf("# Then connect with: ssh %s-dev\n", username)
+	}
+
+	return nil
+}
+
+func generateSSHConfig(username, jumpIP, containerIP, keyPath string) string {
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+
+	config := fmt.Sprintf(`# Containarium SSH Configuration
+# User: %s
+# Generated: %s
+
+# Jump server (GCE instance with proxy-only account)
+Host containarium-jump
+    HostName %s
+    User %s
+    IdentityFile %s
+    # No shell access - proxy-only account
+
+# User's development container
+Host %s-dev
+    HostName %s
+    User %s
+    IdentityFile %s
+    ProxyJump containarium-jump
+    # Optional: disable strict host key checking for testing
+    # StrictHostKeyChecking accept-new
+`, username, timestamp, jumpIP, username, keyPath, username, containerIP, username, keyPath)
+
+	return config
+}
