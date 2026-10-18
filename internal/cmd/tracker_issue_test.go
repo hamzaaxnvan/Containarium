@@ -71,3 +71,53 @@ func TestTrackerCiVerdictLabel(t *testing.T) {
 		in   pb.TrackerCiVerdict
 		want string
 	}{
+		{pb.TrackerCiVerdict_TRACKER_CI_VERDICT_NONE, "none"},
+		{pb.TrackerCiVerdict_TRACKER_CI_VERDICT_PENDING, "pending"},
+		{pb.TrackerCiVerdict_TRACKER_CI_VERDICT_SUCCESS, "success"},
+		{pb.TrackerCiVerdict_TRACKER_CI_VERDICT_FAILED, "failed"},
+		{pb.TrackerCiVerdict_TRACKER_CI_VERDICT_UNSPECIFIED, "unspecified"},
+	}
+	for _, tt := range tests {
+		if got := trackerCiVerdictLabel(tt.in); got != tt.want {
+			t.Errorf("trackerCiVerdictLabel(%v) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestPrintTrackerIssue_UnassignedShowsPlaceholder(t *testing.T) {
+	out := captureStdout(t, func() {
+		printTrackerIssue(&pb.TrackerIssue{
+			Number: 7, Title: "bug", State: pb.TrackerIssueState_TRACKER_ISSUE_STATE_OPEN,
+		})
+	})
+	if !strings.Contains(out, "#7 bug") {
+		t.Errorf("output = %q, want the number and title", out)
+	}
+	if !strings.Contains(out, "(unassigned)") {
+		t.Errorf("output = %q, want an unassigned placeholder", out)
+	}
+}
+
+func TestPrintTrackerIssue_WithCommentsAndLabels(t *testing.T) {
+	out := captureStdout(t, func() {
+		printTrackerIssue(&pb.TrackerIssue{
+			Number: 8, Title: "feature", State: pb.TrackerIssueState_TRACKER_ISSUE_STATE_CLOSED,
+			Assignee: "alice", Labels: []string{"bug", "p1"}, Body: "the body text",
+			Comments: []*pb.TrackerComment{
+				{Author: "bob", Body: "lgtm", CreatedAt: timestamppb.Now()},
+			},
+		})
+	})
+	if !strings.Contains(out, "assignee: alice") {
+		t.Errorf("output = %q, want assignee: alice", out)
+	}
+	if !strings.Contains(out, "labels:   bug, p1") {
+		t.Errorf("output = %q, want the joined labels", out)
+	}
+	if !strings.Contains(out, "the body text") {
+		t.Errorf("output = %q, want the issue body", out)
+	}
+	if !strings.Contains(out, "1 comment(s)") || !strings.Contains(out, "bob") || !strings.Contains(out, "lgtm") {
+		t.Errorf("output = %q, want the comment rendered", out)
+	}
+}
