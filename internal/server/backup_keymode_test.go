@@ -126,3 +126,132 @@ func TestKeyModeFromProto(t *testing.T) {
 		{"both without a wrapper", pb.BackupKeyMode_BACKUP_KEY_MODE_BOTH, false, true, "", codes.FailedPrecondition},
 		{"both without a recipient", pb.BackupKeyMode_BACKUP_KEY_MODE_BOTH, true, false, "", codes.InvalidArgument},
 		{"a value this build does not know", pb.BackupKeyMode(99), true, true, "", codes.InvalidArgument},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := keyModeFromProto(tc.requested, tc.hasWrapper, tc.hasRecipient)
+			if code := status.Code(err); code != tc.wantCode {
+				t.Fatalf("code = %v (err %v), want %v", code, err, tc.wantCode)
+			}
+			if got != tc.want {
+				t.Errorf("mode = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The record's wire key_mode is derived in one place: the recorded mode
+// for managed records, AGE_RECIPIENT for any other encrypted record
+// (every record written before the field existed), UNSPECIFIED for
+// plaintext. wrapped_key and kek_id ride along untouched.
+func TestRecordToProto_CarriesKeyFields(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rec  backup.Record
+		want pb.BackupKeyMode
+	}{
+		{"plaintext", backup.Record{ID: "x"}, pb.BackupKeyMode_BACKUP_KEY_MODE_UNSPECIFIED},
+		{"legacy encrypted, no key_mode in sidecar", backup.Record{ID: "x", Encrypted: true, AgeRecipient: "age1legacy"}, pb.BackupKeyMode_BACKUP_KEY_MODE_AGE_RECIPIENT},
+		{"managed", backup.Record{ID: "x", Encrypted: true, AgeRecipient: "age1ephemeral", KeyMode: backup.KeyModeManaged, WrappedKey: []byte("w"), KEKID: "gcp:k/cryptoKeyVersions/1"}, pb.BackupKeyMode_BACKUP_KEY_MODE_MANAGED},
+		{"both", backup.Record{ID: "x", Encrypted: true, AgeRecipient: "age1legacy", KeyMode: backup.KeyModeBoth, WrappedKey: []byte("w"), KEKID: "gcp:k/cryptoKeyVersions/1"}, pb.BackupKeyMode_BACKUP_KEY_MODE_BOTH},
+		{"a mode this build does not know", backup.Record{ID: "x", Encrypted: true, KeyMode: backup.KeyMode("rot13")}, pb.BackupKeyMode_BACKUP_KEY_MODE_UNSPECIFIED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := recordToProto(&tc.rec)
+			if got.KeyMode != tc.want {
+				t.Errorf("key_mode = %v, want %v", got.KeyMode, tc.want)
+			}
+			if !bytes.Equal(got.WrappedKey, tc.rec.WrappedKey) || got.KekId != tc.rec.KEKID {
+				t.Errorf("wrapped_key/kek_id = %q/%q, want %q/%q", got.WrappedKey, got.KekId, tc.rec.WrappedKey, tc.rec.KEKID)
+			}
+		})
+	}
+}
+
+func backupTestCtx(username string) context.Context {
+	return auth.ContextWithTestSubjectScopes(context.Background(), username, []string{"user"}, []string{auth.ScopeBackupsWrite})
+}
+
+// A request the daemon cannot satisfy is refused with a gRPC code before
+// any container is looked up: s.containers has no manager here, so a
+// request that got past the key-mode check would panic, not fail.
+func TestCreateBackup_KeyModeRefusedBeforeContainerLookup(t *testing.T) {
+	inproc, err := secrets.NewInProcKMS(bytes.Repeat([]byte{1}, secrets.MasterKeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	noWrapper := &BackupServer{containers: &ContainerServer{}, mgr: backup.NewManager(nil, nil, t.TempDir())}
+	withWrapper := &BackupServer{containers: &ContainerServer{}, mgr: backup.NewManager(nil, nil, t.TempDir(), backup.WithWrapper(inproc))}
+
+	for _, tc := range []struct {
+		name string
+		s    *BackupServer
+		req  *pb.CreateBackupRequest
+		want codes.Code
+	}{
+		{"managed on a daemon with no wrapper", noWrapper, &pb.CreateBackupRequest{
+			Username: "alice", Destination: pb.BackupDestination_BACKUP_DESTINATION_LOCAL,
+			KeyMode: pb.BackupKeyMode_BACKUP_KEY_MODE_MANAGED,
+		}, codes.FailedPrecondition},
+		{"both on a daemon with no wrapper", noWrapper, &pb.CreateBackupRequest{
+			Username: "alice", Destination: pb.BackupDestination_BACKUP_DESTINATION_LOCAL,
+			KeyMode: pb.BackupKeyMode_BACKUP_KEY_MODE_BOTH, AgeRecipient: "age1x",
+		}, codes.FailedPrecondition},
+		{"both without a recipient", withWrapper, &pb.CreateBackupRequest{
+			Username: "alice", Destination: pb.BackupDestination_BACKUP_DESTINATION_LOCAL,
+			KeyMode: pb.BackupKeyMode_BACKUP_KEY_MODE_BOTH,
+		}, codes.InvalidArgument},
+		{"age_recipient without a recipient", withWrapper, &pb.CreateBackupRequest{
+			Username: "alice", Destination: pb.BackupDestination_BACKUP_DESTINATION_LOCAL,
+			KeyMode: pb.BackupKeyMode_BACKUP_KEY_MODE_AGE_RECIPIENT,
+		}, codes.InvalidArgument},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.s.CreateBackup(backupTestCtx("alice"), tc.req)
+			if code := status.Code(err); code != tc.want {
+				t.Fatalf("CreateBackup = %v (code %v), want code %v", err, code, tc.want)
+			}
+		})
+	}
+}
+
+// --- #3263: daemon wiring of SystemInfo.managed_backup_key_configured ---
+//
+// `backup status` reads this field to decide whether tenants are encrypted.
+// If NewBackupServer stops recording the managed key on the ContainerServer,
+// or withBackupKeyInfo stops copying it into the response, the CLI reports
+// every tenant UNENCRYPTED and nothing else fails. These go through the real
+// constructor so both halves of the wiring are exercised together.
+// GetSystemInfo itself needs a live Incus connection, so the stamping step
+// it performs (withBackupKeyInfo) is driven directly.
+
+func TestSystemInfo_ManagedBackupKeyConfigured_WhenKeyConfigured(t *testing.T) {
+	clearBackupKMSEnv(t)
+	t.Setenv("CONTAINARIUM_BACKUP_KMS_KEY_NAME", testBackupKMSKey)
+	t.Setenv("CONTAINARIUM_KMS_BACKEND", "gcp")
+	t.Setenv("CONTAINARIUM_GCP_KMS_KEY_NAME", "projects/test-proj/locations/us-west1/keyRings/r/cryptoKeys/secrets")
+	t.Setenv("CONTAINARIUM_GCP_KMS_TOKEN", "tok")
+
+	containers := &ContainerServer{}
+	if _, err := NewBackupServer(containers); err != nil {
+		t.Fatalf("NewBackupServer: %v", err)
+	}
+	info := &pb.SystemInfo{}
+	containers.withBackupKeyInfo(info)
+	if !info.GetManagedBackupKeyConfigured() {
+		t.Error("managed_backup_key_configured = false, want true when the managed backup key is configured")
+	}
+}
+
+func TestSystemInfo_ManagedBackupKeyConfigured_WhenNoKey(t *testing.T) {
+	clearBackupKMSEnv(t)
+
+	containers := &ContainerServer{}
+	if _, err := NewBackupServer(containers); err != nil {
+		t.Fatalf("NewBackupServer: %v", err)
+	}
+	info := &pb.SystemInfo{}
+	containers.withBackupKeyInfo(info)
+	if info.GetManagedBackupKeyConfigured() {
+		t.Error("managed_backup_key_configured = true, want false when no managed backup key is configured")
+	}
+}
