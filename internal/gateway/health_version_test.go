@@ -50,3 +50,39 @@ func TestHealthEndpoint_ReportsVersion(t *testing.T) {
 }
 
 // The existing contract must not change: anything already parsing this
+// endpoint keys off "status", and a liveness probe that starts failing
+// because we added a field would be a bad trade for observability.
+func TestHealthEndpoint_StatusFieldUnchanged(t *testing.T) {
+	rec := httptest.NewRecorder()
+	healthHandler(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	if raw["status"] != "healthy" {
+		t.Errorf(`status = %v, want "healthy" — existing consumers key off this`, raw["status"])
+	}
+}
+
+// Guard against leaking more than intended. Version answers "what is this box
+// running"; commit hash and build time narrow an attacker's CVE search without
+// helping the operational question, so they stay out until someone decides
+// otherwise deliberately.
+func TestHealthEndpoint_ExposesOnlyStatusAndVersion(t *testing.T) {
+	rec := httptest.NewRecorder()
+	healthHandler(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	var raw map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+
+	allowed := map[string]bool{"status": true, "version": true}
+	for k := range raw {
+		if !allowed[k] {
+			t.Errorf("unexpected field %q in /health — this endpoint is unauthenticated; "+
+				"adding build detail here widens what an anonymous caller learns", k)
+		}
+	}
+}
