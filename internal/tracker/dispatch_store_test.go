@@ -259,3 +259,177 @@ func TestDispatchStore_RerunAfterTerminal(t *testing.T) {
 		t.Fatal("labels_pending not persisted")
 	}
 	if _, err := store.GetDispatch(ctx, "00000000-0000-0000-0000-000000000000"); !errors.Is(err, ErrDispatchNotFound) {
+		t.Fatalf("GetDispatch(unknown) err = %v, want ErrDispatchNotFound", err)
+	}
+}
+
+func TestDispatchStore_WarningRecordedOnce(t *testing.T) {
+	store, ctx := newTrackerTestStore(t)
+	const user = "tracker-dispatch-warn"
+	seedDispatchConnection(t, store, ctx, user)
+
+	first, err := store.RecordDispatchWarning(ctx, user, "default", 9, "unknown")
+	if err != nil || !first {
+		t.Fatalf("first RecordDispatchWarning = (%v, %v), want (true, nil)", first, err)
+	}
+	again, err := store.RecordDispatchWarning(ctx, user, "default", 9, "unknown")
+	if err != nil || again {
+		t.Fatalf("second RecordDispatchWarning = (%v, %v), want (false, nil)", again, err)
+	}
+	// A different scope on the same issue is its own warning.
+	other, err := store.RecordDispatchWarning(ctx, user, "default", 9, "other")
+	if err != nil || !other {
+		t.Fatalf("other-scope RecordDispatchWarning = (%v, %v), want (true, nil)", other, err)
+	}
+	// Forgetting it (the comment failed to post) lets the next tick retry.
+	if err := store.ForgetDispatchWarning(ctx, user, "default", 9, "unknown"); err != nil {
+		t.Fatalf("ForgetDispatchWarning: %v", err)
+	}
+	if retry, err := store.RecordDispatchWarning(ctx, user, "default", 9, "unknown"); err != nil || !retry {
+		t.Fatalf("after forget RecordDispatchWarning = (%v, %v), want (true, nil)", retry, err)
+	}
+}
+
+// containsFold is a case-insensitive substring check for error text.
+func containsFold(s, sub string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
+}
+
+// TestDispatchStore_DeleteQueuedOnly: an abandoned (never started) row
+// can be removed while QUEUED; a row that moved on cannot.
+func TestDispatchStore_DeleteQueuedOnly(t *testing.T) {
+	store, ctx := newTrackerTestStore(t)
+	const user = "tracker-dispatch-delete-queued"
+	seedDispatchConnection(t, store, ctx, user)
+
+	row, err := store.InsertDispatch(ctx, newDispatch(user, 1))
+	if err != nil {
+		t.Fatalf("InsertDispatch: %v", err)
+	}
+	if ok, err := store.DeleteQueuedDispatch(ctx, row.ID); err != nil || !ok {
+		t.Fatalf("DeleteQueuedDispatch(queued) = (%v, %v), want (true, nil)", ok, err)
+	}
+	if _, err := store.GetDispatch(ctx, row.ID); !errors.Is(err, ErrDispatchNotFound) {
+		t.Fatalf("GetDispatch after delete = %v, want ErrDispatchNotFound", err)
+	}
+
+	row, err = store.InsertDispatch(ctx, newDispatch(user, 1))
+	if err != nil {
+		t.Fatalf("InsertDispatch (after delete): %v", err)
+	}
+	if ok, err := store.TransitionDispatch(ctx, row.ID, pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_QUEUED,
+		pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_RUNNING, "", time.Now()); err != nil || !ok {
+		t.Fatalf("mark running = (%v, %v)", ok, err)
+	}
+	if ok, err := store.DeleteQueuedDispatch(ctx, row.ID); err != nil || ok {
+		t.Fatalf("DeleteQueuedDispatch(running) = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+// TestIssueInRunLineage (#2060): a run's lineage is the issue it was
+// dispatched for plus the follow-ups it filed — and nothing else: not
+// another run's dispatched issue or child, not an issue on another
+// connection, not a human-created issue, and nothing for an empty run id.
+func TestIssueInRunLineage(t *testing.T) {
+	store, ctx := newTrackerTestStore(t)
+	const user = "tracker-run-lineage"
+	seedDispatchConnection(t, store, ctx, user)
+	_, _ = store.pool.Exec(ctx, "DELETE FROM tracker_issue_lineage WHERE username = $1", user)
+
+	d := newDispatch(user, 42)
+	d.RunID = "run-a"
+	if _, err := store.InsertDispatch(ctx, d); err != nil {
+		t.Fatalf("InsertDispatch(#42 for run-a): %v", err)
+	}
+	other := newDispatch(user, 60)
+	other.RunID = "run-b"
+	if _, err := store.InsertDispatch(ctx, other); err != nil {
+		t.Fatalf("InsertDispatch(#60 for run-b): %v", err)
+	}
+	for _, c := range []struct {
+		run   string
+		child int64
+	}{{"run-a", 43}, {"run-b", 61}} {
+		if _, err := store.RecordChild(ctx, Lineage{Username: user, Connection: "default", ParentNumber: 42, CreatedByRun: c.run}, 0, 0,
+			func(context.Context) (int64, error) { return c.child, nil }); err != nil {
+			t.Fatalf("RecordChild(#%d by %s): %v", c.child, c.run, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name       string
+		connection string
+		run        string
+		number     int64
+		want       bool
+	}{
+		{"its dispatched issue", "default", "run-a", 42, true},
+		{"its recorded child", "default", "run-a", 43, true},
+		{"another run's dispatched issue", "default", "run-a", 60, false},
+		{"another run's child", "default", "run-a", 61, false},
+		{"a human-created issue", "default", "run-a", 77, false},
+		{"its issue number on another connection", "other", "run-a", 42, false},
+		{"empty run id", "default", "", 42, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := store.IssueInRunLineage(ctx, user, tc.connection, tc.run, tc.number)
+			if err != nil {
+				t.Fatalf("IssueInRunLineage: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("IssueInRunLineage(%s, %s, #%d) = %v, want %v", tc.connection, tc.run, tc.number, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDispatchStore_RecordChange is #3001: the change request a run
+// submits lands on the dispatch row that started the run, matched by run
+// id, and reads back through GetDispatch and ListDispatches. A run id no
+// row names (an operator-started run, another daemon's run) records
+// nothing and is not an error.
+func TestDispatchStore_RecordChange(t *testing.T) {
+	store, ctx := newTrackerTestStore(t)
+	const user = "dispatch-record-change"
+	seedDispatchConnection(t, store, ctx, user)
+
+	d := newDispatch(user, 41)
+	d.RunID = "run-change-0001"
+	inserted, err := store.InsertDispatch(ctx, d)
+	if err != nil {
+		t.Fatalf("InsertDispatch: %v", err)
+	}
+	if inserted.ChangeURL != "" || inserted.ChangeNumber != 0 {
+		t.Fatalf("fresh row = {%q, %d}, want no change yet", inserted.ChangeURL, inserted.ChangeNumber)
+	}
+
+	ok, err := store.RecordDispatchChange(ctx, "run-change-0001", "https://gitlab.example/group/project/-/merge_requests/9", 9)
+	if err != nil || !ok {
+		t.Fatalf("RecordDispatchChange = (%v, %v), want (true, nil)", ok, err)
+	}
+	got, err := store.GetDispatch(ctx, inserted.ID)
+	if err != nil {
+		t.Fatalf("GetDispatch: %v", err)
+	}
+	if got.ChangeURL != "https://gitlab.example/group/project/-/merge_requests/9" || got.ChangeNumber != 9 {
+		t.Errorf("row after record = {%q, %d}, want the submitted change", got.ChangeURL, got.ChangeNumber)
+	}
+	rows, err := store.ListDispatches(ctx, user, "default", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("ListDispatches = %d rows, %v; want 1", len(rows), err)
+	}
+	if rows[0].ChangeNumber != 9 {
+		t.Errorf("listed row change number = %d, want 9", rows[0].ChangeNumber)
+	}
+
+	for name, runID := range map[string]string{"unknown run": "run-nobody", "empty run id": ""} {
+		ok, err := store.RecordDispatchChange(ctx, runID, "https://example.invalid/x/1", 1)
+		if err != nil || ok {
+			t.Errorf("%s: RecordDispatchChange = (%v, %v), want (false, nil)", name, ok, err)
+		}
+	}
+	got, _ = store.GetDispatch(ctx, inserted.ID)
+	if got.ChangeNumber != 9 {
+		t.Errorf("row touched by an unmatched record: change number = %d, want 9", got.ChangeNumber)
+	}
+}
