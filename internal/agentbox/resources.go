@@ -92,3 +92,98 @@ func handleCIContextRead(_ context.Context, _ mcp.ReadResourceRequest) ([]mcp.Re
 			MIMEType: "application/json",
 			Text:     string(data),
 		},
+	}, nil
+}
+
+// ciPromptResourceURI is the MCP URI for the static "how to debug a
+// failing CI run" playbook. Paired with ciContextResourceURI: ci-context
+// gives the agent the *data* (which PR, which test), ci-prompt gives it
+// the *behavior* (how to investigate, what not to do).
+const ciPromptResourceURI = "containarium://ci-prompt"
+
+// ciPromptBody is the opinionated playbook returned by the ci-prompt
+// resource. Baked into the binary as a constant so the resource is
+// always available with zero filesystem dependencies — the prompt is
+// the same for every Containarium-hosted CI debug session in v0.
+//
+// Keep this prescriptive. The whole point is to give agents clear
+// behavior guidance rather than hedged suggestions.
+const ciPromptBody = `# Debugging a failing CI run in Containarium
+
+You are connected to a Containarium box that was kept alive after a CI
+test failure. Your job is to diagnose and propose a fix — not just
+describe the problem.
+
+## What to read first
+
+1. **` + "`containarium://ci-context`" + `** — JSON with the PR number, commit
+   SHA, branch, failing test name, and last ~50 lines of test output.
+   Read this before anything else; it tells you what to focus on.
+2. **` + "`/workspace/`" + `** — the repo's source code, checked out at the
+   failing commit. The path is also in ` + "`ci-context.workspace_path`" + `.
+
+## How to work
+
+- Use ` + "`shell_exec`" + ` to reproduce the failure. The test command lives in
+  the project's ` + "`.github/containarium.yml`" + ` under the ` + "`test:`" + ` key.
+- Inspect the failing test's source and recent commits on the file
+  (` + "`git log -p -- <path>`" + `). The bug is usually in code touched by this
+  PR, not in stable code.
+- Make minimal, scoped fixes. Don't refactor unrelated code, don't
+  bump dependencies, don't reformat files you aren't touching.
+- Re-run the failing test after each change. Iterate until it passes.
+
+## How to report
+
+When you have a fix:
+
+1. Show the diff (` + "`git diff`" + ` or per-file patches).
+2. Explain in one sentence what the root cause was.
+3. Note any tests you didn't run (e.g. flaky tests skipped, integration
+   tests requiring external services). The operator who reviews your
+   proposal needs to know what's still untested.
+
+## What NOT to do
+
+- **Don't push commits or open PRs from this box.** You don't have
+  repo write credentials, and even if you did, code changes should
+  go through the operator's review on their machine.
+- **Don't modify ` + "`/workspace/.containarium/`" + `.** That directory belongs
+  to the CI tooling and shouldn't be edited.
+- **Don't run destructive commands** (` + "`rm -rf`" + `, ` + "`git reset --hard`" + `,
+  etc.) without first explaining why.
+
+## When you're stuck
+
+If reproduction or diagnosis stalls, write a short summary of what
+you tried and what you observed, then stop. The operator can pick up
+the thread.
+`
+
+// registerCIPromptResource wires the ci-prompt MCP resource onto the
+// given server. Mirrors registerCIContextResource, with a static body
+// instead of a file read — the prompt is the same on every box.
+func registerCIPromptResource(s *server.MCPServer) {
+	resource := mcp.NewResource(
+		ciPromptResourceURI,
+		"CI debug playbook",
+		mcp.WithResourceDescription(
+			"An opinionated prompt for agents debugging a failing CI run "+
+				"inside this box. Read alongside containarium://ci-context.",
+		),
+		mcp.WithMIMEType("text/markdown"),
+	)
+	s.AddResource(resource, handleCIPromptRead)
+}
+
+// handleCIPromptRead returns the static playbook body. No filesystem
+// reads, no error path — the body is a compile-time constant.
+func handleCIPromptRead(_ context.Context, _ mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	return []mcp.ResourceContents{
+		mcp.TextResourceContents{
+			URI:      ciPromptResourceURI,
+			MIMEType: "text/markdown",
+			Text:     ciPromptBody,
+		},
+	}, nil
+}
