@@ -272,3 +272,140 @@ func _AppService_GetApp_Handler(srv interface{}, ctx context.Context, dec func(i
 		return srv.(AppServiceServer).GetApp(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AppService_GetApp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AppServiceServer).GetApp(ctx, req.(*GetAppRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AppService_StopApp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StopAppRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AppServiceServer).StopApp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AppService_StopApp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AppServiceServer).StopApp(ctx, req.(*StopAppRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AppService_StartApp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartAppRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AppServiceServer).StartApp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AppService_StartApp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AppServiceServer).StartApp(ctx, req.(*StartAppRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AppService_RestartApp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestartAppRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AppServiceServer).RestartApp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AppService_RestartApp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AppServiceServer).RestartApp(ctx, req.(*RestartAppRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AppService_DeleteApp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteAppRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AppServiceServer).DeleteApp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AppService_DeleteApp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AppServiceServer).DeleteApp(ctx, req.(*DeleteAppRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AppService_GetAppLogs_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(GetAppLogsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AppServiceServer).GetAppLogs(m, &grpc.GenericServerStream[GetAppLogsRequest, GetAppLogsResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AppService_GetAppLogsServer = grpc.ServerStreamingServer[GetAppLogsResponse]
+
+// AppService_ServiceDesc is the grpc.ServiceDesc for AppService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var AppService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.AppService",
+	HandlerType: (*AppServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "DeployApp",
+			Handler:    _AppService_DeployApp_Handler,
+		},
+		{
+			MethodName: "ListApps",
+			Handler:    _AppService_ListApps_Handler,
+		},
+		{
+			MethodName: "GetApp",
+			Handler:    _AppService_GetApp_Handler,
+		},
+		{
+			MethodName: "StopApp",
+			Handler:    _AppService_StopApp_Handler,
+		},
+		{
+			MethodName: "StartApp",
+			Handler:    _AppService_StartApp_Handler,
+		},
+		{
+			MethodName: "RestartApp",
+			Handler:    _AppService_RestartApp_Handler,
+		},
+		{
+			MethodName: "DeleteApp",
+			Handler:    _AppService_DeleteApp_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "GetAppLogs",
+			Handler:       _AppService_GetAppLogs_Handler,
+			ServerStreams: true,
+		},
+	},
+	Metadata: "containarium/v1/app.proto",
+}

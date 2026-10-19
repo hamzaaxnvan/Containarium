@@ -94,3 +94,36 @@ func TestCredentialEpisodeDoesNotRepeatTimestampAlert(t *testing.T) {
 		t.Fatal("repeated existing unhealthy transition")
 	}
 	p.observation.Pending = []CredentialEpisode{{ID: "00000000-0000-0000-0000-000000000005", AfterRecovery: true}}
+	if w.Sweep(context.Background()) != 1 {
+		t.Fatal("missed intervening OAuth recovery")
+	}
+	if n.alerts[0].PreviousSource != srcInteractive {
+		t.Fatal("incorrect recovery transition attribution")
+	}
+}
+
+type failCurrentState struct {
+	*memStateStore
+	fail bool
+}
+
+func (s *failCurrentState) Record(ctx context.Context, id string, src pb.CodeCredentialSource, at time.Time) error {
+	if s.fail {
+		return errors.New("current-state write failed")
+	}
+	return s.memStateStore.Record(ctx, id, src, at)
+}
+func TestCredentialEpisodeCurrentStateWriteFailure(t *testing.T) {
+	store := &failCurrentState{memStateStore: newMemStateStore(), fail: true}
+	p := &episodeProber{fakeProber: oneTargetProber(srcInteractive), observation: CredentialEpisodes{Version: 1, Active: true, Pending: []CredentialEpisode{{ID: "00000000-0000-0000-0000-000000000006"}}}}
+	n := &recordingNotifier{}
+	w := NewCredentialWatcher(p, store, n)
+	if w.Sweep(context.Background()) != 1 || len(p.acknowledged) > 0 {
+		t.Fatal("episode was not durable before failed state/ack")
+	}
+	store.fail = false
+	w = NewCredentialWatcher(p, store, n)
+	if w.Sweep(context.Background()) != 0 || len(p.acknowledged) != 1 {
+		t.Fatal("restart duplicated/lost episode")
+	}
+}
