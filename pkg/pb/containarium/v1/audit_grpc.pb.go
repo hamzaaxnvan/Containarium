@@ -39,3 +39,129 @@ type AuditServiceClient interface {
 	// to this backend's audit chain.
 	//
 	// Idempotent per (session_id, phase): a record already ingested is
+	// reported as DUPLICATE and writes nothing, so a shipper that crashed
+	// after a successful call and replays the batch cannot fork or pad the
+	// chain. Storage is all-or-nothing for the batch — on any storage error
+	// no row is committed, so the caller's only rule is "advance the
+	// checkpoint only after OK". Validation runs before any write; an
+	// invalid record rejects the whole batch with InvalidArgument naming its
+	// index.
+	//
+	// Requires the audit:ingest scope, explicitly (a token with no scopes
+	// claim is denied even in non-strict mode).
+	IngestSSHSessionRecords(ctx context.Context, in *IngestSSHSessionRecordsRequest, opts ...grpc.CallOption) (*IngestSSHSessionRecordsResponse, error)
+}
+
+type auditServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewAuditServiceClient(cc grpc.ClientConnInterface) AuditServiceClient {
+	return &auditServiceClient{cc}
+}
+
+func (c *auditServiceClient) IngestSSHSessionRecords(ctx context.Context, in *IngestSSHSessionRecordsRequest, opts ...grpc.CallOption) (*IngestSSHSessionRecordsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(IngestSSHSessionRecordsResponse)
+	err := c.cc.Invoke(ctx, AuditService_IngestSSHSessionRecords_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AuditServiceServer is the server API for AuditService service.
+// All implementations must embed UnimplementedAuditServiceServer
+// for forward compatibility.
+//
+// AuditService — the proto-defined surface of the tamper-evident audit
+// store (internal/audit). Today it carries one write RPC (#2415): the
+// sentinel ships the SSH session records its sshpiperd plugin appends
+// locally (internal/sentinel/sshsession) into THIS backend's audit chain,
+// so the platform's front-door logins get the same hash chain and
+// external anchoring (#1706) as in-box sessions and API calls.
+//
+// Reads stay on the legacy /v1/audit/logs gateway route for now.
+type AuditServiceServer interface {
+	// IngestSSHSessionRecords appends a batch of sentinel SSH session records
+	// to this backend's audit chain.
+	//
+	// Idempotent per (session_id, phase): a record already ingested is
+	// reported as DUPLICATE and writes nothing, so a shipper that crashed
+	// after a successful call and replays the batch cannot fork or pad the
+	// chain. Storage is all-or-nothing for the batch — on any storage error
+	// no row is committed, so the caller's only rule is "advance the
+	// checkpoint only after OK". Validation runs before any write; an
+	// invalid record rejects the whole batch with InvalidArgument naming its
+	// index.
+	//
+	// Requires the audit:ingest scope, explicitly (a token with no scopes
+	// claim is denied even in non-strict mode).
+	IngestSSHSessionRecords(context.Context, *IngestSSHSessionRecordsRequest) (*IngestSSHSessionRecordsResponse, error)
+	mustEmbedUnimplementedAuditServiceServer()
+}
+
+// UnimplementedAuditServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedAuditServiceServer struct{}
+
+func (UnimplementedAuditServiceServer) IngestSSHSessionRecords(context.Context, *IngestSSHSessionRecordsRequest) (*IngestSSHSessionRecordsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method IngestSSHSessionRecords not implemented")
+}
+func (UnimplementedAuditServiceServer) mustEmbedUnimplementedAuditServiceServer() {}
+func (UnimplementedAuditServiceServer) testEmbeddedByValue()                      {}
+
+// UnsafeAuditServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to AuditServiceServer will
+// result in compilation errors.
+type UnsafeAuditServiceServer interface {
+	mustEmbedUnimplementedAuditServiceServer()
+}
+
+func RegisterAuditServiceServer(s grpc.ServiceRegistrar, srv AuditServiceServer) {
+	// If the following call panics, it indicates UnimplementedAuditServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&AuditService_ServiceDesc, srv)
+}
+
+func _AuditService_IngestSSHSessionRecords_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IngestSSHSessionRecordsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AuditServiceServer).IngestSSHSessionRecords(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AuditService_IngestSSHSessionRecords_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AuditServiceServer).IngestSSHSessionRecords(ctx, req.(*IngestSSHSessionRecordsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// AuditService_ServiceDesc is the grpc.ServiceDesc for AuditService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var AuditService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.AuditService",
+	HandlerType: (*AuditServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "IngestSSHSessionRecords",
+			Handler:    _AuditService_IngestSSHSessionRecords_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/audit.proto",
+}
