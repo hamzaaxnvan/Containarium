@@ -47,3 +47,101 @@ const (
 	TenantSecretsMount = "/run/secrets"
 )
 
+// tenantSecretsName is the per-tenant Secret holding delivered secrets.
+//
+// Distinct from the authorized-keys and host-key Secrets: those are SSH
+// plumbing the platform owns, this is tenant data. Mixing them would mean a
+// tenant secret named `authorized_keys` could lock a box out.
+func tenantSecretsName(tenant string) string { return tenant + "-secrets" }
+
+// tenantSecretsObject builds the per-tenant secrets object.
+func tenantSecretsObject(ns, tenant string, data map[string][]byte) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tenantSecretsName(tenant),
+			Namespace: ns,
+			Labels:    boxLabels(tenant),
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: data,
+	}
+}
+
+// ApplyTenantSecrets materializes a tenant's secrets into their box.
+//
+// An empty map deletes the Secret rather than leaving an empty one: a
+// deleted secret must stop being readable in the box, and an empty-but-present
+// Secret keeps the mount alive with stale files until the kubelet resyncs.
+func (b *Backend) ApplyTenantSecrets(ctx context.Context, tenant string, data map[string][]byte) error {
+	if tenant == "" {
+		return fmt.Errorf("k8s: tenant is required")
+	}
+
+	ns := b.cfg.TenantNamespacePrefix + tenant
+	secrets := b.clientset.CoreV1().Secrets(ns)
+	name := tenantSecretsName(tenant)
+
+	if len(data) == 0 {
+		err := secrets.Delete(ctx, name, metav1.DeleteOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("k8s: delete tenant secrets for %q: %w", tenant, err)
+		}
+		return nil
+	}
+
+	desired := tenantSecretsObject(ns, tenant, data)
+	existing, err := secrets.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			if _, err := secrets.Create(ctx, desired, metav1.CreateOptions{}); err != nil {
+				return fmt.Errorf("k8s: create tenant secrets for %q: %w", tenant, err)
+			}
+			return nil
+		}
+		return fmt.Errorf("k8s: read tenant secrets for %q: %w", tenant, err)
+	}
+
+	// Update carries the whole Data map, so a secret deleted upstream
+	// disappears here. Merging instead would leave a deleted secret readable
+	// in the box for as long as the box lives.
+	updated := existing.DeepCopy()
+	updated.Data = data
+	updated.Type = corev1.SecretTypeOpaque
+	if updated.Labels == nil {
+		updated.Labels = map[string]string{}
+	}
+	for k, v := range boxLabels(tenant) {
+		updated.Labels[k] = v
+	}
+	if _, err := secrets.Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("k8s: update tenant secrets for %q: %w", tenant, err)
+	}
+	return nil
+}
+
+// tenantSecretsVolumeFor builds the pod volume and its mount.
+//
+// Optional, because a box with no secrets must still start. A required volume
+// whose Secret does not exist leaves the pod in ContainerCreating forever —
+// so the common case (a tenant who has set no secrets) would be a box that
+// never comes up. The kubelet populates the mount if the Secret appears
+// later, which is exactly the first `secret set` on a running box.
+func tenantSecretsVolumeFor(tenant string) (corev1.Volume, corev1.VolumeMount) {
+	optional := true
+	return corev1.Volume{
+			Name: tenantSecretsVolume,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: tenantSecretsName(tenant),
+					Optional:   &optional,
+					// 0400: readable by the box's user, by nobody else, and
+					// never executable.
+					DefaultMode: int32p(0o400),
+				},
+			},
+		}, corev1.VolumeMount{
+			Name:      tenantSecretsVolume,
+			MountPath: TenantSecretsMount,
+			ReadOnly:  true,
+		}
+}
