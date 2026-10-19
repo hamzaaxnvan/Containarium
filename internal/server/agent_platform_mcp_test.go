@@ -53,3 +53,113 @@ func TestPlatformMCPSeedScript_OnlyWhenRunIsBoundToAConnection(t *testing.T) {
 	}
 	if _, ok := platformMCPSeedScript("/seed", 8080, "default"); !ok {
 		t.Error("no script for a bound run with a known port")
+	}
+}
+
+// TestPlatformMCPSeedScript_WritesResolvedSeed runs the generated script for
+// real (bash, a stub `ip`) rather than asserting on its text — the host is
+// resolved in-box from the default route, and that substitution is the part a
+// string assertion cannot check.
+func TestPlatformMCPSeedScript_WritesResolvedSeed(t *testing.T) {
+	seedDir := t.TempDir()
+	binDir := t.TempDir()
+	stub := "#!/bin/sh\necho 'default via 10.9.8.1 dev eth0'\n"
+	if err := os.WriteFile(filepath.Join(binDir, "ip"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	script, ok := platformMCPSeedScript(seedDir, 8080, "default")
+	if !ok {
+		t.Fatal("no script")
+	}
+	cmd := exec.Command("bash", "-c", script) //nolint:gosec // test-only, script built by the code under test
+	cmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(seedDir, "platform_mcp.json"))
+	if err != nil {
+		t.Fatalf("platform_mcp.json not written: %v", err)
+	}
+	var got platformMCPSeed
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("not valid JSON: %v\n%s", err, raw)
+	}
+	if got.ServerURL != "http://10.9.8.1:8080" {
+		t.Errorf("server_url = %q, want the default-route host", got.ServerURL)
+	}
+	if got.TokenFile != seedDir+"/token" {
+		t.Errorf("token_file = %q, want %q", got.TokenFile, seedDir+"/token")
+	}
+	if got.Tools != "tracker_*" {
+		t.Errorf("tools = %q, want tracker_* — the in-box agent must see the tracker tools only", got.Tools)
+	}
+	if got.Command != "env" || len(got.Args) != 2 || got.Args[0] != "CONTAINARIUM_MCP_ALLOW_INSECURE=true" || got.Args[1] != "mcp-server" {
+		t.Errorf("command = %q %v, want env CONTAINARIUM_MCP_ALLOW_INSECURE=true mcp-server", got.Command, got.Args)
+	}
+}
+
+// #2508: the seed's own command line must put the plaintext opt-in into the
+// platform MCP's environment — the runtime hands that process nothing else of
+// the kind, and the MCP client refuses http:// without it. Run the command
+// exactly as the runtime would (command + args, a stub standing in for the
+// real mcp-server) and read the variable back from inside it.
+func TestPlatformMCPSeed_CommandCarriesThePlaintextOptInToTheProcess(t *testing.T) {
+	seedDir := t.TempDir()
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "ip"), []byte("#!/bin/sh\necho 'default via 10.9.8.1 dev eth0'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stand-in for the real mcp-server: report what the MCP client would see.
+	stub := "#!/bin/sh\necho \"allow_insecure=$CONTAINARIUM_MCP_ALLOW_INSECURE\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "mcp-server"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script, ok := platformMCPSeedScript(seedDir, 8080, "default")
+	if !ok {
+		t.Fatal("no script")
+	}
+	env := append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"))
+	seed := exec.Command("bash", "-c", script) //nolint:gosec // test-only, script built by the code under test
+	seed.Env = env
+	if out, err := seed.CombinedOutput(); err != nil {
+		t.Fatalf("seed script failed: %v\n%s", err, out)
+	}
+	raw, err := os.ReadFile(filepath.Join(seedDir, "platform_mcp.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got platformMCPSeed
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	run := exec.Command(got.Command, got.Args...)             //nolint:gosec // test-only; the seed we just wrote
+	run.Env = append(env, "CONTAINARIUM_MCP_ALLOW_INSECURE=") // the parent (the runtime) does not set it
+	out, err := run.CombinedOutput()
+	if err != nil {
+		t.Fatalf("seeded command failed: %v\n%s", err, out)
+	}
+	if string(out) != "allow_insecure=true\n" {
+		t.Errorf("platform MCP process saw %q, want allow_insecure=true", out)
+	}
+}
+
+// A box whose default route can't be resolved must not get a seed with an
+// empty host (http://:8080) — that would mount a broken server silently.
+func TestPlatformMCPSeedScript_NoHostWritesNothing(t *testing.T) {
+	seedDir := t.TempDir()
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "ip"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script, _ := platformMCPSeedScript(seedDir, 8080, "default")
+	cmd := exec.Command("bash", "-c", script) //nolint:gosec // test-only
+	cmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("script must not fail the whole seed when the host is unresolvable: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(seedDir, "platform_mcp.json")); !os.IsNotExist(err) {
+		t.Errorf("platform_mcp.json written despite an unresolvable host (stat err = %v)", err)
+	}
+}
