@@ -206,3 +206,316 @@ func setUpSubmitConnection(t *testing.T, user string, provider *fakeWriterProvid
 	// "not configured" checks these fields exist to test. Guard here so
 	// passing nil really means "leave it unset".
 	if box != nil {
+		s.submitBoxRunner = box
+		// #2798: a submit seals a Proof Pack generated in the run's box
+		// into the audit chain before it pushes.
+		s.proofPackExecer = &fakeProofBox{commit: box.headSHA, probeRC: 12}
+		s.auditStore = mustTestAuditStore(t)
+	}
+	if pusher != nil {
+		s.submitPusher = pusher
+	}
+	return s, ctx
+}
+
+func TestSubmitTrackerChange_RequiresRunScopedToken(t *testing.T) {
+	const user = "tracker-rpc-submit-no-run"
+	provider := &fakeWriterProvider{}
+	s, _ := setUpWriterConnection(t, user, provider)
+	// An operator context — same scopes, no run_id claim.
+	ctx := kmsKeyTestCtx(user, "member", "tracker:write")
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition (no run_id claim)", status.Code(err))
+	}
+}
+
+func TestSubmitTrackerChange_NoRunRegistryConfigured(t *testing.T) {
+	const user = "tracker-rpc-submit-no-registry"
+	provider := &fakeWriterProvider{}
+	s, ctx := setUpWriterConnection(t, user, provider) // s.runRegistry left nil
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition (no run registry configured)", status.Code(err))
+	}
+}
+
+func TestSubmitTrackerChange_RunNotFound(t *testing.T) {
+	const user = "tracker-rpc-submit-run-not-found"
+	provider := &fakeWriterProvider{}
+	s, ctx := setUpSubmitConnection(t, user, provider, nil, nil, nil) // no run registered
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition (run not found)", status.Code(err))
+	}
+}
+
+func TestSubmitTrackerChange_RunHasNoGitSource(t *testing.T) {
+	const user = "tracker-rpc-submit-no-git-source"
+	provider := &fakeWriterProvider{}
+	noGitSource := runlease.Info{SkillID: "code-review", Box: "agent-box-1"} // GitCommit/Workspace empty
+	s, ctx := setUpSubmitConnection(t, user, provider, nil, nil, &noGitSource)
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition (run has no git_source)", status.Code(err))
+	}
+}
+
+func TestSubmitTrackerChange_NoContainerManagerConfigured(t *testing.T) {
+	const user = "tracker-rpc-submit-no-manager"
+	provider := &fakeWriterProvider{}
+	info := validRunInfo()
+	// box is nil AND s.manager is nil (setUpWriterConnection never sets
+	// it) — boxRunnerForSubmit must return nil, not a typed-nil panic.
+	s, ctx := setUpSubmitConnection(t, user, provider, nil, nil, &info)
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable (no container manager configured)", status.Code(err))
+	}
+}
+
+func TestSubmitTrackerChange_HostGitMissingOrTooOld(t *testing.T) {
+	const user = "tracker-rpc-submit-no-git"
+	provider := &fakeWriterProvider{}
+	info := validRunInfo()
+	box := &fakeSubmitBox{}
+	s, ctx := setUpSubmitConnection(t, user, provider, box, &fakeSubmitPusher{}, &info)
+
+	// An empty-but-existing PATH directory: exec.LookPath("git") fails
+	// deterministically without depending on what's actually installed
+	// on the machine running this test.
+	t.Setenv("PATH", t.TempDir())
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition (git missing)", status.Code(err))
+	}
+}
+
+func TestSubmitTrackerChange_BundleTooLarge(t *testing.T) {
+	const user = "tracker-rpc-submit-bundle-too-large"
+	provider := &fakeWriterProvider{}
+	info := validRunInfo()
+	bundleBytes, headSHA := realBundleBytes(t)
+	box := &fakeSubmitBox{bundleBytes: bundleBytes, headSHA: headSHA}
+	// Force ExtractBundle's in-box size check to report far more than
+	// the real (tiny) fixture bundle actually is, without needing an
+	// actual 50MB+ payload in a test.
+	box.bundleBytes = make([]byte, submitTestOverCap)
+	s, ctx := setUpSubmitConnection(t, user, provider, box, &fakeSubmitPusher{}, &info)
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument (bundle over size cap)", status.Code(err))
+	}
+}
+
+// submitTestOverCap is deliberately larger than submit.DefaultMaxBundleBytes
+// without actually allocating 50MB+ of real bundle content elsewhere in
+// this file — fakeSubmitBox's stat step reports len(bundleBytes)
+// directly, so an all-zero slice of this size is enough to exercise the
+// cap check.
+const submitTestOverCap = 51 * 1024 * 1024
+
+func TestSubmitTrackerChange_PushFails(t *testing.T) {
+	const user = "tracker-rpc-submit-push-fails"
+	provider := &fakeWriterProvider{}
+	info := validRunInfo()
+	bundleBytes, headSHA := realBundleBytes(t)
+	box := &fakeSubmitBox{bundleBytes: bundleBytes, headSHA: headSHA}
+	pusher := &fakeSubmitPusher{err: errors.New("push failed: connection refused")}
+	s, ctx := setUpSubmitConnection(t, user, provider, box, pusher, &info)
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("code = %v, want Internal (push failure)", status.Code(err))
+	}
+}
+
+func TestSubmitTrackerChange_OpenChangeFails(t *testing.T) {
+	const user = "tracker-rpc-submit-openchange-fails"
+	provider := &fakeWriterProvider{openChangeErr: tracker.ErrCredentialInvalid}
+	info := validRunInfo()
+	bundleBytes, headSHA := realBundleBytes(t)
+	box := &fakeSubmitBox{bundleBytes: bundleBytes, headSHA: headSHA}
+	pusher := &fakeSubmitPusher{result: submit.PushResult{Branch: "agent/run-abc123de/1-t", SHA: headSHA}}
+	s, ctx := setUpSubmitConnection(t, user, provider, box, pusher, &info)
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition (credential rejected)", status.Code(err))
+	}
+}
+
+// TestSubmitTrackerChange_HappyPath exercises the whole pipeline end to
+// end with fakes standing in for the box and the git push: extract a
+// real bundle, "push" it (recording the PushSpec for inspection),
+// "open" the change (fakeWriterProvider records the OpenChangeRequest),
+// and check the response and what each fake was actually called with.
+func TestSubmitTrackerChange_HappyPath(t *testing.T) {
+	user := "tracker-rpc-submit-happy-" + uuid.NewString()
+	bundleBytes, headSHA := realBundleBytes(t)
+	wantBranch := "agent/run-abc123de/1-conformance-change"
+	provider := &fakeWriterProvider{
+		openChangeOut: tracker.Change{Number: 6, URL: "https://github.com/acme/widgets/pull/6"},
+	}
+	info := validRunInfo()
+	box := &fakeSubmitBox{bundleBytes: bundleBytes, headSHA: headSHA}
+	pusher := &fakeSubmitPusher{result: submit.PushResult{Branch: wantBranch, SHA: headSHA}}
+	s, ctx := setUpSubmitConnection(t, user, provider, box, pusher, &info)
+	s.auditStore = mustTestAuditStore(t)
+	// #3001: the dispatcher's row for this run, which the submit annotates.
+	dispatch, err := s.trackerStore.InsertDispatch(ctx, tracker.Dispatch{
+		Username: user, Connection: "default", IssueNumber: 1, Scope: "product", SkillID: "code-review", RunID: "run-abc123",
+	})
+	if err != nil {
+		t.Fatalf("seed dispatch row: %v", err)
+	}
+
+	resp, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "My change", Description: "does the thing",
+	})
+	if err != nil {
+		t.Fatalf("SubmitTrackerChange: %v", err)
+	}
+	if resp.GetChange().GetNumber() != 6 {
+		t.Errorf("response change number = %d, want 6", resp.GetChange().GetNumber())
+	}
+	if resp.GetChange().GetUrl() != "https://github.com/acme/widgets/pull/6" {
+		t.Errorf("response change url = %q, want the provider's URL echoed", resp.GetChange().GetUrl())
+	}
+
+	// #3001: the dispatch row now names the change, and the listing a
+	// control plane mirrors carries it.
+	row, err := s.trackerStore.GetDispatch(ctx, dispatch.ID)
+	if err != nil {
+		t.Fatalf("GetDispatch: %v", err)
+	}
+	if row.ChangeURL != "https://github.com/acme/widgets/pull/6" || row.ChangeNumber != 6 {
+		t.Errorf("dispatch row change = {%q, %d}, want the submitted change recorded by run id", row.ChangeURL, row.ChangeNumber)
+	}
+	listed, err := s.ListTrackerDispatches(kmsKeyTestCtx(user, "member", "tracker:admin"), &pb.ListTrackerDispatchesRequest{Username: user, Connection: "default"})
+	if err != nil {
+		t.Fatalf("ListTrackerDispatches: %v", err)
+	}
+	if len(listed.GetDispatches()) != 1 || listed.GetDispatches()[0].GetChangeUrl() != "https://github.com/acme/widgets/pull/6" || listed.GetDispatches()[0].GetChangeNumber() != 6 {
+		t.Errorf("listed dispatches = %v, want one row carrying change_url / change_number", listed.GetDispatches())
+	}
+
+	// PushBundle must have been called with the run's actual recorded
+	// base commit and the bundle's actual resolved head — never guessed
+	// or left zero.
+	if pusher.gotSpec.BaseSHA != info.GitCommit {
+		t.Errorf("PushSpec.BaseSHA = %q, want %q", pusher.gotSpec.BaseSHA, info.GitCommit)
+	}
+	if pusher.gotSpec.HeadSHA != headSHA {
+		t.Errorf("PushSpec.HeadSHA = %q, want %q", pusher.gotSpec.HeadSHA, headSHA)
+	}
+	if pusher.gotSpec.RunID != "run-abc123" {
+		t.Errorf("PushSpec.RunID = %q, want run-abc123", pusher.gotSpec.RunID)
+	}
+	if pusher.gotSpec.Credential == "" {
+		t.Error("PushSpec.Credential is empty — the resolved broker credential must reach GitPusher")
+	}
+
+	// OpenChange must be called with the PUSHED branch (from GitPusher's
+	// result), the daemon-resolved base branch, and a description
+	// carrying the closing reference and the platform stamp — never the
+	// raw, unstamped request description.
+	if provider.openChangeReq.HeadBranch != wantBranch {
+		t.Errorf("OpenChangeRequest.HeadBranch = %q, want %q (the pushed branch, not re-derived)", provider.openChangeReq.HeadBranch, wantBranch)
+	}
+	if provider.openChangeReq.BaseBranch != "main" {
+		t.Errorf("OpenChangeRequest.BaseBranch = %q, want %q (the run's recorded GitRef)", provider.openChangeReq.BaseBranch, "main")
+	}
+	if !strings.Contains(provider.openChangeReq.Description, "Closes #1") {
+		t.Errorf("OpenChangeRequest.Description = %q, want it to contain the closing reference", provider.openChangeReq.Description)
+	}
+	if !strings.Contains(provider.openChangeReq.Description, "does the thing") {
+		t.Errorf("OpenChangeRequest.Description = %q, want the caller's own description", provider.openChangeReq.Description)
+	}
+	if !strings.Contains(provider.openChangeReq.Description, "via Containarium") {
+		t.Errorf("OpenChangeRequest.Description = %q, want the platform stamp", provider.openChangeReq.Description)
+	}
+	rows, _, err := s.auditStore.Query(context.Background(), audit.QueryParams{Username: user, Action: "tracker.submit_change", Limit: 10})
+	if err != nil {
+		t.Fatalf("audit Query: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("audit rows for tracker.submit_change = %d, want 1", len(rows))
+	}
+	if rows[0].RunID != "run-abc123" {
+		t.Errorf("audit RunID = %q, want run-abc123", rows[0].RunID)
+	}
+}
+
+// TestSubmitTrackerChange_EmptyGitRefResolvesProviderDefaultBranch proves
+// the #1922 follow-up: a run with no recorded ref (git_source fetched the
+// remote's default branch) must target the PROVIDER's actual default
+// branch, not a hardcoded "main".
+func TestSubmitTrackerChange_EmptyGitRefResolvesProviderDefaultBranch(t *testing.T) {
+	const user = "tracker-rpc-submit-default-branch"
+	bundleBytes, headSHA := realBundleBytes(t)
+	provider := &fakeWriterProvider{
+		defaultBranchOut: "trunk", // deliberately not "main", to prove it isn't hardcoded
+		openChangeOut:    tracker.Change{Number: 1},
+	}
+	info := validRunInfo()
+	info.GitRef = "" // the run fetched the remote's default branch
+	box := &fakeSubmitBox{bundleBytes: bundleBytes, headSHA: headSHA}
+	pusher := &fakeSubmitPusher{result: submit.PushResult{Branch: "agent/run-abc123de/1-x", SHA: headSHA}}
+	s, ctx := setUpSubmitConnection(t, user, provider, box, pusher, &info)
+
+	if _, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	}); err != nil {
+		t.Fatalf("SubmitTrackerChange: %v", err)
+	}
+	if provider.openChangeReq.BaseBranch != "trunk" {
+		t.Errorf("OpenChangeRequest.BaseBranch = %q, want the provider's own default branch (\"trunk\"), not a hardcoded guess", provider.openChangeReq.BaseBranch)
+	}
+}
+
+// TestSubmitTrackerChange_DefaultBranchResolutionFails proves a failure
+// resolving the default branch is surfaced, not silently defaulted to
+// "main" (which would target the wrong branch on a renamed default).
+func TestSubmitTrackerChange_DefaultBranchResolutionFails(t *testing.T) {
+	const user = "tracker-rpc-submit-default-branch-fails"
+	bundleBytes, headSHA := realBundleBytes(t)
+	provider := &fakeWriterProvider{defaultBranchErr: tracker.ErrUnreachable}
+	info := validRunInfo()
+	info.GitRef = ""
+	box := &fakeSubmitBox{bundleBytes: bundleBytes, headSHA: headSHA}
+	pusher := &fakeSubmitPusher{result: submit.PushResult{Branch: "agent/run-abc123de/1-x", SHA: headSHA}}
+	s, ctx := setUpSubmitConnection(t, user, provider, box, pusher, &info)
+
+	_, err := s.SubmitTrackerChange(ctx, &pb.SubmitTrackerChangeRequest{
+		Username: user, Connection: "default", Issue: 1, Title: "t",
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable (tracker unreachable while resolving default branch)", status.Code(err))
+	}
+}

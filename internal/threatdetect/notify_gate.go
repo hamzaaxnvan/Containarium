@@ -151,3 +151,55 @@ func (g *deliveryGate) shouldDeliver(f *Finding) bool {
 	if f.ID == 0 || f.State == FindingStateResolved {
 		return true // untracked (fail open), or the resolution: always news
 	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	prev, seen := g.last[f.ID]
+	box, state := responseOf(f)
+	return !seen || f.Severity > prev.severity || state != prev.boxState(box) || killNews(prev, f, g.now()) || g.now().Sub(prev.at) >= g.interval
+}
+
+// delivered records that f was queued. A resolved finding is forgotten: it
+// can no longer repeat.
+func (g *deliveryGate) delivered(f *Finding) {
+	if f.ID == 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if f.State == FindingStateResolved {
+		delete(g.last, f.ID)
+		return
+	}
+	box, state := responseOf(f)
+	now := g.now()
+	e := gateEntry{at: now, severity: f.Severity, boxes: map[string]pb.ResponseState{}, kill: killOf(f)}
+	e.skipSent = e.kill.skip != pb.KillSkipReason_KILL_SKIP_REASON_UNSPECIFIED
+	if prev, ok := g.last[f.ID]; ok {
+		maps.Copy(e.boxes, prev.boxes)
+		e.skipSent = e.skipSent || prev.skipSent
+		if prev.kill == e.kill {
+			e.killAt = prev.killAt
+		} else {
+			e.killAt = now
+		}
+	} else {
+		e.killAt = now
+	}
+	e.boxes[box] = state
+	g.last[f.ID] = e
+	if len(g.last) > gateMaxEntries {
+		g.evictOldest()
+	}
+}
+
+func (g *deliveryGate) evictOldest() {
+	var oldestID int64
+	var oldest time.Time
+	first := true
+	for id, e := range g.last {
+		if first || e.at.Before(oldest) {
+			oldestID, oldest, first = id, e.at, false
+		}
+	}
+	delete(g.last, oldestID)
+}

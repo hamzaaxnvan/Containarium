@@ -81,3 +81,87 @@ func (m *Manager) Claim(ctx context.Context, req ClaimRequest) (*ClaimResult, er
 	if tok.TokenID != st.Labels[LabelClaimTokenID] || tok.FPHash != st.Labels[LabelFPHash] {
 		return nil, fmt.Errorf("%w: token does not belong to this box", ErrClaimInvalid)
 	}
+
+	// The LXC backend derives the container AND its Linux user from
+	// ref.Tenant, so every write below addresses the box by its own name
+	// — not by the tenant it is about to belong to.
+	ref := boxRefFor(st.Ref.Name)
+	now := m.cfg.Now()
+
+	m.claimMu.Lock()
+	defer m.claimMu.Unlock()
+	if st.Labels[LabelClaimedAt] != "" {
+		return nil, ErrClaimAlreadyClaimed
+	}
+	// Re-read under the lock: the List above was unlocked.
+	if cur, err := m.findByName(ctx, ref.Name); err != nil {
+		return nil, err
+	} else if cur == nil {
+		return nil, ErrClaimNotFound
+	} else if cur.Labels[LabelClaimedAt] != "" {
+		return nil, ErrClaimAlreadyClaimed
+	}
+	if err := m.boxes.SetMeta(ctx, ref, map[string]string{
+		LabelClaimedAt: now.UTC().Format(time.RFC3339),
+		LabelClaimedBy: req.Tenant,
+	}); err != nil {
+		return nil, fmt.Errorf("anonbox: mark %s claimed: %w", ref.Name, err)
+	}
+
+	var errs []error
+	if err := m.boxes.SetTTL(ctx, ref, nil); err != nil {
+		errs = append(errs, fmt.Errorf("clear ttl: %w", err))
+	}
+	if err := m.liftEgressGuard(ref.Name); err != nil {
+		errs = append(errs, fmt.Errorf("lift egress guard: %w", err))
+	}
+	keys := dedupeKeys(append([]string{st.Labels[LabelPublicKey]}, req.AuthorizedKeys...))
+	if err := m.boxes.SetAuthorizedKeys(ctx, ref, keys); err != nil {
+		errs = append(errs, fmt.Errorf("set authorized keys: %w", err))
+	}
+	// Ownership last: once the tenant label is set, status reports the
+	// box under the new tenant, and the writes above must already have
+	// gone to the right container.
+	if err := m.boxes.SetOwner(ctx, ref, req.Tenant); err != nil {
+		errs = append(errs, fmt.Errorf("set owner: %w", err))
+	}
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("anonbox: %s claimed by %s but conversion incomplete: %w", ref.Name, req.Tenant, errors.Join(errs...))
+	}
+	m.record(FunnelEvent{Kind: FunnelClaimCompleted, FPHash: st.Labels[LabelFPHash], BoxName: ref.Name})
+	return &ClaimResult{BoxName: ref.Name, Tenant: req.Tenant, SSHUser: ref.Tenant}, nil
+}
+
+// findByName returns the box with that instance name, or nil.
+func (m *Manager) findByName(ctx context.Context, name string) (*box.BoxStatus, error) {
+	all, err := m.boxes.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("anonbox: list boxes: %w", err)
+	}
+	for i := range all {
+		if all[i].Ref.Name == name {
+			return &all[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// boxRefFor addresses a box by its own name on backends that derive the
+// container (and login) from ref.Tenant.
+func boxRefFor(name string) box.BoxRef {
+	return box.BoxRef{Tenant: strings.TrimSuffix(name, "-container"), Name: name}
+}
+
+func dedupeKeys(keys []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		k = strings.TrimSpace(k)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, k)
+	}
+	return out
+}
