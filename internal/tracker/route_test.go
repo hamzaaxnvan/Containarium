@@ -113,3 +113,118 @@ func TestRouteStore_CascadeOnConnectionDelete(t *testing.T) {
 	store, ctx := newTrackerTestStore(t)
 	const user = "tracker-route-cascade"
 	seedRouteConnection(t, ctx, store, user, "default")
+
+	for _, scope := range []string{"product", "architecture"} {
+		if _, err := store.SetRoute(ctx, Route{Username: user, Connection: "default", Scope: scope, SkillID: "skill-" + scope}); err != nil {
+			t.Fatalf("SetRoute %s: %v", scope, err)
+		}
+	}
+
+	if err := store.Delete(ctx, user, "default"); err != nil {
+		t.Fatalf("Delete connection: %v", err)
+	}
+
+	var n int
+	if err := store.pool.QueryRow(ctx,
+		"SELECT count(*) FROM tracker_routes WHERE username = $1 AND connection = $2", user, "default").Scan(&n); err != nil {
+		t.Fatalf("count routes: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("routes left after connection delete = %d, want 0 (ON DELETE CASCADE)", n)
+	}
+
+	// Re-creating a connection with the same name must not resurrect the
+	// old routes.
+	seedRouteConnection(t, ctx, store, user, "default")
+	list, err := store.ListRoutes(ctx, user, "default")
+	if err != nil {
+		t.Fatalf("ListRoutes: %v", err)
+	}
+	if len(list) != 0 {
+		t.Errorf("ListRoutes after reconnect = %+v, want empty", list)
+	}
+}
+
+func TestRouteStore_SetOnMissingConnection_NotFound(t *testing.T) {
+	store, ctx := newTrackerTestStore(t)
+	const user = "tracker-route-missing-conn"
+	_, _ = store.pool.Exec(ctx, "DELETE FROM tracker_connections WHERE username = $1", user)
+
+	_, err := store.SetRoute(ctx, Route{Username: user, Connection: "nope", Scope: "product", SkillID: "product-define"})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetRoute on a missing connection err = %v, want ErrNotFound (connection)", err)
+	}
+}
+
+func TestRouteStore_SetRejectsInvalidInput(t *testing.T) {
+	store, ctx := newTrackerTestStore(t)
+	const user = "tracker-route-invalid"
+	seedRouteConnection(t, ctx, store, user, "default")
+
+	tests := []struct {
+		name  string
+		route Route
+	}{
+		{"no username", Route{Connection: "default", Scope: "product", SkillID: "s"}},
+		{"no connection", Route{Username: user, Scope: "product", SkillID: "s"}},
+		{"no skill", Route{Username: user, Connection: "default", Scope: "product"}},
+		{"bad scope", Route{Username: user, Connection: "default", Scope: "scope:product", SkillID: "s"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := store.SetRoute(ctx, tt.route); err == nil {
+				t.Fatalf("SetRoute(%+v) = nil error, want a validation error", tt.route)
+			}
+		})
+	}
+}
+
+// TestValidateRouteScope is pure — no Postgres. A scope is the label
+// suffix ("product" for the label "scope:product"), so the prefix itself,
+// whitespace, and anything a forge would not accept in a label are
+// rejected up front rather than stored as a route that can never match.
+func TestValidateRouteScope(t *testing.T) {
+	tests := []struct {
+		scope   string
+		wantErr bool
+	}{
+		{"product", false},
+		{"architecture", false},
+		{"qa-e2e", false},
+		{"v2.release_notes", false},
+		{"Product", false},
+		{"", true},
+		{"scope:product", true},
+		{"has space", true},
+		{"-leading-dash", true},
+		{"a/b", true},
+		{"tab\there", true},
+		{strings.Repeat("a", 64), false},
+		{strings.Repeat("a", 65), true},
+	}
+	for _, tt := range tests {
+		err := ValidateRouteScope(tt.scope)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("ValidateRouteScope(%q) err = %v, wantErr %v", tt.scope, err, tt.wantErr)
+		}
+	}
+}
+
+func TestIsScopeLabel(t *testing.T) {
+	for label, want := range map[string]bool{
+		"scope:product":  true,
+		"Scope:product":  true,
+		"SCOPE:x":        true,
+		" scope:product": true,
+		"scope:":         true,
+		"scope":          false,
+		"model:fable":    false,
+		"agent:queued":   false,
+		"myscope:x":      false,
+		"":               false,
+	} {
+		if got := IsScopeLabel(label); got != want {
+			t.Errorf("IsScopeLabel(%q) = %v, want %v", label, got, want)
+		}
+	}
+}
