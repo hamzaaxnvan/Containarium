@@ -39,3 +39,44 @@ func TestProbe_ReportsPolicyStoreReadiness(t *testing.T) {
 
 	st, err := probe.Probe(context.Background())
 	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	got := readiness(st)
+	if len(got) != len(policyreadiness.Services()) {
+		t.Fatalf("readiness checks = %v, want one per policy service", got)
+	}
+	for name, c := range got {
+		if c.OK || !strings.Contains(c.Detail, "unavailable") {
+			t.Errorf("%s = %+v, want unmet and saying unavailable", name, c)
+		}
+	}
+	if st.SelfCheckOK != baseline.SelfCheckOK {
+		t.Errorf("SelfCheckOK = %v with readiness unmet, want %v (advisory only)", st.SelfCheckOK, baseline.SelfCheckOK)
+	}
+
+	for _, svc := range policyreadiness.Services() {
+		h.SetServingStatus(svc, healthpb.HealthCheckResponse_SERVING)
+	}
+	st, err = probe.Probe(context.Background())
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	for name, c := range readiness(st) {
+		if !c.OK {
+			t.Errorf("%s = %+v after recovery, want met", name, c)
+		}
+	}
+}
+
+// With no readiness source wired, the probe reports no readiness checks.
+func TestProbe_NoReadinessSourceAddsNoChecks(t *testing.T) {
+	st, err := DefaultStatusProbe{}.Probe(context.Background())
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	for _, c := range st.Checks {
+		if strings.HasPrefix(c.Name, "readiness: ") {
+			t.Errorf("unexpected readiness check %+v", c)
+		}
+	}
+}
