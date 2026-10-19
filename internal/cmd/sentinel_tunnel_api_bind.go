@@ -16,3 +16,10 @@ func applyTunnelAPIBindAddr(ts *sentinel.TunnelServer, addr string) error {
 	ip := net.ParseIP(addr)
 	if ip == nil {
 		return fmt.Errorf("--tunnel-api-bind-addr %q: want an IP address with no port", addr)
+	}
+	ts.APIBindAddr = addr
+	if !ip.IsLoopback() {
+		log.Printf("[sentinel] per-backend tunnel API ports bind to %s (--tunnel-api-bind-addr)", addr)
+	}
+	return nil
+}
