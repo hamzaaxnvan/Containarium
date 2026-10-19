@@ -1,0 +1,360 @@
+// Package recipes provides the built-in catalog of declarative GPU/app
+// recipes. A recipe defines a workload (image, ports, volumes, parameters,
+// post-start commands) that the daemon provisions as a new dedicated
+// container. It mirrors pkg/core/stacks: the catalog ships as embedded YAML
+// and is exposed to the rest of the system as strongly-typed pb.Recipe values.
+package recipes
+
+import (
+	"bytes"
+	"embed"
+	"errors"
+	"fmt"
+	"io"
+	"path"
+	"strings"
+	"sync"
+
+	pb "github.com/footprintai/containarium/pkg/pb/containarium/v1"
+	"gopkg.in/yaml.v3"
+)
+
+//go:embed *.yaml
+var embeddedFS embed.FS
+
+// resourcesDef mirrors pb.RecipeResources for YAML decoding.
+type resourcesDef struct {
+	CPU    string `yaml:"cpu"`
+	Memory string `yaml:"memory"`
+	Disk   string `yaml:"disk"`
+}
+
+// portDef mirrors pb.RecipePort for YAML decoding.
+type portDef struct {
+	ContainerPort int32  `yaml:"container_port"`
+	Subdomain     string `yaml:"subdomain"`
+	// Protocol selects how this port is exposed: "" or "http" (the
+	// default) routes through Caddy under Subdomain; "tcp" or "udp"
+	// registers a direct passthrough route instead (#1462).
+	Protocol string `yaml:"protocol,omitempty"`
+	// ExternalPort is the host-side port for a tcp/udp passthrough.
+	// Ignored for http. Zero defaults to ContainerPort at expose time.
+	ExternalPort int32 `yaml:"external_port,omitempty"`
+}
+
+// volumeDef mirrors pb.RecipeVolume for YAML decoding.
+type volumeDef struct {
+	Name string `yaml:"name"`
+	Path string `yaml:"path"`
+}
+
+// paramDef mirrors pb.RecipeParam for YAML decoding.
+type paramDef struct {
+	Name        string `yaml:"name"`
+	Label       string `yaml:"label"`
+	Description string `yaml:"description,omitempty"`
+	Type        string `yaml:"type"`
+	Default     string `yaml:"default,omitempty"`
+	Required    bool   `yaml:"required,omitempty"`
+}
+
+// recipeDef is the YAML shape of a recipe. It converts to pb.Recipe via
+// ToProto so the wire/API contract stays the single source of truth.
+type recipeDef struct {
+	ID          string            `yaml:"id"`
+	Name        string            `yaml:"name"`
+	Description string            `yaml:"description,omitempty"`
+	Image       string            `yaml:"image"`
+	RequiresGPU bool              `yaml:"requires_gpu,omitempty"`
+	Resources   *resourcesDef     `yaml:"resources,omitempty"`
+	Ports       []portDef         `yaml:"ports,omitempty"`
+	Volumes     []volumeDef       `yaml:"volumes,omitempty"`
+	Env         map[string]string `yaml:"env,omitempty"`
+	Parameters  []paramDef        `yaml:"parameters,omitempty"`
+	PostStart   []string          `yaml:"post_start,omitempty"`
+	// ModelGatewayProvider opts the recipe into the managed model-gateway for the
+	// named provider (e.g. "gemini-openai"); see the proto field for semantics.
+	ModelGatewayProvider string `yaml:"model_gateway_provider,omitempty"`
+	// GuardrailGateNode gates every deploy on a guardrail attestation; see
+	// the proto field for semantics. Kept as a node so that a present but
+	// empty or null `guardrail_gate:` is seen (and refused) rather than
+	// loading as an ungated recipe; validate decodes it into GuardrailGate.
+	GuardrailGateNode yaml.Node         `yaml:"guardrail_gate,omitempty"`
+	GuardrailGate     *guardrailGateDef `yaml:"-"`
+}
+
+// UnmarshalYAML uses the callback form to retain the parent decoder's
+// KnownFields setting, source positions and shared YAML anchors. Decode into
+// a distinct type to avoid recursion, then add the recipe ID to each error.
+func (r *recipeDef) UnmarshalYAML(decode func(any) error) error {
+	type recipeYAML recipeDef
+	var decoded recipeYAML
+	if err := decode(&decoded); err != nil {
+		var typeErr *yaml.TypeError
+		if !errors.As(err, &typeErr) {
+			return fmt.Errorf("recipe %q: %w", decoded.ID, err)
+		}
+		annotated := &yaml.TypeError{Errors: make([]string, len(typeErr.Errors))}
+		for i, message := range typeErr.Errors {
+			annotated.Errors[i] = fmt.Sprintf("recipe %q: %s", decoded.ID, message)
+		}
+		return annotated
+	}
+	*r = recipeDef(decoded)
+	return nil
+}
+
+// guardrailGateDef is the YAML shape of pb.GuardrailGate. require_kinds
+// are the CLI's lower-case kind names; validate maps them to the enum.
+type guardrailGateDef struct {
+	DatasetPath  string   `yaml:"dataset_path"`
+	RequireKinds []string `yaml:"require_kinds,omitempty"`
+}
+
+// guardrailKindsFromYAML maps require_kinds names to enum values; ok is
+// false for an unknown name.
+func guardrailKindsFromYAML(names []string) ([]pb.GuardrailKind, bool) {
+	out := make([]pb.GuardrailKind, 0, len(names))
+	for _, n := range names {
+		k, found := pb.GuardrailKind_value["GUARDRAIL_KIND_"+strings.ToUpper(n)]
+		if !found || k == int32(pb.GuardrailKind_GUARDRAIL_KIND_UNSPECIFIED) {
+			return nil, false
+		}
+		out = append(out, pb.GuardrailKind(k))
+	}
+	return out, true
+}
+
+func validateGuardrailGate(id string, g *guardrailGateDef) error {
+	p := g.DatasetPath
+	if p == "" || !path.IsAbs(p) || path.Clean(p) != p || p == "/" {
+		return fmt.Errorf("recipe %q guardrail_gate.dataset_path %q must be a clean absolute path other than /", id, p)
+	}
+	if _, ok := guardrailKindsFromYAML(g.RequireKinds); !ok {
+		return fmt.Errorf("recipe %q guardrail_gate.require_kinds %v: unknown kind", id, g.RequireKinds)
+	}
+	return nil
+}
+
+// ToProto converts a recipeDef to its pb.Recipe representation.
+func (r *recipeDef) ToProto() *pb.Recipe {
+	out := &pb.Recipe{
+		Id:          r.ID,
+		Name:        r.Name,
+		Description: r.Description,
+		Image:       r.Image,
+		RequiresGpu: r.RequiresGPU,
+		Env:         r.Env,
+		PostStart:   r.PostStart,
+
+		ModelGatewayProvider: r.ModelGatewayProvider,
+	}
+	if r.GuardrailGate != nil {
+		kinds, _ := guardrailKindsFromYAML(r.GuardrailGate.RequireKinds) // validate refused unknown names
+		out.GuardrailGate = &pb.GuardrailGate{DatasetPath: r.GuardrailGate.DatasetPath, RequireKinds: kinds}
+	}
+	if r.Resources != nil {
+		out.Resources = &pb.RecipeResources{
+			Cpu:    r.Resources.CPU,
+			Memory: r.Resources.Memory,
+			Disk:   r.Resources.Disk,
+		}
+	}
+	for _, p := range r.Ports {
+		out.Ports = append(out.Ports, &pb.RecipePort{
+			ContainerPort: p.ContainerPort,
+			Subdomain:     p.Subdomain,
+			Protocol:      portProtocolFromYAML(p.Protocol),
+			ExternalPort:  p.ExternalPort,
+		})
+	}
+	for _, v := range r.Volumes {
+		out.Volumes = append(out.Volumes, &pb.RecipeVolume{
+			Name: v.Name,
+			Path: v.Path,
+		})
+	}
+	for _, p := range r.Parameters {
+		out.Parameters = append(out.Parameters, &pb.RecipeParam{
+			Name:        p.Name,
+			Label:       p.Label,
+			Description: p.Description,
+			Type:        p.Type,
+			Default:     p.Default,
+			Required:    p.Required,
+		})
+	}
+	return out
+}
+
+// portProtocolFromYAML maps a portDef.Protocol string to its pb.RouteProtocol
+// value. validate rejects anything not in this set before ToProto ever sees
+// it, so the "" / "http" default (ROUTE_PROTOCOL_UNSPECIFIED) is the only
+// unrecognized-string case reachable here.
+func portProtocolFromYAML(s string) pb.RouteProtocol {
+	switch s {
+	case "tcp":
+		return pb.RouteProtocol_ROUTE_PROTOCOL_TCP
+	case "udp":
+		return pb.RouteProtocol_ROUTE_PROTOCOL_UDP
+	default:
+		return pb.RouteProtocol_ROUTE_PROTOCOL_UNSPECIFIED
+	}
+}
+
+type config struct {
+	Recipes []recipeDef `yaml:"recipes"`
+}
+
+// Manager holds the loaded recipe catalog.
+type Manager struct {
+	recipes []*pb.Recipe
+	mu      sync.RWMutex
+}
+
+var (
+	defaultManager *Manager
+	once           sync.Once
+)
+
+// New creates an empty recipe manager.
+func New() *Manager { return &Manager{} }
+
+// GetDefault returns the process-wide manager backed by the embedded catalog.
+func GetDefault() *Manager {
+	once.Do(func() {
+		defaultManager = New()
+		if err := defaultManager.LoadEmbedded(); err != nil {
+			// Embedded data is compiled in; a failure here is a programmer
+			// error, so leaving the catalog empty is the safe degradation.
+			defaultManager.recipes = nil
+		}
+	})
+	return defaultManager
+}
+
+// LoadEmbedded loads the built-in recipes.yaml bundled into the binary.
+func (m *Manager) LoadEmbedded() error {
+	data, err := embeddedFS.ReadFile("recipes.yaml")
+	if err != nil {
+		return fmt.Errorf("read embedded recipes: %w", err)
+	}
+	return m.LoadFromBytes(data)
+}
+
+// LoadFromBytes parses and validates a YAML recipe catalog.
+func (m *Manager) LoadFromBytes(data []byte) error {
+	var cfg config
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("parse recipes YAML: %w", err)
+	}
+
+	loaded := make([]*pb.Recipe, 0, len(cfg.Recipes))
+	seen := map[string]bool{}
+	for i := range cfg.Recipes {
+		def := &cfg.Recipes[i]
+		if err := validate(def); err != nil {
+			return err
+		}
+		if seen[def.ID] {
+			return fmt.Errorf("duplicate recipe id: %s", def.ID)
+		}
+		seen[def.ID] = true
+		loaded = append(loaded, def.ToProto())
+	}
+
+	m.mu.Lock()
+	m.recipes = loaded
+	m.mu.Unlock()
+	return nil
+}
+
+func validate(r *recipeDef) error {
+	if r.ID == "" {
+		return fmt.Errorf("recipe is missing required field: id")
+	}
+	if r.Image == "" {
+		return fmt.Errorf("recipe %q is missing required field: image", r.ID)
+	}
+	for _, p := range r.Ports {
+		if p.ContainerPort <= 0 || p.ContainerPort > 65535 {
+			return fmt.Errorf("recipe %q has invalid container_port: %d", r.ID, p.ContainerPort)
+		}
+		switch p.Protocol {
+		case "", "http", "tcp", "udp":
+		default:
+			return fmt.Errorf("recipe %q port %d has unsupported protocol %q (must be http, tcp, or udp)",
+				r.ID, p.ContainerPort, p.Protocol)
+		}
+		if p.ExternalPort != 0 && (p.ExternalPort < 0 || p.ExternalPort > 65535) {
+			return fmt.Errorf("recipe %q port %d has invalid external_port: %d", r.ID, p.ContainerPort, p.ExternalPort)
+		}
+	}
+	if n := r.GuardrailGateNode; n.Kind != 0 {
+		// The key is present: that is a gate declaration, so an empty or
+		// null value is an incomplete gate, never "no gate".
+		if n.Kind != yaml.MappingNode {
+			return fmt.Errorf("recipe %q guardrail_gate is present but not a mapping (an empty gate is refused, not ignored)", r.ID)
+		}
+		// Strict: Node.Decode ignores unknown keys, and a misspelt
+		// require_kinds would silently drop the recipe's own requirement.
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if k := n.Content[i].Value; k != "dataset_path" && k != "require_kinds" {
+				return fmt.Errorf("recipe %q guardrail_gate: unknown key %q (want dataset_path, require_kinds)", r.ID, k)
+			}
+		}
+		r.GuardrailGate = &guardrailGateDef{}
+		if err := n.Decode(r.GuardrailGate); err != nil {
+			return fmt.Errorf("recipe %q guardrail_gate: %w", r.ID, err)
+		}
+		return validateGuardrailGate(r.ID, r.GuardrailGate)
+	}
+	return nil
+}
+
+// List returns all loaded recipes.
+func (m *Manager) List() []*pb.Recipe {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*pb.Recipe, len(m.recipes))
+	copy(out, m.recipes)
+	return out
+}
+
+// Get returns a recipe by ID, or an error if it does not exist.
+func (m *Manager) Get(id string) (*pb.Recipe, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, r := range m.recipes {
+		if r.Id == id {
+			return r, nil
+		}
+	}
+	return nil, fmt.Errorf("recipe not found: %s", id)
+}
+
+// ResolveParameters merges deployer-supplied values over the recipe's
+// declared parameter defaults and enforces required parameters. The returned
+// map is keyed by parameter name. Unknown keys in overrides are ignored.
+func ResolveParameters(r *pb.Recipe, overrides map[string]string) (map[string]string, error) {
+	resolved := map[string]string{}
+	for _, p := range r.Parameters {
+		val := p.Default
+		if ov, ok := overrides[p.Name]; ok && ov != "" {
+			val = ov
+		}
+		if p.Required && val == "" {
+			return nil, fmt.Errorf("recipe %q requires parameter %q", r.Id, p.Name)
+		}
+		resolved[p.Name] = val
+	}
+	return resolved, nil
+}
+
+// ParamEnvName returns the environment variable name a post_start command sees
+// for a given parameter (CONTAINARIUM_PARAM_<UPPER>).
+func ParamEnvName(name string) string {
+	return "CONTAINARIUM_PARAM_" + strings.ToUpper(name)
+}

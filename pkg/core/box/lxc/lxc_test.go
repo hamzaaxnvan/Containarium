@@ -204,3 +204,106 @@ func TestLifecycleDelegation(t *testing.T) {
 	}
 	if _, ok := mock.Containers["alice-container"]; ok {
 		t.Errorf("after Delete, container still present")
+	}
+}
+
+func TestResizeDelegation(t *testing.T) {
+	mock := incustest.NewMockBackend()
+	mock.Containers["alice-container"] = &incus.ContainerInfo{Name: "alice-container", State: "Running"}
+	var gotDisk, gotCPU, gotMem string
+	mock.SetDeviceSizeFunc = func(_, dev, size string) error {
+		if dev == "root" {
+			gotDisk = size
+		}
+		return nil
+	}
+	mock.SetCPULimitFunc = func(_, cpu string) error { gotCPU = cpu; return nil }
+	mock.SetConfigFunc = func(_, key, val string) error {
+		if key == "limits.memory" {
+			gotMem = val
+		}
+		return nil
+	}
+	b := newTestBackend(mock)
+	if err := b.Resize(context.Background(), box.BoxRef{Tenant: "alice"}, box.ResourceLimits{CPU: "4", Memory: "8GB", Disk: "40GB"}); err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+	if gotCPU != "4" || gotMem != "8GB" || gotDisk != "40GB" {
+		t.Errorf("Resize delegated cpu=%q mem=%q disk=%q", gotCPU, gotMem, gotDisk)
+	}
+}
+
+func TestMetaDelegation(t *testing.T) {
+	mock := incustest.NewMockBackend()
+	var setLabels map[string]string
+	mock.SetLabelsFunc = func(_ string, labels map[string]string) error { setLabels = labels; return nil }
+	mock.GetLabelsFunc = func(_ string) (map[string]string, error) {
+		return map[string]string{"team": "infra"}, nil
+	}
+	b := newTestBackend(mock)
+	ref := box.BoxRef{Tenant: "alice"}
+
+	if err := b.SetMeta(context.Background(), ref, map[string]string{"env": "prod"}); err != nil {
+		t.Fatalf("SetMeta: %v", err)
+	}
+	if !reflect.DeepEqual(setLabels, map[string]string{"env": "prod"}) {
+		t.Errorf("SetMeta delegated labels = %+v", setLabels)
+	}
+
+	meta, err := b.GetMeta(context.Background(), ref)
+	if err != nil || !reflect.DeepEqual(meta, map[string]string{"team": "infra"}) {
+		t.Errorf("GetMeta = (%+v, %v)", meta, err)
+	}
+}
+
+func TestMetricsDelegation(t *testing.T) {
+	mock := incustest.NewMockBackend()
+	mock.GetContainerMetricsFunc = func(name string) (*incus.ContainerMetrics, error) {
+		return &incus.ContainerMetrics{
+			Name: name, CPUUsageSeconds: 42, MemoryUsageBytes: 1024, ProcessCount: 7,
+			CPUNrPeriods: 900, CPUNrThrottled: 120, CPUThrottledUsec: 3400,
+		}, nil
+	}
+	b := newTestBackend(mock)
+	m, err := b.Metrics(context.Background(), box.BoxRef{Tenant: "alice"})
+	if err != nil || m == nil {
+		t.Fatalf("Metrics returned (%v, %v)", m, err)
+	}
+	if m.CPUUsageSeconds != 42 || m.MemoryUsageBytes != 1024 || m.ProcessCount != 7 {
+		t.Errorf("Metrics mapping = %+v", m)
+	}
+	// Throttling counters must survive the mapping — dropping one here would
+	// silently return "not reported" for every box (#1573).
+	if m.CPUNrPeriods != 900 || m.CPUNrThrottled != 120 || m.CPUThrottledUsec != 3400 {
+		t.Errorf("throttling mapping = periods %d, throttled %d, usec %d; want 900/120/3400",
+			m.CPUNrPeriods, m.CPUNrThrottled, m.CPUThrottledUsec)
+	}
+}
+
+func TestSetAuthorizedKeysDelegation(t *testing.T) {
+	mock := incustest.NewMockBackend()
+	var wrotePath string
+	var execArgv []string
+	mock.WriteFileFunc = func(_, path string, _ []byte, _ string) error {
+		wrotePath = path
+		return nil
+	}
+	mock.ExecFunc = func(_ string, command []string) error {
+		execArgv = command
+		return nil
+	}
+	b := newTestBackend(mock)
+	// Empty key set exercises the delegation path (stage via file push,
+	// then one placement exec) without depending on SSH key validation.
+	if err := b.SetAuthorizedKeys(context.Background(), box.BoxRef{Tenant: "alice"}, nil); err != nil {
+		t.Fatalf("SetAuthorizedKeys: %v", err)
+	}
+	// Content is staged via the file API, and the placement exec receives
+	// the user's .ssh dir as a positional parameter.
+	if !strings.HasSuffix(wrotePath, "authorized_keys.alice") {
+		t.Errorf("staged authorized_keys written to %q", wrotePath)
+	}
+	if len(execArgv) < 5 || execArgv[4] != "/home/alice/.ssh" {
+		t.Errorf("placement exec argv = %v, want /home/alice/.ssh as $1", execArgv)
+	}
+}
