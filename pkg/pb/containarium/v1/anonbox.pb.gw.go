@@ -325,3 +325,85 @@ func RegisterAnonymousBoxServiceHandlerClient(ctx context.Context, mux *runtime.
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
 		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.AnonymousBoxService/ClaimAnonymousBox", runtime.WithHTTPPathPattern("/v1/anon/boxes:claim"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_AnonymousBoxService_ClaimAnonymousBox_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_AnonymousBoxService_ClaimAnonymousBox_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodGet, pattern_AnonymousBoxService_GetAnonymousDoorConfig_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.AnonymousBoxService/GetAnonymousDoorConfig", runtime.WithHTTPPathPattern("/v1/anon/door"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_AnonymousBoxService_GetAnonymousDoorConfig_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_AnonymousBoxService_GetAnonymousDoorConfig_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPut, pattern_AnonymousBoxService_SetAnonymousDoorConfig_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.AnonymousBoxService/SetAnonymousDoorConfig", runtime.WithHTTPPathPattern("/v1/anon/door"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_AnonymousBoxService_SetAnonymousDoorConfig_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_AnonymousBoxService_SetAnonymousDoorConfig_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodGet, pattern_AnonymousBoxService_ListAnonymousBoxes_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.AnonymousBoxService/ListAnonymousBoxes", runtime.WithHTTPPathPattern("/v1/anon/boxes"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_AnonymousBoxService_ListAnonymousBoxes_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_AnonymousBoxService_ListAnonymousBoxes_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	return nil
+}
+
+var (
+	pattern_AnonymousBoxService_EnsureAnonymousBox_0     = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "anon", "boxes"}, "ensure"))
+	pattern_AnonymousBoxService_ClaimAnonymousBox_0      = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "anon", "boxes"}, "claim"))
+	pattern_AnonymousBoxService_GetAnonymousDoorConfig_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "anon", "door"}, ""))
+	pattern_AnonymousBoxService_SetAnonymousDoorConfig_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "anon", "door"}, ""))
+	pattern_AnonymousBoxService_ListAnonymousBoxes_0     = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1, 2, 2}, []string{"v1", "anon", "boxes"}, ""))
+)
+
+var (
+	forward_AnonymousBoxService_EnsureAnonymousBox_0     = runtime.ForwardResponseMessage
+	forward_AnonymousBoxService_ClaimAnonymousBox_0      = runtime.ForwardResponseMessage
+	forward_AnonymousBoxService_GetAnonymousDoorConfig_0 = runtime.ForwardResponseMessage
+	forward_AnonymousBoxService_SetAnonymousDoorConfig_0 = runtime.ForwardResponseMessage
+	forward_AnonymousBoxService_ListAnonymousBoxes_0     = runtime.ForwardResponseMessage
+)
