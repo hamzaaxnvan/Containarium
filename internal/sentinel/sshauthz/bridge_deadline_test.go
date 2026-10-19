@@ -46,3 +46,28 @@ func TestBridgeExpiredDeadlinePreservesGrace(t *testing.T) {
 		return bridge.Authorize(expired, b, r)
 	})})
 	if err != nil {
+		t.Fatal(err)
+	}
+	up, err := plugin.PluginConfig().PublicKeyCallback(&libplugin.ConnMeta{UserName: "alice"}, key.Marshal())
+	if err != nil || up.GetNextPlugin() == nil {
+		t.Fatalf("did not defer: %v %v", up, err)
+	}
+	meta := up.GetNextPlugin().Meta
+	if meta[sshsession.MetaAuthzDecision] != "ALLOW" || meta[sshsession.MetaUserID] != "cached-person" {
+		t.Fatalf("lost grace attribution: %v", meta)
+	}
+	if _, ok := cache.Get(ck, true); !ok || transport.calls != 0 {
+		t.Fatal("expired deadline removed positive or sent request")
+	}
+}
+
+func TestBridgeCancelledContextSendsNoRequest(t *testing.T) {
+	transport := &countingTransport{}
+	bridge := &BridgeClient{client: &http.Client{Transport: transport}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := bridge.Authorize(ctx, "backend", &pb.AuthorizeSSHRequest{Login: "alice"})
+	if !errors.Is(err, context.Canceled) || transport.calls != 0 {
+		t.Fatalf("cancelled context: %v requests=%d", err, transport.calls)
+	}
+}
