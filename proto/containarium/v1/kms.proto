@@ -53,3 +53,58 @@ service KmsService {
       post: "/v1/kms/migrate-to-envelope"
       body: "*"
     };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Re-wrap legacy secrets under the active KMS KEK";
+      description: "Batches legacy rows and rewrites them to envelope form, verifying each round-trips before committing. dry_run walks + verifies without writing. Admin + kms:admin scope.";
+      tags: "KMS";
+    };
+  }
+}
+
+message GetKMSStatusRequest {}
+
+message GetKMSStatusResponse {
+  // Configured backend: none | inproc | vault | gcp | aws.
+  string backend = 1;
+  // Human-readable description, e.g. "aws kms (region=us-west-2 key=alias/...)".
+  string description = 2;
+  // True when a real KMS backend is active (backend != none and no
+  // config error).
+  bool kms_configured = 3;
+  // True when CONTAINARIUM_REQUIRE_ENVELOPE is set (legacy rows
+  // rejected on read).
+  bool require_envelope = 4;
+}
+
+message GetEnvelopeCoverageRequest {}
+
+message GetEnvelopeCoverageResponse {
+  int64 total = 1;
+  int64 legacy = 2;
+  int64 envelope = 3;
+}
+
+message MigrateToEnvelopeRequest {
+  // When true, walk + verify every legacy row would round-trip but
+  // issue no UPDATE.
+  bool dry_run = 1;
+  // Rows scanned per page. 0 → server default (100).
+  int64 batch_size = 2;
+  // Cap on total rows processed in one call. 0 → unlimited.
+  int64 max_rows = 3;
+}
+
+message MigrateToEnvelopeResponse {
+  int64 scanned = 1;
+  int64 migrated = 2;
+  int64 already_done = 3;
+  int64 failed = 4;
+  bool dry_run = 5;
+  repeated MigrateRowError errors = 6;
+}
+
+message MigrateRowError {
+  string username = 1;
+  string name = 2;
+  string error = 3;
+}
