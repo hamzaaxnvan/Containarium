@@ -36,3 +36,41 @@ func buildChangedTar(root string, paths []string, w io.Writer) (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("tar header %s: %w", abs, err)
 		}
+		hdr.Name = rel // forward-slash relative path
+
+		if err := tw.WriteHeader(hdr); err != nil {
+			return 0, fmt.Errorf("write header %s: %w", abs, err)
+		}
+
+		f, err := os.Open(abs) // #nosec G304 -- abs is constructed from root + a path obtained from our manifest, which we ourselves walked.
+		if err != nil {
+			return 0, fmt.Errorf("open %s: %w", abs, err)
+		}
+		if _, err := io.Copy(tw, f); err != nil {
+			_ = f.Close()
+			return 0, fmt.Errorf("copy %s: %w", abs, err)
+		}
+		_ = f.Close()
+	}
+
+	if err := tw.Close(); err != nil {
+		return 0, fmt.Errorf("close tar: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return 0, fmt.Errorf("close gzip: %w", err)
+	}
+	return cw.n, nil
+}
+
+// countingWriter wraps an io.Writer and counts bytes for the byte-shipped
+// metric in SyncResult.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}

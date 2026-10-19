@@ -30,3 +30,35 @@ admin_ssh_keys = {
 
 # Security
 allowed_ssh_sources = [
+  "0.0.0.0/0" # WARNING: Restrict in production!
+]
+
+# Labels
+labels = {
+  environment = "development"
+  managed_by  = "terraform"
+}
+
+# === Deployment Summary ===
+#
+# This configuration deploys:
+# - 1 spot instance jump server
+# - 500GB persistent disk (containers survive spot termination)
+# - Daily backups with 30-day retention
+#
+# Capacity:
+# - ~50 users maximum
+# - Each container: 4GB RAM, 4 CPU default
+#
+# Cost (approximate):
+# - Spot VM (n2-standard-8): $58/month
+# - Persistent disk (500GB): $40/month
+# - TOTAL: ~$98/month ($1.96/user for 50 users)
+#
+# vs Traditional (50 VMs): $1,250/month
+# Savings: $1,152/month (92%)
+#
+# Downtime:
+# - When spot instance is terminated: 2-5 minutes
+# - Containers automatically restart from persistent disk
+# - Frequency: Typically every few days to weeks
