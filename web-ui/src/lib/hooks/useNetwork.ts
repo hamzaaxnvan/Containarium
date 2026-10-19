@@ -100,3 +100,208 @@ export function usePassthroughRoutes(server: Server | null) {
   const { data, error, isLoading, mutate } = useSWR<PassthroughRoute[]>(
     swrKey,
     fetcher,
+    {
+      refreshInterval: 0,
+      revalidateOnFocus: true,
+      dedupingInterval: 5000,
+    }
+  );
+
+  const addPassthroughRoute = async (
+    externalPort: number,
+    targetIp: string,
+    targetPort: number,
+    protocol?: string,
+    containerName?: string,
+    description?: string
+  ) => {
+    if (!server) throw new Error('No server selected');
+    const client = getClient(server);
+    const route = await client.addPassthroughRoute(externalPort, targetIp, targetPort, protocol, containerName, description);
+    await mutate();
+    return route;
+  };
+
+  const deletePassthroughRoute = async (externalPort: number, protocol?: string) => {
+    if (!server) throw new Error('No server selected');
+    const client = getClient(server);
+    await client.deletePassthroughRoute(externalPort, protocol);
+    await mutate();
+  };
+
+  const updatePassthroughRoute = async (externalPort: number, protocol: string, options: { active?: boolean; targetIp?: string; targetPort?: number }) => {
+    if (!server) throw new Error('No server selected');
+    const client = getClient(server);
+    const route = await client.updatePassthroughRoute(externalPort, protocol, options);
+    await mutate();
+    return route;
+  };
+
+  return {
+    routes: data || [],
+    isLoading,
+    error,
+    addPassthroughRoute,
+    deletePassthroughRoute,
+    updatePassthroughRoute,
+    refresh: () => mutate(),
+  };
+}
+
+/**
+ * Hook for managing network topology
+ */
+export function useNetworkTopology(server: Server | null, includeStopped: boolean = false) {
+  const fetcher = async (): Promise<NetworkTopology> => {
+    if (!server) return { nodes: [], edges: [], networkCidr: '', gatewayIp: '' };
+    const client = getClient(server);
+    return client.getNetworkTopology(includeStopped);
+  };
+
+  const swrKey = server ? `topology-${server.id}-${includeStopped}` : null;
+
+  const { data, error, isLoading, mutate } = useSWR<NetworkTopology>(
+    swrKey,
+    fetcher,
+    {
+      // No polling - rely on SSE for real-time updates
+      refreshInterval: 0,
+      revalidateOnFocus: true,
+      dedupingInterval: 5000,
+    }
+  );
+
+  // Handle events that affect topology (containers and routes)
+  const handleEvent = useCallback(
+    () => {
+      // Revalidate topology on any container or route event
+      mutate();
+    },
+    [mutate]
+  );
+
+  // Subscribe to container and route events via SSE
+  const { status: eventStatus, reconnect } = useEventStream(server, {
+    resourceTypes: ['RESOURCE_TYPE_CONTAINER', 'RESOURCE_TYPE_ROUTE'],
+    onEvent: handleEvent,
+  });
+
+  return {
+    topology: data || { nodes: [], edges: [], networkCidr: '', gatewayIp: '' },
+    isLoading,
+    error,
+    refresh: () => mutate(),
+    // Event stream status
+    eventStatus,
+    reconnectEvents: reconnect,
+  };
+}
+
+/**
+ * Hook for managing ACL for a container (DevBox)
+ * Firewall is applied at the container level, not per-app
+ */
+export function useContainerACL(server: Server | null, username: string) {
+  const fetcher = async (): Promise<NetworkACL | null> => {
+    if (!server || !username) return null;
+    const client = getClient(server);
+    return client.getContainerACL(username);
+  };
+
+  const swrKey = server && username ? `container-acl-${server.id}-${username}` : null;
+
+  const { data, error, isLoading, mutate } = useSWR<NetworkACL | null>(
+    swrKey,
+    fetcher,
+    {
+      revalidateOnFocus: true,
+      dedupingInterval: 5000,
+    }
+  );
+
+  const updateACL = async (
+    preset: string,
+    ingressRules?: unknown[],
+    egressRules?: unknown[]
+  ) => {
+    if (!server) throw new Error('No server selected');
+
+    const client = getClient(server);
+    const acl = await client.updateContainerACL(username, preset, ingressRules, egressRules);
+    await mutate();
+    return acl;
+  };
+
+  return {
+    acl: data,
+    isLoading,
+    error,
+    updateACL,
+    refresh: () => mutate(),
+  };
+}
+
+/**
+ * @deprecated Use useContainerACL instead - ACL is now per-container, not per-app
+ */
+export function useACL(server: Server | null, username: string, _appName: string) {
+  return useContainerACL(server, username);
+}
+
+/**
+ * Hook for getting ACL presets
+ */
+export function useACLPresets(server: Server | null) {
+  const fetcher = async (): Promise<ACLPresetInfo[]> => {
+    if (!server) return [];
+    const client = getClient(server);
+    return client.getACLPresets();
+  };
+
+  const swrKey = server ? `acl-presets-${server.id}` : null;
+
+  const { data, error, isLoading } = useSWR<ACLPresetInfo[]>(
+    swrKey,
+    fetcher,
+    {
+      revalidateOnFocus: false,
+      dedupingInterval: 60000, // Presets don't change often
+    }
+  );
+
+  return {
+    presets: data || [],
+    isLoading,
+    error,
+  };
+}
+
+/**
+ * Hook for getting DNS records (domain suggestions)
+ */
+export function useDNSRecords(server: Server | null) {
+  const fetcher = async (): Promise<{ records: DNSRecord[]; baseDomain: string }> => {
+    if (!server) return { records: [], baseDomain: '' };
+    const client = getClient(server);
+    return client.getDNSRecords();
+  };
+
+  const swrKey = server ? `dns-records-${server.id}` : null;
+
+  const { data, error, isLoading, mutate } = useSWR<{ records: DNSRecord[]; baseDomain: string }>(
+    swrKey,
+    fetcher,
+    {
+      revalidateOnFocus: false,
+      dedupingInterval: 30000,
+    }
+  );
+
+  return {
+    records: data?.records || [],
+    baseDomain: data?.baseDomain || '',
+    isLoading,
+    error,
+    refresh: () => mutate(),
+  };
+}
