@@ -67,3 +67,281 @@ func TestTrafficQueryHistory_RejectsOtherTenant(t *testing.T) {
 func TestTrafficAggregates_RejectsOtherTenant(t *testing.T) {
 	srv := &TrafficServer{}
 	_, err := srv.GetTrafficAggregates(tenantCtx("alice"), &pb.GetTrafficAggregatesRequest{ContainerName: "bob-container"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v want PermissionDenied", err)
+	}
+}
+
+// --- SecurityServer ClamAV tenant reads ---
+
+func TestListClamavReports_RejectsOtherTenant(t *testing.T) {
+	srv := &SecurityServer{}
+	_, err := srv.ListClamavReports(tenantCtx("alice"), &pb.ListClamavReportsRequest{ContainerName: "bob-container"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v want PermissionDenied", err)
+	}
+}
+
+func TestListClamavReports_RejectsTenantBlankName(t *testing.T) {
+	// Blank container_name = list across all containers; require admin.
+	srv := &SecurityServer{}
+	_, err := srv.ListClamavReports(tenantCtx("alice"), &pb.ListClamavReportsRequest{})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v want PermissionDenied (blank name on non-admin)", err)
+	}
+}
+
+func TestTriggerClamavScan_RejectsOtherTenant(t *testing.T) {
+	srv := &SecurityServer{}
+	_, err := srv.TriggerClamavScan(tenantCtx("alice"), &pb.TriggerClamavScanRequest{ContainerName: "bob-container"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v want PermissionDenied", err)
+	}
+}
+
+// #2655: an administrator does not bypass the owner check, and neither does an
+// unscoped or wildcard-scoped token. Only the control plane's acting-for-owner
+// scope lets a non-owner through.
+func TestTriggerClamavScan_AdminCannotStartATenantScan(t *testing.T) {
+	srv := &SecurityServer{}
+	for name, ctx := range map[string]context.Context{
+		"unscoped admin": adminCtx(),
+		"wildcard admin": auth.ContextWithTestSubjectScopes(context.Background(), "ops", []string{auth.RoleAdmin}, []string{auth.ScopeWildcard}),
+		"security:write": auth.ContextWithTestSubjectScopes(context.Background(), "ops", []string{auth.RoleAdmin}, []string{auth.ScopeSecurityWrite}),
+		"system box too": adminCtx(),
+	} {
+		box := "alice-container"
+		if name == "system box too" {
+			box = "caddy"
+		}
+		_, err := srv.TriggerClamavScan(ctx, &pb.TriggerClamavScanRequest{ContainerName: box})
+		if status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("%s: got %v want PermissionDenied", name, err)
+		}
+	}
+}
+
+func TestTriggerClamavScan_ServiceActingForOwnerPasses(t *testing.T) {
+	srv := &SecurityServer{}
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(), "driver", []string{auth.RoleAdmin},
+		[]string{auth.ScopeSecurityWrite, auth.ScopeSecurityTriggerForOwner})
+	mustPass(t, "acting-for-owner TriggerClamavScan", func() error {
+		_, e := srv.TriggerClamavScan(ctx, &pb.TriggerClamavScanRequest{ContainerName: "alice-container"})
+		return e
+	})
+}
+
+func TestTriggerClamavScan_RejectsTenantBlankName(t *testing.T) {
+	// Blank container_name = scan all; require admin.
+	srv := &SecurityServer{}
+	_, err := srv.TriggerClamavScan(tenantCtx("alice"), &pb.TriggerClamavScanRequest{})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v want PermissionDenied (blank name on non-admin)", err)
+	}
+}
+
+// --- Admin and owner pass the gate (both shapes) ---
+//
+// Each subtest wraps the call in recover() — the handler
+// will nil-deref its store/collector AFTER the gate passes,
+// which is exactly what we want to confirm: any panic that
+// reaches us means the gate did NOT reject.
+
+func mustPass(t *testing.T, label string, call func() error) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			// Expected: panic on nil dep after gate passes.
+			// Anything we observe here = gate let us through.
+			return
+		}
+	}()
+	err := call()
+	if status.Code(err) == codes.PermissionDenied {
+		t.Fatalf("%s: gate must NOT reject this caller; got %v", label, err)
+	}
+}
+
+func TestTenantGates_AdminPasses_Blank(t *testing.T) {
+	ctx := adminCtx()
+	srv := &SecurityServer{}
+	mustPass(t, "ListClamavReports blank", func() error {
+		_, e := srv.ListClamavReports(ctx, &pb.ListClamavReportsRequest{})
+		return e
+	})
+}
+
+// #2631: scan-all is gone. A blank container_name is InvalidArgument for an
+// admin (and PermissionDenied for a tenant, see TestTriggerClamavScan_
+// RejectsTenantBlankName), never "scan every box".
+func TestTriggerClamavScan_AdminBlankNameIsInvalidArgument(t *testing.T) {
+	srv := &SecurityServer{}
+	_, err := srv.TriggerClamavScan(adminCtx(), &pb.TriggerClamavScanRequest{})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("got %v want InvalidArgument (scan-all removed)", err)
+	}
+}
+
+func TestTenantGates_AdminPasses_CrossTenant(t *testing.T) {
+	ctx := adminCtx()
+	srv := &TrafficServer{}
+	mustPass(t, "GetConnections cross-tenant", func() error {
+		_, e := srv.GetConnections(ctx, &pb.GetConnectionsRequest{ContainerName: "alice-container"})
+		return e
+	})
+	mustPass(t, "GetTrafficAggregates cross-tenant", func() error {
+		_, e := srv.GetTrafficAggregates(ctx, &pb.GetTrafficAggregatesRequest{ContainerName: "alice-container"})
+		return e
+	})
+}
+
+func TestTrafficGetConnections_OwnerPasses(t *testing.T) {
+	srv := &TrafficServer{}
+	mustPass(t, "owner GetConnections", func() error {
+		_, e := srv.GetConnections(tenantCtx("alice"), &pb.GetConnectionsRequest{ContainerName: "alice-container"})
+		return e
+	})
+}
+
+func TestTriggerClamavScan_OwnerPasses(t *testing.T) {
+	srv := &SecurityServer{}
+	mustPass(t, "owner TriggerClamavScan", func() error {
+		_, e := srv.TriggerClamavScan(tenantCtx("alice"), &pb.TriggerClamavScanRequest{ContainerName: "alice-container"})
+		return e
+	})
+}
+
+// --- NetworkServer egress-via-client (#808) — CWE-639 IDOR fix ---
+//
+// StartEgressProxy/StopEgressProxy previously called only
+// auth.RequireScope(routes:write), an ordinary non-admin scope every
+// tenant token carries — with no auth.AuthorizeContainerAccess check, any
+// tenant could start/stop another tenant's egress relay by naming their
+// container_name. tenantCtx below carries routes:write via ContextWithTestSubjectScopes so
+// these tests fail closed on the SAME gate a real caller would hit, not
+// merely on a missing scope.
+
+func tenantCtxWithRoutesWrite(name string) context.Context {
+	return auth.ContextWithTestSubjectScopes(context.Background(), name, []string{"user"}, []string{auth.ScopeRoutesWrite})
+}
+
+func TestStartEgressProxy_RejectsOtherTenant(t *testing.T) {
+	srv := &NetworkServer{}
+	_, err := srv.StartEgressProxy(tenantCtxWithRoutesWrite("alice"), &pb.StartEgressProxyRequest{
+		ContainerName: "bob-container",
+		UpstreamPort:  18080,
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v want PermissionDenied", err)
+	}
+}
+
+func TestStopEgressProxy_RejectsOtherTenant(t *testing.T) {
+	srv := &NetworkServer{}
+	_, err := srv.StopEgressProxy(tenantCtxWithRoutesWrite("alice"), &pb.StopEgressProxyRequest{
+		ContainerName: "bob-container",
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v want PermissionDenied", err)
+	}
+}
+
+func TestStartEgressProxy_RejectsOtherTenantBareUsername(t *testing.T) {
+	// container_name may be passed without the "-container" suffix
+	// (StartEgressProxy tolerates both forms) — the gate must normalize
+	// before authorizing, not just when the suffix is already present.
+	srv := &NetworkServer{}
+	_, err := srv.StartEgressProxy(tenantCtxWithRoutesWrite("alice"), &pb.StartEgressProxyRequest{
+		ContainerName: "bob",
+		UpstreamPort:  18080,
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v want PermissionDenied", err)
+	}
+}
+
+func TestEgressProxy_OwnerPasses(t *testing.T) {
+	srv := &NetworkServer{}
+	ctx := tenantCtxWithRoutesWrite("alice")
+	mustPass(t, "owner StartEgressProxy", func() error {
+		_, e := srv.StartEgressProxy(ctx, &pb.StartEgressProxyRequest{ContainerName: "alice-container", UpstreamPort: 18080})
+		return e
+	})
+	mustPass(t, "owner StopEgressProxy", func() error {
+		_, e := srv.StopEgressProxy(ctx, &pb.StopEgressProxyRequest{ContainerName: "alice-container"})
+		return e
+	})
+}
+
+func TestEgressProxy_AdminPassesCrossTenant(t *testing.T) {
+	srv := &NetworkServer{}
+	ctx := auth.ContextWithTestSubjectScopes(context.Background(), "ops", []string{auth.RoleAdmin}, []string{auth.ScopeRoutesWrite})
+	mustPass(t, "admin StartEgressProxy cross-tenant", func() error {
+		_, e := srv.StartEgressProxy(ctx, &pb.StartEgressProxyRequest{ContainerName: "alice-container", UpstreamPort: 18080})
+		return e
+	})
+	mustPass(t, "admin StopEgressProxy cross-tenant", func() error {
+		_, e := srv.StopEgressProxy(ctx, &pb.StopEgressProxyRequest{ContainerName: "alice-container"})
+		return e
+	})
+}
+
+// #2659: InstallClamav is authorized like the per-box scan trigger.
+func TestInstallClamav_Authz(t *testing.T) {
+	srv := &SecurityServer{}
+	if _, err := srv.InstallClamav(tenantCtx("alice"), &pb.InstallClamavRequest{ContainerName: "bob-container"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("other tenant: got %v want PermissionDenied", err)
+	}
+	if _, err := srv.InstallClamav(tenantCtx("alice"), &pb.InstallClamavRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("tenant blank name: got %v want PermissionDenied", err)
+	}
+	if _, err := srv.InstallClamav(adminCtx(), &pb.InstallClamavRequest{}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("admin blank name: got %v want InvalidArgument", err)
+	}
+	// Owner passes the gate; with no runtime it then reports Unavailable, not PermissionDenied.
+	if _, err := srv.InstallClamav(tenantCtx("alice"), &pb.InstallClamavRequest{ContainerName: "alice-container"}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("owner: got %v want Unavailable (past the gate)", err)
+	}
+}
+
+// InstallClamav (#2692) follows the same owner-only rule as TriggerClamavScan
+// (#2655): the install runs commands inside the customer's box.
+func TestInstallClamav_OwnerOnly(t *testing.T) {
+	srv := &SecurityServer{} // no runtime: an authorized caller stops at Unavailable, not PermissionDenied
+	driver := auth.ContextWithTestSubjectScopes(context.Background(), "driver", []string{auth.RoleAdmin},
+		[]string{auth.ScopeSecurityWrite, auth.ScopeSecurityTriggerForOwner})
+	tests := []struct {
+		name     string
+		ctx      context.Context
+		box      string
+		wantCode codes.Code
+	}{
+		{"owner passes the gate", tenantCtx("alice"), "alice-container", codes.Unavailable},
+		{"other tenant is refused", tenantCtx("alice"), "bob-container", codes.PermissionDenied},
+		{"unscoped admin cannot install in a tenant box", adminCtx(), "alice-container", codes.PermissionDenied},
+		{"wildcard admin cannot either", auth.ContextWithTestSubjectScopes(context.Background(), "ops", []string{auth.RoleAdmin}, []string{auth.ScopeWildcard}), "alice-container", codes.PermissionDenied},
+		{"security:write admin cannot either", auth.ContextWithTestSubjectScopes(context.Background(), "ops", []string{auth.RoleAdmin}, []string{auth.ScopeSecurityWrite}), "alice-container", codes.PermissionDenied},
+		{"a system box is refused even to an admin", adminCtx(), "caddy", codes.PermissionDenied},
+		{"the control plane acting for the owner passes the gate", driver, "alice-container", codes.Unavailable},
+		{"a non-admin cannot borrow the delegation scope", auth.ContextWithTestSubjectScopes(context.Background(), "mallory", []string{"user"},
+			[]string{auth.ScopeSecurityWrite, auth.ScopeSecurityTriggerForOwner}), "alice-container", codes.PermissionDenied},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := srv.InstallClamav(tt.ctx, &pb.InstallClamavRequest{ContainerName: tt.box})
+			if status.Code(err) != tt.wantCode {
+				t.Fatalf("got %v (%v), want %v", status.Code(err), err, tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestInstallClamav_BlankNameNeedsAnAdminAndIsStillRefused(t *testing.T) {
+	srv := &SecurityServer{}
+	if _, err := srv.InstallClamav(tenantCtx("alice"), &pb.InstallClamavRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("tenant with a blank name: got %v, want PermissionDenied", err)
+	}
+	if _, err := srv.InstallClamav(adminCtx(), &pb.InstallClamavRequest{}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("admin with a blank name: got %v, want InvalidArgument", err)
+	}
+}
