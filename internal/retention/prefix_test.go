@@ -222,3 +222,60 @@ func TestPrefixSource_ACountFailureIsReportedAndNothingIsRemoved(t *testing.T) {
 	for _, c := range []pb.RetentionClass{gwClass, sessClass} {
 		got := findStore(t, rep, c, "audit_logs")
 		if got.GetStatus() != pb.RetentionSweepStatus_RETENTION_SWEEP_STATUS_ERROR || !strings.Contains(got.GetNote(), "boom") {
+			t.Errorf("%v entry = %v, want ERROR carrying the failure", c, got)
+		}
+	}
+	if p.removed != 0 {
+		t.Errorf("RemovePrefix called %d times after a failed count, want never", p.removed)
+	}
+}
+
+func TestPrefixSource_ASkippedRemovalIsNotedNotSilent(t *testing.T) {
+	p := eligibleChain()
+	p.removal = PrefixRemoval{Skipped: "no anchor has been published, so nothing can be purged"}
+	sw := auditedSweeper(t, enforcing(t), nil, chainUnswept())
+	sw.AddPrefixSource(p)
+
+	rep, err := sw.Sweep(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := findStore(t, rep, gwClass, "audit_logs")
+	if got.GetRemoved() != 0 || !strings.Contains(got.GetNote(), "not removed: no anchor") {
+		t.Errorf("entry = %v, want 0 removed and the skip reason in the note", got)
+	}
+}
+
+// zeroWindowStore reports a gateway-logs window of 0 days, which the policy
+// store never stores; the sweeper still refuses to remove on it.
+type zeroWindowStore struct{ Store }
+
+func (z zeroWindowStore) GetPolicy(ctx context.Context) (*pb.RetentionPolicy, error) {
+	p, err := z.Store.GetPolicy(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range p.GetWindows() {
+		if w.GetClass() == gwClass {
+			w.Days = 0
+		}
+	}
+	return p, nil
+}
+
+func TestPrefixSource_AClassWithoutAWindowSkipsTheWholeStore(t *testing.T) {
+	p := eligibleChain()
+	sw := auditedSweeper(t, zeroWindowStore{enforcing(t)}, nil, chainUnswept())
+	sw.AddPrefixSource(p)
+
+	rep, err := sw.Sweep(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.removed != 0 {
+		t.Fatalf("RemovePrefix called %d times with a class that has no window, want never", p.removed)
+	}
+	if got := findStore(t, rep, sessClass, "audit_logs"); !strings.Contains(got.GetNote(), "no retention window") {
+		t.Errorf("session entry = %v, want the whole store skipped for the missing window", got)
+	}
+}
