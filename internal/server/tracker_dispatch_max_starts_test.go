@@ -34,3 +34,22 @@ func TestDispatchTrackerIssues_MaxStartsThroughRPC(t *testing.T) {
 	resp, err := s.DispatchTrackerIssues(admin, &pb.DispatchTrackerIssuesRequest{Username: user, Connection: "default", MaxStarts: 1})
 	if err != nil {
 		t.Fatalf("DispatchTrackerIssues: %v", err)
+	}
+	if len(resp.GetStarted()) != 1 || len(starter.calls) != 1 || resp.GetLeftUndispatched() != 2 {
+		t.Fatalf("started = %d, calls = %d, left = %d; want 1 started and 2 left undispatched",
+			len(resp.GetStarted()), len(starter.calls), resp.GetLeftUndispatched())
+	}
+	rows, err := s.trackerStore.ListDispatches(ctx, user, "default", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("rows = %+v (err %v), want exactly the one started", rows, err)
+	}
+}
+
+func TestDispatchTrackerIssues_NegativeMaxStartsInvalid(t *testing.T) {
+	s := &ContainerServer{trackerStore: &tracker.Store{}, trackerRunStarter: &recordingRunStarter{}}
+	_, err := s.DispatchTrackerIssues(kmsKeyTestCtx("alice", "member", "tracker:admin,agents:run"),
+		&pb.DispatchTrackerIssuesRequest{Username: "alice", Connection: "default", MaxStarts: -1})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v (%v), want InvalidArgument", status.Code(err), err)
+	}
+}
