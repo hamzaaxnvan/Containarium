@@ -164,3 +164,170 @@ type journalWindow struct {
 	exists bool
 	size   int64
 	// lastEnded: the file's last line is a "run ended" status line.
+	lastEnded bool
+	// raw holds up to max+1 bytes from the offset; the extra byte only
+	// signals truncation.
+	raw []byte
+}
+
+// journalReadScript reads the file's size and whether its last line is a
+// "run ended" status line, then up to limit bytes from offset: never the
+// whole file. The first stdout line is "missing" or "<size> <0|1>"; the
+// bytes after it are the chunk.
+func journalReadScript(path string, offset int64, limit int) string {
+	q := shellSingleQuote(path)
+	return fmt.Sprintf(`f=%s
+[ -f "$f" ] || { echo missing; exit 0; }
+size=$(wc -c < "$f" | tr -d ' ')
+ended=0
+tail -n 1 "$f" | grep -qF %s && ended=1
+echo "$size $ended"
+tail -c +%d "$f" | head -c %d
+`, q, shellSingleQuote(runEndedMarker), offset+1, limit)
+}
+
+func readJournalWindow(exec boxScriptFunc, box, path string, offset int64, limit int) (journalWindow, error) {
+	out, err := exec(box, journalReadScript(path, offset, limit))
+	if err != nil {
+		return journalWindow{}, err
+	}
+	header, rest, found := strings.Cut(out, "\n")
+	if header == "missing" {
+		return journalWindow{}, nil
+	}
+	fields := strings.Fields(header)
+	if !found || len(fields) != 2 {
+		return journalWindow{}, fmt.Errorf("unexpected journal read header %q", header)
+	}
+	size, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return journalWindow{}, fmt.Errorf("unexpected journal size %q", fields[0])
+	}
+	return journalWindow{exists: true, size: size, lastEnded: fields[1] == "1", raw: []byte(rest)}, nil
+}
+
+// TailRunLog returns one byte window of a run member's journal (#2096).
+func (s *AgentSkillServer) TailRunLog(ctx context.Context, req *pb.TailRunLogRequest) (*pb.TailRunLogResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeAgentsRead); err != nil {
+		return nil, err
+	}
+	// Both ids become path segments inside the box: validate before anything
+	// else touches them.
+	if !validRunPathID(req.GetRunId()) {
+		return nil, status.Errorf(codes.InvalidArgument, "run_id must match %s and not be . or ..", runIDPattern.String())
+	}
+	if req.GetSkillId() != "" && !validRunPathID(req.GetSkillId()) {
+		return nil, status.Errorf(codes.InvalidArgument, "skill_id must match %s and not be . or ..", runIDPattern.String())
+	}
+	if req.GetStartOffset() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "start_offset must be >= 0")
+	}
+	// A run-bound token (an in-box agent) reads only its own run.
+	if claim, ok := auth.RunIDFromGRPCContext(ctx); ok && claim != req.GetRunId() {
+		return nil, status.Errorf(codes.PermissionDenied, "token is bound to run %q", claim)
+	}
+	maxBytes := int(req.GetMaxBytes())
+	switch {
+	case maxBytes <= 0:
+		maxBytes = tailRunLogDefaultBytes
+	case maxBytes > tailRunLogMaxBytes:
+		maxBytes = tailRunLogMaxBytes
+	}
+	follow := time.Duration(min(max(req.GetFollowSeconds(), 0), tailRunLogMaxFollow)) * time.Second
+
+	members, err := s.runMembers(ctx, req.GetRunId())
+	if err != nil {
+		return nil, err
+	}
+	skillID := req.GetSkillId()
+	if skillID == "" {
+		skillID = members[0]
+	} else if !peersContain(members, skillID) {
+		return nil, status.Errorf(codes.InvalidArgument, "skill %q is not a member of run %q (members: %s)",
+			skillID, req.GetRunId(), strings.Join(members, ","))
+	}
+	if err := auth.AuthorizeTenant(ctx, agentBoxPrefix+skillID); err != nil {
+		return nil, err
+	}
+	exec := s.boxScript()
+	if exec == nil {
+		return nil, status.Error(codes.Unavailable, "no container backend to read the journal from")
+	}
+
+	path, box := journalFile(req.GetRunId(), skillID), memberBox(skillID)
+	offset := req.GetStartOffset()
+	poll := s.runLogPoll
+	if poll <= 0 {
+		poll = tailRunLogPoll
+	}
+	deadline := time.Now().Add(follow)
+	var resp *pb.TailRunLogResponse
+	var w journalWindow
+	var calls []*pb.GatewayCall
+	callsNext := req.GetGatewayAfterSeq()
+	for {
+		w, err = readJournalWindow(exec, box, path, offset, maxBytes+1)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "read journal of %q on %s: %v", skillID, box, err)
+		}
+		resp = windowResponse(w, offset, maxBytes)
+		if s.gatewayCalls != nil {
+			calls, callsNext = s.gatewayCalls.Since(req.GetRunId(), skillID, req.GetGatewayAfterSeq())
+		}
+		if len(resp.Chunk) > 0 || len(calls) > 0 || resp.Ended || !time.Now().Add(poll).Before(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		case <-time.After(poll):
+		}
+	}
+
+	resp.GatewayCalls, resp.GatewayNextSeq = calls, callsNext
+	for _, m := range members {
+		if (m == skillID && w.exists) || (m != skillID && s.journalExists(exec, m, req.GetRunId())) {
+			resp.SkillIds = append(resp.SkillIds, m)
+		}
+	}
+	return resp, nil
+}
+
+// windowResponse turns one read into the response: at most maxBytes of chunk,
+// and ended only once the reader is at the end of a file whose last line is
+// "run ended" (so a --follow loop never stops before the last byte).
+func windowResponse(w journalWindow, offset int64, maxBytes int) *pb.TailRunLogResponse {
+	chunk := w.raw
+	truncated := len(chunk) > maxBytes
+	if truncated {
+		chunk = chunk[:maxBytes]
+	}
+	end := offset + int64(len(chunk))
+	return &pb.TailRunLogResponse{
+		Chunk:     chunk,
+		EndOffset: end,
+		Truncated: truncated,
+		Ended:     w.exists && w.lastEnded && !truncated && end >= w.size,
+	}
+}
+
+func (s *AgentSkillServer) journalExists(exec boxScriptFunc, skillID, runID string) bool {
+	out, err := exec(memberBox(skillID), "[ -f "+shellSingleQuote(journalFile(runID, skillID))+" ] && echo yes || true")
+	return err == nil && strings.TrimSpace(out) == "yes"
+}
+
+// taskRunID decides which run a delegated task is journaled under. A caller
+// whose token is bound to a run (an in-box agent) may only journal into that
+// run: an absent run_id is stamped with the claim, a different one is
+// refused, so one box cannot write into another run's journal. A caller with
+// no run claim (the operator driving a crew) keeps what it asked for.
+func taskRunID(ctx context.Context, requested string) (string, error) {
+	claim, ok := auth.RunIDFromGRPCContext(ctx)
+	if !ok || requested == claim {
+		return requested, nil
+	}
+	if requested == "" {
+		return claim, nil
+	}
+	return "", status.Errorf(codes.PermissionDenied, "run_id %q differs from the caller's run %q", requested, claim)
+}
