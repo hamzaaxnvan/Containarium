@@ -71,3 +71,77 @@ func listenSilentIncusSocket(t *testing.T) string {
 			if err != nil {
 				close(done)
 				return
+			}
+			// Accept the connection and then go silent: never read the
+			// request, never write a response.
+			connCh <- conn
+		}
+	}()
+
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-done
+		close(connCh)
+		for conn := range connCh {
+			_ = conn.Close()
+		}
+	})
+
+	return sockPath
+}
+
+// TestNewWithSocketAndTimeout_BoundedByGivenTimeout proves the fix: a
+// client built with NewWithSocketAndTimeout against an incusd that never
+// answers returns an error within (a small multiple of) the chosen
+// timeout, rather than hanging. Construction itself makes an HTTP call
+// (incus.ConnectIncusUnix probes the connection via GetServer() unless
+// told to skip it), so this alone exercises the same unbounded-HTTP-call
+// code path FindContainerByRole/ListContainers hit during the boot wait.
+func TestNewWithSocketAndTimeout_BoundedByGivenTimeout(t *testing.T) {
+	sockPath := listenSilentIncusSocket(t)
+
+	const callTimeout = 150 * time.Millisecond
+	start := time.Now()
+	_, err := NewWithSocketAndTimeout(sockPath, callTimeout)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error connecting to an unresponsive incus daemon, got nil")
+	}
+	// Generous slack over the timeout itself — this must be well under
+	// the 2-minute outer bound waitForCoreContainers wraps its loop in,
+	// not merely "eventually returns".
+	if elapsed > 2*time.Second {
+		t.Fatalf("NewWithSocketAndTimeout(%s) blocked for %s against an unresponsive server — not bounded by the timeout", callTimeout, elapsed)
+	}
+}
+
+// TestNewWithSocket_UnboundedClientStaysBlockedPastShortWindow documents
+// the bug this issue is about: the existing New()/NewWithSocket()
+// constructor (nil ConnectionArgs, used by every other daemon code path)
+// has no per-call HTTP deadline, so the same connection attempt against
+// the same unresponsive daemon is still blocked well past a window that
+// would comfortably contain several retries of the boot-wait loop. The
+// goroutine is deliberately not waited on to completion — it is unblocked
+// (with a connection error) by the fake socket's cleanup when the test
+// ends, so it cannot leak past this test.
+func TestNewWithSocket_UnboundedClientStaysBlockedPastShortWindow(t *testing.T) {
+	sockPath := listenSilentIncusSocket(t)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewWithSocket(sockPath)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("expected NewWithSocket (no HTTP client timeout) to still be blocked after the wait window against an unresponsive daemon, but it returned (err=%v) — the unbounded-hang mechanism this issue is about no longer reproduces this way", err)
+	case <-time.After(500 * time.Millisecond):
+		// Still blocked, as expected: this is the class of hang
+		// waitForCoreContainers's outer 2-minute context.WithTimeout
+		// cannot interrupt, because it only checks ctx.Done() between
+		// loop iterations and the goroutine here is parked inside a
+		// single HTTP round-trip, not spinning through the loop.
+	}
+}
