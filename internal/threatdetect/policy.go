@@ -158,3 +158,163 @@ func KillsProcess(rule pb.ThreatRuleId) bool {
 // needs: Get returns an error wrapping app.ErrDaemonConfigNotFound for a
 // missing key, exactly as DaemonConfigStore.Get does.
 type PolicyConfigStore interface {
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key, value string) error
+}
+
+// ProcessPolicyStore persists the backend default and per-container
+// overrides as protojson in DaemonConfigStore. With a nil config store (no
+// Postgres) policies live in memory for the process lifetime — the same
+// fallback BadDestinationRule uses for operator entries. An empty stored
+// value means "unset": DaemonConfigStore has no delete, so ClearOverride
+// writes "".
+type ProcessPolicyStore struct {
+	cfg PolicyConfigStore
+
+	mu  sync.Mutex
+	mem map[string]string // used only when cfg == nil
+}
+
+// NewProcessPolicyStore builds a store over cfg; nil cfg is in-memory only.
+func NewProcessPolicyStore(cfg PolicyConfigStore) *ProcessPolicyStore {
+	return &ProcessPolicyStore{cfg: cfg, mem: make(map[string]string)}
+}
+
+// Default returns the stored backend default, or nil when none is stored.
+func (s *ProcessPolicyStore) Default(ctx context.Context) (*pb.ProcessPolicy, error) {
+	return s.get(ctx, ProcessPolicyKey)
+}
+
+// Override returns container's stored override, or nil when none is stored.
+func (s *ProcessPolicyStore) Override(ctx context.Context, container string) (*pb.ProcessPolicy, error) {
+	if container == "" {
+		return nil, nil
+	}
+	return s.get(ctx, ProcessPolicyContainerKey(container))
+}
+
+// SetDefault stores the backend default.
+func (s *ProcessPolicyStore) SetDefault(ctx context.Context, p *pb.ProcessPolicy) error {
+	return s.set(ctx, ProcessPolicyKey, p)
+}
+
+// SetOverride stores container's override.
+func (s *ProcessPolicyStore) SetOverride(ctx context.Context, container string, p *pb.ProcessPolicy) error {
+	if container == "" {
+		return errors.New("container is required for an override")
+	}
+	return s.set(ctx, ProcessPolicyContainerKey(container), p)
+}
+
+// ClearOverride removes container's override so it inherits the backend
+// default again.
+func (s *ProcessPolicyStore) ClearOverride(ctx context.Context, container string) error {
+	if container == "" {
+		return errors.New("container is required for an override")
+	}
+	return s.setRaw(ctx, ProcessPolicyContainerKey(container), "")
+}
+
+// Effective resolves the policy the responder applies to container
+// (override → default → built-in). An empty container resolves the backend
+// level. A store failure is an error, never a silent fall-through to the
+// built-in: the responder must not act on ALERT believing nothing stronger
+// was configured.
+func (s *ProcessPolicyStore) Effective(ctx context.Context, container string) (*pb.ProcessPolicy, error) {
+	backend, err := s.Default(ctx)
+	if err != nil {
+		return nil, err
+	}
+	override, err := s.Override(ctx, container)
+	if err != nil {
+		return nil, err
+	}
+	return ResolveProcessPolicy(override, backend), nil
+}
+
+func (s *ProcessPolicyStore) get(ctx context.Context, key string) (*pb.ProcessPolicy, error) {
+	var raw string
+	if s.cfg == nil {
+		s.mu.Lock()
+		raw = s.mem[key]
+		s.mu.Unlock()
+	} else {
+		v, err := s.cfg.Get(ctx, key)
+		if err != nil {
+			if errors.Is(err, app.ErrDaemonConfigNotFound) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("threatdetect: read process policy %q: %w", key, err)
+		}
+		raw = v
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	var p pb.ProcessPolicy
+	if err := protojson.Unmarshal([]byte(raw), &p); err != nil {
+		return nil, fmt.Errorf("threatdetect: process policy %q is not valid protojson: %w", key, err)
+	}
+	return &p, nil
+}
+
+func (s *ProcessPolicyStore) set(ctx context.Context, key string, p *pb.ProcessPolicy) error {
+	if err := ValidateProcessPolicy(p); err != nil {
+		return err
+	}
+	raw, err := protojson.Marshal(p)
+	if err != nil {
+		return fmt.Errorf("threatdetect: marshal process policy: %w", err)
+	}
+	return s.setRaw(ctx, key, string(raw))
+}
+
+func (s *ProcessPolicyStore) setRaw(ctx context.Context, key, raw string) error {
+	if s.cfg == nil {
+		s.mu.Lock()
+		s.mem[key] = raw
+		s.mu.Unlock()
+		return nil
+	}
+	if err := s.cfg.Set(ctx, key, raw); err != nil {
+		return fmt.Errorf("threatdetect: persist process policy %q: %w", key, err)
+	}
+	return nil
+}
+
+// HardThrottleAllowance resolves the policy's throttle_allowance to the value
+// written to limits.cpu.allowance. A throttle has to be a hard CFS quota:
+// Incus reads a bare "N%" as a soft share (cpu.weight), which does nothing on
+// an uncontended host and replaces the box's existing hard cap, so a
+// "throttled" box ran faster than before (#2676). "N%" therefore means N
+// percent of ONE core and becomes "Nms/100ms"; an explicit "Xms/Yms" is kept.
+// The result is never looser than the box's current hard cap (prev, as read
+// before the action): a throttle must not raise a limit.
+func HardThrottleAllowance(allowance, prev string) (string, error) {
+	if err := ValidateThrottleAllowance(allowance); err != nil {
+		return "", err
+	}
+	hard := allowance
+	if m := allowancePercentRe.FindStringSubmatch(allowance); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		hard = fmt.Sprintf("%dms/100ms", n)
+	}
+	if pq, pp, ok := parseQuota(prev); ok {
+		if nq, np, _ := parseQuota(hard); pq*np < nq*pp { // prev ratio < new ratio
+			return prev, nil
+		}
+	}
+	return hard, nil
+}
+
+// parseQuota reads "Xms/Yms"; ok is false for anything else (empty, a soft
+// "N%" share), which imposes no hard cap to preserve.
+func parseQuota(s string) (q, p int, ok bool) {
+	m := allowanceQuotaRe.FindStringSubmatch(s)
+	if m == nil {
+		return 0, 0, false
+	}
+	q, _ = strconv.Atoi(m[1])
+	p, _ = strconv.Atoi(m[2])
+	return q, p, q > 0 && p > 0
+}
