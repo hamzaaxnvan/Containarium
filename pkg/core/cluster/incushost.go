@@ -90,3 +90,95 @@ func nodeContainerConfig(spec NodeSpec, isolation Isolation, pool string) incus.
 	}
 	if spec.Disk != "" {
 		// Path and Pool alongside the size, as every other caller in the
+		// tree does: Incus refuses a root disk that carries only a size
+		// ("Disk entry is missing the required source or path property"),
+		// and it refuses it at instance creation — inside the
+		// reconciler's provisioning loop, not at config time (#1435).
+		cfg.Disk = &incus.DiskDevice{Path: "/", Pool: pool, Size: spec.Disk}
+	}
+	return cfg
+}
+
+func (h *IncusHost) CreateNode(spec NodeSpec, isolation Isolation) error {
+	cfg := nodeContainerConfig(spec, isolation, h.client.StoragePool())
+	if err := h.client.CreateContainer(cfg); err != nil {
+		return err
+	}
+	if err := h.client.SetLabels(spec.Name, spec.Labels); err != nil {
+		return fmt.Errorf("label %s: %w", spec.Name, err)
+	}
+	return h.client.StartContainer(spec.Name)
+}
+
+func (h *IncusHost) Start(name string) error { return h.client.StartContainer(name) }
+
+// Stop halts an instance, forcing it: a cluster node being removed is
+// not asked politely, and a graceful stop that hangs would block the
+// autoscaler's scale-down behind a 30s timeout per node.
+func (h *IncusHost) Stop(name string) error { return h.client.StopContainer(name, true) }
+
+func (h *IncusHost) Delete(name string) error { return h.client.DeleteContainer(name) }
+
+// WaitReady blocks until the VM has both a network address and a live
+// guest-agent channel, returning the VM's primary IP — matching the
+// VMHost interface's documented contract. The two come up
+// independently, so waiting only for the network (as this used to do)
+// let callers race Exec/Push against a guest agent that was not yet
+// reachable, observed as Incus's own "VM agent isn't currently
+// running" (#1862). The two waits share the caller's single timeout
+// budget rather than doubling it.
+func (h *IncusHost) WaitReady(name string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	ip, err := h.client.WaitForNetwork(name, timeout)
+	if err != nil {
+		return "", err
+	}
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+	if err := h.client.WaitForAgent(name, remaining); err != nil {
+		return "", err
+	}
+	return ip, nil
+}
+
+func (h *IncusHost) Push(name, path string, content []byte, mode string) error {
+	return h.client.WriteFile(name, path, content, mode)
+}
+
+func (h *IncusHost) Read(name, path string) ([]byte, error) {
+	return h.client.ReadFile(name, path)
+}
+
+func (h *IncusHost) Exec(name string, cmd []string) (string, error) {
+	stdout, stderr, err := h.client.ExecWithOutput(name, cmd)
+	if err != nil {
+		return stdout, fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr))
+	}
+	return stdout, nil
+}
+
+func (h *IncusHost) ClusterVMs(tenant, clusterName string) (Observed, error) {
+	all, err := h.client.ListContainers()
+	if err != nil {
+		return Observed{}, err
+	}
+	obs := Observed{Workers: map[string][]ObservedVM{}}
+	for i := range all {
+		c := &all[i]
+		if c.Labels[LabelCluster] != clusterName || c.Labels[LabelClusterOwner] != tenant {
+			continue
+		}
+		vm := ObservedVM{Name: c.Name, Running: strings.EqualFold(c.State, "running")}
+		switch c.Labels[LabelClusterRole] {
+		case RoleControlPlane:
+			cp := vm
+			obs.CP = &cp
+		case RoleWorker:
+			g := c.Labels[LabelNodeGroup]
+			obs.Workers[g] = append(obs.Workers[g], vm)
+		}
+	}
+	return obs, nil
+}
