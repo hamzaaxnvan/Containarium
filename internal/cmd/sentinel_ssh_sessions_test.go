@@ -148,3 +148,154 @@ func extractSessionPhaseOrder(t *testing.T, output string) []string {
 	t.Helper()
 	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
 	var keys []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "OCCURRED_AT") {
+			continue
+		}
+		if strings.HasPrefix(line, "{") {
+			var rec sshsession.Record
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatalf("line not valid JSON: %q: %v", line, err)
+			}
+			keys = append(keys, rec.SessionID+"/"+string(rec.Phase))
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			t.Fatalf("unexpected table line shape: %q", line)
+		}
+		keys = append(keys, fields[2]+"/"+fields[1])
+	}
+	return keys
+}
+
+func TestRunSentinelSSHSessionsList_JSONOutputRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ssh-sessions.jsonl")
+	rec := sshsession.Record{
+		SessionID: "sess-json", Phase: sshsession.SessionPhaseOpen,
+		OccurredAt: time.Date(2026, 2, 2, 0, 0, 0, 0, time.UTC),
+		ClientIP:   "203.0.113.50", Login: "carol", Target: "192.0.2.9:20022",
+		AuthMethod: sshsession.AuthMethodCertificate,
+	}
+	writeSessionJSONL(t, path, rec)
+
+	t.Cleanup(resetSSHSessionsFlags)
+	resetSSHSessionsFlags()
+	sshSessionsFile = path
+	sshSessionsJSON = true
+
+	var out bytes.Buffer
+	cmd := newSSHSessionsTestCmd(context.Background(), &out)
+	if err := runSentinelSSHSessionsList(cmd, nil); err != nil {
+		t.Fatalf("runSentinelSSHSessionsList: %v", err)
+	}
+
+	var got sshsession.Record
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &got); err != nil {
+		t.Fatalf("output is not a single JSON record: %v\noutput: %s", err, out.String())
+	}
+	if got.SessionID != rec.SessionID || got.Login != rec.Login {
+		t.Errorf("got %+v, want session_id/login matching %+v", got, rec)
+	}
+}
+
+func TestRunSentinelSSHSessionsList_MissingSinkIsNotAnError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "does-not-exist.jsonl")
+
+	t.Cleanup(resetSSHSessionsFlags)
+	resetSSHSessionsFlags()
+	sshSessionsFile = path
+
+	var out bytes.Buffer
+	cmd := newSSHSessionsTestCmd(context.Background(), &out)
+	if err := runSentinelSSHSessionsList(cmd, nil); err != nil {
+		t.Fatalf("runSentinelSSHSessionsList: %v", err)
+	}
+	if !strings.Contains(out.String(), "No SSH session records found") {
+		t.Fatalf("got %q, want the empty-result message for a not-yet-created sink", out.String())
+	}
+}
+
+// TestRunSentinelSSHSessionsFollow_PicksUpAppendedRecord covers
+// containarium#2004's `follow` scope item, at the CLI wiring level (the
+// underlying tail semantics are covered exhaustively in
+// internal/sentinel/sshsession/reader_test.go). Synchronization is a real
+// io.Pipe: reading from it blocks until runSentinelSSHSessionsFollow
+// actually writes the row, so the assertion never races the goroutine —
+// the only sleep here is a generous, non-assertive setup window before the
+// append (documented below), matching the pattern already established in
+// reader_test.go.
+func TestRunSentinelSSHSessionsFollow_PicksUpAppendedRecord(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ssh-sessions.jsonl")
+	// Create the sink up front (empty) so Follow's "already exists" open
+	// path is used — deterministic and immediate, unlike the
+	// wait-for-creation path.
+	writeSessionJSONL(t, path)
+
+	origInterval := sshsession.FollowPollInterval
+	sshsession.FollowPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { sshsession.FollowPollInterval = origInterval })
+
+	t.Cleanup(resetSSHSessionsFlags)
+	resetSSHSessionsFlags()
+	sshSessionsFile = path
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pr.Close(); _ = pw.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cmd := newSSHSessionsTestCmd(ctx, nil)
+	cmd.SetOut(pw)
+
+	done := make(chan error, 1)
+	go func() { done <- runSentinelSSHSessionsFollow(cmd, nil) }()
+
+	reader := bufio.NewReader(pr)
+	header, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	if !strings.HasPrefix(header, "OCCURRED_AT") {
+		t.Fatalf("got header %q, want it to start with OCCURRED_AT", header)
+	}
+
+	// The header write happens on the main goroutine BEFORE the Follow
+	// goroutine is even started, so reading it back proves nothing about
+	// whether Follow has opened the sink yet — that open (and the
+	// os.Stat that captures the pre-append offset) races the append
+	// below. Same bounded, non-assertive setup window used in
+	// reader_test.go's own Follow tests: it only affects when the
+	// append happens, not the pass/fail assertion, which is the blocking
+	// pipe read further down.
+	time.Sleep(20 * time.Millisecond)
+
+	writeSessionJSONL(t, path, sshsession.Record{
+		SessionID: "sess-follow", Phase: sshsession.SessionPhaseOpen,
+		OccurredAt: time.Date(2026, 3, 3, 0, 0, 0, 0, time.UTC),
+		ClientIP:   "192.0.2.77", Login: "dave", Target: "198.51.100.9:20022",
+	})
+
+	row, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read row: %v", err)
+	}
+	fields := strings.Fields(row)
+	if len(fields) < 4 || fields[1] != "open" || fields[2] != "sess-follow" || fields[3] != "dave" {
+		t.Fatalf("got row %q, want phase=open session_id=sess-follow login=dave", row)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runSentinelSSHSessionsFollow returned an error after cancellation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runSentinelSSHSessionsFollow did not exit after context cancellation")
+	}
+}
