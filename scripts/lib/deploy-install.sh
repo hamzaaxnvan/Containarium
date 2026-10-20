@@ -39,3 +39,86 @@ deploy_validate_knobs() {
     local LC_ALL=C tries="$1" interval="$2" err="" q
     case "$tries" in
         [1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]) ;;
+        *) printf -v q '%q' "$tries"
+           err="HEALTH_TRIES must be an integer from 1 to 9999 without leading zeros, got $q";;
+    esac
+    case "$interval" in
+        0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][0-9]) ;;
+        *) printf -v q '%q' "$interval"
+           err="${err:+$err; }HEALTH_INTERVAL must be an integer from 0 to 9999 (seconds) without leading zeros, got $q";;
+    esac
+    [ -z "$err" ] || { printf '%s' "$err"; return 1; }
+}
+
+# The service name and URL are placed inside single quotes in the generated
+# command. They come from operator env (SENTINEL_SERVICE, PRIMARY_SERVICE,
+# *_HEALTH_URL), never from untrusted input, and must not contain a `'`.
+deploy_install_cmd() {
+    local svc="$1" url="${2:-}"
+    local dir="${BIN_DIR:-/usr/local/bin}" src="${SRC:-/tmp/containariumd}"
+    local tries="${HEALTH_TRIES-15}" interval="${HEALTH_INTERVAL-2}"
+    local bin="$dir/containariumd" check poll final inv_get inv_same inv_init=":"
+    # A rollback gate must not pass vacuously: reject bad knobs before any
+    # change to the host. The emitted command fails too, because callers
+    # embed this output in `--command="$(...)"`, where a non-zero return of
+    # this function alone would not stop the deploy.
+    local knob_err
+    if ! knob_err="$(deploy_validate_knobs "$tries" "$interval")"; then
+        echo "ERROR: $knob_err" >&2
+        printf 'echo %q >&2; exit 1\n' "ERROR: $knob_err"
+        return 1
+    fi
+    if [ -n "$url" ]; then
+        check="curl -fsS --max-time 3 '$url' >/dev/null 2>&1"
+        # Healthy on the first successful probe.
+        poll="if $check; then echo \"  $svc healthy after install\"; exit 0; fi"
+        final="false"
+    else
+        # A restart always gets a new InvocationID. Comparing it with the one
+        # recorded after start catches a crash and systemd restart that fell
+        # between two probes, which is-active alone cannot see. It cannot
+        # catch a restart that lands between `systemctl start` returning and
+        # the id being recorded: the recorded id is then already the new one.
+        # If the id is unreadable at record time the check degrades to
+        # is-active alone; one lost later, after it was recorded, fails the
+        # check.
+        inv_get="sudo systemctl show -p InvocationID --value '$svc' 2>/dev/null"
+        inv_init="inv=\$($inv_get)"
+        inv_same="[ \"\$($inv_get)\" = \"\$inv\" ]"
+        check="sudo systemctl is-active --quiet '$svc' && $inv_same"
+        # Healthy only if still active, and the same invocation, after the
+        # whole window: a failed probe ends the wait at once and falls
+        # through to the rollback.
+        poll="if ! { $check; }; then break; fi"
+        # The last probe is followed by a sleep; probe once more after it so
+        # the whole window is watched.
+        final="{ $check; }"
+    fi
+    cat <<CMD
+had_old=0
+sudo systemctl stop '$svc' && sleep 1 || exit 1
+if [ -f '$bin' ]; then sudo cp -p '$bin' '$bin.old' && had_old=1 || exit 1; fi
+sudo cp '$src' '$bin' && sudo chmod +x '$bin' || exit 1
+if [ '$dir' = /usr/local/bin ]; then sudo ln -sf '$bin' '$dir/containarium'; fi
+sudo systemctl start '$svc'
+$inv_init
+i=0
+while [ \$i -lt $tries ]; do
+  $poll
+  i=\$((i+1)); sleep $interval
+done
+if [ -z '$url' ] && [ \$i -ge $tries ] && $final; then echo "  $svc healthy after install"; exit 0; fi
+echo "  ERROR: $svc not healthy after install" >&2
+if [ \$had_old = 1 ]; then
+  sudo systemctl stop '$svc' || true
+  if sudo mv '$bin.old' '$bin' && sudo systemctl start '$svc'; then
+    echo "  rolled back to the previous binary ($bin)" >&2
+  else
+    echo "  ROLLBACK FAILED: could not restore and restart the previous binary; $svc needs manual recovery ($bin.old)" >&2
+  fi
+else
+  echo "  no previous binary to restore; $svc left as is" >&2
+fi
+exit 1
+CMD
+}
