@@ -201,3 +201,207 @@ func (UnimplementedZapServiceServer) mustEmbedUnimplementedZapServiceServer() {}
 func (UnimplementedZapServiceServer) testEmbeddedByValue()                    {}
 
 // UnsafeZapServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ZapServiceServer will
+// result in compilation errors.
+type UnsafeZapServiceServer interface {
+	mustEmbedUnimplementedZapServiceServer()
+}
+
+func RegisterZapServiceServer(s grpc.ServiceRegistrar, srv ZapServiceServer) {
+	// If the following call panics, it indicates UnimplementedZapServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ZapService_ServiceDesc, srv)
+}
+
+func _ZapService_TriggerZapScan_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TriggerZapScanRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ZapServiceServer).TriggerZapScan(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ZapService_TriggerZapScan_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ZapServiceServer).TriggerZapScan(ctx, req.(*TriggerZapScanRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ZapService_ListZapScanRuns_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListZapScanRunsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ZapServiceServer).ListZapScanRuns(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ZapService_ListZapScanRuns_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ZapServiceServer).ListZapScanRuns(ctx, req.(*ListZapScanRunsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ZapService_ListZapAlerts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListZapAlertsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ZapServiceServer).ListZapAlerts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ZapService_ListZapAlerts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ZapServiceServer).ListZapAlerts(ctx, req.(*ListZapAlertsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ZapService_GetZapAlertSummary_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetZapAlertSummaryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ZapServiceServer).GetZapAlertSummary(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ZapService_GetZapAlertSummary_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ZapServiceServer).GetZapAlertSummary(ctx, req.(*GetZapAlertSummaryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ZapService_SuppressZapAlert_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SuppressZapAlertRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ZapServiceServer).SuppressZapAlert(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ZapService_SuppressZapAlert_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ZapServiceServer).SuppressZapAlert(ctx, req.(*SuppressZapAlertRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ZapService_GetZapConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetZapConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ZapServiceServer).GetZapConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ZapService_GetZapConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ZapServiceServer).GetZapConfig(ctx, req.(*GetZapConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ZapService_GetZapReport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetZapReportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ZapServiceServer).GetZapReport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ZapService_GetZapReport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ZapServiceServer).GetZapReport(ctx, req.(*GetZapReportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ZapService_InstallZap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InstallZapRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ZapServiceServer).InstallZap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ZapService_InstallZap_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ZapServiceServer).InstallZap(ctx, req.(*InstallZapRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ZapService_ServiceDesc is the grpc.ServiceDesc for ZapService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ZapService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.ZapService",
+	HandlerType: (*ZapServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "TriggerZapScan",
+			Handler:    _ZapService_TriggerZapScan_Handler,
+		},
+		{
+			MethodName: "ListZapScanRuns",
+			Handler:    _ZapService_ListZapScanRuns_Handler,
+		},
+		{
+			MethodName: "ListZapAlerts",
+			Handler:    _ZapService_ListZapAlerts_Handler,
+		},
+		{
+			MethodName: "GetZapAlertSummary",
+			Handler:    _ZapService_GetZapAlertSummary_Handler,
+		},
+		{
+			MethodName: "SuppressZapAlert",
+			Handler:    _ZapService_SuppressZapAlert_Handler,
+		},
+		{
+			MethodName: "GetZapConfig",
+			Handler:    _ZapService_GetZapConfig_Handler,
+		},
+		{
+			MethodName: "GetZapReport",
+			Handler:    _ZapService_GetZapReport_Handler,
+		},
+		{
+			MethodName: "InstallZap",
+			Handler:    _ZapService_InstallZap_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/zap.proto",
+}

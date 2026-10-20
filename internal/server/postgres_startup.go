@@ -238,3 +238,63 @@ func (w *postgresRecoveryWatcher) run(ctx context.Context) bool {
 	loggedUp, loggedUptime := false, false
 	for {
 		if !w.sleep(ctx, delay) {
+			return false
+		}
+		if err := w.ping(ctx); err != nil {
+			if ok > 0 || loggedUp {
+				log.Printf("Postgres recovery watcher: Postgres unreachable again (%v); waiting", err)
+				loggedUp, loggedUptime = false, false
+			}
+			ok = 0
+			delay = min(delay*2, w.maxDelay)
+			continue
+		}
+		ok++
+		delay = w.interval
+		if !loggedUp {
+			log.Printf("Postgres recovery watcher: Postgres answered; confirming")
+			loggedUp = true
+		}
+		if ok < w.required {
+			continue
+		}
+		if up := w.now().Sub(w.started); up < w.minUptime {
+			if !loggedUptime {
+				log.Printf("Postgres recovery watcher: Postgres is back; holding the restart until %s of uptime (flap guard)", w.minUptime)
+				loggedUptime = true
+			}
+			continue
+		}
+		log.Printf("Postgres recovery watcher: Postgres answered %d pings in a row; restarting the daemon (exit %d)", ok, ExitCodePostgresRecovered)
+		return true
+	}
+}
+
+// watchPostgresRecovery wraps Start's context: when the watcher decides to
+// restart, the returned context is cancelled (Start's normal graceful
+// shutdown runs) and finish turns Start's nil result into
+// ErrRestartForPostgresRecovery.
+func (ds *DualServer) watchPostgresRecovery(parent context.Context) (context.Context, func(error) error) {
+	if ds.postgresRecovery == nil {
+		return parent, func(err error) error { return err }
+	}
+	ctx, cancel := context.WithCancel(parent)
+	restarting := make(chan struct{})
+	go func() {
+		if ds.postgresRecovery.run(ctx) {
+			close(restarting)
+			cancel()
+		}
+	}()
+	return ctx, func(err error) error {
+		cancel()
+		select {
+		case <-restarting:
+			if err == nil {
+				return ErrRestartForPostgresRecovery
+			}
+		default:
+		}
+		return err
+	}
+}
