@@ -295,3 +295,597 @@ func TestProxyManager_RemoveRoute_FullDomain(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	pm := NewProxyManager(server.URL, "example.com")
+
+	// Pass full domain, should extract "test" as route ID
+	err := pm.RemoveRoute("test.example.com")
+	if err != nil {
+		t.Fatalf("RemoveRoute() error = %v", err)
+	}
+
+	// Should delete by ID "test" (not "test.example.com")
+	expectedPath := "/id/test"
+	if receivedPath != expectedPath {
+		t.Errorf("request path = %q, want %q", receivedPath, expectedPath)
+	}
+}
+
+func TestProxyManager_RemoveRoute_SubdomainOnly(t *testing.T) {
+	// Test that RemoveRoute works with just subdomain
+	var receivedPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	pm := NewProxyManager(server.URL, "example.com")
+
+	err := pm.RemoveRoute("myapp")
+	if err != nil {
+		t.Fatalf("RemoveRoute() error = %v", err)
+	}
+
+	expectedPath := "/id/myapp"
+	if receivedPath != expectedPath {
+		t.Errorf("request path = %q, want %q", receivedPath, expectedPath)
+	}
+}
+
+func TestProxyManager_RemoveRoute_FallbackToIndex(t *testing.T) {
+	// Test that RemoveRoute falls back to finding by domain when ID not found
+	deleteByIDCalled := false
+	listRoutesCalled := false
+	deleteByIndexCalled := false
+	var deleteIndexPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "DELETE" && r.URL.Path == "/id/test":
+			// First attempt: delete by ID returns 404
+			deleteByIDCalled = true
+			w.WriteHeader(http.StatusNotFound)
+
+		case r.Method == "GET" && r.URL.Path == "/config/apps/http/servers/srv0/routes":
+			// List routes to find the one matching our domain
+			listRoutesCalled = true
+			routes := []map[string]interface{}{
+				{
+					"match": []map[string]interface{}{
+						{"host": []string{"other.example.com"}},
+					},
+				},
+				{
+					"match": []map[string]interface{}{
+						{"host": []string{"test.example.com"}},
+					},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(routes)
+
+		case r.Method == "DELETE" && r.URL.Path == "/config/apps/http/servers/srv0/routes/1":
+			// Delete by index (index 1 = test.example.com)
+			deleteByIndexCalled = true
+			deleteIndexPath = r.URL.Path
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			t.Logf("Unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	pm := NewProxyManager(server.URL, "example.com")
+
+	err := pm.RemoveRoute("test.example.com")
+	if err != nil {
+		t.Fatalf("RemoveRoute() error = %v", err)
+	}
+
+	if !deleteByIDCalled {
+		t.Error("expected delete by ID to be called first")
+	}
+
+	if !listRoutesCalled {
+		t.Error("expected list routes to be called for fallback")
+	}
+
+	if !deleteByIndexCalled {
+		t.Error("expected delete by index to be called as fallback")
+	}
+
+	expectedPath := "/config/apps/http/servers/srv0/routes/1"
+	if deleteIndexPath != expectedPath {
+		t.Errorf("delete index path = %q, want %q", deleteIndexPath, expectedPath)
+	}
+}
+
+func TestProxyManager_AddRoute_FullDomain(t *testing.T) {
+	// Test that AddRoute handles full domain without doubling base domain
+	var receivedBody map[string]interface{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	pm := NewProxyManager(server.URL, "example.com")
+
+	// Pass full domain - should NOT become "test.example.com.example.com"
+	err := pm.AddRoute("test.example.com", "10.0.3.136", 8080)
+	if err != nil {
+		t.Fatalf("AddRoute() error = %v", err)
+	}
+
+	// Verify the route ID is "test" (subdomain extracted)
+	if id, ok := receivedBody["@id"].(string); !ok || id != "test" {
+		t.Errorf("route @id = %v, want %q", receivedBody["@id"], "test")
+	}
+
+	// Verify host match is the full domain (not doubled)
+	if matches, ok := receivedBody["match"].([]interface{}); ok && len(matches) > 0 {
+		match := matches[0].(map[string]interface{})
+		if hosts, ok := match["host"].([]interface{}); ok && len(hosts) > 0 {
+			if hosts[0] != "test.example.com" {
+				t.Errorf("host = %v, want %q", hosts[0], "test.example.com")
+			}
+		}
+	}
+}
+
+func TestProxyManager_AddRoute_SubdomainOnly(t *testing.T) {
+	// Test that AddRoute correctly appends base domain to subdomain
+	var receivedBody map[string]interface{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	pm := NewProxyManager(server.URL, "example.com")
+
+	// Pass subdomain only
+	err := pm.AddRoute("myapp", "10.0.3.136", 8080)
+	if err != nil {
+		t.Fatalf("AddRoute() error = %v", err)
+	}
+
+	// Verify the route ID is the subdomain
+	if id, ok := receivedBody["@id"].(string); !ok || id != "myapp" {
+		t.Errorf("route @id = %v, want %q", receivedBody["@id"], "myapp")
+	}
+
+	// Verify host match includes base domain
+	if matches, ok := receivedBody["match"].([]interface{}); ok && len(matches) > 0 {
+		match := matches[0].(map[string]interface{})
+		if hosts, ok := match["host"].([]interface{}); ok && len(hosts) > 0 {
+			if hosts[0] != "myapp.example.com" {
+				t.Errorf("host = %v, want %q", hosts[0], "myapp.example.com")
+			}
+		}
+	}
+}
+
+func TestProxyManager_AddRoute_NoBaseDomain(t *testing.T) {
+	// Test that AddRoute works without base domain configured
+	var receivedBody map[string]interface{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	pm := NewProxyManager(server.URL, "") // No base domain
+
+	err := pm.AddRoute("custom.example.com", "10.0.3.136", 8080)
+	if err != nil {
+		t.Fatalf("AddRoute() error = %v", err)
+	}
+
+	// Verify the full domain is used as-is
+	if matches, ok := receivedBody["match"].([]interface{}); ok && len(matches) > 0 {
+		match := matches[0].(map[string]interface{})
+		if hosts, ok := match["host"].([]interface{}); ok && len(hosts) > 0 {
+			if hosts[0] != "custom.example.com" {
+				t.Errorf("host = %v, want %q", hosts[0], "custom.example.com")
+			}
+		}
+	}
+}
+
+func TestProxyManager_UpdateRoute(t *testing.T) {
+	// Test UpdateRoute (removes then adds)
+	deleteCalled := false
+	addCalled := false
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "DELETE":
+			deleteCalled = true
+			w.WriteHeader(http.StatusOK)
+		case "POST":
+			addCalled = true
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	pm := NewProxyManager(server.URL, "example.com")
+
+	err := pm.UpdateRoute("test", "10.0.3.140", 9000)
+	if err != nil {
+		t.Fatalf("UpdateRoute() error = %v", err)
+	}
+
+	if !deleteCalled {
+		t.Error("expected delete to be called")
+	}
+
+	if !addCalled {
+		t.Error("expected add to be called")
+	}
+}
+
+func TestProxyManager_ListRoutes_Empty(t *testing.T) {
+	// Test ListRoutes with no routes configured
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("[]"))
+	}))
+	defer server.Close()
+
+	pm := NewProxyManager(server.URL, "example.com")
+
+	routes, err := pm.ListRoutes()
+	if err != nil {
+		t.Fatalf("ListRoutes() error = %v", err)
+	}
+
+	if len(routes) != 0 {
+		t.Errorf("ListRoutes() returned %d routes, want 0", len(routes))
+	}
+}
+
+func TestProxyManager_ListRoutes_BadRequest(t *testing.T) {
+	// Test ListRoutes when Caddy returns 400 (no http app configured)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("invalid traversal path"))
+	}))
+	defer server.Close()
+
+	pm := NewProxyManager(server.URL, "example.com")
+
+	routes, err := pm.ListRoutes()
+	if err != nil {
+		t.Fatalf("ListRoutes() should return empty on 400, got error: %v", err)
+	}
+
+	if len(routes) != 0 {
+		t.Errorf("ListRoutes() returned %d routes, want 0 on 400 response", len(routes))
+	}
+}
+
+// TestProxyManager_EnableProxyProtocol_PreservesOtherFields is a regression
+// test for the prod-broke-everything bug: a naive `PATCH /config/.../srv0`
+// REPLACES the resource at that path, wiping listen/routes/etc. The fix is to
+// read the full config, set only the two new fields on the server map, and
+// atomically /load. The fake Caddy here mirrors the real semantics — its
+// /load endpoint accepts the entire config and is the only way to mutate
+// state — so a regression to PATCH-replace would surface as missing fields.
+func TestProxyManager_EnableProxyProtocol_PreservesOtherFields(t *testing.T) {
+	initial := map[string]interface{}{
+		"apps": map[string]interface{}{
+			"http": map[string]interface{}{
+				"servers": map[string]interface{}{
+					"srv0": map[string]interface{}{
+						"listen": []interface{}{":80", ":443"},
+						"routes": []interface{}{
+							map[string]interface{}{
+								"@id":    "wordpress.example.com",
+								"match":  []interface{}{map[string]interface{}{"host": []interface{}{"wordpress.example.com"}}},
+								"handle": []interface{}{map[string]interface{}{"handler": "reverse_proxy", "upstreams": []interface{}{map[string]interface{}{"dial": "10.0.3.53:8888"}}}},
+							},
+						},
+						"automatic_https": map[string]interface{}{"disable_redirects": false},
+					},
+				},
+			},
+		},
+	}
+	srv := newFakeCaddy(initial)
+	defer srv.Close()
+
+	pm := NewProxyManager(srv.URL, "example.com")
+	if err := pm.EnableProxyProtocol([]string{"10.130.0.13/32", "127.0.0.0/8"}); err != nil {
+		t.Fatalf("EnableProxyProtocol err = %v", err)
+	}
+
+	resp, err := http.Get(srv.URL + "/config/")
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	defer resp.Body.Close()
+	var cfg map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&cfg)
+
+	srv0 := cfg["apps"].(map[string]interface{})["http"].(map[string]interface{})["servers"].(map[string]interface{})["srv0"].(map[string]interface{})
+
+	// New fields are present and well-shaped.
+	wrappers, ok := srv0["listener_wrappers"].([]interface{})
+	if !ok || len(wrappers) != 2 {
+		t.Fatalf("listener_wrappers shape wrong: %v", srv0["listener_wrappers"])
+	}
+	if w0 := wrappers[0].(map[string]interface{}); w0["wrapper"] != "proxy_protocol" {
+		t.Errorf("first wrapper = %v, want proxy_protocol", w0["wrapper"])
+	}
+	if w1 := wrappers[1].(map[string]interface{}); w1["wrapper"] != "tls" {
+		t.Errorf("second wrapper = %v, want tls", w1["wrapper"])
+	}
+	tp, ok := srv0["trusted_proxies"].(map[string]interface{})
+	if !ok || tp["source"] != "static" {
+		t.Fatalf("trusted_proxies wrong: %v", srv0["trusted_proxies"])
+	}
+	tpRanges, _ := tp["ranges"].([]interface{})
+	if len(tpRanges) != 2 || tpRanges[0] != "10.130.0.13/32" {
+		t.Errorf("trusted_proxies.ranges = %v, want [10.130.0.13/32 127.0.0.0/8]", tpRanges)
+	}
+
+	// THE REGRESSION CHECK — every pre-existing field must still be present.
+	listen, ok := srv0["listen"].([]interface{})
+	if !ok || len(listen) != 2 || listen[0] != ":80" || listen[1] != ":443" {
+		t.Fatalf("REGRESSION: listen was clobbered, got %v (want [:80 :443])", srv0["listen"])
+	}
+	routes, ok := srv0["routes"].([]interface{})
+	if !ok || len(routes) != 1 {
+		t.Fatalf("REGRESSION: routes was clobbered, got %v", srv0["routes"])
+	}
+	if _, ok := srv0["automatic_https"]; !ok {
+		t.Errorf("REGRESSION: automatic_https field was wiped")
+	}
+}
+
+// Regression: ensureHTTPApp used to strictly decode the response into
+// CaddyHTTPApp, whose Routes field transitively contains []CaddyHandler — an
+// interface slice — which encoding/json cannot unmarshal into. Any non-trivial
+// existing http app made the decode fail, the code path fell through to
+// createHTTPApp, the PUT 409'd because the http app already existed, and the
+// daemon silently lost every Caddy update that depended on EnsureServerConfig
+// having succeeded (e.g. registering a tunnel-promoted pool primary).
+func TestProxyManager_EnsureHTTPApp_AcceptsExistingConfigWithHandlers(t *testing.T) {
+	var putToHTTPApp int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/http":
+			// Realistic Caddy response: a server with a route whose handle is a
+			// concrete reverse_proxy handler. The old decode failed here.
+			_, _ = w.Write([]byte(`{"servers":{"srv0":{"listen":[":80",":443"],"routes":[{"@id":"wordpress.example.com","match":[{"host":["wordpress.example.com"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"10.0.3.53:8888"}]}]}]}}}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/config/apps/http":
+			putToHTTPApp++
+			http.Error(w, `{"error":"[/config/apps/http] key already exists: http"}`, http.StatusConflict)
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/tls":
+			_, _ = w.Write([]byte(`{"automation":{"policies":[]}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/http/servers/srv0":
+			_, _ = w.Write([]byte(`{"listen":[":80",":443"]}`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/config/apps/layer4/servers/"):
+			// #1743: listenAddrs() checks live L4 state on every call. No
+			// layer4 app configured in this test's Caddy — 404, matching
+			// what a real Caddy returns for a path that doesn't exist.
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Logf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	pm := NewProxyManager(srv.URL, "example.com")
+	if err := pm.EnsureServerConfig(); err != nil {
+		t.Fatalf("EnsureServerConfig err = %v", err)
+	}
+	if putToHTTPApp != 0 {
+		t.Errorf("ensureHTTPApp made %d spurious PUT(s) to /config/apps/http — the interface-decode bug is back", putToHTTPApp)
+	}
+}
+
+// Regression (live-caught during the #733 slice-4 rollout on an already-running
+// BYOC host): EnsureServerConfig used to treat "server config already exists"
+// as fully done, never checking whether its listen array matched
+// listenAddrs(). A host that flips on CONTAINARIUM_BYOC_INGRESS_ADDR after its
+// edge was already provisioned would restart, log that the ingress listener
+// was "enabled", and Caddy would silently keep listening on only :80/:443 —
+// the log line lied. This must add the missing listener via the
+// getFullConfig/loadConfig atomic-swap path (a scoped PUT to .../listen
+// 409s on an already-set key — caught live on the same rollout), and must
+// NOT touch the server's existing routes.
+func TestProxyManager_EnsureServerConfig_AddsBYOCIngressListener_ToExistingConfig(t *testing.T) {
+	cfg := intactConfig()
+	httpApp := cfg["apps"].(map[string]interface{})["http"].(map[string]interface{})
+	servers := httpApp["servers"].(map[string]interface{})
+	srv0 := servers[DefaultCaddyServerName].(map[string]interface{})
+	srv0["routes"] = []interface{}{
+		map[string]interface{}{
+			"@id": "existing.containarium.dev",
+			"match": []interface{}{
+				map[string]interface{}{"host": []interface{}{"existing.containarium.dev"}},
+			},
+			"handle": []interface{}{
+				map[string]interface{}{"handler": "reverse_proxy", "upstreams": []interface{}{
+					map[string]interface{}{"dial": "10.0.0.5:8080"},
+				}},
+			},
+		},
+	}
+
+	srv, fc := newRWFakeCaddy(cfg)
+	defer srv.Close()
+
+	pm := NewProxyManager(srv.URL, "containarium.dev").WithBYOCIngress("127.0.0.1:8081")
+	if err := pm.EnsureServerConfig(); err != nil {
+		t.Fatalf("EnsureServerConfig err = %v", err)
+	}
+
+	gotSrv0 := fc.config["apps"].(map[string]interface{})["http"].(map[string]interface{})["servers"].(map[string]interface{})[DefaultCaddyServerName].(map[string]interface{})
+
+	listen, _ := gotSrv0["listen"].([]interface{})
+	found := false
+	for _, a := range listen {
+		if a == "127.0.0.1:8081" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("listen = %v, want it to include 127.0.0.1:8081 after EnsureServerConfig", listen)
+	}
+	if len(listen) != 3 {
+		t.Errorf("listen = %v, want exactly 3 entries (:80, :443, 127.0.0.1:8081)", listen)
+	}
+
+	routes, _ := gotSrv0["routes"].([]interface{})
+	if len(routes) != 1 {
+		t.Fatalf("routes = %v, want the pre-existing route untouched (len 1)", routes)
+	}
+	route := routes[0].(map[string]interface{})
+	if route["@id"] != "existing.containarium.dev" {
+		t.Errorf("existing route was clobbered: %v", route)
+	}
+
+	if fc.loads != 1 {
+		t.Errorf("expected exactly one atomic /load to add the listener, got %d loads", fc.loads)
+	}
+}
+
+// Companion no-op case: a host with no BYOC ingress configured, and a config
+// already at exactly [:80, :443], must not trigger a spurious write on every
+// daemon restart.
+func TestProxyManager_EnsureServerConfig_NoBYOCIngress_IsNoOp(t *testing.T) {
+	srv, fc := newRWFakeCaddy(intactConfig())
+	defer srv.Close()
+
+	pm := NewProxyManager(srv.URL, "containarium.dev")
+	if err := pm.EnsureServerConfig(); err != nil {
+		t.Fatalf("EnsureServerConfig err = %v", err)
+	}
+	if fc.puts != 0 || fc.loads != 0 {
+		t.Errorf("expected no writes when listen is already [:80 :443] and BYOC ingress is off, got puts=%d loads=%d", fc.puts, fc.loads)
+	}
+}
+
+// TestProxyManager_RemoveTLSSubject_StripsFromAllPolicies covers the
+// container-delete cascade case (#69): when a container is deleted, its
+// hostname must come out of Caddy's TLS automation subjects so Caddy
+// stops trying to ACME-renew an orphaned cert.
+func TestProxyManager_RemoveTLSSubject_StripsFromAllPolicies(t *testing.T) {
+	gone := "helloworld.demo.containarium.dev"
+	var gotPolicies []map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/tls/automation/policies":
+			_, _ = w.Write([]byte(`[
+				{"subjects": ["keep.example.com", "helloworld.demo.containarium.dev", "also.example.com"]},
+				{"subjects": ["another.example.com", "helloworld.demo.containarium.dev"]}
+			]`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/config/apps/tls/automation/policies":
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &gotPolicies)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	pm := NewProxyManager(srv.URL, "demo.containarium.dev")
+	if err := pm.RemoveTLSSubject(gone); err != nil {
+		t.Fatalf("RemoveTLSSubject err = %v", err)
+	}
+
+	if len(gotPolicies) != 2 {
+		t.Fatalf("expected 2 policies in PATCH body, got %d", len(gotPolicies))
+	}
+	for i, p := range gotPolicies {
+		subs, _ := p["subjects"].([]interface{})
+		for _, s := range subs {
+			if s == gone {
+				t.Errorf("policy %d still contains %q after RemoveTLSSubject", i, gone)
+			}
+		}
+	}
+	// First policy had 3 subjects originally with one to drop → expect 2 left
+	if subs, _ := gotPolicies[0]["subjects"].([]interface{}); len(subs) != 2 {
+		t.Errorf("first policy expected 2 subjects after, got %d (%v)", len(subs), subs)
+	}
+	// Second had 2 → expect 1 left
+	if subs, _ := gotPolicies[1]["subjects"].([]interface{}); len(subs) != 1 {
+		t.Errorf("second policy expected 1 subject after, got %d (%v)", len(subs), subs)
+	}
+}
+
+// TestProxyManager_RemoveTLSSubject_NoOpWhenAbsent covers the case
+// where the cascade is called for a container whose route was never
+// ACME-provisioned (e.g. expose_port was never called). Must not error
+// and must not PATCH (avoiding noise in the Caddy config history).
+func TestProxyManager_RemoveTLSSubject_NoOpWhenAbsent(t *testing.T) {
+	patchCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/apps/tls/automation/policies":
+			_, _ = w.Write([]byte(`[{"subjects": ["only.example.com"]}]`))
+		case r.Method == http.MethodPatch:
+			patchCount++
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	pm := NewProxyManager(srv.URL, "")
+	if err := pm.RemoveTLSSubject("not-present.example.com"); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if patchCount != 0 {
+		t.Errorf("expected no PATCH when subject is absent, got %d", patchCount)
+	}
+}
+
+// TestProxyManager_RemoveTLSSubject_HandlesNullConfig covers a fresh
+// Caddy with no TLS app configured yet. Should return nil silently.
+func TestProxyManager_RemoveTLSSubject_HandlesNullConfig(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Caddy returns "null\n" for missing config paths
+		_, _ = w.Write([]byte("null\n"))
+	}))
+	defer srv.Close()
+
+	pm := NewProxyManager(srv.URL, "")
+	if err := pm.RemoveTLSSubject("anything.example.com"); err != nil {
+		t.Errorf("expected nil on null config, got %v", err)
+	}
+}
+
+func TestProxyManager_EnableProxyProtocol_RefusesEmpty(t *testing.T) {
+	pm := NewProxyManager("http://unreachable", "example.com")
+	if err := pm.EnableProxyProtocol(nil); err == nil {
+		t.Errorf("expected error on empty CIDRs, got nil")
+	}
+}
+
+func TestProxyManager_EnableProxyProtocol_RefusesWildcard(t *testing.T) {
+	pm := NewProxyManager("http://unreachable", "example.com")
+	if err := pm.EnableProxyProtocol([]string{"0.0.0.0/0"}); err == nil {
+		t.Errorf("expected error on wildcard CIDR, got nil")
+	}
+	if err := pm.EnableProxyProtocol([]string{"10.0.0.0/8", "::/0"}); err == nil {
+		t.Errorf("expected error on IPv6 wildcard CIDR, got nil")
+	}
+}
