@@ -67,3 +67,73 @@ func TestSelfCheckProxyPath_WedgedListenerStillDetected(t *testing.T) {
 
 // A peer that reacts by closing the connection is healthy, not wedged: the
 // pipeline demonstrably serviced the connection. This is what an SNI router
+// does when it cannot route the requested name.
+func TestSelfCheckProxyPath_ImmediateCloseIsHealthy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	m := selfCheckManager(ln.Addr().(*net.TCPAddr).Port)
+
+	if err := m.selfCheckProxyPath(3 * time.Second); err != nil {
+		t.Fatalf("a peer that closes the connection reacted, so it is not a wedge: %v", err)
+	}
+}
+
+// A peer that reads the ClientHello and replies with a TLS alert has also
+// reacted. Only a timeout means wedged — an alert is a healthy refusal.
+func TestSelfCheckProxyPath_TLSAlertIsHealthy(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				// A tls.Server with no certificates reads the ClientHello
+				// and answers with a handshake failure alert.
+				_ = tls.Server(c, &tls.Config{}).Handshake()
+			}(conn)
+		}
+	}()
+
+	m := selfCheckManager(ln.Addr().(*net.TCPAddr).Port)
+
+	if err := m.selfCheckProxyPath(3 * time.Second); err != nil {
+		t.Fatalf("a TLS alert is a reaction, not a wedge: %v", err)
+	}
+}
+
+// Nothing listening at all is a dial failure, not a pipeline wedge, but it
+// must still surface as an error rather than a false pass.
+func TestSelfCheckProxyPath_NoListenerIsAnError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close() // free the port so the dial is refused
+
+	m := selfCheckManager(port)
+
+	if err := m.selfCheckProxyPath(2 * time.Second); err == nil {
+		t.Fatal("dialing a closed port must report an error")
+	}
+}
