@@ -155,3 +155,160 @@ func (r *MiningBehaviorRule) OnCPU(ctx RuleContext, samples []CPUSample) []RawFi
 		c.points = append(c.points, miningCPUPoint{at: s.At, cores: s.Cores})
 		c.trim(window)
 	}
+	return nil
+}
+
+// OnFlows records candidate flows. Never fires.
+func (r *MiningBehaviorRule) OnFlows(ctx RuleContext, flows []netbpf.FlowRecord) []RawFinding {
+	th := miningThresholds(ctx)
+	now := ctx.Now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, f := range flows {
+		// A list entry names the pool, so it wins over a bare port match.
+		var matched string
+		if cidr, ok := r.listed(f.Dst()); ok {
+			matched = "bad-destination:" + cidr
+		} else if th.isStratumPort(f.Dport) {
+			matched = "port:" + strconv.Itoa(int(f.Dport))
+		} else {
+			continue
+		}
+		src := f.Src()
+		byKey := r.flows[src]
+		if byKey == nil {
+			byKey = make(map[miningFlowKey]*miningFlow)
+			r.flows[src] = byKey
+		}
+		byKey[miningFlowKey{src: src, dst: f.Dst(), sport: f.Sport, dport: f.Dport, proto: f.Proto}] = &miningFlow{rec: f, seenAt: now, matched: matched}
+	}
+	return nil
+}
+
+func (r *MiningBehaviorRule) listed(ip netip.Addr) (string, bool) {
+	if r.matcher == nil {
+		return "", false
+	}
+	return r.matcher.MatchDestination(ip)
+}
+
+// OnDeny is a no-op: the rule reads CPU and flows only.
+func (r *MiningBehaviorRule) OnDeny(RuleContext, netbpf.DenyEvent) []RawFinding { return nil }
+
+// Sweep prunes state to the window, expires containers silent for
+// 2 x window, and fires one HIGH finding per qualifying destination of each
+// container whose CPU mean over a fully covered window reaches the bar.
+func (r *MiningBehaviorRule) Sweep(ctx RuleContext, now time.Time) []RawFinding {
+	th := miningThresholds(ctx)
+	cutoff := now.Add(-th.Window)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for src, byKey := range r.flows {
+		for k, f := range byKey {
+			if !f.seenAt.After(cutoff) {
+				delete(byKey, k)
+			}
+		}
+		if len(byKey) == 0 {
+			delete(r.flows, src)
+		}
+	}
+
+	var out []RawFinding
+	for name, c := range r.containers {
+		if now.Sub(c.lastAt) > 2*th.Window {
+			delete(r.containers, name)
+			continue
+		}
+		kept := c.points[:0]
+		for _, p := range c.points {
+			if p.at.After(cutoff) {
+				kept = append(kept, p)
+			}
+		}
+		c.points = kept
+		// The mean must cover the window, not a burst at its end or a lone
+		// sample after a gap: enough samples, the oldest at least
+		// miningMinCoverage x window old.
+		if len(kept) < miningMinSamples || float64(now.Sub(kept[0].at)) < miningMinCoverage*float64(th.Window) {
+			continue
+		}
+		var sum, peak float64
+		for _, p := range kept {
+			sum += p.cores
+			peak = max(peak, p.cores)
+		}
+		mean := sum / float64(len(kept))
+		if mean < th.Bar(c.limit) {
+			continue
+		}
+		best := map[string]*miningFlow{} // subject -> longest-lived flow
+		for _, f := range r.flows[c.ip] {
+			age := f.rec.LastNs - f.rec.FirstNs
+			if f.rec.LastNs < f.rec.FirstNs || time.Duration(age) < th.FlowMinAge { // #nosec G115 -- age bounded by uptime
+				continue
+			}
+			subject := netip.AddrPortFrom(f.rec.Dst(), f.rec.Dport).String()
+			if prev, ok := best[subject]; !ok || age > prev.rec.LastNs-prev.rec.FirstNs {
+				best[subject] = f
+			}
+		}
+		if len(best) == 0 {
+			continue
+		}
+		tenantID, _ := ctx.TenantForIP(c.ip)
+		cpu := CPUEvidence{
+			MeanCores:     mean,
+			PeakCores:     peak,
+			WindowSeconds: int64(th.Window / time.Second),
+			Samples:       int32(min(len(kept), 1<<31-1)), // #nosec G115 -- clamped
+		}
+		for subject, mf := range best {
+			f := mf.rec
+			// The kernel stamps are monotonic, so anchor on the poll that
+			// reported the flow, as flowsToEBPF does for the traffic view.
+			age := time.Duration(f.LastNs - f.FirstNs) // #nosec G115 -- LastNs >= FirstNs checked above
+			out = append(out, RawFinding{
+				Rule:      pb.ThreatRuleId_THREAT_RULE_ID_MINING_BEHAVIOR,
+				Severity:  pb.ThreatSeverity_THREAT_SEVERITY_HIGH,
+				TenantID:  tenantID,
+				Container: name,
+				Subject:   subject,
+				Evidence: Evidence{
+					CPU: []CPUEvidence{cpu},
+					Flows: []FlowEvidence{{
+						SrcIP:     f.Src().String(),
+						DstIP:     f.Dst().String(),
+						SrcPort:   uint32(f.Sport),
+						DstPort:   uint32(f.Dport),
+						Protocol:  badDestProtoName(f.Proto),
+						Bytes:     int64(f.Bytes),   // #nosec G115 -- one flow's counters
+						Packets:   int64(f.Packets), // #nosec G115 -- one flow's counters
+						FirstSeen: mf.seenAt.Add(-age),
+						LastSeen:  mf.seenAt,
+						Matched:   mf.matched,
+					}},
+				},
+			})
+		}
+	}
+	return out
+}
+
+// trackedContainers is for tests: how many containers hold CPU state.
+func (r *MiningBehaviorRule) trackedContainers() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.containers)
+}
+
+// pointCount is for tests: how many CPU points a container holds.
+func (r *MiningBehaviorRule) pointCount(container string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if c := r.containers[container]; c != nil {
+		return len(c.points)
+	}
+	return 0
+}
