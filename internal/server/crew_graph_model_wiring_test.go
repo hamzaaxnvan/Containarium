@@ -48,3 +48,54 @@ func TestGraphCrewNodeRequest_KeepsOverridesDropsGraph(t *testing.T) {
 	}
 	if got.GetGraph() != nil || got.GetConcurrency() != 0 {
 		t.Errorf("graph fields survived: %v", got)
+	}
+	if got.GetCrewId() != "inner" || got.GetRunId() != "run-2" || got.GetInputJson() != "in" {
+		t.Errorf("request = %v", got)
+	}
+	if parent.GetGraph() == nil || parent.GetCrewId() != "outer" {
+		t.Error("the parent request was mutated")
+	}
+}
+
+// applyRunModel is what beginSkillRunWith provisions: the overridden copy, with
+// the shared catalog skill untouched.
+func TestApplyRunModel_ProvisionsTheOverriddenSkill(t *testing.T) {
+	catalog := skills.GetDefault()
+	shared, err := catalog.Get("hello-agent-claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := shared.GetModel()
+	got, err := applyRunModel(shared, &pb.RunAgentSkillRequest{SkillId: shared.GetId(), Model: "m-run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetModel() != "m-run" {
+		t.Errorf("provisioned model = %q, want the request's", got.GetModel())
+	}
+	if shared.GetModel() != before {
+		t.Errorf("catalog skill mutated: %q -> %q", before, shared.GetModel())
+	}
+}
+
+// The public single-skill request refuses a bad model up front, through
+// RunAgentSkill itself; no runtime is wired, so only validation can return these.
+func TestRunAgentSkill_ModelRefusedUpFront(t *testing.T) {
+	s := &AgentSkillServer{catalog: skills.GetDefault()}
+	for _, tc := range []struct {
+		name  string
+		skill string
+		model string
+		want  codes.Code
+	}{
+		{"malformed id", "hello-agent-claude", "bad id", codes.InvalidArgument},
+		{"no named engine", "code-review", "m-1", codes.FailedPrecondition},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := s.RunAgentSkill(ctxAs("admin", true), &pb.RunAgentSkillRequest{SkillId: tc.skill, Model: tc.model})
+			if status.Code(err) != tc.want {
+				t.Fatalf("code = %v (%v), want %v", status.Code(err), err, tc.want)
+			}
+		})
+	}
+}
