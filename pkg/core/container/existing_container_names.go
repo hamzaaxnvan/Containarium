@@ -50,3 +50,21 @@ func (m *Manager) ExistingContainerNames() (map[string]bool, error) {
 	}
 	if m.nameCache.names != nil && time.Since(m.nameCache.fetchedAt) < ttl {
 		return m.nameCache.names, nil
+	}
+
+	containers, err := m.incus.ListContainers()
+	if err != nil {
+		if m.nameCache.names != nil {
+			return m.nameCache.names, nil
+		}
+		return nil, err
+	}
+
+	names := make(map[string]bool, len(containers))
+	for _, c := range containers {
+		names[c.Name] = true
+	}
+	m.nameCache.names = names
+	m.nameCache.fetchedAt = time.Now()
+	return names, nil
+}
