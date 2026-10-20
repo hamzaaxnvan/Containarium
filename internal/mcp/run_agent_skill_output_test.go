@@ -67,3 +67,27 @@ func TestHandleRunAgentSkill_Output(t *testing.T) {
 				t.Fatalf("handleRunAgentSkill: %v", err)
 			}
 			for _, w := range tt.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("output missing %q:\n%s", w, out)
+				}
+			}
+			for _, nw := range tt.notWant {
+				if strings.Contains(out, nw) {
+					t.Errorf("output unexpectedly contains %q:\n%s", nw, out)
+				}
+			}
+		})
+	}
+}
+
+// TestRunAgentSkillResponse_DecodesRunIDAndMessage checks the wire JSON's
+// runId and message fields reach the typed response.
+func TestRunAgentSkillResponse_DecodesRunIDAndMessage(t *testing.T) {
+	var resp RunAgentSkillResponse
+	if err := json.Unmarshal([]byte(`{"runId":"run-1","message":"run enrolled"}`), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.RunID != "run-1" || resp.Message != "run enrolled" {
+		t.Errorf("decoded %+v, want runId=run-1 message=%q", resp, "run enrolled")
+	}
+}
