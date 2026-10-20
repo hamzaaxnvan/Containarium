@@ -69,3 +69,74 @@ func (bp *BackendPool) Remove(id string) *Backend {
 	if b.syncCancel != nil {
 		b.syncCancel()
 	}
+	delete(bp.backends, id)
+	return b
+}
+
+// Get returns a backend by ID, or nil.
+func (bp *BackendPool) Get(id string) *Backend {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	return bp.backends[id]
+}
+
+// All returns a snapshot of all backends.
+func (bp *BackendPool) All() []*Backend {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	result := make([]*Backend, 0, len(bp.backends))
+	for _, b := range bp.backends {
+		result = append(result, b)
+	}
+	return result
+}
+
+// Healthy returns all backends currently marked healthy.
+func (bp *BackendPool) Healthy() []*Backend {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	var result []*Backend
+	for _, b := range bp.backends {
+		if b.Healthy {
+			result = append(result, b)
+		}
+	}
+	return result
+}
+
+// AnyHealthy returns true if at least one backend is healthy.
+func (bp *BackendPool) AnyHealthy() bool {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	for _, b := range bp.backends {
+		if b.Healthy {
+			return true
+		}
+	}
+	return false
+}
+
+// SelectPrimary returns the best healthy backend for HTTP forwarding.
+// Prefers lower Priority value (GCP=0 > Tunnel=10).
+func (bp *BackendPool) SelectPrimary() *Backend {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+
+	var best *Backend
+	for _, b := range bp.backends {
+		if !b.Healthy {
+			continue
+		}
+		if best == nil || b.Priority < best.Priority {
+			best = b
+		}
+	}
+	return best
+}
+
+// Count returns the number of backends.
+func (bp *BackendPool) Count() int {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	return len(bp.backends)
+}
