@@ -144,3 +144,222 @@ describe("FileJournal", () => {
     j.append(make(secret));
     const raw = readFileSync(j.path, "utf8");
     expect(raw).not.toContain(secret);
+    expect(JournalEventSchema.parse(JSON.parse(raw))).toBeTruthy();
+  });
+
+  // Redaction must run before truncation: truncating first would cut the
+  // secret at the cap, leave its first bytes in the line, and the remaining
+  // fragment would no longer match the secret to redact.
+  it.each(Object.entries(secrets))("redacts the %s before truncating, leaving no byte of it at the cut", (_name, secret) => {
+    const root = tmpRoot();
+    const j = FileJournal.open({ root, runId: "r", skillId: "s", secrets: Object.values(secrets) });
+    const pad = "z".repeat(MAX_FIELD_BYTES - REDACTED.length);
+    j.append({ kind: "tool_result", tool: "shell", text: pad + secret });
+    j.append({ kind: "tool_use", tool: "shell", input: pad + secret });
+    const [result, use] = readLines(j.path) as Array<{ text?: string; input?: string }>;
+    expect(result!.text).toBe(pad + REDACTED);
+    expect(use!.input).toBe(pad + REDACTED);
+    expect(readFileSync(j.path, "utf8")).not.toContain(secret.slice(0, 4));
+  });
+
+  it("redacts every occurrence and marks it", () => {
+    const root = tmpRoot();
+    const j = FileJournal.open({ root, runId: "r", skillId: "s", secrets: ["s3cr3t-value-1234"] });
+    j.append({ kind: "assistant", text: "a s3cr3t-value-1234 b s3cr3t-value-1234" });
+    expect(readLines(j.path)[0]).toMatchObject({ text: `a ${REDACTED} b ${REDACTED}` });
+  });
+
+  it("ignores empty and trivially short secrets instead of redacting everything", () => {
+    const root = tmpRoot();
+    const j = FileJournal.open({ root, runId: "r", skillId: "s", secrets: ["", "x"] });
+    j.append({ kind: "assistant", text: "xyz" });
+    expect(readLines(j.path)[0]).toMatchObject({ text: "xyz" });
+  });
+});
+
+describe("journalSecrets", () => {
+  it("collects the gateway token vars, provider keys and the seeded platform JWT", () => {
+    const dir = tmpRoot();
+    const tokenPath = join(dir, "token");
+    writeFileSync(tokenPath, "platform-jwt-value-abc\n");
+    const got = journalSecrets(
+      {
+        CONTAINARIUM_GATEWAY_TOKEN: "gw-gemini-token-1",
+        ANTHROPIC_AUTH_TOKEN: "gw-anthropic-token-1",
+        OPENAI_API_KEY: "gw-openai-token-1",
+        ANTHROPIC_API_KEY: "direct-anthropic-key",
+        GEMINI_API_KEY: "direct-gemini-key",
+        GOOGLE_API_KEY: "direct-google-key",
+        CODEX_API_KEY: "direct-codex-key",
+        PATH: "/usr/bin",
+      },
+      tokenPath,
+    );
+    expect(new Set(got)).toEqual(
+      new Set([
+        "gw-gemini-token-1",
+        "gw-anthropic-token-1",
+        "gw-openai-token-1",
+        "direct-anthropic-key",
+        "direct-gemini-key",
+        "direct-google-key",
+        "direct-codex-key",
+        "platform-jwt-value-abc",
+      ]),
+    );
+  });
+
+  it("tolerates a missing token file", () => {
+    expect(journalSecrets({}, null)).toEqual([]);
+    expect(journalSecrets({}, "/nonexistent/token")).toEqual([]);
+  });
+});
+
+function fakeEngine(run: (task: string, j: JournalSink) => Promise<string>): Engine {
+  return {
+    name: "fake",
+    async run(task, _cfg, journal) {
+      return { outputJson: await run(task, journal) };
+    },
+  };
+}
+
+describe("runJournaled", () => {
+  it("brackets a successful run with status lines around the engine's events", async () => {
+    const root = tmpRoot();
+    const j = FileJournal.open({ root, runId: "r", skillId: "s", secrets: [] });
+    const res = await runJournaled(
+      fakeEngine(async (_t, jj) => {
+        jj.append({ kind: "assistant", text: "done" });
+        return "{}";
+      }),
+      "{}",
+      cfg,
+      j,
+    );
+    expect(res.outputJson).toBe("{}");
+    expect(readLines(j.path).map((l) => (l as { kind: string; text?: string }).text ?? l)).toEqual([
+      "run started",
+      "done",
+      "run ended exit=0",
+    ]);
+  });
+
+  it("journals the error and exit=1 on failure, then rethrows", async () => {
+    const root = tmpRoot();
+    const j = FileJournal.open({ root, runId: "r", skillId: "s", secrets: [] });
+    await expect(
+      runJournaled(
+        fakeEngine(async () => {
+          throw new Error("model unreachable");
+        }),
+        "{}",
+        cfg,
+        j,
+      ),
+    ).rejects.toThrow("model unreachable");
+    expect(readLines(j.path)).toMatchObject([
+      { seq: 1, kind: "status", text: "run started" },
+      { seq: 2, kind: "error", text: "model unreachable" },
+      { seq: 3, kind: "status", text: "run ended exit=1" },
+    ]);
+  });
+
+  // #2513 item 2: the re-prompt sits inside the bracket, so a run that only
+  // answers on the re-prompt still ends exit=0 with that answer.
+  it("re-prompts once, inside the bracket, a run that changed files but returned nothing", async () => {
+    const root = tmpRoot();
+    const j = FileJournal.open({ root, runId: "r", skillId: "s", secrets: [] });
+    const engine: Engine = {
+      name: "fake",
+      async run(_task, _cfg, journal) {
+        journal.append({ kind: "tool_use", tool: "write_file", input: "{}" });
+        return { outputJson: "", followUp: async () => ({ outputJson: '{"files":[]}' }) };
+      },
+    };
+    const res = await runJournaled(engine, "{}", cfg, j);
+    expect(res.outputJson).toBe('{"files":[]}');
+    expect(readLines(j.path).map((l) => (l as { text?: string }).text ?? (l as { kind: string }).kind)).toEqual([
+      "run started",
+      "tool_use",
+      "run changed files but returned no final message: re-prompting once for the final JSON",
+      "run ended exit=0",
+    ]);
+  });
+});
+
+describe("serveJournals", () => {
+  it("opens <root>/<task run_id>/<skill_id>.jsonl and reuses it for the same run", () => {
+    const root = tmpRoot();
+    const errs: string[] = [];
+    const journals = serveJournals({ root, skillId: "hello-agent", secrets: [], warn: (m) => errs.push(m) });
+    const a = journals("run-7");
+    a.append({ kind: "status", text: "run started" });
+    const b = journals("run-7");
+    b.append({ kind: "status", text: "run started" });
+    expect(readLines(join(root, "run-7", "hello-agent.jsonl")).map((l) => (l as { seq: number }).seq)).toEqual([1, 2]);
+    expect(errs).toEqual([]);
+  });
+
+  it("does not journal (and says so on the process log) when the task has no run_id", () => {
+    const root = tmpRoot();
+    const errs: string[] = [];
+    const journals = serveJournals({ root, skillId: "hello-agent", secrets: [], warn: (m) => errs.push(m) });
+    journals(undefined).append({ kind: "status", text: "run started" });
+    journals("").append({ kind: "status", text: "run started" });
+    expect(errs).toHaveLength(2);
+    expect(errs[0]).toMatch(/run_id/);
+    expect(existsSync(join(root, "hello-agent.jsonl"))).toBe(false);
+  });
+
+  it("does not journal when the box was launched without a skill id", () => {
+    const root = tmpRoot();
+    const errs: string[] = [];
+    const journals = serveJournals({ root, skillId: undefined, secrets: [], warn: (m) => errs.push(m) });
+    journals("run-1").append({ kind: "status", text: "run started" });
+    expect(errs[0]).toMatch(/CONTAINARIUM_SKILL_ID/);
+    expect(existsSync(join(root, "run-1"))).toBe(false);
+  });
+
+  it("degrades to no journal, with a warning, when the journal directory cannot be created", () => {
+    const blocker = join(tmpRoot(), "not-a-dir");
+    writeFileSync(blocker, "");
+    const errs: string[] = [];
+    const journals = serveJournals({ root: join(blocker, "runs"), skillId: "s", secrets: [], warn: (m) => errs.push(m) });
+    expect(() => journals("run-1").append({ kind: "status", text: "run started" })).not.toThrow();
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toMatch(/not journaled/);
+  });
+
+  it("rejects a run_id that would escape the journal root", () => {
+    const journals = serveJournals({ root: tmpRoot(), skillId: "s", secrets: [], warn: () => {} });
+    expect(() => journals("../../etc")).toThrow();
+  });
+});
+
+describe("journal.schema", () => {
+  it("round-trips every event kind through the exported fixture lines", () => {
+    const kinds = new Set<string>();
+    for (const line of JOURNAL_FIXTURE_LINES) {
+      const ev = parseJournalLine(line);
+      kinds.add(ev.kind);
+      expect(JSON.stringify(ev)).toBe(line);
+    }
+    expect(kinds).toEqual(new Set(["status", "assistant", "tool_use", "tool_result", "error"]));
+  });
+
+  it("matches the shared fixtures/journal.jsonl file", () => {
+    const file = readFileSync(new URL("../fixtures/journal.jsonl", import.meta.url), "utf8");
+    expect(file.trimEnd().split("\n")).toEqual([...JOURNAL_FIXTURE_LINES]);
+  });
+
+  it.each([
+    ["unknown kind", { seq: 1, t: "2026-09-28T10:00:00.000Z", kind: "thought", text: "x" }],
+    ["missing tool", { seq: 1, t: "2026-09-28T10:00:00.000Z", kind: "tool_use", input: "{}" }],
+    ["non-integer seq", { seq: 1.5, t: "2026-09-28T10:00:00.000Z", kind: "status", text: "x" }],
+    ["bad timestamp", { seq: 1, t: "yesterday", kind: "status", text: "x" }],
+    ["extra field", { seq: 1, t: "2026-09-28T10:00:00.000Z", kind: "status", text: "x", secret: "y" }],
+  ])("rejects a line with %s", (_name, line) => {
+    expect(() => parseJournalLine(JSON.stringify(line))).toThrow();
+  });
+});
