@@ -191,3 +191,68 @@ func checkRetentionDocFigures(doc string, want docFigures) []string {
 		for _, m := range ms {
 			covered = append(covered, span{m[0], m[1]})
 			if got := num(doc[m[2]:m[3]]); got != s.want {
+				fail(m[0], "%q states %d; %s is %d", doc[m[0]:m[1]], got, s.what, s.want)
+			}
+		}
+	}
+
+	// The inventory's enforced defaults. A crew run (prompts and responses)
+	// is deleted past the longer of the two windows.
+	inv := map[string]int64{
+		"Prompts":               int64(want.defaults[pb.RetentionClass_RETENTION_CLASS_PROMPTS]),
+		"Responses":             int64(want.defaults[pb.RetentionClass_RETENTION_CLASS_RESPONSES]),
+		"Gateway logs":          gw,
+		"Session transcripts":   int64(want.defaults[pb.RetentionClass_RETENTION_CLASS_SESSION_TRANSCRIPTS]),
+		"Prompts and responses": max(int64(want.defaults[pb.RetentionClass_RETENTION_CLASS_PROMPTS]), int64(want.defaults[pb.RetentionClass_RETENTION_CLASS_RESPONSES])),
+	}
+	invSeen := map[string]bool{}
+	for _, m := range invRowRe.FindAllStringSubmatchIndex(doc, -1) {
+		label, days := doc[m[2]:m[3]], num(doc[m[4]:m[5]])
+		covered = append(covered, span{m[4], m[1]})
+		invSeen[label] = true
+		if days != inv[label] {
+			fail(m[0], "inventory row %q says %d days in enforce mode; the class default is %d", label, days, inv[label])
+		}
+	}
+	for label := range inv {
+		if !invSeen[label] {
+			errs = append(errs, fmt.Sprintf("%s: no inventory row for %q states its enforced default", dataFlowDoc, label))
+		}
+	}
+
+	// The crew-run example must follow the longer-window rule it illustrates.
+	if m := crewRe.FindStringSubmatchIndex(doc); m == nil {
+		errs = append(errs, fmt.Sprintf("%s: the crew-run longer-window example is gone; the gate lost track of it", dataFlowDoc))
+	} else {
+		covered = append(covered, span{m[0], m[1]})
+		p, r, kept, not := num(doc[m[2]:m[3]]), num(doc[m[4]:m[5]]), num(doc[m[6]:m[7]]), num(doc[m[8]:m[9]])
+		if p <= r || kept != max(p, r) || not != r {
+			fail(m[0], "crew-run example (%d-day prompts, %d-day responses, kept %d, not %d) contradicts the longer-window rule", p, r, kept, not)
+		}
+	}
+
+	for phrase, owner := range ownedElsewhere {
+		ms := spaced(regexp.QuoteMeta(phrase)).FindAllStringIndex(doc, -1)
+		if len(ms) == 0 {
+			errs = append(errs, fmt.Sprintf("%s: %q (owned by %s) no longer appears; reclassify the figure that replaced it", dataFlowDoc, phrase, owner))
+		}
+		for _, m := range ms {
+			covered = append(covered, span{m[0], m[1]})
+		}
+	}
+
+	// Anything left is a figure nobody checks.
+	for _, m := range dayCountRe.FindAllStringIndex(doc, -1) {
+		ok := false
+		for _, c := range covered {
+			if m[0] >= c.start && m[1] <= c.end {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			fail(m[0], "%q is neither checked against internal/retention nor listed in ownedElsewhere", doc[m[0]:m[1]])
+		}
+	}
+	return errs
+}
