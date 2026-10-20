@@ -348,3 +348,120 @@ func (c *Client) DetachACLFromContainer(containerName, deviceName string) error 
 		return fmt.Errorf("device %s not found in container %s", deviceName, containerName)
 	}
 
+	// Remove ACL from the device
+	delete(device, "security.acls")
+	inst.Devices[deviceName] = device
+
+	// Update the container
+	op, err := c.server.UpdateInstance(containerName, inst.Writable(), etag)
+	if err != nil {
+		return fmt.Errorf("failed to detach ACL from container: %w", err)
+	}
+
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("failed to detach ACL (operation failed): %w", err)
+	}
+
+	return nil
+}
+
+// GetContainerACL gets the ACL attached to a container's network device
+func (c *Client) GetContainerACL(containerName, deviceName string) (string, error) {
+	inst, _, err := c.server.GetInstance(containerName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get container %s: %w", containerName, err)
+	}
+
+	// The expanded view is the effective NIC: it covers both an
+	// instance-local device and one inherited from a profile.
+	device, exists := inst.ExpandedDevices[deviceName]
+	if !exists {
+		device, exists = inst.Devices[deviceName]
+	}
+	if !exists {
+		return "", nil // No device found
+	}
+	return device["security.acls"], nil
+}
+
+// EnsureACLForApp ensures an ACL exists for an app and returns its name
+func (c *Client) EnsureACLForApp(appName, username string, preset ACLPreset, proxyIP, containerNetwork string) (string, error) {
+	aclName := fmt.Sprintf("acl-%s-%s", username, appName)
+
+	// Check if ACL already exists
+	_, err := c.GetNetworkACL(aclName)
+	if err == nil {
+		// ACL exists, update it with new preset
+		config := GetPresetACL(preset, proxyIP, containerNetwork)
+		config.Name = aclName
+		return aclName, c.UpdateNetworkACL(aclName, config)
+	}
+
+	// Create new ACL
+	config := GetPresetACL(preset, proxyIP, containerNetwork)
+	config.Name = aclName
+	return aclName, c.CreateNetworkACL(config)
+}
+
+// EnsureACLForContainer ensures an ACL exists for a DevBox container and returns its name
+// This creates a per-container firewall (not per-app) named "acl-{username}"
+func (c *Client) EnsureACLForContainer(username string, preset ACLPreset, proxyIP, containerNetwork string) (string, error) {
+	aclName := fmt.Sprintf("acl-%s", username)
+
+	// Check if ACL already exists
+	_, err := c.GetNetworkACL(aclName)
+	if err == nil {
+		// ACL exists, update it with new preset
+		config := GetPresetACL(preset, proxyIP, containerNetwork)
+		config.Name = aclName
+		return aclName, c.UpdateNetworkACL(aclName, config)
+	}
+
+	// Create new ACL
+	config := GetPresetACL(preset, proxyIP, containerNetwork)
+	config.Name = aclName
+	return aclName, c.CreateNetworkACL(config)
+}
+
+// ACLInfo holds information about an ACL attached to a container
+type ACLInfo struct {
+	Name         string
+	Description  string
+	IngressRules []ACLRule
+	EgressRules  []ACLRule
+}
+
+// convertAPIRuleToACLRule converts Incus API rule to our ACLRule
+func convertAPIRuleToACLRule(rule api.NetworkACLRule) ACLRule {
+	return ACLRule{
+		Action:          rule.Action,
+		Source:          rule.Source,
+		Destination:     rule.Destination,
+		DestinationPort: rule.DestinationPort,
+		Protocol:        rule.Protocol,
+		Description:     rule.Description,
+	}
+}
+
+// GetACLInfo gets full ACL information
+func (c *Client) GetACLInfo(name string) (*ACLInfo, error) {
+	acl, err := c.GetNetworkACL(name)
+	if err != nil {
+		return nil, err
+	}
+
+	info := &ACLInfo{
+		Name:        acl.Name,
+		Description: acl.Description,
+	}
+
+	for _, rule := range acl.Ingress {
+		info.IngressRules = append(info.IngressRules, convertAPIRuleToACLRule(rule))
+	}
+
+	for _, rule := range acl.Egress {
+		info.EgressRules = append(info.EgressRules, convertAPIRuleToACLRule(rule))
+	}
+
+	return info, nil
+}
