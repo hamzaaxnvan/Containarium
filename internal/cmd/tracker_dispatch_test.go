@@ -61,3 +61,195 @@ func TestValidateDispatchFlags(t *testing.T) {
 		{name: "default loop", interval: 60 * time.Second},
 		{name: "once", once: true, interval: 60 * time.Second},
 		{name: "explicit interval", interval: 5 * time.Minute, intervalChanged: true},
+		{name: "once with interval", once: true, interval: time.Minute, intervalChanged: true, wantErr: "mutually exclusive"},
+		{name: "interval too short", interval: 100 * time.Millisecond, intervalChanged: true, wantErr: "at least"},
+		{name: "max starts", once: true, interval: time.Minute, maxStarts: 2},
+		{name: "negative max starts", once: true, interval: time.Minute, maxStarts: -1, wantErr: "--max-starts"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDispatchFlags(tt.once, tt.interval, tt.intervalChanged, tt.maxStarts)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want one containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseDispatchStateFlag(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    pb.TrackerDispatchState
+		wantErr bool
+	}{
+		{"", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_UNSPECIFIED, false},
+		{"queued", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_QUEUED, false},
+		{"RUNNING", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_RUNNING, false},
+		{"done", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_DONE, false},
+		{"failed", pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED, false},
+		{"unspecified", 0, true},
+		{"stuck", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := parseDispatchStateFlag(tt.in)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("parseDispatchStateFlag(%q) err = %v, wantErr %v", tt.in, err, tt.wantErr)
+			continue
+		}
+		if !tt.wantErr && got != tt.want {
+			t.Errorf("parseDispatchStateFlag(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+// httpModeStub points the CLI at a stub gateway for one test.
+func httpModeStub(t *testing.T, respBody string) (gotMethod, gotPath, gotQuery *string) {
+	t.Helper()
+	var m, p, q string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m, p, q = r.Method, r.URL.Path, r.URL.RawQuery
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, respBody)
+	}))
+	t.Cleanup(srv.Close)
+	oldServer, oldHTTP, oldToken := serverAddr, httpMode, authToken
+	t.Cleanup(func() { serverAddr, httpMode, authToken = oldServer, oldHTTP, oldToken })
+	serverAddr, httpMode, authToken = srv.URL, true, "tok"
+	return &m, &p, &q
+}
+
+func TestTrackerDispatch_HTTPModeOnceHitsGatewayPath(t *testing.T) {
+	method, path, _ := httpModeStub(t, `{"started":[{"id":"d1","issueNumber":"42","scope":"product","skillId":"product-define","runId":"run-1","state":"TRACKER_DISPATCH_STATE_QUEUED"}],"skippedUnrouted":1,"skippedOverDepth":2}`)
+	oldOnce := trackerDispatchOnce
+	t.Cleanup(func() { trackerDispatchOnce = oldOnce })
+	trackerDispatchOnce = true
+
+	out := captureStdout(t, func() {
+		if err := runTrackerDispatch(trackerDispatchCmd, []string{"alice", "default"}); err != nil {
+			t.Errorf("runTrackerDispatch: %v", err)
+		}
+	})
+	if *method != http.MethodPost || *path != "/v1/tracker/connections/alice/default/dispatch" {
+		t.Errorf("%s %s, want POST /v1/tracker/connections/alice/default/dispatch", *method, *path)
+	}
+	if !strings.Contains(out, "#42") || !strings.Contains(out, "scope:product") || !strings.Contains(out, "run-1") {
+		t.Errorf("output = %q, want the started issue, label and run id", out)
+	}
+	if !strings.Contains(out, "unrouted=1") || !strings.Contains(out, "over-depth=2") {
+		t.Errorf("output = %q, want the skip counts", out)
+	}
+}
+
+// --max-starts (#2270) is sent on the request, and the tick line reports
+// how many eligible issues it left for a later tick.
+func TestTrackerDispatch_MaxStartsPassesThrough(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"leftUndispatched":3}`)
+	}))
+	t.Cleanup(srv.Close)
+	oldServer, oldHTTP, oldToken := serverAddr, httpMode, authToken
+	oldOnce, oldMax := trackerDispatchOnce, trackerDispatchMaxStarts
+	t.Cleanup(func() {
+		serverAddr, httpMode, authToken = oldServer, oldHTTP, oldToken
+		trackerDispatchOnce, trackerDispatchMaxStarts = oldOnce, oldMax
+	})
+	serverAddr, httpMode, authToken = srv.URL, true, "tok"
+	trackerDispatchOnce, trackerDispatchMaxStarts = true, 2
+
+	out := captureStdout(t, func() {
+		if err := runTrackerDispatch(trackerDispatchCmd, []string{"alice", "default"}); err != nil {
+			t.Errorf("runTrackerDispatch: %v", err)
+		}
+	})
+	if !strings.Contains(gotBody, `"maxStarts":2`) {
+		t.Errorf("request body = %s, want maxStarts 2", gotBody)
+	}
+	if !strings.Contains(out, "left-undispatched=3") {
+		t.Errorf("output = %q, want the left-undispatched count", out)
+	}
+}
+
+func TestTrackerDispatch_NegativeMaxStartsRejected(t *testing.T) {
+	oldOnce, oldMax := trackerDispatchOnce, trackerDispatchMaxStarts
+	t.Cleanup(func() { trackerDispatchOnce, trackerDispatchMaxStarts = oldOnce, oldMax })
+	trackerDispatchOnce, trackerDispatchMaxStarts = true, -1
+	err := runTrackerDispatch(trackerDispatchCmd, []string{"alice", "default"})
+	if err == nil || !strings.Contains(err.Error(), "--max-starts") {
+		t.Fatalf("err = %v, want a --max-starts error before any request", err)
+	}
+}
+
+func TestTrackerDispatches_HTTPModeHitsGatewayPath(t *testing.T) {
+	method, path, query := httpModeStub(t, `{"dispatches":[{"id":"d1","issueNumber":"42","scope":"product","skillId":"product-define","runId":"run-1","state":"TRACKER_DISPATCH_STATE_FAILED","failureReason":"run did not start: boom"}]}`)
+	oldState := trackerDispatchesState
+	t.Cleanup(func() { trackerDispatchesState = oldState })
+	trackerDispatchesState = "failed"
+
+	out := captureStdout(t, func() {
+		if err := runTrackerDispatches(trackerDispatchesCmd, []string{"alice", "default"}); err != nil {
+			t.Errorf("runTrackerDispatches: %v", err)
+		}
+	})
+	if *method != http.MethodGet || *path != "/v1/tracker/connections/alice/default/dispatches" || *query != "state=TRACKER_DISPATCH_STATE_FAILED" {
+		t.Errorf("%s %s?%s, want GET .../dispatches?state=TRACKER_DISPATCH_STATE_FAILED", *method, *path, *query)
+	}
+	if !strings.Contains(out, "failed") || !strings.Contains(out, "run did not start: boom") {
+		t.Errorf("output = %q, want the state and failure reason", out)
+	}
+}
+
+// A row whose run still holds lineage reservations (#2062) says how many
+// and since when; a row with none says nothing extra.
+func TestPrintTrackerDispatches_LineageReservations(t *testing.T) {
+	since := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	out := captureStdout(t, func() {
+		printTrackerDispatches("alice", "default", []*pb.TrackerDispatch{
+			{IssueNumber: 7, Scope: "product", SkillId: "product-define", RunId: "run-7",
+				State: pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_RUNNING, LineageReservations: 2,
+				OldestLineageReservationAt: timestamppb.New(since)},
+			{IssueNumber: 8, Scope: "product", SkillId: "product-define", RunId: "run-8",
+				State: pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_RUNNING},
+		})
+	})
+	if !strings.Contains(out, "reserved=2 since 2026-01-02T03:04:05Z") {
+		t.Errorf("output = %q, want run-7's reservations and their age", out)
+	}
+	if strings.Count(out, "reserved=") != 1 {
+		t.Errorf("output = %q, want only run-7 to report reservations", out)
+	}
+}
+
+func TestPrintTrackerDispatches_Empty(t *testing.T) {
+	out := captureStdout(t, func() { printTrackerDispatches("alice", "default", nil) })
+	if !strings.Contains(out, "no dispatches") {
+		t.Errorf("output = %q, want a placeholder", out)
+	}
+}
+
+// A tick's swept rows (#2026) are printed with their cause and run, and
+// counted in the summary line.
+func TestPrintDispatchTick_TimedOut(t *testing.T) {
+	out := captureStdout(t, func() {
+		printDispatchTick(&pb.DispatchTrackerIssuesResponse{TimedOut: []*pb.TrackerDispatch{{
+			IssueNumber: 7, Scope: "product", SkillId: "product-define", RunId: "run-7",
+			State: pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED, Failure: pb.TrackerDispatchFailure_TRACKER_DISPATCH_FAILURE_TIMEOUT,
+			FailureReason: "run exceeded the run timeout of 1h0m0s",
+		}}})
+	})
+	for _, want := range []string{"#7", "scope:product", "run-7", "timeout", "run exceeded the run timeout", "timed_out=1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output = %q, want %q", out, want)
+		}
+	}
+}
