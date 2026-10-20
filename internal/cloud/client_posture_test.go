@@ -138,3 +138,73 @@ func TestReportHostStatus_BackwardCompatibility(t *testing.T) {
 		assertLegacy(t, old)
 	})
 	t.Run("new REST sender to old default gateway", func(t *testing.T) {
+		// Use the gateway's actual default inbound marshaler (unknown JSON
+		// fields are discarded), not a permissive fake JSON decoder.
+		received := make(chan *dynamicpb.Message, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/actuation/status" {
+				t.Errorf("path = %s", r.URL.Path)
+			}
+			if r.Header.Get("Grpc-Metadata-Host-Bearer") != "test-bearer" {
+				t.Error("missing bearer")
+			}
+			inbound, _ := runtime.MarshalerForRequest(runtime.NewServeMux(), r)
+			raw, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			var current cloudv1.ReportHostStatusRequest
+			if err := protojson.Unmarshal(raw, &current); err != nil || !proto.Equal(&current, req) {
+				t.Errorf("REST payload did not preserve new posture: %v, error: %v", &current, err)
+			}
+			old := dynamicpb.NewMessage(md)
+			if err := inbound.NewDecoder(bytes.NewReader(raw)).Decode(old); err != nil {
+				t.Errorf("old gateway rejected additive field: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			received <- old
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, "{}")
+		}))
+		defer srv.Close()
+		transport := newRESTActuation(srv.URL, "test-bearer")
+		defer transport.hc.CloseIdleConnections()
+		if _, err := transport.ReportHostStatus(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case old := <-received:
+			assertLegacy(t, old)
+		default:
+			t.Fatal("old gateway did not decode the report")
+		}
+	})
+	t.Run("old sender to new receiver", func(t *testing.T) {
+		old := dynamicpb.NewMessage(md)
+		old.Set(md.Fields().ByName("agent_version"), protoreflect.ValueOfString("old-agent"))
+		wire, err := proto.Marshal(old)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got cloudv1.ReportHostStatusRequest
+		if err := proto.Unmarshal(wire, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.GetPosture() != nil || got.GetAgentVersion() != "old-agent" {
+			t.Fatalf("old sender must mean unreported: %v", &got)
+		}
+		raw, err := protojson.Marshal(old)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := protojson.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.GetPosture() != nil {
+			t.Fatal("old JSON sender acquired posture")
+		}
+	})
+}
