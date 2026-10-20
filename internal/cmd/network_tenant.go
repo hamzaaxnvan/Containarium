@@ -37,3 +37,17 @@ func runNetworkTenantCapabilities(cmd *cobra.Command) error {
 	}
 	c, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
 	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	out, err := c.GetNetworkTenantCapabilities()
+	if err != nil {
+		return err
+	}
+	raw, err := protojson.MarshalOptions{Indent: "  ", EmitUnpopulated: true}.Marshal(out)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(cmd.OutOrStdout(), string(raw))
+	return nil
+}

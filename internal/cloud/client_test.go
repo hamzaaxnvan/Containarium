@@ -417,3 +417,422 @@ func TestWatchOnceSyncsNetworkPolicies(t *testing.T) {
 	}
 }
 
+func TestReconcileNilDepsIsNoop(t *testing.T) {
+	c := &Client{} // no sink, no actuator
+	c.ctx = context.Background()
+	c.reconcile(&cloudv1.AssignmentBatch{
+		NetworkPolicies: []*cloudv1.NetworkPolicy{{OrgId: "x"}},
+		Assignments:     []*cloudv1.Assignment{{ContainerId: "c", DesiredState: "running"}},
+	}) // must not panic
+}
+
+func TestReconcileAssignment_RunningCreatesAndReports(t *testing.T) {
+	cfg := &Config{ControlPlane: "bufconn", HostID: "h", Token: "h.b"}
+	c, fake := newTestClient(t, cfg)
+	act := &fakeActuator{}
+	c.containers = act
+
+	c.reconcileAssignment(&cloudv1.Assignment{
+		ContainerId:  "11111111-2222-3333-4444-555555555555",
+		OrgId:        "org-9",
+		DesiredState: "running",
+		Image:        "ubuntu:24.04",
+		RamMb:        512,
+	})
+
+	act.mu.Lock()
+	defer act.mu.Unlock()
+	if len(act.running) != 1 {
+		t.Fatalf("expected 1 EnsureRunning, got %d", len(act.running))
+	}
+	got := act.running[0]
+	if got.OrgID != "org-9" || got.Image != "ubuntu:24.04" || got.RAMMB != 512 {
+		t.Errorf("spec not propagated: %+v", got)
+	}
+	if got.LocalName != "cld-111111112222" {
+		t.Errorf("local name = %q, want cld-111111112222", got.LocalName)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.reportedState != "active" || fake.reportedID != "11111111-2222-3333-4444-555555555555" {
+		t.Errorf("report = (%q,%q), want (container-id, active)", fake.reportedID, fake.reportedState)
+	}
+}
+
+func TestReconcileAssignment_DesiredStates(t *testing.T) {
+	cfg := &Config{ControlPlane: "bufconn", HostID: "h", Token: "h.b"}
+	c, _ := newTestClient(t, cfg)
+	act := &fakeActuator{}
+	c.containers = act
+
+	c.reconcileAssignment(&cloudv1.Assignment{ContainerId: "aaaa", DesiredState: "stopped"})
+	c.reconcileAssignment(&cloudv1.Assignment{ContainerId: "bbbb", DesiredState: "deleted"})
+
+	act.mu.Lock()
+	defer act.mu.Unlock()
+	if len(act.stopped) != 1 || act.stopped[0] != "cld-aaaa" {
+		t.Errorf("stopped = %v, want [cld-aaaa]", act.stopped)
+	}
+	if len(act.deleted) != 1 || act.deleted[0] != "cld-bbbb" {
+		t.Errorf("deleted = %v, want [cld-bbbb]", act.deleted)
+	}
+}
+
+func TestLocalContainerName(t *testing.T) {
+	cases := map[string]string{
+		"11111111-2222-3333-4444-555555555555": "cld-111111112222",
+		"short":                                "cld-short",
+		"":                                     "cld-unknown",
+	}
+	for in, want := range cases {
+		if got := localContainerName(in); got != want {
+			t.Errorf("localContainerName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// fakeProbe is a canned StatusProbe for the report-loop test.
+type fakeProbe struct{ st HostStatus }
+
+func (p fakeProbe) Probe(context.Context) (HostStatus, error) { return p.st, nil }
+
+func TestReportStatusOnce_SendsCapabilityWithBearer(t *testing.T) {
+	c, fake := newTestClient(t, &Config{
+		ControlPlane: "bufnet", HostID: "h1", Token: "h1.secret", Insecure: true,
+	})
+	c.status = fakeProbe{st: HostStatus{
+		AgentVersion: "v0.29.0", CPUCores: 8, TotalRAMMB: 32768, AvailRAMMB: 30000,
+		SelfCheckOK: false,
+		Checks:      []HostCheck{{Name: "useradd", OK: false, Detail: "blocked"}},
+	}}
+
+	c.reportStatusOnce()
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.statusReports != 1 {
+		t.Fatalf("want 1 status report, got %d", fake.statusReports)
+	}
+	if fake.statusBearer != "h1.secret" {
+		t.Errorf("status report missing host bearer: got %q", fake.statusBearer)
+	}
+	req := fake.statusReq
+	if req.GetAgentVersion() != "v0.29.0" || req.GetCpuCores() != 8 || req.GetTotalRamMb() != 32768 {
+		t.Errorf("capability fields not mapped: %+v", req)
+	}
+	if req.GetSelfCheckOk() {
+		t.Error("self_check_ok should be false")
+	}
+	if len(req.GetChecks()) != 1 || req.GetChecks()[0].GetName() != "useradd" || req.GetChecks()[0].GetOk() {
+		t.Errorf("self-check breakdown not mapped: %+v", req.GetChecks())
+	}
+}
+
+// TestRefreshDriverTokenOnce_PushesMintedToken covers #557: the refresh loop
+// mints a fresh driver token and pushes it via ReportHostStatus with the host
+// bearer attached, so the cloud can reseal + overwrite the stored credential.
+func TestRefreshDriverTokenOnce_PushesMintedToken(t *testing.T) {
+	c, fake := newTestClient(t, &Config{
+		ControlPlane: "bufnet", HostID: "h1", Token: "h1.secret", Insecure: true,
+	})
+	c.driver = func() (string, error) { return "fresh.minted.jwt", nil }
+
+	c.refreshDriverTokenOnce()
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.statusReports != 1 {
+		t.Fatalf("want 1 status report, got %d", fake.statusReports)
+	}
+	if fake.statusBearer != "h1.secret" {
+		t.Errorf("driver-token refresh missing host bearer: got %q", fake.statusBearer)
+	}
+	if got := fake.statusReq.GetDriverToken(); got != "fresh.minted.jwt" {
+		t.Errorf("driver token not pushed: got %q", got)
+	}
+	if fake.statusReq.GetPosture() != nil {
+		t.Error("token-only update must not fabricate a posture measurement")
+	}
+}
+
+// TestRefreshDriverTokenOnce_MintFailureSkipsPush confirms a mint error is
+// swallowed (logged) and no RPC is sent — the old token stays valid until the
+// next cycle.
+func TestRefreshDriverTokenOnce_MintFailureSkipsPush(t *testing.T) {
+	c, fake := newTestClient(t, &Config{
+		ControlPlane: "bufnet", HostID: "h1", Token: "h1.secret", Insecure: true,
+	})
+	c.driver = func() (string, error) { return "", errMintFailed }
+
+	c.refreshDriverTokenOnce()
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.statusReports != 0 {
+		t.Fatalf("mint failure must not push a status report, got %d", fake.statusReports)
+	}
+}
+
+var errMintFailed = errorString("mint failed")
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }
+
+func TestEnroll_RedeemsTokenAndReturnsHostID(t *testing.T) {
+	// Enroll dials its own connection, so use a real loopback TCP server
+	// (bufconn isn't reachable by grpc.NewClient(addr)).
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := grpc.NewServer()
+	fake := &fakeActuation{}
+	cloudv1.RegisterActuationServiceServer(srv, fake)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	hostID, bearer, err := Enroll(context.Background(), lis.Addr().String(), "host-uuid.secret", true,
+		EnrollOptions{DriverToken: "admin.jwt.tok", OSSBackendID: "tunnel-gpu-1"})
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if hostID != "host-uuid" {
+		t.Errorf("want host id host-uuid, got %q", hostID)
+	}
+	if bearer != "host-uuid.secret" {
+		t.Errorf("want bearer host-uuid.secret, got %q", bearer)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.enrollToken != "host-uuid.secret" {
+		t.Errorf("server saw token %q", fake.enrollToken)
+	}
+	if fake.enrollDriverTok != "admin.jwt.tok" {
+		t.Errorf("server saw driver token %q", fake.enrollDriverTok)
+	}
+	if fake.enrollBackendID != "tunnel-gpu-1" {
+		t.Errorf("server saw backend id %q", fake.enrollBackendID)
+	}
+}
+
+// TestEnroll_ReEnrollRebuildsBearerFromReturnedHostID pins the cloud #572
+// re-enroll case over gRPC (mirrors TestEnrollREST_ReEnroll for the REST
+// transport): the server resolves the join token to an EXISTING host row
+// whose id differs from the token's own embedded (throwaway) id. The
+// persisted bearer must be rebuilt from the RETURNED id, or every subsequent
+// heartbeat 401s forever.
+func TestEnroll_ReEnrollRebuildsBearerFromReturnedHostID(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := grpc.NewServer()
+	fake := &fakeActuation{enrollHostIDOverride: "existing-host-999"}
+	cloudv1.RegisterActuationServiceServer(srv, fake)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	hostID, bearer, err := Enroll(context.Background(), lis.Addr().String(), "throwaway-host-123.secret", true, EnrollOptions{})
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if hostID != "existing-host-999" {
+		t.Errorf("want host id existing-host-999, got %q", hostID)
+	}
+	if bearer != "existing-host-999.secret" {
+		t.Errorf("want bearer rebuilt from the returned id (existing-host-999.secret), got %q", bearer)
+	}
+}
+
+func TestDefaultStatusProbe_ReportsVersionAndCPU(t *testing.T) {
+	st, err := DefaultStatusProbe{}.Probe(context.Background())
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if st.AgentVersion == "" {
+		t.Error("agent version should be set")
+	}
+	if st.CPUCores <= 0 {
+		t.Errorf("cpu cores should be positive, got %d", st.CPUCores)
+	}
+	// SelfCheckOK / Checks are environment-dependent (root + useradd needed to
+	// pass), so we don't assert their values — only that the self-check ran and
+	// populated the breakdown on this (non-windows) platform.
+	if len(st.Checks) == 0 {
+		t.Error("doctor self-check should populate at least one check on non-windows")
+	}
+}
+
+// fakeTerminator records the users whose sessions the reconciler ended.
+type fakeTerminator struct {
+	mu    sync.Mutex
+	users []string
+	orgs  []string // org passed with each call, parallel to users
+	err   error
+}
+
+func (f *fakeTerminator) TerminateUserSessions(_ context.Context, userID, orgID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.users = append(f.users, userID)
+	f.orgs = append(f.orgs, orgID)
+	return f.err
+}
+
+func (f *fakeTerminator) calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.users...)
+}
+
+// A TERMINATE_USER_SESSIONS assignment reaches the session terminator, never
+// the container actuator, and a replay of the same assignment_id is a no-op
+// (#2522): WatchAssignments resends the full snapshot on every batch.
+func TestReconcileAssignment_TerminateUserSessionsIdempotent(t *testing.T) {
+	cfg := &Config{ControlPlane: "bufconn", HostID: "h", Token: "h.b"}
+	c, fake := newTestClient(t, cfg)
+	act := &fakeActuator{}
+	term := &fakeTerminator{}
+	c.containers, c.sessions = act, term
+
+	batch := &cloudv1.AssignmentBatch{Assignments: []*cloudv1.Assignment{{
+		AssignmentId: "as-1",
+		Kind:         cloudv1.AssignmentKind_ASSIGNMENT_KIND_TERMINATE_USER_SESSIONS,
+		UserId:       "alice",
+	}}}
+	c.reconcile(batch)
+	c.reconcile(batch) // replay: same assignment_id
+
+	if got := term.calls(); len(got) != 1 || got[0] != "alice" {
+		t.Fatalf("terminator calls = %v, want exactly [alice]", got)
+	}
+	if term.orgs[0] != "" {
+		t.Errorf("org on an unscoped order = %q, want empty", term.orgs[0])
+	}
+	act.mu.Lock()
+	if len(act.running)+len(act.stopped)+len(act.deleted) != 0 {
+		t.Errorf("terminate assignment reached the container actuator: %+v", act)
+	}
+	act.mu.Unlock()
+	fake.mu.Lock()
+	if fake.reportedID != "" {
+		t.Errorf("terminate assignment reported container state for %q", fake.reportedID)
+	}
+	fake.mu.Unlock()
+
+	// A new assignment for the same user is a new request and runs.
+	c.reconcile(&cloudv1.AssignmentBatch{Assignments: []*cloudv1.Assignment{{
+		AssignmentId: "as-2",
+		Kind:         cloudv1.AssignmentKind_ASSIGNMENT_KIND_TERMINATE_USER_SESSIONS,
+		UserId:       "alice",
+	}}})
+	if got := term.calls(); len(got) != 2 {
+		t.Errorf("a new assignment_id should run again: %v", got)
+	}
+}
+
+// A failed termination is not recorded as done, so the next delivery retries.
+func TestReconcileAssignment_TerminateFailureRetries(t *testing.T) {
+	c := &Client{ctx: context.Background()}
+	term := &fakeTerminator{err: errors.New("db down")}
+	c.sessions = term
+	a := &cloudv1.Assignment{
+		AssignmentId: "as-1",
+		Kind:         cloudv1.AssignmentKind_ASSIGNMENT_KIND_TERMINATE_USER_SESSIONS,
+		UserId:       "alice",
+	}
+	c.reconcileAssignment(a)
+	term.mu.Lock()
+	term.err = nil
+	term.mu.Unlock()
+	c.reconcileAssignment(a)
+	c.reconcileAssignment(a)
+	if got := term.calls(); len(got) != 2 {
+		t.Errorf("calls = %v, want a retry after the failure and then nothing", got)
+	}
+}
+
+// Without a terminator (or without a user) nothing runs and nothing panics.
+func TestReconcileAssignment_TerminateWithoutDeps(t *testing.T) {
+	c := &Client{ctx: context.Background()}
+	c.reconcile(&cloudv1.AssignmentBatch{Assignments: []*cloudv1.Assignment{{
+		AssignmentId: "as-1", Kind: cloudv1.AssignmentKind_ASSIGNMENT_KIND_TERMINATE_USER_SESSIONS, UserId: "alice",
+	}}})
+	term := &fakeTerminator{}
+	c.sessions = term
+	c.reconcileAssignment(&cloudv1.Assignment{
+		AssignmentId: "as-2", Kind: cloudv1.AssignmentKind_ASSIGNMENT_KIND_TERMINATE_USER_SESSIONS,
+	})
+	if got := term.calls(); len(got) != 0 {
+		t.Errorf("an assignment without user_id ran: %v", got)
+	}
+}
+
+// An id the host cannot map to a local login (#2602) is logged at warn with
+// the assignment id and reported as its own outcome, distinct from a walk
+// that found no live sessions. Redelivery of either is a no-op.
+func TestReconcileTermination_UnmappedIsDistinctFromZeroSessions(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	assignment := func(id, user string) *cloudv1.Assignment {
+		return &cloudv1.Assignment{AssignmentId: id, Kind: cloudv1.AssignmentKind_ASSIGNMENT_KIND_TERMINATE_USER_SESSIONS, UserId: user}
+	}
+
+	unmapped := &fakeTerminator{err: fmt.Errorf("%w: cp-user-9", ErrUserNotMapped)}
+	c := &Client{ctx: context.Background(), sessions: unmapped}
+	if got := c.reconcileTermination(assignment("as-unmapped", "cp-user-9")); got != terminationUnmapped {
+		t.Errorf("unmapped outcome = %v, want %v", got, terminationUnmapped)
+	}
+	line := buf.String()
+	if !strings.Contains(line, "WARN") || !strings.Contains(line, "as-unmapped") || !strings.Contains(line, "cp-user-9") {
+		t.Errorf("log = %q, want a warning naming the assignment and user", line)
+	}
+	if got := c.reconcileTermination(assignment("as-unmapped", "cp-user-9")); got != terminationReplayed {
+		t.Errorf("redelivered unmapped outcome = %v, want %v", got, terminationReplayed)
+	}
+	if n := len(unmapped.calls()); n != 1 {
+		t.Errorf("terminator calls = %d, want 1 (redelivery is a no-op)", n)
+	}
+
+	buf.Reset()
+	zero := &fakeTerminator{} // mapped, but the walk ended nothing
+	c = &Client{ctx: context.Background(), sessions: zero}
+	if got := c.reconcileTermination(assignment("as-zero", "alice")); got != terminationEnded {
+		t.Errorf("zero-session outcome = %v, want %v", got, terminationEnded)
+	}
+	if strings.Contains(buf.String(), "WARN") {
+		t.Errorf("a successful walk logged a warning: %q", buf.String())
+	}
+	if got := c.reconcileTermination(assignment("as-zero", "alice")); got != terminationReplayed {
+		t.Errorf("redelivered outcome = %v, want %v", got, terminationReplayed)
+	}
+	if n := len(zero.calls()); n != 1 {
+		t.Errorf("terminator calls = %d, want 1", n)
+	}
+
+	failing := &fakeTerminator{err: errors.New("db down")}
+	c = &Client{ctx: context.Background(), sessions: failing}
+	if got := c.reconcileTermination(assignment("as-fail", "alice")); got != terminationFailed {
+		t.Errorf("failure outcome = %v, want %v", got, terminationFailed)
+	}
+}
+
+// #2546: the assignment's org_id reaches the terminator.
+func TestReconcileAssignment_TerminateUserSessionsCarriesOrg(t *testing.T) {
+	cfg := &Config{ControlPlane: "bufconn", HostID: "h", Token: "h.b"}
+	c, _ := newTestClient(t, cfg)
+	term := &fakeTerminator{}
+	c.containers, c.sessions = &fakeActuator{}, term
+	c.reconcile(&cloudv1.AssignmentBatch{Assignments: []*cloudv1.Assignment{{
+		AssignmentId: "as-org",
+		Kind:         cloudv1.AssignmentKind_ASSIGNMENT_KIND_TERMINATE_USER_SESSIONS,
+		UserId:       "alice",
+		OrgId:        "org-a",
+	}}})
+	if got := term.calls(); len(got) != 1 || term.orgs[0] != "org-a" {
+		t.Fatalf("calls = %v orgs = %v, want one call scoped to org-a", got, term.orgs)
+	}
+}
