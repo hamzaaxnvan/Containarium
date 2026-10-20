@@ -95,3 +95,149 @@ func (n *WebhookNotifier) SetRenotifyInterval(d time.Duration) {
 // first Notify.
 func (n *WebhookNotifier) Start(ctx context.Context) {
 	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case f := <-n.queue:
+				n.deliver(ctx, f)
+			}
+		}
+	}()
+}
+
+// Notify enqueues f for delivery when its severity is MEDIUM or above and
+// the gate lets it through: first sight, severity escalation, a response
+// state change (#2718), the re-notify interval elapsing, or resolution
+// (#2643); a repeat write to an open finding inside the interval is not
+// delivered again.
+// Non-blocking: if the queue is full the finding is dropped (and logged)
+// rather than backing up the caller; a dropped finding is not marked
+// delivered, so its next write retries.
+func (n *WebhookNotifier) Notify(f *Finding) {
+	if f == nil || f.Severity < pb.ThreatSeverity_THREAT_SEVERITY_MEDIUM {
+		return
+	}
+	if !n.gate.shouldDeliver(f) {
+		return
+	}
+	select {
+	case n.queue <- f:
+		n.gate.delivered(f)
+	default:
+		log.Printf("threatdetect: webhook notify queue full (cap %d), dropping finding %d (rule=%s tenant=%s)",
+			notifierQueueCap, f.ID, f.Rule, f.TenantID)
+	}
+}
+
+func (n *WebhookNotifier) deliver(ctx context.Context, f *Finding) {
+	url, err := n.config.Get(ctx, webhookURLConfigKey)
+	if err != nil || url == "" {
+		return // nothing configured — not an error, just nothing to do
+	}
+	secret, _ := n.config.Get(ctx, webhookSecretConfigKey) // optional: unsigned if absent
+
+	body, merr := json.Marshal(f.ToProto())
+	if merr != nil {
+		log.Printf("threatdetect: marshal finding %d for webhook: %v", f.ID, merr)
+		return
+	}
+
+	var lastErr error
+	var lastStatus int
+	start := time.Now()
+	for attempt := 0; attempt < notifierMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff(attempt)):
+			}
+		}
+		status, derr := n.postOnce(ctx, url, secret, body)
+		lastStatus, lastErr = status, derr
+		if derr == nil {
+			break
+		}
+	}
+
+	n.record(ctx, f, url, lastErr == nil, lastStatus, lastErr, len(body), time.Since(start))
+}
+
+func (n *WebhookNotifier) postOnce(ctx context.Context, url, secret string, body []byte) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if secret != "" {
+		req.Header.Set("X-Containarium-Signature", signPayload(body, secret))
+	}
+	resp, err := n.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp.StatusCode, fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
+	}
+	return resp.StatusCode, nil
+}
+
+func (n *WebhookNotifier) record(ctx context.Context, f *Finding, url string, success bool, httpStatus int, deliverErr error, payloadSize int, dur time.Duration) {
+	errMsg := ""
+	if deliverErr != nil {
+		errMsg = deliverErr.Error()
+		log.Printf("threatdetect: webhook delivery failed for finding %d (rule=%s tenant=%s): %v", f.ID, f.Rule, f.TenantID, deliverErr)
+	}
+	if n.delivery == nil {
+		return
+	}
+	if err := n.delivery.Record(ctx, &alert.WebhookDelivery{
+		AlertName:    f.Rule.String(),
+		Source:       "threatdetect",
+		WebhookURL:   maskWebhookURL(url),
+		Success:      success,
+		HTTPStatus:   httpStatus,
+		ErrorMessage: errMsg,
+		PayloadSize:  payloadSize,
+		DurationMs:   int(dur.Milliseconds()),
+	}); err != nil {
+		log.Printf("threatdetect: record webhook delivery for finding %d: %v", f.ID, err)
+	}
+}
+
+// signPayload computes HMAC-SHA256 of payload using secret, in the same
+// "sha256=<hex>" format internal/server/alert_server.go's signPayload uses,
+// so an operator's existing signature-verification code works unmodified
+// regardless of which path delivered the payload.
+func signPayload(payload []byte, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// backoff is attempt-indexed linear backoff (attempt 1 -> 500ms, attempt 2
+// -> 1s, ...) — simple and sufficient for a 3-attempt budget; no need for
+// jittered exponential at this scale.
+func backoff(attempt int) time.Duration {
+	return time.Duration(attempt) * 500 * time.Millisecond
+}
+
+// maskWebhookURL mirrors alert_server.go's maskURL: show scheme+host, mask
+// the path (which may embed a secret token). Reimplemented locally rather
+// than imported — package server imports threatdetect, not the reverse.
+func maskWebhookURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	parts := strings.SplitN(rawURL, "//", 2)
+	if len(parts) < 2 {
+		return "***"
+	}
+	hostPart := parts[1]
+	if idx := strings.Index(hostPart, "/"); idx > 0 {
+		return parts[0] + "//" + hostPart[:idx] + "/***"
+	}
+	return rawURL
+}

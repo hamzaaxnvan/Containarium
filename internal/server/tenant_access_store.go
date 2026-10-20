@@ -91,3 +91,97 @@ func applyAccess(old *pb.NetworkPolicy, c *pb.TenantAccessChange) (*pb.NetworkPo
 		delete(allowed, src)
 	}
 	for _, src := range c.AddSources {
+		allowed[src] = true
+	}
+	next.AllowFromTenants = nil
+	for src := range allowed {
+		next.AllowFromTenants = append(next.AllowFromTenants, src)
+	}
+	sort.Strings(next.AllowFromTenants)
+	return next, nil
+}
+
+func (s *MemNetworkPolicyStore) PatchTenantAccess(_ context.Context, changes []*pb.TenantAccessChange) ([]*pb.TenantAccessPolicy, error) {
+	if err := validateAccessChanges(changes); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Sorted application order matches the Postgres store's lock order, so both
+	// backends return policies in the same sequence for the same request.
+	ordered := append([]*pb.TenantAccessChange(nil), changes...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Destination < ordered[j].Destination })
+	next := map[string]*pb.NetworkPolicy{}
+	out := make([]*pb.TenantAccessPolicy, 0, len(ordered))
+	for _, c := range ordered {
+		p, err := applyAccess(s.m[c.Destination], c)
+		if err != nil {
+			return nil, err
+		}
+		next[c.Destination] = p
+		out = append(out, &pb.TenantAccessPolicy{Policy: proto.Clone(p).(*pb.NetworkPolicy), Revision: PolicyRevision(p)})
+	}
+	for key, p := range next {
+		s.m[key] = p
+	}
+	return out, nil
+}
+
+func (s *PostgresNetworkPolicyStore) PatchTenantAccess(ctx context.Context, changes []*pb.TenantAccessChange) ([]*pb.TenantAccessPolicy, error) {
+	if err := validateAccessChanges(changes); err != nil {
+		return nil, err
+	}
+	// Consistent lock order avoids A/B vs B/A deadlocks. No caller input mutation.
+	changes = append([]*pb.TenantAccessChange(nil), changes...)
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Destination < changes[j].Destination })
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	out := []*pb.TenantAccessPolicy{}
+	for _, c := range changes {
+		tag, err := tx.Exec(ctx, `INSERT INTO network_policies (tenant) VALUES ($1) ON CONFLICT (tenant) DO NOTHING`, c.Destination)
+		if err != nil {
+			return nil, err
+		}
+		inserted := tag.RowsAffected() == 1
+		p := &pb.NetworkPolicy{Tenant: c.Destination}
+		var mode, preset, egressMode int32
+		var deny []byte
+		err = tx.QueryRow(ctx, `SELECT allow_intra_tenant,egress_cidrs,egress_domains,mode,allow_metadata,source,deny_rules,allow_from_tenants,egress_preset,egress_mode FROM network_policies WHERE tenant=$1 FOR UPDATE`, c.Destination).Scan(&p.AllowIntraTenant, &p.EgressCidrs, &p.EgressDomains, &mode, &p.AllowMetadata, &p.Source, &deny, &p.AllowFromTenants, &preset, &egressMode)
+		if err != nil {
+			return nil, err
+		}
+		p.Mode = pb.NetworkPolicyMode(mode)
+		p.EgressPreset = pb.EgressPreset(preset)
+		p.EgressMode = pb.NetworkPolicyMode(egressMode)
+		p.DenyRules, err = decodeDenyRules(deny)
+		if err != nil {
+			return nil, err
+		}
+		if inserted {
+			p = nil
+		}
+		next, err := applyAccess(p, c)
+		if err != nil {
+			return nil, err
+		}
+		// Only ingress sources change. Default mode for an absent record is already
+		// unspecified/log-only; do not UPDATE any egress, mode, metadata or deny field.
+		if inserted {
+			next.Mode = pb.NetworkPolicyMode_NETWORK_POLICY_MODE_UNSPECIFIED
+		}
+		if _, err = tx.Exec(ctx, `UPDATE network_policies SET allow_from_tenants=$2,updated_at=NOW() WHERE tenant=$1`, c.Destination, nonNilStrings(next.AllowFromTenants)); err != nil {
+			return nil, err
+		}
+		out = append(out, &pb.TenantAccessPolicy{Policy: next, Revision: PolicyRevision(next)})
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+var _ TenantAccessStore = (*MemNetworkPolicyStore)(nil)
+var _ TenantAccessStore = (*PostgresNetworkPolicyStore)(nil)
