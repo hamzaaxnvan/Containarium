@@ -37,3 +37,81 @@ func TestBuildWorkspaceSeedScript(t *testing.T) {
 	}
 	want := workspaceSeed{
 		Path:      "/workspace/runs/run-git-1",
+		GitSource: "https://github.com/octocat/Spoon-Knife",
+		GitRef:    "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9",
+		GitCommit: "d0dd1f61b33d64e29d8bc1372a94ef6a2fee76a9",
+	}
+	if got != want {
+		t.Errorf("workspace.json decoded to %+v, want %+v", got, want)
+	}
+}
+
+// TestBuildWorkspaceSeedScriptTellsAgentWhereCheckoutIs pins #2512: until the
+// runtime binds to workspace.json, the checkout path must reach the agent
+// through its system prompt, appended (never replacing the skill's prompt) and
+// quote-safe.
+func TestBuildWorkspaceSeedScriptTellsAgentWhereCheckoutIs(t *testing.T) {
+	seedDir := seedDirFor("run-1")
+	script := buildWorkspaceSeedScript(seedDir, workspaceSeed{
+		Path:      workspaceDirFor("run-1"),
+		GitSource: "https://example.com/it's/repo",
+		GitCommit: "deadbeef",
+	})
+	if !strings.Contains(script, ">> "+seedDir+"/system_prompt.txt") {
+		t.Fatalf("script does not append to the system prompt:\n%s", script)
+	}
+	if strings.Contains(script, "> "+seedDir+"/system_prompt.txt") && !strings.Contains(script, ">> "+seedDir+"/system_prompt.txt") {
+		t.Errorf("script overwrites the system prompt:\n%s", script)
+	}
+	for _, want := range []string{"/workspace/runs/run-1", "deadbeef"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("prompt note missing %q:\n%s", want, script)
+		}
+	}
+	if got := buildWorkspaceSeedScript(seedDir, workspaceSeed{}); strings.Contains(got, "system_prompt.txt") {
+		t.Errorf("no checkout, but the prompt was touched:\n%s", got)
+	}
+}
+
+// TestBuildWorkspaceSeedScriptEscapesSingleQuotes proves a git_source/ref
+// carrying a single quote can't break out of the printf argument's shell
+// quoting — same defect class buildAgentSeedScript already guards
+// (TestBuildAgentSeedScriptEscapesSingleQuotes), reapplied here because this
+// script's caller-controlled fields (git_source, git_ref) are a repo URL and a
+// ref string a caller chose, not a system prompt this repo authored.
+func TestBuildWorkspaceSeedScriptEscapesSingleQuotes(t *testing.T) {
+	script := buildWorkspaceSeedScript(seedDirFor("run-1"), workspaceSeed{
+		Path:      "/workspace/runs/run-1",
+		GitSource: "https://github.com/org/it's-a-repo",
+		GitRef:    "main",
+		GitCommit: "deadbeef",
+	})
+	payload := extractSingleQuotedPrintfArg(t, script)
+	var got workspaceSeed
+	if err := json.Unmarshal([]byte(payload), &got); err != nil {
+		t.Fatalf("escaped payload failed to decode as JSON: %v\nscript:\n%s", err, script)
+	}
+	if got.GitSource != "https://github.com/org/it's-a-repo" {
+		t.Errorf("GitSource round-tripped as %q, want the original unescaped value", got.GitSource)
+	}
+}
+
+// extractSingleQuotedPrintfArg pulls the single-quoted argument out of the
+// script's `printf '%s' '<payload>' > .../workspace.json` line and undoes
+// shell single-quote escaping, so the test can assert on the JSON it
+// actually decodes to rather than string-matching the shell-quoted form.
+func extractSingleQuotedPrintfArg(t *testing.T, script string) string {
+	t.Helper()
+	const marker = "printf '%s' '"
+	i := strings.Index(script, marker)
+	if i < 0 {
+		t.Fatalf("script does not contain a printf '%%s' '...' line:\n%s", script)
+	}
+	rest := script[i+len(marker):]
+	end := strings.Index(rest, "' >")
+	if end < 0 {
+		t.Fatalf("could not find the closing quote of the printf argument:\n%s", script)
+	}
+	// Undo shellSingleQuote's escaping: `'\''` -> `'`.
+	return strings.ReplaceAll(rest[:end], `'\''`, "'")
+}
