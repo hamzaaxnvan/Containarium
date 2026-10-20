@@ -66,3 +66,37 @@ func TestGuardrailBaselineSetCLI_SendsTypedMode(t *testing.T) {
 				t.Fatalf("sent %v, want [%v]", f.got, tc.want)
 			}
 			if !strings.Contains(out, tc.out) {
+				t.Fatalf("output %q missing %q", out, tc.out)
+			}
+		})
+	}
+}
+
+// TestGuardrailBaselineSetCLI_Refusals: a missing or unknown mode never
+// reaches the daemon; a daemon refusal (non-admin) is a command error.
+func TestGuardrailBaselineSetCLI_Refusals(t *testing.T) {
+	for _, args := range [][]string{nil, {"--mode", "warn"}, {"--mode", ""}, {"--mode", "unspecified"}} {
+		f := &fakeGuardrailBaselineAPI{}
+		withFakeGuardrailBaselineAPI(t, f)
+		if out, err := runGuardrailBaselineSetCLI(t, args...); err == nil {
+			t.Fatalf("baseline set %v succeeded (%s), want an error", args, out)
+		}
+		if len(f.got) != 0 {
+			t.Fatalf("baseline set %v reached the daemon with %v", args, f.got)
+		}
+	}
+
+	denied := &fakeGuardrailBaselineAPI{err: errors.New("set guardrail baseline mode: rpc error: code = PermissionDenied")}
+	withFakeGuardrailBaselineAPI(t, denied)
+	out, err := runGuardrailBaselineSetCLI(t, "--mode", "block")
+	if err == nil || strings.Contains(out, "Baseline mode set") {
+		t.Fatalf("non-admin set = (%q, %v), want an error and no success line", out, err)
+	}
+}
+
+// TestGuardrailBaselineSetCLI_NeedsServer: without --server it fails.
+func TestGuardrailBaselineSetCLI_NeedsServer(t *testing.T) {
+	if _, err := runGuardrailBaselineSetCLI(t, "--mode", "block"); !errors.Is(err, errNoGuardrailServer) {
+		t.Fatalf("baseline set without --server = %v, want errNoGuardrailServer", err)
+	}
+}
