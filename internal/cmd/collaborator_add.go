@@ -73,3 +73,79 @@ func runCollaboratorAdd(cmd *cobra.Command, args []string) error {
 	for _, keyFile := range collaboratorSSHKeyFiles {
 		sshKeyBytes, err := os.ReadFile(keyFile)
 		if err != nil {
+			return fmt.Errorf("failed to read SSH key file %q: %w", keyFile, err)
+		}
+		sshPublicKey := strings.TrimSpace(string(sshKeyBytes))
+		if sshPublicKey == "" {
+			return fmt.Errorf("SSH key file %q is empty", keyFile)
+		}
+		validKey := false
+		for _, prefix := range validSSHKeyPrefixes {
+			if strings.HasPrefix(sshPublicKey, prefix) {
+				validKey = true
+				break
+			}
+		}
+		if !validKey {
+			return fmt.Errorf("invalid SSH public key format in %q", keyFile)
+		}
+		sshPublicKeys = append(sshPublicKeys, sshPublicKey)
+	}
+
+	switch {
+	case httpMode && serverAddr != "":
+		return addCollaboratorRemoteHTTP(ownerUsername, collaboratorUsername, sshPublicKeys)
+	case serverAddr != "":
+		return addCollaboratorRemote(ownerUsername, collaboratorUsername, sshPublicKeys)
+	default:
+		return addCollaboratorLocal(ownerUsername, collaboratorUsername, sshPublicKeys)
+	}
+}
+
+func addCollaboratorRemote(ownerUsername, collaboratorUsername string, sshPublicKeys []string) error {
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return fmt.Errorf("failed to connect to remote server: %w", err)
+	}
+	defer func() { _ = grpcClient.Close() }()
+
+	resp, err := grpcClient.AddCollaborator(ownerUsername, collaboratorUsername, sshPublicKeys, collaboratorGrantSudo, collaboratorGrantRuntime)
+	if err != nil {
+		return fmt.Errorf("failed to add collaborator: %w", err)
+	}
+	printAddCollaboratorResponse(resp)
+	return nil
+}
+
+func addCollaboratorRemoteHTTP(ownerUsername, collaboratorUsername string, sshPublicKeys []string) error {
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP client: %w", err)
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	resp, err := httpClient.AddCollaborator(ownerUsername, collaboratorUsername, sshPublicKeys, collaboratorGrantSudo, collaboratorGrantRuntime)
+	if err != nil {
+		return fmt.Errorf("failed to add collaborator: %w", err)
+	}
+	printAddCollaboratorResponse(resp)
+	return nil
+}
+
+func printAddCollaboratorResponse(resp *pb.AddCollaboratorResponse) {
+	collab := resp.GetCollaborator()
+	fmt.Printf("Collaborator %s added to %s\n\n", collab.GetCollaboratorUsername(), collab.GetContainerName())
+	fmt.Printf("Account name: %s\n", collab.GetAccountName())
+	if resp.GetSshCommand() != "" {
+		fmt.Printf("SSH command:  %s\n\n", resp.GetSshCommand())
+	}
+	if collab.GetHasSudo() {
+		fmt.Printf("Sudo access:  full (ALL commands)\n")
+	} else {
+		fmt.Printf("After connecting, use: sudo su - %s\n", collab.GetOwnerUsername())
+	}
+	if collab.GetHasContainerRuntime() {
+		fmt.Printf("Container runtime: docker/podman group membership granted\n")
+	}
+	fmt.Printf("Sessions are logged to: /var/log/sudo-io/%s/\n", collab.GetAccountName())
+}
