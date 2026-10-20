@@ -42,3 +42,47 @@ command -v multipass >/dev/null || die "multipass not installed — 'brew instal
 case "${1:-}" in
   --down)
     multipass delete --purge "$VM" 2>/dev/null && echo "deleted $VM" || echo "$VM not present"
+    exit 0
+    ;;
+  --shell)
+    DO_SHELL=1 ;;
+  --run)
+    DO_RUN=1 ;;
+  "" ) ;;
+  *) die "unknown arg: $1 (use --run | --shell | --down)" ;;
+esac
+
+# Launch (or reuse) the VM.
+if multipass info "$VM" >/dev/null 2>&1; then
+  echo "VM '$VM' already exists — reusing. (./multipass-up.sh --down to recreate)"
+else
+  echo "launching '$VM' ($IMAGE, ${CPUS}cpu/${MEM}/${DISK}) ..."
+  multipass launch "$IMAGE" --name "$VM" --cpus "$CPUS" --memory "$MEM" --disk "$DISK" --cloud-init "$CLOUD_INIT"
+fi
+
+# Copy the harness in (fresh each run, so edits propagate).
+multipass transfer "$HARNESS" "$VM:$GUEST_HARNESS"
+multipass exec "$VM" -- chmod +x "$GUEST_HARNESS"
+
+RUN_CMD="multipass exec $VM -- sudo $GUEST_HARNESS"
+
+if [ "${DO_RUN:-}" = 1 ]; then
+  echo "running harness in '$VM' ..."; echo
+  exec $RUN_CMD
+fi
+if [ "${DO_SHELL:-}" = 1 ]; then
+  exec multipass shell "$VM"
+fi
+
+cat <<EOF
+
+VM '$VM' ready, harness copied to $GUEST_HARNESS.
+
+  Run the harness:   $RUN_CMD
+  (or)               ./multipass-up.sh --run
+  Shell in:          multipass shell $VM
+  Tear down:         ./multipass-up.sh --down
+
+To test production's exact sshpiperd, install it in the VM and run with
+SSHPIPERD_BIN / SSHPIPERD_LAUNCH set — see the harness header.
+EOF
