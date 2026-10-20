@@ -44,3 +44,34 @@ func TestStartBoxRun_MissingManagedToolchain(t *testing.T) {
 					case script == signInProbeScript(t):
 						return "interactive\n", nil
 					case strings.Contains(script, "setsid"):
+						spawned = true
+						return "4242 boot-1\n", nil
+					}
+					return "", nil
+				},
+			}
+			if tc.mount != "absent" {
+				s.boxRunEnsureToolchain = func(username string) error {
+					if username != "alice" || spawned {
+						t.Fatal("must attach this box before spawning")
+					}
+					if tc.mount == "broken" {
+						return errors.New("mount is not read-only")
+					}
+					return nil
+				}
+			}
+			_, err := s.StartBoxRun(adminCtx(), &pb.StartBoxRunRequest{Username: "alice", Prompt: "build"})
+			if tc.refused {
+				if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "/opt/containarium/toolchains") {
+					t.Fatalf("missing mount: got %v, want FailedPrecondition naming mount", err)
+				}
+				if spawned {
+					t.Fatal("run spawned without the toolchain mount")
+				}
+			} else if err != nil || !spawned {
+				t.Fatalf("%s/%s should run: spawned=%v err=%v", tc.level, tc.mount, spawned, err)
+			}
+		})
+	}
+}
