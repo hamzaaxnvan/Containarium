@@ -340,3 +340,118 @@ func RequireRole(ctx context.Context, role string) error {
 	}
 	return nil
 }
+
+// RequireRoleOrScope passes if the caller holds the role OR explicitly holds
+// the scope. It's for read paths an admin reaches by role and a
+// least-privilege token reaches by an explicit read scope (#621). Uses
+// HasExplicitScope, not HasScope — an absent scopes claim must NOT unlock an
+// otherwise admin-only read.
+func RequireRoleOrScope(ctx context.Context, role, scope string) error {
+	_, roles, ok := SubjectFromGRPCContext(ctx)
+	if !ok {
+		return status.Error(codes.Unauthenticated, "no authenticated subject in request context")
+	}
+	if HasRole(roles, role) {
+		return nil
+	}
+	if scopes, _ := ScopesFromGRPCContext(ctx); HasExplicitScope(scopes, scope) {
+		return nil
+	}
+	return status.Errorf(codes.PermissionDenied, "requires role %q or scope %q", role, scope)
+}
+
+// RequireScope returns nil if the authenticated subject's JWT
+// carries the required scope (or no scopes claim at all, which
+// is the Phase 1.7 backwards-compat "unrestricted" path — unless
+// strict mode is armed, see below). Returns Unauthenticated when
+// no subject is in context and PermissionDenied when scopes are
+// explicitly granted but the required one is missing.
+//
+// Use at the top of handlers AFTER the existing role check, not
+// instead of it. Roles and scopes are orthogonal: roles answer
+// "who is this caller?", scopes answer "what was this specific
+// token authorized to do?". Both must pass.
+//
+// Phase 1.7b — pairs with the MCP-side filter landed in PR #250.
+// The MCP filter catches agent abuse before the network call;
+// this catches REST/gRPC callers who bypass MCP entirely.
+//
+// #1679 — every call whose token carries no scopes claim is
+// recorded (see UnscopedTokenCalls), regardless of mode, so an
+// operator can measure the unscoped population before opting in.
+// When StrictScopesEnabled(), such a call is rejected outright
+// instead of falling through to the backwards-compat unrestricted
+// path; IsStrictScopesDenial distinguishes that rejection from an
+// ordinary insufficient-scope denial.
+func RequireScope(ctx context.Context, required string) error {
+	if _, _, ok := SubjectFromGRPCContext(ctx); !ok {
+		return status.Error(codes.Unauthenticated, "no authenticated subject in request context")
+	}
+	scopes, present := ScopesFromGRPCContext(ctx)
+	if !present {
+		recordUnscopedCall()
+		if StrictScopesEnabled() {
+			return status.Errorf(codes.PermissionDenied, "%s (scope required: %s) — mint a token with --scopes", strictScopesDenialPrefix, required)
+		}
+	}
+	if HasScope(scopes, required) {
+		return nil
+	}
+	return status.Error(codes.PermissionDenied, "scope required: "+required)
+}
+
+// RequireExplicitScope is RequireScope without the backwards-compat
+// "no scopes claim = unrestricted" fall-through (#2415). It exists for
+// write paths whose authority must never be inherited from a pre-scope
+// admin token: a token with NO scopes claim is denied whether or not
+// strict-scope mode is on, exactly as a token with the wrong scopes is.
+// The wildcard scope still passes, as everywhere else. Use it for the
+// audit-ingest RPC; keep RequireScope for the surfaces whose unscoped
+// population #1679 is still measuring.
+func RequireExplicitScope(ctx context.Context, required string) error {
+	if _, _, ok := SubjectFromGRPCContext(ctx); !ok {
+		return status.Error(codes.Unauthenticated, "no authenticated subject in request context")
+	}
+	scopes, present := ScopesFromGRPCContext(ctx)
+	if !present {
+		recordUnscopedCall()
+	}
+	if HasExplicitScope(scopes, required) {
+		return nil
+	}
+	return status.Error(codes.PermissionDenied, "scope required: "+required)
+}
+
+// AuthorizeTenant returns nil if the authenticated subject is
+// allowed to act on `requestedUsername` — either because they are
+// that user, or because they hold the admin role. Returns a
+// PermissionDenied gRPC status otherwise, and Unauthenticated if
+// no subject is in context at all.
+//
+// Call at the top of every gRPC handler that takes a username from
+// the request body. Without this check, a token issued to tenant A
+// can act on tenant B's resources (CWE-639 IDOR).
+func AuthorizeTenant(ctx context.Context, requestedUsername string) error {
+	subject, roles, ok := SubjectFromGRPCContext(ctx)
+	if !ok {
+		return status.Error(codes.Unauthenticated, "no authenticated subject in request context")
+	}
+	if HasRole(roles, RoleAdmin) {
+		return nil
+	}
+	if subject != requestedUsername {
+		return status.Error(codes.PermissionDenied, "not authorized for this tenant")
+	}
+	return nil
+}
+
+func splitRoles(s string) []string {
+	parts := strings.Split(s, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
