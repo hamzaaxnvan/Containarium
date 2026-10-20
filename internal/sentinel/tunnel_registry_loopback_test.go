@@ -35,3 +35,28 @@ func TestIsAlreadyExistsErr(t *testing.T) {
 			name:   "empty output (e.g. success)",
 			output: "",
 			want:   false,
+		},
+		{
+			name:   "invalid address",
+			output: "Error: any valid prefix is expected rather than \"bogus\".\n",
+			want:   false,
+		},
+		{
+			name:   "missing interface",
+			output: "Cannot find device \"lo\"\n",
+			want:   false,
+		},
+		{
+			name:   "permission denied",
+			output: "RTNETLINK answers: Operation not permitted\n",
+			want:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAlreadyExistsErr([]byte(tc.output)); got != tc.want {
+				t.Errorf("isAlreadyExistsErr(%q) = %v, want %v", tc.output, got, tc.want)
+			}
+		})
+	}
+}
