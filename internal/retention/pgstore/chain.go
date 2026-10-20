@@ -273,3 +273,95 @@ func (c *ChainSource) withBase(ctx context.Context, out retention.PrefixRemoval)
 type batchResult struct {
 	gateway, session int64
 	skipped          string
+}
+
+func (c *ChainSource) removeBatch(ctx context.Context, cutoffs map[pb.RetentionClass]time.Time, batch int64) (batchResult, error) {
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return batchResult{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '10s'`); err != nil {
+		return batchResult{}, err
+	}
+	if _, err := tx.Exec(ctx, `LOCK TABLE retention_legal_holds IN SHARE MODE`); err != nil {
+		return batchResult{}, err
+	}
+	rows, err := tx.Query(ctx, `SELECT org_id FROM retention_legal_holds ORDER BY org_id`)
+	if err != nil {
+		return batchResult{}, err
+	}
+	var held []string
+	for rows.Next() {
+		var org string
+		if err := rows.Scan(&org); err != nil {
+			rows.Close()
+			return batchResult{}, err
+		}
+		held = append(held, org)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return batchResult{}, err
+	}
+
+	p, err := c.plan(ctx, tx, cutoffs, held)
+	if err != nil {
+		return batchResult{}, err
+	}
+	if p.skipped != "" {
+		return batchResult{skipped: p.skipped}, nil
+	}
+	if p.end == 0 {
+		return batchResult{}, nil
+	}
+
+	// The oldest `batch` rows below the end id, deleted and counted by class;
+	// the last of them is the new base.
+	var baseID *int64
+	var baseHash *string
+	var gw, sess int64
+	if err := tx.QueryRow(ctx, `
+		WITH picked AS (
+			SELECT id, row_hash, action FROM audit_logs
+			WHERE id < $1 ORDER BY id LIMIT $2 FOR UPDATE
+		), gone AS (
+			DELETE FROM audit_logs a USING picked p WHERE a.id = p.id RETURNING a.id
+		)
+		SELECT (SELECT id FROM picked ORDER BY id DESC LIMIT 1),
+		       (SELECT row_hash FROM picked ORDER BY id DESC LIMIT 1),
+		       count(*) FILTER (WHERE NOT (action = ANY($3))),
+		       count(*) FILTER (WHERE action = ANY($3))
+		FROM picked`,
+		p.end, batch, audit.SessionTranscriptActions).Scan(&baseID, &baseHash, &gw, &sess); err != nil {
+		return batchResult{}, err
+	}
+	if baseID == nil {
+		return batchResult{}, nil // nothing left below the end
+	}
+	if err := audit.WriteChainBase(ctx, tx, *baseID, *baseHash, gw+sess); err != nil {
+		return batchResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return batchResult{}, err
+	}
+	return batchResult{gateway: gw, session: sess}, nil
+}
+
+func basePB(b audit.ChainBase) *pb.RetentionChainBase {
+	return &pb.RetentionChainBase{
+		BaseId:     b.ID,
+		BaseHash:   b.Hash,
+		PurgedAt:   timestamppb.New(b.PurgedAt),
+		RowsPurged: b.RowsPurged,
+	}
+}
+
+// wrapMissingTable adds the likely cause to a missing-table error.
+func wrapMissingTable(op string, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgUndefinedTable {
+		return fmt.Errorf("%s: %s (the audit store has not created its tables on this daemon)", op, pgErr.Message)
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}

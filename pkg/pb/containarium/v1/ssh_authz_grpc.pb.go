@@ -75,3 +75,81 @@ func (c *sSHAuthzServiceClient) Authorize(ctx context.Context, in *AuthorizeSSHR
 // backend. The daemon answers from local state (self-host) or forwards to
 // the cloud over ActuationService.AuthorizeSSH, which reuses these same
 // messages so neither side translates.
+//
+// The REST route is mounted behind the sentinel request signature
+// (auth.SentinelVerifier), not a JWT: it is sentinel-to-daemon plumbing.
+type SSHAuthzServiceServer interface {
+	// Authorize decides whether the credential offered to the sentinel may
+	// open a session as `login` on this backend, right now.
+	//
+	// The request/response names follow the architecture doc, and the same
+	// messages back ActuationService.AuthorizeSSH on purpose (one message set
+	// for both hops), hence the lint exemptions.
+	Authorize(context.Context, *AuthorizeSSHRequest) (*AuthorizeSSHResponse, error)
+	mustEmbedUnimplementedSSHAuthzServiceServer()
+}
+
+// UnimplementedSSHAuthzServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSSHAuthzServiceServer struct{}
+
+func (UnimplementedSSHAuthzServiceServer) Authorize(context.Context, *AuthorizeSSHRequest) (*AuthorizeSSHResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Authorize not implemented")
+}
+func (UnimplementedSSHAuthzServiceServer) mustEmbedUnimplementedSSHAuthzServiceServer() {}
+func (UnimplementedSSHAuthzServiceServer) testEmbeddedByValue()                         {}
+
+// UnsafeSSHAuthzServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SSHAuthzServiceServer will
+// result in compilation errors.
+type UnsafeSSHAuthzServiceServer interface {
+	mustEmbedUnimplementedSSHAuthzServiceServer()
+}
+
+func RegisterSSHAuthzServiceServer(s grpc.ServiceRegistrar, srv SSHAuthzServiceServer) {
+	// If the following call panics, it indicates UnimplementedSSHAuthzServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&SSHAuthzService_ServiceDesc, srv)
+}
+
+func _SSHAuthzService_Authorize_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AuthorizeSSHRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SSHAuthzServiceServer).Authorize(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SSHAuthzService_Authorize_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SSHAuthzServiceServer).Authorize(ctx, req.(*AuthorizeSSHRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// SSHAuthzService_ServiceDesc is the grpc.ServiceDesc for SSHAuthzService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SSHAuthzService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.SSHAuthzService",
+	HandlerType: (*SSHAuthzServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Authorize",
+			Handler:    _SSHAuthzService_Authorize_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/ssh_authz.proto",
+}
