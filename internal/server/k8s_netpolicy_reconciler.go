@@ -103,3 +103,73 @@ func (r *K8sNetworkPolicyReconciler) Stop() {
 
 // Reconcile makes every tenant's NetworkPolicy match the store once.
 //
+// One tenant's failure never stops the others. A policy the backend refuses
+// — because it contains something NetworkPolicy cannot express — is a
+// standing condition, not a transient one, so it is logged on every pass
+// rather than once: an operator who has not noticed yet should keep being
+// told, and the alternative is a tenant silently running without the policy
+// they configured.
+func (r *K8sNetworkPolicyReconciler) Reconcile(ctx context.Context) error {
+	policies, err := r.store.List(ctx)
+	if err != nil {
+		return err
+	}
+
+	seen := make(map[string]struct{}, len(policies))
+	for _, p := range policies {
+		tenant := p.GetTenant()
+		if tenant == "" {
+			continue
+		}
+		seen[tenant] = struct{}{}
+
+		if err := r.applier.ApplyTenantPolicy(ctx, tenant, p); err != nil {
+			// Deliberately still marked applied: the tenant's namespace may
+			// hold an earlier policy of ours, and forgetting it here would
+			// mean never reverting it when the policy is later deleted.
+			r.markApplied(tenant)
+			log.Printf("[k8s-netpolicy] tenant %q: %v", tenant, err)
+			continue
+		}
+		r.markApplied(tenant)
+	}
+
+	// Tenants we wrote a policy for that no longer have one: revert to the
+	// default-deny floor. Not to allow-all — a delete must never widen.
+	for _, tenant := range r.appliedNotIn(seen) {
+		if err := r.applier.ApplyTenantPolicy(ctx, tenant, nil); err != nil {
+			log.Printf("[k8s-netpolicy] tenant %q: reverting to the default-deny floor failed, so "+
+				"its previous allowlist is still in force: %v", tenant, err)
+			continue
+		}
+		r.forget(tenant)
+		log.Printf("[k8s-netpolicy] tenant %q policy removed; reverted to the default-deny floor", tenant)
+	}
+	return nil
+}
+
+func (r *K8sNetworkPolicyReconciler) markApplied(tenant string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.applied[tenant] = struct{}{}
+}
+
+func (r *K8sNetworkPolicyReconciler) forget(tenant string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.applied, tenant)
+}
+
+// appliedNotIn returns tenants we have written a policy for that are absent
+// from the given set.
+func (r *K8sNetworkPolicyReconciler) appliedNotIn(seen map[string]struct{}) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var gone []string
+	for tenant := range r.applied {
+		if _, ok := seen[tenant]; !ok {
+			gone = append(gone, tenant)
+		}
+	}
+	return gone
+}

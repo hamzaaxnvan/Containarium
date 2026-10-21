@@ -85,3 +85,47 @@ func TestGRPCInterceptor_LogErrorRecordsPersistFailure(t *testing.T) {
 	t.Fatalf("persist-failure count never reached 1 after a Log() error; got %d", GetPersistFailureReport().Count)
 }
 
+// blockingAuditLogger blocks inside Log() until the test releases it —
+// used to deterministically fill GRPCInterceptor's buffered channel so
+// the channel-full drop path (the SECOND failure mode named in the
+// report) is exercised rather than raced.
+type blockingAuditLogger struct {
+	proceed chan struct{}
+}
+
+func (b *blockingAuditLogger) Log(_ context.Context, _ *AuditEntry) error {
+	<-b.proceed
+	return nil
+}
+
+func TestGRPCInterceptor_ChannelFullRecordsPersistFailure(t *testing.T) {
+	ResetPersistFailuresForTest()
+	t.Cleanup(ResetPersistFailuresForTest)
+
+	g := NewGRPCInterceptor()
+	blocker := &blockingAuditLogger{proceed: make(chan struct{})}
+	g.setLogger(blocker)
+	defer close(blocker.proceed) // release the parked writer goroutine
+
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) { return "ok", nil }
+	call := func() {
+		_, _ = g.Unary()(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/x/Y"}, handler)
+	}
+
+	// First call is dequeued immediately by the writer goroutine and
+	// blocks inside Log(), holding the "in flight" slot — the 256-entry
+	// buffer starts fully free after this.
+	call()
+	time.Sleep(20 * time.Millisecond) // let the writer goroutine reach the blocking Log() call
+
+	for i := 0; i < 256; i++ {
+		call() // fills the buffer exactly
+	}
+
+	before := GetPersistFailureReport().Count
+	call() // the 258th entry: buffer full, must be dropped and counted
+
+	if got := GetPersistFailureReport().Count; got != before+1 {
+		t.Fatalf("persist-failure count = %d, want %d — a channel-full drop must be counted", got, before+1)
+	}
+}
