@@ -67,3 +67,72 @@ NO_COMMANDS (the pack is written either way); non-zero without a pack
 when the commands could not be run at all.
 
 Example:
+  containariumd proof-pack generate <tenant>-container --dir /workspace --out pack.json`,
+	Args: cobra.ExactArgs(1),
+	RunE: runProofPackGenerate,
+}
+
+func init() {
+	proofPackCmd.AddCommand(proofPackGenerateCmd)
+	rootCmd.AddCommand(proofPackCmd)
+
+	proofPackGenerateCmd.Flags().StringVar(&proofPackDir, "dir", proofpack.DefaultRepoDir, "Repository directory inside the box")
+	proofPackGenerateCmd.Flags().StringVarP(&proofPackOut, "out", "o", "", "File to write the pack JSON to (default stdout)")
+	proofPackGenerateCmd.Flags().DurationVar(&proofPackStepTimeout, "step-timeout", proofpack.DefaultStepTimeout, "Time limit for each step")
+}
+
+func runProofPackGenerate(cmd *cobra.Command, args []string) error {
+	ex, err := proofPackExecer()
+	if err != nil {
+		return fmt.Errorf("connect to incus: %w", err)
+	}
+	pack, err := proofpack.Generate(cmd.Context(), ex, args[0], proofpack.Options{
+		RepoDir:     proofPackDir,
+		StepTimeout: proofPackStepTimeout,
+	})
+	if err != nil {
+		return err
+	}
+	out, err := protojson.MarshalOptions{Multiline: true, Indent: "  "}.Marshal(pack)
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	if proofPackOut == "" {
+		if _, err := cmd.OutOrStdout().Write(out); err != nil {
+			return err
+		}
+	} else if err := writePrivateFile(proofPackOut, out); err != nil {
+		return err
+	}
+
+	digest, err := proofpack.PackDigest(pack)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "proof pack: %s, %d step(s), sha256 %s\n",
+		pack.GetStatus(), len(pack.GetSteps()), digest)
+	if pack.GetStatus() != pb.ProofPackStatus_PROOF_PACK_STATUS_PASSED {
+		return fmt.Errorf("proof pack status is %s", pack.GetStatus())
+	}
+	return nil
+}
+
+// writePrivateFile writes b to path with mode 0600, including when path
+// already exists with a wider mode (os.WriteFile only applies the mode on
+// create). The pack's logs can hold whatever the tests printed.
+func writePrivateFile(path string, b []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- operator-chosen output path
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
