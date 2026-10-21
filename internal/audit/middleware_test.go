@@ -39,3 +39,44 @@ func TestHTTPAuditMiddleware_LogErrorRecordsPersistFailure(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inner handler status = %d, want 200 — an audit-write failure must never surface to the request", rec.Code)
+	}
+	waitForPersistFailureCount(t, 1)
+}
+
+func TestHTTPAuditMiddleware_ChannelFullRecordsPersistFailure(t *testing.T) {
+	ResetPersistFailuresForTest()
+	t.Cleanup(ResetPersistFailuresForTest)
+
+	blocker := &blockingAuditLogger{proceed: make(chan struct{})}
+	defer close(blocker.proceed)
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := HTTPAuditMiddleware(inner, blocker)
+
+	fire := func() {
+		req := httptest.NewRequest(http.MethodPost, "/v1/containers/create", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+	}
+
+	// First request is dequeued immediately by the writer goroutine and
+	// blocks inside Log(), holding the "in flight" slot — the 256-entry
+	// buffer starts fully free after this.
+	fire()
+	time.Sleep(20 * time.Millisecond)
+
+	for i := 0; i < 256; i++ {
+		fire() // fills the buffer exactly
+	}
+
+	before := GetPersistFailureReport().Count
+	fire() // the 258th request: buffer full, entry dropped and must be counted
+
+	if got := GetPersistFailureReport().Count; got != before+1 {
+		t.Fatalf("persist-failure count = %d, want %d — a channel-full drop must be counted", got, before+1)
+	}
+}
