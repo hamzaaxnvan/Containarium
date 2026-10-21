@@ -105,3 +105,111 @@ func TestConsoleRouterIntegration(t *testing.T) {
 	tunnelServer.SetTunnelIdentity(id)
 
 	connectCh := make(chan *TunnelSpot, 1)
+	tunnelServer.OnConnect = func(spot *TunnelSpot) {
+		select {
+		case connectCh <- spot:
+		default:
+		}
+	}
+
+	serveTunnelServer(t, ctx, tunnelServer, connMux.TunnelListener())
+	time.Sleep(100 * time.Millisecond)
+
+	// The hypervisor host's tunnel client — reused completely unmodified,
+	// exactly as internal/cmd/hypervisor_agent.go does in production.
+	client := &TunnelClient{
+		SentinelAddr: fmt.Sprintf("127.0.0.1:%d", muxPort),
+		SentinelPins: []TunnelPin{id.Pin()},
+		Token:        tunnelToken,
+		SpotID:       "lab-vbox-host-1",
+		Ports:        []int{hvConsolePort},
+	}
+	go func() { _ = client.Run(ctx) }()
+
+	select {
+	case <-connectCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for tunnel connection")
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// The console router itself, under test.
+	routerPort := freePort(t)
+	router := NewConsoleRouter(fmt.Sprintf("127.0.0.1:%d", routerPort), NewConsoleRouterPolicy(routerToken), registry)
+	go func() { _ = router.Run(ctx) }()
+	time.Sleep(100 * time.Millisecond)
+
+	dial := func(t *testing.T) net.Conn {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", routerPort), 3*time.Second)
+		require.NoError(t, err)
+		return conn
+	}
+
+	t.Run("wrong router token is rejected", func(t *testing.T) {
+		conn := dial(t)
+		defer func() { _ = conn.Close() }()
+
+		require.NoError(t, json.NewEncoder(conn).Encode(ConsoleRouterHandshake{
+			Token: "wrong", SpotID: "lab-vbox-host-1", Port: hvConsolePort,
+		}))
+		var resp ConsoleRouterResponse
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		require.NoError(t, json.NewDecoder(conn).Decode(&resp))
+		assert.False(t, resp.OK)
+	})
+
+	t.Run("unknown spot is rejected", func(t *testing.T) {
+		conn := dial(t)
+		defer func() { _ = conn.Close() }()
+
+		require.NoError(t, json.NewEncoder(conn).Encode(ConsoleRouterHandshake{
+			Token: routerToken, SpotID: "no-such-hypervisor", Port: hvConsolePort,
+		}))
+		var resp ConsoleRouterResponse
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		require.NoError(t, json.NewDecoder(conn).Decode(&resp))
+		assert.False(t, resp.OK)
+	})
+
+	t.Run("valid request relays end to end", func(t *testing.T) {
+		conn := dial(t)
+		defer func() { _ = conn.Close() }()
+
+		require.NoError(t, json.NewEncoder(conn).Encode(ConsoleRouterHandshake{
+			Token: routerToken, SpotID: "lab-vbox-host-1", Port: hvConsolePort,
+		}))
+
+		reader := bufio.NewReader(conn)
+		respLine, err := reader.ReadString('\n')
+		require.NoError(t, err)
+		var resp ConsoleRouterResponse
+		require.NoError(t, json.Unmarshal([]byte(respLine), &resp))
+		require.True(t, resp.OK, "response: %+v", resp)
+
+		// From here the connection is a raw relay to the echo listener
+		// standing in for the hypervisor-agent.
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		_, err = conn.Write([]byte("hello from operator"))
+		require.NoError(t, err)
+
+		buf := make([]byte, len("hello from operator"))
+		_, err = fullRead(reader, buf)
+		require.NoError(t, err)
+		assert.Equal(t, "hello from operator", string(buf))
+	})
+}
+
+// fullRead reads exactly len(buf) bytes from r, since bufio.Reader may
+// already hold some of them buffered from the handshake response line.
+func fullRead(r *bufio.Reader, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := r.Read(buf[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
