@@ -178,3 +178,363 @@ type CaddyTLSAutomationPolicy struct {
 	MustStaple    bool             `json:"must_staple,omitempty"`
 	RenewalWindow string           `json:"renewal_window,omitempty"` // Duration string, e.g., "720h"
 }
+
+// CaddyTLSIssuer represents a TLS certificate issuer configuration
+type CaddyTLSIssuer struct {
+	Module               string               `json:"module"`          // "acme", "internal", "zerossl"
+	CA                   string               `json:"ca,omitempty"`    // ACME CA URL
+	Email                string               `json:"email,omitempty"` // ACME account email
+	ExternalAccountKey   string               `json:"external_account,omitempty"`
+	TrustedRootsPEMFiles []string             `json:"trusted_roots_pem_files,omitempty"`
+	Challenges           *CaddyACMEChallenges `json:"challenges,omitempty"` // DNS-01 opt-in; nil = Caddy default (HTTP-01 + TLS-ALPN-01)
+}
+
+// CaddyACMEChallenges configures which ACME challenge types the issuer may
+// use. Only the DNS-01 path is modeled here — it's the one that can issue
+// wildcard certs and sidesteps the HTTP-01 redirect failure mode. Leaving
+// this nil keeps Caddy's default HTTP-01 + TLS-ALPN-01 behavior.
+type CaddyACMEChallenges struct {
+	DNS *CaddyDNSChallenge `json:"dns,omitempty"`
+}
+
+// CaddyDNSChallenge holds the DNS-01 provider configuration. Provider is a
+// type-erased object because each caddy-dns module has its own schema (e.g.
+// cloudflare uses {"name":"cloudflare","api_token":"..."}, route53 reads the
+// AWS environment with just {"name":"route53"}). The Caddy binary must be
+// built with the matching dns.providers.<name> module — see
+// internal/hosting/caddy.go for the xcaddy build path.
+type CaddyDNSChallenge struct {
+	Provider map[string]interface{} `json:"provider"`
+}
+
+// CaddyTLSAutomation represents the TLS automation configuration
+type CaddyTLSAutomation struct {
+	Policies []CaddyTLSAutomationPolicy `json:"policies,omitempty"`
+}
+
+// CaddyTLSApp represents the TLS app configuration
+type CaddyTLSApp struct {
+	Automation *CaddyTLSAutomation `json:"automation,omitempty"`
+}
+
+// CaddyHTTPApp represents the HTTP app configuration
+type CaddyHTTPApp struct {
+	Servers map[string]*CaddyServerConfig `json:"servers,omitempty"`
+}
+
+// --- Layer 4 (caddy-l4) types for SNI-based TLS passthrough ---
+
+// CaddyL4App represents the layer4 app configuration
+type CaddyL4App struct {
+	Servers map[string]*CaddyL4Server `json:"servers"`
+}
+
+// CaddyL4Server represents a layer4 server with listeners and routes
+type CaddyL4Server struct {
+	Listen []string       `json:"listen"`
+	Routes []CaddyL4Route `json:"routes"`
+}
+
+// CaddyL4Route represents a layer4 route with match conditions and handlers
+type CaddyL4Route struct {
+	Match  []CaddyL4Match   `json:"match,omitempty"`
+	Handle []CaddyL4Handler `json:"handle"`
+}
+
+// CaddyL4Match represents match conditions for a layer4 route
+type CaddyL4Match struct {
+	TLS *CaddyL4TLSMatch `json:"tls,omitempty"`
+}
+
+// CaddyL4TLSMatch matches TLS ClientHello SNI field
+type CaddyL4TLSMatch struct {
+	SNI []string `json:"sni"`
+}
+
+// CaddyL4Handler represents a layer4 handler (proxy or subroute).
+// ProxyProtocol is set on the catchall's proxy handler to "v2" when the L4
+// server is in PROXY-aware mode — caddy-l4 then re-emits a PROXY v2 header
+// to the upstream HTTP server (srv0) so srv0's listener_wrapper can recover
+// the parsed source.
+type CaddyL4Handler struct {
+	Handler       string            `json:"handler"`
+	Upstreams     []CaddyL4Upstream `json:"upstreams,omitempty"`
+	ProxyProtocol string            `json:"proxy_protocol,omitempty"`
+}
+
+// CaddyL4Upstream represents an upstream for layer4 proxy
+type CaddyL4Upstream struct {
+	Dial []string `json:"dial"`
+}
+
+// CaddyConfig represents the top-level Caddy configuration
+type CaddyConfig struct {
+	Admin *CaddyAdminConfig `json:"admin,omitempty"`
+	Apps  *CaddyApps        `json:"apps,omitempty"`
+}
+
+// CaddyAdminConfig represents admin API configuration
+type CaddyAdminConfig struct {
+	Listen string `json:"listen,omitempty"` // e.g., ":2019" or "localhost:2019"
+}
+
+// CaddyApps contains all Caddy app configurations
+type CaddyApps struct {
+	HTTP *CaddyHTTPApp `json:"http,omitempty"`
+	TLS  *CaddyTLSApp  `json:"tls,omitempty"`
+}
+
+// NewReverseProxyRoute creates a typed reverse proxy route for HTTP
+func NewReverseProxyRoute(id string, hosts []string, upstreamDial string) CaddyRouteTyped {
+	return CaddyRouteTyped{
+		ID: id,
+		Match: []CaddyMatchTyped{
+			{Host: hosts},
+		},
+		Handle: []CaddyHandler{
+			CaddyReverseProxyHandler{
+				Handler: "reverse_proxy",
+				Upstreams: []CaddyUpstreamTyped{
+					{Dial: upstreamDial},
+				},
+			},
+		},
+	}
+}
+
+// NewGRPCReverseProxyRoute creates a typed reverse proxy route for gRPC
+// gRPC requires HTTP/2 (h2c for cleartext to backend)
+func NewGRPCReverseProxyRoute(id string, hosts []string, upstreamDial string) CaddyRouteTyped {
+	return CaddyRouteTyped{
+		ID: id,
+		Match: []CaddyMatchTyped{
+			{Host: hosts},
+		},
+		Handle: []CaddyHandler{
+			CaddyReverseProxyHandler{
+				Handler: "reverse_proxy",
+				Upstreams: []CaddyUpstreamTyped{
+					{Dial: upstreamDial},
+				},
+				Transport: NewGRPCTransport(),
+			},
+		},
+	}
+}
+
+// zeroSSLDirectory is ZeroSSL's ACME v2 directory URL — the `ca` that
+// identifies the fallback issuer in an emitted policy, and the value
+// ensureIssuerEmail matches on when deciding whether an existing policy still
+// carries an issuer that can never register (#1616).
+const zeroSSLDirectory = "https://acme.zerossl.com/v2/DV90"
+
+// NewACMEIssuer creates a Let's Encrypt ACME issuer
+func NewACMEIssuer() CaddyTLSIssuer {
+	return CaddyTLSIssuer{
+		Module: "acme",
+	}
+}
+
+// NewZeroSSLIssuer creates a ZeroSSL ACME issuer
+func NewZeroSSLIssuer() CaddyTLSIssuer {
+	return CaddyTLSIssuer{
+		Module: "acme",
+		CA:     zeroSSLDirectory,
+	}
+}
+
+// ACMEEmailFromEnv returns the ACME account contact address from
+// CONTAINARIUM_ACME_EMAIL, or "" when unset.
+//
+// Read at emit time rather than threaded through the ProxyManager because
+// every construction path for a policy's issuers funnels through issuersFor,
+// and the address is a property of the CA account, not of any one policy.
+func ACMEEmailFromEnv() string {
+	return strings.TrimSpace(os.Getenv("CONTAINARIUM_ACME_EMAIL"))
+}
+
+// issuersFor returns the ACME issuers for a policy, attaching the DNS-01
+// challenge config to each when dns is non-nil (both CAs support DNS-01).
+// When dns is nil the issuers carry no `challenges` field, so the emitted
+// JSON keeps the pre-DNS-01 default (HTTP-01 + TLS-ALPN-01).
+//
+// Whether ZeroSSL is emitted at all depends on CONTAINARIUM_ACME_EMAIL,
+// because ZeroSSL refuses ACME account registration without a contact address
+// ("your email address is required to use ZeroSSL's ACME endpoint"). Emitting
+// it unconfigured produced a policy that *looked* like it had a fallback
+// issuer and could never obtain a certificate from it — the failure only
+// visible as a per-issuance error line, so hosts ran on a single working
+// issuer without any signal that redundancy was gone (#1616). With no email
+// we emit the one issuer that can actually work instead, and skip a
+// guaranteed-failed round trip on every issuance.
+//
+// The address also goes on the Let's Encrypt issuer: it is where a CA sends
+// expiry warnings, one of the few external signals for a stalled renewal.
+func issuersFor(dns *CaddyACMEChallenges) []CaddyTLSIssuer {
+	email := ACMEEmailFromEnv()
+
+	acme := NewACMEIssuer()
+	acme.Email = email
+	acme.Challenges = dns
+	issuers := []CaddyTLSIssuer{acme}
+
+	if email == "" {
+		return issuers
+	}
+
+	zerossl := NewZeroSSLIssuer()
+	zerossl.Email = email
+	zerossl.Challenges = dns
+	return append(issuers, zerossl)
+}
+
+// NewTLSPolicy creates a TLS automation policy with default issuers
+// (HTTP-01 + TLS-ALPN-01).
+func NewTLSPolicy(subjects []string) CaddyTLSAutomationPolicy {
+	return NewTLSPolicyWithDNS(subjects, nil)
+}
+
+// NewTLSPolicyWithDNS creates a TLS automation policy whose issuers solve
+// DNS-01 via the given challenge config. Passing nil is equivalent to
+// NewTLSPolicy. DNS-01 is required for wildcard subjects (e.g.
+// "*.example.com").
+func NewTLSPolicyWithDNS(subjects []string, dns *CaddyACMEChallenges) CaddyTLSAutomationPolicy {
+	return CaddyTLSAutomationPolicy{
+		Subjects: subjects,
+		Issuers:  issuersFor(dns),
+	}
+}
+
+// DNSChallengeFromEnv builds a DNS-01 challenge config from the daemon's
+// environment, or returns nil (the default — HTTP-01 + TLS-ALPN-01) when
+// DNS-01 isn't opted into.
+//
+//   - CONTAINARIUM_ACME_DNS_PROVIDER — the caddy-dns provider name, e.g.
+//     "cloudflare". Empty/unset → DNS-01 disabled, returns nil.
+//   - CONTAINARIUM_ACME_DNS_PROVIDER_CONFIG — optional JSON object of
+//     provider-specific fields merged into the provider block, so any
+//     caddy-dns module works without hardcoding its schema, e.g.
+//     '{"api_token":"{env.MY_TOKEN}"}'. Caddy expands {env.X} at load time,
+//     so the secret itself is never placed in this process's config or logs.
+//
+// As a convenience for the common case, "cloudflare" defaults api_token to
+// "{env.CF_API_TOKEN}" when not overridden. The Caddy binary must be built
+// with the matching dns.providers.<name> module.
+func DNSChallengeFromEnv() *CaddyACMEChallenges {
+	provider := strings.TrimSpace(os.Getenv("CONTAINARIUM_ACME_DNS_PROVIDER"))
+	if provider == "" {
+		return nil
+	}
+	prov := map[string]interface{}{"name": provider}
+	if raw := strings.TrimSpace(os.Getenv("CONTAINARIUM_ACME_DNS_PROVIDER_CONFIG")); raw != "" {
+		var extra map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &extra); err == nil {
+			for k, v := range extra {
+				prov[k] = v
+			}
+		}
+	}
+	if provider == "cloudflare" {
+		if _, ok := prov["api_token"]; !ok {
+			prov["api_token"] = "{env.CF_API_TOKEN}"
+		}
+	}
+	return &CaddyACMEChallenges{DNS: &CaddyDNSChallenge{Provider: prov}}
+}
+
+// envPlaceholderPattern matches a Caddy `{env.VARNAME}` placeholder — the
+// whole value must be exactly one placeholder (Caddy's own config
+// substitution syntax), not a placeholder embedded in a larger string.
+var envPlaceholderPattern = regexp.MustCompile(`^\{env\.([A-Za-z_][A-Za-z0-9_]*)\}$`)
+
+// EnvPlaceholdersInDNSProvider returns the names of every `{env.VAR}`
+// placeholder Caddy will expand when it loads this DNS-01 provider config,
+// deduplicated and sorted.
+//
+// Caddy runs as its own process (in its own container, for the daemon's core
+// Caddy) and expands these placeholders from ITS OWN environment, not the
+// daemon's — a variable this function names has to actually reach Caddy's
+// process environment somehow, or the ACME DNS-01 challenge fails with an
+// error that looks like a scoping problem rather than a missing credential
+// (#1597). Callers use this list to check (and provision) that path; nothing
+// here touches any environment itself.
+//
+// Returns nil for a nil challenge config or one with no provider (HTTP-01 /
+// TLS-ALPN-01, no DNS-01 configured).
+func EnvPlaceholdersInDNSProvider(dns *CaddyACMEChallenges) []string {
+	if dns == nil || dns.DNS == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var vars []string
+	for _, v := range dns.DNS.Provider {
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		m := envPlaceholderPattern.FindStringSubmatch(s)
+		if m == nil || seen[m[1]] {
+			continue
+		}
+		seen[m[1]] = true
+		vars = append(vars, m[1])
+	}
+	sort.Strings(vars)
+	return vars
+}
+
+// CaddyVersion is the pinned Caddy release the Makefile's build-caddy target
+// (the pre-built release asset, #1617) and setupCaddy's xcaddy
+// source-build fallback both target. A deliberate pin, not `xcaddy build`
+// with no version arg — that tracks Caddy's latest tag at BUILD time, which
+// is the same per-host-provisioning-time drift this asset exists to remove,
+// just moved to CI cadence instead of removed. Bump it deliberately, in its
+// own reviewable commit, keeping the Makefile's CADDY_VERSION in sync.
+const CaddyVersion = "v2.11.4"
+
+// dnsProviderModules maps a caddy-dns provider name to its Go module path,
+// for the xcaddy build of Caddy. This is the single source of truth shared by
+// the core Caddy build (internal/server.setupCaddy) and the hosting Caddy
+// build (internal/hosting.CaddyManager.providerModule): the build must compile
+// in the matching dns.providers.<name> module or Caddy rejects the DNS-01
+// config the daemon emits.
+var dnsProviderModules = map[string]string{
+	"cloudflare":     "github.com/caddy-dns/cloudflare",
+	"route53":        "github.com/caddy-dns/route53",
+	"godaddy":        "github.com/caddy-dns/godaddy",
+	"googleclouddns": "github.com/caddy-dns/googleclouddns",
+	"digitalocean":   "github.com/caddy-dns/digitalocean",
+	"azure":          "github.com/caddy-dns/azure",
+	"vultr":          "github.com/caddy-dns/vultr",
+	"duckdns":        "github.com/caddy-dns/duckdns",
+	"namecheap":      "github.com/caddy-dns/namecheap",
+}
+
+// DNSProviderModule returns the xcaddy `--with` module path for a caddy-dns
+// provider name, or "" if unknown. Used by the core Caddy build to compile in
+// the DNS-01 provider the daemon is configured to emit (#378).
+func DNSProviderModule(provider string) string {
+	return dnsProviderModules[strings.TrimSpace(provider)]
+}
+
+// AllDNSProviderModules returns every caddy-dns module path this build
+// knows about, sorted for a deterministic build argument order. The
+// release pipeline's pre-built Caddy binary (#1617, cmd/print-caddy-modules)
+// bakes in every provider here rather than just the one an operator has
+// configured, so setupCaddy's downloaded binary works for ANY provider a
+// host is later configured with, without needing a rebuild per provider —
+// and so this map stays the one place a new provider needs adding.
+func AllDNSProviderModules() []string {
+	mods := make([]string, 0, len(dnsProviderModules))
+	for _, m := range dnsProviderModules {
+		mods = append(mods, m)
+	}
+	sort.Strings(mods)
+	return mods
+}
+
+// DNSProviderFromEnv returns the configured caddy-dns provider name (from
+// CONTAINARIUM_ACME_DNS_PROVIDER), or "" when DNS-01 isn't opted into.
+func DNSProviderFromEnv() string {
+	return strings.TrimSpace(os.Getenv("CONTAINARIUM_ACME_DNS_PROVIDER"))
+}
