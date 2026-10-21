@@ -21,3 +21,15 @@ func TestHandleCodeEgressPolicy(t *testing.T) {
 			`"implicit":[{"kind":"CODING_TOOL_EGRESS_IMPLICIT_KIND_DNS_RESOLVER","description":"resolver"}]}}`))
 	}))
 	defer server.Close()
+
+	out, err := handleCodeEgressPolicy(NewClient(server.URL, "test-token"), map[string]interface{}{"tenant": "alice"})
+	require.NoError(t, err)
+	assert.Equal(t, "/v1/code/egress-policy/alice", gotPath)
+	assert.Contains(t, out, "tenant policy, revision 4, mode enforce")
+	assert.Contains(t, out, "deny all")
+	assert.Contains(t, out, "dns resolver")
+
+	_, err = handleCodeEgressPolicy(NewClient(server.URL, "test-token"), map[string]interface{}{})
+	require.NoError(t, err)
+	assert.Equal(t, "/v1/code/egress-policy", gotPath, "no tenant reads the cluster default")
+}
