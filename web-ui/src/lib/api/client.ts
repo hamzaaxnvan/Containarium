@@ -371,3 +371,1124 @@ export class ContaineriumClient {
    * Start a container
    */
   async startContainer(username: string): Promise<Container> {
+    const response = await this.client.post('/containers/' + username + '/start', {});
+    const container = response.data.container || response.data;
+    return transformContainer(container);
+  }
+
+  /**
+   * Stop a container
+   */
+  async stopContainer(username: string, force: boolean = false): Promise<Container> {
+    const response = await this.client.post('/containers/' + username + '/stop', { force });
+    const container = response.data.container || response.data;
+    return transformContainer(container);
+  }
+
+  /**
+   * Resize container resources (CPU, memory, disk)
+   * All parameters are optional - only specified values will be changed
+   * Note: Disk can only be increased, not decreased
+   */
+  async resizeContainer(
+    username: string,
+    resources: { cpu?: string; memory?: string; disk?: string }
+  ): Promise<Container> {
+    const response = await this.client.put('/containers/' + username + '/resize', {
+      cpu: resources.cpu || '',
+      memory: resources.memory || '',
+      disk: resources.disk || '',
+    });
+    const container = response.data.container || response.data;
+    return transformContainer(container);
+  }
+
+  /**
+   * Clean up disk space in a container
+   * Removes temp files, package caches, and trims journal logs
+   */
+  async cleanupDisk(username: string): Promise<{ message: string; freedBytes: number; container: Container }> {
+    const response = await this.client.post(`/containers/${username}/cleanup-disk`, {});
+    const container = response.data.container ? transformContainer(response.data.container) : await this.getContainer(username);
+    return {
+      message: response.data.message || 'Disk cleanup completed',
+      freedBytes: Number(response.data.freedBytes || response.data.freed_bytes) || 0,
+      container,
+    };
+  }
+
+  /**
+   * Enable or disable per-container auto-sleep (Phase 1 scale-down).
+   * Writes the user.containarium.auto_sleep_enabled / idle_threshold_minutes
+   * Incus user.* metadata keys via POST /v1/containers/{username}/auto-sleep.
+   * Does NOT itself stop or start the container — Phase 2 ticker consumes the flag.
+   */
+  async toggleAutoSleep(
+    username: string,
+    enabled: boolean,
+    idleThresholdMinutes: number,
+  ): Promise<{ message: string; autoSleepEnabled: boolean; idleThresholdMinutes: number }> {
+    const response = await this.client.post(`/containers/${username}/auto-sleep`, {
+      enabled,
+      idleThresholdMinutes,
+    });
+    return {
+      message: String(response.data.message || ''),
+      autoSleepEnabled: Boolean(response.data.autoSleepEnabled),
+      idleThresholdMinutes: Number(response.data.idleThresholdMinutes) || 0,
+    };
+  }
+
+  /**
+   * Get metrics for all containers or a specific container
+   */
+  async getMetrics(username?: string): Promise<ContainerMetrics[]> {
+    const params = username ? { username } : {};
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const response = await this.client.get<{ metrics?: any[] }>('/metrics', { params });
+    const metrics = response.data.metrics || [];
+    // Parse string numbers to actual numbers (API may return strings)
+    return metrics.map((m) => ({
+      name: String(m.name || ''),
+      cpuUsageSeconds: Number(m.cpuUsageSeconds) || 0,
+      memoryUsageBytes: Number(m.memoryUsageBytes) || 0,
+      memoryPeakBytes: Number(m.memoryPeakBytes) || 0,
+      diskUsageBytes: Number(m.diskUsageBytes) || 0,
+      networkRxBytes: Number(m.networkRxBytes) || 0,
+      networkTxBytes: Number(m.networkTxBytes) || 0,
+      processCount: Number(m.processCount) || 0,
+    }));
+  }
+
+  // ============================================
+  // Core Services Methods
+  // ============================================
+
+  /**
+   * Get core infrastructure services (PostgreSQL, Caddy, VictoriaMetrics, ClamAV)
+   */
+  async getCoreServices(): Promise<CoreService[]> {
+    const response = await this.client.get<{ services?: CoreService[] }>('/system/core-services');
+    return response.data.services || [];
+  }
+
+  // ============================================
+  // App Management Methods
+  // ============================================
+
+  /**
+   * List all apps for a user
+   */
+  async listApps(username?: string): Promise<App[]> {
+    const params = username ? { username } : {};
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const response = await this.client.get<{ apps?: any[] }>('/apps', { params });
+    return response.data.apps || [];
+  }
+
+  /**
+   * Get a specific app
+   */
+  async getApp(username: string, appName: string): Promise<App> {
+    const response = await this.client.get(`/apps/${username}/${appName}`);
+    return response.data.app || response.data;
+  }
+
+  /**
+   * Stop an app
+   */
+  async stopApp(username: string, appName: string): Promise<App> {
+    const response = await this.client.post(`/apps/${username}/${appName}/stop`, {});
+    return response.data.app || response.data;
+  }
+
+  /**
+   * Start an app
+   */
+  async startApp(username: string, appName: string): Promise<App> {
+    const response = await this.client.post(`/apps/${username}/${appName}/start`, {});
+    return response.data.app || response.data;
+  }
+
+  /**
+   * Restart an app
+   */
+  async restartApp(username: string, appName: string): Promise<App> {
+    const response = await this.client.post(`/apps/${username}/${appName}/restart`, {});
+    return response.data.app || response.data;
+  }
+
+  /**
+   * Delete an app
+   */
+  async deleteApp(username: string, appName: string, removeData: boolean = false): Promise<void> {
+    await this.client.delete(`/apps/${username}/${appName}`, {
+      params: { removeData },
+    });
+  }
+
+  /**
+   * Get app logs
+   */
+  async getAppLogs(username: string, appName: string, tailLines: number = 100): Promise<string[]> {
+    const response = await this.client.get(`/apps/${username}/${appName}/logs`, {
+      params: { tailLines },
+    });
+    return response.data.logLines || [];
+  }
+
+  // ============================================
+  // Network Management Methods
+  // ============================================
+
+  /**
+   * Get all proxy routes
+   */
+  async getRoutes(username?: string): Promise<ProxyRoute[]> {
+    const params = username ? { username } : {};
+    const response = await this.client.get<{ routes?: ProxyRoute[] }>('/network/routes', { params });
+    return response.data.routes || [];
+  }
+
+  /**
+   * Get the zero-click bootstrap URL for an agent-workspace box.
+   */
+  async getWorkspaceAccess(name: string): Promise<WorkspaceAccess> {
+    const response = await this.client.get<{ token?: string; url?: string }>(
+      `/recipes/workspace/${encodeURIComponent(name)}/access`
+    );
+    return { token: response.data.token || '', url: response.data.url || '' };
+  }
+
+  /**
+   * Add a new proxy route
+   * @param protocol - Route protocol: 'ROUTE_PROTOCOL_HTTP' (default) or 'ROUTE_PROTOCOL_GRPC'
+   */
+  async addRoute(domain: string, targetIp: string, targetPort: number, protocol?: string): Promise<ProxyRoute> {
+    const response = await this.client.post<{ route?: ProxyRoute }>('/network/routes', {
+      domain,
+      target_ip: targetIp,
+      target_port: targetPort,
+      protocol: protocol || 'ROUTE_PROTOCOL_HTTP',
+    });
+    return response.data.route || {
+      subdomain: domain,
+      fullDomain: domain,
+      containerIp: targetIp,
+      port: targetPort,
+      active: true,
+      protocol: protocol as any || 'ROUTE_PROTOCOL_HTTP',
+    };
+  }
+
+  /**
+   * Delete a proxy route
+   */
+  async deleteRoute(domain: string): Promise<void> {
+    await this.client.delete(`/network/routes/${encodeURIComponent(domain)}`);
+  }
+
+  /**
+   * Update a proxy route (enable/disable or modify)
+   * @param domain - Domain name (identifies the route)
+   * @param options - Update options (active to toggle, targetIp/targetPort to update target)
+   */
+  async updateRoute(
+    domain: string,
+    options: {
+      active?: boolean;
+      targetIp?: string;
+      targetPort?: number;
+      protocol?: string;
+    }
+  ): Promise<ProxyRoute> {
+    const response = await this.client.put<{ route?: ProxyRoute }>(
+      `/network/routes/${encodeURIComponent(domain)}`,
+      {
+        domain,
+        target_ip: options.targetIp,
+        target_port: options.targetPort,
+        protocol: options.protocol,
+        active: options.active,
+      }
+    );
+    return response.data.route || {
+      subdomain: domain,
+      fullDomain: domain,
+      containerIp: options.targetIp || '',
+      port: options.targetPort || 0,
+      active: options.active ?? true,
+      protocol: options.protocol as any || 'ROUTE_PROTOCOL_HTTP',
+    };
+  }
+
+  /**
+   * Get passthrough routes (TCP/UDP port forwarding)
+   */
+  async getPassthroughRoutes(): Promise<PassthroughRoute[]> {
+    const response = await this.client.get<{ routes?: PassthroughRoute[] }>('/network/passthrough');
+    return (response.data.routes || []).map(r => ({
+      externalPort: r.externalPort || (r as any).external_port,
+      targetIp: r.targetIp || (r as any).target_ip,
+      targetPort: r.targetPort || (r as any).target_port,
+      protocol: r.protocol,
+      active: r.active,
+      containerName: r.containerName || (r as any).container_name,
+      description: r.description,
+    }));
+  }
+
+  /**
+   * Add a passthrough route (TCP/UDP port forwarding)
+   */
+  async addPassthroughRoute(
+    externalPort: number,
+    targetIp: string,
+    targetPort: number,
+    protocol: string = 'ROUTE_PROTOCOL_TCP',
+    containerName?: string,
+    description?: string
+  ): Promise<PassthroughRoute> {
+    const response = await this.client.post<{ route?: PassthroughRoute }>('/network/passthrough', {
+      external_port: externalPort,
+      target_ip: targetIp,
+      target_port: targetPort,
+      protocol,
+      container_name: containerName,
+      description,
+    });
+    const r = response.data.route;
+    return r ? {
+      externalPort: r.externalPort || (r as any).external_port,
+      targetIp: r.targetIp || (r as any).target_ip,
+      targetPort: r.targetPort || (r as any).target_port,
+      protocol: r.protocol,
+      active: r.active,
+      containerName: r.containerName || (r as any).container_name,
+      description: r.description,
+    } : {
+      externalPort,
+      targetIp,
+      targetPort,
+      protocol: protocol as any,
+      active: true,
+      containerName,
+      description,
+    };
+  }
+
+  /**
+   * Delete a passthrough route
+   */
+  async deletePassthroughRoute(externalPort: number, protocol: string = 'ROUTE_PROTOCOL_TCP'): Promise<void> {
+    await this.client.delete(`/network/passthrough/${externalPort}`, {
+      params: { protocol },
+    });
+  }
+
+  /**
+   * Update a passthrough route (enable/disable or modify)
+   * @param externalPort - External port (identifies the route)
+   * @param protocol - Protocol (TCP/UDP, identifies the route)
+   * @param options - Update options
+   */
+  async updatePassthroughRoute(
+    externalPort: number,
+    protocol: string,
+    options: {
+      active?: boolean;
+      targetIp?: string;
+      targetPort?: number;
+      containerName?: string;
+      description?: string;
+    }
+  ): Promise<PassthroughRoute> {
+    const response = await this.client.put<{ route?: PassthroughRoute }>(
+      `/network/passthrough/${externalPort}`,
+      {
+        external_port: externalPort,
+        protocol,
+        target_ip: options.targetIp,
+        target_port: options.targetPort,
+        container_name: options.containerName,
+        description: options.description,
+        active: options.active,
+      }
+    );
+    const r = response.data.route;
+    return r ? {
+      externalPort: r.externalPort || (r as any).external_port,
+      targetIp: r.targetIp || (r as any).target_ip,
+      targetPort: r.targetPort || (r as any).target_port,
+      protocol: r.protocol,
+      active: r.active,
+      containerName: r.containerName || (r as any).container_name,
+      description: r.description,
+    } : {
+      externalPort,
+      targetIp: options.targetIp || '',
+      targetPort: options.targetPort || 0,
+      protocol: protocol as any,
+      active: options.active ?? true,
+      containerName: options.containerName,
+      description: options.description,
+    };
+  }
+
+  /**
+   * Get ACL for a container (DevBox)
+   */
+  async getContainerACL(username: string): Promise<NetworkACL> {
+    const response = await this.client.get(`/v1/containers/${username}/acl`);
+    return response.data.acl || response.data;
+  }
+
+  /**
+   * Update ACL for a container (DevBox)
+   */
+  async updateContainerACL(
+    username: string,
+    preset: string,
+    ingressRules?: unknown[],
+    egressRules?: unknown[]
+  ): Promise<NetworkACL> {
+    const response = await this.client.put(`/v1/containers/${username}/acl`, {
+      username,
+      preset,
+      ingressRules,
+      egressRules,
+    });
+    return response.data.acl || response.data;
+  }
+
+  /**
+   * Get network topology
+   */
+  async getNetworkTopology(includeStopped: boolean = false): Promise<NetworkTopology> {
+    const response = await this.client.get<{ topology?: NetworkTopology }>('/network/topology', {
+      params: { includeStopped },
+    });
+    return response.data.topology || { nodes: [], edges: [], networkCidr: '', gatewayIp: '' };
+  }
+
+  /**
+   * Get available ACL presets
+   */
+  async getACLPresets(): Promise<ACLPresetInfo[]> {
+    const response = await this.client.get<{ presets?: ACLPresetInfo[] }>('/network/acl-presets');
+    return response.data.presets || [];
+  }
+
+  /**
+   * Get DNS records for domain suggestions
+   */
+  async getDNSRecords(): Promise<{ records: DNSRecord[]; baseDomain: string }> {
+    const response = await this.client.get<{ records?: DNSRecord[]; baseDomain?: string }>('/network/dns-records');
+    return {
+      records: response.data.records || [],
+      baseDomain: response.data.baseDomain || '',
+    };
+  }
+
+  // ============================================
+  // Collaborator Management Methods
+  // ============================================
+
+  /**
+   * List collaborators for a container
+   */
+  async listCollaborators(ownerUsername: string): Promise<Collaborator[]> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const response = await this.client.get<{ collaborators?: any[]; totalCount?: number }>(
+      `/containers/${ownerUsername}/collaborators`
+    );
+    return (response.data.collaborators || []).map(transformCollaborator);
+  }
+
+  /**
+   * Add a collaborator to a container
+   */
+  async addCollaborator(ownerUsername: string, req: AddCollaboratorRequest): Promise<{ collaborator: Collaborator; sshCommand: string }> {
+    const response = await this.client.post(`/containers/${ownerUsername}/collaborators`, {
+      collaborator_username: req.collaboratorUsername,
+      ssh_public_keys: req.sshPublicKeys,
+      grant_sudo: req.grantSudo || false,
+      grant_container_runtime: req.grantContainerRuntime || false,
+    });
+    return {
+      collaborator: transformCollaborator(response.data.collaborator || {}),
+      sshCommand: String(response.data.sshCommand || response.data.ssh_command || ''),
+    };
+  }
+
+  /**
+   * Remove a collaborator from a container
+   */
+  async removeCollaborator(ownerUsername: string, collaboratorUsername: string): Promise<void> {
+    await this.client.delete(`/containers/${ownerUsername}/collaborators/${collaboratorUsername}`);
+  }
+
+  // ============================================
+  // Monitoring Methods
+  // ============================================
+
+  /**
+   * Promote the in-memory bearer token into a same-origin session
+   * cookie so the browser sends it with iframe / top-level navigations
+   * (notably the /grafana/ reverse proxy on the monitoring page).
+   *
+   * Browsers cannot attach Authorization headers to <iframe src=...>
+   * loads from JS, so the embedded Grafana dashboard would otherwise
+   * always 401. The daemon's auth middleware accepts the cookie as a
+   * fallback to the bearer header — same JWT, same validation, same
+   * revocation. See issue #338.
+   *
+   * Idempotent: callers can invoke this on every relevant page mount
+   * without worrying about duplicate cookies. withCredentials is
+   * required for axios to accept the Set-Cookie response.
+   */
+  async setSessionCookie(): Promise<void> {
+    await this.client.post('/auth/session', null, { withCredentials: true });
+  }
+
+  /**
+   * Get monitoring configuration (Grafana/VictoriaMetrics URLs)
+   */
+  async getMonitoringInfo(): Promise<{ enabled: boolean; grafanaUrl: string; victoriaMetricsUrl: string }> {
+    const response = await this.client.get<{
+      enabled?: boolean;
+      grafanaUrl?: string;
+      grafana_url?: string;
+      victoriaMetricsUrl?: string;
+      victoria_metrics_url?: string;
+    }>('/system/monitoring');
+    return {
+      enabled: response.data.enabled || false,
+      grafanaUrl: response.data.grafanaUrl || response.data.grafana_url || '',
+      victoriaMetricsUrl: response.data.victoriaMetricsUrl || response.data.victoria_metrics_url || '',
+    };
+  }
+
+  // ============================================
+  // Label Management Methods
+  // ============================================
+
+  /**
+   * Get labels for a container
+   */
+  async getLabels(username: string): Promise<Record<string, string>> {
+    const response = await this.client.get<{ labels?: Record<string, string> }>(`/containers/${username}/labels`);
+    return response.data.labels || {};
+  }
+
+  /**
+   * Set labels on a container (overwrites existing labels with same keys)
+   */
+  async setLabels(username: string, labels: Record<string, string>): Promise<Record<string, string>> {
+    const response = await this.client.put<{ labels?: Record<string, string> }>(`/containers/${username}/labels`, {
+      labels,
+    });
+    return response.data.labels || {};
+  }
+
+  /**
+   * Remove a label from a container
+   */
+  async removeLabel(username: string, key: string): Promise<Record<string, string>> {
+    const response = await this.client.delete<{ labels?: Record<string, string> }>(`/containers/${username}/labels/${key}`);
+    return response.data.labels || {};
+  }
+
+  // ============================================
+  // Traffic Monitoring Methods
+  // ============================================
+
+  /**
+   * Get active connections for a container
+   */
+  async getConnections(containerName: string, options?: {
+    protocol?: string;
+    destIpPrefix?: string;
+    destPort?: number;
+    limit?: number;
+  }): Promise<GetConnectionsResponse> {
+    const params: Record<string, unknown> = {};
+    if (options?.protocol) params.protocol = options.protocol;
+    if (options?.destIpPrefix) params.destIpPrefix = options.destIpPrefix;
+    if (options?.destPort) params.destPort = options.destPort;
+    if (options?.limit) params.limit = options.limit;
+
+    const response = await this.client.get<GetConnectionsResponse>(
+      `/containers/${containerName}/connections`,
+      { params }
+    );
+    return {
+      connections: response.data.connections || [],
+      totalCount: response.data.totalCount || 0,
+    };
+  }
+
+  /**
+   * Get connection summary for a container
+   */
+  async getConnectionSummary(containerName: string): Promise<ConnectionSummary> {
+    const response = await this.client.get<GetConnectionSummaryResponse>(
+      `/containers/${containerName}/connections/summary`
+    );
+    return response.data.summary || {
+      containerName,
+      activeConnections: 0,
+      tcpConnections: 0,
+      udpConnections: 0,
+      totalBytesSent: 0,
+      totalBytesReceived: 0,
+      topDestinations: [],
+    };
+  }
+
+  /**
+   * Query traffic history for a container
+   */
+  async getTrafficHistory(containerName: string, options: {
+    startTime: string;
+    endTime: string;
+    destIp?: string;
+    destPort?: number;
+    offset?: number;
+    limit?: number;
+  }): Promise<QueryTrafficHistoryResponse> {
+    const params: Record<string, unknown> = {
+      startTime: options.startTime,
+      endTime: options.endTime,
+    };
+    if (options.destIp) params.destIp = options.destIp;
+    if (options.destPort) params.destPort = options.destPort;
+    if (options.offset) params.offset = options.offset;
+    if (options.limit) params.limit = options.limit;
+
+    const response = await this.client.get<QueryTrafficHistoryResponse>(
+      `/containers/${containerName}/traffic/history`,
+      { params }
+    );
+    return {
+      connections: response.data.connections || [],
+      totalCount: response.data.totalCount || 0,
+    };
+  }
+
+  /**
+   * Get traffic aggregates for a container
+   */
+  async getTrafficAggregates(containerName: string, options: {
+    startTime: string;
+    endTime: string;
+    interval?: string;
+    groupByDestIp?: boolean;
+    groupByDestPort?: boolean;
+  }): Promise<TrafficAggregate[]> {
+    const params: Record<string, unknown> = {
+      startTime: options.startTime,
+      endTime: options.endTime,
+    };
+    if (options.interval) params.interval = options.interval;
+    if (options.groupByDestIp) params.groupByDestIp = options.groupByDestIp;
+    if (options.groupByDestPort) params.groupByDestPort = options.groupByDestPort;
+
+    const response = await this.client.get<GetTrafficAggregatesResponse>(
+      `/containers/${containerName}/traffic/aggregates`,
+      { params }
+    );
+    return response.data.aggregates || [];
+  }
+
+  /**
+   * Get ClamAV scan summary across all containers
+   */
+  async getClamavSummary(): Promise<ClamavSummaryResponse> {
+    const response = await this.client.get('/security/clamav-summary');
+    return response.data;
+  }
+
+  /**
+   * List ClamAV scan reports with optional filtering
+   */
+  async listClamavReports(params?: ListClamavReportsParams): Promise<ClamavReportsResponse> {
+    const response = await this.client.get('/security/clamav-reports', { params });
+    return {
+      reports: response.data.reports || [],
+      totalCount: response.data.totalCount || 0,
+    };
+  }
+
+  /**
+   * Trigger an on-demand ClamAV scan
+   * @param containerName - Container to scan (required by the daemon: scan-all was removed, #2631)
+   */
+  async triggerClamavScan(containerName?: string): Promise<TriggerScanResponse> {
+    const response = await this.client.post<TriggerScanResponse>('/security/clamav-scan', {
+      container_name: containerName || '',
+    }, {
+      timeout: 30000, // Now async — returns immediately
+    });
+    return {
+      message: response.data.message || '',
+      scannedCount: response.data.scannedCount || 0,
+    };
+  }
+
+  /**
+   * Get scan job queue status (pending/running/completed/failed jobs)
+   */
+  async getScanStatus(): Promise<ScanStatusResponse> {
+    const response = await this.client.get<ScanStatusResponse>('/security/scan-status');
+    return {
+      jobs: (response.data.jobs || []).map(j => ({
+        id: j.id,
+        containerName: j.containerName || (j as any).container_name || '',
+        username: j.username || '',
+        status: j.status,
+        retryCount: j.retryCount || (j as any).retry_count || 0,
+        errorMessage: j.errorMessage || (j as any).error_message || '',
+        createdAt: j.createdAt || (j as any).created_at || '',
+        startedAt: j.startedAt || (j as any).started_at || '',
+        completedAt: j.completedAt || (j as any).completed_at || '',
+      })),
+      pendingCount: response.data.pendingCount || (response.data as any).pending_count || 0,
+      runningCount: response.data.runningCount || (response.data as any).running_count || 0,
+      completedCount: response.data.completedCount || (response.data as any).completed_count || 0,
+      failedCount: response.data.failedCount || (response.data as any).failed_count || 0,
+    };
+  }
+
+  // ============================================
+  // Pentest Methods
+  // ============================================
+
+  async triggerPentestScan(containerName?: string): Promise<TriggerPentestScanResponse> {
+    const body: Record<string, string> = {};
+    if (containerName) body.container_name = containerName;
+    const response = await this.client.post<TriggerPentestScanResponse>('/pentest/scan', body);
+    return {
+      scanRunId: response.data.scanRunId || (response.data as any).scan_run_id || '',
+      message: response.data.message || '',
+    };
+  }
+
+  async listPentestScanRuns(containerName?: string, limit: number = 20, offset: number = 0): Promise<PentestScanRunsResponse> {
+    const params: Record<string, any> = { limit, offset };
+    if (containerName) params.container_name = containerName;
+    const response = await this.client.get<PentestScanRunsResponse>('/pentest/scans', {
+      params,
+    });
+    return {
+      scanRuns: (response.data.scanRuns || (response.data as any).scan_runs || []).map((r: any) => ({
+        id: r.id,
+        trigger: r.trigger || '',
+        status: r.status || '',
+        modules: r.modules || '',
+        targetsCount: r.targetsCount || r.targets_count || 0,
+        criticalCount: r.criticalCount || r.critical_count || 0,
+        highCount: r.highCount || r.high_count || 0,
+        mediumCount: r.mediumCount || r.medium_count || 0,
+        lowCount: r.lowCount || r.low_count || 0,
+        infoCount: r.infoCount || r.info_count || 0,
+        errorMessage: r.errorMessage || r.error_message || '',
+        startedAt: r.startedAt || r.started_at || '',
+        completedAt: r.completedAt || r.completed_at || '',
+        duration: r.duration || '',
+        completedCount: r.completedCount || r.completed_count || 0,
+      })),
+      totalCount: response.data.totalCount || (response.data as any).total_count || 0,
+    };
+  }
+
+  async listPentestFindings(params?: ListPentestFindingsParams): Promise<PentestFindingsResponse> {
+    // Map camelCase params to snake_case for the gRPC-gateway API
+    const queryParams: Record<string, any> = {};
+    if (params) {
+      if (params.severity) queryParams.severity = params.severity;
+      if (params.category) queryParams.category = params.category;
+      if (params.status) queryParams.status = params.status;
+      if (params.targetType) queryParams.target_type = params.targetType;
+      if (params.containerName) queryParams.container_name = params.containerName;
+      if (params.limit !== undefined) queryParams.limit = params.limit;
+      if (params.offset !== undefined) queryParams.offset = params.offset;
+    }
+    const response = await this.client.get<PentestFindingsResponse>('/pentest/findings', { params: queryParams });
+    return {
+      findings: (response.data.findings || []).map((f: any) => ({
+        id: f.id,
+        fingerprint: f.fingerprint || '',
+        category: f.category || '',
+        severity: f.severity || '',
+        title: f.title || '',
+        description: f.description || '',
+        target: f.target || '',
+        evidence: f.evidence || '',
+        cveIds: f.cveIds || f.cve_ids || '',
+        remediation: f.remediation || '',
+        status: f.status || '',
+        firstScanRunId: f.firstScanRunId || f.first_scan_run_id || '',
+        lastScanRunId: f.lastScanRunId || f.last_scan_run_id || '',
+        firstSeenAt: f.firstSeenAt || f.first_seen_at || '',
+        lastSeenAt: f.lastSeenAt || f.last_seen_at || '',
+        resolvedAt: f.resolvedAt || f.resolved_at || '',
+        suppressed: f.suppressed || false,
+        suppressedReason: f.suppressedReason || f.suppressed_reason || '',
+        targetType: f.targetType || f.target_type || '',
+      })),
+      totalCount: response.data.totalCount || (response.data as any).total_count || 0,
+    };
+  }
+
+  async getPentestFindingSummary(): Promise<PentestFindingSummaryResponse> {
+    const response = await this.client.get<PentestFindingSummaryResponse>('/pentest/findings/summary');
+    const s: any = response.data.summary || response.data;
+    return {
+      summary: {
+        totalFindings: s.totalFindings || s.total_findings || 0,
+        openFindings: s.openFindings || s.open_findings || 0,
+        resolvedFindings: s.resolvedFindings || s.resolved_findings || 0,
+        suppressedFindings: s.suppressedFindings || s.suppressed_findings || 0,
+        criticalCount: s.criticalCount || s.critical_count || 0,
+        highCount: s.highCount || s.high_count || 0,
+        mediumCount: s.mediumCount || s.medium_count || 0,
+        lowCount: s.lowCount || s.low_count || 0,
+        infoCount: s.infoCount || s.info_count || 0,
+        byCategory: s.byCategory || s.by_category || {},
+      },
+    };
+  }
+
+  async suppressPentestFinding(findingId: number, reason: string): Promise<{ message: string }> {
+    const response = await this.client.post(`/pentest/findings/${findingId}/suppress`, {
+      finding_id: findingId,
+      reason,
+    });
+    return { message: response.data.message || '' };
+  }
+
+  async remediatePentestFinding(findingId: number): Promise<RemediatePentestFindingResponse> {
+    const response = await this.client.post<RemediatePentestFindingResponse>(`/pentest/findings/${findingId}/remediate`, {});
+    return {
+      success: response.data.success ?? false,
+      message: response.data.message || '',
+      packageName: response.data.packageName || (response.data as any).package_name || '',
+      oldVersion: response.data.oldVersion || (response.data as any).old_version || '',
+      newVersion: response.data.newVersion || (response.data as any).new_version || '',
+    };
+  }
+
+  async getPentestConfig(): Promise<PentestConfigResponse> {
+    const response = await this.client.get<PentestConfigResponse>('/pentest/config');
+    const c: any = response.data.config || response.data;
+    return {
+      config: {
+        enabled: c.enabled || false,
+        interval: c.interval || '',
+        modules: c.modules || '',
+        nucleiAvailable: c.nucleiAvailable || c.nuclei_available || false,
+        trivyAvailable: c.trivyAvailable || c.trivy_available || false,
+      },
+    };
+  }
+
+  async installPentestTool(toolName: string): Promise<InstallPentestToolResponse> {
+    const response = await this.client.post<InstallPentestToolResponse>('/pentest/tools/install', {
+      tool_name: toolName,
+    }, {
+      timeout: 120000, // 2 minutes — download + extract can be slow
+    });
+    return {
+      success: response.data.success || false,
+      message: response.data.message || '',
+    };
+  }
+
+  // ============================================
+  // Audit Log Methods
+  // ============================================
+
+  /**
+   * Get audit logs with optional filtering and pagination
+   */
+  async getAuditLogs(params?: AuditLogsParams): Promise<AuditLogsResponse> {
+    const response = await this.client.get<AuditLogsResponse>('/audit/logs', { params });
+    return {
+      logs: response.data.logs || [],
+      totalCount: response.data.totalCount || 0,
+    };
+  }
+
+  // ============================================
+  // Alert Management Methods
+  // ============================================
+
+  /**
+   * List all custom alert rules
+   */
+  async listAlertRules(): Promise<AlertRulesResponse> {
+    const response = await this.client.get<AlertRulesResponse>('/alerts');
+    return {
+      rules: response.data.rules || [],
+    };
+  }
+
+  /**
+   * Get a single alert rule by ID
+   */
+  async getAlertRule(id: string): Promise<AlertRule> {
+    const response = await this.client.get<{ rule: AlertRule }>(`/alerts/${id}`);
+    return response.data.rule;
+  }
+
+  /**
+   * Create a new alert rule
+   */
+  async createAlertRule(req: CreateAlertRuleRequest): Promise<AlertRule> {
+    const response = await this.client.post<{ rule: AlertRule }>('/alerts', req);
+    return response.data.rule;
+  }
+
+  /**
+   * Update an existing alert rule
+   */
+  async updateAlertRule(id: string, req: UpdateAlertRuleRequest): Promise<AlertRule> {
+    const response = await this.client.put<{ rule: AlertRule }>(`/alerts/${id}`, {
+      ...req,
+      id,
+    });
+    return response.data.rule;
+  }
+
+  /**
+   * Delete an alert rule
+   */
+  async deleteAlertRule(id: string): Promise<void> {
+    await this.client.delete(`/alerts/${id}`);
+  }
+
+  /**
+   * Get alerting system status
+   */
+  async getAlertingInfo(): Promise<AlertingInfoResponse> {
+    const response = await this.client.get<AlertingInfoResponse>('/system/alerting');
+    return {
+      enabled: response.data.enabled || false,
+      vmalertStatus: response.data.vmalertStatus || '',
+      alertmanagerStatus: response.data.alertmanagerStatus || '',
+      webhookUrl: response.data.webhookUrl || '',
+      totalRules: response.data.totalRules || 0,
+      customRules: response.data.customRules || 0,
+      webhookSecretConfigured: response.data.webhookSecretConfigured || false,
+    };
+  }
+
+  /**
+   * List built-in default alert rules
+   */
+  async listDefaultAlertRules(): Promise<AlertRulesResponse> {
+    const response = await this.client.get<AlertRulesResponse>('/alerts/defaults');
+    return response.data;
+  }
+
+  /**
+   * Update alerting configuration (webhook URL and/or secret)
+   */
+  async updateAlertingConfig(webhookUrl: string, generateWebhookSecret?: boolean): Promise<UpdateAlertingConfigResponse> {
+    const body: Record<string, unknown> = { webhook_url: webhookUrl };
+    if (generateWebhookSecret) {
+      body.generate_webhook_secret = true;
+    }
+    const response = await this.client.put<UpdateAlertingConfigResponse>('/system/alerting', body);
+    return response.data;
+  }
+
+  /**
+   * Test webhook by sending a test notification with current system status
+   */
+  async testWebhook(): Promise<TestWebhookResponse> {
+    const response = await this.client.post<TestWebhookResponse>('/system/alerting/test', {});
+    return response.data;
+  }
+
+  /**
+   * List webhook delivery history
+   */
+  async listWebhookDeliveries(limit: number = 50, offset: number = 0): Promise<WebhookDeliveriesResponse> {
+    const response = await this.client.get<WebhookDeliveriesResponse>('/system/alerting/deliveries', {
+      params: { limit, offset },
+    });
+    return {
+      deliveries: (response.data.deliveries || []).map(d => ({
+        id: d.id,
+        timestamp: d.timestamp || '',
+        alertName: d.alertName || (d as any).alert_name || '',
+        source: d.source || '',
+        webhookUrl: d.webhookUrl || (d as any).webhook_url || '',
+        success: d.success || false,
+        httpStatus: d.httpStatus || (d as any).http_status || 0,
+        errorMessage: d.errorMessage || (d as any).error_message || '',
+        payloadSize: d.payloadSize || (d as any).payload_size || 0,
+        durationMs: d.durationMs || (d as any).duration_ms || 0,
+      })),
+      totalCount: response.data.totalCount || (response.data as any).total_count || 0,
+    };
+  }
+
+  // ============================================
+  // ZAP Methods
+  // ============================================
+
+  async triggerZapScan(): Promise<TriggerZapScanResponse> {
+    const response = await this.client.post<TriggerZapScanResponse>('/zap/scan', {});
+    return {
+      scanRunId: response.data.scanRunId || (response.data as any).scan_run_id || '',
+      message: response.data.message || '',
+    };
+  }
+
+  async listZapScanRuns(limit: number = 20, offset: number = 0): Promise<ZapScanRunsResponse> {
+    const response = await this.client.get<ZapScanRunsResponse>('/zap/scans', {
+      params: { limit, offset },
+    });
+    return {
+      scanRuns: (response.data.scanRuns || (response.data as any).scan_runs || []).map((r: any) => ({
+        id: r.id,
+        trigger: r.trigger || '',
+        status: r.status || '',
+        targetsCount: r.targetsCount || r.targets_count || 0,
+        highCount: r.highCount || r.high_count || 0,
+        mediumCount: r.mediumCount || r.medium_count || 0,
+        lowCount: r.lowCount || r.low_count || 0,
+        infoCount: r.infoCount || r.info_count || 0,
+        errorMessage: r.errorMessage || r.error_message || '',
+        startedAt: r.startedAt || r.started_at || '',
+        completedAt: r.completedAt || r.completed_at || '',
+        duration: r.duration || '',
+        completedCount: r.completedCount || r.completed_count || 0,
+      })),
+      totalCount: response.data.totalCount || (response.data as any).total_count || 0,
+    };
+  }
+
+  async listZapAlerts(params?: ListZapAlertsParams): Promise<ZapAlertsResponse> {
+    const queryParams: Record<string, any> = {};
+    if (params) {
+      if (params.risk) queryParams.risk = params.risk;
+      if (params.status) queryParams.status = params.status;
+      if (params.domain) queryParams.domain = params.domain;
+      if (params.limit !== undefined) queryParams.limit = params.limit;
+      if (params.offset !== undefined) queryParams.offset = params.offset;
+    }
+    const response = await this.client.get<ZapAlertsResponse>('/zap/alerts', { params: queryParams });
+    return {
+      alerts: (response.data.alerts || []).map((a: any) => ({
+        id: a.id,
+        fingerprint: a.fingerprint || '',
+        pluginId: a.pluginId || a.plugin_id || '',
+        alertName: a.alertName || a.alert_name || '',
+        risk: a.risk || '',
+        confidence: a.confidence || '',
+        description: a.description || '',
+        url: a.url || '',
+        method: a.method || '',
+        evidence: a.evidence || '',
+        solution: a.solution || '',
+        cweIds: a.cweIds || a.cwe_ids || '',
+        references: a.references || '',
+        status: a.status || '',
+        firstScanRunId: a.firstScanRunId || a.first_scan_run_id || '',
+        lastScanRunId: a.lastScanRunId || a.last_scan_run_id || '',
+        firstSeenAt: a.firstSeenAt || a.first_seen_at || '',
+        lastSeenAt: a.lastSeenAt || a.last_seen_at || '',
+        resolvedAt: a.resolvedAt || a.resolved_at || '',
+        suppressed: a.suppressed || false,
+        suppressedReason: a.suppressedReason || a.suppressed_reason || '',
+      })),
+      totalCount: response.data.totalCount || (response.data as any).total_count || 0,
+    };
+  }
+
+  async getZapAlertSummary(): Promise<ZapAlertSummaryResponse> {
+    const response = await this.client.get<ZapAlertSummaryResponse>('/zap/alerts/summary');
+    const s: any = response.data.summary || response.data;
+    return {
+      summary: {
+        totalAlerts: s.totalAlerts || s.total_alerts || 0,
+        openAlerts: s.openAlerts || s.open_alerts || 0,
+        resolvedAlerts: s.resolvedAlerts || s.resolved_alerts || 0,
+        suppressedAlerts: s.suppressedAlerts || s.suppressed_alerts || 0,
+        highCount: s.highCount || s.high_count || 0,
+        mediumCount: s.mediumCount || s.medium_count || 0,
+        lowCount: s.lowCount || s.low_count || 0,
+        infoCount: s.infoCount || s.info_count || 0,
+      },
+    };
+  }
+
+  async suppressZapAlert(alertId: number, reason: string): Promise<{ message: string }> {
+    const response = await this.client.post(`/zap/alerts/${alertId}/suppress`, {
+      alert_id: alertId,
+      reason,
+    });
+    return { message: response.data.message || '' };
+  }
+
+  async getZapConfig(): Promise<ZapConfigResponse> {
+    const response = await this.client.get<ZapConfigResponse>('/zap/config');
+    const c: any = response.data.config || response.data;
+    return {
+      config: {
+        enabled: c.enabled || false,
+        interval: c.interval || '',
+        zapAvailable: c.zapAvailable || c.zap_available || false,
+        zapVersion: c.zapVersion || c.zap_version || '',
+      },
+    };
+  }
+
+  async getZapReport(scanRunId: string, format: string = 'html'): Promise<ZapReportResponse> {
+    const response = await this.client.get<ZapReportResponse>(`/zap/scans/${scanRunId}/report`, {
+      params: { format },
+      timeout: 180000, // 3 minutes — ZAP report generation can be slow (daemon startup + report)
+    });
+    return {
+      content: response.data.content || '',
+      contentType: response.data.contentType || (response.data as any).content_type || '',
+      filename: response.data.filename || '',
+    };
+  }
+
+  async installZap(): Promise<InstallZapResponse> {
+    const response = await this.client.post<InstallZapResponse>('/zap/install', {}, {
+      timeout: 300000, // 5 minutes — ZAP is a large download
+    });
+    return {
+      success: response.data.success || false,
+      message: response.data.message || '',
+    };
+  }
+
+  getClamavReportExportUrl(from: string, to: string, containerName?: string, status?: string): string {
+    const baseURL = normalizeEndpoint(this.server.endpoint);
+    const token = sanitizeToken(this.server.token);
+    const params = new URLSearchParams({ from, to, token });
+    if (containerName) params.set('container_name', containerName);
+    if (status) params.set('status', status);
+    return `${baseURL}/security/clamav-reports/export?${params.toString()}`;
+  }
+}
+
+/**
+ * Create a client instance for a server.
+ * Returns a DemoClient for the special '__demo__' endpoint.
+ */
+export function getClient(server: Server): ContaineriumClient {
+  if (server.endpoint === '__demo__') {
+    // Lazy import to avoid bundling demo data in production
+    const { DemoClient } = require('@/src/lib/demo/DemoClient');
+    return new DemoClient();
+  }
+  return new ContaineriumClient(server);
+}
