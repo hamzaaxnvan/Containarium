@@ -62,3 +62,67 @@ func parseConsoleUsername(path string) string {
 // between the caller and the instance's serial console. Callers must
 // already be authenticated and tenant-authorized (see
 // authorizeTenantWSAccess in gateway.go) — matching TerminalHandler's
+// contract, that check happens in the route registration closure, not
+// here.
+func (ch *ConsoleHandler) HandleConsole(w http.ResponseWriter, r *http.Request) {
+	username := parseConsoleUsername(r.URL.Path)
+	if username == "" {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	containerName := username + "-container"
+
+	state, _, err := ch.incusClient.GetInstanceState(containerName)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("container not found: %v", err), http.StatusNotFound)
+		return
+	}
+	if state.Status != "Running" {
+		http.Error(w, fmt.Sprintf("container is not running (status: %s)", state.Status), http.StatusBadRequest)
+		return
+	}
+
+	conn, err := ch.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("console WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	log.Printf("console attached for container %s", containerName)
+	ch.attachConsole(conn, containerName)
+	log.Printf("console detached for container %s", containerName)
+}
+
+// attachConsole bridges conn (the caller's WebSocket) to the instance's
+// serial console and blocks until the session ends. It does not depend on
+// op.Wait()'s exact completion semantics for a clean detach: closing conn
+// (a client-initiated close frame, or the connection simply dying) is
+// observed via SetCloseHandler, which is what actually drives the
+// ConsoleDisconnect signal telling Incus to detach without killing the
+// instance — the same signal upstream's own `incus console` CLI relies on.
+func (ch *ConsoleHandler) attachConsole(conn *websocket.Conn, containerName string) {
+	disconnect := make(chan bool)
+	var closeOnce sync.Once
+	closeDisconnect := func() { closeOnce.Do(func() { close(disconnect) }) }
+
+	conn.SetCloseHandler(func(code int, text string) error {
+		closeDisconnect()
+		return nil
+	})
+
+	op, err := ch.incusClient.ConsoleInstance(containerName, api.InstanceConsolePost{Type: "console"}, &incus.InstanceConsoleArgs{
+		Terminal:          ws.NewWrapper(conn),
+		Control:           func(*websocket.Conn) {}, // resize not meaningful for a serial console
+		ConsoleDisconnect: disconnect,
+	})
+	if err != nil {
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("error: "+err.Error()))
+		return
+	}
+
+	if err := op.Wait(); err != nil {
+		log.Printf("console session for %s ended with error: %v", containerName, err)
+	}
+	closeDisconnect()
+}
