@@ -40,3 +40,32 @@ func (r *CrossTenantFlowRule) OnFlows(ctx RuleContext, flows []netbpf.FlowRecord
 		}
 		out = append(out, RawFinding{
 			Rule:     pb.ThreatRuleId_THREAT_RULE_ID_CROSS_TENANT_FLOW,
+			Severity: pb.ThreatSeverity_THREAT_SEVERITY_CRITICAL,
+			TenantID: srcTenant,
+			// Subject is the peer tenant id — see RawFinding's dedupe-scope
+			// doc. Two tenants probing each other from both sides dedupe
+			// into two distinct findings (one per direction), which is
+			// correct: each side's container is a separate thing to
+			// investigate.
+			Subject: dstTenant,
+			Evidence: Evidence{Flows: []FlowEvidence{{
+				SrcIP:    f.Src().String(),
+				DstIP:    f.Dst().String(),
+				SrcPort:  uint32(f.Sport),
+				DstPort:  uint32(f.Dport),
+				Protocol: protoName(f.Proto),
+				Bytes:    safeInt64(f.Bytes),
+				Packets:  safeInt64(f.Packets),
+			}}},
+		})
+	}
+	return out
+}
+
+// OnDeny: cross-tenant-flow is a flow-shaped rule; a policy deny means the
+// enforcer already stopped the packet, so it can't be the breach this rule
+// exists to catch (that's DenyBurstRule's signal instead).
+func (r *CrossTenantFlowRule) OnDeny(RuleContext, netbpf.DenyEvent) []RawFinding { return nil }
+
+// Sweep: no time-window state to evaluate.
+func (r *CrossTenantFlowRule) Sweep(RuleContext, time.Time) []RawFinding { return nil }

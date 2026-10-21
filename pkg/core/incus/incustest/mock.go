@@ -246,3 +246,251 @@ func (m *MockBackend) ExecWithExitCode(containerName string, command []string) (
 	if m.ExecWithExitCodeFunc != nil {
 		return m.ExecWithExitCodeFunc(containerName, command)
 	}
+	return "", "", 0, nil
+}
+
+func (m *MockBackend) WriteFile(containerName, path string, content []byte, mode string) error {
+	if m.WriteFileFunc != nil {
+		return m.WriteFileFunc(containerName, path, content, mode)
+	}
+	return nil
+}
+
+func (m *MockBackend) ReadFile(containerName, path string) ([]byte, error) {
+	if m.ReadFileFunc != nil {
+		return m.ReadFileFunc(containerName, path)
+	}
+	return nil, nil
+}
+
+func (m *MockBackend) ListDir(containerName, path string) ([]string, error) {
+	if m.ListDirFunc != nil {
+		return m.ListDirFunc(containerName, path)
+	}
+	return nil, nil
+}
+
+func (m *MockBackend) SetConfig(containerName, key, value string) error {
+	if m.SetConfigFunc != nil {
+		return m.SetConfigFunc(containerName, key, value)
+	}
+	return nil
+}
+
+func (m *MockBackend) SetCPULimit(containerName, cpu string) error {
+	if m.SetCPULimitFunc != nil {
+		return m.SetCPULimitFunc(containerName, cpu)
+	}
+	return nil
+}
+
+func (m *MockBackend) SetCPUConfig(containerName, count, allowance string) error {
+	if m.SetCPUConfigFunc != nil {
+		return m.SetCPUConfigFunc(containerName, count, allowance)
+	}
+	return nil
+}
+
+func (m *MockBackend) FreezeContainer(name string) error {
+	if m.FreezeContainerFunc != nil {
+		return m.FreezeContainerFunc(name)
+	}
+	return nil
+}
+
+func (m *MockBackend) UnfreezeContainer(name string) error {
+	if m.UnfreezeContainerFunc != nil {
+		return m.UnfreezeContainerFunc(name)
+	}
+	return nil
+}
+
+func (m *MockBackend) UnsetConfig(containerName, key string) error {
+	if m.UnsetConfigFunc != nil {
+		return m.UnsetConfigFunc(containerName, key)
+	}
+	return nil
+}
+
+func (m *MockBackend) SetDeviceSize(containerName, deviceName, size string) error {
+	if m.SetDeviceSizeFunc != nil {
+		return m.SetDeviceSizeFunc(containerName, deviceName, size)
+	}
+	return nil
+}
+
+func (m *MockBackend) ResolveGPUInputToPCI(input string) (string, error) {
+	if m.ResolveGPUInputToPCIFunc != nil {
+		return m.ResolveGPUInputToPCIFunc(input)
+	}
+	return "", nil
+}
+
+func (m *MockBackend) CleanupDisk(containerName string) (string, int64, error) {
+	if m.CleanupDiskFunc != nil {
+		return m.CleanupDiskFunc(containerName)
+	}
+	return "", 0, nil
+}
+
+func (m *MockBackend) AddLabel(containerName, key, value string) error {
+	if m.AddLabelFunc != nil {
+		return m.AddLabelFunc(containerName, key, value)
+	}
+	return nil
+}
+
+func (m *MockBackend) RemoveLabel(containerName, key string) error {
+	if m.RemoveLabelFunc != nil {
+		return m.RemoveLabelFunc(containerName, key)
+	}
+	return nil
+}
+
+func (m *MockBackend) GetLabels(containerName string) (map[string]string, error) {
+	if m.GetLabelsFunc != nil {
+		return m.GetLabelsFunc(containerName)
+	}
+	return nil, nil
+}
+
+func (m *MockBackend) SetLabels(containerName string, labels map[string]string) error {
+	if m.SetLabelsFunc != nil {
+		return m.SetLabelsFunc(containerName, labels)
+	}
+	return nil
+}
+
+func (m *MockBackend) GetServerInfo() (*api.Server, error) {
+	if m.GetServerInfoFunc != nil {
+		return m.GetServerInfoFunc()
+	}
+	return nil, nil
+}
+
+func (m *MockBackend) GetContainerMetrics(name string) (*incus.ContainerMetrics, error) {
+	if m.GetContainerMetricsFunc != nil {
+		return m.GetContainerMetricsFunc(name)
+	}
+	return nil, nil
+}
+
+func (m *MockBackend) GetContainerImageFingerprint(name string) (string, error) {
+	if m.GetContainerImageFingerprintFunc != nil {
+		return m.GetContainerImageFingerprintFunc(name)
+	}
+	return "", nil
+}
+
+func (m *MockBackend) PublishImage(containerName, alias string, properties map[string]string) (string, error) {
+	if m.PublishImageFunc != nil {
+		return m.PublishImageFunc(containerName, alias, properties)
+	}
+	return "", nil
+}
+
+func (m *MockBackend) GetImageAliasProperties(alias string) (map[string]string, bool, error) {
+	if m.GetImageAliasPropertiesFunc != nil {
+		return m.GetImageAliasPropertiesFunc(alias)
+	}
+	return nil, false, nil
+}
+
+func (m *MockBackend) UpdateContainerConfig(name, key, value string) error {
+	if m.UpdateContainerConfigFunc != nil {
+		return m.UpdateContainerConfigFunc(name, key, value)
+	}
+	return nil
+}
+
+func (m *MockBackend) GetRawInstance(name string) (map[string]string, string, error) {
+	if m.GetRawInstanceFunc != nil {
+		return m.GetRawInstanceFunc(name)
+	}
+	return nil, "", nil
+}
+
+func (m *MockBackend) GetConsoleLog(name string) (string, error) {
+	if m.GetConsoleLogFunc != nil {
+		return m.GetConsoleLogFunc(name)
+	}
+	return "", nil
+}
+
+// StoragePool reports the configured pool, defaulting to incus's own default
+// so existing tests see exactly what they always did (#1213).
+func (m *MockBackend) StoragePool() string {
+	if m.StoragePoolName == "" {
+		return incus.DefaultStoragePool
+	}
+	return m.StoragePoolName
+}
+
+// Compile-time assertion that *MockBackend satisfies incus.Backend.
+var _ incus.Backend = (*MockBackend)(nil)
+
+// Network ACLs + NIC devices (core-infra network guard). Defaults are
+// permissive no-ops so existing tests see no change; a test that cares
+// installs the hook.
+func (m *MockBackend) GetNetworkACL(name string) (*api.NetworkACL, error) {
+	if m.GetNetworkACLFunc != nil {
+		return m.GetNetworkACLFunc(name)
+	}
+	return nil, fmt.Errorf("network ACL %q not found", name)
+}
+
+func (m *MockBackend) CreateNetworkACL(config incus.ACLConfig) error {
+	if m.CreateNetworkACLFunc != nil {
+		return m.CreateNetworkACLFunc(config)
+	}
+	return nil
+}
+
+func (m *MockBackend) UpdateNetworkACL(name string, config incus.ACLConfig) error {
+	if m.UpdateNetworkACLFunc != nil {
+		return m.UpdateNetworkACLFunc(name, config)
+	}
+	return nil
+}
+
+func (m *MockBackend) ListNetworkACLs() ([]api.NetworkACL, error) {
+	if m.ListNetworkACLsFunc != nil {
+		return m.ListNetworkACLsFunc()
+	}
+	return nil, nil
+}
+
+func (m *MockBackend) DeleteNetworkACL(name string) error {
+	if m.DeleteNetworkACLFunc != nil {
+		return m.DeleteNetworkACLFunc(name)
+	}
+	return nil
+}
+
+func (m *MockBackend) SetOwnedACL(containerName, aclName, deviceName, ownedPrefix string) error {
+	if m.SetOwnedACLFunc != nil {
+		return m.SetOwnedACLFunc(containerName, aclName, deviceName, ownedPrefix)
+	}
+	return nil
+}
+
+func (m *MockBackend) AttachACLToContainer(containerName, aclName, deviceName string) error {
+	if m.AttachACLToContainerFunc != nil {
+		return m.AttachACLToContainerFunc(containerName, aclName, deviceName)
+	}
+	return nil
+}
+
+func (m *MockBackend) EnsureNICDevice(containerName string, want incus.NICDevice) error {
+	if m.EnsureNICDeviceFunc != nil {
+		return m.EnsureNICDeviceFunc(containerName, want)
+	}
+	return nil
+}
+
+func (m *MockBackend) SetDeviceConfig(containerName, deviceName string, keys map[string]string) error {
+	if m.SetDeviceConfigFunc != nil {
+		return m.SetDeviceConfigFunc(containerName, deviceName, keys)
+	}
+	return nil
+}
