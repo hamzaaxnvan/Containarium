@@ -70,3 +70,76 @@ func TestPostKeyResync_WrongSecretRejected(t *testing.T) {
 	}
 }
 
+// A sentinel too old to serve the endpoint (or any other non-200) must
+// surface as an error the caller logs, never as a silent success.
+func TestPostKeyResync_NotFoundIsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	if _, err := postKeyResync(context.Background(), srv.URL, "backend-a", "test", testHMACSecret); err == nil {
+		t.Fatal("expected an error for a 404 from the sentinel")
+	}
+}
+
+func TestPostKeyResync_TrailingSlashInSentinelURL(t *testing.T) {
+	var path atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path.Store(r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(sentinel.KeyResyncResponse{Synced: true})
+	}))
+	defer srv.Close()
+
+	if _, err := postKeyResync(context.Background(), srv.URL+"/", "backend-a", "test", testHMACSecret); err != nil {
+		t.Fatalf("postKeyResync: %v", err)
+	}
+	if got, _ := path.Load().(string); got != "/sentinel/keys/resync" {
+		t.Fatalf("path = %q, want /sentinel/keys/resync", got)
+	}
+}
+
+// A daemon with no sentinel in front of it (standalone, or a test server)
+// has nothing to notify. It must no-op rather than panic on the nil pool —
+// this runs on every create.
+func TestNotifySentinelKeyChange_NoSentinelIsNoOp(t *testing.T) {
+	s := &ContainerServer{}
+	s.notifySentinelKeyChange(context.Background(), "create_container test")
+
+	s = &ContainerServer{peerPool: NewPeerPool("backend-a", "", nil, "pool-a")}
+	s.notifySentinelKeyChange(context.Background(), "create_container test")
+}
+
+// A daemon holding the sentinel HMAC secret is part of a sentinel-fronted
+// deployment, so an empty sentinel URL there silently turns off event-driven
+// key resync (and self-upgrade) — the warning must name both and the fix.
+// A genuinely standalone daemon (no secret) must stay quiet.
+func TestSentinelConfigWarning(t *testing.T) {
+	tests := []struct {
+		name     string
+		url      string
+		secret   []byte
+		wantWarn bool
+	}{
+		{"sentinel-fronted daemon with URL", "http://10.0.0.5:8081", testHMACSecret, false},
+		{"secret set but no URL", "", testHMACSecret, true},
+		{"standalone daemon (neither)", "", nil, false},
+		{"URL without secret is left to the existing #687 warning", "http://10.0.0.5:8081", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sentinelConfigWarning(tt.url, tt.secret)
+			if (got != "") != tt.wantWarn {
+				t.Fatalf("sentinelConfigWarning(%q, secret len %d) = %q, want warning=%v", tt.url, len(tt.secret), got, tt.wantWarn)
+			}
+			if tt.wantWarn {
+				for _, want := range []string{"--sentinel-url", "key resync", "self-upgrade"} {
+					if !strings.Contains(got, want) {
+						t.Errorf("warning %q does not mention %q", got, want)
+					}
+				}
+			}
+		})
+	}
+}

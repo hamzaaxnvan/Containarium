@@ -61,3 +61,67 @@ Examples:
 }
 
 func init() {
+	sshKeysSetCmd.Flags().StringVar(&sshKeysServer, "server", "", "server to talk to (default: your logged-in server)")
+	sshKeysSetCmd.Flags().StringArrayVar(&sshKeysKeys, "key", nil, "public key to authorize (repeatable)")
+	sshKeysSetCmd.Flags().StringArrayVar(&sshKeysKeyFiles, "key-file", nil, "file holding one public key to authorize (repeatable)")
+	sshKeysSetCmd.Flags().BoolVar(&sshKeysEmpty, "empty", false, "remove every key you manage (required to send an empty list)")
+	sshKeysCmd.AddCommand(sshKeysSetCmd)
+	rootCmd.AddCommand(sshKeysCmd)
+}
+
+// buildSetSSHKeysRequest assembles the request. Keys are passed through
+// untouched: validation is the daemon's job, so the CLI cannot disagree with it.
+func buildSetSSHKeysRequest(box string, keys, keyFiles []string, empty bool) (*pb.SetSSHKeysRequest, error) {
+	all := append([]string{}, keys...)
+	for _, f := range keyFiles {
+		b, err := os.ReadFile(f) // #nosec G304 -- path from an explicit flag
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", f, err)
+		}
+		all = append(all, strings.TrimSpace(string(b)))
+	}
+	switch {
+	case len(all) == 0 && !empty:
+		return nil, fmt.Errorf("no keys given: pass --key/--key-file, or --empty to remove every key")
+	case len(all) > 0 && empty:
+		return nil, fmt.Errorf("--empty cannot be combined with --key/--key-file")
+	}
+	return &pb.SetSSHKeysRequest{Username: box, SshPublicKeys: all, AllowEmpty: empty}, nil
+}
+
+func (c *connectAPI) SetSSHKeys(ctx context.Context, req *pb.SetSSHKeysRequest) (*pb.SetSSHKeysResponse, error) {
+	b, err := protojson.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Message     string `json:"message"`
+		RemovedKeys int32  `json:"removedKeys"`
+		TotalKeys   int32  `json:"totalKeys"`
+	}
+	if _, err := c.do(ctx, http.MethodPut, "/v1/containers/"+url.PathEscape(req.Username)+"/ssh-keys", json.RawMessage(b), &out); err != nil {
+		return nil, err
+	}
+	return &pb.SetSSHKeysResponse{Message: out.Message, RemovedKeys: out.RemovedKeys, TotalKeys: out.TotalKeys}, nil
+}
+
+func runSSHKeysSet(cmd *cobra.Command, args []string) error {
+	box := args[0]
+	if err := validateBoxName(box); err != nil {
+		return err
+	}
+	req, err := buildSetSSHKeysRequest(box, sshKeysKeys, sshKeysKeyFiles, sshKeysEmpty)
+	if err != nil {
+		return err
+	}
+	api, err := newConnectAPI(pickSSHServer(sshKeysServer))
+	if err != nil {
+		return err
+	}
+	resp, err := api.SetSSHKeys(cmd.Context(), req)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "%s (removed %d, %d caller-managed key(s) now authorized)\n", resp.Message, resp.RemovedKeys, resp.TotalKeys)
+	return nil
+}
