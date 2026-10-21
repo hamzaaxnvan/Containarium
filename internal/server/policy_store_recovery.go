@@ -81,3 +81,86 @@ func (r *policyStoreRecovery) syncHealth() {
 		}
 		r.health.SetServingStatus(svc, st)
 	}
+	set(pb.GuardrailPolicyService_ServiceDesc.ServiceName, r.guardrail.Durable())
+	set(pb.CodingToolEgressPolicyService_ServiceDesc.ServiceName, r.egress.Durable())
+}
+
+// pending reports whether any store is still on its stand-in.
+func (r *policyStoreRecovery) pending() bool {
+	return !r.guardrail.Durable() || !r.egress.Durable()
+}
+
+// Run publishes readiness, then retries until both stores are installed or
+// ctx ends. pool is the pool startup opened, or nil if it could not connect;
+// a pool the loop opens is kept for the installed stores.
+func (r *policyStoreRecovery) Run(ctx context.Context, pool *pgxpool.Pool) {
+	r.syncHealth()
+	if !r.pending() {
+		return
+	}
+	wait := r.initial
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.after(wait):
+		}
+		next := min(wait*2, r.max)
+		err := r.attempt(ctx, &pool)
+		r.syncHealth()
+		if !r.pending() {
+			r.logf("Policy stores recovered: the Postgres guardrail and coding-tool egress policy stores are installed")
+			return
+		}
+		r.logf("Warning: policy store still UNAVAILABLE (its APIs fail closed): %v; next attempt in %s", err, next)
+		wait = next
+	}
+}
+
+// attempt connects if needed and installs every store still pending. Only
+// the Postgres stores are installed; an in-memory store is refused.
+func (r *policyStoreRecovery) attempt(ctx context.Context, pool **pgxpool.Pool) error {
+	if *pool == nil {
+		p, err := r.connect(ctx)
+		if err != nil {
+			return fmt.Errorf("connect to Postgres: %w", err)
+		}
+		*pool = p
+	}
+	var errs []error
+	if !r.guardrail.Durable() {
+		err := r.guardrail.InstallDurableStore(func() (guardrailpolicy.Store, error) {
+			st, err := r.openGuardrail(ctx, *pool)
+			if err != nil {
+				return nil, err
+			}
+			if _, mem := st.(*guardrailpolicy.MemoryStore); mem {
+				return nil, errInMemoryPolicyStore
+			}
+			return st, nil
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("guardrail policy store: %w", err))
+		} else {
+			r.logf("Guardrail policy persistence enabled (Postgres store, installed by retry)")
+		}
+	}
+	if !r.egress.Durable() {
+		err := r.egress.InstallDurableStore(func() (CodingToolEgressPolicyStore, error) {
+			st, err := r.openEgress(ctx, *pool)
+			if err != nil {
+				return nil, err
+			}
+			if _, mem := st.(*MemCodingToolEgressPolicyStore); mem {
+				return nil, errInMemoryPolicyStore
+			}
+			return st, nil
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("coding-tool egress policy store: %w", err))
+		} else {
+			r.logf("Coding-tool egress policy persistence enabled (Postgres store, installed by retry)")
+		}
+	}
+	return errors.Join(errs...)
+}
