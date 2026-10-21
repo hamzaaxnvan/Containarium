@@ -114,3 +114,119 @@ var ErrRevisionConflict = errors.New("guardrail policy changed since it was read
 // ErrRevocationPermanent: the request drops or changes a stored revoked key.
 var ErrRevocationPermanent = errors.New("guardrail signer revocation is permanent")
 
+// CheckTransition is what a Set checks against the stored state, under the
+// store's lock: the expected_revision precondition (stored is the stored
+// revision, 0 when not configured), and that every stored revoked key is
+// kept with the same reason.
+func CheckTransition(prev *pb.ServerGuardrailPolicy, stored int64, req *pb.SetGuardrailPolicyRequest) error {
+	if req.ExpectedRevision != nil && req.GetExpectedRevision() != stored {
+		return fmt.Errorf("%w: expected revision %d, stored revision is %d", ErrRevisionConflict, req.GetExpectedRevision(), stored)
+	}
+	kept := make(map[string]string, len(req.GetRevokedSigners()))
+	for _, r := range req.GetRevokedSigners() {
+		kept[r.GetKeyId()] = r.GetReason()
+	}
+	for _, r := range prev.GetRevokedSigners() {
+		reason, ok := kept[r.GetKeyId()]
+		if !ok {
+			return fmt.Errorf("%w: the request drops revoked key %s", ErrRevocationPermanent, r.GetKeyId())
+		}
+		if reason != r.GetReason() {
+			return fmt.Errorf("%w: the request changes the reason of revoked key %s", ErrRevocationPermanent, r.GetKeyId())
+		}
+	}
+	return nil
+}
+
+// Next builds the record a Set stores on top of prev (nil = not configured):
+// revision prev+1, the request's rules and signers (copied), now and
+// updatedBy. A revoked key already stored keeps its stored entry; a new one
+// gets revoked_at = now, whatever the request says. Exported for pgstore.
+func Next(prev *pb.ServerGuardrailPolicy, req *pb.SetGuardrailPolicyRequest, updatedBy string, now time.Time) *pb.ServerGuardrailPolicy {
+	stamp := timestamppb.New(now.UTC().Truncate(time.Microsecond))
+	out := &pb.ServerGuardrailPolicy{
+		Policy:    proto.Clone(req.GetPolicy()).(*pb.GuardrailPolicy),
+		Revision:  prev.GetRevision() + 1,
+		UpdatedAt: stamp,
+		UpdatedBy: updatedBy,
+	}
+	for _, s := range req.GetTrustedSigners() {
+		out.TrustedSigners = append(out.TrustedSigners, proto.Clone(s).(*pb.GuardrailTrustedSigner))
+	}
+	stored := make(map[string]*pb.GuardrailRevokedKey, len(prev.GetRevokedSigners()))
+	for _, r := range prev.GetRevokedSigners() {
+		stored[r.GetKeyId()] = r
+	}
+	for _, r := range req.GetRevokedSigners() {
+		entry, ok := stored[r.GetKeyId()]
+		if !ok {
+			entry = &pb.GuardrailRevokedKey{KeyId: r.GetKeyId(), Reason: r.GetReason(), RevokedAt: stamp}
+		}
+		out.RevokedSigners = append(out.RevokedSigners, proto.Clone(entry).(*pb.GuardrailRevokedKey))
+	}
+	return out
+}
+
+// Clone deep-copies p; nil stays nil.
+func Clone(p *pb.ServerGuardrailPolicy) *pb.ServerGuardrailPolicy {
+	if p == nil {
+		return nil
+	}
+	return proto.Clone(p).(*pb.ServerGuardrailPolicy)
+}
+
+// MemoryStore is the in-process store for daemons without a database and
+// for tests. It does not survive a restart.
+type MemoryStore struct {
+	mu       sync.Mutex
+	cur      *pb.ServerGuardrailPolicy
+	baseline *pb.GuardrailBaselineSetting
+}
+
+func NewMemoryStore() *MemoryStore { return &MemoryStore{baseline: DefaultBaseline()} }
+
+func (m *MemoryStore) GetBaselineMode(context.Context) (*pb.GuardrailBaselineSetting, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return proto.Clone(m.baseline).(*pb.GuardrailBaselineSetting), nil
+}
+
+func (m *MemoryStore) SetBaselineMode(_ context.Context, mode pb.GuardrailBaselineMode, updatedBy string, beforeCommit BaselineBeforeCommit) (*BaselineSetResult, error) {
+	if !ValidBaselineMode(mode) {
+		return nil, ErrInvalidBaselineMode
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur := NextBaseline(m.baseline, mode, updatedBy, time.Now())
+	res := &BaselineSetResult{
+		Previous: proto.Clone(m.baseline).(*pb.GuardrailBaselineSetting),
+		Current:  proto.Clone(cur).(*pb.GuardrailBaselineSetting),
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(res); err != nil {
+			return nil, err
+		}
+	}
+	m.baseline = cur
+	return res, nil
+}
+
+func (m *MemoryStore) Get(context.Context) (*pb.ServerGuardrailPolicy, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cur == nil {
+		return nil, ErrNotConfigured
+	}
+	return Clone(m.cur), nil
+}
+
+func (m *MemoryStore) Set(_ context.Context, req *pb.SetGuardrailPolicyRequest, updatedBy string) (*SetResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prev := m.cur
+	if err := CheckTransition(prev, prev.GetRevision(), req); err != nil {
+		return nil, err
+	}
+	m.cur = Next(prev, req, updatedBy, time.Now())
+	return &SetResult{Previous: Clone(prev), Current: Clone(m.cur)}, nil
+}
