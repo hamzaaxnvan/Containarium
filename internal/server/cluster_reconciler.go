@@ -183,3 +183,374 @@ func (r *ClusterReconciler) ReconcileOnce(ctx context.Context) {
 	if err != nil {
 		log.Printf("[cluster] reconcile: list: %v", err)
 		return
+	}
+	for _, c := range clusters {
+		if err := r.reconcileCluster(ctx, c); err != nil {
+			log.Printf("[cluster] reconcile %s/%s: %v", c.Owner, c.Name, err)
+			// Provisioning failures surface on the record; the next
+			// pass retries (interval = natural backoff).
+			_ = r.store.SetState(ctx, c.Owner, c.Name, clusterstore.StateError, err.Error())
+		}
+	}
+}
+
+func desiredFrom(c *clusterstore.Cluster) clustercore.Desired {
+	d := clustercore.Desired{
+		Tenant:   c.Owner,
+		Cluster:  c.Name,
+		Deleting: c.State == clusterstore.StateDeleting,
+	}
+	for _, g := range c.NodeGroups {
+		// Decide's Min is the CREATION target: the autoscaler-owned
+		// target size clamped into [min, max] (#1415). Decide itself
+		// stays scale-up-only; explicit removals go through the CA
+		// provider's DeleteNodes.
+		d.Groups = append(d.Groups, clustercore.DesiredGroup{
+			Name: g.Name, Min: int(g.EffectiveTarget()), Max: int(g.MaxNodes),
+			CPU: g.Size.CPU, Memory: g.Size.Memory, Disk: g.Size.Disk,
+		})
+	}
+	return d
+}
+
+// cpSize is the control-plane VM's fixed size — platform overhead,
+// deliberately not part of any tenant node group.
+var cpSize = clustercore.DesiredGroup{CPU: "2", Memory: "4GB", Disk: "40GB"}
+
+func (r *ClusterReconciler) reconcileCluster(ctx context.Context, c *clusterstore.Cluster) error {
+	observed, err := r.mgr.Observe(c.Owner, c.Name)
+	if err != nil {
+		return fmt.Errorf("observe: %w", err)
+	}
+	// Desired is read AFTER the observation, never before.
+	//
+	// ReconcileOnce lists every cluster once, so the record reaching
+	// this function can be arbitrarily old — as old as all the
+	// preceding clusters' work in the same pass, and provisioning
+	// blocks on a multi-minute WaitReady. Deriving Desired from that
+	// snapshot and pairing it with a fresh observation is the #1498
+	// resurrect race in its remaining form: a scale-down landing in
+	// between yields a target that still counts a node the observation
+	// no longer sees, and Decide rebuilds it.
+	//
+	// Reading the record last cannot produce that pairing. The worst
+	// case becomes a target LOWER than the observation, which Decide
+	// leaves alone (it only creates up to Min, never scales down) and
+	// the autoscaler resolves.
+	//
+	// A record that cannot be re-read falls back to the snapshot: that
+	// is the status quo, not a new failure, and refusing to reconcile
+	// on a transient store error would be worse.
+	if fresh, ferr := r.store.Get(ctx, c.Owner, c.Name); ferr == nil && fresh != nil {
+		c = fresh
+	}
+	desired := desiredFrom(c)
+	iso := coreIsolation(c.NodeIsolation)
+	actions := clustercore.Decide(desired, observed)
+
+	groupByName := make(map[string]clustercore.DesiredGroup, len(desired.Groups))
+	for _, g := range desired.Groups {
+		groupByName[g.Name] = g
+	}
+
+	for _, act := range actions {
+		switch act.Kind {
+		case clustercore.ActionCreateCP:
+			release, err := r.admitSize(c, cpSize, "control-plane")
+			if err != nil {
+				return nil // refusal recorded; retry next pass
+			}
+			cpIP, err := r.mgr.ProvisionCP(c.Owner, c.Name, iso, cpSize, r.controlPlaneSANs())
+			release() // #1588: release once the attempt concludes, success or failure
+			if err != nil {
+				return fmt.Errorf("provision control plane: %w", err)
+			}
+			_ = r.store.UpsertNode(ctx, &clusterstore.Node{
+				Owner: c.Owner, Cluster: c.Name, VMName: act.Name,
+				Role: clusterstore.RoleControlPlane, State: clusterstore.NodeStateReady,
+				CreatedAt: time.Now().UTC(),
+			})
+			log.Printf("[cluster] %s/%s: control plane up at %s", c.Owner, c.Name, cpIP)
+
+		case clustercore.ActionCreateWorker:
+			g := groupByName[act.Group]
+			release, err := r.admitSize(c, g, act.Group)
+			if err != nil {
+				return nil // refusal recorded; retry next pass
+			}
+			cpIP, err := r.mgr.CPIP(c.Owner, c.Name)
+			if err != nil {
+				release() // #1588: nothing to provision after all
+				return fmt.Errorf("control-plane IP: %w", err)
+			}
+			err = r.mgr.ProvisionWorker(c.Owner, c.Name, iso, g, act.Name, cpIP)
+			release() // #1588: release once the attempt concludes, success or failure
+			if err != nil {
+				return fmt.Errorf("provision worker %s: %w", act.Name, err)
+			}
+			_ = r.store.UpsertNode(ctx, &clusterstore.Node{
+				Owner: c.Owner, Cluster: c.Name, VMName: act.Name,
+				Role: clusterstore.RoleWorker, Group: act.Group,
+				State: clusterstore.NodeStateProvisioning, CreatedAt: time.Now().UTC(),
+			})
+			_ = r.store.AppendEvent(ctx, c.Owner, c.Name, clusterstore.Event{
+				At: time.Now().UTC(), Kind: clusterstore.EventScaleUp,
+				Group: act.Group, Reason: "reconciler: group below min_nodes",
+			})
+
+		case clustercore.ActionStartVM:
+			if err := r.mgr.StartVM(act.Name); err != nil {
+				return fmt.Errorf("start %s: %w", act.Name, err)
+			}
+
+		case clustercore.ActionDeleteVM:
+			if err := r.mgr.DeleteVM(act.Name); err != nil {
+				return fmt.Errorf("delete %s: %w", act.Name, err)
+			}
+			_ = r.store.DeleteNode(ctx, c.Owner, c.Name, act.Name)
+		}
+	}
+
+	if desired.Deleting {
+		// Torn down when nothing is left on the host: drop the
+		// endpoint and the rows — the name becomes reusable and a
+		// re-created cluster starts empty.
+		observed, err := r.mgr.Observe(c.Owner, c.Name)
+		if err != nil {
+			return fmt.Errorf("observe after teardown: %w", err)
+		}
+		if observed.CP == nil && len(observed.Workers) == 0 {
+			if r.unpublish != nil {
+				if err := r.unpublish(ctx, c); err != nil {
+					return fmt.Errorf("unpublish endpoint: %w", err)
+				}
+			}
+			if err := r.store.Delete(ctx, c.Owner, c.Name); err != nil {
+				return fmt.Errorf("delete record: %w", err)
+			}
+			log.Printf("[cluster] %s/%s: deleted", c.Owner, c.Name)
+		}
+		return nil
+	}
+
+	return r.settleState(ctx, c)
+}
+
+// admitSize runs the CPU-admission gate for one VM-sized request; a
+// refusal is recorded as a REFUSED scale event (loud, never clamped).
+//
+// #1588: the returned release must be called by admitSize's own caller once
+// its ProvisionCP/ProvisionWorker attempt concludes, success or failure —
+// same admit-then-release contract every other admission call site follows.
+// The nil-admit and refused paths hand back a no-op so callers can defer it
+// unconditionally without a nil check.
+func (r *ClusterReconciler) admitSize(c *clusterstore.Cluster, g clustercore.DesiredGroup, what string) (release func(), err error) {
+	if r.admit == nil {
+		return func() {}, nil
+	}
+	release, err = r.admit(c.Owner, g.CPU)
+	if err != nil {
+		_ = r.store.AppendEvent(context.Background(), c.Owner, c.Name, clusterstore.Event{
+			At: time.Now().UTC(), Kind: clusterstore.EventRefused,
+			Group: what, Reason: fmt.Sprintf("admission refused %s cpu=%s: %v", what, g.CPU, err),
+		})
+		return func() {}, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	return release, nil
+}
+
+// settleState publishes the endpoint once the CP is up and flips the
+// record to READY when the cluster's own API reports every expected
+// node Ready.
+func (r *ClusterReconciler) settleState(ctx context.Context, c *clusterstore.Cluster) error {
+	observed, err := r.mgr.Observe(c.Owner, c.Name)
+	if err != nil {
+		return fmt.Errorf("observe: %w", err)
+	}
+	if observed.CP == nil || !observed.CP.Running {
+		return nil // still converging; nothing to settle
+	}
+
+	if c.APIEndpoint == "" {
+		cpIP, err := r.mgr.CPIP(c.Owner, c.Name)
+		if err != nil {
+			return fmt.Errorf("control-plane IP: %w", err)
+		}
+		endpoint := cpIP + ":6443"
+		if r.publish != nil {
+			endpoint, err = r.publish(ctx, c, cpIP)
+			if err != nil {
+				return fmt.Errorf("publish endpoint: %w", err)
+			}
+		}
+		if err := r.store.SetEndpoint(ctx, c.Owner, c.Name, endpoint); err != nil {
+			return fmt.Errorf("record endpoint: %w", err)
+		}
+		c.APIEndpoint = endpoint
+	}
+
+	// VPA rides the settle path: a transient deploy failure retries
+	// every pass until READY; DeployVPA is idempotent and never
+	// rotates a deployed webhook secret.
+	if !r.vpaDisabled && c.State != clusterstore.StateReady {
+		if err := r.mgr.DeployVPA(c.Owner, c.Name); err != nil {
+			return fmt.Errorf("deploy VPA: %w", err)
+		}
+	}
+
+	// The autoscaler rides the settle path too: DeployCA is idempotent.
+	if r.mintCACert != nil && c.State != clusterstore.StateReady {
+		creds, err := r.mintCACert(c.Owner, c.Name)
+		if err != nil {
+			return fmt.Errorf("mint autoscaler credential: %w", err)
+		}
+		deploy := clustercore.CADeploy{
+			ProviderAddr:           r.caAddr,
+			ScaleDownDelayAfterAdd: r.caScaleDownDelay,
+			ScaleDownUnneededTime:  r.caScaleDownUnneeded,
+		}
+		if err := r.mgr.DeployCA(c.Owner, c.Name, deploy, creds); err != nil {
+			return fmt.Errorf("deploy autoscaler: %w", err)
+		}
+	}
+
+	expected := 1 // control plane
+	for _, g := range c.NodeGroups {
+		expected += int(g.EffectiveTarget())
+	}
+	ready, err := r.mgr.ReadyNodes(c.Owner, c.Name)
+	if err != nil {
+		return nil // API not up yet; try next pass
+	}
+	if ready >= expected && c.State != clusterstore.StateReady {
+		if err := r.store.SetState(ctx, c.Owner, c.Name, clusterstore.StateReady, ""); err != nil {
+			return err
+		}
+		// Worker rows ride along: the cluster API says they joined.
+		nodes, _ := r.store.ListNodes(ctx, c.Owner, c.Name)
+		for _, n := range nodes {
+			if n.State != clusterstore.NodeStateReady {
+				n.State = clusterstore.NodeStateReady
+				_ = r.store.UpsertNode(ctx, n)
+			}
+		}
+		log.Printf("[cluster] %s/%s: READY (%d nodes)", c.Owner, c.Name, ready)
+	} else if ready < expected && c.State == clusterstore.StateReady {
+		if err := r.store.SetState(ctx, c.Owner, c.Name, clusterstore.StateDegraded,
+			fmt.Sprintf("%d of %d expected nodes Ready", ready, expected)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- endpoint publishing over the passthrough surface ------------------
+
+// controlPlaneSANs are the extra subject-alt-names the API server
+// certificate must carry. The node's own IP is added by the manager;
+// this adds the published endpoint's host, which is what a tenant's
+// kubeconfig actually dials (#1464). Empty until
+// WireEndpointPublisher runs — with no published endpoint there is no
+// extra name to cover.
+func (r *ClusterReconciler) controlPlaneSANs() []string {
+	if r.advertiseHost == "" {
+		return nil
+	}
+	return []string{r.advertiseHost}
+}
+
+// WireEndpointPublisher connects the reconciler to the durable
+// passthrough surface (design: create flow step 3): allocate an
+// external port from portRange, DNAT it to <cp>:6443, and record
+// <advertiseAddr>:<port> as the cluster's API endpoint. Invoked with
+// the _system identity — this is a daemon-internal reconciler path.
+func (r *ClusterReconciler) WireEndpointPublisher(network *NetworkServer, advertiseAddr, portRange string) error {
+	// Recorded here rather than through a setter of its own: a SAN for
+	// an endpoint nobody publishes is worse than no SAN, so the two
+	// stay welded to one call.
+	r.advertiseHost = advertiseAddr
+	lo, hi, err := parsePortRange(portRange)
+	if err != nil {
+		return err
+	}
+	r.publish = func(ctx context.Context, c *clusterstore.Cluster, cpIP string) (string, error) {
+		port, err := r.freeClusterPort(ctx, lo, hi)
+		if err != nil {
+			return "", err
+		}
+		sysCtx := auth.ContextWithSystemIdentity(ctx)
+		if _, err := network.AddPassthroughRoute(sysCtx, &pb.AddPassthroughRouteRequest{
+			ExternalPort:  int32(port), //nolint:gosec // freeClusterPort draws from parsePortRange's validated [1024,65535]
+			TargetIp:      cpIP,
+			TargetPort:    6443,
+			Protocol:      pb.RouteProtocol_ROUTE_PROTOCOL_TCP,
+			ContainerName: clustercore.CPName(c.Owner, c.Name),
+		}); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s:%d", advertiseAddr, port), nil
+	}
+	r.unpublish = func(ctx context.Context, c *clusterstore.Cluster) error {
+		port := portFromEndpoint(c.APIEndpoint)
+		if port == 0 {
+			return nil // never published
+		}
+		sysCtx := auth.ContextWithSystemIdentity(ctx)
+		_, err := network.DeletePassthroughRoute(sysCtx, &pb.DeletePassthroughRouteRequest{
+			ExternalPort: int32(port), //nolint:gosec // portFromEndpoint rejects values outside [1,65535]
+			Protocol:     pb.RouteProtocol_ROUTE_PROTOCOL_TCP,
+		})
+		if err != nil && status.Code(err) == codes.NotFound {
+			return nil // already gone — teardown is idempotent
+		}
+		return err
+	}
+	return nil
+}
+
+func parsePortRange(s string) (int, int, error) {
+	var lo, hi int
+	if _, err := fmt.Sscanf(s, "%d-%d", &lo, &hi); err != nil {
+		return 0, 0, fmt.Errorf("invalid port range %q (want e.g. 36443-36542): %w", s, err)
+	}
+	if lo < 1024 || hi > 65535 || hi < lo {
+		return 0, 0, fmt.Errorf("invalid port range %q", s)
+	}
+	return lo, hi, nil
+}
+
+// freeClusterPort picks the first port in [lo,hi] not already recorded
+// on some cluster's endpoint.
+func (r *ClusterReconciler) freeClusterPort(ctx context.Context, lo, hi int) (int, error) {
+	clusters, err := r.store.List(ctx, "")
+	if err != nil {
+		return 0, err
+	}
+	used := make(map[int]bool, len(clusters))
+	for _, c := range clusters {
+		if p := portFromEndpoint(c.APIEndpoint); p != 0 {
+			used[p] = true
+		}
+	}
+	for p := lo; p <= hi; p++ {
+		if !used[p] {
+			return p, nil
+		}
+	}
+	return 0, fmt.Errorf("cluster API port range %d-%d exhausted", lo, hi)
+}
+
+func portFromEndpoint(endpoint string) int {
+	_, portStr, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return 0
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p < 1 || p > 65535 {
+		return 0
+	}
+	return p
+}
