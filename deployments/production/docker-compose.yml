@@ -8,3 +8,35 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - /var/lib/incus/unix.socket:/var/lib/incus/unix.socket
+    restart: unless-stopped
+    networks:
+      - containarium-net
+
+  web-ui:
+    image: ghcr.io/hamzaaxnvan/containarium-web-ui:latest
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+    networks:
+      - containarium-net
+    depends_on:
+      - containarium
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - containarium
+      - web-ui
+    restart: unless-stopped
+    networks:
+      - containarium-net
+
+networks:
+  containarium-net:
+    driver: bridge
