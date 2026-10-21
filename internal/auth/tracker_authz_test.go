@@ -101,3 +101,38 @@ func TestAuthorizeTrackerTenant_ContextFallback(t *testing.T) {
 	ctx := ContextWithClaims(context.Background(), claims)
 	if err := AuthorizeTrackerTenant(ctx, "alice"); err != nil {
 		t.Fatalf("context-value run token on its own tenant: %v", err)
+	}
+	if err := AuthorizeTrackerTenant(ctx, "bob"); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("context-value run token on another tenant: code = %v, want PermissionDenied", status.Code(err))
+	}
+}
+
+// #2268 — RunTenantFromGRPCContext is how AuthorizeTrackerTenant recovers
+// the run's tenant, propagated the same way MDKeyTrackerConn is.
+
+func TestRunTenantFromGRPCContext_Metadata(t *testing.T) {
+	md := metadata.Pairs(MDKeyRunTenant, "alice")
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+
+	got, ok := RunTenantFromGRPCContext(ctx)
+	if !ok || got != "alice" {
+		t.Fatalf("got %q ok=%v, want alice/true", got, ok)
+	}
+}
+
+func TestRunTenantFromGRPCContext_ContextFallback(t *testing.T) {
+	claims := &Claims{Username: "agent-x", RunTenant: "alice"}
+	ctx := ContextWithClaims(context.Background(), claims)
+
+	got, ok := RunTenantFromGRPCContext(ctx)
+	if !ok || got != "alice" {
+		t.Fatalf("got %q ok=%v, want alice/true", got, ok)
+	}
+}
+
+func TestRunTenantFromGRPCContext_None(t *testing.T) {
+	got, ok := RunTenantFromGRPCContext(context.Background())
+	if ok || got != "" {
+		t.Fatalf("got %q ok=%v, want empty/false for a context with no run_tenant", got, ok)
+	}
+}

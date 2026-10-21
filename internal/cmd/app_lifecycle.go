@@ -47,3 +47,103 @@ var appRestartCmd = &cobra.Command{
 Examples:
   containarium app restart myapp --server <host:port> --user alice`,
 	Args: cobra.ExactArgs(1),
+	RunE: runAppRestart,
+}
+
+func init() {
+	appCmd.AddCommand(appStopCmd)
+	appCmd.AddCommand(appStartCmd)
+	appCmd.AddCommand(appRestartCmd)
+
+	// Add username flag to all lifecycle commands
+	appStopCmd.Flags().StringVarP(&lifecycleUsername, "user", "u", "", "Username (required)")
+	appStartCmd.Flags().StringVarP(&lifecycleUsername, "user", "u", "", "Username (required)")
+	appRestartCmd.Flags().StringVarP(&lifecycleUsername, "user", "u", "", "Username (required)")
+}
+
+func runAppStop(cmd *cobra.Command, args []string) error {
+	appName := args[0]
+
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required")
+	}
+
+	if lifecycleUsername == "" {
+		return fmt.Errorf("--user is required")
+	}
+
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer func() { _ = grpcClient.Close() }()
+
+	app, err := grpcClient.StopApp(lifecycleUsername, appName)
+	if err != nil {
+		return fmt.Errorf("failed to stop app: %w", err)
+	}
+
+	state := strings.TrimPrefix(app.State.String(), "APP_STATE_")
+	fmt.Printf("Application %s stopped successfully (state: %s)\n", appName, state)
+
+	return nil
+}
+
+func runAppStart(cmd *cobra.Command, args []string) error {
+	appName := args[0]
+
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required")
+	}
+
+	if lifecycleUsername == "" {
+		return fmt.Errorf("--user is required")
+	}
+
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer func() { _ = grpcClient.Close() }()
+
+	app, err := grpcClient.StartApp(lifecycleUsername, appName)
+	if err != nil {
+		return fmt.Errorf("failed to start app: %w", err)
+	}
+
+	state := strings.TrimPrefix(app.State.String(), "APP_STATE_")
+	fmt.Printf("Application %s started successfully (state: %s)\n", appName, state)
+	fmt.Printf("URL: https://%s\n", app.FullDomain)
+
+	return nil
+}
+
+func runAppRestart(cmd *cobra.Command, args []string) error {
+	appName := args[0]
+
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required")
+	}
+
+	if lifecycleUsername == "" {
+		return fmt.Errorf("--user is required")
+	}
+
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer func() { _ = grpcClient.Close() }()
+
+	fmt.Printf("Restarting application %s...\n", appName)
+	app, err := grpcClient.RestartApp(lifecycleUsername, appName)
+	if err != nil {
+		return fmt.Errorf("failed to restart app: %w", err)
+	}
+
+	state := strings.TrimPrefix(app.State.String(), "APP_STATE_")
+	fmt.Printf("Application %s restarted successfully (state: %s)\n", appName, state)
+	fmt.Printf("URL: https://%s\n", app.FullDomain)
+
+	return nil
+}
