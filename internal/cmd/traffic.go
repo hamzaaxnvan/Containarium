@@ -377,3 +377,98 @@ func runTrafficHistory(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	var resp queryHistoryResp
+	if err := trafficGet(cmd.Context(), "/v1/containers/"+url.PathEscape(box)+"/traffic/history",
+		historyQuery(start, end, trafficTo != ""), &resp); err != nil {
+		return err
+	}
+
+	out := cmd.OutOrStdout()
+	if trafficFormat == "json" {
+		return writeJSON(out, resp)
+	}
+	if len(resp.Connections) == 0 {
+		fmt.Fprintf(out, "No matching history for %q between %s and %s.\n", box,
+			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
+		printOldest(out, resp)
+		return nil
+	}
+	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "PROTO\tSOURCE\tDESTINATION\tSENT\tRECV\tENDED")
+	for _, c := range resp.Connections {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			shortEnum(c.Protocol),
+			hostPort(c.SourceIP, c.SourcePort),
+			hostPort(c.DestIP, c.DestPort),
+			humanBytes(int64(c.BytesSent)), humanBytes(int64(c.BytesReceived)),
+			c.EndedAt)
+	}
+	_ = tw.Flush()
+	fmt.Fprintf(out, "\n%d historical connection(s).\n", resp.TotalCount)
+	return nil
+}
+
+// printOldest explains an empty result: either history exists but nothing
+// matched, or nothing has been collected at all.
+func printOldest(out io.Writer, resp queryHistoryResp) {
+	if resp.OldestRecordTime == "" {
+		fmt.Fprintln(out, "No traffic records are held for this scope: no history is held, so the collector may not have been recording.")
+		return
+	}
+	fmt.Fprintf(out, "Oldest record held: %s (anything earlier is not available).\n", resp.OldestRecordTime)
+}
+
+// runTrafficFind is the host-wide history query: which box connected to a
+// destination, without naming the box. Admin-only on the server.
+func runTrafficFind(cmd *cobra.Command, _ []string) error {
+	if trafficFrom == "" {
+		return fmt.Errorf("--from is required (RFC3339, e.g. 2026-10-20T10:00:00Z)")
+	}
+	start, end, err := historyWindow(time.Now())
+	if err != nil {
+		return err
+	}
+	var resp queryHistoryResp
+	if err := trafficGet(cmd.Context(), "/v1/traffic/history", historyQuery(start, end, trafficTo != ""), &resp); err != nil {
+		return err
+	}
+	out := cmd.OutOrStdout()
+	if trafficFormat == "json" {
+		return writeJSON(out, resp)
+	}
+	if len(resp.Connections) == 0 {
+		fmt.Fprintf(out, "No box matched between %s and %s.\n",
+			start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
+		printOldest(out, resp)
+		return nil
+	}
+	tw := tabwriter.NewWriter(out, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "BOX\tSTARTED\tPROTO\tSOURCE\tDESTINATION\tSENT\tRECV")
+	for _, c := range resp.Connections {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			c.ContainerName, c.StartedAt, shortEnum(c.Protocol),
+			hostPort(c.SourceIP, c.SourcePort), hostPort(c.DestIP, c.DestPort),
+			humanBytes(int64(c.BytesSent)), humanBytes(int64(c.BytesReceived)))
+	}
+	_ = tw.Flush()
+	fmt.Fprintf(out, "\n%d matching connection(s)", resp.TotalCount)
+	if int(resp.TotalCount) > len(resp.Connections) {
+		fmt.Fprintf(out, " (showing %d; raise --limit, max 1000, or narrow the window)", len(resp.Connections))
+	}
+	fmt.Fprintln(out, ".")
+	return nil
+}
+
+// --- small display helpers (writeJSON + humanBytes are shared, see runner.go /
+// backup_create.go) ---
+
+// hostPort renders "ip:port", omitting the port when 0 (ICMP / unset).
+func hostPort(ip string, port uint32) string {
+	if ip == "" {
+		return "-"
+	}
+	if port == 0 {
+		return ip
+	}
+	return ip + ":" + strconv.FormatUint(uint64(port), 10)
+}

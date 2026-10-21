@@ -40,3 +40,24 @@ export interface EngineResult {
   // The agent's final output text/JSON.
   outputJson: string;
   // Engine-shaped usage/cost, if available.
+  usage?: unknown;
+  // followUp sends one more user message in the same conversation (the same
+  // thread or session, with what the run just did in context) and returns
+  // that turn's result, journaling it to the journal it is given. Absent when
+  // the engine cannot continue the conversation. Used to re-prompt once for a
+  // missing final message (#2513; see reprompt.ts).
+  followUp?: (prompt: string, journal: JournalSink) => Promise<EngineResult>;
+}
+
+export interface Engine {
+  readonly name: string;
+  // run executes one task, appending each assistant message, tool call and
+  // tool result to journal as it happens (#2095). The caller brackets the run
+  // with status lines (runJournaled); an error that ends the run is thrown,
+  // not journaled here.
+  run(
+    task: string,
+    cfg: EngineConfig,
+    journal: JournalSink,
+  ): Promise<EngineResult>;
+}
