@@ -114,3 +114,62 @@ type rewriteHost struct {
 }
 
 func (r rewriteHost) RoundTrip(req *http.Request) (*http.Response, error) {
+	u := *req.URL
+	target := strings.TrimPrefix(r.to, "http://")
+	u.Scheme, u.Host = "http", target
+	clone := req.Clone(req.Context())
+	clone.URL = &u
+	clone.Host = target
+	rt := r.base
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	return rt.RoundTrip(clone)
+}
+
+// AC4: a repo-scoped token against an org target must say so. GitHub returns
+// a bare 403 that names no scope, which is the difference between a one-line
+// fix and an afternoon of guessing.
+func TestGitHubClient_403AgainstAnOrgNamesTheScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"Resource not accessible by personal access token"}`))
+	}))
+	defer srv.Close()
+
+	c := &githubClient{http: &http.Client{Transport: rewriteHost{to: srv.URL}}}
+
+	_, err := c.ListRunners(context.Background(), "footprintai", "ghp_repo_scoped")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "admin:org") {
+		t.Errorf("error does not name the scope an org target needs: %v", err)
+	}
+
+	// A repo target's 403 must NOT claim admin:org is the fix.
+	_, err = c.ListRunners(context.Background(), "footprintai/containarium", "ghp_x")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "admin:org") {
+		t.Errorf("a repository target's failure blamed the org scope: %v", err)
+	}
+}
+
+// Existing repo behaviour must be byte-for-byte unchanged (AC3).
+func TestRepoTargetBehaviourUnchanged(t *testing.T) {
+	got, err := ParseTarget("footprintai/containarium")
+	if err != nil {
+		t.Fatalf("ParseTarget: %v", err)
+	}
+	if got.APIPath() != "repos/footprintai/containarium" {
+		t.Errorf("APIPath() = %q — the repo endpoint moved", got.APIPath())
+	}
+	if got.ConfigURL() != "https://github.com/footprintai/containarium" {
+		t.Errorf("ConfigURL() = %q — the runner would register against the wrong URL", got.ConfigURL())
+	}
+	if got.RequiredPATScope() != "repo" {
+		t.Errorf("RequiredPATScope() = %q, want repo", got.RequiredPATScope())
+	}
+}
