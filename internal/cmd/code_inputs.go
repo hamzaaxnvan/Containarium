@@ -174,3 +174,180 @@ func codeAnswer(api runlog.RunInputs, box, run, id string, a pb.RunInputAnswer, 
 			}
 			line, _ := bufio.NewReader(confirm.in).ReadString('\n')
 			if s := strings.ToLower(strings.TrimSpace(line)); s != "y" && s != "yes" {
+				return fmt.Errorf("not confirmed; nothing was sent")
+			}
+		}
+	}
+	res, err := runlog.Answer(api, box, run, id, shown, a)
+	if err != nil {
+		return err
+	}
+	if err := runlog.WriteAnswerResult(w, res); err != nil {
+		return fmt.Errorf("request %s on run %s: %w", id, run, err)
+	}
+	return nil
+}
+
+// codeInputPollInterval is how often `code attach` looks for new requests.
+var codeInputPollInterval = 2 * time.Second
+
+// stdinIsTerminal is a seam: inline answers are offered only to a human at a
+// terminal.
+var stdinIsTerminal = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) } // #nosec G115 -- a file descriptor
+
+// startInlineAnswers lets a human at a terminal answer the run's permission
+// requests while its output streams (#2184): each new open request is printed
+// to diag (stdout stays the run's output), and printed again if its prompt
+// changes; a line "a" or "d" on in answers the oldest one printed, bound to
+// the request (tool and complete input) as last printed. It
+// needs the daemon (--server); without one, or on a daemon without the RPCs,
+// it prints one note and stays off. The returned func stops it.
+func startInlineAnswers(ctx context.Context, newClient func() (runInputsAPI, error), box, run string, in io.Reader, diag io.Writer) func() {
+	c, err := newClient()
+	if err != nil {
+		fmt.Fprintf(diag, "note: permission requests cannot be answered here: %v\n", err)
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	w := &inlineAnswers{api: c, box: box, run: run, diag: diag, shown: map[string]*pb.RunInput{}}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.poll(ctx)
+	}()
+	// The reader blocks on stdin and cannot be interrupted; it ends with the
+	// process, and ignores lines once ctx is done.
+	go w.read(ctx, in)
+	return func() {
+		cancel()
+		wg.Wait()
+		_ = c.Close()
+	}
+}
+
+type inlineAnswers struct {
+	api      runlog.RunInputs
+	box, run string
+	diag     io.Writer
+	mu       sync.Mutex
+	// shown maps each printed request id to the request as last printed: an
+	// answer binds that, never a later journal read the user has not seen.
+	shown     map[string]*pb.RunInput
+	open      []*pb.RunInput // oldest first, as last listed
+	reportErr bool
+}
+
+func (w *inlineAnswers) poll(ctx context.Context) {
+	for {
+		w.refresh()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(codeInputPollInterval):
+		}
+	}
+}
+
+func (w *inlineAnswers) refresh() {
+	resp, err := w.api.ListRunInputs(&pb.ListRunInputsRequest{Username: w.box, RunName: w.run})
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err != nil {
+		if !w.reportErr {
+			w.reportErr = true
+			fmt.Fprintf(w.diag, "[containarium code] cannot read permission requests: %v\n", err)
+		}
+		return
+	}
+	w.open = resp.GetOpen()
+	for _, r := range w.open {
+		prev, printed := w.shown[r.GetRequestId()]
+		if printed && prev.GetTool() == r.GetTool() && prev.GetInput() == r.GetInput() && prev.GetPrompt() == r.GetPrompt() {
+			continue
+		}
+		what := "permission request"
+		if printed {
+			// The journal is the agent's to write: say so when a request
+			// already on screen changes, and bind answers to the new text.
+			what = "permission request CHANGED"
+		}
+		left := ""
+		if r.GetExpiresAt() != nil {
+			left = fmt.Sprintf(" (expires in %s)", time.Until(r.GetExpiresAt().AsTime()).Round(time.Second))
+		}
+		var b strings.Builder
+		_ = runlog.WriteRequest(&b, r) // a strings.Builder does not fail
+		// Only a request that was actually printed can be answered.
+		// a / d answers the oldest printed request, which need not be this
+		// one: name it, so an allow never lands on a request the user did
+		// not mean.
+		target := r.GetRequestId()
+		if t := w.oldestLocked(); t != nil {
+			target = t.GetRequestId()
+		}
+		if _, err := fmt.Fprintf(w.diag, "[containarium code] %s%s\n%s[containarium code] a + Enter allows, d + Enter denies %s\n",
+			what, left, b.String(), coderun.PlainText(target)); err != nil {
+			continue
+		}
+		w.shown[r.GetRequestId()] = r
+	}
+}
+
+// oldest is the oldest open request that has been printed, as printed.
+func (w *inlineAnswers) oldest() *pb.RunInput {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.oldestLocked()
+}
+
+func (w *inlineAnswers) oldestLocked() *pb.RunInput {
+	for _, r := range w.open {
+		if shown, printed := w.shown[r.GetRequestId()]; printed {
+			return shown
+		}
+	}
+	return nil
+}
+
+func (w *inlineAnswers) read(ctx context.Context, in io.Reader) {
+	sc := bufio.NewScanner(in)
+	for sc.Scan() {
+		if ctx.Err() != nil {
+			return
+		}
+		var a pb.RunInputAnswer
+		switch strings.ToLower(strings.TrimSpace(sc.Text())) {
+		case "a":
+			a = pb.RunInputAnswer_RUN_INPUT_ANSWER_ALLOW
+		case "d":
+			a = pb.RunInputAnswer_RUN_INPUT_ANSWER_DENY
+		default:
+			continue
+		}
+		shown := w.oldest()
+		if shown == nil {
+			fmt.Fprintln(w.diag, "[containarium code] no open permission request to answer")
+			continue
+		}
+		res, err := runlog.AnswerShown(w.api, w.box, w.run, shown, a)
+		if err != nil {
+			fmt.Fprintf(w.diag, "[containarium code] %v\n", err)
+			continue
+		}
+		var out strings.Builder
+		_ = runlog.WriteAnswerResult(&out, res) // ErrNotAnswered: the text says why
+		fmt.Fprint(w.diag, "[containarium code] "+out.String())
+		w.refresh()
+		if next := w.oldest(); next != nil {
+			fmt.Fprintf(w.diag, "[containarium code] a + Enter allows, d + Enter denies %s\n", coderun.PlainText(next.GetRequestId()))
+		}
+	}
+}
+
+// runUsesApprovals reports whether run was started with --approvals ask: its
+// approval server creates the answers directory when it starts.
+func runUsesApprovals(ctx context.Context, sess approvalSession, run string) bool {
+	out, err := sess.ShellExec(ctx, "[ -d "+coderun.ShellQuoteSingle(coderun.ApprovalAnswersDir(run))+" ] && echo yes")
+	return err == nil && strings.TrimSpace(out) == "yes"
+}

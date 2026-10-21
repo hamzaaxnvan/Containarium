@@ -111,3 +111,342 @@ func runList(cmd *cobra.Command, args []string) error {
 		// Filter by state
 		if filterState != "all" {
 			if filterState == "running" && c.State != "Running" {
+				continue
+			}
+			if filterState == "stopped" && c.State != "Stopped" {
+				continue
+			}
+		}
+
+		// Filter by labels
+		if len(labelFilter) > 0 {
+			if !incus.MatchLabels(c.Labels, labelFilter) {
+				continue
+			}
+		}
+
+		// Count states
+		if c.State == "Running" {
+			runningCount++
+		} else {
+			stoppedCount++
+		}
+
+		filtered = append(filtered, c)
+	}
+
+	// Output based on format
+	switch outputFormat {
+	case "table":
+		if groupByLabel != "" {
+			printGroupedTableFormat(filtered, groupByLabel, showLabels)
+		} else {
+			printTableFormat(filtered, runningCount, stoppedCount, showLabels)
+		}
+	case "json":
+		if groupByLabel != "" {
+			return printGroupedJSONFormat(filtered, groupByLabel)
+		}
+		return printJSONFormat(filtered)
+	case "yaml":
+		if groupByLabel != "" {
+			printGroupedYAMLFormat(filtered, groupByLabel)
+		} else {
+			printYAMLFormat(filtered)
+		}
+	default:
+		return fmt.Errorf("unknown format: %s (use: table, json, yaml)", outputFormat)
+	}
+
+	return nil
+}
+
+func printTableFormat(containers []incus.ContainerInfo, running, stopped int, withLabels bool) {
+	// MON column: ✓ when the container has app-emitted OTel
+	// stamped in (environment.OTEL_EXPORTER_OTLP_ENDPOINT
+	// non-empty). 3-char column keeps the table compact.
+	// ISO column: lxc / vm / "-" when the backend did not report it (#2196).
+	if withLabels {
+		fmt.Printf("%-25s %-12s %-3s %-3s %-20s %-15s %s\n", "CONTAINER NAME", "STATUS", "ISO", "MON", "IP ADDRESS", "CPU/MEMORY", "LABELS")
+		fmt.Printf("%-25s %-12s %-3s %-3s %-20s %-15s %s\n", strings.Repeat("-", 25), strings.Repeat("-", 12), "---", "---", strings.Repeat("-", 20), strings.Repeat("-", 15), strings.Repeat("-", 30))
+	} else {
+		fmt.Printf("%-25s %-12s %-3s %-3s %-20s %-15s\n", "CONTAINER NAME", "STATUS", "ISO", "MON", "IP ADDRESS", "CPU/MEMORY")
+		fmt.Printf("%-25s %-12s %-3s %-3s %-20s %-15s\n", strings.Repeat("-", 25), strings.Repeat("-", 12), "---", "---", strings.Repeat("-", 20), strings.Repeat("-", 15))
+	}
+
+	if len(containers) == 0 {
+		fmt.Println("No containers found.")
+		return
+	}
+
+	monCount := 0
+	for _, c := range containers {
+		ip := c.IPAddress
+		if ip == "" {
+			ip = "-"
+		}
+
+		resources := fmt.Sprintf("%sc/%s", c.CPU, c.Memory)
+		if c.CPU == "" && c.Memory == "" {
+			resources = "-"
+		}
+
+		mon := "-"
+		if c.MonitoringEnabled {
+			mon = "✓"
+			monCount++
+		}
+		iso := ostype.IsolationShort(ostype.IsolationFromInstanceType(c.InstanceType))
+
+		if withLabels {
+			labelStr := formatLabels(c.Labels)
+			fmt.Printf("%-25s %-12s %-3s %-3s %-20s %-15s %s\n", c.Name, c.State, iso, mon, ip, resources, labelStr)
+		} else {
+			fmt.Printf("%-25s %-12s %-3s %-3s %-20s %-15s\n", c.Name, c.State, iso, mon, ip, resources)
+		}
+	}
+
+	fmt.Println()
+	fmt.Printf("Total: %d containers (%d running, %d stopped, %d monitored)\n", len(containers), running, stopped, monCount)
+}
+
+// formatLabels formats labels as a comma-separated string
+func formatLabels(labels map[string]string) string {
+	if len(labels) == 0 {
+		return "-"
+	}
+	var parts []string
+	for k, v := range labels {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+	}
+	return strings.Join(parts, ",")
+}
+
+// parseLabelFilter parses label filter from key=value format
+func parseLabelFilter(labelSlice []string) map[string]string {
+	result := make(map[string]string)
+	for _, label := range labelSlice {
+		parts := strings.SplitN(label, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			if key != "" {
+				result[key] = value
+			}
+		}
+	}
+	return result
+}
+
+// listJSON is the shape `containarium list --json` emits. A named struct
+// rather than a map so the field names are checked at compile time — a typo
+// in a map key produces valid JSON with the wrong shape, and the first thing
+// to notice is whatever is parsing it.
+type listJSON struct {
+	Containers []incus.ContainerInfo `json:"containers"`
+	TotalCount int                   `json:"total_count"`
+}
+
+func printJSONFormat(containers []incus.ContainerInfo) error {
+	output := listJSON{Containers: containers, TotalCount: len(containers)}
+
+	data, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	fmt.Println(string(data))
+	return nil
+}
+
+func printYAMLFormat(containers []incus.ContainerInfo) {
+	fmt.Println("containers:")
+	for _, c := range containers {
+		fmt.Printf("  - name: %s\n", c.Name)
+		fmt.Printf("    state: %s\n", c.State)
+		fmt.Printf("    ip_address: %s\n", c.IPAddress)
+		fmt.Printf("    monitoring_enabled: %t\n", c.MonitoringEnabled)
+		if c.CPU != "" {
+			fmt.Printf("    cpu: %s\n", c.CPU)
+		}
+		if c.Memory != "" {
+			fmt.Printf("    memory: %s\n", c.Memory)
+		}
+		if len(c.Labels) > 0 {
+			fmt.Printf("    labels:\n")
+			for k, v := range c.Labels {
+				fmt.Printf("      %s: %s\n", k, v)
+			}
+		}
+	}
+	fmt.Printf("total_count: %d\n", len(containers))
+}
+
+// groupContainersByLabel groups containers by a specific label key
+func groupContainersByLabel(containers []incus.ContainerInfo, labelKey string) map[string][]incus.ContainerInfo {
+	groups := make(map[string][]incus.ContainerInfo)
+	for _, c := range containers {
+		labelValue := "(no label)"
+		if c.Labels != nil {
+			if val, ok := c.Labels[labelKey]; ok {
+				labelValue = val
+			}
+		}
+		groups[labelValue] = append(groups[labelValue], c)
+	}
+	return groups
+}
+
+// getSortedGroupKeys returns sorted group keys with "(no label)" at the end
+func getSortedGroupKeys(groups map[string][]incus.ContainerInfo) []string {
+	keys := make([]string, 0, len(groups))
+	hasNoLabel := false
+	for k := range groups {
+		if k == "(no label)" {
+			hasNoLabel = true
+		} else {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	if hasNoLabel {
+		keys = append(keys, "(no label)")
+	}
+	return keys
+}
+
+func printGroupedTableFormat(containers []incus.ContainerInfo, labelKey string, withLabels bool) {
+	groups := groupContainersByLabel(containers, labelKey)
+	sortedKeys := getSortedGroupKeys(groups)
+
+	totalCount := 0
+	totalRunning := 0
+	totalStopped := 0
+
+	for _, groupValue := range sortedKeys {
+		groupContainers := groups[groupValue]
+
+		// Print group header
+		fmt.Printf("\n=== %s: %s (%d containers) ===\n", labelKey, groupValue, len(groupContainers))
+
+		// Print table header
+		if withLabels {
+			fmt.Printf("%-25s %-12s %-3s %-20s %-15s %s\n", "CONTAINER NAME", "STATUS", "ISO", "IP ADDRESS", "CPU/MEMORY", "LABELS")
+			fmt.Printf("%-25s %-12s %-3s %-20s %-15s %s\n", strings.Repeat("-", 25), strings.Repeat("-", 12), "---", strings.Repeat("-", 20), strings.Repeat("-", 15), strings.Repeat("-", 30))
+		} else {
+			fmt.Printf("%-25s %-12s %-3s %-20s %-15s\n", "CONTAINER NAME", "STATUS", "ISO", "IP ADDRESS", "CPU/MEMORY")
+			fmt.Printf("%-25s %-12s %-3s %-20s %-15s\n", strings.Repeat("-", 25), strings.Repeat("-", 12), "---", strings.Repeat("-", 20), strings.Repeat("-", 15))
+		}
+
+		for _, c := range groupContainers {
+			ip := c.IPAddress
+			if ip == "" {
+				ip = "-"
+			}
+
+			resources := fmt.Sprintf("%sc/%s", c.CPU, c.Memory)
+			if c.CPU == "" && c.Memory == "" {
+				resources = "-"
+			}
+			iso := ostype.IsolationShort(ostype.IsolationFromInstanceType(c.InstanceType))
+
+			if withLabels {
+				labelStr := formatLabels(c.Labels)
+				fmt.Printf("%-25s %-12s %-3s %-20s %-15s %s\n", c.Name, c.State, iso, ip, resources, labelStr)
+			} else {
+				fmt.Printf("%-25s %-12s %-3s %-20s %-15s\n", c.Name, c.State, iso, ip, resources)
+			}
+
+			totalCount++
+			if c.State == "Running" {
+				totalRunning++
+			} else {
+				totalStopped++
+			}
+		}
+	}
+
+	fmt.Println()
+	fmt.Printf("Total: %d containers in %d groups (%d running, %d stopped)\n", totalCount, len(groups), totalRunning, totalStopped)
+}
+
+// groupedListJSON is the shape `containarium list --group-by --json` emits.
+type groupedListJSON struct {
+	GroupBy    string                           `json:"group_by"`
+	Groups     map[string][]incus.ContainerInfo `json:"groups"`
+	GroupCount int                              `json:"group_count"`
+	TotalCount int                              `json:"total_count"`
+}
+
+func printGroupedJSONFormat(containers []incus.ContainerInfo, labelKey string) error {
+	groups := groupContainersByLabel(containers, labelKey)
+
+	output := groupedListJSON{
+		GroupBy:    labelKey,
+		Groups:     groups,
+		GroupCount: len(groups),
+		TotalCount: len(containers),
+	}
+
+	data, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	fmt.Println(string(data))
+	return nil
+}
+
+func printGroupedYAMLFormat(containers []incus.ContainerInfo, labelKey string) {
+	groups := groupContainersByLabel(containers, labelKey)
+	sortedKeys := getSortedGroupKeys(groups)
+
+	fmt.Printf("group_by: %s\n", labelKey)
+	fmt.Println("groups:")
+
+	for _, groupValue := range sortedKeys {
+		groupContainers := groups[groupValue]
+		fmt.Printf("  %s:\n", groupValue)
+		for _, c := range groupContainers {
+			fmt.Printf("    - name: %s\n", c.Name)
+			fmt.Printf("      state: %s\n", c.State)
+			fmt.Printf("      ip_address: %s\n", c.IPAddress)
+			if c.CPU != "" {
+				fmt.Printf("      cpu: %s\n", c.CPU)
+			}
+			if c.Memory != "" {
+				fmt.Printf("      memory: %s\n", c.Memory)
+			}
+			if len(c.Labels) > 0 {
+				fmt.Printf("      labels:\n")
+				for k, v := range c.Labels {
+					fmt.Printf("        %s: %s\n", k, v)
+				}
+			}
+		}
+	}
+	fmt.Printf("group_count: %d\n", len(groups))
+	fmt.Printf("total_count: %d\n", len(containers))
+}
+
+// listRemote lists containers from remote gRPC server
+func listRemote() ([]incus.ContainerInfo, error) {
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = grpcClient.Close() }()
+
+	return grpcClient.ListContainers()
+}
+
+// listRemoteHTTP lists containers from remote HTTP API
+func listRemoteHTTP() ([]incus.ContainerInfo, error) {
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = httpClient.Close() }()
+
+	return httpClient.ListContainers()
+}
