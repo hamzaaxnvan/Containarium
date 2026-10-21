@@ -113,3 +113,42 @@ func runBackendsSelfMeasurement(cmd *cobra.Command, args []string) error {
 	var out selfMeasurementResp
 	if err := json.Unmarshal(body, &out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
+	}
+
+	target := out.BackendID
+	if target == "" {
+		target = "(local)"
+	}
+	if out.Measurement == nil {
+		fmt.Fprintf(cmd.OutOrStdout(), "no self-measurement returned for %s\n", target)
+		return nil
+	}
+
+	m := out.Measurement
+	w := cmd.OutOrStdout()
+	fmt.Fprintf(w, "Integrity self-measurement for %s:\n", target)
+	fmt.Fprintf(w, "  Measured at:     %s\n", orDash(m.MeasuredAt))
+	fmt.Fprintf(w, "  Daemon version:  %s\n", orDash(m.DaemonVersion))
+	fmt.Fprintf(w, "  Hash algorithm:  %s\n", orDash(m.HashAlgorithm))
+	fmt.Fprintf(w, "  Binary digest:   %s\n", orDash(m.BinaryDigest))
+	if len(m.ProgramDigests) == 0 {
+		fmt.Fprintf(w, "  Program objects: none\n")
+	} else {
+		fmt.Fprintf(w, "  Program objects:\n")
+		for _, p := range m.ProgramDigests {
+			fmt.Fprintf(w, "    %s = %s\n", p.Name, p.Digest)
+		}
+	}
+	fmt.Fprintf(w, "  Config digest:   %s\n", orDash(m.ConfigDigest))
+	fmt.Fprintf(w, "  Measurement:     %s\n", orDash(m.MeasurementDigest))
+	if m.Signed {
+		tpm := "software key"
+		if m.TpmBacked {
+			tpm = "TPM-backed key"
+		}
+		fmt.Fprintf(w, "  Signature:       SIGNED (%s, %s)\n", orDash(m.SignatureAlgorithm), tpm)
+	} else {
+		fmt.Fprintf(w, "  Signature:       UNSIGNED (no node identity key bootstrapped — unverifiable, not tamper)\n")
+	}
+	return nil
+}
