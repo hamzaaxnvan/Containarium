@@ -78,3 +78,84 @@ func produceProofPack(ctx context.Context, ops packBoxOps, box, repoDir, artifac
 			return nil, fmt.Errorf("write %s in %s: %w", f.Path, box, err)
 		}
 	}
+	return proofpack.Generate(ctx, ops, box, proofpack.Options{RepoDir: repoDir})
+}
+
+// producePackIn is the production producePackFunc.
+func (s *CrewServer) producePackIn(ctx context.Context, box, repoDir, artifactJSON string) (*pb.ProofPack, error) {
+	if s.agents == nil || s.agents.recipes == nil || s.agents.recipes.containers == nil || s.agents.recipes.containers.manager == nil {
+		return nil, fmt.Errorf("no container manager to run the test commands with")
+	}
+	return produceProofPack(ctx, s.agents.recipes.containers.manager, box, repoDir, artifactJSON)
+}
+
+// provisionProducerBox is the production provisionMemberFunc for a
+// PACK_PRODUCER. Unlike provisionMemberBox it mints no platform or gateway
+// token, seeds nothing and starts no agent runtime: the box gets the run's
+// checkout and its skill's egress policy, nothing else. Its lease carries no
+// credentials, and ending it removes the checkout like every member's.
+func (s *CrewServer) provisionProducerBox(ctx context.Context, skill *pb.AgentSkill, req *pb.RunCrewRequest, runID string) (runlease.Lease, string, error) {
+	box, _, _, err := s.agents.provisionBoxOnly(ctx, skill, req.GetBackendId(), req.GetPool())
+	if err != nil {
+		return runlease.Lease{}, "", err
+	}
+	// SeedDir is set although nothing is seeded: runlease.End refuses an
+	// empty one, and would then leave the workspace behind.
+	lease := runlease.Lease{RunID: runID, Box: box, SeedDir: seedDirFor(runID)}
+	var commit string
+	if req.GetGitSource() != "" {
+		lease.Workspace = workspaceDirFor(runID)
+		commit, err = s.agents.agentBox().FetchGitSource(box, containerpkg.GitSourceSpec{
+			Source:        req.GetGitSource(),
+			Ref:           req.GetGitRef(),
+			Credential:    req.GetGitCredential(),
+			WorkspacePath: lease.Workspace,
+		})
+		if err != nil {
+			s.agents.endRunLease(ctx, lease, s.agents.boxWiper(), provisionFailedReason)
+			return runlease.Lease{}, "", status.Errorf(codes.FailedPrecondition, "git fetch into pack producer box %s failed: %v", box, err)
+		}
+	}
+	s.agents.applyAllowedPeersPolicy(ctx, "agent-"+skill.Id, skill)
+	s.agents.auditRunLease(ctx, "agent.run_lease_issue", runID, runLeaseIssuePayload(lease, pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED))
+	return lease, commit, nil
+}
+
+// crewProofPack produces the pack for a crew run whose A2A members returned
+// artifactJSON, and summarizes it. It never fails the run: every outcome,
+// including no pack at all, is reported on the summary.
+func crewProofPack(ctx context.Context, produce producePackFunc, coderBox string, producer runlease.Lease, artifactJSON string) *pb.CrewProofPack {
+	res := &pb.CrewProofPack{ProducerBox: producer.Box, CoderBox: coderBox}
+	if producer.Box == "" || producer.Box == coderBox {
+		res.Error = fmt.Sprintf("refusing to produce the pack in %q: it is the coder's box", producer.Box)
+		return res
+	}
+	if produce == nil {
+		res.Error = "this daemon has no pack producer wired"
+		return res
+	}
+	files, err := parseArtifactFiles(artifactJSON)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	dir := producer.Workspace
+	if dir == "" {
+		dir = proofpack.DefaultRepoDir
+	}
+	pack, err := produce(ctx, producer.Box, dir, artifactJSON)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	digest, err := proofpack.PackDigest(pack)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	res.Status, res.PackSha256, res.GitCommit = pack.GetStatus(), digest, pack.GetGitCommit()
+	for _, f := range files {
+		res.AppliedFiles = append(res.AppliedFiles, f.Path)
+	}
+	return res
+}

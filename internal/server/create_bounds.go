@@ -45,3 +45,74 @@ const (
 	// for an unknown one. Catalog IDs are short identifiers.
 	MaxStackIDLength = 64
 
+	// MaxLabels caps the labels map cardinality.
+	MaxLabels = 64
+
+	// MaxLabelKeyLen / MaxLabelValueLen — labels show up in Incus
+	// config, which has its own length limits. 256 chars per
+	// component is comfortably within those.
+	MaxLabelKeyLen   = 256
+	MaxLabelValueLen = 256
+)
+
+// validateStackID rejects an unknown stack ID with InvalidArgument, naming the
+// valid IDs (#2860). Empty means no stack and is valid.
+func validateStackID(id string) error {
+	if err := stacks.GetDefault().CheckStackID(id); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return nil
+}
+
+// validateCreateContainerBounds enforces the size caps above on
+// req. Returns nil if every field is within bounds; otherwise a
+// gRPC InvalidArgument status that names the offending field +
+// limit so the caller can fix.
+func validateCreateContainerBounds(req *pb.CreateContainerRequest) error {
+	if n := len(req.Stack); n > MaxStackIDLength {
+		return status.Errorf(codes.InvalidArgument,
+			"stack is %d bytes, max is %d", n, MaxStackIDLength)
+	}
+	if n := len(req.SshKeys); n > MaxSSHKeys {
+		return status.Errorf(codes.InvalidArgument,
+			"ssh_keys has %d entries, max is %d", n, MaxSSHKeys)
+	}
+	for i, key := range req.SshKeys {
+		if n := len(key); n > MaxSSHKeyLength {
+			return status.Errorf(codes.InvalidArgument,
+				"ssh_keys[%d] is %d bytes, max is %d", i, n, MaxSSHKeyLength)
+		}
+	}
+
+	if n := len(req.StackParameters); n > MaxStackParameters {
+		return status.Errorf(codes.InvalidArgument,
+			"stack_parameters has %d entries, max is %d", n, MaxStackParameters)
+	}
+	for k, v := range req.StackParameters {
+		if n := len(k); n > MaxStackParameterKeyLen {
+			return status.Errorf(codes.InvalidArgument,
+				"stack_parameters key is %d bytes, max is %d", n, MaxStackParameterKeyLen)
+		}
+		if n := len(v); n > MaxStackParameterValueLen {
+			return status.Errorf(codes.InvalidArgument,
+				"stack_parameters[%q] value is %d bytes, max is %d", k, n, MaxStackParameterValueLen)
+		}
+	}
+
+	if n := len(req.Labels); n > MaxLabels {
+		return status.Errorf(codes.InvalidArgument,
+			"labels has %d entries, max is %d", n, MaxLabels)
+	}
+	for k, v := range req.Labels {
+		if n := len(k); n > MaxLabelKeyLen {
+			return status.Errorf(codes.InvalidArgument,
+				"labels key is %d bytes, max is %d", n, MaxLabelKeyLen)
+		}
+		if n := len(v); n > MaxLabelValueLen {
+			return status.Errorf(codes.InvalidArgument,
+				"labels[%q] value is %d bytes, max is %d", k, n, MaxLabelValueLen)
+		}
+	}
+
+	return nil
+}
