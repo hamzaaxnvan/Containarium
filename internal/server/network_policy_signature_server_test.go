@@ -70,3 +70,28 @@ func TestNetworkPolicySignature_Validation(t *testing.T) {
 	}
 }
 
+func TestNetworkPolicySignature_AdminOnly(t *testing.T) {
+	s := newNPServerWithSigs()
+	userCtx := auth.ContextWithTestSubject(context.Background(), "alice", "user")
+	_, err := s.SetNetworkPolicySignature(userCtx, &pb.SetNetworkPolicySignatureRequest{
+		Signature: &pb.NetworkPolicySignature{Name: "x", Pattern: "y"},
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Errorf("non-admin set should be PermissionDenied, got %v", err)
+	}
+}
+
+func TestNetworkPolicySignature_Unavailable(t *testing.T) {
+	// No signature store wired → Set/Delete return Unavailable, List returns empty.
+	s := NewNetworkPolicyServer(NewMemNetworkPolicyStore())
+	ctx := npAdminCtx()
+	if _, err := s.SetNetworkPolicySignature(ctx, &pb.SetNetworkPolicySignatureRequest{
+		Signature: &pb.NetworkPolicySignature{Name: "x", Pattern: "y"},
+	}); status.Code(err) != codes.Unavailable {
+		t.Errorf("set without store = %v, want Unavailable", err)
+	}
+	list, err := s.ListNetworkPolicySignatures(ctx, &pb.ListNetworkPolicySignaturesRequest{})
+	if err != nil || len(list.GetSignatures()) != 0 {
+		t.Errorf("list without store = (%v, %d sigs), want (nil, 0)", err, len(list.GetSignatures()))
+	}
+}
