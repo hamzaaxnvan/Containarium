@@ -40,3 +40,18 @@ Examples:
 
 func init() {
 	rootCmd.AddCommand(passthroughRouteCmd)
+}
+
+// parsePassthroughRouteProtocol maps the CLI's --protocol flag to the
+// proto enum. Empty defaults to TCP, matching the daemon's own default
+// (internal/server/network_server.go's AddPassthroughRoute).
+func parsePassthroughRouteProtocol(s string) (pb.RouteProtocol, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "tcp":
+		return pb.RouteProtocol_ROUTE_PROTOCOL_TCP, nil
+	case "udp":
+		return pb.RouteProtocol_ROUTE_PROTOCOL_UDP, nil
+	default:
+		return pb.RouteProtocol_ROUTE_PROTOCOL_UNSPECIFIED, fmt.Errorf("protocol must be 'tcp' or 'udp', got %q", s)
+	}
+}

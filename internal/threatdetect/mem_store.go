@@ -102,3 +102,212 @@ func (s *MemFindingStore) Upsert(ctx context.Context, f *Finding) (*Finding, err
 				delete(s.byKey, evictedKey)
 			}
 		}
+		out = f
+		rollback = func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.byKey[key] == f {
+				delete(s.byKey, key)
+			}
+			// The ring entry is left in place: it's never read by key, so an
+			// orphaned entry there is harmless, and removing it would shift
+			// every later index for no benefit.
+		}
+	}
+	// The caller, the event and the webhook worker all read the finding
+	// after the lock is released, while a concurrent Upsert of the same key
+	// may be updating the stored entry. Hand them a copy (#2748). The copy
+	// names the box this write came from, as the Postgres store's does
+	// (#2835): the stored entry keeps the box that first opened it.
+	out = out.clone()
+	if ok {
+		out.Container = f.Container
+	}
+	s.mu.Unlock()
+
+	detail := fmt.Sprintf("rule=%s severity=%s tenant=%s subject=%s count=%d", out.Rule, out.Severity, out.TenantID, out.Subject, out.Count)
+	if err := s.audit.Log(ctx, &audit.AuditEntry{
+		Action:       "create",
+		ResourceType: auditResourceType,
+		ResourceID:   fmt.Sprintf("%d", out.ID),
+		Detail:       detail,
+	}); err != nil {
+		rollback()
+		return nil, fmt.Errorf("threatdetect: audit log finding (degraded mode): %w", err)
+	}
+	s.emitter.EmitSecurityFinding(out.ToProto())
+	if s.notifier != nil {
+		s.notifier.Notify(out)
+	}
+	return out, nil
+}
+
+// Get returns the finding with the given id (mirrors FindingStore.Get).
+func (s *MemFindingStore) Get(ctx context.Context, id int64) (*Finding, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.ring {
+		if f.ID == id {
+			return f.clone(), nil
+		}
+	}
+	return nil, fmt.Errorf("threatdetect: finding %d: %w", id, ErrFindingNotFound)
+}
+
+// List returns findings matching filter, ordered most-recently-seen first
+// (mirrors FindingStore.List — same ListFilter, same zero-value semantics).
+func (s *MemFindingStore) List(ctx context.Context, filter ListFilter) ([]*Finding, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	matches := make([]*Finding, 0, len(s.ring))
+	for _, f := range s.ring {
+		if filter.Severity != pb.ThreatSeverity_THREAT_SEVERITY_UNSPECIFIED && f.Severity != filter.Severity {
+			continue
+		}
+		if filter.TenantID != "" && f.TenantID != filter.TenantID {
+			continue
+		}
+		if !filter.Since.IsZero() && f.LastSeen.Before(filter.Since) {
+			continue
+		}
+		if filter.State != "" && f.State != filter.State {
+			continue
+		}
+		if filter.Rule != pb.ThreatRuleId_THREAT_RULE_ID_UNSPECIFIED && f.Rule != filter.Rule {
+			continue
+		}
+		if filter.BackendID != "" && f.BackendID != filter.BackendID {
+			continue
+		}
+		matches = append(matches, f.clone())
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].LastSeen.After(matches[j].LastSeen) })
+	if len(matches) > limit {
+		matches = matches[:limit]
+	}
+	return matches, nil
+}
+
+// SetResponse mirrors FindingStore.SetResponse without Postgres, including
+// the sticky process_killed: the OR with the stored flag happens under the
+// ring lock, in the same read-modify-write.
+func (s *MemFindingStore) SetResponse(ctx context.Context, id int64, r FindingResponse) (*Finding, error) {
+	return s.writeResponse(ctx, id, r, r, false)
+}
+
+// SetResponseHeld mirrors FindingStore.SetResponseHeld: standing is stored,
+// box is delivered (#2820).
+func (s *MemFindingStore) SetResponseHeld(ctx context.Context, id int64, box, standing FindingResponse) (*Finding, error) {
+	return s.writeResponse(ctx, id, standing, box, false)
+}
+
+// ResolveWithResponse mirrors FindingStore.ResolveWithResponse: r is stored
+// and the finding resolved under one lock, delivered once as the resolve.
+func (s *MemFindingStore) ResolveWithResponse(ctx context.Context, id int64, r FindingResponse) (*Finding, error) {
+	return s.writeResponse(ctx, id, r, r, true)
+}
+
+// writeResponse stores stored as finding id's response (keeping the kill on
+// record), resolves it too when resolve is set and it is open, and delivers
+// box. A resolve of a finding that is no longer open still records the
+// response and delivers it, then reports ErrFindingNotOpen.
+func (s *MemFindingStore) writeResponse(ctx context.Context, id int64, stored, box FindingResponse, resolve bool) (*Finding, error) {
+	s.mu.Lock()
+	var f *Finding
+	for _, cand := range s.ring {
+		if cand.ID == id {
+			f = cand
+			break
+		}
+	}
+	if f == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("threatdetect: finding %d: %w", id, ErrFindingNotFound)
+	}
+	cp := stored
+	cp.KeepKillOf(f.Response)
+	f.Response = &cp
+	notOpen := resolve && f.State != FindingStateOpen
+	resolved := resolve && !notOpen
+	if resolved {
+		f.State = FindingStateResolved
+		key := dedupeKey{rule: f.Rule.String(), tenant: f.TenantID, subject: f.Subject}
+		if s.byKey[key] == f {
+			delete(s.byKey, key)
+		}
+	}
+	// The webhook worker reads its finding after this returns; hand it a
+	// snapshot so a later write to the ring entry cannot change what this
+	// delivery says.
+	snap := f.clone()
+	delivery := ResponseDelivery(snap, box)
+	state := f.State
+	s.mu.Unlock()
+	if resolved {
+		if err := s.audit.Log(ctx, &audit.AuditEntry{
+			Action:       "resolve",
+			ResourceType: auditResourceType,
+			ResourceID:   fmt.Sprintf("%d", snap.ID),
+			Detail:       fmt.Sprintf("rule=%s tenant=%s subject=%s", snap.Rule, snap.TenantID, snap.Subject),
+		}); err != nil {
+			log.Printf("threatdetect: audit log resolve for finding %d (degraded mode): %v", snap.ID, err)
+		}
+	}
+	s.emitter.EmitSecurityFinding(snap.ToProto())
+	if s.notifier != nil {
+		s.notifier.Notify(delivery) // a response transition, or the resolve it made, is delivered (#2718, #2820)
+	}
+	if notOpen {
+		return snap, fmt.Errorf("threatdetect: finding %d is not open (state=%s): %w", id, state, ErrFindingNotOpen)
+	}
+	return snap, nil
+}
+
+// Resolve transitions a finding to FindingStateResolved (mirrors
+// FindingStore.Resolve, including the ErrFindingNotOpen distinction between
+// "no such finding" and "already resolved").
+func (s *MemFindingStore) Resolve(ctx context.Context, id int64) (*Finding, error) {
+	s.mu.Lock()
+	var f *Finding
+	for _, cand := range s.ring {
+		if cand.ID == id {
+			f = cand
+			break
+		}
+	}
+	if f == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("threatdetect: finding %d: %w", id, ErrFindingNotFound)
+	}
+	if f.State != FindingStateOpen {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("threatdetect: finding %d is not open (state=%s): %w", id, f.State, ErrFindingNotOpen)
+	}
+	f.State = FindingStateResolved
+	key := dedupeKey{rule: f.Rule.String(), tenant: f.TenantID, subject: f.Subject}
+	if s.byKey[key] == f {
+		delete(s.byKey, key)
+	}
+	// Snapshot under the lock so later writes cannot change this result.
+	f = f.clone()
+	delivery := resolveDelivery(f)
+	s.mu.Unlock()
+
+	if err := s.audit.Log(ctx, &audit.AuditEntry{
+		Action:       "resolve",
+		ResourceType: auditResourceType,
+		ResourceID:   fmt.Sprintf("%d", f.ID),
+		Detail:       fmt.Sprintf("rule=%s tenant=%s subject=%s", f.Rule, f.TenantID, f.Subject),
+	}); err != nil {
+		log.Printf("threatdetect: audit log resolve for finding %d (degraded mode): %v", f.ID, err)
+	}
+	s.emitter.EmitSecurityFinding(f.ToProto())
+	if s.notifier != nil {
+		s.notifier.Notify(delivery) // delivered once: the resolution (#2643)
+	}
+	return f, nil
+}
