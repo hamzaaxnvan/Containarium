@@ -542,3 +542,547 @@ func (s *Store) resolveEncryptKMS(username string) (corecrypto.KMSClient, error)
 // kek_id, not by any "current tenant override" — every row decrypts
 // under whatever key it actually says it's under, independent of
 // whether SetTenantKMSKey/ClearTenantKMSKey has since moved that
+// tenant's override elsewhere (or is still mid-rewrap). This is what
+// makes a partially-completed rewrap safe: nothing here needs to know
+// "am I done migrating this tenant yet."
+//
+// Non-GCP kek_ids (inproc/vault/aws) fall back to s.kms unchanged —
+// per-tenant keys aren't implemented for those backends (#1630 scope).
+func (s *Store) resolveDecryptKMS(kekID string) (corecrypto.KMSClient, error) {
+	if s.tenantKMSFactory != nil {
+		// A GCP kek_id names the key VERSION (#2402); decrypt is
+		// addressed to the CryptoKey, which Cloud KMS resolves to the
+		// right version from the ciphertext. Pre-#2402 rows carry the
+		// bare key name and parse the same way.
+		if keyName, ok := corecrypto.GCPCryptoKeyFromKEKID(kekID); ok {
+			return s.kekClient(keyName)
+		}
+	}
+	return s.kms, nil
+}
+
+// kekClient returns a cached KMSClient for keyResourceName, building
+// one via tenantKMSFactory on first use. Shared by both the encrypt
+// path (resolveEncryptKMS) and the decrypt path (resolveDecryptKMS) —
+// a key that happens to be both "the shared default" and reached via
+// this cache just means one harmless redundant client alongside s.kms,
+// not an inconsistency.
+func (s *Store) kekClient(keyResourceName string) (corecrypto.KMSClient, error) {
+	s.kekClientsMu.RLock()
+	c, ok := s.kekClients[keyResourceName]
+	s.kekClientsMu.RUnlock()
+	if ok {
+		return c, nil
+	}
+
+	s.kekClientsMu.Lock()
+	defer s.kekClientsMu.Unlock()
+	if c, ok := s.kekClients[keyResourceName]; ok { // re-check post-lock
+		return c, nil
+	}
+	built, err := s.tenantKMSFactory(keyResourceName)
+	if err != nil {
+		return nil, err
+	}
+	s.kekClients[keyResourceName] = built
+	return built, nil
+}
+
+// loadTenantKEKCache populates tenantKEK from the tenant_kms_keys
+// table once at Store construction, so resolveEncryptKMS is a pure
+// in-memory lookup rather than a DB round-trip on every Set.
+func (s *Store) loadTenantKEKCache(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx, `SELECT username, kek_resource_name FROM tenant_kms_keys`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var username, keyName string
+		if err := rows.Scan(&username, &keyName); err != nil {
+			return err
+		}
+		s.tenantKEK[username] = keyName
+	}
+	return rows.Err()
+}
+
+// SetTenantKMSKey sets username's per-tenant KEK to keyResourceName
+// and re-wraps every secret username currently owns under it (#1630).
+// Empty keyResourceName is equivalent to ClearTenantKMSKey.
+//
+// Requires the daemon's KMS backend to be "gcp" (WithTenantKMSFactory
+// configured) — returns an error otherwise rather than silently
+// no-op-ing what looks like a security-relevant change.
+//
+// The override is persisted and cached BEFORE the rewrap loop runs, so
+// this is resumable: a retry after a partial failure only re-wraps
+// rows still under their old key (each Get/Set pair is independently
+// correct regardless of how many prior rows already moved — see
+// resolveDecryptKMS).
+func (s *Store) SetTenantKMSKey(ctx context.Context, username, keyResourceName string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("secrets: username is required")
+	}
+	keyResourceName = strings.TrimSpace(keyResourceName)
+	if keyResourceName == "" {
+		return s.ClearTenantKMSKey(ctx, username)
+	}
+	if s.tenantKMSFactory == nil {
+		return ErrTenantKMSNotSupported
+	}
+	if _, err := s.kekClient(keyResourceName); err != nil {
+		return fmt.Errorf("build tenant kms client: %w", err)
+	}
+
+	const q = `
+		INSERT INTO tenant_kms_keys (username, kek_resource_name)
+		VALUES ($1, $2)
+		ON CONFLICT (username) DO UPDATE SET
+			kek_resource_name = EXCLUDED.kek_resource_name,
+			updated_at        = NOW();
+	`
+	if _, err := s.pool.Exec(ctx, q, username, keyResourceName); err != nil {
+		return fmt.Errorf("persist tenant kms key: %w", err)
+	}
+	s.tenantKEKMu.Lock()
+	s.tenantKEK[username] = keyResourceName
+	s.tenantKEKMu.Unlock()
+
+	return s.rewrapTenant(ctx, username)
+}
+
+// ClearTenantKMSKey stops routing username's NEW secret writes to their
+// dedicated KMS key — it does NOT touch any existing secret. This is the
+// cryptographic-shred half of per-org CMEK disable
+// (FootprintAI/Containarium-cloud#1386, #1387): the caller (the cloud
+// control plane) destroys the underlying GCP key right after this call
+// returns, and every row still carrying that key's kek_id becomes
+// permanently unreadable — resolveDecryptKMS resolves strictly from each
+// row's own persisted kek_id, never from this override, so leaving old
+// rows alone here is exactly what makes that destroy a real shred rather
+// than a no-op. Idempotent: clearing a tenant with no override is just a
+// delete of zero rows, still succeeds.
+func (s *Store) ClearTenantKMSKey(ctx context.Context, username string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("secrets: username is required")
+	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM tenant_kms_keys WHERE username = $1`, username); err != nil {
+		return fmt.Errorf("clear tenant kms key: %w", err)
+	}
+	s.tenantKEKMu.Lock()
+	delete(s.tenantKEK, username)
+	s.tenantKEKMu.Unlock()
+
+	return nil
+}
+
+// rewrapTenant re-encrypts every secret username owns under whatever
+// resolveEncryptKMS currently resolves for username — i.e., the
+// dedicated key SetTenantKMSKey just committed. Only SetTenantKMSKey
+// calls this (migrating live secrets onto a NEW key they're keeping);
+// ClearTenantKMSKey does NOT — see its doc comment for why leaving old
+// rows alone is what makes per-org CMEK disable a real cryptographic
+// shred instead of a silent preserve-under-a-different-key.
+//
+// Not optimized to skip rows already on the target key — tenants carry
+// a handful of secrets, not thousands, so a harmless re-encrypt of an
+// already-correct row is an acceptable simplicity tradeoff here.
+func (s *Store) rewrapTenant(ctx context.Context, username string) error {
+	metas, err := s.List(ctx, username)
+	if err != nil {
+		return fmt.Errorf("list secrets for rewrap: %w", err)
+	}
+	for _, m := range metas {
+		if err := s.rewrapOne(ctx, username, m.Name); err != nil {
+			return fmt.Errorf("rewrap %s/%s: %w", username, m.Name, err)
+		}
+	}
+	return nil
+}
+
+// rewrapMaxAttempts bounds rewrapOne's retry loop — generous for what
+// should be, in practice, at most one real collision (a tenant setting
+// a secret at the exact moment an admin rewraps their key).
+const rewrapMaxAttempts = 5
+
+// rewrapOneTestHook, when non-nil, is invoked by rewrapOne once per
+// attempt, right after its read and before its conditional write —
+// tests use it to deterministically force a version mismatch on a
+// chosen attempt, so the retry branch is directly testable instead of
+// depending on real goroutine timing. Always nil outside tests.
+var rewrapOneTestHook func(username, name string, attempt int)
+
+// rewrapOne re-encrypts a single secret under the currently-resolved
+// KMS client, via a version-guarded conditional UPDATE rather than
+// Get-then-Set. A plain Get-then-Set is a read-modify-write race: if a
+// tenant calls SetSecret on the same (username, name) between rewrapOne's
+// read and write, the unconditional Set would silently overwrite the
+// tenant's new value with the old plaintext re-encrypted, AND bump the
+// version again — a silent rollback with no error anywhere (CodeRabbit
+// finding on #1631). The conditional UPDATE affects zero rows if the
+// version moved since the read; rewrapOne detects that and retries with
+// a fresh read instead of clobbering.
+//
+// Preserves the row's version and delivery on success — a rewrap isn't
+// a value change, so it shouldn't look like one (no version bump).
+func (s *Store) rewrapOne(ctx context.Context, username, name string) error {
+	for attempt := 0; attempt < rewrapMaxAttempts; attempt++ {
+		// getRaw, not Get: a KEK rewrap must re-encrypt a broker-only
+		// row's value too (key management, not delivery) — Get's
+		// broker gate would turn every broker-only secret into a
+		// rewrap failure.
+		meta, value, err := s.getRaw(ctx, username, name)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil // deleted concurrently — nothing left to rewrap
+			}
+			return fmt.Errorf("read: %w", err)
+		}
+		// Test-only seam: lets tests deterministically inject a
+		// concurrent write between this read and the conditional
+		// write below, so the retry branch is directly exercisable
+		// instead of relying on real goroutine timing. Nil (and this
+		// call a no-op) in production.
+		if rewrapOneTestHook != nil {
+			rewrapOneTestHook(username, name, attempt)
+		}
+		nonce, ct, wrappedDEK, kekID, err := s.encryptForStorage(ctx, username, name, []byte(value))
+		if err != nil {
+			return fmt.Errorf("encrypt: %w", err)
+		}
+		ok, err := s.tryRewrapAtVersion(ctx, username, name, nonce, ct, wrappedDEK, kekID, meta.Version)
+		if err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+		if ok {
+			return nil
+		}
+		// meta.Version no longer matches the row — something else
+		// wrote (or deleted) it since the read above. Retry with a
+		// fresh Get rather than overwrite whatever that write did.
+	}
+	return fmt.Errorf("gave up after %d attempts: concurrent writes to %s/%s kept racing the rewrap", rewrapMaxAttempts, username, name)
+}
+
+// tryRewrapAtVersion attempts the single conditional UPDATE rewrapOne
+// needs, split out so it's testable without needing to actually win a
+// race: a test can set up a row at version N, advance it to N+1 via an
+// ordinary Set, and then assert that a rewrap attempt still targeting
+// version N affects zero rows and leaves the N+1 row untouched.
+func (s *Store) tryRewrapAtVersion(ctx context.Context, username, name string, nonce, ct, wrappedDEK []byte, kekID string, expectedVersion int32) (bool, error) {
+	const q = `
+		UPDATE secrets
+		SET nonce = $1, ciphertext = $2, wrapped_dek = $3, kek_id = $4, updated_at = NOW()
+		WHERE username = $5 AND name = $6 AND version = $7
+	`
+	tag, err := s.pool.Exec(ctx, q, nonce, ct, wrappedDEK, kekID, username, name, expectedVersion)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// Get reads a single secret's decrypted plaintext value. Returns
+// ErrNotFound if the (username, name) tuple isn't in the table.
+//
+// Failed decryption (wrong master key, tampered ciphertext) returns
+// the underlying crypto error so callers can distinguish "you
+// looked up something that exists but I can't decrypt it" from
+// "nothing here."
+//
+// For a broker-only row, returns the metadata but ErrBrokerOnly instead
+// of a value — the write-only guarantee applies regardless of the
+// caller's scopes. rewrapTenant and BrokerCredential use the unexported
+// getRaw below, which carries no such gate, because a KEK rewrap is key
+// management (every row must stay decryptable under the current key)
+// and BrokerCredential IS the narrow path broker-only values are meant
+// to flow through.
+func (s *Store) Get(ctx context.Context, username, name string) (meta *SecretMetadata, value string, err error) {
+	if IsGatewayKeyNamespace(username) {
+		return nil, "", fmt.Errorf("%w: %q is the model gateway's own", ErrReservedNamespace, username)
+	}
+	meta, value, err = s.getRaw(ctx, username, name)
+	if err != nil {
+		return nil, "", err
+	}
+	if meta.Delivery == DeliveryBroker {
+		return meta, "", ErrBrokerOnly
+	}
+	return meta, value, nil
+}
+
+// BrokerCredential returns the plaintext value of a broker-only secret.
+// Refuses (ErrNotBrokerOnly) any row in a delivering mode — the value a
+// box already receives must never also be the value handed to a forge
+// credential path. Satisfies internal/tracker.CredentialSource; wiring
+// this into anything outside internal/tracker (and the server plumbing
+// that constructs a tracker.Broker) defeats the point of having it as a
+// separate method from Get. See TestBrokerCredentialCallers_Allowlist.
+func (s *Store) BrokerCredential(ctx context.Context, username, name string) (string, error) {
+	// The model gateway's per-owner keys are broker-mode rows too, but they are
+	// not tracker credentials: keep the two brokered domains from reading each
+	// other's material (see gateway_keys.go).
+	if IsGatewayKeyNamespace(username) {
+		return "", fmt.Errorf("%w: %q is the model gateway's own", ErrReservedNamespace, username)
+	}
+	meta, value, err := s.getRaw(ctx, username, name)
+	if err != nil {
+		return "", err
+	}
+	if meta.Delivery != DeliveryBroker {
+		return "", ErrNotBrokerOnly
+	}
+	return value, nil
+}
+
+// getRaw is the shared Postgres round-trip: fetch and decrypt
+// regardless of delivery mode. Get and BrokerCredential each apply an
+// opposite-direction delivery gate on top of it.
+//
+// Envelope rows take the KMS-unwrap path; legacy rows (wrapped_dek IS
+// NULL) take the master-key path. Both produce the same plaintext shape.
+func (s *Store) getRaw(ctx context.Context, username, name string) (meta *SecretMetadata, value string, err error) {
+	if username == "" {
+		return nil, "", fmt.Errorf("username is required")
+	}
+	if verr := corecrypto.ValidateName(name); verr != nil {
+		return nil, "", verr
+	}
+
+	const q = `
+		SELECT nonce, ciphertext, wrapped_dek, kek_id, delivery, version, created_at, updated_at
+		FROM secrets
+		WHERE username = $1 AND name = $2
+	`
+	var nonce, ct, wrappedDEK []byte
+	var kekID *string // nullable
+	var delivery string
+	var version int32
+	var createdAt, updatedAt time.Time
+	if err := s.pool.QueryRow(ctx, q, username, name).Scan(&nonce, &ct, &wrappedDEK, &kekID, &delivery, &version, &createdAt, &updatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", ErrNotFound
+		}
+		return nil, "", fmt.Errorf("select secret: %w", err)
+	}
+
+	kID := ""
+	if kekID != nil {
+		kID = *kekID
+	}
+	plaintext, err := s.decryptFromStorage(ctx, username, name, nonce, ct, wrappedDEK, kID)
+	if err != nil {
+		return nil, "", fmt.Errorf("decrypt secret: %w", err)
+	}
+	return &SecretMetadata{
+		Username:  username,
+		Name:      name,
+		Version:   version,
+		CreatedAt: createdAt,
+		UpdatedAt: updatedAt,
+		Delivery:  delivery,
+	}, string(plaintext), nil
+}
+
+// List returns metadata for all secrets owned by the tenant.
+// Values are never returned by this path — only Get returns the
+// decrypted plaintext (and is audit-logged at the caller's layer).
+func (s *Store) List(ctx context.Context, username string) ([]SecretMetadata, error) {
+	if IsGatewayKeyNamespace(username) {
+		return nil, fmt.Errorf("%w: %q is the model gateway's own", ErrReservedNamespace, username)
+	}
+	if username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	const q = `
+		SELECT username, name, version, created_at, updated_at, delivery
+		FROM secrets
+		WHERE username = $1
+		ORDER BY name
+	`
+	rows, err := s.pool.Query(ctx, q, username)
+	if err != nil {
+		return nil, fmt.Errorf("list secrets: %w", err)
+	}
+	defer rows.Close()
+
+	var out []SecretMetadata
+	for rows.Next() {
+		var m SecretMetadata
+		if err := rows.Scan(&m.Username, &m.Name, &m.Version, &m.CreatedAt, &m.UpdatedAt, &m.Delivery); err != nil {
+			return nil, fmt.Errorf("scan secret row: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate secret rows: %w", err)
+	}
+	return out, nil
+}
+
+// Delete removes a single secret. Returns ErrNotFound if no such
+// row existed (so callers can return a clean 404 instead of a
+// generic 200).
+func (s *Store) Delete(ctx context.Context, username, name string) error {
+	if IsGatewayKeyNamespace(username) {
+		return fmt.Errorf("%w: %q is the model gateway's own; use DeleteGatewayProviderKey", ErrReservedNamespace, username)
+	}
+	return s.deleteSecret(ctx, username, name)
+}
+
+// deleteSecret is Delete without the reserved-namespace guard — the one path
+// that may delete from it (DeleteGatewayProviderKey).
+func (s *Store) deleteSecret(ctx context.Context, username, name string) error {
+	if username == "" {
+		return fmt.Errorf("username is required")
+	}
+	if err := corecrypto.ValidateName(name); err != nil {
+		return err
+	}
+	const q = `DELETE FROM secrets WHERE username = $1 AND name = $2`
+	tag, err := s.pool.Exec(ctx, q, username, name)
+	if err != nil {
+		return fmt.Errorf("delete secret: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UsernamesWithFileDelivery returns the set of tenants that
+// own at least one file-mode secret. Used by the Phase 4.3
+// reconciler to narrow the re-stamp pass to containers that
+// could actually be affected by a bare `incus restart`
+// (env-mode secrets survive the restart natively via incus
+// config; only file-mode secrets need re-laying onto tmpfs).
+//
+// Empty result = no file-mode rows anywhere; the reconciler
+// can no-op on the whole pass.
+func (s *Store) UsernamesWithFileDelivery(ctx context.Context) ([]string, error) {
+	const q = `
+		SELECT DISTINCT username
+		FROM secrets
+		WHERE delivery = $1
+		ORDER BY username
+	`
+	rows, err := s.pool.Query(ctx, q, DeliveryFile)
+	if err != nil {
+		return nil, fmt.Errorf("query file-mode tenants: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, fmt.Errorf("scan tenant: %w", err)
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// SecretValue pairs a decrypted plaintext with its delivery
+// mode. Phase 4.3 — LoadAllForUserWithDelivery returns this
+// so callers can dispatch per-secret (env stamp vs tmpfs
+// file). Legacy LoadAllForUser keeps its name+value map
+// shape for backwards compatibility.
+type SecretValue struct {
+	Value    string
+	Delivery string
+}
+
+// LoadAllForUser returns the decrypted plaintext values for every
+// secret owned by the tenant. Used by the daemon's env-var
+// stamping path (CreateContainer / StartContainer / RefreshSecrets)
+// to build the map of environment.<NAME>=<value> assignments.
+//
+// This path is the hot one: returning N decrypted values in one
+// round-trip beats N Get calls. The caller is responsible for not
+// logging the map or persisting it outside the LXC config.
+//
+// Phase B: per-row dispatch — legacy rows use master key, envelope
+// rows use KMS unwrap. The mixed-state case (some of each) is
+// supported until the migration tool runs.
+//
+// Phase 4.3 — backwards-compat shim. New callers should prefer
+// LoadAllForUserWithDelivery to receive per-secret delivery
+// modes and dispatch tmpfs / env stamping appropriately.
+func (s *Store) LoadAllForUser(ctx context.Context, username string) (map[string]string, error) {
+	full, err := s.LoadAllForUserWithDelivery(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(full))
+	for k, v := range full {
+		out[k] = v.Value
+	}
+	return out, nil
+}
+
+// LoadAllForUserWithDelivery is the Phase 4.3 shape — same
+// decrypt-all semantics as LoadAllForUser, but each entry
+// carries the row's delivery mode so the caller can route
+// "env" rows to incus config stamping and "file" rows to
+// the tmpfs file writer.
+//
+// Rows with an empty / NULL delivery column (e.g. pre-4.3
+// migrations missed by the DEFAULT 'env' clause) are
+// treated as env.
+//
+// Broker-mode rows are excluded IN THIS QUERY, not by a check each
+// caller remembers to make. Every delivery path (LXC env/file/compose
+// stamping, the K8s Secret materializer, and LoadAllForUser which
+// delegates here) funnels through this one method, so a delivery path
+// written next year inherits the exclusion instead of needing to
+// reimplement it. See docs/architecture/agent-tracker-broker.md.
+func (s *Store) LoadAllForUserWithDelivery(ctx context.Context, username string) (map[string]SecretValue, error) {
+	// Belt and braces on top of the broker-mode exclusion below: the reserved
+	// model-gateway namespace is not a tenant and nothing about it is ever
+	// delivered anywhere (see gateway_keys.go).
+	if IsGatewayKeyNamespace(username) {
+		return nil, fmt.Errorf("%w: %q is the model gateway's own", ErrReservedNamespace, username)
+	}
+	if username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	const q = `
+		SELECT name, nonce, ciphertext, wrapped_dek, kek_id, delivery
+		FROM secrets
+		WHERE username = $1 AND delivery <> 'broker'
+	`
+	rows, err := s.pool.Query(ctx, q, username)
+	if err != nil {
+		return nil, fmt.Errorf("load secrets for user: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]SecretValue)
+	for rows.Next() {
+		var name, delivery string
+		var nonce, ct, wrappedDEK []byte
+		var kekID *string
+		if err := rows.Scan(&name, &nonce, &ct, &wrappedDEK, &kekID, &delivery); err != nil {
+			return nil, fmt.Errorf("scan secret row: %w", err)
+		}
+		kID := ""
+		if kekID != nil {
+			kID = *kekID
+		}
+		pt, decErr := s.decryptFromStorage(ctx, username, name, nonce, ct, wrappedDEK, kID)
+		if decErr != nil {
+			return nil, fmt.Errorf("decrypt secret %s/%s: %w", username, name, decErr)
+		}
+		if delivery == "" {
+			delivery = DeliveryEnv
+		}
+		out[name] = SecretValue{Value: string(pt), Delivery: delivery}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate secret rows: %w", err)
+	}
+	return out, nil
+}

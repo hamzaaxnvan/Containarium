@@ -40,3 +40,45 @@ func init() {
 	routeAddCmd.Flags().StringVarP(&routeAddContainer, "container", "c", "", "Associated container name (optional)")
 	routeAddCmd.Flags().StringVarP(&routeAddDescription, "description", "d", "", "Route description (optional)")
 
+	_ = routeAddCmd.MarkFlagRequired("target")
+}
+
+func runRouteAdd(cmd *cobra.Command, args []string) error {
+	domain := args[0]
+
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required")
+	}
+
+	// Parse target IP:port
+	parts := strings.Split(routeAddTarget, ":")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid target format: expected IP:port, got %s", routeAddTarget)
+	}
+
+	targetIP := parts[0]
+	targetPort, err := strconv.ParseInt(parts[1], 10, 32)
+	if err != nil {
+		return fmt.Errorf("invalid port: %s", parts[1])
+	}
+
+	apiClient, err := newRouteClient()
+	if err != nil {
+		return fmt.Errorf("failed to connect to server: %w", err)
+	}
+	defer func() { _ = apiClient.Close() }()
+
+	route, err := apiClient.AddRoute(domain, targetIP, int32(targetPort), routeAddContainer, routeAddDescription)
+	if err != nil {
+		return fmt.Errorf("failed to add route: %w", err)
+	}
+
+	fmt.Printf("Route added successfully!\n")
+	fmt.Printf("  Domain:  %s\n", domain)
+	fmt.Printf("  Target:  %s:%d\n", route.ContainerIp, route.Port)
+	if routeAddContainer != "" {
+		fmt.Printf("  Container: %s\n", routeAddContainer)
+	}
+
+	return nil
+}
