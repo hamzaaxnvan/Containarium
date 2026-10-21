@@ -64,3 +64,20 @@ func TestFetchSHA256_NonOKStatusIsError(t *testing.T) {
 	orig := GitHubReleaseBaseURL
 	GitHubReleaseBaseURL = srv.URL
 	t.Cleanup(func() { GitHubReleaseBaseURL = orig })
+
+	if _, err := FetchSHA256(context.Background(), "v9.9.9-nope", "containariumd-linux-amd64"); err == nil {
+		t.Fatal("expected an error for a 404 SHA256SUMS.txt")
+	}
+}
+
+func TestBinaryDownloadURL(t *testing.T) {
+	orig := GitHubReleaseBaseURL
+	GitHubReleaseBaseURL = "https://github.com/FootprintAI/Containarium/releases/download"
+	t.Cleanup(func() { GitHubReleaseBaseURL = orig })
+
+	got := BinaryDownloadURL("v0.55.0", "containariumd-linux-amd64")
+	want := "https://github.com/FootprintAI/Containarium/releases/download/v0.55.0/containariumd-linux-amd64"
+	if got != want {
+		t.Errorf("BinaryDownloadURL = %q, want %q", got, want)
+	}
+}

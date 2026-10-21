@@ -27,3 +27,11 @@ Examples:
 
   # Add a passthrough route with different external/internal ports
   containarium passthrough add --port 9443 --target-ip 10.0.3.150 --target-port 50051 --protocol tcp
+
+  # Remove a passthrough route
+  containarium passthrough remove --port 50051`,
+}
+
+func init() {
+	rootCmd.AddCommand(passthroughCmd)
+}
