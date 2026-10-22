@@ -65,3 +65,139 @@ type SSHSessionDetail struct {
 	SentinelID       string              `json:"sentinel_id,omitempty"`
 	UserID           string              `json:"user_id,omitempty"`
 	AuthzDecision    pb.SSHAuthzDecision `json:"authz_decision,omitempty"`
+	DenyReason       pb.SSHDenyReason    `json:"deny_reason,omitempty"`
+	Enforced         bool                `json:"enforced,omitempty"`
+
+	// Set only on ssh_auth_failed / ssh_banned rows (#2419).
+	FailureCount    uint64            `json:"failure_count,omitempty"`
+	BannedUntil     string            `json:"banned_until,omitempty"` // RFC 3339, UTC
+	BanListener     pb.SSHBanListener `json:"ban_listener,omitempty"`
+	SuppressedCount uint64            `json:"suppressed_count,omitempty"`
+}
+
+// IngestSSHSessionRecords appends the sentinel's SSH session records to this
+// backend's audit chain. See the RPC's proto comment for the contract.
+func (s *AuditServer) IngestSSHSessionRecords(ctx context.Context, req *pb.IngestSSHSessionRecordsRequest) (*pb.IngestSSHSessionRecordsResponse, error) {
+	// Explicit, not RequireScope: a token with no scopes claim must not be
+	// able to write into the tamper-evident chain.
+	if err := auth.RequireExplicitScope(ctx, auth.ScopeAuditIngest); err != nil {
+		return nil, err
+	}
+	if s.store == nil {
+		return nil, status.Error(codes.Unavailable, "audit store is not available on this daemon")
+	}
+
+	n := len(req.GetRecords())
+	if n == 0 {
+		return nil, status.Error(codes.InvalidArgument, "records must contain at least one record")
+	}
+	if n > maxIngestBatch {
+		return nil, status.Errorf(codes.InvalidArgument, "records has %d entries, max %d", n, maxIngestBatch)
+	}
+
+	// Validate everything before the first write: an invalid record rejects
+	// the batch, it is never skipped (a skipped audit record is a hole).
+	jti, _ := auth.JTIFromContext(ctx)
+	entries := make([]audit.BatchEntry, n)
+	for i, p := range req.GetRecords() {
+		rec, err := sshsession.FromProto(p)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "records[%d]: %v", i, err)
+		}
+		be, err := sshSessionBatchEntry(rec, req.GetSentinelId(), jti)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "records[%d]: %v", i, err)
+		}
+		entries[i] = be
+	}
+
+	outcomes, err := s.store.LogBatch(ctx, entries)
+	if err != nil {
+		// Nothing was committed (LogBatch is one transaction), so the caller
+		// retries the identical batch.
+		return nil, status.Errorf(codes.Unavailable, "audit store write failed: %v", err)
+	}
+	if len(outcomes) != n {
+		return nil, status.Errorf(codes.Internal, "audit store returned %d outcomes for %d records", len(outcomes), n)
+	}
+
+	resp := &pb.IngestSSHSessionRecordsResponse{Outcomes: make([]pb.IngestOutcome, n)}
+	for i, o := range outcomes {
+		switch o {
+		case audit.BatchInserted:
+			resp.Outcomes[i] = pb.IngestOutcome_INGEST_OUTCOME_INSERTED
+			resp.Inserted++
+		case audit.BatchDuplicate:
+			resp.Outcomes[i] = pb.IngestOutcome_INGEST_OUTCOME_DUPLICATE
+			resp.Duplicates++
+		default:
+			return nil, status.Errorf(codes.Internal, "audit store returned unknown outcome %d", o)
+		}
+	}
+	return resp, nil
+}
+
+// sshSessionBatchEntry maps one validated Record to its audit row.
+func sshSessionBatchEntry(rec sshsession.Record, sentinelID, jti string) (audit.BatchEntry, error) {
+	action := auditActionSSHSessionOpen
+	switch rec.Phase {
+	case sshsession.SessionPhaseClose:
+		action = auditActionSSHSessionClose
+	case sshsession.SessionPhaseDenied:
+		action = auditActionSSHSessionDenied
+	case sshsession.SessionPhaseAuthFailed:
+		action = auditActionSSHAuthFailed
+	case sshsession.SessionPhaseBanned:
+		action = auditActionSSHBanned
+	}
+	var bannedUntil string
+	if rec.BannedUntil != nil {
+		bannedUntil = rec.BannedUntil.UTC().Format(time.RFC3339)
+	}
+	detail, err := json.Marshal(SSHSessionDetail{
+		Target:           rec.Target,
+		AuthMethod:       string(rec.AuthMethod),
+		ClientPort:       rec.ClientPort,
+		KeyID:            rec.KeyID,
+		Serial:           rec.Serial,
+		CAKeyFingerprint: rec.CAFingerprint,
+		KeyFingerprint:   rec.KeyFingerprint,
+		CloseReason:      string(rec.CloseReason),
+		SentinelID:       sentinelID,
+		UserID:           rec.UserID,
+		AuthzDecision:    rec.AuthzDecision,
+		DenyReason:       rec.DenyReason,
+		Enforced:         rec.Enforced,
+		FailureCount:     rec.FailureCount,
+		BannedUntil:      bannedUntil,
+		BanListener:      rec.BanListener,
+		SuppressedCount:  rec.SuppressedCount,
+	})
+	if err != nil {
+		return audit.BatchEntry{}, fmt.Errorf("marshal detail: %w", err)
+	}
+	return audit.BatchEntry{
+		Entry: audit.AuditEntry{
+			Timestamp:    rec.OccurredAt,
+			Username:     rec.Login,
+			Action:       action,
+			ResourceType: auditResourceSSHSession,
+			ResourceID:   rec.SessionID,
+			Detail:       audit.SanitizeDetail(string(detail)),
+			SourceIP:     rec.ClientIP,
+			TokenID:      jti,
+		},
+		DedupeKey: sshSessionDedupeKey(rec),
+	}, nil
+}
+
+// sshSessionDedupeKey is the row's idempotency identity: one row per
+// (session, phase). A synthesized orphan close gets its own suffix so it
+// never occupies the identity of the session's genuine close.
+func sshSessionDedupeKey(rec sshsession.Record) string {
+	key := fmt.Sprintf("sshsession:%s:%s", rec.SessionID, rec.Phase)
+	if rec.CloseReason == sshsession.CloseReasonUnknownOrphan {
+		key += ":orphan"
+	}
+	return key
+}
