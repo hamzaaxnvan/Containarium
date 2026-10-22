@@ -481,3 +481,729 @@ type ProofPack struct {
 	StepTimeoutSeconds int64 `protobuf:"varint,13,opt,name=step_timeout_seconds,json=stepTimeoutSeconds,proto3" json:"step_timeout_seconds,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
+}
+
+func (x *ProofPack) Reset() {
+	*x = ProofPack{}
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProofPack) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProofPack) ProtoMessage() {}
+
+func (x *ProofPack) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProofPack.ProtoReflect.Descriptor instead.
+func (*ProofPack) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_proof_pack_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ProofPack) GetSchemaVersion() uint32 {
+	if x != nil {
+		return x.SchemaVersion
+	}
+	return 0
+}
+
+func (x *ProofPack) GetProducer() string {
+	if x != nil {
+		return x.Producer
+	}
+	return ""
+}
+
+func (x *ProofPack) GetRepoDir() string {
+	if x != nil {
+		return x.RepoDir
+	}
+	return ""
+}
+
+func (x *ProofPack) GetGitCommit() string {
+	if x != nil {
+		return x.GitCommit
+	}
+	return ""
+}
+
+func (x *ProofPack) GetCommandSource() ProofCommandSource {
+	if x != nil {
+		return x.CommandSource
+	}
+	return ProofCommandSource_PROOF_COMMAND_SOURCE_UNSPECIFIED
+}
+
+func (x *ProofPack) GetDeclarationSha256() string {
+	if x != nil {
+		return x.DeclarationSha256
+	}
+	return ""
+}
+
+func (x *ProofPack) GetSteps() []*ProofStep {
+	if x != nil {
+		return x.Steps
+	}
+	return nil
+}
+
+func (x *ProofPack) GetCounts() []*ProofKindCount {
+	if x != nil {
+		return x.Counts
+	}
+	return nil
+}
+
+func (x *ProofPack) GetStatus() ProofPackStatus {
+	if x != nil {
+		return x.Status
+	}
+	return ProofPackStatus_PROOF_PACK_STATUS_UNSPECIFIED
+}
+
+func (x *ProofPack) GetStartedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.StartedAt
+	}
+	return nil
+}
+
+func (x *ProofPack) GetFinishedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.FinishedAt
+	}
+	return nil
+}
+
+func (x *ProofPack) GetLogLimitBytes() int64 {
+	if x != nil {
+		return x.LogLimitBytes
+	}
+	return 0
+}
+
+func (x *ProofPack) GetStepTimeoutSeconds() int64 {
+	if x != nil {
+		return x.StepTimeoutSeconds
+	}
+	return 0
+}
+
+// ProofPartDigest is the digest of one step of a sealed pack: SHA-256
+// (lowercase hex) of the step's deterministic proto encoding, the same
+// digest PackDigest takes of the whole pack (#2798).
+type ProofPartDigest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The step's declared name.
+	Name          string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Sha256        string `protobuf:"bytes,2,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProofPartDigest) Reset() {
+	*x = ProofPartDigest{}
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProofPartDigest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProofPartDigest) ProtoMessage() {}
+
+func (x *ProofPartDigest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProofPartDigest.ProtoReflect.Descriptor instead.
+func (*ProofPartDigest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_proof_pack_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ProofPartDigest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ProofPartDigest) GetSha256() string {
+	if x != nil {
+		return x.Sha256
+	}
+	return ""
+}
+
+// ProofPackSeal is what sealing a pack records. Its body, without
+// audit_row_id, is the detail of one audit_logs row (action
+// "proof_pack.seal"), so the existing audit hash chain covers it. No new
+// hashing scheme: every digest here is a SHA-256 of a deterministic proto
+// encoding, and the chain row is hashed by internal/audit like any other.
+type ProofPackSeal struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// PackDigest of the whole pack.
+	PackSha256 string `protobuf:"bytes,1,opt,name=pack_sha256,json=packSha256,proto3" json:"pack_sha256,omitempty"`
+	// PackDigest of the pack with its steps removed: everything that is not a
+	// step (producer, commit, counts, status, times, bounds).
+	HeaderSha256 string `protobuf:"bytes,2,opt,name=header_sha256,json=headerSha256,proto3" json:"header_sha256,omitempty"`
+	// One per step, in the pack's step order.
+	Parts []*ProofPartDigest `protobuf:"bytes,3,rep,name=parts,proto3" json:"parts,omitempty"`
+	// The audit_logs row that holds this seal. Not part of the row's own
+	// detail, which is written before the row has an id.
+	AuditRowId    int64 `protobuf:"varint,4,opt,name=audit_row_id,json=auditRowId,proto3" json:"audit_row_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProofPackSeal) Reset() {
+	*x = ProofPackSeal{}
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProofPackSeal) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProofPackSeal) ProtoMessage() {}
+
+func (x *ProofPackSeal) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProofPackSeal.ProtoReflect.Descriptor instead.
+func (*ProofPackSeal) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_proof_pack_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ProofPackSeal) GetPackSha256() string {
+	if x != nil {
+		return x.PackSha256
+	}
+	return ""
+}
+
+func (x *ProofPackSeal) GetHeaderSha256() string {
+	if x != nil {
+		return x.HeaderSha256
+	}
+	return ""
+}
+
+func (x *ProofPackSeal) GetParts() []*ProofPartDigest {
+	if x != nil {
+		return x.Parts
+	}
+	return nil
+}
+
+func (x *ProofPackSeal) GetAuditRowId() int64 {
+	if x != nil {
+		return x.AuditRowId
+	}
+	return 0
+}
+
+// SealedProofPack is the file attached to an agent-opened PR: the pack and
+// the seal that points at its audit chain row. `containarium proof-pack
+// verify` reads it.
+type SealedProofPack struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Pack          *ProofPack             `protobuf:"bytes,1,opt,name=pack,proto3" json:"pack,omitempty"`
+	Seal          *ProofPackSeal         `protobuf:"bytes,2,opt,name=seal,proto3" json:"seal,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SealedProofPack) Reset() {
+	*x = SealedProofPack{}
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SealedProofPack) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SealedProofPack) ProtoMessage() {}
+
+func (x *SealedProofPack) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SealedProofPack.ProtoReflect.Descriptor instead.
+func (*SealedProofPack) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_proof_pack_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *SealedProofPack) GetPack() *ProofPack {
+	if x != nil {
+		return x.Pack
+	}
+	return nil
+}
+
+func (x *SealedProofPack) GetSeal() *ProofPackSeal {
+	if x != nil {
+		return x.Seal
+	}
+	return nil
+}
+
+type VerifyProofPackRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The file attached to the PR, as `containarium proof-pack verify` reads
+	// it. Bounded: at most 32 steps and 4 MiB encoded.
+	Sealed        *SealedProofPack `protobuf:"bytes,1,opt,name=sealed,proto3" json:"sealed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerifyProofPackRequest) Reset() {
+	*x = VerifyProofPackRequest{}
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyProofPackRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyProofPackRequest) ProtoMessage() {}
+
+func (x *VerifyProofPackRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyProofPackRequest.ProtoReflect.Descriptor instead.
+func (*VerifyProofPackRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_proof_pack_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *VerifyProofPackRequest) GetSealed() *SealedProofPack {
+	if x != nil {
+		return x.Sealed
+	}
+	return nil
+}
+
+// ProofMismatch names the first part of a pack that differs from its seal.
+type ProofMismatch struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// True when the difference is in the pack's non-step fields; step_index
+	// and name are then unset.
+	Header    bool  `protobuf:"varint,1,opt,name=header,proto3" json:"header,omitempty"`
+	StepIndex int32 `protobuf:"varint,2,opt,name=step_index,json=stepIndex,proto3" json:"step_index,omitempty"`
+	// The step's name as sealed.
+	Name          string `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	Reason        string `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProofMismatch) Reset() {
+	*x = ProofMismatch{}
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProofMismatch) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProofMismatch) ProtoMessage() {}
+
+func (x *ProofMismatch) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProofMismatch.ProtoReflect.Descriptor instead.
+func (*ProofMismatch) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_proof_pack_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ProofMismatch) GetHeader() bool {
+	if x != nil {
+		return x.Header
+	}
+	return false
+}
+
+func (x *ProofMismatch) GetStepIndex() int32 {
+	if x != nil {
+		return x.StepIndex
+	}
+	return 0
+}
+
+func (x *ProofMismatch) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *ProofMismatch) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+type VerifyProofPackResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// True only for PROOF_PACK_VERDICT_OK.
+	Ok      bool             `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
+	Verdict ProofPackVerdict `protobuf:"varint,2,opt,name=verdict,proto3,enum=containarium.v1.ProofPackVerdict" json:"verdict,omitempty"`
+	// Set for MISMATCH.
+	FirstMismatch *ProofMismatch `protobuf:"bytes,3,opt,name=first_mismatch,json=firstMismatch,proto3" json:"first_mismatch,omitempty"`
+	// Human-readable detail for any verdict other than OK.
+	Message string `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
+	// Set for OK: the pack digest, the seal's audit row, the steps checked,
+	// and the chain tip the walk covered. A client compares the tip's hash
+	// with the external anchor.
+	PackSha256    string `protobuf:"bytes,5,opt,name=pack_sha256,json=packSha256,proto3" json:"pack_sha256,omitempty"`
+	AuditRowId    int64  `protobuf:"varint,6,opt,name=audit_row_id,json=auditRowId,proto3" json:"audit_row_id,omitempty"`
+	StepsChecked  int32  `protobuf:"varint,7,opt,name=steps_checked,json=stepsChecked,proto3" json:"steps_checked,omitempty"`
+	ChainTipId    int64  `protobuf:"varint,8,opt,name=chain_tip_id,json=chainTipId,proto3" json:"chain_tip_id,omitempty"`
+	ChainTipHash  string `protobuf:"bytes,9,opt,name=chain_tip_hash,json=chainTipHash,proto3" json:"chain_tip_hash,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerifyProofPackResponse) Reset() {
+	*x = VerifyProofPackResponse{}
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyProofPackResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyProofPackResponse) ProtoMessage() {}
+
+func (x *VerifyProofPackResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_proof_pack_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyProofPackResponse.ProtoReflect.Descriptor instead.
+func (*VerifyProofPackResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_proof_pack_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *VerifyProofPackResponse) GetOk() bool {
+	if x != nil {
+		return x.Ok
+	}
+	return false
+}
+
+func (x *VerifyProofPackResponse) GetVerdict() ProofPackVerdict {
+	if x != nil {
+		return x.Verdict
+	}
+	return ProofPackVerdict_PROOF_PACK_VERDICT_UNSPECIFIED
+}
+
+func (x *VerifyProofPackResponse) GetFirstMismatch() *ProofMismatch {
+	if x != nil {
+		return x.FirstMismatch
+	}
+	return nil
+}
+
+func (x *VerifyProofPackResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *VerifyProofPackResponse) GetPackSha256() string {
+	if x != nil {
+		return x.PackSha256
+	}
+	return ""
+}
+
+func (x *VerifyProofPackResponse) GetAuditRowId() int64 {
+	if x != nil {
+		return x.AuditRowId
+	}
+	return 0
+}
+
+func (x *VerifyProofPackResponse) GetStepsChecked() int32 {
+	if x != nil {
+		return x.StepsChecked
+	}
+	return 0
+}
+
+func (x *VerifyProofPackResponse) GetChainTipId() int64 {
+	if x != nil {
+		return x.ChainTipId
+	}
+	return 0
+}
+
+func (x *VerifyProofPackResponse) GetChainTipHash() string {
+	if x != nil {
+		return x.ChainTipHash
+	}
+	return ""
+}
+
+var File_containarium_v1_proof_pack_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_proof_pack_proto_rawDesc = "" +
+	"\n" +
+	" containarium/v1/proof_pack.proto\x12\x0fcontainarium.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\"\xb2\x02\n" +
+	"\tProofStep\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x122\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x1e.containarium.v1.ProofPartKindR\x04kind\x12\x1b\n" +
+	"\texit_code\x18\x03 \x01(\x05R\bexitCode\x12\x1b\n" +
+	"\ttimed_out\x18\x04 \x01(\bR\btimedOut\x12\x1f\n" +
+	"\vduration_ms\x18\x05 \x01(\x03R\n" +
+	"durationMs\x12\x10\n" +
+	"\x03log\x18\x06 \x01(\fR\x03log\x12\x1d\n" +
+	"\n" +
+	"log_sha256\x18\a \x01(\tR\tlogSha256\x12#\n" +
+	"\rlog_truncated\x18\b \x01(\bR\flogTruncated\x12,\n" +
+	"\x12log_original_bytes\x18\t \x01(\x03R\x10logOriginalBytes\"t\n" +
+	"\x0eProofKindCount\x122\n" +
+	"\x04kind\x18\x01 \x01(\x0e2\x1e.containarium.v1.ProofPartKindR\x04kind\x12\x16\n" +
+	"\x06passed\x18\x02 \x01(\x05R\x06passed\x12\x16\n" +
+	"\x06failed\x18\x03 \x01(\x05R\x06failed\"\xfa\x04\n" +
+	"\tProofPack\x12%\n" +
+	"\x0eschema_version\x18\x01 \x01(\rR\rschemaVersion\x12\x1a\n" +
+	"\bproducer\x18\x02 \x01(\tR\bproducer\x12\x19\n" +
+	"\brepo_dir\x18\x03 \x01(\tR\arepoDir\x12\x1d\n" +
+	"\n" +
+	"git_commit\x18\x04 \x01(\tR\tgitCommit\x12J\n" +
+	"\x0ecommand_source\x18\x05 \x01(\x0e2#.containarium.v1.ProofCommandSourceR\rcommandSource\x12-\n" +
+	"\x12declaration_sha256\x18\x06 \x01(\tR\x11declarationSha256\x120\n" +
+	"\x05steps\x18\a \x03(\v2\x1a.containarium.v1.ProofStepR\x05steps\x127\n" +
+	"\x06counts\x18\b \x03(\v2\x1f.containarium.v1.ProofKindCountR\x06counts\x128\n" +
+	"\x06status\x18\t \x01(\x0e2 .containarium.v1.ProofPackStatusR\x06status\x129\n" +
+	"\n" +
+	"started_at\x18\n" +
+	" \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x12;\n" +
+	"\vfinished_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"finishedAt\x12&\n" +
+	"\x0flog_limit_bytes\x18\f \x01(\x03R\rlogLimitBytes\x120\n" +
+	"\x14step_timeout_seconds\x18\r \x01(\x03R\x12stepTimeoutSeconds\"=\n" +
+	"\x0fProofPartDigest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06sha256\x18\x02 \x01(\tR\x06sha256\"\xaf\x01\n" +
+	"\rProofPackSeal\x12\x1f\n" +
+	"\vpack_sha256\x18\x01 \x01(\tR\n" +
+	"packSha256\x12#\n" +
+	"\rheader_sha256\x18\x02 \x01(\tR\fheaderSha256\x126\n" +
+	"\x05parts\x18\x03 \x03(\v2 .containarium.v1.ProofPartDigestR\x05parts\x12 \n" +
+	"\faudit_row_id\x18\x04 \x01(\x03R\n" +
+	"auditRowId\"u\n" +
+	"\x0fSealedProofPack\x12.\n" +
+	"\x04pack\x18\x01 \x01(\v2\x1a.containarium.v1.ProofPackR\x04pack\x122\n" +
+	"\x04seal\x18\x02 \x01(\v2\x1e.containarium.v1.ProofPackSealR\x04seal\"R\n" +
+	"\x16VerifyProofPackRequest\x128\n" +
+	"\x06sealed\x18\x01 \x01(\v2 .containarium.v1.SealedProofPackR\x06sealed\"r\n" +
+	"\rProofMismatch\x12\x16\n" +
+	"\x06header\x18\x01 \x01(\bR\x06header\x12\x1d\n" +
+	"\n" +
+	"step_index\x18\x02 \x01(\x05R\tstepIndex\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12\x16\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\xf7\x02\n" +
+	"\x17VerifyProofPackResponse\x12\x0e\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok\x12;\n" +
+	"\averdict\x18\x02 \x01(\x0e2!.containarium.v1.ProofPackVerdictR\averdict\x12E\n" +
+	"\x0efirst_mismatch\x18\x03 \x01(\v2\x1e.containarium.v1.ProofMismatchR\rfirstMismatch\x12\x18\n" +
+	"\amessage\x18\x04 \x01(\tR\amessage\x12\x1f\n" +
+	"\vpack_sha256\x18\x05 \x01(\tR\n" +
+	"packSha256\x12 \n" +
+	"\faudit_row_id\x18\x06 \x01(\x03R\n" +
+	"auditRowId\x12#\n" +
+	"\rsteps_checked\x18\a \x01(\x05R\fstepsChecked\x12 \n" +
+	"\fchain_tip_id\x18\b \x01(\x03R\n" +
+	"chainTipId\x12$\n" +
+	"\x0echain_tip_hash\x18\t \x01(\tR\fchainTipHash*\xe6\x01\n" +
+	"\rProofPartKind\x12\x1f\n" +
+	"\x1bPROOF_PART_KIND_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14PROOF_PART_KIND_TEST\x10\x01\x12\x18\n" +
+	"\x14PROOF_PART_KIND_UNIT\x10\x02\x12\x1f\n" +
+	"\x1bPROOF_PART_KIND_INTEGRATION\x10\x03\x12\x17\n" +
+	"\x13PROOF_PART_KIND_E2E\x10\x04\x12#\n" +
+	"\x1fPROOF_PART_KIND_STATIC_ANALYSIS\x10\x05\x12!\n" +
+	"\x1dPROOF_PART_KIND_SECURITY_SCAN\x10\x06*\xa9\x01\n" +
+	"\x12ProofCommandSource\x12$\n" +
+	" PROOF_COMMAND_SOURCE_UNSPECIFIED\x10\x00\x12!\n" +
+	"\x1dPROOF_COMMAND_SOURCE_DECLARED\x10\x01\x12+\n" +
+	"'PROOF_COMMAND_SOURCE_FALLBACK_MAKE_TEST\x10\x02\x12\x1d\n" +
+	"\x19PROOF_COMMAND_SOURCE_NONE\x10\x03*\x93\x01\n" +
+	"\x0fProofPackStatus\x12!\n" +
+	"\x1dPROOF_PACK_STATUS_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18PROOF_PACK_STATUS_PASSED\x10\x01\x12\x1c\n" +
+	"\x18PROOF_PACK_STATUS_FAILED\x10\x02\x12!\n" +
+	"\x1dPROOF_PACK_STATUS_NO_COMMANDS\x10\x03*\xe2\x01\n" +
+	"\x10ProofPackVerdict\x12\"\n" +
+	"\x1ePROOF_PACK_VERDICT_UNSPECIFIED\x10\x00\x12\x19\n" +
+	"\x15PROOF_PACK_VERDICT_OK\x10\x01\x12\x1f\n" +
+	"\x1bPROOF_PACK_VERDICT_MISMATCH\x10\x02\x12\"\n" +
+	"\x1ePROOF_PACK_VERDICT_SEAL_PURGED\x10\x03\x12%\n" +
+	"!PROOF_PACK_VERDICT_SEAL_NOT_FOUND\x10\x04\x12#\n" +
+	"\x1fPROOF_PACK_VERDICT_CHAIN_BROKEN\x10\x052\xfb\x03\n" +
+	"\x10ProofPackService\x12\xe6\x03\n" +
+	"\x0fVerifyProofPack\x12'.containarium.v1.VerifyProofPackRequest\x1a(.containarium.v1.VerifyProofPackResponse\"\xff\x02\x92A\xda\x02\n" +
+	"\n" +
+	"Proof Pack\x12\x1aVerify a sealed Proof Pack\x1a\xaf\x02Check a sealed Proof Pack against this daemon's audit hash chain. Returns ok, the first differing part, and whether retention purged the seal row. The result is only as trustworthy as this daemon; compare chain_tip_hash with the external anchor for more. Requires the admin role or the audit:read scope.\x82\xd3\xe4\x93\x02\x1b:\x01*\"\x16/v1/proof-packs/verifyBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_proof_pack_proto_rawDescOnce sync.Once
+	file_containarium_v1_proof_pack_proto_rawDescData []byte
+)
+
+func file_containarium_v1_proof_pack_proto_rawDescGZIP() []byte {
+	file_containarium_v1_proof_pack_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_proof_pack_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_proof_pack_proto_rawDesc), len(file_containarium_v1_proof_pack_proto_rawDesc)))
+	})
+	return file_containarium_v1_proof_pack_proto_rawDescData
+}
+
+var file_containarium_v1_proof_pack_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_containarium_v1_proof_pack_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_containarium_v1_proof_pack_proto_goTypes = []any{
+	(ProofPartKind)(0),              // 0: containarium.v1.ProofPartKind
+	(ProofCommandSource)(0),         // 1: containarium.v1.ProofCommandSource
+	(ProofPackStatus)(0),            // 2: containarium.v1.ProofPackStatus
+	(ProofPackVerdict)(0),           // 3: containarium.v1.ProofPackVerdict
+	(*ProofStep)(nil),               // 4: containarium.v1.ProofStep
+	(*ProofKindCount)(nil),          // 5: containarium.v1.ProofKindCount
+	(*ProofPack)(nil),               // 6: containarium.v1.ProofPack
+	(*ProofPartDigest)(nil),         // 7: containarium.v1.ProofPartDigest
+	(*ProofPackSeal)(nil),           // 8: containarium.v1.ProofPackSeal
+	(*SealedProofPack)(nil),         // 9: containarium.v1.SealedProofPack
+	(*VerifyProofPackRequest)(nil),  // 10: containarium.v1.VerifyProofPackRequest
+	(*ProofMismatch)(nil),           // 11: containarium.v1.ProofMismatch
+	(*VerifyProofPackResponse)(nil), // 12: containarium.v1.VerifyProofPackResponse
+	(*timestamppb.Timestamp)(nil),   // 13: google.protobuf.Timestamp
+}
+var file_containarium_v1_proof_pack_proto_depIdxs = []int32{
+	0,  // 0: containarium.v1.ProofStep.kind:type_name -> containarium.v1.ProofPartKind
+	0,  // 1: containarium.v1.ProofKindCount.kind:type_name -> containarium.v1.ProofPartKind
+	1,  // 2: containarium.v1.ProofPack.command_source:type_name -> containarium.v1.ProofCommandSource
+	4,  // 3: containarium.v1.ProofPack.steps:type_name -> containarium.v1.ProofStep
+	5,  // 4: containarium.v1.ProofPack.counts:type_name -> containarium.v1.ProofKindCount
+	2,  // 5: containarium.v1.ProofPack.status:type_name -> containarium.v1.ProofPackStatus
+	13, // 6: containarium.v1.ProofPack.started_at:type_name -> google.protobuf.Timestamp
+	13, // 7: containarium.v1.ProofPack.finished_at:type_name -> google.protobuf.Timestamp
+	7,  // 8: containarium.v1.ProofPackSeal.parts:type_name -> containarium.v1.ProofPartDigest
+	6,  // 9: containarium.v1.SealedProofPack.pack:type_name -> containarium.v1.ProofPack
+	8,  // 10: containarium.v1.SealedProofPack.seal:type_name -> containarium.v1.ProofPackSeal
+	9,  // 11: containarium.v1.VerifyProofPackRequest.sealed:type_name -> containarium.v1.SealedProofPack
+	3,  // 12: containarium.v1.VerifyProofPackResponse.verdict:type_name -> containarium.v1.ProofPackVerdict
+	11, // 13: containarium.v1.VerifyProofPackResponse.first_mismatch:type_name -> containarium.v1.ProofMismatch
+	10, // 14: containarium.v1.ProofPackService.VerifyProofPack:input_type -> containarium.v1.VerifyProofPackRequest
+	12, // 15: containarium.v1.ProofPackService.VerifyProofPack:output_type -> containarium.v1.VerifyProofPackResponse
+	15, // [15:16] is the sub-list for method output_type
+	14, // [14:15] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_proof_pack_proto_init() }
+func file_containarium_v1_proof_pack_proto_init() {
+	if File_containarium_v1_proof_pack_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_proof_pack_proto_rawDesc), len(file_containarium_v1_proof_pack_proto_rawDesc)),
+			NumEnums:      4,
+			NumMessages:   9,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_proof_pack_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_proof_pack_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_proof_pack_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_proof_pack_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_proof_pack_proto = out.File
+	file_containarium_v1_proof_pack_proto_goTypes = nil
+	file_containarium_v1_proof_pack_proto_depIdxs = nil
+}
