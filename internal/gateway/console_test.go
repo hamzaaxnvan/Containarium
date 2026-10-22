@@ -15,3 +15,12 @@ func TestParseConsoleUsername(t *testing.T) {
 		{"/v1/containers/alice/terminal", ""},
 		{"/v1/containers/alice/console-attach/extra", ""},
 		{"/v1/containers//console-attach", ""},
+		{"/v1/containers", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := parseConsoleUsername(c.path); got != c.want {
+			t.Errorf("parseConsoleUsername(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+}
