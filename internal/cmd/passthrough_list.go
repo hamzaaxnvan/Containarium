@@ -33,3 +33,38 @@ func runPassthroughList() error {
 	}
 
 	// Create passthrough manager (network CIDR not needed for listing)
+	pm := network.NewPassthroughManager("0.0.0.0/0")
+
+	routes, err := pm.ListRoutes()
+	if err != nil {
+		return fmt.Errorf("failed to list passthrough routes: %w", err)
+	}
+
+	if len(routes) == 0 {
+		fmt.Println("No passthrough routes configured")
+		return nil
+	}
+
+	// Print routes in a table format
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "EXT PORT\tTARGET\tPROTOCOL\tSTATUS")
+	fmt.Fprintln(w, "--------\t------\t--------\t------")
+
+	for _, route := range routes {
+		status := "Inactive"
+		if route.Active {
+			status = "Active"
+		}
+		fmt.Fprintf(w, "%d\t%s:%d\t%s\t%s\n",
+			route.ExternalPort,
+			route.TargetIP,
+			route.TargetPort,
+			route.Protocol,
+			status,
+		)
+	}
+	_ = w.Flush()
+
+	fmt.Printf("\nTotal: %d passthrough route(s)\n", len(routes))
+	return nil
+}
