@@ -811,3 +811,275 @@ daemon, the sentinel, and every on-host admin verb (`daemon`,
 want to drive the platform from (your laptop, a jump box); install
 `containariumd` on every host that runs the daemon or sentinel itself.
 A compat symlink (`/usr/local/bin/containarium -> containariumd`) keeps
+existing hosts and scripts that still invoke `containarium <daemon verb>`
+working during the rollout.
+
+### Manual install (recommended for getting started)
+
+```bash
+curl -fsSL https://containarium.dev/install.sh | sudo bash
+```
+
+See [`hacks/README.md`](hacks/README.md) for what the script does.
+
+### Terraform (recommended for production)
+
+```bash
+cd terraform/gce
+cp examples/single-server-spot.tfvars terraform.tfvars
+vim terraform.tfvars   # set project_id, admin_ssh_keys, allowed_ssh_sources
+terraform init
+terraform apply
+```
+
+See [`terraform/gce/README.md`](terraform/gce/README.md) for variables.
+
+### System requirements
+
+- **Host OS**: Ubuntu 24.04 LTS or later, or Debian 13 (trixie)
+  (containers can be any supported OS). Debian 13 has been verified
+  with the installer; Debian 12 is accepted but untested. The ZFS
+  kernel module is optional on Debian, where the cloud kernel does not
+  ship it; disk quotas then need another storage backend.
+- **Incus 6.19+** required for Docker-in-LXC support. Ubuntu 24.04's
+  default repos ship 6.0.0 which has an AppArmor bug
+  ([CVE-2025-52881](https://ubuntu.com/security/CVE-2025-52881));
+  use the [Zabbly Incus repository](https://pkgs.zabbly.com/) for
+  current builds.
+  <!-- claim-exempt: names a vendor CVE that affects installs, asserts no Containarium property -->
+- **ZFS kernel module** (for disk quotas).
+- Kernel modules: `overlay`, `br_netfilter`, `nf_nat` (Docker in
+  containers needs these).
+
+```bash
+# Quick Incus install via Zabbly
+curl -fsSL https://pkgs.zabbly.com/key.asc | \
+  sudo gpg --dearmor -o /usr/share/keyrings/zabbly-incus.gpg
+echo 'deb [signed-by=/usr/share/keyrings/zabbly-incus.gpg] \
+  https://pkgs.zabbly.com/incus/stable noble main' | \
+  sudo tee /etc/apt/sources.list.d/zabbly-incus-stable.list
+sudo apt update
+sudo apt install incus incus-tools incus-client
+incus --version  # 6.19 or later
+```
+
+---
+
+## API
+
+Containarium exposes:
+
+- **REST API** at `http://localhost:8080` (gRPC-gateway over the gRPC
+  service, JWT auth)
+- **gRPC** at `:50051` (mTLS, primarily used by the CLI)
+- **Two MCP servers**: `mcp-server` (platform) and `agent-box`
+  (in-the-box)
+
+OpenAPI / Swagger UI at
+`http://localhost:8080/swagger-ui/`.
+
+Token-issuance is **CLI-only** by design; the daemon does not have an
+"issue token via API" endpoint, because if it did, anyone with API
+access could mint admin tokens.
+
+---
+
+## Hardening notes
+
+### SSH key hygiene
+
+- Each user gets their own keypair. **Never** share keys between users
+  — sharing breaks revocation, audit, and per-user fail2ban.
+  <!-- claim-exempt: key-handling advice, asserts no property of the product -->
+- The same key can authenticate to both the sentinel proxy account and
+  the container. That's the supported flow: simpler for users, no
+  security loss because the proxy account is `nologin` and only routes
+  through.
+- To rotate: user generates a new key, admin replaces the
+  `authorized_keys` content in the container.
+
+### Agent-box sandbox
+
+If you're running an untrusted agent, set `AGENTBOX_ROOT` to a project
+directory:
+
+```bash
+# In the container
+export AGENTBOX_ROOT=/srv/project
+agent-box   # all file ops now constrained to /srv/project
+```
+
+`shell_exec` is intentionally not constrained beyond the LXC container
+boundary itself — by design, that's the tool's contract. If you need
+tighter isolation, run agent-box in a more restrictive container (e.g.
+nested LXC, or chroot the user account further).
+<!-- claim-exempt: disclaims isolation for shell_exec rather than claiming it -->
+
+### Network
+
+- Backend VMs have **no public IP** by default; they reach out via
+  Cloud NAT and accept inbound only via sshpiper.
+- Sentinel allowlist: configure `allowed_ssh_sources` in Terraform
+  (or firewall rules manually) to lock down who can hit port 22.
+
+---
+
+## Comparison FAQ
+
+**Why not Docker / Podman?**
+Docker is for application containers. Containarium uses LXC system
+containers — full Linux OS per container, real `systemd`, native SSH,
+Docker-in-LXC works, persistent filesystem. If your agent will
+`apt install` and reboot, you want LXC.
+
+**Why not Kubernetes?**
+K8s orchestrates application containers across nodes — that's the
+infrastructure layer. Containarium is the agent runtime that runs *on
+top of* Kubernetes (or LXC), giving each agent a persistent, SSH-native
+box without handing it cluster credentials. If you're already on K8s,
+run `containariumd daemon --runtime=k8s` and use your existing cluster as
+the backend. See the [Kubernetes backend](#kubernetes-backend-experimental)
+section and [docs/KIND-QUICKSTART.md](docs/KIND-QUICKSTART.md).
+
+**Why not Vagrant?**
+Vagrant orchestrates VMs on a developer's local machine. Containarium
+hosts environments on shared remote infrastructure for many agents.
+
+**Why not Dev Containers / VS Code Remote Containers?**
+Dev Containers are project-scoped, IDE-coupled, single-developer.
+Containarium gives many users (or many of one user's agents) their own
+persistent boxes on shared infrastructure, IDE-agnostic.
+
+**Why not Codespaces / Gitpod?**
+Browser-IDE-as-a-Service, per-hour billed, vendor-locked. Containarium
+is self-hosted, persistent, SSH/MCP-based, no per-hour billing in OSS.
+
+**Why not e2b / Modal / Daytona?**
+Closest peers — sandboxes for AI agents. They're SaaS-only and
+typically optimize for short-lived, process-per-call execution.
+Containarium is self-hostable, MCP-native, and gives you full
+persistent Linux boxes. Pick e2b if you want hosted-only and
+ephemeral; pick Containarium if you want self-hosted, persistent,
+and your data on your infra.
+
+**Why LXC at all?**
+- Each container runs a full Linux OS with `systemd`.
+- SSH access is first-class.
+- Docker-in-LXC works (vs. fragile Docker-in-Docker).
+- Real persistent filesystem, real users, real `sudo`.
+- "Feels like a VM" for the agent — same surface area as a managed
+  cloud VM, fraction of the resource cost.
+
+---
+
+## Use cases
+
+- **AI-agent sandboxes** (the lead): Cursor, Claude Code, Cline,
+  OpenCode, custom agents — all reach the same MCP surface.
+- **Shared developer environments**: many developers, one host, SSH
+  jump server with per-user accounts and containers (isolation
+  caveats: [`docs/security/CLAIMS.md`](docs/security/CLAIMS.md)).
+- **ML / GPU experimentation**: GPU passthrough into LXC.
+- **Education, bootcamps, workshops**: per-student isolated Linux
+  with no per-student VM.
+- **CI / build infrastructure**: long-lived build hosts that keep
+  caches warm across runs.
+- **Demo / testing infrastructure**: spin up a real Linux env, test,
+  tear down.
+
+---
+
+## In the wild
+
+Where Containarium has been demonstrated live:
+
+- **2026-08 — COSCUP, Taipei.** *An SSH-native agent runtime, built
+  because our hardware was sitting idle* — where utilisation goes on AI
+  and VM fleets, why one VM per developer stopped paying for itself, and
+  how LXC + sshpiper + persistent disk became Containarium.
+  [Slides](https://containarium.dev/talks/coscup2026).
+- **2026-06-04 — AI Agent Night, Taipei.** When the grand-prize
+  giveaway (a custom vibe-keyboard) hit a snag — the event had no way
+  to run the lucky draw — we fired up Containarium and vibe-coded a
+  lucky-draw picker on the spot to save the giveaway. Still live:
+  [lucky-draw.demo.containarium.dev](https://lucky-draw.demo.containarium.dev/).
+
+Demoed Containarium somewhere? Open a PR and add it here.
+
+---
+
+## Status
+
+- **Production-deployed** on GCP (multi-region) and bare-metal GPU
+  nodes.
+- **APIs are stable** (protobuf-defined with gRPC-gateway).
+- **Apache 2.0**, no CLA, accepting community PRs.
+- Active maintenance: see commit history on `main` and recent
+  releases.
+
+---
+
+## Roadmap
+
+- **Shipped (2026-06)**: **[Kubernetes backend](#kubernetes-backend-experimental)**
+  <!-- claim-row: Kubernetes boxes get a default-deny NetworkPolicy. -->
+  — run a box as a pod in a cluster you operate, reached over SSH like an LXC
+  box, with the sshpiper gateway, default-deny NetworkPolicy, CSI storage, and
+  `nvidia.com/gpu` passthrough. Selected at runtime via `--runtime=k8s` (no
+  recompile). End-to-end validated on `kind`; 5-minute local bring-up in
+  [docs/KIND-QUICKSTART.md](docs/KIND-QUICKSTART.md). See also
+  [docs/K8S-AGENT-BOX-RUNTIME-DESIGN.md](docs/K8S-AGENT-BOX-RUNTIME-DESIGN.md).
+- **Shipped**: `agent-box` MCP, `ssh-config` CLI, `expose-port` CLI, and
+  the demo recording — the [Quick start](#quick-start) above is built on
+  them.
+- **Q3 2026**: `agent-box` tier-2 (MCP Roots, background process
+  management), demo-driven docs and examples.
+- **Q4 2026**: OSS v1.0 cut — stable API surface, contribution
+  guide.
+
+If you want to drive an item, open an issue or PR — community work is
+welcome and we triage weekly.
+
+---
+
+## Contributing
+
+- Read [CLAUDE.md](CLAUDE.md) for the CLI-first principle (every new
+  platform action lands as `containarium <verb>` first; MCP wraps it).
+- Check existing issues and PRs.
+- Add tests for new features.
+- Update docs if user-visible behavior changes.
+
+No CLA. Apache 2.0 means you can use, modify, and redistribute. We
+welcome PRs that align with the project's positioning and reject
+those that don't (e.g. "let me add multi-tenancy to the OSS daemon"
+goes into the cloud repo discussion, not here).
+
+---
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+---
+
+## Acknowledgments
+
+- [Incus](https://linuxcontainers.org/incus/) — modern LXC manager.
+- [sshpiper](https://github.com/tg123/sshpiper) — SSH reverse proxy.
+- [mcp-go](https://github.com/mark3labs/mcp-go) — Go MCP server library.
+- [Caddy](https://caddyserver.com/) — TLS / reverse proxy with
+  PROXY-protocol support.
+- [Cobra](https://cobra.dev/) — CLI framework.
+- [Terraform](https://terraform.io/) — infrastructure as code.
+
+---
+
+## Support
+
+- **Project site**: [containarium.dev](https://containarium.dev) — overview, hosted cloud, GitHub Action for CI, PR previews.
+- **Documentation**: [docs/](docs/) directory.
+- **Issues**: GitHub Issues.
+- **Demo video**: [55s walkthrough on YouTube](https://youtu.be/IBDDD_tb8FY).
+- **Live demo app**: [helloworld.demo.containarium.dev](https://helloworld.demo.containarium.dev).
+- **Organization**: FootprintAI.
