@@ -133,3 +133,49 @@ func BridgeHandler(resolver BackendResolver, authorizer Authorizer) http.Handler
 				http.Error(w, "invalid timeout", http.StatusBadRequest)
 				return
 			}
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+		if err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		req := &pb.AuthorizeSSHRequest{}
+		if err := protojson.Unmarshal(raw, req); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		backend, known, err := resolver.ResolveBackend(r.Context(), req.GetLogin())
+		if err != nil {
+			http.Error(w, "routing unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if !known || backend != r.PathValue("backend") {
+			http.Error(w, "login route changed", http.StatusConflict)
+			return
+		}
+		res, err := authorizer.Authorize(ctx, backend, req)
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			var invalid *ProtocolError
+			if errors.As(err, &invalid) {
+				status = http.StatusUnprocessableEntity
+			}
+			var upstream *HTTPError
+			if errors.As(err, &upstream) {
+				status = upstream.Status
+			}
+			http.Error(w, "authorization unavailable", status)
+			return
+		}
+		raw, err = protojson.Marshal(res)
+		if err != nil {
+			http.Error(w, fmt.Sprint(err), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(raw)
+	})
+	return mux
+}

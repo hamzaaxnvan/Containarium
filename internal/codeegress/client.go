@@ -85,3 +85,62 @@ func WriteResponse(w io.Writer, resp *pb.GetCodingToolEgressPolicyResponse) erro
 		b.WriteString("effective:  unrestricted (no policy for this tenant and no cluster default)\n")
 		_, err := io.WriteString(w, b.String())
 		return err
+	}
+	fmt.Fprintf(&b, "effective:  %s, revision %d, mode %s\n", sourceName(eff.GetSource()), eff.GetRevision(), modeName(eff.GetMode()))
+	if eff.GetDenyAll() {
+		b.WriteString("            deny all: no destination is listed\n")
+	}
+	for _, c := range eff.GetEgressCidrs() {
+		fmt.Fprintf(&b, "  cidr      %s\n", c)
+	}
+	for _, d := range eff.GetEgressDomains() {
+		fmt.Fprintf(&b, "  domain    %s\n", d)
+	}
+	b.WriteString("always allowed:\n")
+	for _, e := range eff.GetImplicit() {
+		dest := e.GetDestination()
+		if dest == "" {
+			dest = "(per box)"
+		}
+		fmt.Fprintf(&b, "  %-13s %s — %s\n", implicitName(e.GetKind()), dest, e.GetDescription())
+	}
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+func displayTenant(t string) string {
+	if t == "" {
+		return "(cluster default)"
+	}
+	return t
+}
+
+func sourceName(s pb.CodingToolEgressPolicySource) string {
+	switch s {
+	case pb.CodingToolEgressPolicySource_CODING_TOOL_EGRESS_POLICY_SOURCE_TENANT:
+		return "tenant policy"
+	case pb.CodingToolEgressPolicySource_CODING_TOOL_EGRESS_POLICY_SOURCE_CLUSTER_DEFAULT:
+		return "cluster default"
+	}
+	return s.String()
+}
+
+func modeName(m pb.NetworkPolicyMode) string {
+	switch m {
+	case pb.NetworkPolicyMode_NETWORK_POLICY_MODE_ENFORCE:
+		return "enforce"
+	case pb.NetworkPolicyMode_NETWORK_POLICY_MODE_LOG_ONLY:
+		return "log_only"
+	}
+	return m.String()
+}
+
+func implicitName(k pb.CodingToolEgressImplicitKind) string {
+	switch k {
+	case pb.CodingToolEgressImplicitKind_CODING_TOOL_EGRESS_IMPLICIT_KIND_DNS_RESOLVER:
+		return "dns resolver"
+	case pb.CodingToolEgressImplicitKind_CODING_TOOL_EGRESS_IMPLICIT_KIND_MODEL_GATEWAY:
+		return "model gateway"
+	}
+	return k.String()
+}
