@@ -102,3 +102,56 @@ func TestHandleStartContainer_WaitForReadyPropagates(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&captured))
 		_, _ = w.Write([]byte(`{"message":"started","container":{"state":"Running"},"readyTimedOut":false}`))
+	}))
+	defer srv.Close()
+	client := NewClient(srv.URL, "tok")
+
+	_, err := handleStartContainer(client, map[string]interface{}{
+		"username":     "alice",
+		"waitForReady": true,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, true, captured["wait_for_ready"])
+}
+
+// TestHandleStartContainer_DefaultWaitForReadyFalse — the boolean
+// default must be false (matches the proto's zero value); otherwise
+// every start_container without an explicit waitForReady would block
+// on the 30s probe.
+func TestHandleStartContainer_DefaultWaitForReadyFalse(t *testing.T) {
+	var captured map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&captured))
+		_, _ = w.Write([]byte(`{"message":"started","container":{"state":"Running"},"readyTimedOut":false}`))
+	}))
+	defer srv.Close()
+	client := NewClient(srv.URL, "tok")
+
+	_, err := handleStartContainer(client, map[string]interface{}{"username": "alice"})
+	require.NoError(t, err)
+	assert.Equal(t, false, captured["wait_for_ready"])
+}
+
+// TestHandleStartContainer_RequiresUsername — handler validates
+// before hitting the wire.
+func TestHandleStartContainer_RequiresUsername(t *testing.T) {
+	client := NewClient("http://127.0.0.1:1", "tok")
+	_, err := handleStartContainer(client, map[string]interface{}{})
+	if err == nil || !strings.Contains(err.Error(), "username") {
+		t.Errorf("err = %v, want 'username is required'", err)
+	}
+}
+
+// TestHandleStartContainer_ShowsTimeoutWarning — when daemon reports
+// readyTimedOut=true, the response text includes a warning sigil
+// that operators recognise.
+func TestHandleStartContainer_ShowsTimeoutWarning(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"message":"started","container":{"state":"Running"},"readyTimedOut":true}`))
+	}))
+	defer srv.Close()
+	client := NewClient(srv.URL, "tok")
+	out, err := handleStartContainer(client, map[string]interface{}{"username": "alice", "waitForReady": true})
+	require.NoError(t, err)
+	assert.Contains(t, out, "readiness probe timed out")
+}
