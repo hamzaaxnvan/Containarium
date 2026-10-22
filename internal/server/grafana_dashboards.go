@@ -158,3 +158,83 @@ const OverviewDashboard = `{
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "fieldConfig": { "defaults": {}, "overrides": [] },
           "transformations": [
+            { "id": "organize", "options": { "excludeByName": { "Time": true, "Value": true, "__name__": true, "alertstate": true, "source": true, "service_name": true }, "renameByName": { "alertname": "Alert", "alertgroup": "Group", "severity": "Severity" } } }
+          ],
+          "options": { "showHeader": true, "footer": { "show": false } }
+        },
+        {
+          "id": 19, "title": "Alerts Over Time", "type": "timeseries",
+          "gridPos": { "h": 6, "w": 24, "x": 0, "y": 29 },
+          "targets": [
+            { "expr": "count(ALERTS{alertstate=\"firing\"}) or vector(0)", "legendFormat": "Firing", "refId": "A" },
+            { "expr": "count(ALERTS{alertstate=\"pending\"}) or vector(0)", "legendFormat": "Pending", "refId": "B" }
+          ],
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "fieldConfig": { "defaults": { "custom": { "lineWidth": 2, "fillOpacity": 20 }, "unit": "short" }, "overrides": [{ "matcher": { "id": "byName", "options": "Firing" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }] },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+        }
+      ]
+    },
+    {
+      "id": 12, "title": "Core Infrastructure", "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 13, "title": "Core CPU (cores)", "type": "timeseries",
+          "gridPos": { "h": 6, "w": 12, "x": 0, "y": 23 },
+          "targets": [{ "expr": "rate(container_cpu_usage_seconds{container_name=~\"containarium-core-.*\"}[5m])", "legendFormat": "{{ container_name }}", "refId": "A" }],
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "fieldConfig": { "defaults": { "custom": { "lineWidth": 1, "fillOpacity": 5 }, "unit": "short" }, "overrides": [] },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+        },
+        {
+          "id": 14, "title": "Core Memory", "type": "timeseries",
+          "gridPos": { "h": 6, "w": 12, "x": 12, "y": 23 },
+          "targets": [{ "expr": "container_memory_usage_bytes{container_name=~\"containarium-core-.*\"}", "legendFormat": "{{ container_name }}", "refId": "A" }],
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "fieldConfig": { "defaults": { "custom": { "lineWidth": 1, "fillOpacity": 5 }, "unit": "bytes" }, "overrides": [] },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+        },
+        {
+          "id": 15, "title": "Core Disk", "type": "timeseries",
+          "gridPos": { "h": 6, "w": 12, "x": 0, "y": 29 },
+          "targets": [{ "expr": "container_disk_usage_bytes{container_name=~\"containarium-core-.*\"}", "legendFormat": "{{ container_name }}", "refId": "A" }],
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "fieldConfig": { "defaults": { "custom": { "lineWidth": 1, "fillOpacity": 5 }, "unit": "bytes" }, "overrides": [] },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+        },
+        {
+          "id": 16, "title": "Core Network I/O", "type": "timeseries",
+          "gridPos": { "h": 6, "w": 12, "x": 12, "y": 29 },
+          "targets": [
+            { "expr": "container_network_rx_bytes{container_name=~\"containarium-core-.*\"}", "legendFormat": "{{ container_name }} RX", "refId": "A" },
+            { "expr": "container_network_tx_bytes{container_name=~\"containarium-core-.*\"}", "legendFormat": "{{ container_name }} TX", "refId": "B" }
+          ],
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "fieldConfig": { "defaults": { "custom": { "lineWidth": 1, "fillOpacity": 5 }, "unit": "bytes" }, "overrides": [] },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "backend",
+        "type": "query",
+        "label": "Backend Node",
+        "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+        "query": "label_values(container_cpu_usage_seconds, backend_id)",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2,
+        "sort": 1,
+        "multi": false
+      }
+    ]
+  },
+  "annotations": { "list": [] }
+}`
