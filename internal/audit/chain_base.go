@@ -58,3 +58,64 @@ type ChainBaseReader interface {
 	ChainBase(ctx context.Context) (ChainBase, bool, error)
 }
 
+// RowQuerier is the read side shared by *pgxpool.Pool and pgx.Tx.
+type RowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func readChainBase(ctx context.Context, q RowQuerier) (ChainBase, bool, error) {
+	var b ChainBase
+	err := q.QueryRow(ctx,
+		`SELECT base_id, base_hash, purged_at, rows_purged FROM audit_chain_base WHERE id = 1`,
+	).Scan(&b.ID, &b.Hash, &b.PurgedAt, &b.RowsPurged)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ChainBase{}, false, nil
+	}
+	if err != nil {
+		return ChainBase{}, false, fmt.Errorf("audit: read chain base: %w", err)
+	}
+	return b, true, nil
+}
+
+// ChainBase returns the stored base, and whether a purge has ever happened.
+func (s *Store) ChainBase(ctx context.Context) (ChainBase, bool, error) {
+	return readChainBase(ctx, s.pool)
+}
+
+// ReadChainBase reads the base through q, a pool or the transaction that is
+// about to act on it.
+func ReadChainBase(ctx context.Context, q RowQuerier) (ChainBase, bool, error) {
+	return readChainBase(ctx, q)
+}
+
+// WriteChainBase moves the base to (id, hash) inside tx, the transaction that
+// deletes the rows before it, and adds purged to the running total. It refuses
+// to move the base backwards: a base that goes down would re-trust rows that
+// an earlier purge removed.
+func WriteChainBase(ctx context.Context, tx pgx.Tx, id int64, hash string, purged int64) error {
+	if id < 1 || purged < 1 {
+		return fmt.Errorf("audit: chain base needs a row id and a purge count, got id=%d purged=%d", id, purged)
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO audit_chain_base (id, base_id, base_hash, purged_at, rows_purged)
+		VALUES (1, $1, $2, now(), $3)
+		ON CONFLICT (id) DO UPDATE SET
+			base_id     = EXCLUDED.base_id,
+			base_hash   = EXCLUDED.base_hash,
+			purged_at   = EXCLUDED.purged_at,
+			rows_purged = audit_chain_base.rows_purged + EXCLUDED.rows_purged
+		WHERE audit_chain_base.base_id < EXCLUDED.base_id`,
+		id, hash, purged)
+	if err != nil {
+		return fmt.Errorf("audit: write chain base: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("audit: chain base would move backwards to id=%d", id)
+	}
+	return nil
+}
+
+// SessionTranscriptActions are the audit_logs actions that make up the
+// session-transcript retention class (SSH logins and the sentinel's session
+// records). Every other action in the chain counts as gateway logs (#2878).
+var SessionTranscriptActions = []string{"ssh_login", "ssh_session_open", "ssh_session_close"}
