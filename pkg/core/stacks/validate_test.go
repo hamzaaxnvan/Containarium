@@ -16,3 +16,16 @@ func TestValidateStackID(t *testing.T) {
 
 func TestCheckStackID(t *testing.T) {
 	m := GetDefault()
+	if err := m.CheckStackID("nodejs"); err != nil {
+		t.Errorf("CheckStackID(nodejs) = %v", err)
+	}
+	err := m.CheckStackID("typo")
+	if err == nil {
+		t.Fatal("CheckStackID(typo) = nil, want an error")
+	}
+	for _, want := range []string{`"typo"`, "nodejs", "python"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should contain %q", err, want)
+		}
+	}
+}
