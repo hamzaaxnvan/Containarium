@@ -33,3 +33,21 @@ const AnonDoorUsername = "sentinel-door"
 func anonDoorHandler(v auth.SentinelVerifier, jwtHandler, inner http.Handler, now func() time.Time) http.Handler {
 	if now == nil {
 		now = time.Now
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(auth.SentinelHeaderSignature) == "" && r.Header.Get(auth.SentinelHeaderTimestamp) == "" {
+			jwtHandler.ServeHTTP(w, r)
+			return
+		}
+		if err := v.VerifyRequest(r, now()); err != nil {
+			http.Error(w, `{"error": "invalid sentinel signature", "code": 401}`, http.StatusUnauthorized)
+			return
+		}
+		ctx := auth.ContextWithClaims(r.Context(), &auth.Claims{
+			Username: AnonDoorUsername,
+			Roles:    []string{},
+			Scopes:   []string{auth.ScopeAnonDoor},
+		})
+		inner.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
