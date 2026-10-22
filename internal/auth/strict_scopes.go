@@ -78,3 +78,23 @@ func ResetUnscopedTokenCallsForTest() {
 	unscopedCalls.mu.Lock()
 	defer unscopedCalls.mu.Unlock()
 	unscopedCalls.count = 0
+	unscopedCalls.since = time.Time{}
+}
+
+// UnscopedTokenCallReport is a point-in-time snapshot of the unscoped-token
+// measurement, surfaced to operators via
+// TokensService.GetUnscopedTokenReport.
+type UnscopedTokenCallReport struct {
+	// Count is the number of RequireScope calls observed whose token
+	// carried no scopes claim, since Since (or 0 if none yet).
+	Count int64
+	// Since is when the first such call was observed. Zero if Count is 0.
+	Since time.Time
+}
+
+// UnscopedTokenCalls returns the current unscoped-token-call measurement.
+func UnscopedTokenCalls() UnscopedTokenCallReport {
+	unscopedCalls.mu.Lock()
+	defer unscopedCalls.mu.Unlock()
+	return UnscopedTokenCallReport{Count: unscopedCalls.count, Since: unscopedCalls.since}
+}
