@@ -21,3 +21,27 @@ its image inside it, then exposes the configured ports.
 }
 
 func init() {
+	rootCmd.AddCommand(recipeCmd)
+}
+
+// recipeAPI is the subset of the typed client used by recipe commands. Both
+// the gRPC and HTTP clients satisfy it, so commands dispatch on --http without
+// duplicating method calls.
+type recipeAPI interface {
+	ListRecipes() ([]*pb.Recipe, error)
+	GetRecipe(id string) (*pb.Recipe, error)
+	DeployRecipe(recipeID, name, gpu, backendID, pool string, params map[string]string, guardrailInput *pb.GuardrailGateInput) (*pb.DeployRecipeResponse, error)
+	GetWorkspaceAccess(name string) (*pb.GetWorkspaceAccessResponse, error)
+	Close() error
+}
+
+// newRecipeClient returns a recipe-capable client for the configured server.
+func newRecipeClient() (recipeAPI, error) {
+	if serverAddr == "" {
+		return nil, fmt.Errorf("--server is required")
+	}
+	if httpMode {
+		return client.NewHTTPClient(serverAddr, authToken)
+	}
+	return client.NewGRPCClient(serverAddr, certsDir, insecure)
+}
