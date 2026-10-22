@@ -75,3 +75,120 @@ trap cleanup EXIT
 cat >"$WORK/claude" <<'STUB'
 #!/bin/sh
 prompt="$2"; fmt="$4"
+if [ "$fmt" = stream-json ]; then
+  printf '{"type":"system","subtype":"init"}\n'
+  echo 'e2e-stderr-diagnostic' >&2
+  printf '{"type":"result","subtype":"success"}\n'
+else
+  printf 'FAKE-AGENT-PROMPT<<%s>>\n' "$prompt"
+  echo FAKE-AGENT-DONE
+fi
+case "$prompt" in
+  *FAIL*)  exit 1 ;;
+  *SLEEP*) i=0; while [ $i -lt 120 ]; do echo "heartbeat-$i"; i=$((i+1)); sleep 1; done ;;
+esac
+exit 0
+STUB
+if [ "$SABOTAGE" = silent-agent ]; then sed -i.bak '1a\
+exit 0' "$WORK/claude"; fi
+
+# `connect` authorizes the key via the API, but the sentinel only learns of it
+# at its next keysync (~2 min cadence). On a fresh box the first connects fail
+# with "Permission denied (publickey)" until then, so wait instead of failing.
+echo "== wait for SSH to $BOX (up to ${E2E_SSH_WAIT:-300}s)"
+t0=$SECONDS
+until "$BIN" connect "$BOX" --exec true >/dev/null 2>&1; do
+  [ $((SECONDS - t0)) -ge "${E2E_SSH_WAIT:-300}" ] && { echo "SSH to $BOX not ready after $((SECONDS - t0))s"; exit 2; }
+  sleep 10
+done
+echo "SSH ready after $((SECONDS - t0))s"
+
+# `code run` speaks MCP to `ssh <box> -- agent-box`, so the box needs agent-box
+# on PATH (/usr/local/bin). Boxes provisioned for coding agents have it; a plain
+# fresh box does not, and every `code` command then dies with "initialize MCP
+# session: transport closed". Build it with `make build-agent-box-linux`.
+AGENT_BOX_BIN="${E2E_AGENT_BOX_BIN:-./bin/agent-box-linux-amd64}"
+if [ -n "${E2E_FORCE_AGENT_BOX_INSTALL:-}" ] || ! box_exec 'command -v agent-box' >/dev/null 2>&1; then
+  echo "== install agent-box on $BOX from $AGENT_BOX_BIN"
+  [ -f "$AGENT_BOX_BIN" ] || { echo "missing $AGENT_BOX_BIN (make build-agent-box-linux)"; exit 2; }
+  SSH_CMD="$("$BIN" connect "$BOX" --print | tail -1)"
+  # shellcheck disable=SC2086  # SSH_CMD is a command line, split on purpose
+  $SSH_CMD 'sudo tee /usr/local/bin/agent-box >/dev/null && sudo chmod 755 /usr/local/bin/agent-box' <"$AGENT_BOX_BIN" \
+    || { echo "cannot install agent-box on $BOX"; exit 2; }
+fi
+
+echo "== install fake agent on $BOX"
+B64="$(base64 <"$WORK/claude" | tr -d '\n')"
+box_exec "mkdir -p \$HOME/.local/bin; [ -f $REMOTE_CLAUDE ] && [ ! -f $REMOTE_CLAUDE.e2e-orig ] && cp $REMOTE_CLAUDE $REMOTE_CLAUDE.e2e-orig; echo $B64 | base64 -d > $REMOTE_CLAUDE && chmod +x $REMOTE_CLAUDE" >/dev/null \
+  || { echo "cannot install fake agent on $BOX"; exit 2; }
+
+# ---- 1. happy path: output streams back, run ends exited ------------------
+echo "== 1. happy path"
+out="$(code run --name "$RUN-a" --prompt 'hello world' 2>"$WORK/err")"
+assert_contains "1a agent output streamed to local stdout" "$out" 'FAKE-AGENT-PROMPT<<hello world>>'
+assert_contains "1b agent ran to completion"               "$out" 'FAKE-AGENT-DONE'
+assert_contains "1c 'started' diagnostic on stderr"        "$(cat "$WORK/err")" 'started'
+st="$(code status --name "$RUN-a" 2>&1)"
+assert_contains "1d status reports exited"                 "$st" 'exited'
+
+# ---- 2. quoting: prompt is data, never shell ------------------------------
+echo "== 2. quoting / injection"
+nasty="it's \$(touch /tmp/e2e-pwned-1) \`touch /tmp/e2e-pwned-2\` ; touch /tmp/e2e-pwned-3"
+out="$(code run --name "$RUN-b" --prompt "$nasty" 2>/dev/null)"
+assert_contains "2a prompt arrives byte-exact" "$out" "FAKE-AGENT-PROMPT<<$nasty>>"
+leaked="$(box_exec 'ls /tmp/e2e-pwned-* 2>/dev/null')"
+[ -z "$leaked" ] && ok "2b no command was executed from the prompt" || fail "2b prompt was shell-interpreted: $leaked"
+
+# ---- 3. framed capture: JSON on stdout, diagnostics on stderr -------------
+echo "== 3. --output-format-stream-json"
+out="$(code run --name "$RUN-a" --prompt 'json please' --output-format-stream-json 2>"$WORK/err")"
+assert_contains     "3a stdout carries the JSON stream"     "$out" '"subtype":"success"'
+assert_not_contains "3b stderr text is not mixed into stdout" "$out" 'e2e-stderr-diagnostic'
+assert_contains     "3c stderr text arrives on stderr"       "$(cat "$WORK/err")" 'e2e-stderr-diagnostic'
+n_bad="$(grep -vc '^{.*}$' <<<"$out")"
+[ "$n_bad" = 0 ] && ok "3d every stdout line is valid-looking JSON" || fail "3d $n_bad non-JSON stdout lines"
+
+# ---- 4. detach survives client death; attach replays; stop ---------------
+echo "== 4. detach / attach / stop"
+code run --name "$RUN-long" --prompt SLEEP >"$WORK/long.out" 2>&1 & LOCAL=$!; PIDS+=("$LOCAL")
+wait_status "$RUN-long" ', running\)' 30 >/dev/null && ok "4a run is running" || fail "4a run never reached running"
+sleep 4
+kill "$LOCAL" 2>/dev/null; wait "$LOCAL" 2>/dev/null
+sleep 2
+st="$(code status --name "$RUN-long" 2>&1)"
+assert_contains "4b killing the local client did NOT kill the run" "$st" 'running'
+attach_for() { # <secs> — attach, then drop the client after <secs>
+  code attach --name "$RUN-long" 2>&1 & local p=$!; sleep "$1"; kill "$p" 2>/dev/null; wait "$p" 2>/dev/null
+}
+out="$(attach_for 8)"
+assert_contains "4c attach replays output from the start" "$out" 'heartbeat-0'
+code stop --name "$RUN-long" >"$WORK/stop.out" 2>&1
+assert_contains "4d stop reports the run" "$(cat "$WORK/stop.out")" "name: $RUN-long"
+if wait_status "$RUN-long" ', running\)' 3 >/dev/null; then fail "4e run still running after stop"; else ok "4e run is no longer running after stop"; fi
+out="$(attach_for 6)"
+assert_contains "4f log stays readable after stop" "$out" 'heartbeat-0'
+
+# ---- 5. failing agent (#2011: exit status is now surfaced, not swallowed) -
+echo "== 5. failing agent"
+out="$(code run --name "$RUN-b" --prompt 'please FAIL' 2>&1)"; rc=$?
+assert_contains "5a failing agent's output still streams" "$out" 'FAKE-AGENT-DONE'
+[ "$rc" -ne 0 ] && ok "5b 'code run' itself exits non-zero when the agent does" \
+  || fail "5b 'code run' exited 0 for a failing agent (rc=$rc)"
+st="$(code status --name "$RUN-b" 2>&1)"
+assert_contains "5c status shows exited" "$st" 'exited'
+assert_contains "5d status surfaces exit code 1" "$st" 'exit_code: 1'
+
+# ---- 6. same-box concurrency ----------------------------------------------
+echo "== 6. concurrent names"
+code run --name "$RUN-a" --prompt SLEEP >/dev/null 2>&1 & PIDS+=("$!")
+code run --name "$RUN-b" --prompt SLEEP >/dev/null 2>&1 & PIDS+=("$!")
+wait_status "$RUN-a" ', running\)' 30 >/dev/null && wait_status "$RUN-b" ', running\)' 30 >/dev/null \
+  && ok "6a two named runs run concurrently" || fail "6a concurrent runs did not both reach running"
+code stop --name "$RUN-a" --force >/dev/null 2>&1; code stop --name "$RUN-b" --force >/dev/null 2>&1
+
+# ---- 7. unknown run -------------------------------------------------------
+echo "== 7. unknown run"
+if code status --name "$RUN-does-not-exist" >/dev/null 2>&1; then fail "7a status of an unknown run exited 0"; else ok "7a status of an unknown run fails"; fi
+
+echo
+if [ "$FAILS" -eq 0 ]; then echo "PASS: all assertions held"; else echo "FAILED: $FAILS assertion(s)"; exit 1; fi
