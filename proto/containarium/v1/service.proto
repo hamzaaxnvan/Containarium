@@ -901,3 +901,304 @@ service ContainerService {
       body: "*"
     };
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Validate GPU passthrough";
+      description: "Launches a throwaway nvidia.runtime LXC on the backend, runs nvidia-smi inside, and returns whether the GPU is usable (status, model, driver). Admin-only.";
+      tags: "System";
+    };
+  }
+
+  // TriggerUpgrade upgrades a backend's daemon now rather than waiting for the
+  // periodic auto-update tick: the daemon pulls the binary the sentinel
+  // currently serves (SHA-verified), smoke-tests it, swaps atomically (keeping
+  // .old), and restarts. Admin-only. Async — poll GetUpgradeStatus or watch the
+  // version in ListBackends. backend_id in the body, empty = local. #354 Phase B.
+  rpc TriggerUpgrade(TriggerUpgradeRequest) returns (TriggerUpgradeResponse) {
+    option (google.api.http) = {
+      post: "/v1/backends/upgrade"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Trigger daemon upgrade on a backend";
+      description: "Upgrades a backend's daemon to the binary the sentinel currently serves, immediately instead of on the periodic tick. SHA-verified and smoke-tested before an atomic swap; the daemon restarts. Admin-only. Returns an upgrade_id for GetUpgradeStatus.";
+      tags: "System";
+    };
+  }
+
+  // GetUpgradeStatus polls an upgrade started by TriggerUpgrade. A local
+  // self-upgrade restarts the daemon and loses in-memory job state, so after a
+  // restart this returns "unknown" — compare the backend version in
+  // ListBackends instead. #354.
+  rpc GetUpgradeStatus(GetUpgradeStatusRequest) returns (GetUpgradeStatusResponse) {
+    option (google.api.http) = {
+      get: "/v1/upgrades/{upgrade_id}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Poll upgrade status";
+      description: "Returns the status of an upgrade started by TriggerUpgrade. Note: a local self-upgrade restarts the daemon and drops job state, returning 'unknown' afterward; compare the backend version in ListBackends to confirm.";
+      tags: "System";
+    };
+  }
+
+  // GetMonitoringInfo gets monitoring configuration (Grafana/VictoriaMetrics URLs)
+  rpc GetMonitoringInfo(GetMonitoringInfoRequest) returns (GetMonitoringInfoResponse) {
+    option (google.api.http) = {
+      get: "/v1/system/monitoring"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get monitoring information";
+      description: "Returns monitoring configuration including Grafana and VictoriaMetrics URLs. Used by the web UI to embed the Grafana dashboard.";
+      tags: "Monitoring";
+    };
+  }
+
+  // SetMetricsExport enables or disables opt-in export of host/container
+  // infra metrics to the host cloud's native monitoring (GCP Cloud
+  // Monitoring in the MVP; AWS is a reserved enum value that returns
+  // UNIMPLEMENTED). Enabling validates the provider and, for GCP, resolves
+  // Application Default Credentials with the monitoring-write scope as a
+  // synchronous dry run — a host with no usable ADC gets FAILED_PRECONDITION
+  // with an IAM remediation hint and nothing is persisted or started.
+  // Disabling stops emission within one export interval. Neither direction
+  // requires a daemon restart. #1069 delivers the toggle, config
+  // persistence, and the credential probe; the metrics collector itself
+  // lands with #1070/#1071.
+  rpc SetMetricsExport(SetMetricsExportRequest) returns (SetMetricsExportResponse) {
+    option (google.api.http) = {
+      post: "/v1/system/metrics-export"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Enable or disable cloud-native metrics export";
+      description: "Opt-in export of host/container infra metrics to the host cloud's native monitoring (GCP Cloud Monitoring in the MVP). Enabling probes Application Default Credentials (monitoring-write scope) before persisting anything; a host with no resolvable ADC fails with FAILED_PRECONDITION and an IAM remediation hint. Disabling stops emission within one export interval. AWS is reserved and returns UNIMPLEMENTED.";
+      tags: "Monitoring";
+    };
+  }
+
+  // GetMetricsExport returns the current cloud-native metrics export
+  // configuration and last-known health (last success time, last error,
+  // failure count — populated once #1070/#1071 wire the collector).
+  rpc GetMetricsExport(GetMetricsExportRequest) returns (GetMetricsExportResponse) {
+    option (google.api.http) = {
+      get: "/v1/system/metrics-export"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get cloud-native metrics export status";
+      description: "Returns whether cloud-native metrics export is enabled, the configured provider, the export interval, and last-known health (populated once the collector lands in #1070/#1071).";
+      tags: "Monitoring";
+    };
+  }
+
+  // CreateAlertRule creates a new custom alert rule
+  rpc CreateAlertRule(CreateAlertRuleRequest) returns (CreateAlertRuleResponse) {
+    option (google.api.http) = {
+      post: "/v1/alerts"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Create alert rule";
+      description: "Creates a new custom alert rule. The rule is persisted in PostgreSQL and synced to vmalert for evaluation.";
+      tags: "Alerts";
+    };
+  }
+
+  // ListAlertRules lists all alert rules
+  rpc ListAlertRules(ListAlertRulesRequest) returns (ListAlertRulesResponse) {
+    option (google.api.http) = {
+      get: "/v1/alerts"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List alert rules";
+      description: "Returns all custom alert rules stored in the database.";
+      tags: "Alerts";
+    };
+  }
+
+  // GetAlertRule gets a single alert rule by ID
+  rpc GetAlertRule(GetAlertRuleRequest) returns (GetAlertRuleResponse) {
+    option (google.api.http) = {
+      get: "/v1/alerts/{id}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get alert rule";
+      description: "Returns a single alert rule by its ID.";
+      tags: "Alerts";
+    };
+  }
+
+  // UpdateAlertRule updates an existing alert rule
+  rpc UpdateAlertRule(UpdateAlertRuleRequest) returns (UpdateAlertRuleResponse) {
+    option (google.api.http) = {
+      put: "/v1/alerts/{id}"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Update alert rule";
+      description: "Updates an existing alert rule. Changes are synced to vmalert automatically.";
+      tags: "Alerts";
+    };
+  }
+
+  // DeleteAlertRule deletes an alert rule
+  rpc DeleteAlertRule(DeleteAlertRuleRequest) returns (DeleteAlertRuleResponse) {
+    option (google.api.http) = {
+      delete: "/v1/alerts/{id}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Delete alert rule";
+      description: "Deletes an alert rule by ID. The rule is removed from both the database and vmalert.";
+      tags: "Alerts";
+    };
+  }
+
+  // GetAlertingInfo gets alerting system status and configuration
+  rpc GetAlertingInfo(GetAlertingInfoRequest) returns (GetAlertingInfoResponse) {
+    option (google.api.http) = {
+      get: "/v1/system/alerting"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get alerting information";
+      description: "Returns alerting system status including vmalert and Alertmanager health, webhook configuration, and rule counts.";
+      tags: "Alerts";
+    };
+  }
+
+  // ListDefaultAlertRules lists the built-in default alert rules
+  rpc ListDefaultAlertRules(ListDefaultAlertRulesRequest) returns (ListDefaultAlertRulesResponse) {
+    option (google.api.http) = {
+      get: "/v1/alerts/defaults"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List default alert rules";
+      description: "Returns the built-in default alert rules for system and container monitoring. These rules are always active and cannot be modified.";
+      tags: "Alerts";
+    };
+  }
+
+  // UpdateAlertingConfig updates alerting system configuration (webhook URL)
+  rpc UpdateAlertingConfig(UpdateAlertingConfigRequest) returns (UpdateAlertingConfigResponse) {
+    option (google.api.http) = {
+      put: "/v1/system/alerting"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Update alerting configuration";
+      description: "Updates the alerting system configuration, such as the webhook URL for notifications. Changes take effect immediately.";
+      tags: "Alerts";
+    };
+  }
+
+  // TestWebhook sends a test notification to the configured webhook with current system status
+  rpc TestWebhook(TestWebhookRequest) returns (TestWebhookResponse) {
+    option (google.api.http) = {
+      post: "/v1/system/alerting/test"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Test webhook";
+      description: "Sends a test alert notification to the configured webhook URL with current system status information.";
+      tags: "Alerts";
+    };
+  }
+
+  // ListWebhookDeliveries lists webhook delivery history
+  rpc ListWebhookDeliveries(ListWebhookDeliveriesRequest) returns (ListWebhookDeliveriesResponse) {
+    option (google.api.http) = {
+      get: "/v1/system/alerting/deliveries"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List webhook deliveries";
+      description: "Returns the history of webhook delivery attempts including success/failure status, HTTP codes, and timing.";
+      tags: "Alerts";
+    };
+  }
+
+  // SetSecret creates or updates a tenant secret. Idempotent —
+  // repeated calls with the same (username, name) bump the version
+  // and replace the value. See docs/SECRETS-MANAGEMENT-DESIGN.md.
+  rpc SetSecret(SetSecretRequest) returns (SetSecretResponse) {
+    option (google.api.http) = {
+      post: "/v1/secrets"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Create or update a tenant secret";
+      description: "Encrypts the value with the daemon's master key and stores it in Postgres. Idempotent: same (username, name) bumps version. The value is never logged. Name must match ^[A-Z_][A-Z0-9_]*$ up to 128 chars; value max 64 KiB.";
+      tags: "Secrets";
+    };
+  }
+
+  // GetSecret reads a single secret's plaintext value. Always
+  // audit-logged. Admin JWT required (v1).
+  rpc GetSecret(GetSecretRequest) returns (GetSecretResponse) {
+    option (google.api.http) = {
+      get: "/v1/secrets/{username}/{name}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Read a single tenant secret";
+      description: "Returns the decrypted plaintext value. Audit-logged. Caller's responsibility to keep the value safe once it's on the wire.";
+      tags: "Secrets";
+    };
+  }
+
+  // ListSecrets enumerates a tenant's secrets, metadata only —
+  // names + versions + timestamps. Never returns values.
+  rpc ListSecrets(ListSecretsRequest) returns (ListSecretsResponse) {
+    option (google.api.http) = {
+      get: "/v1/secrets/{username}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List tenant secrets (metadata only)";
+      description: "Returns name/version/timestamp tuples. Values are only readable via GetSecret per-name (audit-logged).";
+      tags: "Secrets";
+    };
+  }
+
+  // DeleteSecret removes a secret. Does not auto-clean env-var
+  // stamps on running containers — caller invokes RefreshSecrets
+  // separately if needed.
+  rpc DeleteSecret(DeleteSecretRequest) returns (DeleteSecretResponse) {
+    option (google.api.http) = {
+      delete: "/v1/secrets/{username}/{name}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Delete a tenant secret";
+      description: "Removes the secret from Postgres. Does NOT cascade to env-var stamps on running containers — call RefreshSecrets to re-stamp without restarting.";
+      tags: "Secrets";
+    };
+  }
+
+  // RefreshSecrets re-stamps the LXC's environment.<NAME> config
+  // keys from the current secret-store state for the tenant.
+  // Running processes don't pick up the new env (POSIX semantics);
+  // useful after rotation when the next exec'd process should see
+  // the new value without a full container restart.
+  rpc RefreshSecrets(RefreshSecretsRequest) returns (RefreshSecretsResponse) {
+    option (google.api.http) = {
+      post: "/v1/secrets/{username}/refresh"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Re-stamp tenant secrets into the LXC env";
+      description: "Reads all of the tenant's secrets from the DB, decrypts, and updates the LXC's environment.<NAME> config keys to match. Running processes keep their old env (POSIX); new execs see the refreshed values.";
+      tags: "Secrets";
+    };
+  }
+
+  // SetTenantKMSKey sets or clears a tenant's per-tenant KMS key for
+  // secrets envelope encryption, re-wrapping the tenant's existing
+  // secrets under the new key (or back to the shared KEK on clear).
+  // Admin role + explicit secrets:write scope required unconditionally
+  // — see SetTenantKMSKeyRequest's comment for why this RPC doesn't get
+  // the self-access exception the other secrets RPCs have.
+  rpc SetTenantKMSKey(SetTenantKMSKeyRequest) returns (SetTenantKMSKeyResponse) {
+    option (google.api.http) = {
+      post: "/v1/secrets/{username}/kms-key"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Set or clear a tenant's per-tenant KMS key";
+      description: "Re-wraps the tenant's existing secrets under the given GCP KMS CryptoKey (or back to the shared KEK if kek_resource_name is empty). Requires CONTAINARIUM_KMS_BACKEND=gcp. Admin role + explicit secrets:write scope required, unconditionally.";
+      tags: "Secrets";
+    };
+  }
+}
