@@ -54,3 +54,115 @@ service AnonymousBoxService {
     option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
       summary: "Get anonymous door config";
       description: "Kill switch, bans and the fixed per-box limits of the anonymous tier. Admin only.";
+      tags: "AnonymousBox";
+    };
+  }
+
+  // SetAnonymousDoorConfig flips the kill switch and edits bans (#2200).
+  // Requires role admin or scope anon:admin.
+  rpc SetAnonymousDoorConfig(SetAnonymousDoorConfigRequest) returns (AnonymousDoorConfig) {
+    option (google.api.http) = {
+      put: "/v1/anon/door"
+      body: "config"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Set anonymous door config";
+      description: "Enable/disable the anonymous door and edit banned fingerprints. Admin only.";
+      tags: "AnonymousBox";
+    };
+  }
+
+  // ListAnonymousBoxes lists every live anonymous box on this daemon.
+  // Requires role admin or scope anon:admin.
+  rpc ListAnonymousBoxes(ListAnonymousBoxesRequest) returns (ListAnonymousBoxesResponse) {
+    option (google.api.http) = {
+      get: "/v1/anon/boxes"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List anonymous boxes";
+      description: "Every live anonymous box with its fingerprint hash, expiry and claim state. Admin only.";
+      tags: "AnonymousBox";
+    };
+  }
+}
+
+message EnsureAnonymousBoxRequest {
+  // "SHA256:<base64>" as ssh.FingerprintSHA256. Optional; when set it
+  // must match public_key or the request is rejected.
+  string fingerprint = 1;
+  // One authorized_keys line. Required.
+  string public_key = 2;
+  // Connecting client's IP, kept on the box for abuse handling.
+  string source_ip = 3;
+}
+
+message EnsureAnonymousBoxResponse {
+  string box_name = 1;
+  // VM address reachable from the sentinel.
+  string ssh_host = 2;
+  int32 ssh_port = 3;
+  // The box's login — its tenant-named user, as every other box.
+  string ssh_user = 4;
+  google.protobuf.Timestamp ttl_expires_at = 5;
+  // true on a reconnect to an existing live box.
+  bool reused = 6;
+  // true when a prior box for this key is gone (expired or preempted),
+  // so the banner can say so.
+  bool previous_expired = 7;
+}
+
+message ClaimAnonymousBoxRequest {
+  string claim_token = 1;
+  // New owner (tenant username).
+  string tenant = 2;
+  // The tenant's keys to add; the original key stays.
+  repeated string authorized_keys = 3;
+}
+
+message ClaimAnonymousBoxResponse {
+  string box_name = 1;
+  string tenant = 2;
+}
+
+message AnonymousBoxLimits {
+  string cpu = 1;
+  string memory = 2;
+  string disk = 3;
+  int64 ttl_seconds = 4;
+  int32 max_boxes = 5;
+  double per_fingerprint_rps = 6;
+  int32 per_fingerprint_burst = 7;
+  double per_ip_rps = 8;
+  int32 per_ip_burst = 9;
+}
+
+message AnonymousDoorConfig {
+  bool enabled = 1;
+  // Shown to a rejected caller while the door is disabled.
+  string disabled_message = 2;
+  repeated string banned_fingerprints = 3;
+  // Read-only echo of the daemon's fixed limits.
+  AnonymousBoxLimits limits = 4;
+}
+
+message GetAnonymousDoorConfigRequest {}
+
+message SetAnonymousDoorConfigRequest {
+  AnonymousDoorConfig config = 1;
+}
+
+message ListAnonymousBoxesRequest {}
+
+message AnonymousBox {
+  string box_name = 1;
+  // sha256 hex of the fingerprint — never the key or the raw fingerprint.
+  string fingerprint_hash = 2;
+  string ssh_host = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp ttl_expires_at = 5;
+  bool claimed = 6;
+}
+
+message ListAnonymousBoxesResponse {
+  repeated AnonymousBox boxes = 1;
+}

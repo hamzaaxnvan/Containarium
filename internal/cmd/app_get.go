@@ -61,3 +61,66 @@ func runAppGet(cmd *cobra.Command, args []string) error {
 
 	switch getFormat {
 	case "table":
+		printAppDetails(app)
+	case "json":
+		return printAppJSON(app)
+	default:
+		return fmt.Errorf("unknown format: %s (use: table, json)", getFormat)
+	}
+
+	return nil
+}
+
+func printAppDetails(app *pb.App) {
+	state := strings.TrimPrefix(app.State.String(), "APP_STATE_")
+
+	fmt.Println("Application Details")
+	fmt.Println(strings.Repeat("=", 50))
+	fmt.Printf("Name:           %s\n", app.Name)
+	fmt.Printf("ID:             %s\n", app.Id)
+	fmt.Printf("Username:       %s\n", app.Username)
+	fmt.Printf("State:          %s\n", state)
+	fmt.Printf("Domain:         %s\n", app.FullDomain)
+	fmt.Printf("Port:           %d\n", app.Port)
+	fmt.Printf("Container:      %s\n", app.ContainerName)
+
+	if app.ContainerImage != "" {
+		fmt.Printf("Container Image: %s\n", app.ContainerImage)
+	}
+
+	if app.ErrorMessage != "" {
+		fmt.Printf("Error:          %s\n", app.ErrorMessage)
+	}
+
+	if len(app.EnvVars) > 0 {
+		fmt.Println("\nEnvironment Variables:")
+		for key, value := range app.EnvVars {
+			fmt.Printf("  %s=%s\n", key, value)
+		}
+	}
+
+	fmt.Println("\nTimestamps:")
+	if app.CreatedAt != nil {
+		fmt.Printf("  Created:      %s\n", app.CreatedAt.AsTime().Format("2006-01-02 15:04:05"))
+	}
+	if app.UpdatedAt != nil {
+		fmt.Printf("  Updated:      %s\n", app.UpdatedAt.AsTime().Format("2006-01-02 15:04:05"))
+	}
+	if app.DeployedAt != nil {
+		fmt.Printf("  Deployed:     %s\n", app.DeployedAt.AsTime().Format("2006-01-02 15:04:05"))
+	}
+
+	if app.RestartCount > 0 {
+		fmt.Printf("\nRestart Count:  %d\n", app.RestartCount)
+	}
+}
+
+func printAppJSON(app *pb.App) error {
+	data, err := json.MarshalIndent(app, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	fmt.Println(string(data))
+	return nil
+}
