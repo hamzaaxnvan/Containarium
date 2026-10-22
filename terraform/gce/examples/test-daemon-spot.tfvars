@@ -40,3 +40,17 @@ enable_load_balancer      = false
 
 # Enable monitoring
 enable_monitoring = true
+
+# Instance naming
+instance_name = "containarium-test"
+
+# Enable disk snapshots (backup)
+enable_disk_snapshots = true
+
+# Labels for organization
+labels = {
+  environment = "test"
+  managed_by  = "terraform"
+  project     = "containarium"
+  purpose     = "daemon-testing"
+}

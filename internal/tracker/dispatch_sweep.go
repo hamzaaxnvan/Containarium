@@ -164,3 +164,170 @@ func (d *Dispatcher) failSwept(tickCtx context.Context, row Dispatch, from pb.Tr
 // abandoned once the budget is spent. The row is already FAILED either
 // way; the projection, on its own fresh budget, must still happen.
 func (d *Dispatcher) endLease(tickCtx context.Context, runID string) {
+	if d.Leases == nil {
+		return
+	}
+	budget := d.leaseEndBudget
+	if budget <= 0 {
+		budget = DefaultLeaseEndBudget
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(tickCtx), budget)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if recover() != nil {
+				log.Printf("[tracker] dispatch run %s: ending the lease panicked (value withheld)", runID)
+			}
+		}()
+		d.Leases.End(ctx, runID)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		log.Printf("[tracker] dispatch run %s: ending the lease did not finish: %v", runID, ctx.Err())
+	}
+}
+
+// observeEnd reports a row that just reached a terminal state.
+func (d *Dispatcher) observeEnd(row Dispatch) {
+	if d.Observer == nil {
+		return
+	}
+	latency := row.EndedAt.Sub(row.CreatedAt)
+	if latency < 0 {
+		latency = 0
+	}
+	d.Observer.DispatchEnded(DispatchEnded{Scope: row.Scope, State: row.State, Failure: row.Failure, Latency: latency})
+}
+
+// projectFailure puts a FAILED row onto the issue: agent:failed (the
+// active state labels removed) and one stamped comment naming the run
+// and the reason. The raw error stays in failure_reason. It runs once per
+// row — only the terminal transition's compare-and-set winner calls it —
+// so the comment is posted at most once per dispatch id; the
+// labels_pending retry re-projects the labels, never the comment
+// (#2047). A forge label failure leaves labels_pending set and reports
+// it; only that store write's error is returned.
+func (d *Dispatcher) projectFailure(ctx context.Context, row Dispatch, timeout time.Duration) (pending bool, err error) {
+	add, remove := terminalLabels(row)
+	// Each write resolves its own credential (#2269).
+	conn, labelErr := d.forgeConn(ctx, row.Username)
+	if labelErr == nil {
+		labelErr = d.Provider.SetLabels(ctx, conn, row.IssueNumber, add, remove)
+	}
+	conn, commentErr := d.forgeConn(ctx, row.Username)
+	if commentErr == nil {
+		_, commentErr = d.Provider.Comment(ctx, conn, row.IssueNumber, failureComment(row, timeout))
+	}
+	if commentErr != nil {
+		log.Printf("[tracker] dispatch %s: failure comment on #%d: %v", row.ID, row.IssueNumber, commentErr)
+	}
+	if labelErr == nil {
+		return !d.labelsLanded(ctx, row), nil
+	}
+	log.Printf("[tracker] dispatch %s: project failure onto #%d: %v", row.ID, row.IssueNumber, labelErr)
+	if err := d.Store.SetDispatchLabelsPending(ctx, row.ID, true); err != nil {
+		return false, fmt.Errorf("mark labels pending for #%d: %w", row.IssueNumber, err)
+	}
+	return true, nil
+}
+
+// terminalLabels is a terminal row's projection: agent:done with the
+// trigger scope label removed, or agent:failed (the scope label kept,
+// so a human retries by removing agent:failed). Either way the active
+// state labels go.
+func terminalLabels(row Dispatch) (add, remove []string) {
+	if row.State == pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_DONE {
+		return []string{LabelAgentDone}, []string{LabelAgentQueued, LabelAgentRunning, ScopeLabelPrefix + row.Scope}
+	}
+	return []string{LabelAgentFailed}, []string{LabelAgentQueued, LabelAgentRunning}
+}
+
+// labelsLanded clears labels_pending once a projection reached the
+// forge, and reports whether it did. A failed clear only leaves the row
+// pending: the next tick re-projects (idempotently) and clears it then.
+func (d *Dispatcher) labelsLanded(ctx context.Context, row Dispatch) bool {
+	if err := d.Store.SetDispatchLabelsPending(ctx, row.ID, false); err != nil {
+		log.Printf("[tracker] dispatch %s: clear labels pending: %v", row.ID, err)
+		return false
+	}
+	return true
+}
+
+// retryPendingLabels re-projects every terminal row whose labels never
+// reached the forge (#2026's labels_pending retry, #2047, #2052) and
+// returns the issues whose projection still has not landed: the tick
+// must not dispatch them again, because their row — not their labels —
+// says they were handled. Only the latest row per issue is retried, and
+// only its labels: the failure comment was posted (or attempted) once,
+// by the terminal transition.
+//
+// The projection counts as landed when the write succeeds, or when the
+// issue already carries the row's state label — a human who cannot get
+// the dispatcher's writes through (a token that may comment but not
+// label) applies it by hand, then removes it to ask for a new
+// generation, the ordinary re-run protocol. Only a store error is
+// returned.
+func (d *Dispatcher) retryPendingLabels(ctx context.Context, username, connection string) (map[int64]bool, error) {
+	rows, err := d.Store.ListLabelsPendingDispatches(ctx, username, connection)
+	if err != nil {
+		return nil, fmt.Errorf("list labels-pending dispatches: %w", err)
+	}
+	held := make(map[int64]bool, len(rows))
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return held, err
+		}
+		add, remove := terminalLabels(row)
+		conn, err := d.forgeConn(ctx, row.Username)
+		if err == nil {
+			err = d.Provider.SetLabels(ctx, conn, row.IssueNumber, add, remove)
+		}
+		if err != nil {
+			var issue Issue
+			conn, gerr := d.forgeConn(ctx, row.Username)
+			if gerr == nil {
+				issue, gerr = d.Provider.GetIssue(ctx, conn, row.IssueNumber)
+			}
+			if gerr != nil || !hasAnyLabel(issue.Labels, add...) {
+				log.Printf("[tracker] dispatch %s: retry labels on #%d: %v", row.ID, row.IssueNumber, err)
+				held[row.IssueNumber] = true
+				continue
+			}
+		}
+		if err := d.Store.SetDispatchLabelsPending(ctx, row.ID, false); err != nil {
+			return held, fmt.Errorf("clear labels pending for #%d: %w", row.IssueNumber, err)
+		}
+	}
+	return held, nil
+}
+
+// failureComment is the dispatcher's comment on a failed dispatch: the
+// run id, the dispatch id and a reason derived from the typed cause —
+// never the raw error, which may carry backend details onto a possibly
+// public issue.
+func failureComment(row Dispatch, timeout time.Duration) string {
+	var why string
+	switch row.Failure {
+	case pb.TrackerDispatchFailure_TRACKER_DISPATCH_FAILURE_START_ERROR:
+		why = "could not be started"
+	case pb.TrackerDispatchFailure_TRACKER_DISPATCH_FAILURE_RUN_ERROR:
+		why = "ended with an error"
+	case pb.TrackerDispatchFailure_TRACKER_DISPATCH_FAILURE_TIMEOUT:
+		// Not "its credentials were revoked": that is not yet true for a
+		// run still provisioning (it is torn down once provisioning
+		// returns), and not guaranteed when the lease end fails.
+		why = fmt.Sprintf("timed out after %s (the connection's run timeout) and was marked failed; any result it reports later is ignored", timeout)
+	case pb.TrackerDispatchFailure_TRACKER_DISPATCH_FAILURE_LEASE_LOST:
+		why = "was marked failed because it has no live lease on the daemon (the daemon restarted, or the run never reported a start)"
+	default:
+		why = "failed"
+	}
+	return Sanitize(fmt.Sprintf("The agent run `%s` for `%s%s` %s (dispatch `%s`). "+
+		"An operator can see the details with `containarium tracker dispatches <username> <connection> --state failed`. "+
+		"To retry, remove `%s`.",
+		row.RunID, ScopeLabelPrefix, row.Scope, why, row.ID, LabelAgentFailed)) +
+		"\n\n" + Stamp(dispatcherIdentity(row.Username, row.RunID), KindComment)
+}
