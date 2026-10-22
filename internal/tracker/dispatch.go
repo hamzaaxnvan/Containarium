@@ -252,3 +252,386 @@ func (d *Dispatcher) Tick(ctx context.Context, username, connection string) (Tic
 		if scope == "" {
 			res.SkippedUnrouted++
 			continue
+		}
+
+		// Chain depth (#2025), enforced by the daemon from the lineage
+		// table — never from anything on the issue. Create already refuses
+		// a child past max_depth; this holds a policy lowered afterwards.
+		depth, err := d.Store.IssueDepth(ctx, username, connection, issue.Number)
+		if err != nil {
+			return res, fmt.Errorf("read depth of #%d: %w", issue.Number, err)
+		}
+		if !policy.DepthAllowed(depth) {
+			res.SkippedOverDepth++
+			continue
+		}
+
+		// The caller's budget (#2270): once MaxStarts runs have started,
+		// an issue that got this far is left for a later tick — no row, no
+		// label. Checked before the insert so nothing is written for it.
+		if d.MaxStarts > 0 && len(res.Started) >= int(d.MaxStarts) {
+			res.LeftUndispatched++
+			continue
+		}
+
+		// From the insert until StartRun has succeeded, no cancellation
+		// point may leave the row QUEUED with no run behind it (#2049):
+		// the active-row index would skip the issue on every later tick,
+		// and nothing sweeps queued rows. So the writes in this window run
+		// on a detached, bounded context, and a tick cancelled inside it
+		// removes the row (nothing is on the forge yet) or fails it
+		// (agent:queued is, or may be, on the issue) — never leaves it.
+		//
+		// The insert itself is detached: a cancel landing while it is in
+		// flight could commit the row yet report an error.
+		ictx, icancel := bookkeepingContext(ctx)
+		row, err := d.Store.InsertDispatch(ictx, Dispatch{
+			Username: username, Connection: connection, IssueNumber: issue.Number,
+			Scope: scope, SkillID: skillID, RunID: d.newRunID(), CreatedAt: d.Clock.Now(), Depth: depth,
+		})
+		icancel()
+		if errors.Is(err, ErrDispatchActive) {
+			res.SkippedActive++ // another dispatcher (or a live run) holds it
+			continue
+		}
+		if err != nil {
+			return res, fmt.Errorf("insert dispatch for #%d: %w", issue.Number, err)
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			if err := d.abandon(ctx, row); err != nil {
+				return res, err
+			}
+			return res, cerr
+		}
+
+		// The previous generation may have gone terminal after the retry
+		// above and before this insert, with its projection failing (or
+		// still in flight): the issue shows no state label, but it was
+		// handled. The row says so; the label cannot (#2047, #2052). A
+		// failed read (a cancelled tick included) abandons the row too.
+		if prior, err := d.Store.PriorDispatchLabelsPending(ctx, username, connection, issue.Number, row.ID); err != nil || prior {
+			if aerr := d.abandon(ctx, row); aerr != nil {
+				return res, errors.Join(err, aerr)
+			}
+			if err != nil {
+				return res, fmt.Errorf("read prior dispatch of #%d: %w", issue.Number, err)
+			}
+			res.SkippedActive++
+			continue
+		}
+
+		// Re-read before starting anything (#2023): the list above can be
+		// stale. A peer may have dispatched this issue AND finished it
+		// between our list and our insert — its row is terminal, so the
+		// insert succeeded, but the issue now carries agent:done and no
+		// scope label. Starting here would be a second run.
+		if keep, err := d.stillDispatchable(ctx, row, scope); err != nil {
+			return res, err
+		} else if !keep {
+			res.SkippedActive++
+			continue
+		}
+
+		// The row is authoritative; the label is its projection. It goes
+		// on before the start (provisioning can take minutes) and a forge
+		// failure leaves labels_pending for the retry (#2026). Detached, so
+		// a cancel mid-write cannot leave the row with neither the label
+		// nor labels_pending; the tick's cancellation is checked after.
+		if err := d.labelQueued(ctx, row); err != nil {
+			return res, d.failBeforeStart(ctx, row, err)
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			// A cancelled tick starts no new run.
+			failed, err := d.failStart(ctx, row, cerr)
+			if err != nil {
+				return res, err
+			}
+			res.Failed = append(res.Failed, *failed)
+			return res, cerr
+		}
+
+		input, err := dispatchInputJSON(row)
+		if err != nil {
+			return res, d.failBeforeStart(ctx, row, err)
+		}
+		lc := &dispatchRun{d: d, row: *row}
+		if startErr := d.Runs.StartRun(ctx, StartRunRequest{
+			Username: username, Connection: connection, SkillID: skillID, RunID: row.RunID, InputJSON: input,
+			RepoURL: d.RepoURL, Lifecycle: lc,
+		}); startErr != nil {
+			if errors.Is(startErr, ErrDispatchEnded) {
+				// Swept while it was still provisioning: the sweep already
+				// failed and projected the row, and the starter tore the
+				// run down. Nothing to report a second time.
+				continue
+			}
+			failed, err := d.failStart(ctx, row, startErr)
+			if err != nil {
+				return res, err
+			}
+			res.Failed = append(res.Failed, *failed)
+			continue
+		}
+		if lc.started.Load() {
+			row.State = pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_RUNNING
+		}
+		res.Started = append(res.Started, *row)
+	}
+	return res, nil
+}
+
+// stillDispatchable re-reads the issue after this tick won the insert
+// and reports whether it is still open, still carries the routed scope
+// label, and carries no state or gate label. When it is not — or the
+// re-read fails — the never-started row is removed so the issue is
+// neither double-run nor locked, and the caller skips it this tick.
+// The only error returned is a store error.
+func (d *Dispatcher) stillDispatchable(ctx context.Context, row *Dispatch, scope string) (bool, error) {
+	conn, err := d.forgeConn(ctx, row.Username)
+	var fresh Issue
+	if err == nil {
+		fresh, err = d.Provider.GetIssue(ctx, conn, row.IssueNumber)
+	}
+	keep := err == nil &&
+		fresh.State != pb.TrackerIssueState_TRACKER_ISSUE_STATE_CLOSED &&
+		containsExact(fresh.Labels, ScopeLabelPrefix+scope) &&
+		!hasAnyLabel(fresh.Labels, LabelNeedsApproval) &&
+		!hasAnyLabel(fresh.Labels, ReservedStateLabels...)
+	if keep {
+		return true, nil
+	}
+	// A cancelled tick (the re-read fails with it) must not leave a
+	// QUEUED row behind that locks the issue: abandon is detached.
+	return false, d.abandon(ctx, row)
+}
+
+// abandon deletes a row whose run was never started and whose issue was
+// never labelled, on a detached context, so the next tick can dispatch
+// the issue again.
+func (d *Dispatcher) abandon(ctx context.Context, row *Dispatch) error {
+	dctx, cancel := bookkeepingContext(ctx)
+	defer cancel()
+	if _, err := d.Store.DeleteQueuedDispatch(dctx, row.ID); err != nil {
+		return fmt.Errorf("abandon dispatch for #%d: %w", row.IssueNumber, err)
+	}
+	return nil
+}
+
+// labelQueued projects the new row onto the issue as agent:queued, or
+// records labels_pending when the forge write fails, detached from the
+// tick. The only error returned is the labels_pending write failing.
+func (d *Dispatcher) labelQueued(ctx context.Context, row *Dispatch) error {
+	lctx, cancel := bookkeepingContext(ctx)
+	defer cancel()
+	conn, err := d.forgeConn(lctx, row.Username)
+	if err == nil {
+		err = d.Provider.SetLabels(lctx, conn, row.IssueNumber, []string{LabelAgentQueued}, nil)
+	}
+	if err == nil {
+		return nil
+	}
+	if err := d.Store.SetDispatchLabelsPending(lctx, row.ID, true); err != nil {
+		return fmt.Errorf("mark labels pending for #%d: %w", row.IssueNumber, err)
+	}
+	row.LabelsPending = true
+	return nil
+}
+
+// failBeforeStart fails a row the tick must give up on before starting
+// its run, so the tick's error return does not leave it QUEUED, and
+// returns cause (joined with the bookkeeping error, if that failed too).
+func (d *Dispatcher) failBeforeStart(ctx context.Context, row *Dispatch, cause error) error {
+	if _, err := d.failStart(ctx, row, cause); err != nil {
+		return errors.Join(cause, err)
+	}
+	return cause
+}
+
+func containsExact(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// failureBookkeepingBudget bounds the tick's pre-start and failStart
+// store and forge writes once detached from the tick's context.
+const failureBookkeepingBudget = 30 * time.Second
+
+// bookkeepingContext detaches ctx from the tick's cancellation (keeping
+// its values) and bounds it by failureBookkeepingBudget.
+func bookkeepingContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), failureBookkeepingBudget)
+}
+
+// failStart moves a row whose run never started to FAILED
+// (START_ERROR), then projects that onto the issue (agent:failed + a
+// comment naming the run), best-effort.
+//
+// The bookkeeping runs on a context detached from the tick's: the start
+// most often fails BECAUSE the tick was cancelled or timed out (a client
+// deadline landing mid-provision), and leaving the row QUEUED would lock
+// the issue until the sweep's grace period ends. Same idiom as
+// endRunLease. The raw error stays in failure_reason, readable via
+// `tracker dispatches`, never on a possibly public issue.
+func (d *Dispatcher) failStart(tickCtx context.Context, row *Dispatch, startErr error) (*Dispatch, error) {
+	ctx, cancel := bookkeepingContext(tickCtx)
+	defer cancel()
+	reason := fmt.Sprintf("run did not start: %v", startErr)
+	now := d.Clock.Now()
+	moved, err := d.Store.FailDispatch(ctx, row.ID, pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_QUEUED,
+		pb.TrackerDispatchFailure_TRACKER_DISPATCH_FAILURE_START_ERROR, reason, now)
+	if err != nil {
+		return nil, fmt.Errorf("fail dispatch for #%d: %w", row.IssueNumber, err)
+	}
+	out := *row
+	out.State = pb.TrackerDispatchState_TRACKER_DISPATCH_STATE_FAILED
+	out.Failure = pb.TrackerDispatchFailure_TRACKER_DISPATCH_FAILURE_START_ERROR
+	out.FailureReason = reason
+	out.EndedAt = now
+	if !moved {
+		return &out, nil // a peer (the sweep) already failed and projected it
+	}
+	d.observeEnd(out)
+	pending, err := d.projectFailure(ctx, out, 0)
+	if err != nil {
+		return nil, err
+	}
+	out.LabelsPending = pending
+	return &out, nil
+}
+
+// warnUnrouted posts the one-time warning for an unrouted scope label.
+// The warning row is recorded first so concurrent dispatchers post it
+// once; a failed post forgets the row so the next tick retries.
+func (d *Dispatcher) warnUnrouted(ctx context.Context, username, connection string, issue int64, scope string) error {
+	first, err := d.Store.RecordDispatchWarning(ctx, username, connection, issue, scope)
+	if err != nil {
+		return fmt.Errorf("record unrouted warning for #%d: %w", issue, err)
+	}
+	if !first {
+		return nil
+	}
+	// Label names are issue metadata anyone with triage rights controls.
+	// Only a suffix that could be a route scope is echoed; anything else
+	// gets generic text. Sanitize runs BEFORE the stamp is appended so a
+	// forged marker in a label is stripped and the real one kept.
+	text := "No agent is routed for this issue's `scope:` label on this tracker connection, so it will not start a run; " +
+		"the label is not a valid route scope (letters, digits, `.`, `_`, `-`; max 64)."
+	if ValidateRouteScope(scope) == nil {
+		text = fmt.Sprintf("No agent is routed for `%s%s` on this tracker connection, so this label will not start a run. "+
+			"An operator can route it with `containarium tracker route set <username> <connection> --scope %s --skill <skill-id>`.",
+			ScopeLabelPrefix, scope, scope)
+	}
+	body := Sanitize(text) + "\n\n" + Stamp(dispatcherIdentity(username, ""), KindComment)
+	conn, err := d.forgeConn(ctx, username)
+	if err == nil {
+		_, err = d.Provider.Comment(ctx, conn, issue, body)
+	}
+	if err != nil {
+		if ferr := d.Store.ForgetDispatchWarning(ctx, username, connection, issue, scope); ferr != nil {
+			return fmt.Errorf("forget unrouted warning for #%d: %w", issue, ferr)
+		}
+	}
+	return nil
+}
+
+// dispatcherIdentity is the stamp on the dispatcher's own comments: the
+// daemon acting for the operator's tenant, not any run. runID, when
+// known, names the run the comment is about.
+func dispatcherIdentity(username, runID string) Identity {
+	if runID == "" {
+		runID = username
+	}
+	return Identity{RunID: runID, SkillID: "dispatcher"}
+}
+
+// forgeConn is the connection for ONE forge call: d.Conn with the
+// broker credential resolved now, through d.Credentials, for tenant
+// (#2269). Every provider call goes through it and the result is never
+// kept, so a credential rotated since the tick began — or since the run
+// started — is picked up by the next write. A resolve error is that
+// write's error: the caller treats it like the forge refusing the call
+// (labels_pending for a projection, a failed tick for the list).
+func (d *Dispatcher) forgeConn(ctx context.Context, tenant string) (Conn, error) {
+	c := d.Conn
+	if d.Credentials == nil {
+		return c, nil
+	}
+	cred, err := d.Credentials.BrokerCredential(ctx, tenant, d.CredentialSecret)
+	if err != nil {
+		return Conn{}, fmt.Errorf("resolve broker credential: %w", err)
+	}
+	c.Credential = cred
+	return c, nil
+}
+
+// effectivePolicy is d.Policy, or the documented defaults when unset.
+func (d *Dispatcher) effectivePolicy() Policy {
+	if d.Policy != nil {
+		return *d.Policy
+	}
+	return PolicyFromProto(nil)
+}
+
+func (d *Dispatcher) newRunID() string {
+	if d.NewRunID != nil {
+		return d.NewRunID()
+	}
+	return uuid.NewString()
+}
+
+// dispatchInputJSON is the run's input_json: the issue reference and
+// the dispatch id, never the issue body.
+func dispatchInputJSON(row *Dispatch) (string, error) {
+	b, err := protojson.Marshal(&pb.TrackerDispatchInput{
+		Connection:  row.Connection,
+		IssueNumber: row.IssueNumber,
+		Scope:       row.Scope,
+		DispatchId:  row.ID,
+		Depth:       row.Depth,
+		Username:    row.Username,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode dispatch input: %w", err)
+	}
+	return string(b), nil
+}
+
+// scopeLabels returns the sorted, de-duplicated suffixes of an issue's
+// `scope:<role>` labels. Sorted so a multi-scope issue picks the same
+// route on every dispatcher.
+func scopeLabels(labels []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, l := range labels {
+		suffix, ok := strings.CutPrefix(l, ScopeLabelPrefix)
+		if !ok || suffix == "" || seen[suffix] {
+			continue
+		}
+		seen[suffix] = true
+		out = append(out, suffix)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// hasAnyLabel matches the gate and state labels case-insensitively and
+// ignoring surrounding whitespace: GitHub compares label names
+// case-insensitively but returns the case a label was first created
+// with, so a repo whose label was created as `Agent:Needs-Approval`
+// must still gate. Scope matching (scopeLabels) stays exact — a
+// mismatch there fails closed (no run), a mismatch here would fail open.
+func hasAnyLabel(labels []string, want ...string) bool {
+	for _, l := range labels {
+		l = strings.TrimSpace(l)
+		for _, w := range want {
+			if strings.EqualFold(l, w) {
+				return true
+			}
+		}
+	}
+	return false
+}

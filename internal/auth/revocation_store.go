@@ -67,3 +67,142 @@ func (s *PgRevocationStore) initSchema(ctx context.Context) error {
 func (s *PgRevocationStore) IsRevoked(ctx context.Context, jti string) (bool, error) {
 	if jti == "" {
 		return false, nil
+	}
+	var found int
+	err := s.pool.QueryRow(ctx,
+		`SELECT 1 FROM jwt_revocations WHERE jti = $1`, jti,
+	).Scan(&found)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("revocation lookup: %w", err)
+	}
+	return true, nil
+}
+
+// Revoke inserts a row, or no-ops on conflict — the first
+// revocation is the canonical one and the reason/revoked_at
+// stay frozen at the first call. We don't want a later
+// revoke to overwrite the audit history.
+func (s *PgRevocationStore) Revoke(ctx context.Context, jti string, expiresAt time.Time, reason string) error {
+	_, err := s.RevokeClaim(ctx, jti, expiresAt, reason)
+	return err
+}
+
+// RevokeClaim is Revoke plus the rows-affected signal — see
+// RevocationStore.RevokeClaim. The insert IS the atomic check: Postgres
+// serializes concurrent INSERTs against the same primary key, so exactly
+// one concurrent caller ever observes claimed=true for a given jti.
+func (s *PgRevocationStore) RevokeClaim(ctx context.Context, jti string, expiresAt time.Time, reason string) (bool, error) {
+	if jti == "" {
+		return false, fmt.Errorf("revoke: empty jti")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO jwt_revocations (jti, expires_at, reason)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (jti) DO NOTHING
+	`, jti, expiresAt, reason)
+	if err != nil {
+		return false, fmt.Errorf("revoke insert: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// RevokeFamily marks a refresh-token rotation family compromised. See
+// RevocationStore.RevokeFamily.
+func (s *PgRevocationStore) RevokeFamily(ctx context.Context, familyID string, reason string) error {
+	if familyID == "" {
+		return fmt.Errorf("revoke family: empty family id")
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO jwt_revoked_families (family_id, reason)
+		VALUES ($1, $2)
+		ON CONFLICT (family_id) DO NOTHING
+	`, familyID, reason)
+	if err != nil {
+		return fmt.Errorf("revoke family insert: %w", err)
+	}
+	return nil
+}
+
+// IsFamilyRevoked returns true when the family_id row exists. See
+// RevocationStore.IsFamilyRevoked.
+func (s *PgRevocationStore) IsFamilyRevoked(ctx context.Context, familyID string) (bool, error) {
+	if familyID == "" {
+		return false, nil
+	}
+	var found int
+	err := s.pool.QueryRow(ctx,
+		`SELECT 1 FROM jwt_revoked_families WHERE family_id = $1`, familyID,
+	).Scan(&found)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("family revocation lookup: %w", err)
+	}
+	return true, nil
+}
+
+// CleanupExpired deletes rows whose token expiry is in the
+// past — they can no longer authenticate even without the
+// revocation row, so keeping them around wastes table space
+// and slows the index.
+func (s *PgRevocationStore) CleanupExpired(ctx context.Context, now time.Time) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM jwt_revocations WHERE expires_at < $1`, now,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup expired: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// List returns revocation rows. See RevocationStore.List
+// for semantics. Builds the WHERE clause dynamically based
+// on params; bind-variable indices are 1-based to match
+// pgx conventions.
+func (s *PgRevocationStore) List(ctx context.Context, params ListRevocationsParams) ([]Revocation, error) {
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	q := `SELECT jti, expires_at, revoked_at, reason FROM jwt_revocations`
+	var args []any
+	var conds []string
+
+	if !params.IncludeExpired {
+		conds = append(conds, fmt.Sprintf("expires_at > $%d", len(args)+1))
+		args = append(args, time.Now())
+	}
+	if params.JTIPrefix != "" {
+		conds = append(conds, fmt.Sprintf("jti LIKE $%d", len(args)+1))
+		args = append(args, params.JTIPrefix+"%")
+	}
+	if len(conds) > 0 {
+		q += " WHERE " + strings.Join(conds, " AND ")
+	}
+	q += fmt.Sprintf(" ORDER BY revoked_at DESC LIMIT $%d", len(args)+1)
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list revocations: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Revocation
+	for rows.Next() {
+		var r Revocation
+		if err := rows.Scan(&r.JTI, &r.ExpiresAt, &r.RevokedAt, &r.Reason); err != nil {
+			return nil, fmt.Errorf("scan revocation row: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
