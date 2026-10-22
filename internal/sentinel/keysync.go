@@ -121,3 +121,498 @@ func (ks *KeyStore) Sync(backendID, backendIP string, httpPort int) error {
 	bk.sshPort = keysResp.SSHPort
 	bk.lastSync = time.Now()
 	bk.lastErr = nil
+	// Relay the SSH CA trust bundle (cloud#1928). Refuse an empty one: a
+	// backend that hasn't completed its own first cloud heartbeat yet
+	// reports nothing, and caching that over a good bundle would make Apply
+	// remove trust from every certificate-auth login. A version match is
+	// also a no-op — cheapest path, and keeps caTrustContent from being
+	// reassigned (same string) on every poll.
+	if keysResp.TrustedUserCAKeys != "" && keysResp.SSHTrustVersion != ks.caTrustVersion {
+		ks.caTrustContent = keysResp.TrustedUserCAKeys
+		ks.caTrustVersion = keysResp.SSHTrustVersion
+	}
+	ks.mu.Unlock()
+
+	return nil
+}
+
+// BackendForLogin returns the id of the backend sshpiper routes login to,
+// using exactly Apply's rule (the first backend, sorted by id, that lists
+// the user wins). The SSH session shipper (#2415) uses it to send each
+// record to the audit chain of the backend the session actually reached.
+// ok is false when no synced backend lists the login.
+func (ks *KeyStore) BackendForLogin(login string) (backendID string, ok bool) {
+	if login == "" {
+		return "", false
+	}
+	ks.mu.RLock()
+	defer ks.mu.RUnlock()
+	ids := make([]string, 0, len(ks.backends))
+	for id := range ks.backends {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		for _, u := range ks.backends[id].users {
+			if u.Username == login {
+				return id, true
+			}
+		}
+	}
+	return "", false
+}
+
+// SyncLegacy is the backward-compatible Sync that uses a default backend ID.
+// Used in single-backend mode.
+func (ks *KeyStore) SyncLegacy(backendIP string, httpPort int) error {
+	return ks.Sync("default", backendIP, httpPort)
+}
+
+// RemoveBackend removes all user data for a backend.
+func (ks *KeyStore) RemoveBackend(backendID string) {
+	ks.mu.Lock()
+	delete(ks.backends, backendID)
+	ks.mu.Unlock()
+}
+
+// Apply writes the sshpiper YAML config with per-user routing.
+// Each user is routed to the backend they were synced from.
+// If the same username appears on multiple backends, GCP takes priority
+// (lower backend priority value wins).
+func (ks *KeyStore) Apply() error {
+	ks.mu.RLock()
+	// Build a merged user list with per-user backend IP routing
+	seen := make(map[string]bool)
+	var routes []userRoute
+
+	// Collect from all backends — sort backend IDs for deterministic iteration
+	// so the generated config is byte-stable and we can skip the rewrite when
+	// nothing actually changed.
+	backendIDs := make([]string, 0, len(ks.backends))
+	for id := range ks.backends {
+		backendIDs = append(backendIDs, id)
+	}
+	sort.Strings(backendIDs)
+	for _, id := range backendIDs {
+		bk := ks.backends[id]
+		for _, u := range bk.users {
+			if seen[u.Username] {
+				continue // first backend to claim a user wins
+			}
+			seen[u.Username] = true
+			routes = append(routes, userRoute{
+				username:       u.Username,
+				authorizedKeys: u.AuthorizedKeys,
+				backendIP:      bk.backendIP,
+				sshPort:        bk.sshPort,
+			})
+		}
+	}
+	ks.mu.RUnlock()
+
+	// Sort routes by username for deterministic config output
+	sort.Slice(routes, func(i, j int) bool {
+		return routes[i].username < routes[j].username
+	})
+
+	if len(routes) == 0 {
+		return fmt.Errorf("no users to configure")
+	}
+
+	// Ensure directories exist
+	if err := os.MkdirAll(sshpiperUsersDir, 0755); err != nil { // #nosec G301 -- sshpiper needs world-readable dirs for authorized_keys lookup
+		return fmt.Errorf("failed to create sshpiper users dir: %w", err)
+	}
+
+	// Write per-user authorized_keys
+	liveUsers := make(map[string]bool, len(routes))
+	for _, r := range routes {
+		liveUsers[r.username] = true
+		userDir := filepath.Join(sshpiperUsersDir, r.username)
+		if err := os.MkdirAll(userDir, 0755); err != nil { // #nosec G301 -- sshpiper requires world-readable user dirs
+			log.Printf("[keysync] failed to create dir for %s: %v", r.username, err)
+			continue
+		}
+		akPath := filepath.Join(userDir, "authorized_keys")
+		// Strip blank lines and comment lines before writing — sshpiper's
+		// authorized_keys parser may stop at a blank line, causing key match failures.
+		cleanedKeys := cleanAuthorizedKeys(r.authorizedKeys)
+		if err := os.WriteFile(akPath, []byte(cleanedKeys+"\n"), 0600); err != nil {
+			log.Printf("[keysync] failed to write authorized_keys for %s: %v", r.username, err)
+			continue
+		}
+	}
+
+	// Prune sshpiper user dirs for containers that no longer exist (#835).
+	// The sentinel accumulates one dir per historical container; without this
+	// step the directory grows without bound and keysync's O(dirs) work
+	// widens the first-connect race window.
+	pruned := 0
+	if entries, err := os.ReadDir(sshpiperUsersDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() || liveUsers[e.Name()] {
+				continue
+			}
+			stale := filepath.Join(sshpiperUsersDir, e.Name())
+			if rmErr := os.RemoveAll(stale); rmErr != nil {
+				log.Printf("[keysync] failed to prune stale sshpiper dir %s: %v", stale, rmErr)
+			} else {
+				pruned++
+			}
+		}
+	}
+	if pruned > 0 {
+		log.Printf("[keysync] pruned %d stale sshpiper user dirs", pruned)
+	}
+
+	// Apply the relayed SSH CA trust bundle (cloud#1928), if any, BEFORE
+	// rendering below — sshpiperCAKeysPath() gates purely on the file's
+	// on-disk presence/size, so a first-ever cached bundle must land before
+	// this same Apply() pass renders, not one cycle later. Best-effort: a
+	// write failure here must not block the users/routes config update that
+	// follows, which is why this ONLY logs rather than returning an error.
+	if err := ks.applyCATrustBundle(); err != nil {
+		log.Printf("[keysync] ssh ca trust bundle apply failed: %v", err)
+	}
+
+	// Generate sshpiper YAML config with per-user backend routing.
+	newContent := renderSSHPiperConfig(routes, sshpiperCAKeysPath())
+
+	// Compare with existing config
+	oldContent, _ := os.ReadFile(sshpiperConfigFile)
+	if bytes.Equal(oldContent, newContent) {
+		ks.mu.Lock()
+		ks.configChanged = false
+		ks.mu.Unlock()
+		return nil
+	}
+
+	if err := os.WriteFile(sshpiperConfigFile, newContent, 0600); err != nil {
+		return fmt.Errorf("failed to write sshpiper config: %w", err)
+	}
+
+	ks.mu.Lock()
+	ks.configChanged = true
+	ks.mu.Unlock()
+
+	log.Printf("[keysync] sshpiper config updated: %d users across %d backends", len(routes), ks.backendCount())
+	return nil
+}
+
+// PushSentinelKey sends the sentinel's upstream public key to a backend.
+func (ks *KeyStore) PushSentinelKey(backendIP string, httpPort int) error {
+	pubKeyPath := sshpiperUpstreamKey + ".pub"
+	pubKey, err := os.ReadFile(pubKeyPath)
+	if err != nil {
+		return fmt.Errorf("failed to read sentinel upstream public key %s: %w", pubKeyPath, err)
+	}
+
+	url := fmt.Sprintf("http://%s:%d/authorized-keys/sentinel", backendIP, httpPort)
+	body, _ := json.Marshal(gateway.SentinelKeyRequest{PublicKey: strings.TrimSpace(string(pubKey))})
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := newSignedRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("push sentinel key: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("push sentinel key POST %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("push sentinel key: unexpected status %d", resp.StatusCode)
+	}
+
+	log.Printf("[keysync] sentinel upstream key pushed to backend %s", backendIP)
+	return nil
+}
+
+// RunSyncLoop periodically syncs keys from a specific backend.
+// Blocks until ctx is cancelled.
+// A failed attempt is retried on the fast-retry schedule before falling
+// back to the interval (#953), so a blip costs seconds of stale sshpiper
+// routing rather than a full interval.
+func (ks *KeyStore) RunSyncLoop(ctx context.Context, backendID, backendIP string, httpPort int, interval time.Duration) {
+	log.Printf("[keysync] starting sync loop for backend %s (%s:%d, interval=%s)", backendID, backendIP, httpPort, interval)
+
+	runSyncLoop(ctx, "keysync", interval, syncRetryDelays(interval), func() error {
+		return ks.syncAndApply(backendID, backendIP, httpPort)
+	})
+
+	log.Printf("[keysync] sync loop stopped for backend %s", backendID)
+}
+
+// RunSyncLoopLegacy is backward-compatible: uses "default" as backend ID.
+func (ks *KeyStore) RunSyncLoopLegacy(ctx context.Context, backendIP string, httpPort int, interval time.Duration) {
+	ks.RunSyncLoop(ctx, "default", backendIP, httpPort, interval)
+}
+
+// syncAndApply pulls a backend's keys and rewrites the sshpiper config.
+//
+// The returned error reports whether this cycle fully succeeded, so the
+// periodic loop can fast-retry a transient failure (#953). It deliberately
+// does NOT retry internally: the event-driven resync endpoint calls this
+// synchronously from an HTTP handler, and a retry burst there would block
+// the response for minutes.
+func (ks *KeyStore) syncAndApply(backendID, backendIP string, httpPort int) error {
+	if err := ks.Sync(backendID, backendIP, httpPort); err != nil {
+		log.Printf("[keysync] sync failed for %s: %v", backendID, err)
+		if strings.Contains(err.Error(), "unexpected status 401") {
+			log.Printf("[keysync] backend %s rejected the signed /authorized-keys request with 401 — "+
+				"this backend's CONTAINARIUM_SENTINEL_AUTH_SECRET doesn't match this sentinel's (or is unset). "+
+				"Until fixed, this backend never gets an sshpiper pipe entry and SSH to its containers silently "+
+				"fails with 'no matching pipe' (#687). Fix: set matching CONTAINARIUM_SENTINEL_AUTH_SECRET on both ends "+
+				"(BYOC hosts: `pool join --sentinel-auth-secret ...`).", backendID)
+		}
+		return err
+	}
+
+	ks.mu.RLock()
+	count := 0
+	if bk, ok := ks.backends[backendID]; ok {
+		count = len(bk.users)
+	}
+	ks.mu.RUnlock()
+	log.Printf("[keysync] sync OK for %s: %d users", backendID, count)
+
+	// A failed push is worth retrying but must not abort the cycle: the
+	// pull already succeeded, and applying it is what keeps SSH working.
+	// Reported at the end so the loop still sees the cycle as incomplete.
+	pushErr := ks.PushSentinelKey(backendIP, httpPort)
+	if pushErr != nil {
+		log.Printf("[keysync] push sentinel key failed for %s: %v", backendID, pushErr)
+	}
+
+	if err := ks.Apply(); err != nil {
+		log.Printf("[keysync] apply failed: %v", err)
+		return err
+	}
+
+	ks.mu.RLock()
+	changed := ks.configChanged
+	ks.mu.RUnlock()
+
+	// No sshpiper restart on a routing change. The sshpiperd `yaml` plugin
+	// re-reads /etc/sshpiper/config.yaml on every incoming connection (its
+	// listPipe → loadConfig path does an os.ReadFile per connect), so a fresh
+	// config is picked up by new connections automatically while in-flight
+	// sessions stay live. The previous `systemctl restart sshpiper` tore down
+	// every live SSH session on each container create/delete (issue #301).
+	if changed {
+		log.Printf("[keysync] sshpiper routing table updated; new connections pick it up on next connect (no restart)")
+	}
+	return pushErr
+}
+
+func (ks *KeyStore) ensureBackendLocked(backendID, backendIP string) *backendKeys {
+	bk, ok := ks.backends[backendID]
+	if !ok {
+		bk = &backendKeys{backendID: backendID, backendIP: backendIP}
+		ks.backends[backendID] = bk
+	}
+	bk.backendIP = backendIP
+	return bk
+}
+
+// cleanAuthorizedKeys strips blank lines and comment lines from an authorized_keys
+// string. sshpiper's parser may stop at a blank line, causing key match failures
+// when the client's key appears after one.
+func cleanAuthorizedKeys(raw string) string {
+	var lines []string
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// isTunnelLoopback returns true if the IP is a tunnel loopback alias (127.0.0.x, x >= 10).
+// These addresses are assigned by the TunnelRegistry for tunnel-connected backends.
+func isTunnelLoopback(ip string) bool {
+	return strings.HasPrefix(ip, "127.0.0.") && len(ip) > 8 && ip != "127.0.0.1"
+}
+
+// routeTargetPort resolves the port the sentinel forwards a user's SSH to.
+//
+// advertised is the backend's KeysResponse.SSHPort:
+//   - 0 (pre-advertisement daemons, and the LXC runtime): the legacy
+//     convention — 22 for direct backends, 20022 through a tunnel loopback
+//     (the TunnelServer remaps an advertised port 22 to a 20022 listener to
+//     stay clear of sshpiper's own *:22).
+//   - 22 on a tunnel loopback: same 20022 remap — the backend means "my
+//     sshd", and the tunnel listener for it is on 20022.
+//   - anything else: used as-is. Tunnel listeners for non-22 ports keep
+//     their advertised number, so a K8s node's gateway ingress (e.g. 32022)
+//     is the same port on the loopback alias as on the node directly.
+func routeTargetPort(backendIP string, advertised int) int {
+	tunnel := isTunnelLoopback(backendIP)
+	switch {
+	case advertised == 0 && tunnel:
+		return 20022
+	case advertised == 0:
+		return 22
+	case advertised == 22 && tunnel:
+		return 20022
+	default:
+		return advertised
+	}
+}
+
+// sshpiperCAKeysPath returns the trusted-user-CA-keys path to embed in the
+// generated config, or "" when no CA trust anchor is installed. Gated on the
+// file existing and being non-empty so the daemon's behaviour is unchanged
+// until something installs the CA public key there — an operator by hand,
+// or (as of cloud#1928) this daemon's own applyCATrustBundle, relaying what
+// a cloud-enrolled backend cached. Either way certificate auth turns on
+// without a code change or flag flip, and removing the file turns it back
+// off.
+func sshpiperCAKeysPath() string {
+	if fi, err := os.Stat(sshpiperTrustedUserCAKeys); err == nil && !fi.IsDir() && fi.Size() > 0 {
+		return sshpiperTrustedUserCAKeys
+	}
+	return ""
+}
+
+// applyCATrustBundle writes the relayed SSH CA trust bundle (cloud#1928) to
+// sshpiperTrustedUserCAKeys when it differs from what's already there,
+// atomically (temp file + rename in the same directory) so sshpiperd never
+// observes a partial file mid-write. No-op when nothing has been cached yet
+// (ks.caTrustVersion == "") — an operator's manually-dropped file, or
+// whatever was applied before this daemon last restarted, is left exactly
+// as-is rather than removed; this only ever ADDS or REPLACES trust, never
+// clears it, matching the "refuse an empty bundle" rule in Sync.
+func (ks *KeyStore) applyCATrustBundle() error {
+	ks.mu.RLock()
+	content, version := ks.caTrustContent, ks.caTrustVersion
+	ks.mu.RUnlock()
+	return writeCATrustBundleFile(sshpiperTrustedUserCAKeys, content, version)
+}
+
+// writeCATrustBundleFile does the actual atomic write for applyCATrustBundle,
+// taking the target path as a parameter so it's directly testable against a
+// temp file instead of the real /etc/sshpiper (which a test can't write to).
+// No-op when version is "" (nothing cached yet). Skips the write entirely
+// when path's current content already matches — the common case on every
+// poll once converged.
+func writeCATrustBundleFile(path, content, version string) error {
+	if version == "" {
+		return nil
+	}
+	// #nosec G304 -- path is always the hardcoded sshpiperTrustedUserCAKeys
+	// const (applyCATrustBundle) or a t.TempDir() path in tests; taking it
+	// as a parameter (rather than a literal) is what makes this function
+	// testable at all — see the doc comment above.
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+		return nil // already applied; skip the write + rename
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil { // #nosec G301 -- sshd needs to read this directory
+		return fmt.Errorf("ssh ca trust: mkdir %s: %w", dir, err)
+	}
+	tmp, err := os.CreateTemp(dir, ".trusted_user_ca_keys.*")
+	if err != nil {
+		return fmt.Errorf("ssh ca trust: create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	writeErr := func() error {
+		if _, err := tmp.WriteString(content); err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+		if err := tmp.Chmod(0644); err != nil { // #nosec G302 -- sshd (root) must be able to read this file
+			return fmt.Errorf("chmod: %w", err)
+		}
+		return tmp.Close()
+	}()
+	if writeErr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("ssh ca trust: %w", writeErr)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("ssh ca trust: rename into place: %w", err)
+	}
+	log.Printf("[keysync] ssh ca trust bundle applied: version=%s", version)
+	return nil
+}
+
+// renderSSHPiperConfig builds the sshpiper YAML for the given routes. When
+// caKeysPath is non-empty, each pipe also trusts CA-signed user certificates
+// (sshpiper's trusted_user_ca_keys) IN ADDITION TO the per-user authorized_keys
+// — an additive migration: existing key-based SSH keeps working while
+// certificate auth is accepted at the sentinel, the only place a container-SSH
+// user's key is verified. Pure and deterministic so the output is unit-tested
+// directly and stays byte-stable for the skip-if-unchanged compare in Apply.
+func renderSSHPiperConfig(routes []userRoute, caKeysPath string) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("version: \"1.0\"\npipes:\n")
+	for _, r := range routes {
+		sshPort := routeTargetPort(r.backendIP, r.sshPort)
+		akPath := filepath.Join(sshpiperUsersDir, r.username, "authorized_keys")
+		fmt.Fprintf(&buf, "  - from:\n")
+		fmt.Fprintf(&buf, "      - username: %q\n", r.username)
+		fmt.Fprintf(&buf, "        authorized_keys:\n")
+		fmt.Fprintf(&buf, "          - %s\n", akPath)
+		if caKeysPath != "" {
+			fmt.Fprintf(&buf, "        trusted_user_ca_keys:\n")
+			fmt.Fprintf(&buf, "          - %s\n", caKeysPath)
+		}
+		fmt.Fprintf(&buf, "    to:\n")
+		fmt.Fprintf(&buf, "      host: %s:%d\n", r.backendIP, sshPort)
+		fmt.Fprintf(&buf, "      username: %q\n", r.username)
+		fmt.Fprintf(&buf, "      ignore_hostkey: true\n")
+		fmt.Fprintf(&buf, "      private_key: %s\n", sshpiperUpstreamKey)
+	}
+	return buf.Bytes()
+}
+
+func (ks *KeyStore) backendCount() int {
+	ks.mu.RLock()
+	defer ks.mu.RUnlock()
+	return len(ks.backends)
+}
+
+// --- Exported state getters ---
+
+// SyncedCount returns the total number of users across all backends.
+func (ks *KeyStore) SyncedCount() int {
+	ks.mu.RLock()
+	defer ks.mu.RUnlock()
+	count := 0
+	for _, bk := range ks.backends {
+		count += len(bk.users)
+	}
+	return count
+}
+
+// LastSync returns the most recent sync time across all backends.
+func (ks *KeyStore) LastSync() time.Time {
+	ks.mu.RLock()
+	defer ks.mu.RUnlock()
+	var latest time.Time
+	for _, bk := range ks.backends {
+		if bk.lastSync.After(latest) {
+			latest = bk.lastSync
+		}
+	}
+	return latest
+}
+
+// LastSyncErr returns the first error from any backend, or nil.
+func (ks *KeyStore) LastSyncErr() error {
+	ks.mu.RLock()
+	defer ks.mu.RUnlock()
+	for _, bk := range ks.backends {
+		if bk.lastErr != nil {
+			return bk.lastErr
+		}
+	}
+	return nil
+}
