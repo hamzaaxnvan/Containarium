@@ -835,3 +835,213 @@ func (*SubscribeEventsRequest) Descriptor() ([]byte, []int) {
 }
 
 func (x *SubscribeEventsRequest) GetResourceTypes() []ResourceType {
+	if x != nil {
+		return x.ResourceTypes
+	}
+	return nil
+}
+
+func (x *SubscribeEventsRequest) GetIncludeMetrics() bool {
+	if x != nil {
+		return x.IncludeMetrics
+	}
+	return false
+}
+
+func (x *SubscribeEventsRequest) GetMetricsIntervalSeconds() int32 {
+	if x != nil {
+		return x.MetricsIntervalSeconds
+	}
+	return 0
+}
+
+var File_containarium_v1_events_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_events_proto_rawDesc = "" +
+	"\n" +
+	"\x1ccontainarium/v1/events.proto\x12\x0fcontainarium.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1cgoogle/api/annotations.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\x1a\x1fcontainarium/v1/container.proto\x1a\x19containarium/v1/app.proto\x1a\x1dcontainarium/v1/network.proto\x1a\x1dcontainarium/v1/traffic.proto\x1a%containarium/v1/threatdetection.proto\"\x92\x01\n" +
+	"\x0eContainerEvent\x128\n" +
+	"\tcontainer\x18\x01 \x01(\v2\x1a.containarium.v1.ContainerR\tcontainer\x12F\n" +
+	"\x0eprevious_state\x18\x02 \x01(\x0e2\x1f.containarium.v1.ContainerStateR\rpreviousState\"t\n" +
+	"\bAppEvent\x12&\n" +
+	"\x03app\x18\x01 \x01(\v2\x14.containarium.v1.AppR\x03app\x12@\n" +
+	"\x0eprevious_state\x18\x02 \x01(\x0e2\x19.containarium.v1.AppStateR\rpreviousState\"?\n" +
+	"\n" +
+	"RouteEvent\x121\n" +
+	"\x05route\x18\x01 \x01(\v2\x1b.containarium.v1.ProxyRouteR\x05route\"K\n" +
+	"\fMetricsEvent\x12;\n" +
+	"\ametrics\x18\x01 \x03(\v2!.containarium.v1.ContainerMetricsR\ametrics\"\x83\x01\n" +
+	"\tAnonEvent\x12\x19\n" +
+	"\bbox_name\x18\x01 \x01(\tR\aboxName\x12)\n" +
+	"\x10fingerprint_hash\x18\x02 \x01(\tR\x0ffingerprintHash\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x18\n" +
+	"\aseconds\x18\x04 \x01(\x01R\aseconds\"J\n" +
+	"\x14SecurityFindingEvent\x122\n" +
+	"\afinding\x18\x01 \x01(\v2\x18.containarium.v1.FindingR\afinding\"\x8a\x06\n" +
+	"\x05Event\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12.\n" +
+	"\x04type\x18\x02 \x01(\x0e2\x1a.containarium.v1.EventTypeR\x04type\x12B\n" +
+	"\rresource_type\x18\x03 \x01(\x0e2\x1d.containarium.v1.ResourceTypeR\fresourceType\x12\x1f\n" +
+	"\vresource_id\x18\x04 \x01(\tR\n" +
+	"resourceId\x128\n" +
+	"\ttimestamp\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\x12J\n" +
+	"\x0fcontainer_event\x18\n" +
+	" \x01(\v2\x1f.containarium.v1.ContainerEventH\x00R\x0econtainerEvent\x128\n" +
+	"\tapp_event\x18\v \x01(\v2\x19.containarium.v1.AppEventH\x00R\bappEvent\x12>\n" +
+	"\vroute_event\x18\f \x01(\v2\x1b.containarium.v1.RouteEventH\x00R\n" +
+	"routeEvent\x12D\n" +
+	"\rmetrics_event\x18\r \x01(\v2\x1d.containarium.v1.MetricsEventH\x00R\fmetricsEvent\x12D\n" +
+	"\rtraffic_event\x18\x0e \x01(\v2\x1d.containarium.v1.TrafficEventH\x00R\ftrafficEvent\x12]\n" +
+	"\x16security_finding_event\x18\x0f \x01(\v2%.containarium.v1.SecurityFindingEventH\x00R\x14securityFindingEvent\x12;\n" +
+	"\n" +
+	"anon_event\x18\x10 \x01(\v2\x1a.containarium.v1.AnonEventH\x00R\tanonEvent\x12)\n" +
+	"\x10fingerprint_hash\x18\x06 \x01(\tR\x0ffingerprintHashB\t\n" +
+	"\apayload\"\xc1\x01\n" +
+	"\x16SubscribeEventsRequest\x12D\n" +
+	"\x0eresource_types\x18\x01 \x03(\x0e2\x1d.containarium.v1.ResourceTypeR\rresourceTypes\x12'\n" +
+	"\x0finclude_metrics\x18\x02 \x01(\bR\x0eincludeMetrics\x128\n" +
+	"\x18metrics_interval_seconds\x18\x03 \x01(\x05R\x16metricsIntervalSeconds*\xa6\a\n" +
+	"\tEventType\x12\x1a\n" +
+	"\x16EVENT_TYPE_UNSPECIFIED\x10\x00\x12 \n" +
+	"\x1cEVENT_TYPE_CONTAINER_CREATED\x10\x01\x12 \n" +
+	"\x1cEVENT_TYPE_CONTAINER_DELETED\x10\x02\x12 \n" +
+	"\x1cEVENT_TYPE_CONTAINER_STARTED\x10\x03\x12 \n" +
+	"\x1cEVENT_TYPE_CONTAINER_STOPPED\x10\x04\x12&\n" +
+	"\"EVENT_TYPE_CONTAINER_STATE_CHANGED\x10\x05\x12\x1b\n" +
+	"\x17EVENT_TYPE_APP_DEPLOYED\x10\n" +
+	"\x12\x1a\n" +
+	"\x16EVENT_TYPE_APP_DELETED\x10\v\x12\x1a\n" +
+	"\x16EVENT_TYPE_APP_STARTED\x10\f\x12\x1a\n" +
+	"\x16EVENT_TYPE_APP_STOPPED\x10\r\x12 \n" +
+	"\x1cEVENT_TYPE_APP_STATE_CHANGED\x10\x0e\x12\x1a\n" +
+	"\x16EVENT_TYPE_ROUTE_ADDED\x10\x14\x12\x1c\n" +
+	"\x18EVENT_TYPE_ROUTE_DELETED\x10\x15\x12\x1d\n" +
+	"\x19EVENT_TYPE_METRICS_UPDATE\x10\x1e\x12\x1d\n" +
+	"\x19EVENT_TYPE_TRAFFIC_UPDATE\x10(\x12\x1f\n" +
+	"\x1bEVENT_TYPE_SECURITY_FINDING\x102\x12\x1b\n" +
+	"\x17EVENT_TYPE_ANON_CONNECT\x10<\x12\x1f\n" +
+	"\x1bEVENT_TYPE_ANON_SHELL_READY\x10=\x12\x1d\n" +
+	"\x19EVENT_TYPE_ANON_RECONNECT\x10>\x12%\n" +
+	"!EVENT_TYPE_ANON_CLAIM_LINK_ISSUED\x10?\x12#\n" +
+	"\x1fEVENT_TYPE_ANON_CLAIM_COMPLETED\x10@\x12\x1b\n" +
+	"\x17EVENT_TYPE_ANON_EXPIRED\x10A\x12 \n" +
+	"\x1cEVENT_TYPE_ANON_KILLED_ABUSE\x10B\x12%\n" +
+	"!EVENT_TYPE_ANON_REJECTED_CAPACITY\x10C\x12&\n" +
+	"\"EVENT_TYPE_ANON_REJECTED_RATELIMIT\x10D\x12!\n" +
+	"\x1dEVENT_TYPE_ANON_REJECTED_DOOR\x10E\x12#\n" +
+	"\x1fEVENT_TYPE_ANON_LOST_PREEMPTION\x10F\x12\"\n" +
+	"\x1eEVENT_TYPE_ANON_REMINDER_OPTIN\x10G*\xf0\x01\n" +
+	"\fResourceType\x12\x1d\n" +
+	"\x19RESOURCE_TYPE_UNSPECIFIED\x10\x00\x12\x1b\n" +
+	"\x17RESOURCE_TYPE_CONTAINER\x10\x01\x12\x15\n" +
+	"\x11RESOURCE_TYPE_APP\x10\x02\x12\x17\n" +
+	"\x13RESOURCE_TYPE_ROUTE\x10\x03\x12\x19\n" +
+	"\x15RESOURCE_TYPE_METRICS\x10\x04\x12\x19\n" +
+	"\x15RESOURCE_TYPE_TRAFFIC\x10\x05\x12\"\n" +
+	"\x1eRESOURCE_TYPE_SECURITY_FINDING\x10\x06\x12\x1a\n" +
+	"\x16RESOURCE_TYPE_ANON_BOX\x10\a2\xa3\x02\n" +
+	"\fEventService\x12\x92\x02\n" +
+	"\x0fSubscribeEvents\x12'.containarium.v1.SubscribeEventsRequest\x1a\x16.containarium.v1.Event\"\xbb\x01\x92A\x9b\x01\n" +
+	"\x06Events\x12\x1dSubscribe to real-time events\x1arOpens a Server-Sent Events stream for real-time resource updates. Filter by resource types using query parameters.\x82\xd3\xe4\x93\x02\x16\x12\x14/v1/events/subscribe0\x01BKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_events_proto_rawDescOnce sync.Once
+	file_containarium_v1_events_proto_rawDescData []byte
+)
+
+func file_containarium_v1_events_proto_rawDescGZIP() []byte {
+	file_containarium_v1_events_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_events_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_events_proto_rawDesc), len(file_containarium_v1_events_proto_rawDesc)))
+	})
+	return file_containarium_v1_events_proto_rawDescData
+}
+
+var file_containarium_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_containarium_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_containarium_v1_events_proto_goTypes = []any{
+	(EventType)(0),                 // 0: containarium.v1.EventType
+	(ResourceType)(0),              // 1: containarium.v1.ResourceType
+	(*ContainerEvent)(nil),         // 2: containarium.v1.ContainerEvent
+	(*AppEvent)(nil),               // 3: containarium.v1.AppEvent
+	(*RouteEvent)(nil),             // 4: containarium.v1.RouteEvent
+	(*MetricsEvent)(nil),           // 5: containarium.v1.MetricsEvent
+	(*AnonEvent)(nil),              // 6: containarium.v1.AnonEvent
+	(*SecurityFindingEvent)(nil),   // 7: containarium.v1.SecurityFindingEvent
+	(*Event)(nil),                  // 8: containarium.v1.Event
+	(*SubscribeEventsRequest)(nil), // 9: containarium.v1.SubscribeEventsRequest
+	(*Container)(nil),              // 10: containarium.v1.Container
+	(ContainerState)(0),            // 11: containarium.v1.ContainerState
+	(*App)(nil),                    // 12: containarium.v1.App
+	(AppState)(0),                  // 13: containarium.v1.AppState
+	(*ProxyRoute)(nil),             // 14: containarium.v1.ProxyRoute
+	(*ContainerMetrics)(nil),       // 15: containarium.v1.ContainerMetrics
+	(*Finding)(nil),                // 16: containarium.v1.Finding
+	(*timestamppb.Timestamp)(nil),  // 17: google.protobuf.Timestamp
+	(*TrafficEvent)(nil),           // 18: containarium.v1.TrafficEvent
+}
+var file_containarium_v1_events_proto_depIdxs = []int32{
+	10, // 0: containarium.v1.ContainerEvent.container:type_name -> containarium.v1.Container
+	11, // 1: containarium.v1.ContainerEvent.previous_state:type_name -> containarium.v1.ContainerState
+	12, // 2: containarium.v1.AppEvent.app:type_name -> containarium.v1.App
+	13, // 3: containarium.v1.AppEvent.previous_state:type_name -> containarium.v1.AppState
+	14, // 4: containarium.v1.RouteEvent.route:type_name -> containarium.v1.ProxyRoute
+	15, // 5: containarium.v1.MetricsEvent.metrics:type_name -> containarium.v1.ContainerMetrics
+	16, // 6: containarium.v1.SecurityFindingEvent.finding:type_name -> containarium.v1.Finding
+	0,  // 7: containarium.v1.Event.type:type_name -> containarium.v1.EventType
+	1,  // 8: containarium.v1.Event.resource_type:type_name -> containarium.v1.ResourceType
+	17, // 9: containarium.v1.Event.timestamp:type_name -> google.protobuf.Timestamp
+	2,  // 10: containarium.v1.Event.container_event:type_name -> containarium.v1.ContainerEvent
+	3,  // 11: containarium.v1.Event.app_event:type_name -> containarium.v1.AppEvent
+	4,  // 12: containarium.v1.Event.route_event:type_name -> containarium.v1.RouteEvent
+	5,  // 13: containarium.v1.Event.metrics_event:type_name -> containarium.v1.MetricsEvent
+	18, // 14: containarium.v1.Event.traffic_event:type_name -> containarium.v1.TrafficEvent
+	7,  // 15: containarium.v1.Event.security_finding_event:type_name -> containarium.v1.SecurityFindingEvent
+	6,  // 16: containarium.v1.Event.anon_event:type_name -> containarium.v1.AnonEvent
+	1,  // 17: containarium.v1.SubscribeEventsRequest.resource_types:type_name -> containarium.v1.ResourceType
+	9,  // 18: containarium.v1.EventService.SubscribeEvents:input_type -> containarium.v1.SubscribeEventsRequest
+	8,  // 19: containarium.v1.EventService.SubscribeEvents:output_type -> containarium.v1.Event
+	19, // [19:20] is the sub-list for method output_type
+	18, // [18:19] is the sub-list for method input_type
+	18, // [18:18] is the sub-list for extension type_name
+	18, // [18:18] is the sub-list for extension extendee
+	0,  // [0:18] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_events_proto_init() }
+func file_containarium_v1_events_proto_init() {
+	if File_containarium_v1_events_proto != nil {
+		return
+	}
+	file_containarium_v1_container_proto_init()
+	file_containarium_v1_app_proto_init()
+	file_containarium_v1_network_proto_init()
+	file_containarium_v1_traffic_proto_init()
+	file_containarium_v1_threatdetection_proto_init()
+	file_containarium_v1_events_proto_msgTypes[6].OneofWrappers = []any{
+		(*Event_ContainerEvent)(nil),
+		(*Event_AppEvent)(nil),
+		(*Event_RouteEvent)(nil),
+		(*Event_MetricsEvent)(nil),
+		(*Event_TrafficEvent)(nil),
+		(*Event_SecurityFindingEvent)(nil),
+		(*Event_AnonEvent)(nil),
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_events_proto_rawDesc), len(file_containarium_v1_events_proto_rawDesc)),
+			NumEnums:      2,
+			NumMessages:   8,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_events_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_events_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_events_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_events_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_events_proto = out.File
+	file_containarium_v1_events_proto_goTypes = nil
+	file_containarium_v1_events_proto_depIdxs = nil
+}

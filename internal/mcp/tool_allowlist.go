@@ -54,3 +54,17 @@ func filterToolsByAllowlist(tools []Tool, pattern string) ([]Tool, error) {
 	for j, ok := range matched {
 		if !ok {
 			return nil, fmt.Errorf("%s entry %q matched no registered tool", EnvMCPTools, entries[j])
+		}
+	}
+	return out, nil
+}
+
+// toolMatchesAllowlistEntry reports whether name satisfies entry: an exact
+// match, or, when entry ends in "*", a prefix match against everything
+// before the "*".
+func toolMatchesAllowlistEntry(name, entry string) bool {
+	if prefix, ok := strings.CutSuffix(entry, "*"); ok {
+		return strings.HasPrefix(name, prefix)
+	}
+	return name == entry
+}
