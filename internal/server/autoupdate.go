@@ -130,3 +130,268 @@ func (u *AutoUpdater) checkAndUpdate(ctx context.Context, force bool) (bool, err
 		_ = os.Remove(tmpPath)
 		return false, fmt.Errorf("checksum mismatch after download (got %s, want %s)", dlChecksum[:12], remoteChecksum[:12])
 	}
+
+	// 6. Make executable
+	if err := os.Chmod(tmpPath, 0755); err != nil { // #nosec G302 -- executable binary needs 0755
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("chmod: %w", err)
+	}
+
+	// 6b. Smoke-test the downloaded binary before committing the swap: it must
+	// at least execute and print its version. Guards against a corrupt or
+	// incompatible binary that would otherwise leave the host running a daemon
+	// that won't start. The previous binary is kept as .old for manual
+	// rollback. #354 — pre-swap safety.
+	smokeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	smokeOut, smokeErr := exec.CommandContext(smokeCtx, tmpPath, "version").CombinedOutput() // #nosec G204 -- tmpPath derived from trusted binaryPath
+	cancel()
+	if smokeErr != nil {
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("smoke test failed (new binary did not run `version`): %w; output: %s", smokeErr, strings.TrimSpace(string(smokeOut)))
+	}
+
+	// 7. Replace: rename running binary to .old, move new one in place
+	oldPath := u.binaryPath + ".old"
+	_ = os.Remove(oldPath)
+	if err := os.Rename(u.binaryPath, oldPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("rename old binary: %w", err)
+	}
+	if err := os.Rename(tmpPath, u.binaryPath); err != nil {
+		// Try to restore old binary
+		_ = os.Rename(oldPath, u.binaryPath)
+		return false, fmt.Errorf("rename new binary: %w", err)
+	}
+
+	log.Printf("[auto-update] binary replaced successfully, restarting...")
+
+	// 8. Launch a detached upgrade watchdog before restarting. The watchdog
+	// outlives this process (new session via Setsid) and polls the health
+	// endpoint; if the new binary doesn't become healthy within 90s it
+	// restores .old and restarts the service automatically (#507).
+	u.launchWatchdog()
+
+	// 9. Restart services via systemd (async — we'll be killed)
+	// Restart tunnel first (it also uses the same binary), then the daemon.
+	go func() {
+		time.Sleep(1 * time.Second)
+		// Restart tunnel if it exists (peers only)
+		if exec.Command("systemctl", "is-active", "containarium-tunnel").Run() == nil { // #nosec G204
+			log.Printf("[auto-update] restarting containarium-tunnel...")
+			_ = exec.Command("systemctl", "restart", "containarium-tunnel").Run() // #nosec G204
+		}
+		// Restart daemon (this kills us)
+		log.Printf("[auto-update] restarting containarium...")
+		if err := exec.Command("systemctl", "restart", "containarium").Run(); err != nil { // #nosec G204
+			_ = exec.Command("systemctl", "restart", "containarium-daemon").Run() // #nosec G204
+		}
+	}()
+
+	return true, nil
+}
+
+// ServedVersion returns the version of the binary the sentinel currently
+// serves — what a sentinel-path upgrade would install — from the sentinel's
+// /containarium/version. Errors (including a 404 from an older sentinel
+// without the route) mean "unknown"; they are not cached. #2171.
+func (u *AutoUpdater) ServedVersion(ctx context.Context) (string, error) {
+	u.servedMu.Lock()
+	defer u.servedMu.Unlock()
+	if u.servedVersion != "" && time.Since(u.servedAt) < servedVersionTTL {
+		return u.servedVersion, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.sentinelURL+"/containarium/version", nil)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", fmt.Errorf("decode: %w", err)
+	}
+	if body.Version == "" {
+		return "", fmt.Errorf("empty version")
+	}
+	u.servedVersion, u.servedAt = body.Version, time.Now()
+	return body.Version, nil
+}
+
+func (u *AutoUpdater) getRemoteChecksum(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", u.sentinelURL+"/containarium/checksum", nil)
+	if err != nil {
+		return "", err
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+func (u *AutoUpdater) getLocalChecksum() (string, error) {
+	return checksumFile(u.binaryPath)
+}
+
+func (u *AutoUpdater) downloadBinary(ctx context.Context, destPath string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", u.sentinelURL+"/containarium", nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	f, err := os.Create(destPath) // #nosec G304 -- destPath is a temp file derived from trusted binaryPath config
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// RunUpgradeWatchdog polls healthURL until the daemon is healthy or timeout
+// elapses. On success the previous binary (.old) is kept as .prev. On
+// timeout, if binaryPath+".old" exists, it restores .old and
+// optionally restarts the service. dryRun skips the systemctl restart.
+// This is the testable core called by both the daemon and the CLI subcommand.
+func RunUpgradeWatchdog(binaryPath, healthURL string, timeout, initialDelay, pollInterval time.Duration, dryRun bool) error {
+	oldPath := binaryPath + ".old"
+
+	if initialDelay > 0 {
+		time.Sleep(initialDelay)
+	}
+
+	log.Printf("[upgrade-watchdog] polling %s (timeout %s, interval %s)", healthURL, timeout, pollInterval)
+
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(healthURL) //nolint:noctx
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				log.Printf("[upgrade-watchdog] daemon is healthy — upgrade succeeded")
+				// Keep the previous binary as .prev (#3058): /health only
+				// proves liveness, so the release may still be broken and
+				// this is the only rollback binary. Overwrites the .prev of
+				// the previous upgrade.
+				if _, err := os.Stat(oldPath); err == nil {
+					if err := os.Rename(oldPath, binaryPath+".prev"); err != nil {
+						log.Printf("[upgrade-watchdog] WARNING: keep previous binary as .prev: %v", err)
+					} else {
+						log.Printf("[upgrade-watchdog] previous binary kept as %s.prev", binaryPath)
+					}
+				}
+				return nil
+			}
+		}
+		time.Sleep(pollInterval)
+	}
+
+	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
+		return fmt.Errorf("[upgrade-watchdog] daemon not healthy after %s and no .old binary; manual intervention required", timeout)
+	}
+
+	log.Printf("[upgrade-watchdog] daemon not healthy after %s — rolling back to .old", timeout)
+	if err := os.Rename(oldPath, binaryPath); err != nil {
+		return fmt.Errorf("[upgrade-watchdog] rename .old back: %w", err)
+	}
+	log.Printf("[upgrade-watchdog] binary restored")
+
+	if dryRun {
+		return nil
+	}
+
+	log.Printf("[upgrade-watchdog] restarting containarium service")
+	out, err := exec.Command("systemctl", "restart", "containarium").CombinedOutput() // #nosec G204
+	if err != nil {
+		log.Printf("[upgrade-watchdog] systemctl restart failed (%v; %s) — exiting for service-manager restart", err, string(out))
+		os.Exit(1)
+	}
+	log.Printf("[upgrade-watchdog] rollback complete")
+	return nil
+}
+
+// WatchdogLogPath is the file the detached upgrade watchdog appends its
+// output to: upgrade-watchdog.log in the binary's directory (#3058).
+func WatchdogLogPath(binaryPath string) string {
+	return filepath.Join(filepath.Dir(binaryPath), "upgrade-watchdog.log")
+}
+
+// launchWatchdog spawns the upgrade-watchdog subcommand in a detached process
+// (new session via Setsid) so it outlives the current daemon process through
+// the systemctl restart (#507). Errors are best-effort logged — a watchdog
+// launch failure is not fatal to the upgrade itself.
+func (u *AutoUpdater) launchWatchdog() {
+	healthURL := u.watchdogHealthURL
+	if healthURL == "" {
+		healthURL = "http://localhost:8080/health"
+	}
+	cmd := exec.Command(u.binaryPath, // #nosec G204 -- binaryPath is trusted config
+		"upgrade-watchdog",
+		"--binary-path", u.binaryPath,
+		"--health-url", healthURL,
+	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // detach from parent process group
+	// #3058: the child is detached, so without a file its log output (and
+	// any rollback trace) is lost. Append to a 0600 file beside the binary.
+	logPath := WatchdogLogPath(u.binaryPath)
+	if lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err != nil { // #nosec G304 -- derived from trusted binaryPath config
+		log.Printf("[auto-update] WARNING: cannot open watchdog log %s: %v — watchdog output will be lost", logPath, err)
+	} else {
+		_ = lf.Chmod(0o600)
+		cmd.Stdout = lf
+		cmd.Stderr = lf
+		defer func() { _ = lf.Close() }() // child holds its own dup after Start
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("[auto-update] WARNING: failed to launch upgrade watchdog: %v — rollback on failure will not be available", err)
+		return
+	}
+	log.Printf("[auto-update] upgrade watchdog launched (pid %d)", cmd.Process.Pid)
+	// Do NOT cmd.Wait() — the watchdog outlives this process intentionally.
+}
+
+func checksumFile(path string) (string, error) {
+	f, err := os.Open(path) // #nosec G304 -- path is the binary path from trusted config
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
