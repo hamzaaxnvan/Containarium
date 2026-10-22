@@ -424,3 +424,217 @@ func (r *Reconciler) gather(ctx context.Context) (Inputs, []string, []string, er
 		}
 		in.Boxes = append(in.Boxes, b)
 	}
+	return in, unresolved, unmanaged, nil
+}
+
+// attach makes the NIC instance-local and sets the guard keys. Both calls
+// are no-ops when converged. A transient Incus conflict (another writer
+// changed the instance between our read and write, or the instance is
+// mid-operation) is retried a few times; the writes are read-modify-write
+// and idempotent, so a retry after a conflict is safe.
+func (r *Reconciler) attach(container, acl string) error {
+	return retryTransient(func() error {
+		if err := r.be.EnsureNICDevice(container, incus.NICDevice{Name: r.cfg.NICDevice, Network: r.cfg.Bridge}); err != nil {
+			return fmt.Errorf("nic device on %s: %w", container, err)
+		}
+		// The guard owns every containarium-tenant-* entry on the NIC: this
+		// tenant's ACL replaces any other tenant's (a box re-attributed to
+		// another tenant must not keep admitting its old siblings), while a
+		// per-container acl-<user> egress ACL already there is kept. The
+		// default-action and anti-spoof keys are merged alongside.
+		if err := r.be.SetOwnedACL(container, acl, r.cfg.NICDevice, tenantACLPrefix); err != nil {
+			return fmt.Errorf("set tenant acl on %s: %w", container, err)
+		}
+		if err := r.be.SetDeviceConfig(container, r.cfg.NICDevice, tenantNICKeys()); err != nil {
+			return fmt.Errorf("nic acl keys on %s: %w", container, err)
+		}
+		return nil
+	})
+}
+
+// tenantNICKeys are the guard keys plus Incus's anti-spoofing filters. The
+// allow table admits by SOURCE ADDRESS, so without them a tenant could send
+// with a sibling's, the gateway's or Caddy's address and be admitted;
+// security.mac_filtering + security.ipv4_filtering pin a NIC to its own MAC
+// and its DHCP/static IPv4 and drop spoofed ARP. (security.ipv6_filtering
+// is left for the IPv6 sibling work: no allow rule names an IPv6 source
+// yet, so there is nothing to spoof toward, and some kernels refuse it
+// without br_netfilter.)
+func tenantNICKeys() map[string]string {
+	keys := nicguard.NICKeys("")
+	delete(keys, "security.acls") // appended by AttachACLToContainer, not overwritten here
+	keys["security.mac_filtering"] = "true"
+	keys["security.ipv4_filtering"] = "true"
+	return keys
+}
+
+// transientAttempts and transientBackoff bound the retry; a test lowers
+// the backoff.
+var (
+	transientAttempts = 5
+	transientBackoff  = 200 * time.Millisecond
+)
+
+// instanceGone reports whether a NIC write failed because the instance is
+// being or has been removed (#2850). A failure alone never decides it: the
+// host is listed again, and only an instance that is absent counts. An error
+// that reads like a vanished dataset or instance gets a few spaced re-checks,
+// because the rollback that caused it may not have finished yet; any other
+// error gets one immediate re-check. An instance still listed after that is a
+// real fault, and the caller reports it.
+func (r *Reconciler) instanceGone(name string, err error) bool {
+	checks := 1
+	if looksGone(err) {
+		checks = goneChecks
+	}
+	for i := 0; i < checks; i++ {
+		if i > 0 {
+			time.Sleep(goneBackoff)
+		}
+		list, lerr := r.be.ListContainers()
+		if lerr != nil {
+			return false
+		}
+		present := false
+		for _, c := range list {
+			if c.Name == name {
+				present = true
+				break
+			}
+		}
+		if !present {
+			return true
+		}
+	}
+	return false
+}
+
+// looksGone matches the messages Incus and ZFS give for a dataset or instance
+// that is no longer there.
+func looksGone(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "does not exist") || strings.Contains(msg, "not found")
+}
+
+// firstLine trims a multi-part error to its first line for a log message.
+func firstLine(err error) string {
+	msg := err.Error()
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		return msg[:i]
+	}
+	return msg
+}
+
+// goneChecks and goneBackoff bound how long a failed NIC write waits to learn
+// whether the instance is being removed (#2850); a test lowers the backoff.
+var (
+	goneChecks  = 4
+	goneBackoff = 250 * time.Millisecond
+)
+
+func isTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "ETag doesn't match") || strings.Contains(msg, "Instance is busy")
+}
+
+func retryTransient(f func() error) error {
+	var err error
+	for i := 0; i < transientAttempts; i++ {
+		if err = f(); err == nil || !isTransient(err) {
+			return err
+		}
+		time.Sleep(transientBackoff)
+	}
+	return fmt.Errorf("%w (gave up after %d attempts)", err, transientAttempts)
+}
+
+// pruneStale deletes containarium-tenant-* ACLs that no current tenant
+// owns. Deletion of an ACL still attached somewhere fails in Incus and is
+// reported; it is never forced.
+func (r *Reconciler) pruneStale(pol Policy) error {
+	acls, err := r.be.ListNetworkACLs()
+	if err != nil {
+		return fmt.Errorf("list acls: %w", err)
+	}
+	live := map[string]bool{}
+	for _, a := range pol.ACLs {
+		live[a.Name] = true
+	}
+	var firstErr error
+	for _, a := range acls {
+		if !strings.HasPrefix(a.Name, tenantACLPrefix) || live[a.Name] {
+			continue
+		}
+		if err := r.be.DeleteNetworkACL(a.Name); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("delete stale acl %s: %w", a.Name, err)
+		}
+	}
+	return firstErr
+}
+
+// warnUnsupported logs the capability gap once per reason, not every pass.
+func (r *Reconciler) warnUnsupported(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.warned == err.Error() {
+		return
+	}
+	r.warned = err.Error()
+	log.Printf("[tenantguard] UNSUPPORTED on this host — tenants are NOT isolated from each other: %v (containarium doctor reports this; install Incus from the Zabbly repository with the nftables driver, or set CONTAINARIUM_TENANT_GUARD=off to acknowledge)", err)
+}
+
+// legacyACLPrefix names the per-container ACLs UpdateContainerACL writes.
+const legacyACLPrefix = "acl-"
+
+// sanitizeLegacyACLs rewrites every acl-<user> ACL that still has ingress
+// rules so it keeps only its egress half. Returns how many it cleared.
+func (r *Reconciler) sanitizeLegacyACLs() (int, error) {
+	acls, err := r.be.ListNetworkACLs()
+	if err != nil {
+		return 0, fmt.Errorf("list acls: %w", err)
+	}
+	var firstErr error
+	cleared := 0
+	for _, a := range acls {
+		if !strings.HasPrefix(a.Name, legacyACLPrefix) || len(a.Ingress) == 0 {
+			continue
+		}
+		cfg := incus.ACLConfig{Name: a.Name, Description: a.Description}
+		for _, rl := range a.Egress {
+			cfg.EgressRules = append(cfg.EgressRules, incus.ACLRule{
+				Action: rl.Action, Source: rl.Source, Destination: rl.Destination,
+				DestinationPort: rl.DestinationPort, Protocol: rl.Protocol, Description: rl.Description,
+			})
+		}
+		if uerr := r.be.UpdateNetworkACL(a.Name, cfg); uerr != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("clear legacy ingress on %s: %w", a.Name, uerr)
+			}
+			continue
+		}
+		log.Printf("[tenantguard] cleared %d legacy ingress rule(s) from per-container ACL %s (ingress is the guard's since #2359; egress kept)", len(a.Ingress), a.Name)
+		cleared++
+	}
+	return cleared, firstErr
+}
+
+func (r *Reconciler) fail(err error) error {
+	r.setStatus(func(s *Status) {
+		s.Mode = r.cfg.Mode
+		s.LastError = err.Error()
+		s.LastPass = time.Now()
+		if s.StaleSince.IsZero() {
+			s.StaleSince = time.Now()
+		}
+	})
+	return err
+}
+
+func (r *Reconciler) setStatus(f func(*Status)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f(&r.status)
+}
