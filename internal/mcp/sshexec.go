@@ -57,3 +57,239 @@ func withCertIfPresent(privPath string, signer ssh.Signer) (ssh.Signer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pair certificate with key: %w", err)
 	}
+	return certSigner, nil
+}
+
+// dialSSH opens a pure-Go SSH client to the target using the private key at
+// privPath — and, when one sits next to it, the certificate issued for it.
+// No system `ssh` binary required.
+func dialSSH(ctx context.Context, t connectcore.Target, privPath string) (*ssh.Client, error) {
+	keyBytes, err := os.ReadFile(privPath) // #nosec G304 -- privPath is the managed key sshkey.LocateOrGenerate resolved
+	if err != nil {
+		return nil, fmt.Errorf("read managed key %s: %w", privPath, err)
+	}
+	signer, err := ssh.ParsePrivateKey(keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse managed key: %w", err)
+	}
+	signer, err = withCertIfPresent(privPath, signer)
+	if err != nil {
+		return nil, err
+	}
+	hostKeyCB, err := tofuHostKeyCallback()
+	if err != nil {
+		return nil, err
+	}
+	cfg := &ssh.ClientConfig{
+		User:            t.User,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: hostKeyCB,
+		Timeout:         mcpSSHDialTimeout,
+	}
+	hostport := net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
+	d := &net.Dialer{Timeout: mcpSSHDialTimeout}
+	conn, err := d.DialContext(ctx, "tcp", hostport)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", hostport, err)
+	}
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, hostport, cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("ssh handshake %s: %w", hostport, err)
+	}
+	return ssh.NewClient(sshConn, chans, reqs), nil
+}
+
+// tofuHostKeyCallback returns an accept-new (trust-on-first-use) host-key
+// callback backed by ~/.ssh/known_hosts — the pure-Go equivalent of ssh's
+// StrictHostKeyChecking=accept-new the CLI uses: an unknown host is
+// recorded and trusted, but a CHANGED key for a known host is rejected
+// (MITM detection). This preserves the CLI's posture without shelling out.
+func tofuHostKeyCallback() (ssh.HostKeyCallback, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = os.TempDir() // minimal container with no HOME — still get in-file TOFU
+	}
+	khPath := filepath.Join(home, ".ssh", "known_hosts")
+	if err := os.MkdirAll(filepath.Dir(khPath), 0o700); err != nil {
+		return nil, fmt.Errorf("create known_hosts dir: %w", err)
+	}
+	// knownhosts.New needs the file to exist; create it empty if absent.
+	f, err := os.OpenFile(khPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- fixed ~/.ssh/known_hosts path
+	if err != nil {
+		return nil, fmt.Errorf("open known_hosts: %w", err)
+	}
+	_ = f.Close()
+	known, err := knownhosts.New(khPath)
+	if err != nil {
+		return nil, fmt.Errorf("load known_hosts: %w", err)
+	}
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		verr := known(hostname, remote, key)
+		if verr == nil {
+			return nil
+		}
+		var keyErr *knownhosts.KeyError
+		if errors.As(verr, &keyErr) && len(keyErr.Want) == 0 {
+			// Unknown host → record it (accept-new), then trust.
+			return appendKnownHost(khPath, hostname, key)
+		}
+		// Known host whose key changed → reject (potential MITM).
+		return verr
+	}, nil
+}
+
+func appendKnownHost(path, hostname string, key ssh.PublicKey) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- fixed ~/.ssh/known_hosts path
+	if err != nil {
+		return fmt.Errorf("open known_hosts for append: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		return fmt.Errorf("record host key: %w", err)
+	}
+	return nil
+}
+
+// authRetryWindow / authRetryInterval bound how long the exec path retries the
+// SSH dial when the handshake fails to AUTHENTICATE. handleConnect authorizes
+// the managed key immediately before dialing, but that key lands in the host
+// authorized_keys instantly while the sentinel keysync only mirrors it into
+// sshpiper on its next tick (~2m). So a first connect to a freshly-authorized
+// box can race that sync and get publickey-denied (#830). Retrying absorbs the
+// propagation lag; non-auth failures (dial/connection/host-key) still fail
+// fast. vars (not consts) so tests can shrink them.
+var (
+	authRetryWindow   = 40 * time.Second
+	authRetryInterval = 8 * time.Second
+)
+
+// dialSSHWithAuthRetry dials the box, retrying ONLY on an authentication
+// failure (the keysync-propagation race, #830) until authRetryWindow elapses.
+func dialSSHWithAuthRetry(t connectcore.Target, privPath string) (*ssh.Client, error) {
+	deadline := time.Now().Add(authRetryWindow)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), mcpSSHDialTimeout+5*time.Second)
+		client, err := dialSSH(ctx, t, privPath)
+		cancel()
+		if err == nil {
+			return client, nil
+		}
+		if !isSSHAuthError(err) || !time.Now().Before(deadline) {
+			return nil, err
+		}
+		time.Sleep(authRetryInterval)
+	}
+}
+
+// isSSHAuthError reports whether an SSH dial failed because the server rejected
+// our key (vs. a connection/host-key/other error). x/crypto surfaces this as a
+// "handshake failed: ssh: unable to authenticate …" error.
+func isSSHAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "unable to authenticate") ||
+		strings.Contains(s, "no supported methods remain")
+}
+
+// runMCPSSHExec runs one command over a pure-Go SSH session and returns its
+// stdout/stderr + exit code. A non-zero remote exit is NOT a tool error —
+// the command ran; the agent needs the output and the code. Only a failure
+// to connect or open the session is an error.
+func runMCPSSHExec(t connectcore.Target, privPath, execCmd string) (string, error) {
+	client, err := dialSSHWithAuthRetry(t, privPath)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = client.Close() }()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("ssh session: %w", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	var stdout, stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+
+	exitCode := 0
+	if runErr := session.Run(execCmd); runErr != nil {
+		var ee *ssh.ExitError
+		if errors.As(runErr, &ee) {
+			exitCode = ee.ExitStatus()
+		} else {
+			return "", fmt.Errorf("ssh run: %w", runErr)
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "exit_code: %d\n", exitCode)
+	if stdout.Len() > 0 {
+		fmt.Fprintf(&b, "\n--- stdout ---\n%s", stdout.String())
+	}
+	if stderr.Len() > 0 {
+		fmt.Fprintf(&b, "\n--- stderr ---\n%s", stderr.String())
+	}
+	return b.String(), nil
+}
+
+// runMCPSessionExec runs one command inside a named tmux session on the box
+// (Tier 2) over a pure-Go SSH session, piping the orchestration script on
+// stdin, and returns the framed output + exit code. Like runMCPSSHExec, a
+// non-zero remote exit is data, not a tool error.
+func runMCPSessionExec(target connectcore.Target, privPath, session, command string) (string, error) {
+	marker, err := connectcore.NewMarker()
+	if err != nil {
+		return "", err
+	}
+
+	client, err := dialSSHWithAuthRetry(target, privPath)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = client.Close() }()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("ssh session: %w", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	// The orchestration script reads positional args: $1 session $2 marker
+	// $3 base64-command $4 timeout. session is validated [A-Za-z0-9_-],
+	// marker is hex, the command is base64, timeout is an int — all safe as
+	// bare words, so no shell quoting is needed.
+	remote := "bash -s -- " + strings.Join([]string{
+		session, marker, connectcore.EncodeCommand(command), "60",
+	}, " ")
+
+	sess.Stdin = strings.NewReader(connectcore.SessionExecScript())
+	var stdout, stderr bytes.Buffer
+	sess.Stdout = &stdout
+	sess.Stderr = &stderr
+	if runErr := sess.Run(remote); runErr != nil {
+		var ee *ssh.ExitError
+		if !errors.As(runErr, &ee) {
+			return "", fmt.Errorf("session exec: %w", runErr)
+		}
+		// Non-zero ssh exit still carries framed output we parse below.
+	}
+
+	out, code, perr := connectcore.ParseSessionResult(stdout.String(), marker)
+	if perr != nil {
+		if stderr.Len() > 0 {
+			return "", fmt.Errorf("%w (ssh: %s)", perr, strings.TrimSpace(stderr.String()))
+		}
+		return "", perr
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "session: %s\nexit_code: %d\n", session, code)
+	if out != "" {
+		fmt.Fprintf(&b, "\n--- output ---\n%s", out)
+	}
+	return b.String(), nil
+}
