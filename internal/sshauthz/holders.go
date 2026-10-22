@@ -30,3 +30,36 @@ var ErrHomeRootUnreadable = errors.New("cannot rule out another account as a hol
 type HolderLookup interface {
 	OtherAccountHolds(ctx context.Context, fingerprint, excludeUsername string) (bool, error)
 }
+
+// FileHolders answers HolderLookup from the host's authorized_keys files
+// (homeRoot/*/.ssh/authorized_keys), the same source the startup backfill
+// reads and the authorization decider checks.
+type FileHolders struct{ HomeRoot string }
+
+// OtherAccountHolds implements HolderLookup.
+func (f FileHolders) OtherAccountHolds(ctx context.Context, fingerprint, excludeUsername string) (bool, error) {
+	res, err := ScanAuthorizedKeys(f.HomeRoot, time.Time{})
+	if err != nil {
+		// Fail closed: an unreadable home root is not "no holder". The path and
+		// os error stay in the daemon log, not in the caller's error.
+		log.Printf("[ssh-keys] cannot read the home root, failing the revoke closed: %v (#3276)", err)
+		return false, ErrHomeRootUnreadable
+	}
+	// A holder among the readable accounts answers the question whatever else
+	// is unreadable, so only the revoke whose answer depends on an account we
+	// cannot read fails.
+	for _, r := range res.Records {
+		if r.Fingerprint == fingerprint && r.Username != excludeUsername {
+			return true, nil
+		}
+	}
+	// Fail closed: an account we cannot read might hold the key. The excluded
+	// account's own state does not matter to whether another account holds it.
+	for _, u := range res.Unreadable {
+		if u.Username != excludeUsername {
+			log.Printf("[ssh-keys] cannot rule out account %s as a key holder, failing the revoke closed: %v (#3241)", u.Username, u.Err)
+			return false, ErrHolderUnknown
+		}
+	}
+	return false, nil
+}
