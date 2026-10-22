@@ -17,3 +17,41 @@ type CloudProvider interface {
 	StartInstance(ctx context.Context) error
 }
 
+// EventWatcher is an optional interface that CloudProviders can implement
+// to proactively watch for VM lifecycle events (e.g., spot preemption).
+// This enables the sentinel to react immediately rather than waiting for
+// the TCP health check to detect the outage.
+type EventWatcher interface {
+	// WatchEvents sends VM lifecycle events to the channel.
+	// Blocks until ctx is cancelled. The provider controls the polling interval.
+	WatchEvents(ctx context.Context, events chan<- VMEvent) error
+}
+
+// VMEvent represents a lifecycle event on the backend VM.
+type VMEvent struct {
+	Type      VMEventType
+	Timestamp time.Time
+	Detail    string // human-readable description
+}
+
+// VMEventType classifies VM lifecycle events.
+type VMEventType string
+
+const (
+	EventPreempted    VMEventType = "preempted"
+	EventStopped      VMEventType = "stopped"
+	EventStarted      VMEventType = "started"
+	EventTerminated   VMEventType = "terminated"
+	EventProvisioning VMEventType = "provisioning"
+)
+
+// InstanceStatus represents the state of a cloud VM instance.
+type InstanceStatus string
+
+const (
+	StatusRunning      InstanceStatus = "running"
+	StatusStopped      InstanceStatus = "stopped"
+	StatusTerminated   InstanceStatus = "terminated"
+	StatusProvisioning InstanceStatus = "provisioning"
+	StatusUnknown      InstanceStatus = "unknown"
+)
