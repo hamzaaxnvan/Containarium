@@ -26,3 +26,31 @@ type PrefixSource interface {
 	// RemovePrefix removes the prefix CountPrefix called eligible, at most
 	// maxRows rows, and returns what it removed and the chain base after it.
 	RemovePrefix(ctx context.Context, cutoffs map[pb.RetentionClass]time.Time, heldOrgs []string, maxRows int) (PrefixRemoval, error)
+}
+
+// PrefixCount is what CountPrefix found.
+type PrefixCount struct {
+	ByClass map[pb.RetentionClass]Count
+	// Base is where verification of the retained chain starts now, nil before
+	// the first purge.
+	Base *pb.RetentionChainBase
+	// Note says what bounds the purge (an anchor, a hold, a class window) or
+	// why nothing is eligible.
+	Note string
+}
+
+// PrefixRemoval is what RemovePrefix did.
+type PrefixRemoval struct {
+	RemovedByClass map[pb.RetentionClass]int64
+	// Base is the chain base after the removal.
+	Base *pb.RetentionChainBase
+	// Skipped says why nothing could be removed at all (no anchor, a missing
+	// table), so a silent zero is not mistaken for "nothing to remove".
+	Skipped string
+}
+
+// AddPrefixSource wires a PrefixSource in. Its classes in its store stop being
+// listed as not swept.
+func (s *Sweeper) AddPrefixSource(p PrefixSource) {
+	s.prefixes = append(s.prefixes, p)
+}
