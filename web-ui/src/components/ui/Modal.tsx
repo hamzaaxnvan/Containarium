@@ -32,3 +32,72 @@ export function Modal({ open, onClose, title, children, footer, size = 'md' }: M
             </Dialog.Close>
           </div>
 
+          {/* Body */}
+          <div className="px-5 py-4">{children}</div>
+
+          {/* Footer */}
+          {footer && (
+            <div className="flex items-center justify-end gap-2 border-t border-[var(--border-subtle)] px-5 py-4">
+              {footer}
+            </div>
+          )}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+export function ModalBtn({
+  onClick, disabled, variant = 'ghost', children, type = 'button',
+}: {
+  onClick?: () => void;
+  disabled?: boolean;
+  variant?: 'ghost' | 'primary' | 'danger';
+  children: React.ReactNode;
+  type?: 'button' | 'submit';
+}) {
+  const cls = {
+    ghost: 'border border-[var(--border)] bg-transparent text-[var(--text-secondary)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]',
+    primary: 'bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)]',
+    danger: 'bg-red-600 text-white hover:bg-red-700',
+  }[variant];
+  return (
+    <button
+      type={type}
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex items-center gap-1.5 rounded-md px-3.5 py-2 text-xs font-medium transition-colors disabled:opacity-50 ${cls}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function FormField({ label, hint, error, children }: { label: string; hint?: string; error?: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <label className="text-xs font-medium text-[var(--text-secondary)]">{label}</label>
+      {children}
+      {hint && !error && <p className="text-[10px] text-[var(--text-muted)]">{hint}</p>}
+      {error && <p className="text-[10px] text-[var(--c-red)]">{error}</p>}
+    </div>
+  );
+}
+
+export function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
+  return (
+    <input
+      {...props}
+      className={`w-full rounded-md border border-[var(--border-subtle)] bg-[var(--surface-2)] px-3 py-2 text-xs text-[var(--text)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50 ${props.className || ''}`}
+    />
+  );
+}
+
+export function Textarea(props: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  return (
+    <textarea
+      {...props}
+      className={`w-full rounded-md border border-[var(--border-subtle)] bg-[var(--surface-2)] px-3 py-2 text-xs text-[var(--text)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50 resize-none ${props.className || ''}`}
+    />
+  );
+}

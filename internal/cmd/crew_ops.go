@@ -148,3 +148,154 @@ func resolveCrewRunGitCredential() (string, error) {
 }
 
 func runCrewList(cmd *cobra.Command, args []string) error {
+	var list []*pb.Crew
+	if serverAddr == "" {
+		list = crews.GetDefault().List() // catalog is compiled into the CLI
+	} else {
+		c, err := newCrewClient()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = c.Close() }()
+		if list, err = c.ListCrews(); err != nil {
+			return err
+		}
+	}
+	if len(list) == 0 {
+		fmt.Println("No crews available.")
+		return nil
+	}
+	fmt.Printf("%-16s %-14s %-28s %s\n", "ID", "TOPOLOGY", "SKILLS", "DESCRIPTION")
+	fmt.Println(strings.Repeat("-", 90))
+	for _, c := range list {
+		fmt.Printf("%-16s %-14s %-28s %s\n", c.Id, crewTopologyName(c.Topology), strings.Join(c.SkillIds, ","), c.Description)
+	}
+	return nil
+}
+
+func runCrewGet(cmd *cobra.Command, args []string) error {
+	var crew *pb.Crew
+	var err error
+	if serverAddr == "" {
+		crew, err = crews.GetDefault().Get(args[0])
+	} else {
+		var c crewAPI
+		if c, err = newCrewClient(); err != nil {
+			return err
+		}
+		defer func() { _ = c.Close() }()
+		crew, err = c.GetCrew(args[0])
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Printf("ID:          %s\n", crew.Id)
+	fmt.Printf("Name:        %s\n", crew.Name)
+	fmt.Printf("Description: %s\n", crew.Description)
+	fmt.Printf("Topology:    %s\n", crewTopologyName(crew.Topology))
+	fmt.Printf("Skills:      %s\n", strings.Join(crew.SkillIds, " -> "))
+	return nil
+}
+
+func runCrewRun(cmd *cobra.Command, args []string) error {
+	gitCredential, err := resolveCrewRunGitCredential()
+	if err != nil {
+		return err
+	}
+	engineOverrides, err := resolveCrewRunEngineOverrides()
+	if err != nil {
+		return err
+	}
+	modelOverrides, err := resolveCrewRunModelOverrides()
+	if err != nil {
+		return err
+	}
+
+	c, err := newCrewClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	fmt.Printf("Running crew %q...\n", args[0])
+	var run *pb.CrewRun
+	if crewRunGraphFile != "" {
+		graph, parseErr := loadTaskGraph(crewRunGraphFile)
+		if parseErr != nil {
+			return parseErr
+		}
+		run, err = c.RunCrewGraph(&pb.RunCrewRequest{CrewId: args[0], BackendId: crewRunBackendID,
+			Pool: crewRunPool, Graph: graph, Concurrency: crewRunConcurrency, InputJson: crewRunInput,
+			GitSource: crewRunGitSource, GitRef: crewRunGitRef, GitCredential: gitCredential, EngineOverrides: engineOverrides, ModelOverrides: modelOverrides})
+	} else {
+		if crewRunConcurrency != 0 {
+			return fmt.Errorf("--concurrency requires --plan")
+		}
+		run, err = c.RunCrew(args[0], crewRunBackendID, crewRunPool, crewRunInput,
+			crewRunGitSource, crewRunGitRef, gitCredential, engineOverrides, modelOverrides)
+	}
+	if err != nil {
+		return err
+	}
+	printCrewRun(run)
+	return nil
+}
+
+func runCrewStatus(cmd *cobra.Command, args []string) error {
+	c, err := newCrewClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	run, err := c.GetCrewRun(args[0])
+	if err != nil {
+		return err
+	}
+	printCrewRun(run)
+	return nil
+}
+
+func printCrewRun(run *pb.CrewRun) {
+	fmt.Printf("\nRun:      %s\n", run.Id)
+	fmt.Printf("Crew:     %s\n", run.CrewId)
+	fmt.Printf("State:    %s\n", run.State)
+	fmt.Printf("Trace:    %s\n", run.TraceId)
+	if run.GetGitSource() != "" {
+		// GitCommit is empty until the first member's fetch resolves one
+		// (#1554) — a run still RUNNING, or one that failed before any
+		// member's fetch completed, shows the source without a commit yet.
+		if run.GetGitCommit() != "" {
+			fmt.Printf("Git:      %s @ %s\n", run.GetGitSource(), run.GetGitCommit())
+		} else {
+			fmt.Printf("Git:      %s (commit not yet resolved)\n", run.GetGitSource())
+		}
+	}
+	if run.Error != "" {
+		fmt.Printf("Error:    %s\n", run.Error)
+	}
+	for _, node := range run.NodeResults {
+		fmt.Printf("Node: %s  State: %s  Run: %s\n", node.NodeId, node.State, node.RunId)
+		if node.Error != "" {
+			fmt.Printf("  Error: %s\n", node.Error)
+		}
+		if node.OutputJson != "" {
+			fmt.Printf("  Output: %s\n", node.OutputJson)
+		}
+	}
+	if run.ArtifactJson != "" {
+		fmt.Printf("Artifact: %s\n", run.ArtifactJson)
+	}
+}
+
+func crewTopologyName(t pb.CrewTopology) string {
+	switch t {
+	case pb.CrewTopology_CREW_TOPOLOGY_PIPELINE:
+		return "pipeline"
+	case pb.CrewTopology_CREW_TOPOLOGY_ORCHESTRATOR:
+		return "orchestrator"
+	case pb.CrewTopology_CREW_TOPOLOGY_FREEFORM:
+		return "freeform"
+	default:
+		return "unspecified"
+	}
+}
