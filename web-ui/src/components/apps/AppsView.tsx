@@ -81,3 +81,45 @@ export default function AppsView({ apps, isLoading, error, onStopApp, onStartApp
           </pre>
         </div>
       ) : (
+        <div className="grid gap-4" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(350px, 1fr))' }}>
+          {apps.map(app => (
+            <AppCard
+              key={app.id}
+              app={app}
+              onStop={onStopApp}
+              onStart={onStartApp}
+              onRestart={onRestartApp}
+              onDelete={(u, n) => { setDeleteDialog({ open: true, username: u, appName: n }); setConfirmText(''); }}
+              onViewLogs={onViewLogs}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Delete confirmation */}
+      <Modal
+        open={deleteDialog.open}
+        onClose={() => setDeleteDialog({ open: false, username: '', appName: '' })}
+        title="Delete Application"
+        size="sm"
+        footer={
+          <>
+            <ModalBtn onClick={() => setDeleteDialog({ open: false, username: '', appName: '' })} disabled={deleting}>Cancel</ModalBtn>
+            <ModalBtn variant="danger" onClick={handleDeleteConfirm} disabled={confirmText !== deleteDialog.appName || deleting}>
+              {deleting ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
+              Delete
+            </ModalBtn>
+          </>
+        }
+      >
+        <p className="mb-1 text-sm text-[var(--text)]">
+          Are you sure you want to delete <strong>{deleteDialog.appName}</strong>?
+        </p>
+        <p className="mb-4 text-xs text-[var(--text-muted)]">This action cannot be undone. Type the app name to confirm:</p>
+        <FormField label={`Type "${deleteDialog.appName}" to confirm`}>
+          <Input value={confirmText} onChange={e => setConfirmText(e.target.value)} placeholder={deleteDialog.appName} />
+        </FormField>
+      </Modal>
+    </div>
+  );
+}

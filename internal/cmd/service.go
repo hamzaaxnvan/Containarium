@@ -132,3 +132,272 @@ Group=root
 # than the slow leak a cap guards against.
 #
 # Accounting is the prerequisite either way: it costs nothing, exposes the
+# cgroup memory statistics, and is what makes the working set measurable so a
+# cap can later be chosen from data instead of guessed. #1349 went unnoticed
+# for 27 days precisely because nothing was measuring.
+MemoryAccounting=yes
+
+# CPU weight well above the tenant default (#2284). Every tenant instance
+# runs at systemd's default weight of 100; so did this daemon, which meant a
+# CPU-saturated host starved the very process that creates boxes while the
+# platform software was healthy. A weight is a share, not a cap or a
+# priority: under contention the daemon gets ~10x a tenant's slice, and when
+# the host is idle nothing changes. incusd gets the same weight via a
+# drop-in (see ensureIncusCPUWeightDropIn); hostcheck checks both.
+CPUAccounting=yes
+CPUWeight=1000
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=-/var/lib/containarium /var/lib/incus /etc/containarium /etc /home /var/lock /run/lock -/opt/containarium /var/log -/mnt/incus-data
+
+# StateDirectory= makes systemd create /var/lib/containarium (0750, root) before
+# the daemon starts and grants it write access. The backup service writes there
+# on every destination -- pkg/core/backup stages the dump and its sidecar index
+# under /var/lib/containarium/backups even for GCS -- and nothing else on the
+# host creates that directory, so without this ProtectSystem=strict makes those
+# writes fail EROFS. The "-" on the ReadWritePaths entry above keeps that
+# (now redundant) grant from ever being the thing that fails namespace setup.
+StateDirectory=containarium
+StateDirectoryMode=0750
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=containarium
+
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
+`
+
+var serviceCmd = &cobra.Command{
+	Use:   "service",
+	Short: "Manage the Containarium systemd service",
+}
+
+var serviceInstallCmd = &cobra.Command{
+	Use:   "install",
+	Short: "Install the systemd service file and enable the daemon",
+	Long: `Install the Containarium systemd service file to /etc/systemd/system/.
+
+The service is configured with minimal flags (--rest --jwt-secret-file) because
+the daemon auto-detects PostgreSQL and Caddy from Incus containers, and loads
+persisted config (base-domain, ports, etc.) from the daemon_config table in PostgreSQL.
+
+Requires root privileges.`,
+	RunE: runServiceInstall,
+}
+
+var serviceUninstallCmd = &cobra.Command{
+	Use:   "uninstall",
+	Short: "Stop and remove the systemd service",
+	RunE:  runServiceUninstall,
+}
+
+var serviceStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show the systemd service status",
+	RunE:  runServiceStatus,
+}
+
+func init() {
+	rootCmd.AddCommand(serviceCmd)
+	serviceCmd.AddCommand(serviceInstallCmd)
+	serviceCmd.AddCommand(serviceUninstallCmd)
+	serviceCmd.AddCommand(serviceStatusCmd)
+}
+
+func runServiceInstall(cmd *cobra.Command, args []string) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("this command requires root privileges (use sudo)")
+	}
+
+	if err := ensureDaemonUnitAndSecret(); err != nil {
+		return err
+	}
+
+	// Reload systemd
+	if err := exec.Command("systemctl", "daemon-reload").Run(); err != nil {
+		return fmt.Errorf("failed to reload systemd: %w", err)
+	}
+	applyPlatformCPUWeightNow()
+
+	// Enable service
+	if err := exec.Command("systemctl", "enable", "containarium").Run(); err != nil {
+		return fmt.Errorf("failed to enable service: %w", err)
+	}
+	log.Printf("Service enabled")
+
+	// Start service
+	if err := exec.Command("systemctl", "start", "containarium").Run(); err != nil {
+		return fmt.Errorf("failed to start service: %w", err)
+	}
+	log.Printf("Service started")
+
+	fmt.Println()
+	fmt.Println("Containarium service installed and running.")
+	fmt.Println()
+	fmt.Println("  Status:  sudo systemctl status containarium")
+	fmt.Println("  Logs:    sudo journalctl -u containarium -f")
+	fmt.Println("  Stop:    sudo systemctl stop containarium")
+	fmt.Println("  Restart: sudo systemctl restart containarium")
+
+	return nil
+}
+
+// daemonOwnedDirs are the unit's ReadWritePaths entries that Containarium owns
+// rather than inherits from the base system, so they may not exist on a fresh
+// host. Everything else the unit grants (/var/lib/incus, /etc, /home, /var/log,
+// /var/lock, /run/lock) already exists or is created by incus.
+//
+// Two reasons these must be created at install time:
+//
+//   - ProtectSystem=strict makes systemd build the mount namespace from
+//     ReadWritePaths= *before* the daemon executes, and a missing listed path
+//     fails that setup with status=226/NAMESPACE — an opaque crashloop naming
+//     neither the path nor the setting.
+//   - They are in hostcheck.DaemonWritablePaths, which the doctor treats as
+//     Required. `pool join` runs its capability self-check after this function,
+//     so creating them here is what lets that check pass on a fresh host
+//     instead of aborting the join.
+//
+// StateDirectory= in the unit covers /var/lib/containarium at runtime too, but
+// only once the unit starts — which is after the doctor has already run.
+var daemonOwnedDirs = []string{"/opt/containarium", "/var/lib/containarium"}
+
+// ensureDaemonOwnedDirs creates the Containarium-owned directories the unit
+// sandbox and the doctor both expect. root is prepended to each path so tests
+// can exercise this without touching the real filesystem; callers pass "/".
+func ensureDaemonOwnedDirs(root string) error {
+	for _, dir := range daemonOwnedDirs {
+		// 0750: every consumer is root (the daemon, the Terraform startup
+		// scripts' markers, logrotate, the backup sidecar index).
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o750); err != nil {
+			return fmt.Errorf("failed to create %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// ensureDaemonUnitAndSecret makes the daemon's JWT secret and the canonical
+// hardened systemd unit exist (idempotent). Shared by `service install` and
+// `pool join` so the daemon unit is authored in exactly ONE place
+// (correct-by-construction caps/ReadWritePaths — the capability trap the
+// byo-compute-pool-join PRD calls out). Does NOT reload/enable/start.
+func ensureDaemonUnitAndSecret() error {
+	jwtPath := "/etc/containarium/jwt.secret"
+	if _, err := os.Stat(jwtPath); os.IsNotExist(err) {
+		if err := os.MkdirAll("/etc/containarium", 0700); err != nil {
+			return fmt.Errorf("failed to create config directory: %w", err)
+		}
+		if err := os.WriteFile(jwtPath, []byte(generateRandomSecret()), 0600); err != nil {
+			return fmt.Errorf("failed to write JWT secret: %w", err)
+		}
+		log.Printf("Generated JWT secret: %s", jwtPath)
+	} else {
+		log.Printf("JWT secret already exists: %s", jwtPath)
+	}
+	if err := ensureDaemonOwnedDirs("/"); err != nil {
+		return err
+	}
+	// #nosec G306 -- systemd unit, world-readable config by convention; no secrets
+	if err := os.WriteFile(systemdServicePath, []byte(systemdServiceTemplate), 0644); err != nil {
+		return fmt.Errorf("failed to write service file: %w", err)
+	}
+	log.Printf("Service file written: %s", systemdServicePath)
+	if err := ensureCompatSymlink("/"); err != nil {
+		return err
+	}
+	if err := ensureIncusCPUWeightDropIn("/"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// renderIncusCPUWeightDropIn is the systemd drop-in that gives incusd the
+// same CPU weight the daemon unit carries inline (#2284). Weight only — no
+// ExecStart (incus's own unit is not ours to rewrite) and no quota (a cap on
+// incusd would turn tenant load into a platform outage, the opposite of the
+// goal). hostcheck.PlatformCPUWeight is the single source of the number so
+// the doctor's check and this file cannot disagree.
+func renderIncusCPUWeightDropIn() string {
+	var b strings.Builder
+	b.WriteString("# Written by `containariumd service install` (#2284). Tenant instances run at\n")
+	b.WriteString("# systemd's default CPUWeight=100; incusd must keep answering the daemon's\n")
+	b.WriteString("# health probe and every create while they contend. A weight is a share under\n")
+	b.WriteString("# contention, not a cap. Override with a later-sorted drop-in, not by editing.\n")
+	b.WriteString("[Service]\n")
+	b.WriteString("CPUAccounting=yes\n")
+	fmt.Fprintf(&b, "CPUWeight=%d\n", hostcheck.PlatformCPUWeight)
+	return b.String()
+}
+
+// ensureIncusCPUWeightDropIn writes the incusd CPU-weight drop-in under
+// root (callers pass "/"; tests a temp dir). Idempotent. The caller's
+// `systemctl daemon-reload` makes it the unit's configuration; see
+// applyPlatformCPUWeightNow for the already-running incusd.
+func ensureIncusCPUWeightDropIn(root string) error {
+	path := filepath.Join(root, incusCPUWeightDropInPath)
+	// #nosec G301 -- systemd drop-in directory under /etc/systemd/system, world-readable by convention like its parent; no secrets
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("failed to create %s: %w", filepath.Dir(path), err)
+	}
+	// #nosec G306 -- systemd drop-in, world-readable config by convention; no secrets
+	if err := os.WriteFile(path, []byte(renderIncusCPUWeightDropIn()), 0o644); err != nil {
+		return fmt.Errorf("failed to write incus CPU-weight drop-in: %w", err)
+	}
+	log.Printf("incus CPU-weight drop-in written: %s", path)
+	return nil
+}
+
+// applyPlatformCPUWeightNow pushes the weight onto the RUNNING incus.service
+// cgroup. A daemon-reload makes the drop-in the unit's configuration but
+// does not re-realize cgroup attributes on a unit that is already running;
+// the alternative — restarting incusd — would stop every tenant on the
+// host. `set-property --runtime` applies it immediately without persisting
+// a second copy (the drop-in is the persistent one, and takes over at the
+// next incus restart or boot). Best-effort: a host without systemd or
+// without incus running just logs it.
+func applyPlatformCPUWeightNow() {
+	// #nosec G204 -- fixed argv: a constant unit name and a compile-time weight, no caller input
+	out, err := exec.Command("systemctl", "set-property", "--runtime", "incus.service",
+		fmt.Sprintf("CPUWeight=%d", hostcheck.PlatformCPUWeight), "CPUAccounting=yes").CombinedOutput()
+	if err != nil {
+		log.Printf("could not apply CPUWeight to the running incus.service (will apply on its next restart): %v %s", err, strings.TrimSpace(string(out)))
+		return
+	}
+	log.Printf("incus.service CPUWeight=%d applied to the running unit", hostcheck.PlatformCPUWeight)
+}
+
+func runServiceUninstall(cmd *cobra.Command, args []string) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("this command requires root privileges (use sudo)")
+	}
+
+	_ = exec.Command("systemctl", "stop", "containarium").Run()
+	_ = exec.Command("systemctl", "disable", "containarium").Run()
+
+	if err := os.Remove(systemdServicePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove service file: %w", err)
+	}
+	removeCompatSymlink("/")
+
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+
+	log.Printf("Service stopped, disabled, and removed")
+	return nil
+}
+
+func runServiceStatus(cmd *cobra.Command, args []string) error {
+	out, err := exec.Command("systemctl", "status", "containarium", "--no-pager").CombinedOutput()
+	fmt.Print(string(out))
+	if err != nil {
+		// systemctl status returns non-zero when service is not running
+		return nil
+	}
+	return nil
+}
