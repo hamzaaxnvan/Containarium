@@ -388,3 +388,394 @@ func (s *CrewServer) runCrew(ctx context.Context, req *pb.RunCrewRequest, crew *
 			}
 			// The earlier members provisioned and are serving; this RPC IS the
 			// run, so nothing will ever come back for them. End their leases
+			// here or they hold live credentials and their checkout of the
+			// caller's repo indefinitely (#2100). The member that just failed
+			// has no lease to end — provisionSkillBox ends its own partial one
+			// before returning its error.
+			s.endMemberLeases(ctx, leases, deps.wiper, provisionFailedReason)
+			// A member whose runtime is not in its box is a precondition
+			// failure, not an internal one (#2936). Every other provisioning
+			// failure, an engine refusal included, stays Internal as it
+			// always was (TestRunCrew_EngineOverrides_AppliedPerMember).
+			code := codes.Internal
+			if errors.Is(err, errInBoxRuntimeMissing) {
+				code = codes.FailedPrecondition
+			}
+			return nil, status.Errorf(code, "crew %q: %s", crew.Id, run.Error)
+		}
+		leases = append(leases, lease)
+		switch role {
+		case pb.CrewRole_CREW_ROLE_CODER:
+			coderBox = lease.Box
+		case pb.CrewRole_CREW_ROLE_PACK_PRODUCER:
+			producer = &leases[len(leases)-1]
+		}
+		// Record the commit the FIRST member's fetch resolved to — every
+		// member fetches the same git_source/git_ref, so they resolve to the
+		// same commit barring a concurrent push mid-run (accepted, same as a
+		// single-agent run's own git_source race). Empty gitCommit means this
+		// run had no git_source; nothing to record.
+		if run.GitCommit == "" && gitCommit != "" {
+			run.GitCommit = gitCommit
+		}
+	}
+
+	// Drive the topology hops over A2A under the shared trace_id, and record the
+	// terminal state. driveCrew failures (e.g. a member's A2A server not up yet)
+	// land the run in FAILED rather than erroring the RPC — the caller gets the
+	// run handle to inspect via GetCrewRun.
+	out, err := driveCrew(ctx, crew, trace, req.InputJson, withRunID(deps.send, run.Id))
+	if err != nil {
+		run.State = pb.CrewRunState_CREW_RUN_STATE_FAILED
+		run.Error = err.Error()
+	} else {
+		run.State = pb.CrewRunState_CREW_RUN_STATE_COMPLETED
+		run.ArtifactJson = out
+		// The producer tests the final files: the last A2A member's artifact.
+		if producer != nil {
+			run.ProofPack = crewProofPack(ctx, deps.producePack, coderBox, *producer, out)
+		}
+	}
+
+	if err := s.runs.Put(ctx, run); err != nil {
+		log.Printf("[crew] record run %s: %v", run.GetId(), err)
+	}
+
+	// The run is over on either branch, so every member's lease ends on either
+	// branch (#2100). Same reason RunAgentSkill records for its own run exit: a
+	// crew member's box is long-lived and keeps serving, but the credentials
+	// and the workspace it was given for THIS run do not outlive it.
+	s.endMemberLeases(ctx, leases, deps.wiper, runExitReason)
+
+	return &pb.RunCrewResponse{Run: run}, nil
+}
+
+// taskSender delivers one A2A task — AgentSkillServer.SendAgentTask in
+// production, a fake in tests. Lets driveCrew be unit-tested without boxes.
+type taskSender func(ctx context.Context, req *pb.SendAgentTaskRequest) (*pb.SendAgentTaskResponse, error)
+
+// withRunID stamps every hop with the crew run's id, so each member's runtime
+// journals its task under that run (#2095).
+func withRunID(send taskSender, runID string) taskSender {
+	return func(ctx context.Context, req *pb.SendAgentTaskRequest) (*pb.SendAgentTaskResponse, error) {
+		req.RunId = runID
+		return send(ctx, req)
+	}
+}
+
+// driveCrew runs the crew's topology to a final artifact, threading the run's
+// trace_id through every hop:
+//   - PIPELINE: deliver the crew input to skill[0], chain each output into the
+//     next skill (from = the previous skill, so allowed_peers gates the hop).
+//   - ORCHESTRATOR / FREEFORM: deliver the input to the entry skill and return
+//     its artifact — the agent self-delegates to the rest within its
+//     allowed_peers.
+func driveCrew(ctx context.Context, crew *pb.Crew, trace, input string, send taskSender) (string, error) {
+	ids := crewA2AMembers(crew)
+	if len(ids) == 0 {
+		return "", fmt.Errorf("crew %q has no skills", crew.Id)
+	}
+
+	deliver := func(from, to, in string) (string, error) {
+		resp, err := send(ctx, &pb.SendAgentTaskRequest{
+			FromSkillId: from,
+			ToPeerId:    to,
+			InputJson:   in,
+			TraceId:     trace,
+		})
+		if err != nil {
+			return "", fmt.Errorf("hop %q->%q: %w", from, to, err)
+		}
+		if resp.Artifact == nil {
+			return "", fmt.Errorf("hop %q->%q returned no artifact", from, to)
+		}
+		if resp.Artifact.State == pb.AgentTaskState_AGENT_TASK_STATE_FAILED {
+			return "", fmt.Errorf("hop %q->%q failed: %s", from, to, resp.Artifact.Error)
+		}
+		return resp.Artifact.OutputJson, nil
+	}
+
+	if crew.Topology == pb.CrewTopology_CREW_TOPOLOGY_PIPELINE {
+		cur := input
+		from := "" // first hop originates from the crew/operator, not a skill
+		for _, sid := range ids {
+			out, err := deliver(from, sid, cur)
+			if err != nil {
+				return "", err
+			}
+			cur, from = out, sid
+		}
+		return cur, nil
+	}
+
+	// ORCHESTRATOR / FREEFORM: the entry skill owns the rest.
+	return deliver("", ids[0], input)
+}
+
+// GetCrewRun returns the status and artifact of a crew run.
+func (s *CrewServer) GetCrewRun(ctx context.Context, req *pb.GetCrewRunRequest) (*pb.GetCrewRunResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeCrewsRead); err != nil {
+		return nil, err
+	}
+	run, ok, err := s.runs.Get(ctx, req.Id)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read crew run %q: %v", req.Id, err)
+	}
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "crew run %q not found", req.Id)
+	}
+	return &pb.GetCrewRunResponse{Run: run}, nil
+}
+
+// skillByID adapts the skill catalog to the lookup validateCrewTopology needs.
+func (s *CrewServer) skillByID(id string) (*pb.AgentSkill, bool) {
+	sk, err := s.skills.Get(id)
+	if err != nil {
+		return nil, false
+	}
+	return sk, true
+}
+
+// validateCrewTopology checks that every A2A edge the topology implies is
+// permitted by the members' allowed_peers — so a crew can never ask for a hop
+// the Phase 2 network policy would drop. Pure (skill lookup injected) and
+// unit-testable without a daemon.
+func validateCrewTopology(crew *pb.Crew, getSkill func(id string) (*pb.AgentSkill, bool)) error {
+	for _, sid := range crew.SkillIds {
+		if _, ok := getSkill(sid); !ok {
+			return fmt.Errorf("crew %q references unknown skill %q", crew.Id, sid)
+		}
+	}
+	if err := validateCrewRoles(crew); err != nil {
+		return err
+	}
+	for _, edge := range crewRequiredEdges(crew) {
+		from, _ := getSkill(edge[0])
+		if !peersContain(from.AllowedPeers, edge[1]) {
+			return fmt.Errorf(
+				"crew %q topology requires edge %s->%s, but %s.allowed_peers does not permit it (the trust fabric would drop the hop)",
+				crew.Id, edge[0], edge[1], edge[0])
+		}
+	}
+	return nil
+}
+
+// validateCrewRoles checks a crew's declared roles (#2799). The member that
+// produces the Proof Pack must not be the coder: not the same skill, and not
+// the same box, so the pack never comes from the box that wrote the change.
+// It runs last in a PIPELINE so it tests the reviewer's final files. A crew
+// that declares no roles passes unchanged.
+func validateCrewRoles(crew *pb.Crew) error {
+	roles := crew.GetRoles()
+	if len(roles) == 0 {
+		return nil
+	}
+	ids := crew.GetSkillIds()
+	if len(roles) != len(ids) {
+		return fmt.Errorf("crew %q declares %d roles for %d members; want one role per member", crew.Id, len(roles), len(ids))
+	}
+	coder, producer := -1, -1
+	for i, r := range roles {
+		var slot *int
+		switch r {
+		case pb.CrewRole_CREW_ROLE_CODER:
+			slot = &coder
+		case pb.CrewRole_CREW_ROLE_PACK_PRODUCER:
+			slot = &producer
+		default:
+			continue
+		}
+		if *slot >= 0 {
+			return fmt.Errorf("crew %q has more than one %s member", crew.Id, r)
+		}
+		*slot = i
+	}
+	if producer < 0 {
+		return nil
+	}
+	if coder < 0 {
+		return fmt.Errorf("crew %q has a PACK_PRODUCER but no CODER for it to be independent of", crew.Id)
+	}
+	if crew.Topology != pb.CrewTopology_CREW_TOPOLOGY_PIPELINE {
+		return fmt.Errorf("crew %q: a PACK_PRODUCER needs PIPELINE topology, so it runs after every other member", crew.Id)
+	}
+	if producer != len(ids)-1 {
+		return fmt.Errorf("crew %q: the PACK_PRODUCER %q must be the last member, so it tests the final files", crew.Id, ids[producer])
+	}
+	if skillBoxName(ids[producer]) == skillBoxName(ids[coder]) {
+		return fmt.Errorf("crew %q: PACK_PRODUCER %q and CODER %q run in the same box %s; the pack must come from a box other than the coder's",
+			crew.Id, ids[producer], ids[coder], skillBoxName(ids[coder]))
+	}
+	return nil
+}
+
+// crewA2AMembers is the crew's members that take part in its A2A hops, in
+// order. The PACK_PRODUCER is not one (#2799): the daemon runs the test
+// commands in its box itself, so no agent hands it a task.
+func crewA2AMembers(crew *pb.Crew) []string {
+	roles := crew.GetRoles()
+	if len(roles) != len(crew.GetSkillIds()) {
+		return crew.GetSkillIds()
+	}
+	out := make([]string, 0, len(roles))
+	for i, sid := range crew.GetSkillIds() {
+		if roles[i] != pb.CrewRole_CREW_ROLE_PACK_PRODUCER {
+			out = append(out, sid)
+		}
+	}
+	return out
+}
+
+// crewRequiredEdges returns the directed A2A edges a topology implies.
+func crewRequiredEdges(crew *pb.Crew) [][2]string {
+	ids := crewA2AMembers(crew)
+	var edges [][2]string
+	switch crew.Topology {
+	case pb.CrewTopology_CREW_TOPOLOGY_PIPELINE:
+		for i := 0; i+1 < len(ids); i++ {
+			edges = append(edges, [2]string{ids[i], ids[i+1]})
+		}
+	case pb.CrewTopology_CREW_TOPOLOGY_ORCHESTRATOR:
+		for i := 1; i < len(ids); i++ {
+			edges = append(edges, [2]string{ids[0], ids[i]})
+		}
+	case pb.CrewTopology_CREW_TOPOLOGY_FREEFORM:
+		// No required edges: members coordinate freely within whatever their
+		// allowed_peers permit; the crew just bounds the set + the trace.
+	}
+	return edges
+}
+
+func peersContain(peers []string, id string) bool {
+	for _, p := range peers {
+		if p == id {
+			return true
+		}
+	}
+	return false
+}
+
+// graphModelMembers is the skills a graph run's nodes use: each skill node's
+// skill and each crew node's members, once each. A crew the catalog does not
+// know is skipped; graph validation reports it.
+func graphModelMembers(g *pb.TaskGraph, catalog *crews.Manager) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(id string) {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	for _, node := range g.GetNodes() {
+		if id := node.GetCrewId(); id != "" {
+			if c, err := catalog.Get(id); err == nil {
+				for _, sid := range c.GetSkillIds() {
+					add(sid)
+				}
+			}
+			continue
+		}
+		if id := node.GetSkillId(); id != "" {
+			add(id)
+		}
+	}
+	return out
+}
+
+// validateModelOverrides refuses a model_overrides entry that cannot take
+// effect, before anything is provisioned (#3259, #3264): a key that is not among
+// the members the run starts (a crew's skills, or a graph's node skills), an id
+// that is not a plain id, and a member with no named engine (the model would be
+// dropped silently, as a skill's own pinned model is).
+func validateModelOverrides(scope string, members []string, req *pb.RunCrewRequest, getSkill func(string) (*pb.AgentSkill, bool)) error {
+	if len(req.GetModelOverrides()) == 0 {
+		return nil
+	}
+	inRun := make(map[string]bool, len(members))
+	for _, id := range members {
+		inRun[id] = true
+	}
+	for sid, model := range req.GetModelOverrides() {
+		if !inRun[sid] {
+			return status.Errorf(codes.InvalidArgument, "model_overrides names %q, which is not a member of %s", sid, scope)
+		}
+		if !validBoxRunModel(model) {
+			return status.Errorf(codes.InvalidArgument, "model_overrides[%s] must match %s", sid, boxRunModelPattern.String())
+		}
+		skill, ok := getSkill(sid)
+		if !ok {
+			continue // topology/graph validation reports a missing member
+		}
+		if agentengine.Override(skill.GetEngine(), req.GetEngineOverrides()[sid]) == pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED {
+			return status.Errorf(codes.FailedPrecondition,
+				"model_overrides[%s]: skill %s names no engine and engine_overrides has none for it, and a model is carried to the box only together with a named engine",
+				sid, sid)
+		}
+	}
+	return nil
+}
+
+// validateSkillRunModel applies the same rules to a single-skill run's `model`
+// (#3264): a plain id, and a named engine (the skill's, or the request's).
+func validateSkillRunModel(skill *pb.AgentSkill, engine pb.AgentEngine, model string) error {
+	if model == "" {
+		return nil
+	}
+	if !validBoxRunModel(model) {
+		return status.Errorf(codes.InvalidArgument, "model must match %s", boxRunModelPattern.String())
+	}
+	if agentengine.Override(skill.GetEngine(), engine) == pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED {
+		return status.Errorf(codes.FailedPrecondition,
+			"model: skill %s names no engine and the request has none, and a model is carried to the box only together with a named engine", skill.GetId())
+	}
+	return nil
+}
+
+// applyRunModel validates a single-skill request's `model` and returns the skill
+// the run provisions: the skill itself, or a copy carrying the model.
+func applyRunModel(skill *pb.AgentSkill, req *pb.RunAgentSkillRequest) (*pb.AgentSkill, error) {
+	if err := validateSkillRunModel(skill, req.GetEngine(), req.GetModel()); err != nil {
+		return nil, err
+	}
+	return withSkillModel(skill, req.GetModel()), nil
+}
+
+// withSkillModel returns the skill itself when model is empty, else a copy whose
+// `model` is model (the catalog's own skill is shared and never mutated).
+func withSkillModel(skill *pb.AgentSkill, model string) *pb.AgentSkill {
+	if model == "" {
+		return skill
+	}
+	c := proto.Clone(skill).(*pb.AgentSkill)
+	c.Model = model
+	return c
+}
+
+// withModelOverride returns the skill the run should provision: the skill itself
+// when the request has no override for it, else a copy whose `model` is the
+// override (the catalog's own skill is shared and never mutated).
+func withModelOverride(skill *pb.AgentSkill, req *pb.RunCrewRequest) *pb.AgentSkill {
+	return withSkillModel(skill, req.GetModelOverrides()[skill.GetId()])
+}
+
+// crewMemberModels is the model each member will be driven with: its override,
+// else its own pinned model. A member with no named engine exports no model, so
+// it is not listed.
+func crewMemberModels(members []string, req *pb.RunCrewRequest, getSkill func(string) (*pb.AgentSkill, bool)) map[string]string {
+	out := map[string]string{}
+	for _, sid := range members {
+		skill, ok := getSkill(sid)
+		if !ok {
+			continue
+		}
+		named := agentengine.Override(skill.GetEngine(), req.GetEngineOverrides()[sid]) != pb.AgentEngine_AGENT_ENGINE_UNSPECIFIED
+		if m := withModelOverride(skill, req).GetModel(); named && m != "" {
+			out[sid] = m
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}

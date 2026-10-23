@@ -98,3 +98,29 @@ func runSentinelRegisterToken(cmd *cobra.Command, args []string) error {
 		endpoint = sentinelRegisterTokenSentinelURL + "/sentinel/audit-ingest-tokens"
 		body, err = json.Marshal(sentinel.AuditIngestTokenRegisterRequest{
 			BackendID: sentinelRegisterTokenBackend,
+			Token:     sentinelRegisterTokenToken,
+		})
+	default: // sentinelTokenKindTunnelJoin
+		if sentinelRegisterTokenBackend != "" {
+			return fmt.Errorf("--backend applies only to --kind audit-ingest")
+		}
+		pools := make([]sentinel.Pool, len(sentinelRegisterTokenPools))
+		for i, p := range sentinelRegisterTokenPools {
+			pools[i] = sentinel.Pool(p)
+		}
+		endpoint = sentinelRegisterTokenSentinelURL + "/sentinel/tunnel-tokens"
+		body, err = json.Marshal(sentinel.TunnelTokenRegisterRequest{
+			Token: sentinelRegisterTokenToken,
+			Pools: pools,
+		})
+	}
+	if err != nil {
+		return err
+	}
+
+	if err := sendSentinelAdminRequest(http.MethodPost, endpoint, sentinelRegisterTokenSecret, body); err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "token registered\n")
+	return nil
+}
