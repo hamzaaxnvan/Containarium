@@ -44,3 +44,142 @@ import (
 // check loop; read from the /metrics HTTP goroutine, hence the atomic.
 func (m *Manager) recordFailover() {
 	m.failoverTotal.Add(1)
+}
+
+// recordFailback counts one switch back to a preferred primary (#2476).
+func (m *Manager) recordFailback() {
+	m.failbackTotal.Add(1)
+}
+
+// FailbackCount returns the number of failbacks to a preferred primary.
+func (m *Manager) FailbackCount() int64 {
+	return m.failbackTotal.Load()
+}
+
+// primaryIsPreferred reports whether the current primary is the best-priority
+// backend registered (healthy or not). False means the sentinel is sitting on a
+// fallback, which is what an alert should page on if it lasts more than a few
+// minutes: it is the condition #2476 left in place indefinitely.
+func (m *Manager) primaryIsPreferred() bool {
+	m.mu.RLock()
+	cur := m.primary
+	m.mu.RUnlock()
+	if cur == nil {
+		return true // maintenance / nothing elected: not "on a fallback"
+	}
+	for _, b := range m.backends.All() {
+		if b.Priority < cur.Priority {
+			return false
+		}
+	}
+	return true
+}
+
+// renderFailbackMetrics is the exposition for the failback counter and the
+// preferred-primary gauge. Pure, like renderBackendMetrics.
+func renderFailbackMetrics(failbacks int64, preferred bool) string {
+	var b bytes.Buffer
+	fmt.Fprint(&b, "# HELP sentinel_failback_total Total switches back to a preferred primary after it recovered.\n")
+	fmt.Fprint(&b, "# TYPE sentinel_failback_total counter\n")
+	fmt.Fprintf(&b, "sentinel_failback_total %d\n", failbacks)
+	v := 0
+	if preferred {
+		v = 1
+	}
+	fmt.Fprint(&b, "# HELP sentinel_primary_preferred 1 if the active primary is the best-priority registered backend, 0 if the sentinel is on a fallback.\n")
+	fmt.Fprint(&b, "# TYPE sentinel_primary_preferred gauge\n")
+	fmt.Fprintf(&b, "sentinel_primary_preferred %d\n", v)
+	return b.String()
+}
+
+// FailoverCount returns the number of primary-backend failovers observed.
+func (m *Manager) FailoverCount() int64 {
+	return m.failoverTotal.Load()
+}
+
+// recordBackendHealth notes a backend's health transition.
+//
+// This deliberately keeps its own map rather than reading Backend.Healthy at
+// scrape time: that field is written by the health-check loop without holding
+// the pool's lock, so reading it from an HTTP goroutine is a data race. Fixing
+// that properly means reworking BackendPool's concurrency contract, which is
+// not something to change on the way past — a guarded copy here is cheap and
+// leaves the existing semantics untouched.
+func (m *Manager) recordBackendHealth(id string, healthy bool) {
+	m.backendHealthMu.Lock()
+	defer m.backendHealthMu.Unlock()
+	if m.backendHealth == nil {
+		m.backendHealth = make(map[string]bool)
+	}
+	m.backendHealth[id] = healthy
+}
+
+// BackendHealthSnapshot returns a copy of the per-backend health map. A copy,
+// not the live map — handing out the original would put the caller's range
+// loop in a race with the health-check loop's writes.
+func (m *Manager) BackendHealthSnapshot() map[string]bool {
+	m.backendHealthMu.RLock()
+	defer m.backendHealthMu.RUnlock()
+	out := make(map[string]bool, len(m.backendHealth))
+	for k, v := range m.backendHealth {
+		out[k] = v
+	}
+	return out
+}
+
+// renderBackendMetrics builds the Prometheus exposition for the failover
+// counter and per-backend health. Pure, so the label rendering and ordering
+// are testable without a Manager.
+func renderBackendMetrics(failovers int64, health map[string]bool) string {
+	var b bytes.Buffer
+
+	fmt.Fprint(&b, "# HELP sentinel_failover_total Total primary-backend failovers, including those absorbed without entering maintenance.\n")
+	fmt.Fprint(&b, "# TYPE sentinel_failover_total counter\n")
+	fmt.Fprintf(&b, "sentinel_failover_total %d\n", failovers)
+
+	// No backends registered yet (pure tunnel mode before a peer connects).
+	// Emitting a TYPE line with no samples under it is noise; omit the family.
+	if len(health) == 0 {
+		return b.String()
+	}
+
+	ids := make([]string, 0, len(health))
+	for id := range health {
+		ids = append(ids, id)
+	}
+	// Stable order: a scrape diff should reflect real change, not Go's
+	// randomised map iteration.
+	sort.Strings(ids)
+
+	// HELP/TYPE are per-family and must appear once, ahead of the samples.
+	fmt.Fprint(&b, "# HELP sentinel_backend_healthy Per-backend health as seen by the sentinel: 1 healthy, 0 unhealthy.\n")
+	fmt.Fprint(&b, "# TYPE sentinel_backend_healthy gauge\n")
+	for _, id := range ids {
+		v := 0
+		if health[id] {
+			v = 1
+		}
+		// Not %q: the value is already escaped, and %q would escape the
+		// escapes.
+		fmt.Fprintf(&b, "sentinel_backend_healthy{backend=\"%s\"} %d\n", escapeLabelValue(id), v)
+	}
+	return b.String()
+}
+
+// labelValueEscaper mirrors the Prometheus text-format rules: backslash, double
+// quote and newline must be escaped inside a label value.
+var labelValueEscaper = strings.NewReplacer(
+	`\`, `\\`,
+	`"`, `\"`,
+	"\n", `\n`,
+)
+
+// escapeLabelValue makes a backend ID safe to embed in a label.
+//
+// Backend IDs arrive from tunnel registration rather than a fixed allowlist, so
+// they are not guaranteed label-safe. One unescaped quote yields a line no
+// scraper can parse — and a parse error kills the entire scrape, not just the
+// offending series, so every other metric on this endpoint would vanish too.
+func escapeLabelValue(s string) string {
+	return labelValueEscaper.Replace(s)
+}

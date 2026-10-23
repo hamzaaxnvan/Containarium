@@ -36,3 +36,156 @@ export interface ContainerEventPayload {
   container?: {
     name: string;
     username: string;
+    state: string;
+    ipAddress?: string;
+    cpu?: string;
+    memory?: string;
+    disk?: string;
+    image?: string;
+    podmanEnabled?: boolean;
+    stack?: string;
+  };
+  previousState?: string;
+}
+
+/**
+ * App event payload
+ */
+export interface AppEventPayload {
+  app?: {
+    id: string;
+    name: string;
+    username: string;
+    containerName: string;
+    subdomain: string;
+    fullDomain: string;
+    port: number;
+    state: string;
+  };
+  previousState?: string;
+}
+
+/**
+ * Route event payload
+ */
+export interface RouteEventPayload {
+  route?: {
+    subdomain: string;
+    fullDomain: string;
+    containerIp: string;
+    port: number;
+    active: boolean;
+    appId?: string;
+    appName?: string;
+  };
+}
+
+/**
+ * Metrics event payload
+ */
+export interface MetricsEventPayload {
+  metrics: Array<{
+    name: string;
+    cpuUsageSeconds: number;
+    memoryUsageBytes: number;
+    memoryPeakBytes: number;
+    diskUsageBytes: number;
+    networkRxBytes: number;
+    networkTxBytes: number;
+    processCount: number;
+  }>;
+}
+
+/**
+ * Traffic event payload
+ */
+export interface TrafficEventPayload {
+  eventType: 'NEW' | 'UPDATE' | 'DESTROY';
+  connection: {
+    id: string;
+    containerName: string;
+    containerIp: string;
+    protocol: string;
+    sourceIp: string;
+    sourcePort: number;
+    destIp: string;
+    destPort: number;
+    state: string;
+    direction: string;
+    bytesSent: number;
+    bytesReceived: number;
+    packetsSent: number;
+    packetsReceived: number;
+    firstSeen: string;
+    lastSeen: string;
+  };
+}
+
+/**
+ * Server-sent event from the backend
+ */
+export interface ServerEvent {
+  id: string;
+  type: EventType;
+  resourceType: ResourceType;
+  resourceId: string;
+  timestamp: string;
+  containerEvent?: ContainerEventPayload;
+  appEvent?: AppEventPayload;
+  routeEvent?: RouteEventPayload;
+  metricsEvent?: MetricsEventPayload;
+  trafficEvent?: TrafficEventPayload;
+}
+
+/**
+ * Connection status for SSE
+ */
+export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
+
+/**
+ * Options for event stream subscription
+ */
+export interface EventStreamOptions {
+  resourceTypes?: ResourceType[];
+  includeMetrics?: boolean;
+  metricsIntervalSeconds?: number;
+  onEvent?: (event: ServerEvent) => void;
+  onConnect?: () => void;
+  onDisconnect?: () => void;
+  onError?: (error: Event) => void;
+}
+
+/**
+ * Helper function to check if event is container-related
+ */
+export function isContainerEvent(event: ServerEvent): boolean {
+  return event.resourceType === 'RESOURCE_TYPE_CONTAINER';
+}
+
+/**
+ * Helper function to check if event is app-related
+ */
+export function isAppEvent(event: ServerEvent): boolean {
+  return event.resourceType === 'RESOURCE_TYPE_APP';
+}
+
+/**
+ * Helper function to check if event is route-related
+ */
+export function isRouteEvent(event: ServerEvent): boolean {
+  return event.resourceType === 'RESOURCE_TYPE_ROUTE';
+}
+
+/**
+ * Helper function to check if event is metrics-related
+ */
+export function isMetricsEvent(event: ServerEvent): boolean {
+  return event.resourceType === 'RESOURCE_TYPE_METRICS';
+}
+
+/**
+ * Helper function to check if event is traffic-related
+ */
+export function isTrafficEvent(event: ServerEvent): boolean {
+  return event.resourceType === 'RESOURCE_TYPE_TRAFFIC';
+}
