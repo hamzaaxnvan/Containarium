@@ -402,3 +402,206 @@ func parseNotifyJournals(box, out string, now time.Time) map[string][]notify.Req
 	type rec struct {
 		name    string
 		record  agentbox.RunRecord
+		journal []byte
+	}
+	var recs []rec
+	for _, line := range strings.Split(out, "\n") {
+		kind, rest, _ := strings.Cut(line, " ")
+		switch kind {
+		case "B":
+			boot = strings.TrimSpace(rest)
+		case "P":
+			for _, f := range strings.Fields(rest) {
+				var pid int
+				if _, err := fmt.Sscan(f, &pid); err == nil {
+					alive[pid] = true
+				}
+			}
+		case "R":
+			fields := strings.Fields(rest)
+			if len(fields) != 4 || !agentbox.IsCurrentRecordFile(fields[0]) {
+				continue
+			}
+			name := strings.TrimSuffix(fields[0], ".json")
+			if !validRunPathID(name) {
+				continue
+			}
+			recData, err := decodeB64Field(fields[1])
+			if err != nil {
+				continue
+			}
+			record, err := agentbox.DecodeRunRecord(recData)
+			if err != nil {
+				continue
+			}
+			sidecar, _ := decodeB64Field(fields[2])
+			journal, err := decodeB64Field(fields[3])
+			if err != nil {
+				continue
+			}
+			recs = append(recs, rec{name, agentbox.FoldExitSidecar(record, sidecar), journal})
+		}
+	}
+	for _, r := range recs {
+		if agentbox.ResolveOutcome(r.record, boot, func(pid int) bool { return pid > 0 && alive[pid] }) != agentbox.RunOutcomeRunning {
+			continue
+		}
+		events := coderun.ParseInputJournal(r.journal)
+		first := map[string]coderun.InputEvent{}
+		for _, e := range events {
+			if _, ok := first[e.RequestID]; e.Kind == coderun.KindInputRequest && !ok {
+				first[e.RequestID] = e
+			}
+		}
+		summary := coderun.SummarizeApprovals(events)
+		reqs := make([]notify.Request, 0, len(summary.Open))
+		seen := map[string]bool{}
+		for _, o := range summary.Open {
+			if seen[o.RequestID] {
+				continue
+			}
+			seen[o.RequestID] = true
+			e := first[o.RequestID]
+			if !e.ExpiresAt.IsZero() && !now.Before(e.ExpiresAt) {
+				continue
+			}
+			reqs = append(reqs, notify.Request{
+				Box: box, Run: r.name, RequestID: e.RequestID, Tool: e.Tool, Prompt: e.Prompt, ExpiresAt: e.ExpiresAt,
+			})
+		}
+		open[r.name] = reqs
+	}
+	return open
+}
+
+// RunNotifyWatcher polls until ctx is done.
+func (s *NotifyServer) RunNotifyWatcher(ctx context.Context) {
+	t := time.NewTicker(NotifyPollInterval)
+	defer t.Stop()
+	for {
+		s.pollOnce(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// pollOnce starts one poll for every channel user that has none running,
+// each on its own goroutine (bounded by sem). Tests wait on s.wg.
+func (s *NotifyServer) pollOnce(ctx context.Context) {
+	exec := s.exec()
+	if exec == nil {
+		return
+	}
+	channels, err := s.store.List(ctx)
+	if err != nil {
+		log.Printf("[notify] list channels: %v", err)
+		return
+	}
+	for _, ch := range channels {
+		s.mu.Lock()
+		busy := s.inflight[ch.Username]
+		if !busy {
+			s.inflight[ch.Username] = true
+		}
+		s.mu.Unlock()
+		if busy {
+			continue
+		}
+		s.wg.Add(1)
+		go func(user string) {
+			defer s.wg.Done()
+			defer func() {
+				s.mu.Lock()
+				delete(s.inflight, user)
+				s.mu.Unlock()
+			}()
+			select {
+			case s.sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			release := sync.OnceFunc(func() { <-s.sem })
+			defer release()
+			s.pollUser(ctx, exec, user, release)
+		}(ch.Username)
+	}
+}
+
+// execBounded runs the user's journal read. Past execTimeout it calls release,
+// giving the concurrency slot to other users, and waits for the read to end
+// before returning an error, so the user stays in flight and is not polled
+// again meanwhile; what such a late read returns is discarded as stale.
+func (s *NotifyServer) execBounded(ctx context.Context, exec boxScriptFunc, user string, release func()) (string, error) {
+	type result struct {
+		out string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := exec(user+"-container", notifyJournalScript(s.dir))
+		done <- result{out, err}
+	}()
+	t := time.NewTimer(s.execTimeout)
+	defer t.Stop()
+	select {
+	case r := <-done:
+		return r.out, r.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-t.C:
+	}
+	log.Printf("[notify] reading %s's box took over %s; freeing its slot until the read returns", user, s.execTimeout)
+	release()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	return "", errors.New("box read timed out")
+}
+
+// pollUser reads one user's journals and sends what is due. A box that
+// cannot be read is skipped this round, keeping its state.
+func (s *NotifyServer) pollUser(ctx context.Context, exec boxScriptFunc, user string, release func()) {
+	out, err := s.execBounded(ctx, exec, user, release)
+	if err != nil {
+		return
+	}
+	pushes := s.coalescer.Step(user, parseNotifyJournals(user, out, s.now()), s.now())
+	sort.Slice(pushes, func(i, j int) bool { return pushes[i].Run < pushes[j].Run })
+	// The box's user can write run records and journals, so a flood of
+	// fake runs must not become a flood of pushes: the rest wait.
+	for _, p := range pushes[min(len(pushes), notifyMaxPushesPerPoll):] {
+		s.coalescer.Requeue(p)
+	}
+	pushes = pushes[:min(len(pushes), notifyMaxPushesPerPoll)]
+	for _, p := range pushes {
+		if ctx.Err() != nil {
+			s.coalescer.Requeue(p)
+			continue
+		}
+		if err := s.deliver(ctx, user, p); err != nil {
+			log.Printf("[notify] push for %s/%s: %v", user, p.Run, err)
+			s.coalescer.Requeue(p)
+			continue
+		}
+		s.coalescer.Sent(p, s.now())
+	}
+}
+
+// deliver sends one push with the channel and token read together, at send
+// time: a channel changed or removed since the poll began is honoured.
+func (s *NotifyServer) deliver(ctx context.Context, user string, p notify.Push) error {
+	ch, token, err := s.channelAndToken(ctx, user)
+	if errors.Is(err, notify.ErrNotFound) {
+		// Channel removed since the poll began: nothing was sent, so the
+		// requests go back in the queue for a channel set later.
+		return errors.New("channel removed before the push was sent")
+	}
+	if err != nil {
+		return err
+	}
+	return s.sender.Send(ctx, ch, token, notify.BuildMessage(p.Requests, ch.RedactCommand, s.now()))
+}
