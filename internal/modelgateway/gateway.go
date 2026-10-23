@@ -346,3 +346,351 @@ func (g *Gateway) handleModel(w http.ResponseWriter, r *http.Request) {
 			r.Body = io.NopCloser(bytes.NewReader(raw))
 			r.ContentLength = int64(len(raw))
 			r.Header.Set("Content-Length", strconv.Itoa(len(raw)))
+		}
+	}
+	// Every OpenAI-shaped provider, including one an operator registered at
+	// runtime (ProvidersFromEnv) — keyed off the provider's own trait rather
+	// than a list of names, so a new OpenAI-compatible upstream is metered on
+	// the streaming path from the moment it is registered.
+	if prov.openAIShaped {
+		if raw, rerr := io.ReadAll(r.Body); rerr == nil {
+			_ = r.Body.Close()
+			sysPrompt = extractSystemPrompt(raw)
+			reqModel = requestModel(raw)
+			body, _ := ensureStreamUsage(raw)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.ContentLength = int64(len(body))
+			r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		}
+	}
+	if !g.cfg.OutputFilter {
+		sysPrompt = "" // redaction disabled → meter-only (filterSSEStream skips it)
+	}
+
+	logModel := reqModel
+	if logModel == "" {
+		logModel = pathModel
+	}
+
+	// Model ceiling (basic tiering), enforced against whichever model was
+	// actually resolved — never just pathModel. The original gate only
+	// ever compared AllowedModels to pathModel, which only Gemini sets;
+	// Anthropic, OpenAI, and Gemini-OpenAI all carry their model in the
+	// body (reqModel, above) and got a free pass regardless of what the
+	// token was scoped to. A request whose model this gateway couldn't
+	// resolve at all (logModel == "") is refused open when the token is
+	// scoped, rather than treated as ceiling-exempt: an unresolvable
+	// model is exactly the case a restricted token must not get a bypass
+	// from.
+	if len(claims.AllowedModels) > 0 && !contains(claims.AllowedModels, logModel) {
+		g.policy.RecordDenial(claims.Tenant)
+		http.Error(w, "model not allowed by token: "+logModel, http.StatusForbidden)
+		return
+	}
+
+	// Inbound guardrail policy (#2367). Resolved per call, before the ladder
+	// and the Director: a call refused because the policy is unavailable
+	// (cold start, or a read error while the last known policy scanned)
+	// never reaches the provider. ir is nil when this call is not scanned.
+	inSub := inboundSubject{tenant: claims.Tenant, skill: claims.SkillID, provider: provName, model: logModel}
+	inMode, inOK := g.inbound.resolve(r.Context())
+	if !inOK {
+		dec := guardrail.InboundBlocked(guardrail.InboundReasonPolicyUnavailable)
+		// block's returned error is what ModifyResponse hands the proxy; here
+		// the response is written directly, so only its side effects
+		// (log, counters, audit) are wanted.
+		_ = g.inbound.block(inSub, dec, inMode.revision)
+		g.failed.Add(1)
+		writeInboundBlock(w, http.StatusServiceUnavailable, dec)
+		return
+	}
+	// No admin policy: the baseline scan. LOG mode is never held (#2736);
+	// BLOCK mode is scanned below through the hold path (#2738), and uses bl
+	// only for an upstream error the hold path passes through unscanned.
+	var bl *baselineRequest
+	if inMode.baseline {
+		bl = &baselineRequest{in: g.inbound, sub: inSub}
+	}
+	var ir *inboundRequest
+	if inMode.scan {
+		ir = &inboundRequest{in: g.inbound, mode: inMode, sub: inSub}
+		ir.onBlocked = func(held []byte, streaming bool) {
+			m := reqModel
+			if m == "" {
+				m = pathModel
+			}
+			var u Usage
+			var ok bool
+			if streaming {
+				u, ok = usageFromSSE(held, func(b map[string]any) Usage { return prov.parseUsage(b, m) })
+				if ok && u.Model == "" {
+					u.Model = m
+				}
+			} else {
+				var decoded map[string]any
+				if json.Unmarshal(held, &decoded) == nil {
+					u, ok = prov.parseUsage(decoded, pathModel), true
+				}
+			}
+			if !ok {
+				return // no usage in the held bytes; record nothing rather than guess
+			}
+			g.meter.recordBlocked(claims.Tenant, claims.SkillID, provName, u)
+			g.policy.RecordUsage(claims.Tenant, u)
+			if g.cfg.Sink != nil {
+				g.cfg.Sink.RecordUsage(claims.Tenant, claims.SkillID, provName, u)
+			}
+		}
+	}
+
+	// Enforcement ladder. Deliberately the last gate before proxying: a denied
+	// request never reaches the Director, so the real provider key is never
+	// injected and never leaves the gateway on a call we refused.
+	if dec := g.policy.Check(RequestInfo{
+		Tenant:     claims.Tenant,
+		Skill:      claims.SkillID,
+		Provider:   provName,
+		Model:      logModel,
+		Endpoint:   upstreamPath,
+		RemoteAddr: r.RemoteAddr,
+	}); !dec.Allow {
+		if dec.RetryAfter > 0 {
+			// Round UP, and floor at 1. Truncating 59.4s to 59 tells a
+			// well-behaved client to come back while the circuit is still
+			// open, so it gets denied again — and a Retry-After of 0 invites
+			// an immediate retry, which is the opposite of a throttle.
+			secs := int(math.Ceil(dec.RetryAfter.Seconds()))
+			if secs < 1 {
+				secs = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+		}
+		g.cfg.Logger.Printf("model-gateway: DENY tenant=%s skill=%s provider=%s model=%s state=%s reason=%q",
+			claims.Tenant, claims.SkillID, provName, logModel, dec.State, dec.Reason)
+		http.Error(w, "model gateway: "+dec.Reason, dec.Status)
+		return
+	}
+	// Request-lifecycle capture, read after ServeHTTP returns. Mutex-guarded
+	// because the streaming usage callback runs in filterSSEStream's goroutine
+	// (the non-streaming path sets them inline in ModifyResponse).
+	var (
+		mu        sync.Mutex
+		streamed  bool
+		metered   bool
+		lastU     Usage
+		proxyErr  error     // set when the upstream round trip itself failed
+		headersAt time.Time // when the upstream's response headers arrived
+	)
+	markStreamed := func() { mu.Lock(); streamed = true; mu.Unlock() }
+	captureUsage := func(u Usage) { mu.Lock(); metered = true; lastU = u; mu.Unlock() }
+
+	proxy := &httputil.ReverseProxy{
+		// Flush streamed (SSE) responses promptly so chat tokens aren't buffered.
+		FlushInterval: -1,
+		Director: func(req *http.Request) {
+			req.URL.Scheme = upstream.Scheme
+			req.URL.Host = upstream.Host
+			req.Host = upstream.Host
+			req.URL.Path = upstreamPath
+			prov.inject(req.Header, key) // strip gateway token, inject real key
+			// Drop the client's Accept-Encoding so the upstream returns identity
+			// (and Go's transport transparently decompresses any gzip). Otherwise a
+			// client that asks for gzip (e.g. LibreChat/undici) makes the provider
+			// gzip the SSE stream, and the streaming filter below reads raw
+			// compressed bytes as text — corrupting tool_call chunks so the agent
+			// client gets garbage and aborts ("terminated"). The non-streaming path
+			// already skips compressed bodies; this keeps the streaming path safe.
+			req.Header.Del("Accept-Encoding")
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			mu.Lock()
+			headersAt = time.Now()
+			mu.Unlock()
+			// Baseline (#2736): tee the final body, whatever the steps below
+			// make of it, and scan it once the proxy has written it all.
+			if bl != nil && !inMode.baselineBlock {
+				defer bl.watch(resp)
+			}
+			// Scanned mode (#2367): hold the whole response here, scan it,
+			// and either block (typed error via ErrorHandler, nothing
+			// committed to the client yet) or restore the held bytes for the
+			// unchanged metering/filter path below. See inbound.go.
+			if ir != nil {
+				if err := ir.enforce(resp); err != nil {
+					return err
+				}
+				if bl != nil && ir.passedThrough {
+					defer bl.watch(resp)
+				}
+			}
+			// Streaming (SSE): intercept to meter usage + redact prompt leakage.
+			if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+				meterModel := reqModel
+				if meterModel == "" {
+					meterModel = pathModel
+				}
+				markStreamed()
+				onUsage := func(u Usage) {
+					if u.Model == "" {
+						u.Model = meterModel
+					}
+					g.meter.record(claims.Tenant, claims.SkillID, provName, u)
+					g.policy.RecordUsage(claims.Tenant, u)
+					if g.cfg.Sink != nil {
+						g.cfg.Sink.RecordUsage(claims.Tenant, claims.SkillID, provName, u)
+					}
+					captureUsage(u) // folded into the END lifecycle log
+				}
+				pr, pw := io.Pipe()
+				go filterSSEStream(pw, resp.Body, sysPrompt,
+					func(b map[string]any) Usage { return prov.parseUsage(b, meterModel) }, onUsage)
+				resp.Body = pr
+				resp.Header.Del("Content-Length")
+				resp.ContentLength = -1
+				return nil
+			}
+			// Metering on non-streaming, uncompressed JSON. Compressed bodies
+			// pass through unmetered.
+			if resp.Header.Get("Content-Encoding") != "" {
+				return nil
+			}
+			if !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+				return nil
+			}
+			body, err := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				return err
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			resp.ContentLength = int64(len(body))
+			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+
+			var decoded map[string]any
+			if json.Unmarshal(body, &decoded) == nil {
+				u := prov.parseUsage(decoded, pathModel)
+				g.meter.record(claims.Tenant, claims.SkillID, provName, u)
+				g.policy.RecordUsage(claims.Tenant, u)
+				if g.cfg.Sink != nil {
+					g.cfg.Sink.RecordUsage(claims.Tenant, claims.SkillID, provName, u)
+				}
+				captureUsage(u) // folded into the END lifecycle log
+
+				// Normalize Gemini's non-conformant tool-call finish_reason
+				// ("stop" -> "tool_calls") on the OpenAI-shaped surface, so an
+				// agent client runs the tool instead of hanging. Only rewrites
+				// when a tool call is actually present; normal responses untouched.
+				if prov.openAIShaped && normalizeNonStreamToolFinish(decoded) {
+					if nb, merr := json.Marshal(decoded); merr == nil {
+						resp.Body = io.NopCloser(bytes.NewReader(nb))
+						resp.ContentLength = int64(len(nb))
+						resp.Header.Set("Content-Length", strconv.Itoa(len(nb)))
+					}
+				}
+			}
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			var blocked *inboundBlockError
+			if errors.As(err, &blocked) {
+				writeInboundBlock(w, http.StatusBadGateway, blocked.dec)
+				return
+			}
+			mu.Lock()
+			proxyErr = err
+			mu.Unlock()
+			http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		},
+	}
+
+	// --- request lifecycle: START → serve → END ---
+	// Every accepted request gets a START and a matching END line keyed by a
+	// monotonic req id, plus the live inflight gauge. For a streaming response
+	// ServeHTTP blocks until the piped SSE stream is fully drained, so END marks
+	// the true end of generation — turning "is it done or hung?" into a fact.
+	reqID := g.reqSeq.Add(1)
+	start := time.Now()
+	inflight := g.inflight.Add(1)
+	g.cfg.Logger.Printf("model-gateway: req=%d START tenant=%s skill=%s provider=%s model=%s inflight=%d",
+		reqID, claims.Tenant, claims.SkillID, provName, logModel, inflight)
+
+	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+	proxy.ServeHTTP(sw, r)
+
+	mu.Lock()
+	st, md, lu, perr, hdrAt := streamed, metered, lastU, proxyErr, headersAt
+	mu.Unlock()
+	dur := time.Since(start)
+	callStatus, terr := int32(sw.status), pb.GatewayTransportError_GATEWAY_TRANSPORT_ERROR_UNSPECIFIED // #nosec G115 -- an HTTP status code
+	if perr != nil {
+		callStatus, terr = 0, classifyTransportError(perr)
+	}
+	callEnd := time.Now()
+	if !hdrAt.IsZero() {
+		callEnd = hdrAt // latency is the time to the response headers, not the whole stream
+	}
+	g.recordCall(claims, newCall(claims, provName, logModel, keyOwner, callStatus, terr, start, callEnd))
+	status := "ok"
+	if sw.status >= 400 {
+		status = "error"
+		g.failed.Add(1)
+	} else {
+		g.completed.Add(1)
+	}
+	warn := ""
+	if st && !md {
+		// A streaming response that ended without ever emitting a usage event:
+		// the upstream stream was cut/abandoned — the classic "looks hung" case.
+		warn = " warn=stream-ended-without-usage"
+	}
+	g.cfg.Logger.Printf("model-gateway: req=%d END status=%s http=%d stream=%t dur=%s in=%d out=%d cached=%d inflight=%d%s",
+		reqID, status, sw.status, st, dur.Round(time.Millisecond),
+		lu.InputTokens, lu.OutputTokens, lu.CachedTokens, g.inflight.Add(-1), warn)
+}
+
+// statusWriter wraps http.ResponseWriter to capture the response status code for
+// the END lifecycle log. It deliberately does NOT implement http.Flusher:
+// httputil.ReverseProxy flushes through http.NewResponseController, which
+// checks for a Flusher before it follows Unwrap, so a Flush method here would
+// shadow Unwrap and silently no-op whenever this writer sits above another
+// wrapper (the #2773 class of bug — SSE token streams buffer until the
+// upstream closes). Unwrap alone lets the controller reach the real Flusher
+// however many wrappers sit in between.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	if !s.wrote {
+		s.status = code
+		s.wrote = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Write(b []byte) (int, error) {
+	s.wrote = true // an implicit 200 if WriteHeader was never called
+	return s.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.NewResponseController reach the underlying writer's
+// Flusher, Hijacker and deadline setters.
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+func contains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// recordCall hands a finished call to the configured recorder, if any.
+func (g *Gateway) recordCall(claims *GatewayClaims, c *pb.GatewayCall) {
+	if g.cfg.Calls != nil {
+		g.cfg.Calls.RecordCall(claims.RunID, c)
+	}
+}
