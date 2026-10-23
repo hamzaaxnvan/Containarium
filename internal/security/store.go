@@ -148,3 +148,453 @@ func (s *Store) ListReports(ctx context.Context, params ListParams) ([]*pb.Clama
 		args = append(args, params.From)
 		argIdx++
 	}
+
+	if params.To != "" {
+		baseQuery += fmt.Sprintf(" AND scanned_at <= $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND scanned_at <= $%d", argIdx)
+		args = append(args, params.To)
+		argIdx++
+	}
+
+	// Get total count
+	var totalCount int32
+	err := s.pool.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to count reports: %w", err)
+	}
+
+	// Apply pagination
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	baseQuery += fmt.Sprintf(" ORDER BY scanned_at DESC LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
+	args = append(args, limit, params.Offset)
+
+	rows, err := s.pool.Query(ctx, baseQuery, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to query reports: %w", err)
+	}
+	defer rows.Close()
+
+	var reports []*pb.ClamavReport
+	for rows.Next() {
+		var (
+			id            int64
+			containerName string
+			username      string
+			status        string
+			findingsCount int32
+			findings      string
+			scannedAt     time.Time
+			scanDuration  *string
+			createdAt     time.Time
+		)
+
+		if err := rows.Scan(&id, &containerName, &username, &status, &findingsCount,
+			&findings, &scannedAt, &scanDuration, &createdAt); err != nil {
+			return nil, 0, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		report := &pb.ClamavReport{
+			Id:            id,
+			ContainerName: containerName,
+			Username:      username,
+			Status:        status,
+			FindingsCount: findingsCount,
+			Findings:      findings,
+			ScannedAt:     scannedAt.Format(time.RFC3339),
+			CreatedAt:     createdAt.Format(time.RFC3339),
+			StatusEnum:    StatusEnum(status),
+			Reason:        ReasonFor(status, findings),
+		}
+		if scanDuration != nil {
+			report.ScanDuration = *scanDuration
+		}
+
+		reports = append(reports, report)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return reports, totalCount, nil
+}
+
+// ListReportsForExport returns all matching rows (no pagination) for CSV export
+func (s *Store) ListReportsForExport(ctx context.Context, from, to, containerName, status string) ([]*pb.ClamavReport, error) {
+	query := `SELECT id, container_name, username, status, findings_count, findings,
+		scanned_at, scan_duration, created_at FROM clamav_reports WHERE scanned_at >= $1 AND scanned_at <= $2`
+
+	args := []interface{}{from, to}
+	argIdx := 3
+
+	if containerName != "" {
+		query += fmt.Sprintf(" AND container_name = $%d", argIdx)
+		args = append(args, containerName)
+		argIdx++
+	}
+
+	if status != "" {
+		query += fmt.Sprintf(" AND status = $%d", argIdx)
+		args = append(args, status)
+	}
+
+	query += " ORDER BY scanned_at DESC"
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query reports for export: %w", err)
+	}
+	defer rows.Close()
+
+	var reports []*pb.ClamavReport
+	for rows.Next() {
+		var (
+			id            int64
+			cname         string
+			username      string
+			st            string
+			findingsCount int32
+			findings      string
+			scannedAt     time.Time
+			scanDuration  *string
+			createdAt     time.Time
+		)
+
+		if err := rows.Scan(&id, &cname, &username, &st, &findingsCount,
+			&findings, &scannedAt, &scanDuration, &createdAt); err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		report := &pb.ClamavReport{
+			Id:            id,
+			ContainerName: cname,
+			Username:      username,
+			Status:        st,
+			FindingsCount: findingsCount,
+			Findings:      findings,
+			ScannedAt:     scannedAt.Format(time.RFC3339),
+			CreatedAt:     createdAt.Format(time.RFC3339),
+			StatusEnum:    StatusEnum(st),
+			Reason:        ReasonFor(st, findings),
+		}
+		if scanDuration != nil {
+			report.ScanDuration = *scanDuration
+		}
+
+		reports = append(reports, report)
+	}
+
+	return reports, rows.Err()
+}
+
+// GetContainerSummaries returns the latest scan status per container
+func (s *Store) GetContainerSummaries(ctx context.Context) ([]*pb.ClamavContainerSummary, error) {
+	query := `
+		SELECT DISTINCT ON (container_name)
+			container_name, username, scanned_at, status, findings_count,
+			(SELECT COUNT(*) FROM clamav_reports r2 WHERE r2.container_name = r1.container_name) as total_scans,
+			(SELECT COUNT(*) FROM clamav_reports r2 WHERE r2.container_name = r1.container_name AND r2.status = 'infected') as infected_scans
+		FROM clamav_reports r1
+		ORDER BY container_name, scanned_at DESC
+	`
+
+	rows, err := s.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query summaries: %w", err)
+	}
+	defer rows.Close()
+
+	var summaries []*pb.ClamavContainerSummary
+	for rows.Next() {
+		var (
+			containerName string
+			username      string
+			scannedAt     time.Time
+			status        string
+			findingsCount int32
+			totalScans    int32
+			infectedScans int32
+		)
+
+		if err := rows.Scan(&containerName, &username, &scannedAt, &status,
+			&findingsCount, &totalScans, &infectedScans); err != nil {
+			return nil, fmt.Errorf("failed to scan summary row: %w", err)
+		}
+
+		summaries = append(summaries, &pb.ClamavContainerSummary{
+			ContainerName:     containerName,
+			Username:          username,
+			LastScanAt:        scannedAt.Format(time.RFC3339),
+			LastStatus:        status,
+			LastFindingsCount: findingsCount,
+			TotalScans:        totalScans,
+			InfectedScans:     infectedScans,
+		})
+	}
+
+	return summaries, rows.Err()
+}
+
+// Cleanup removes old reports beyond the retention period
+func (s *Store) Cleanup(ctx context.Context, retentionDays int) error {
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	query := "DELETE FROM clamav_reports WHERE created_at < $1"
+	_, err := s.pool.Exec(ctx, query, cutoff)
+	return err
+}
+
+// ScanJob represents a queued ClamAV scan job
+type ScanJob struct {
+	ID            int64
+	ContainerName string
+	Username      string
+	Status        string // pending | running | completed | failed
+	RetryCount    int
+	MaxRetries    int
+	ErrorMessage  string
+	CreatedAt     time.Time
+	StartedAt     *time.Time
+	CompletedAt   *time.Time
+}
+
+// ActiveScanJob reports whether the container already has a pending or running
+// scan job, and its id.
+func (s *Store) ActiveScanJob(ctx context.Context, containerName string) (id int64, found bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT id FROM scan_jobs WHERE container_name = $1 AND status IN ('pending', 'running') LIMIT 1`,
+		containerName,
+	).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("failed to look up active scan job: %w", err)
+	}
+	return id, true, nil
+}
+
+// EnqueueScanJob inserts a new pending scan job and returns its ID.
+// If the container already has a pending or running job, it skips the insert
+// and returns the existing job's ID to avoid queue bloat from repeated scan-all triggers.
+func (s *Store) EnqueueScanJob(ctx context.Context, containerName, username string) (int64, error) {
+	// Check for existing pending/running job for this container
+	var existingID int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM scan_jobs WHERE container_name = $1 AND status IN ('pending', 'running') LIMIT 1`,
+		containerName,
+	).Scan(&existingID)
+	if err == nil {
+		// Already has an active job, skip
+		return existingID, nil
+	}
+
+	var id int64
+	err = s.pool.QueryRow(ctx,
+		`INSERT INTO scan_jobs (container_name, username) VALUES ($1, $2) RETURNING id`,
+		containerName, username,
+	).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("failed to enqueue scan job: %w", err)
+	}
+	return id, nil
+}
+
+// ClaimNextJob atomically claims the oldest pending job for processing.
+// Returns nil if no jobs are available.
+func (s *Store) ClaimNextJob(ctx context.Context) (*ScanJob, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE scan_jobs
+		SET status = 'running', started_at = NOW()
+		WHERE id = (
+			SELECT id FROM scan_jobs
+			WHERE status = 'pending'
+			ORDER BY created_at
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, container_name, username, status, retry_count, max_retries,
+			COALESCE(error_message, ''), created_at, started_at, completed_at
+	`)
+
+	job := &ScanJob{}
+	err := row.Scan(
+		&job.ID, &job.ContainerName, &job.Username, &job.Status,
+		&job.RetryCount, &job.MaxRetries, &job.ErrorMessage,
+		&job.CreatedAt, &job.StartedAt, &job.CompletedAt,
+	)
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to claim scan job: %w", err)
+	}
+	return job, nil
+}
+
+// CompleteJob marks a job as completed
+func (s *Store) CompleteJob(ctx context.Context, jobID int64) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE scan_jobs SET status = 'completed', completed_at = NOW() WHERE id = $1`,
+		jobID,
+	)
+	return err
+}
+
+// FailJob increments retry_count. If retries remain, re-queues as pending; otherwise marks as failed.
+func (s *Store) FailJob(ctx context.Context, jobID int64, errMsg string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE scan_jobs
+		SET retry_count = retry_count + 1,
+			error_message = $2,
+			status = CASE WHEN retry_count + 1 < max_retries THEN 'pending' ELSE 'failed' END,
+			started_at = CASE WHEN retry_count + 1 < max_retries THEN NULL ELSE started_at END,
+			completed_at = CASE WHEN retry_count + 1 >= max_retries THEN NOW() ELSE NULL END
+		WHERE id = $1
+	`, jobID, errMsg)
+	return err
+}
+
+// ListScanJobs returns recent scan jobs, optionally filtered by status.
+// Returns up to limit jobs ordered by created_at DESC.
+func (s *Store) ListScanJobs(ctx context.Context, status string, limit int) ([]ScanJob, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := `SELECT id, container_name, username, status, retry_count, max_retries,
+		COALESCE(error_message, ''), created_at, started_at, completed_at
+		FROM scan_jobs WHERE 1=1`
+	var args []interface{}
+	argIdx := 1
+
+	if status != "" {
+		query += fmt.Sprintf(" AND status = $%d", argIdx)
+		args = append(args, status)
+		argIdx++
+	}
+
+	query += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d", argIdx)
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list scan jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []ScanJob
+	for rows.Next() {
+		var job ScanJob
+		if err := rows.Scan(
+			&job.ID, &job.ContainerName, &job.Username, &job.Status,
+			&job.RetryCount, &job.MaxRetries, &job.ErrorMessage,
+			&job.CreatedAt, &job.StartedAt, &job.CompletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan job row: %w", err)
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// CleanupOldJobs deletes completed/failed jobs older than retentionDays
+func (s *Store) CleanupOldJobs(ctx context.Context, retentionDays int) error {
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM scan_jobs WHERE status IN ('completed', 'failed') AND created_at < $1`,
+		cutoff,
+	)
+	return err
+}
+
+// Scan report statuses. "incomplete" means clamdscan errored or never ran to
+// the end, so nothing may be concluded about the box — in particular it must
+// never be treated as clean (#2496).
+const (
+	ScanStatusClean      = "clean"
+	ScanStatusInfected   = "infected"
+	ScanStatusIncomplete = "incomplete"
+	// ScanStatusUnsupportedSize: the box has less memory than ClamAV needs
+	// (MinBoxMemoryBytes), so no scan was attempted (#2631).
+	ScanStatusUnsupportedSize = "unsupported_size"
+	// ScanStatusNotInstalled: ClamAV or its signatures are absent from the box,
+	// so no scan was attempted (#2631).
+	ScanStatusNotInstalled = "not_installed"
+)
+
+// ClassifyClamScan turns a clamdscan run into a report status. FOUND lines
+// win (an infection is real even if another path errored); otherwise any exec
+// error — exit 2, a failed exec, a non-zero exit with no findings — is
+// "incomplete" and the stderr/exit error is kept in findings so an operator
+// can see why. Only a clean exit with no findings is "clean".
+func ClassifyClamScan(stdout, stderr string, scanErr error) (status string, findingsCount int, findings string) {
+	status, findingsCount, findings = ParseClamScanOutput(stdout)
+	if scanErr == nil {
+		return status, findingsCount, findings
+	}
+	detail := scanErr.Error()
+	if msg := strings.TrimSpace(stderr); msg != "" {
+		detail += "\n" + msg
+	}
+	if status == ScanStatusInfected {
+		// Keep the verdict and count, but record that the run also errored
+		// so an operator can tell the scan was partial.
+		return status, findingsCount, findings + "\n" + detail
+	}
+	return ScanStatusIncomplete, 0, detail
+}
+
+// ParseClamScanOutput parses clamscan output and returns status, findings count, and findings text
+func ParseClamScanOutput(output string) (status string, findingsCount int, findings string) {
+	lines := strings.Split(output, "\n")
+	var foundLines []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "FOUND") {
+			foundLines = append(foundLines, line)
+		}
+	}
+
+	if len(foundLines) > 0 {
+		return ScanStatusInfected, len(foundLines), strings.Join(foundLines, "\n")
+	}
+	return ScanStatusClean, 0, ""
+}
+
+// StatusEnum maps a stored status string to the typed enum (#2631).
+func StatusEnum(status string) pb.ClamavScanStatus {
+	switch status {
+	case ScanStatusClean:
+		return pb.ClamavScanStatus_CLAMAV_SCAN_STATUS_CLEAN
+	case ScanStatusInfected:
+		return pb.ClamavScanStatus_CLAMAV_SCAN_STATUS_INFECTED
+	case ScanStatusIncomplete:
+		return pb.ClamavScanStatus_CLAMAV_SCAN_STATUS_INCOMPLETE
+	case ScanStatusUnsupportedSize:
+		return pb.ClamavScanStatus_CLAMAV_SCAN_STATUS_UNSUPPORTED_SIZE
+	case ScanStatusNotInstalled:
+		return pb.ClamavScanStatus_CLAMAV_SCAN_STATUS_NOT_INSTALLED
+	case "never":
+		return pb.ClamavScanStatus_CLAMAV_SCAN_STATUS_NEVER_SCANNED
+	default:
+		return pb.ClamavScanStatus_CLAMAV_SCAN_STATUS_UNSPECIFIED
+	}
+}
+
+// ReasonFor is the reason a scan produced no verdict: the stored findings text
+// for every status other than clean/infected, empty for those two.
+func ReasonFor(status, findings string) string {
+	switch status {
+	case ScanStatusClean, ScanStatusInfected:
+		return ""
+	}
+	return findings
+}

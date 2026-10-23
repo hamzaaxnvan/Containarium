@@ -56,3 +56,62 @@ func Run(run func() int) int {
 	}
 	return code
 }
+
+// FORCE bypasses identity validation only. Parsing, schema isolation, and
+// cleanup still apply. A marker is a database-name token "test" (for example
+// containarium_test) or the exact application_name "containarium-test".
+func validateDSN(dsn, force string) error {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return errors.New("invalid PostgreSQL test DSN")
+	}
+	if force != "1" && !testDatabase.MatchString(strings.ToLower(cfg.Database)) && cfg.RuntimeParams["application_name"] != "containarium-test" {
+		return errors.New("refusing unsafe CONTAINARIUM_TEST_DSN: use a test database name or application_name=containarium-test (CONTAINARIUM_TEST_DSN_FORCE=1 bypasses identity validation only)")
+	}
+	return nil
+}
+
+func schemaDSN(dsn, schema string) string {
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, _ := url.Parse(dsn) // validateDSN has already parsed the connection string.
+		q := u.Query()
+		q.Set("search_path", schema)
+		u.RawQuery = q.Encode()
+		return u.String()
+	}
+	// The last keyword wins. schema is generated from a fixed prefix and hex.
+	return dsn + " search_path=" + schema
+}
+
+func newSchema(ctx context.Context, dsn, force string) (string, func() error, error) {
+	if err := validateDSN(dsn, force); err != nil {
+		return "", nil, err
+	}
+	var suffix [16]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", nil, fmt.Errorf("schema name: %w", err)
+	}
+	schema := "test_" + hex.EncodeToString(suffix[:])
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return "", nil, fmt.Errorf("connect test database: %w", err)
+	}
+	closeAdmin := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = admin.Close(ctx)
+	}
+	ident := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+ident); err != nil {
+		closeAdmin()
+		return "", nil, fmt.Errorf("create test schema: %w", err)
+	}
+	cleanup := func() error {
+		defer closeAdmin()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := admin.Exec(ctx, "DROP SCHEMA "+ident+" CASCADE")
+		return err
+	}
+	return schemaDSN(dsn, schema), cleanup, nil
+}

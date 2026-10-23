@@ -66,3 +66,37 @@ type CredentialSource interface {
 // SecretCredential is the tenant-secret source.
 //
 // Name is the secret the engine's runs expect in their environment
+// (ANTHROPIC_API_KEY, OPENAI_API_KEY, …). It is a NAME, never a value: nothing
+// in this package or the install path reads a secret's plaintext, which is why
+// the install-time check is metadata-only.
+type SecretCredential struct {
+	Name string
+}
+
+func (SecretCredential) Kind() Kind           { return KindSecret }
+func (SecretCredential) Preflight() Preflight { return PreflightSecretMetadata }
+
+// GatewayCredential is the model-gateway source. Provider is the gateway
+// provider name (gatewayprovider.Name of the GatewayProvider enum) the token is
+// minted for.
+type GatewayCredential struct {
+	Provider string
+}
+
+func (GatewayCredential) Kind() Kind           { return KindGateway }
+func (GatewayCredential) Preflight() Preflight { return PreflightGatewayDryRun }
+
+// Kinds lists every --credential value, for flag help and error messages.
+func Kinds() []string { return []string{string(KindSecret), string(KindGateway)} }
+
+// ParseCredentialKind resolves a --credential flag value. As with ParseName, an
+// unknown value is an error naming the valid ones rather than a silent default:
+// defaulting "gatewy" to a tenant secret would start billing the wrong party.
+func ParseCredentialKind(s string) (Kind, error) {
+	switch k := Kind(strings.ToLower(strings.TrimSpace(s))); k {
+	case KindSecret, KindGateway:
+		return k, nil
+	default:
+		return "", fmt.Errorf("unknown credential source %q (one of: %s)", s, strings.Join(Kinds(), ", "))
+	}
+}
