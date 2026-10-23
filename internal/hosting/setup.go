@@ -176,3 +176,92 @@ func (s *Setup) Run(ctx context.Context) (*SetupResult, error) {
 			result.CaddyStatus = "running"
 			s.logger("Caddy is running")
 		} else {
+			result.CaddyStatus = "not running"
+			s.logger("Warning: Caddy service is not running")
+		}
+	} else {
+		s.logger("Skipping Caddy setup (--skip-caddy)")
+	}
+
+	return result, nil
+}
+
+// DetectPublicIP attempts to detect the server's public IP address
+func DetectPublicIP(ctx context.Context) (string, error) {
+	services := []string{
+		"https://ifconfig.me",
+		"https://ipinfo.io/ip",
+		"https://api.ipify.org",
+		"https://icanhazip.com",
+	}
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	for _, svc := range services {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, svc, nil)
+		if err != nil {
+			continue
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		ip := strings.TrimSpace(string(body))
+		if ip != "" && isValidIP(ip) {
+			return ip, nil
+		}
+	}
+
+	return "", fmt.Errorf("could not detect public IP address")
+}
+
+// isValidIP performs a basic validation of an IP address
+func isValidIP(ip string) bool {
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, part := range parts {
+		if len(part) == 0 || len(part) > 3 {
+			return false
+		}
+		for _, c := range part {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// VerifyHTTPS attempts to verify that HTTPS is working for the domain
+func VerifyHTTPS(ctx context.Context, domain string) error {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	url := fmt.Sprintf("https://%s", domain)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTPS request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Any response means HTTPS is working (cert is valid)
+	return nil
+}

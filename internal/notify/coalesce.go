@@ -64,3 +64,70 @@ func (c *Coalescer) Step(user string, open map[string][]Request, now time.Time) 
 			c.state[k] = st
 		}
 		byID := make(map[string]Request, len(reqs))
+		for _, r := range reqs {
+			byID[r.RequestID] = r
+			if !st.seen[r.RequestID] {
+				st.seen[r.RequestID] = true
+				st.pending = append(st.pending, r.RequestID)
+			}
+		}
+		// Forget closed requests: a pending one is not pushed, and a pushed
+		// one can never reopen under the same id.
+		var due []Request
+		kept := st.pending[:0]
+		for _, id := range st.pending {
+			if r, ok := byID[id]; ok {
+				kept = append(kept, id)
+				due = append(due, r)
+			}
+		}
+		st.pending = kept
+		for id := range st.seen {
+			if _, ok := byID[id]; !ok {
+				delete(st.seen, id)
+			}
+		}
+		if len(due) == 0 || (!st.lastPush.IsZero() && now.Sub(st.lastPush) < c.window) {
+			continue
+		}
+		st.pending = nil
+		st.lastPush = now
+		out = append(out, Push{User: user, Run: run, Requests: due})
+	}
+	return out
+}
+
+// Sent records when p was actually delivered: the run's window starts then,
+// not when Step selected it, so time spent sending other pushes first does
+// not shorten it.
+func (c *Coalescer) Sent(p Push, at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if st := c.state[runKey{p.User, p.Run}]; st != nil && at.After(st.lastPush) {
+		st.lastPush = at
+	}
+}
+
+// Requeue puts the requests of a push that could not be delivered back in
+// front of the run's queue, so the next Step retries them.
+func (c *Coalescer) Requeue(p Push) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.state[runKey{p.User, p.Run}]
+	if st == nil {
+		return
+	}
+	ids := make([]string, 0, len(p.Requests)+len(st.pending))
+	for _, r := range p.Requests {
+		ids = append(ids, r.RequestID)
+	}
+	st.pending = append(ids, st.pending...)
+	st.lastPush = time.Time{}
+}
+
+// runs is the number of runs with state, for tests.
+func (c *Coalescer) runs() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.state)
+}
