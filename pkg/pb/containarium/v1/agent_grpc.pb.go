@@ -312,3 +312,632 @@ func (UnimplementedAgentSkillServiceServer) SendAgentTask(context.Context, *Send
 }
 func (UnimplementedAgentSkillServiceServer) TailRunLog(context.Context, *TailRunLogRequest) (*TailRunLogResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method TailRunLog not implemented")
+}
+func (UnimplementedAgentSkillServiceServer) EnqueueAgentTask(context.Context, *EnqueueAgentTaskRequest) (*EnqueueAgentTaskResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnqueueAgentTask not implemented")
+}
+func (UnimplementedAgentSkillServiceServer) LeaseAgentTask(context.Context, *LeaseAgentTaskRequest) (*LeaseAgentTaskResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method LeaseAgentTask not implemented")
+}
+func (UnimplementedAgentSkillServiceServer) CompleteAgentTask(context.Context, *CompleteAgentTaskRequest) (*CompleteAgentTaskResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CompleteAgentTask not implemented")
+}
+func (UnimplementedAgentSkillServiceServer) StartAgentWorker(context.Context, *StartAgentWorkerRequest) (*StartAgentWorkerResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartAgentWorker not implemented")
+}
+func (UnimplementedAgentSkillServiceServer) mustEmbedUnimplementedAgentSkillServiceServer() {}
+func (UnimplementedAgentSkillServiceServer) testEmbeddedByValue()                           {}
+
+// UnsafeAgentSkillServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to AgentSkillServiceServer will
+// result in compilation errors.
+type UnsafeAgentSkillServiceServer interface {
+	mustEmbedUnimplementedAgentSkillServiceServer()
+}
+
+func RegisterAgentSkillServiceServer(s grpc.ServiceRegistrar, srv AgentSkillServiceServer) {
+	// If the following call panics, it indicates UnimplementedAgentSkillServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&AgentSkillService_ServiceDesc, srv)
+}
+
+func _AgentSkillService_ListAgentSkills_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListAgentSkillsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).ListAgentSkills(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_ListAgentSkills_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).ListAgentSkills(ctx, req.(*ListAgentSkillsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_ListAgentEngines_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListAgentEnginesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).ListAgentEngines(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_ListAgentEngines_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).ListAgentEngines(ctx, req.(*ListAgentEnginesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_GetAgentSkill_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetAgentSkillRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).GetAgentSkill(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_GetAgentSkill_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).GetAgentSkill(ctx, req.(*GetAgentSkillRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_ProvisionSkillBox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProvisionSkillBoxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).ProvisionSkillBox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_ProvisionSkillBox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).ProvisionSkillBox(ctx, req.(*ProvisionSkillBoxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_GetSkillBoxCredentialStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSkillBoxCredentialStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).GetSkillBoxCredentialStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_GetSkillBoxCredentialStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).GetSkillBoxCredentialStatus(ctx, req.(*GetSkillBoxCredentialStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_RunAgentSkill_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunAgentSkillRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).RunAgentSkill(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_RunAgentSkill_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).RunAgentSkill(ctx, req.(*RunAgentSkillRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_SendAgentTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SendAgentTaskRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).SendAgentTask(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_SendAgentTask_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).SendAgentTask(ctx, req.(*SendAgentTaskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_TailRunLog_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TailRunLogRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).TailRunLog(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_TailRunLog_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).TailRunLog(ctx, req.(*TailRunLogRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_EnqueueAgentTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnqueueAgentTaskRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).EnqueueAgentTask(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_EnqueueAgentTask_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).EnqueueAgentTask(ctx, req.(*EnqueueAgentTaskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_LeaseAgentTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LeaseAgentTaskRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).LeaseAgentTask(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_LeaseAgentTask_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).LeaseAgentTask(ctx, req.(*LeaseAgentTaskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_CompleteAgentTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompleteAgentTaskRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).CompleteAgentTask(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_CompleteAgentTask_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).CompleteAgentTask(ctx, req.(*CompleteAgentTaskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AgentSkillService_StartAgentWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartAgentWorkerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentSkillServiceServer).StartAgentWorker(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentSkillService_StartAgentWorker_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentSkillServiceServer).StartAgentWorker(ctx, req.(*StartAgentWorkerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// AgentSkillService_ServiceDesc is the grpc.ServiceDesc for AgentSkillService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var AgentSkillService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.AgentSkillService",
+	HandlerType: (*AgentSkillServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "ListAgentSkills",
+			Handler:    _AgentSkillService_ListAgentSkills_Handler,
+		},
+		{
+			MethodName: "ListAgentEngines",
+			Handler:    _AgentSkillService_ListAgentEngines_Handler,
+		},
+		{
+			MethodName: "GetAgentSkill",
+			Handler:    _AgentSkillService_GetAgentSkill_Handler,
+		},
+		{
+			MethodName: "ProvisionSkillBox",
+			Handler:    _AgentSkillService_ProvisionSkillBox_Handler,
+		},
+		{
+			MethodName: "GetSkillBoxCredentialStatus",
+			Handler:    _AgentSkillService_GetSkillBoxCredentialStatus_Handler,
+		},
+		{
+			MethodName: "RunAgentSkill",
+			Handler:    _AgentSkillService_RunAgentSkill_Handler,
+		},
+		{
+			MethodName: "SendAgentTask",
+			Handler:    _AgentSkillService_SendAgentTask_Handler,
+		},
+		{
+			MethodName: "TailRunLog",
+			Handler:    _AgentSkillService_TailRunLog_Handler,
+		},
+		{
+			MethodName: "EnqueueAgentTask",
+			Handler:    _AgentSkillService_EnqueueAgentTask_Handler,
+		},
+		{
+			MethodName: "LeaseAgentTask",
+			Handler:    _AgentSkillService_LeaseAgentTask_Handler,
+		},
+		{
+			MethodName: "CompleteAgentTask",
+			Handler:    _AgentSkillService_CompleteAgentTask_Handler,
+		},
+		{
+			MethodName: "StartAgentWorker",
+			Handler:    _AgentSkillService_StartAgentWorker_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/agent.proto",
+}
+
+const (
+	CrewService_PlanTaskGraph_FullMethodName     = "/containarium.v1.CrewService/PlanTaskGraph"
+	CrewService_ListCrews_FullMethodName         = "/containarium.v1.CrewService/ListCrews"
+	CrewService_GetCrew_FullMethodName           = "/containarium.v1.CrewService/GetCrew"
+	CrewService_RunCrew_FullMethodName           = "/containarium.v1.CrewService/RunCrew"
+	CrewService_GetCrewRun_FullMethodName        = "/containarium.v1.CrewService/GetCrewRun"
+	CrewService_ValidateTaskGraph_FullMethodName = "/containarium.v1.CrewService/ValidateTaskGraph"
+)
+
+// CrewServiceClient is the client API for CrewService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// CrewService runs collaborating sets of skills bound to a task purpose.
+type CrewServiceClient interface {
+	// PlanTaskGraph reads a repository in a planner box and validates its output
+	// against this daemon's catalogs. It never runs the resulting graph.
+	PlanTaskGraph(ctx context.Context, in *PlanTaskGraphRequest, opts ...grpc.CallOption) (*PlanTaskGraphResponse, error)
+	// ListCrews returns all available crews.
+	ListCrews(ctx context.Context, in *ListCrewsRequest, opts ...grpc.CallOption) (*ListCrewsResponse, error)
+	// GetCrew returns a single crew definition by id.
+	GetCrew(ctx context.Context, in *GetCrewRequest, opts ...grpc.CallOption) (*GetCrewResponse, error)
+	// RunCrew launches a crew against an input: validates the topology against the
+	// union of member skills' allowed_peers, provisions each skill's box, compiles
+	// per-agent network policy, threads one trace_id through every hop, and
+	// returns the run handle.
+	RunCrew(ctx context.Context, in *RunCrewRequest, opts ...grpc.CallOption) (*RunCrewResponse, error)
+	// GetCrewRun returns the status and artifact of a crew run.
+	GetCrewRun(ctx context.Context, in *GetCrewRunRequest, opts ...grpc.CallOption) (*GetCrewRunResponse, error)
+	// ValidateTaskGraph checks a task graph against this daemon's crew and skill
+	// catalogs: acyclic, every assignee known, node count and depth within the
+	// cap. Returns InvalidArgument naming the first problem found.
+	ValidateTaskGraph(ctx context.Context, in *ValidateTaskGraphRequest, opts ...grpc.CallOption) (*ValidateTaskGraphResponse, error)
+}
+
+type crewServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewCrewServiceClient(cc grpc.ClientConnInterface) CrewServiceClient {
+	return &crewServiceClient{cc}
+}
+
+func (c *crewServiceClient) PlanTaskGraph(ctx context.Context, in *PlanTaskGraphRequest, opts ...grpc.CallOption) (*PlanTaskGraphResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PlanTaskGraphResponse)
+	err := c.cc.Invoke(ctx, CrewService_PlanTaskGraph_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *crewServiceClient) ListCrews(ctx context.Context, in *ListCrewsRequest, opts ...grpc.CallOption) (*ListCrewsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListCrewsResponse)
+	err := c.cc.Invoke(ctx, CrewService_ListCrews_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *crewServiceClient) GetCrew(ctx context.Context, in *GetCrewRequest, opts ...grpc.CallOption) (*GetCrewResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetCrewResponse)
+	err := c.cc.Invoke(ctx, CrewService_GetCrew_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *crewServiceClient) RunCrew(ctx context.Context, in *RunCrewRequest, opts ...grpc.CallOption) (*RunCrewResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RunCrewResponse)
+	err := c.cc.Invoke(ctx, CrewService_RunCrew_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *crewServiceClient) GetCrewRun(ctx context.Context, in *GetCrewRunRequest, opts ...grpc.CallOption) (*GetCrewRunResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetCrewRunResponse)
+	err := c.cc.Invoke(ctx, CrewService_GetCrewRun_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *crewServiceClient) ValidateTaskGraph(ctx context.Context, in *ValidateTaskGraphRequest, opts ...grpc.CallOption) (*ValidateTaskGraphResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ValidateTaskGraphResponse)
+	err := c.cc.Invoke(ctx, CrewService_ValidateTaskGraph_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CrewServiceServer is the server API for CrewService service.
+// All implementations must embed UnimplementedCrewServiceServer
+// for forward compatibility.
+//
+// CrewService runs collaborating sets of skills bound to a task purpose.
+type CrewServiceServer interface {
+	// PlanTaskGraph reads a repository in a planner box and validates its output
+	// against this daemon's catalogs. It never runs the resulting graph.
+	PlanTaskGraph(context.Context, *PlanTaskGraphRequest) (*PlanTaskGraphResponse, error)
+	// ListCrews returns all available crews.
+	ListCrews(context.Context, *ListCrewsRequest) (*ListCrewsResponse, error)
+	// GetCrew returns a single crew definition by id.
+	GetCrew(context.Context, *GetCrewRequest) (*GetCrewResponse, error)
+	// RunCrew launches a crew against an input: validates the topology against the
+	// union of member skills' allowed_peers, provisions each skill's box, compiles
+	// per-agent network policy, threads one trace_id through every hop, and
+	// returns the run handle.
+	RunCrew(context.Context, *RunCrewRequest) (*RunCrewResponse, error)
+	// GetCrewRun returns the status and artifact of a crew run.
+	GetCrewRun(context.Context, *GetCrewRunRequest) (*GetCrewRunResponse, error)
+	// ValidateTaskGraph checks a task graph against this daemon's crew and skill
+	// catalogs: acyclic, every assignee known, node count and depth within the
+	// cap. Returns InvalidArgument naming the first problem found.
+	ValidateTaskGraph(context.Context, *ValidateTaskGraphRequest) (*ValidateTaskGraphResponse, error)
+	mustEmbedUnimplementedCrewServiceServer()
+}
+
+// UnimplementedCrewServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedCrewServiceServer struct{}
+
+func (UnimplementedCrewServiceServer) PlanTaskGraph(context.Context, *PlanTaskGraphRequest) (*PlanTaskGraphResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PlanTaskGraph not implemented")
+}
+func (UnimplementedCrewServiceServer) ListCrews(context.Context, *ListCrewsRequest) (*ListCrewsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListCrews not implemented")
+}
+func (UnimplementedCrewServiceServer) GetCrew(context.Context, *GetCrewRequest) (*GetCrewResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCrew not implemented")
+}
+func (UnimplementedCrewServiceServer) RunCrew(context.Context, *RunCrewRequest) (*RunCrewResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RunCrew not implemented")
+}
+func (UnimplementedCrewServiceServer) GetCrewRun(context.Context, *GetCrewRunRequest) (*GetCrewRunResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCrewRun not implemented")
+}
+func (UnimplementedCrewServiceServer) ValidateTaskGraph(context.Context, *ValidateTaskGraphRequest) (*ValidateTaskGraphResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ValidateTaskGraph not implemented")
+}
+func (UnimplementedCrewServiceServer) mustEmbedUnimplementedCrewServiceServer() {}
+func (UnimplementedCrewServiceServer) testEmbeddedByValue()                     {}
+
+// UnsafeCrewServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to CrewServiceServer will
+// result in compilation errors.
+type UnsafeCrewServiceServer interface {
+	mustEmbedUnimplementedCrewServiceServer()
+}
+
+func RegisterCrewServiceServer(s grpc.ServiceRegistrar, srv CrewServiceServer) {
+	// If the following call panics, it indicates UnimplementedCrewServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&CrewService_ServiceDesc, srv)
+}
+
+func _CrewService_PlanTaskGraph_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PlanTaskGraphRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CrewServiceServer).PlanTaskGraph(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CrewService_PlanTaskGraph_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CrewServiceServer).PlanTaskGraph(ctx, req.(*PlanTaskGraphRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CrewService_ListCrews_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListCrewsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CrewServiceServer).ListCrews(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CrewService_ListCrews_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CrewServiceServer).ListCrews(ctx, req.(*ListCrewsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CrewService_GetCrew_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCrewRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CrewServiceServer).GetCrew(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CrewService_GetCrew_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CrewServiceServer).GetCrew(ctx, req.(*GetCrewRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CrewService_RunCrew_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunCrewRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CrewServiceServer).RunCrew(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CrewService_RunCrew_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CrewServiceServer).RunCrew(ctx, req.(*RunCrewRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CrewService_GetCrewRun_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetCrewRunRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CrewServiceServer).GetCrewRun(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CrewService_GetCrewRun_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CrewServiceServer).GetCrewRun(ctx, req.(*GetCrewRunRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CrewService_ValidateTaskGraph_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ValidateTaskGraphRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CrewServiceServer).ValidateTaskGraph(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CrewService_ValidateTaskGraph_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CrewServiceServer).ValidateTaskGraph(ctx, req.(*ValidateTaskGraphRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// CrewService_ServiceDesc is the grpc.ServiceDesc for CrewService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var CrewService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.CrewService",
+	HandlerType: (*CrewServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PlanTaskGraph",
+			Handler:    _CrewService_PlanTaskGraph_Handler,
+		},
+		{
+			MethodName: "ListCrews",
+			Handler:    _CrewService_ListCrews_Handler,
+		},
+		{
+			MethodName: "GetCrew",
+			Handler:    _CrewService_GetCrew_Handler,
+		},
+		{
+			MethodName: "RunCrew",
+			Handler:    _CrewService_RunCrew_Handler,
+		},
+		{
+			MethodName: "GetCrewRun",
+			Handler:    _CrewService_GetCrewRun_Handler,
+		},
+		{
+			MethodName: "ValidateTaskGraph",
+			Handler:    _CrewService_ValidateTaskGraph_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/agent.proto",
+}
