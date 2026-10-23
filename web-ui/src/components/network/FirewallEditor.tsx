@@ -80,3 +80,86 @@ export default function FirewallEditor({ open, onClose, acl, presets, isLoading,
         <>
           <ModalBtn onClick={onClose} disabled={saving}>Cancel</ModalBtn>
           <ModalBtn variant="primary" onClick={handleSave} disabled={saving || isLoading}>
+            {saving && <Loader2 size={13} className="animate-spin" />}
+            Apply Preset
+          </ModalBtn>
+        </>
+      }
+    >
+      {isLoading ? (
+        <div className="flex justify-center py-10">
+          <Loader2 size={24} className="animate-spin text-[var(--text-secondary)]" />
+        </div>
+      ) : (
+        <div className="flex flex-col gap-4">
+          <div className="flex items-start gap-2 rounded-lg border border-blue-500/30 bg-blue-500/10 p-3 text-xs text-[var(--c-blue)]">
+            <Info size={14} className="mt-0.5 shrink-0" />
+            <span>Firewall rules control network traffic to and from your application container. We recommend <strong>Full Isolation</strong> for production apps.</span>
+          </div>
+          <p className="text-xs text-[var(--text-muted)]">Owner: {username}</p>
+
+          {/* Tabs */}
+          <div className="flex border-b border-[var(--border-subtle)]">
+            {TABS.slice(0, tabCount).map((t, i) => (
+              <button
+                key={t}
+                onClick={() => setTab(i)}
+                className={`px-4 py-2 text-xs font-medium border-b-2 -mb-px transition-colors ${tab === i ? 'border-[var(--accent)] text-[var(--accent)]' : 'border-transparent text-[var(--text-secondary)] hover:text-[var(--text)]'}`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+
+          {tab === 0 && (
+            <div className="flex flex-col gap-2">
+              {presets.filter(p => p.preset !== 'ACL_PRESET_CUSTOM').map(preset => {
+                const isSelected = preset.preset === selectedPreset;
+                return (
+                  <button
+                    key={preset.preset}
+                    onClick={() => setSelectedPreset(preset.preset)}
+                    className={`flex items-center justify-between rounded-xl border p-4 text-left transition-colors ${isSelected ? 'border-[var(--accent)] bg-blue-500/5' : 'border-[var(--border-subtle)] hover:border-[var(--border)] hover:bg-[var(--surface-2)]'}`}
+                  >
+                    <div>
+                      <p className="text-sm font-semibold text-[var(--text)]">{preset.name}</p>
+                      <p className="text-xs text-[var(--text-muted)]">{preset.description}</p>
+                    </div>
+                    {isSelected && <CheckCircle size={16} className="text-[var(--accent)]" />}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {tab === 1 && selectedPresetInfo && (
+            <div className="flex flex-col gap-4">
+              <div>
+                <p className="mb-2 text-xs font-medium text-[var(--text-secondary)]">Ingress Rules (Incoming Traffic)</p>
+                <RulesTable rules={selectedPresetInfo.defaultIngressRules} title="ingress" />
+              </div>
+              <div>
+                <p className="mb-2 text-xs font-medium text-[var(--text-secondary)]">Egress Rules (Outgoing Traffic)</p>
+                <RulesTable rules={selectedPresetInfo.defaultEgressRules} title="egress" />
+              </div>
+            </div>
+          )}
+
+          {tab === 2 && acl && (
+            <div className="flex flex-col gap-4">
+              <p className="text-xs text-[var(--text-muted)]">Current preset: <strong className="text-[var(--text-secondary)]">{getACLPresetName(acl.preset)}</strong></p>
+              <div>
+                <p className="mb-2 text-xs font-medium text-[var(--text-secondary)]">Ingress Rules</p>
+                <RulesTable rules={acl.ingressRules} title="ingress" />
+              </div>
+              <div>
+                <p className="mb-2 text-xs font-medium text-[var(--text-secondary)]">Egress Rules</p>
+                <RulesTable rules={acl.egressRules} title="egress" />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+}
