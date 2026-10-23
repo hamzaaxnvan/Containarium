@@ -49,3 +49,55 @@ Group=root
 # than the slow leak a cap guards against.
 #
 # Accounting is the prerequisite either way: it costs nothing, exposes the
+# cgroup memory statistics, and is what makes the working set measurable so a
+# cap can later be chosen from data instead of guessed. #1349 went unnoticed
+# for 27 days precisely because nothing was measuring.
+MemoryAccounting=yes
+
+# CPU weight well above the tenant default (#2284). Every tenant instance
+# runs at systemd's default weight of 100; so did this daemon, which meant a
+# CPU-saturated host starved the very process that creates boxes while the
+# platform software was healthy. A weight is a share, not a cap or a
+# priority: under contention the daemon gets ~10x a tenant's slice, and when
+# the host is idle nothing changes. incusd gets the same weight via a
+# drop-in (see ensureIncusCPUWeightDropIn); hostcheck checks both.
+CPUAccounting=yes
+CPUWeight=1000
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+# /etc - for creating jump server users (useradd needs to modify /etc/passwd)
+# /home - for creating user home directories and SSH keys
+# /var/lib/incus - for container management
+# /var/lock, /run/lock - for useradd flock serialization
+# /var/log - useradd touches /var/log/lastlog (the "second capability trap")
+# /opt/containarium - runtime state/assets
+# /mnt/incus-data - the daemon writes containarium-recovery.yaml here when the
+#   persistent disk is mounted (see saveRecoveryConfigToPersistentStorage in
+#   internal/cmd/daemon.go and DefaultRecoveryConfigPath in internal/cmd/recover.go).
+#   "-" prefixed because the mount is optional; the daemon stat-gates the write.
+# This set MUST match internal/hostcheck.DaemonWritablePaths; a path the doctor
+# requires but ProtectSystem=strict denies makes the host boot DEGRADED.
+ReadWritePaths=-/var/lib/containarium /var/lib/incus /etc/containarium /etc /home /var/lock /run/lock /var/log -/opt/containarium -/mnt/incus-data
+
+# StateDirectory= makes systemd create /var/lib/containarium (0750, root) before
+# the daemon starts and grants it write access. The backup service writes there
+# on every destination -- pkg/core/backup stages the dump and its sidecar index
+# under /var/lib/containarium/backups even for GCS -- and nothing else on the
+# host creates that directory, so without this ProtectSystem=strict makes those
+# writes fail EROFS. The "-" on the ReadWritePaths entry above keeps that
+# (now redundant) grant from ever being the thing that fails namespace setup.
+StateDirectory=containarium
+StateDirectoryMode=0750
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=containarium
+
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target
