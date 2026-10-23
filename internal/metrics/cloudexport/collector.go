@@ -588,3 +588,298 @@ func registerPlatformInstruments(mp *sdkmetric.MeterProvider, sources PlatformSo
 			snap := sources.ProvisionStats()
 			for op, n := range snap.Attempts {
 				o.ObserveInt64(attempts, n, metric.WithAttributeSet(labels.provisionAttributeSet(op)))
+			}
+			for op, n := range snap.Failures {
+				o.ObserveInt64(failures, n, metric.WithAttributeSet(labels.provisionAttributeSet(op)))
+			}
+			for op, n := range snap.DurationSecondsSum {
+				o.ObserveFloat64(durationSum, n, metric.WithAttributeSet(labels.provisionAttributeSet(op)))
+			}
+			return nil
+		},
+		attempts, failures, durationSum,
+	)
+	if err != nil {
+		return err
+	}
+
+	peersConnected, err := meter.Int64ObservableGauge(MetricPlatformPeersConnected,
+		metric.WithUnit("{peer}"), metric.WithDescription("Number of registered BYOC peers this backend currently sees as healthy (tunnel up)."))
+	if err != nil {
+		return err
+	}
+	tunnelState, err := meter.Int64ObservableGauge(MetricPlatformTunnelState,
+		metric.WithDescription("Per-peer tunnel state: 1 if the peer is currently healthy, 0 if not. peer_id is the enrolled host name."))
+	if err != nil {
+		return err
+	}
+
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			peers := sources.Peers()
+			var connected int64
+			for _, peer := range peers {
+				state := int64(0)
+				if peer.Healthy {
+					connected++
+					state = 1
+				}
+				o.ObserveInt64(tunnelState, state, metric.WithAttributeSet(labels.tunnelAttributeSet(peer.ID)))
+			}
+			// Always observed, even at zero peers — a scalar summary
+			// like the host-series gauges, not a per-key breakdown, so
+			// there is no set of keys to fabricate or omit.
+			o.ObserveInt64(peersConnected, connected, metric.WithAttributeSet(labels.attributeSet()))
+			return nil
+		},
+		peersConnected, tunnelState,
+	)
+	if err != nil {
+		return err
+	}
+
+	backupAge, err := meter.Float64ObservableGauge(MetricBackupLastSuccessAgeSeconds,
+		metric.WithUnit("s"), metric.WithDescription("Seconds since each tenant's most recent successful backup. Absence from the series means no stored backup exists for that tenant at all, or the tenant has no container on this host (moved or deleted); it never means fresh."))
+	if err != nil {
+		return err
+	}
+
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			n := now()
+			for _, s := range sources.BackupHealth() {
+				age := n.Sub(s.LastSuccessAt).Seconds()
+				o.ObserveFloat64(backupAge, age, metric.WithAttributeSet(labels.backupAttributeSet(s.Username)))
+			}
+			return nil
+		},
+		backupAge,
+	)
+	if err != nil {
+		return err
+	}
+
+	readFailures, err := meter.Int64ObservableCounter(MetricBackupHealthReadFailures,
+		metric.WithDescription("Cumulative count of export ticks on which the backup index could not be read, leaving the backup-age series empty. Alert on increase > 0."))
+	if err != nil {
+		return err
+	}
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			o.ObserveInt64(readFailures, sources.BackupHealthReadFailures(), metric.WithAttributeSet(labels.attributeSet()))
+			return nil
+		},
+		readFailures,
+	)
+	return err
+}
+
+// registerHeartbeatInstrument creates the heartbeat/up gauge (#1072) and
+// wires a callback that observes a constant 1 on every tick, deliberately
+// in its OWN callback with no dependency on Sources. That independence is
+// the dead-man contract: the series is present iff the daemon is alive and
+// its export pipeline is delivering to the cloud, so its absence means
+// exactly one thing — the host or daemon died (or was partitioned from the
+// provider). A transient Sources error (incus briefly unavailable) skips
+// the host series for that tick but must not suppress the heartbeat, or an
+// incus hiccup would masquerade as backend death and page the operator.
+// For the same reason the heartbeat is not modeled as a metric group: it
+// accompanies every collector regardless of which groups are enabled.
+func registerHeartbeatInstrument(mp *sdkmetric.MeterProvider, labels Labels) error {
+	meter := mp.Meter(meterName)
+	heartbeat, err := meter.Int64ObservableGauge(MetricHeartbeat,
+		metric.WithDescription("Liveness heartbeat: constant 1 emitted every export interval while the daemon runs. Absence is the dead-man signal for a metric-absence alert policy."))
+	if err != nil {
+		return err
+	}
+	observeOpt := metric.WithAttributeSet(labels.heartbeatAttributeSet())
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			o.ObserveInt64(heartbeat, 1, observeOpt)
+			return nil
+		},
+		heartbeat,
+	)
+	return err
+}
+
+// registerHostInstruments creates the eight allowlisted host gauges and
+// wires one callback that pulls a single SystemResources snapshot per
+// tick and observes all of them under the fixed label set. On a Sources
+// error the callback logs and returns nil — the tick is skipped with no
+// observations (so no stale series), never a panic.
+func registerHostInstruments(mp *sdkmetric.MeterProvider, sources Sources, labels Labels) error {
+	meter := mp.Meter(meterName)
+
+	load1, err := meter.Float64ObservableGauge(MetricCPULoad1m,
+		metric.WithDescription("Host 1-minute load average."))
+	if err != nil {
+		return err
+	}
+	load5, err := meter.Float64ObservableGauge(MetricCPULoad5m,
+		metric.WithDescription("Host 5-minute load average."))
+	if err != nil {
+		return err
+	}
+	load15, err := meter.Float64ObservableGauge(MetricCPULoad15m,
+		metric.WithDescription("Host 15-minute load average."))
+	if err != nil {
+		return err
+	}
+	memUsed, err := meter.Int64ObservableGauge(MetricMemoryUsed,
+		metric.WithUnit("By"), metric.WithDescription("Host memory used, in bytes."))
+	if err != nil {
+		return err
+	}
+	memTotal, err := meter.Int64ObservableGauge(MetricMemoryTotal,
+		metric.WithUnit("By"), metric.WithDescription("Host memory total, in bytes."))
+	if err != nil {
+		return err
+	}
+	diskUsed, err := meter.Int64ObservableGauge(MetricDiskUsed,
+		metric.WithUnit("By"), metric.WithDescription("Host disk used, in bytes."))
+	if err != nil {
+		return err
+	}
+	diskTotal, err := meter.Int64ObservableGauge(MetricDiskTotal,
+		metric.WithUnit("By"), metric.WithDescription("Host disk total, in bytes."))
+	if err != nil {
+		return err
+	}
+	containerCount, err := meter.Int64ObservableGauge(MetricContainerCount,
+		metric.WithUnit("{container}"), metric.WithDescription("Number of containers on the host."))
+	if err != nil {
+		return err
+	}
+
+	attrSet := labels.attributeSet()
+	observeOpt := metric.WithAttributeSet(attrSet)
+
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			sr, err := sources.SystemResources(ctx)
+			if err != nil {
+				// Skip this tick: log and emit nothing. Never panic,
+				// never crash the daemon, never touch the internal
+				// VM pipeline.
+				log.Printf("[cloudexport] skipping export tick: SystemResources: %v", err)
+				return nil
+			}
+			if sr == nil {
+				log.Printf("[cloudexport] skipping export tick: nil SystemResources")
+				return nil
+			}
+			o.ObserveFloat64(load1, sr.CPULoad1Min, observeOpt)
+			o.ObserveFloat64(load5, sr.CPULoad5Min, observeOpt)
+			o.ObserveFloat64(load15, sr.CPULoad15Min, observeOpt)
+			o.ObserveInt64(memUsed, sr.MemoryUsedBytes, observeOpt)
+			o.ObserveInt64(memTotal, sr.MemoryTotalBytes, observeOpt)
+			o.ObserveInt64(diskUsed, sr.DiskUsedBytes, observeOpt)
+			o.ObserveInt64(diskTotal, sr.DiskTotalBytes, observeOpt)
+			o.ObserveInt64(containerCount, sr.ContainerCount, observeOpt)
+			return nil
+		},
+		load1, load5, load15, memUsed, memTotal, diskUsed, diskTotal, containerCount,
+	)
+	return err
+}
+
+// registerContainerInstruments creates the container group's per-container
+// series — the original five (#1071) plus the three CFS-throttling counters
+// (#1575) — and wires one callback that pulls a single AllContainerMetrics
+// snapshot per tick and observes them for every container currently reported.
+// The five are observed unconditionally; the throttling three only when the
+// runtime reported a signal. CPU/network are counters
+// (cumulative, matching incus's own CPU-seconds and byte counters);
+// memory/disk are gauges (point-in-time). A container absent from the
+// snapshot — because AllContainerMetrics enumerates live containers
+// fresh every tick — simply has no point observed for it this tick,
+// which is exactly the "deleted container's series stop at the next
+// interval" behavior the design doc requires: no separate
+// deletion-tracking state to fall out of sync.
+func registerContainerInstruments(mp *sdkmetric.MeterProvider, sources Sources, labels Labels) error {
+	meter := mp.Meter(meterName)
+
+	cpu, err := meter.Int64ObservableCounter(MetricContainerCPUUsageSeconds,
+		metric.WithUnit("s"), metric.WithDescription("Cumulative CPU time used by the container, in seconds."))
+	if err != nil {
+		return err
+	}
+	mem, err := meter.Int64ObservableGauge(MetricContainerMemoryUsageBytes,
+		metric.WithUnit("By"), metric.WithDescription("Current memory usage of the container, in bytes."))
+	if err != nil {
+		return err
+	}
+	disk, err := meter.Int64ObservableGauge(MetricContainerDiskUsageBytes,
+		metric.WithUnit("By"), metric.WithDescription("Current root-filesystem disk usage of the container, in bytes."))
+	if err != nil {
+		return err
+	}
+	rx, err := meter.Int64ObservableCounter(MetricContainerNetworkRxBytes,
+		metric.WithUnit("By"), metric.WithDescription("Cumulative network bytes received by the container (all interfaces except loopback)."))
+	if err != nil {
+		return err
+	}
+	tx, err := meter.Int64ObservableCounter(MetricContainerNetworkTxBytes,
+		metric.WithUnit("By"), metric.WithDescription("Cumulative network bytes transmitted by the container (all interfaces except loopback)."))
+	if err != nil {
+		return err
+	}
+	cfsPeriods, err := meter.Int64ObservableCounter(MetricContainerCPUCFSPeriods,
+		metric.WithUnit("{period}"), metric.WithDescription("Cumulative CFS bandwidth periods elapsed for the container. The denominator for a throttled-share alert."))
+	if err != nil {
+		return err
+	}
+	throttledPeriods, err := meter.Int64ObservableCounter(MetricContainerCPUThrottledPeriods,
+		metric.WithUnit("{period}"), metric.WithDescription("Cumulative CFS periods in which the container was throttled against its CPU ceiling."))
+	if err != nil {
+		return err
+	}
+	throttledUsec, err := meter.Int64ObservableCounter(MetricContainerCPUThrottledUsec,
+		metric.WithUnit("us"), metric.WithDescription("Cumulative time the container spent throttled, in microseconds."))
+	if err != nil {
+		return err
+	}
+
+	_, err = meter.RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			containers, err := sources.AllContainerMetrics(ctx)
+			if err != nil {
+				// Skip this tick: log and emit nothing, same contract as
+				// the host series' SystemResources error handling. Never
+				// panic, never crash the daemon.
+				log.Printf("[cloudexport] skipping container series tick: AllContainerMetrics: %v", err)
+				return nil
+			}
+			for name, m := range containers {
+				if m == nil {
+					continue
+				}
+				observeOpt := metric.WithAttributeSet(labels.containerAttributeSet(name))
+				o.ObserveInt64(cpu, m.CpuUsageSeconds, observeOpt)
+				o.ObserveInt64(mem, m.MemoryUsageBytes, observeOpt)
+				o.ObserveInt64(disk, m.DiskUsageBytes, observeOpt)
+				o.ObserveInt64(rx, m.NetworkRxBytes, observeOpt)
+				o.ObserveInt64(tx, m.NetworkTxBytes, observeOpt)
+
+				// Throttling counters are observed only when the runtime
+				// actually reported them (#1575). A zero period count means
+				// "no signal available" — a K8s box, a cgroup with no CPU
+				// bandwidth limit, a container that just stopped — and
+				// emitting a flat zero for those would read as a confident
+				// "never throttled", silencing a throttling alert for exactly
+				// the boxes it cannot see. Absence is the honest answer, and
+				// it is already this collector's idiom for "nothing to
+				// report" (see the deleted-container behavior above).
+				if m.CpuNrPeriods > 0 {
+					o.ObserveInt64(cfsPeriods, m.CpuNrPeriods, observeOpt)
+					o.ObserveInt64(throttledPeriods, m.CpuNrThrottled, observeOpt)
+					o.ObserveInt64(throttledUsec, m.CpuThrottledUsec, observeOpt)
+				}
+			}
+			return nil
+		},
+		cpu, mem, disk, rx, tx, cfsPeriods, throttledPeriods, throttledUsec,
+	)
+	return err
+}
