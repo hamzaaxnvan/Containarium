@@ -130,3 +130,47 @@ func runGuardrailSignerBundle(cmd *cobra.Command, _ []string) error {
 	defer done()
 	cur, err := api.GetGuardrailPolicy()
 	if err != nil {
+		return err
+	}
+	if !cur.GetConfigured() {
+		return fmt.Errorf("the server has no guardrail policy configured, so there is no trust bundle")
+	}
+	b, err := protojson.MarshalOptions{Multiline: true}.Marshal(guardrailpolicy.BundleOf(cur.GetPolicy()))
+	if err != nil {
+		return err
+	}
+	if guardrailSignerOut == "" {
+		_, err = fmt.Fprintln(cmd.OutOrStdout(), string(b))
+		return err
+	}
+	return os.WriteFile(guardrailSignerOut, append(b, '\n'), 0o600)
+}
+
+// verifyWithTrustBundle is verify's offline path under a bundle: a revoked
+// key fails first, then the signer must be in the bundle.
+func verifyWithTrustBundle(path string, att *pb.GuardrailAttestation, dir string, required []pb.GuardrailKind) (*pb.GuardrailTrustedSigner, error) {
+	raw, err := os.ReadFile(path) // #nosec G304 -- operator-supplied --trust-bundle path
+	if err != nil {
+		return nil, err
+	}
+	bundle := &pb.GuardrailTrustBundle{}
+	if err := protojson.Unmarshal(raw, bundle); err != nil {
+		return nil, fmt.Errorf("trust bundle %s: %w", path, err)
+	}
+	if err := guardrailpolicy.CheckRevoked(att, bundle.GetRevoked()); err != nil {
+		return nil, err
+	}
+	for _, s := range bundle.GetSigners() {
+		if s.GetKeyId() != att.GetKeyId() {
+			continue
+		}
+		if err := guardrail.VerifySubject(att, s.GetPublicKey(), dir); err != nil {
+			return nil, err
+		}
+		if err := guardrail.VerifyCoverage(att, required); err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+	return nil, fmt.Errorf("%w (attestation key %s is not in the trust bundle)", guardrailpolicy.ErrUntrustedSigner, shortGuardrailHash(att.GetKeyId()))
+}

@@ -127,3 +127,262 @@ func pvcObject(ns, tenant, storageClass, disk string) *corev1.PersistentVolumeCl
 	// (nil pointer) so the cluster's default StorageClass takes over — but in
 	// practice callers with StorageClass=="" skip PVC creation entirely (see
 	// Config.StorageClass semantics), so this branch is defensive-only.
+	pvc.Spec.StorageClassName = &storageClass
+	return pvc
+}
+
+// parseDiskQuantity resolves a caller-supplied disk size into a valid K8s
+// resource.Quantity, never panicking regardless of what the caller sent
+// (#973: an incus-style "50GB" — the CLI's own default — reached
+// resource.MustParse and killed the daemon; this is the CreateContainer
+// request path, so a bad string is remote-triggerable by any authenticated
+// caller). Empty defaults to defaultDisk. A valid K8s quantity ("20Gi")
+// passes straight through. An incus-style quantity (two-letter GB/MB/KB/...
+// suffix, decimal scale) is normalized to the K8s single-letter equivalent
+// (same decimal scale, so this is a straight rewrite, not a unit
+// conversion) and reparsed. Anything else — including total garbage —
+// degrades to defaultDisk with a log line, mirroring resourceRequirements'
+// lenient handling of invalid CPU/Memory strings elsewhere in this file.
+func parseDiskQuantity(disk string) resource.Quantity {
+	if disk == "" {
+		disk = defaultDisk
+	}
+	if q, err := resource.ParseQuantity(disk); err == nil {
+		return q
+	}
+	if normalized, ok := normalizeIncusDiskSuffix(disk); ok {
+		if q, err := resource.ParseQuantity(normalized); err == nil {
+			return q
+		}
+	}
+	log.Printf("[k8s] invalid disk quantity %q; falling back to default %q", disk, defaultDisk)
+	// defaultDisk is a package constant known to be a valid quantity, so
+	// MustParse here can't panic on caller input.
+	return resource.MustParse(defaultDisk)
+}
+
+// normalizeIncusDiskSuffix rewrites an incus-style two-letter decimal size
+// suffix (KB/MB/GB/TB/PB/EB) into the single-letter K8s equivalent
+// (K/M/G/T/P/E). Incus's GB etc. are decimal (10^3-scaled), matching K8s's
+// unsuffixed-i letters exactly, so no scale conversion is needed — just the
+// suffix rewrite. Returns ok=false when disk doesn't end in one of these
+// suffixes (e.g. it's already a K8s quantity, or garbage).
+func normalizeIncusDiskSuffix(disk string) (normalized string, ok bool) {
+	for _, suf := range []string{"KB", "MB", "GB", "TB", "PB", "EB"} {
+		if strings.HasSuffix(disk, suf) {
+			return strings.TrimSuffix(disk, suf) + suf[:1], true
+		}
+	}
+	return "", false
+}
+
+func int64p(i int64) *int64 { return &i }
+func boolp(b bool) *bool    { return &b }
+func int32p(i int32) *int32 { return &i }
+
+// boxLabels are the identity labels shared by all of a tenant box's objects;
+// the pod selector and the cross-namespace List selector both key off them.
+func boxLabels(tenant string) map[string]string {
+	return map[string]string{
+		managedByLabel: managedByValue,
+		tenantLabel:    tenant,
+	}
+}
+
+func secretName(tenant string) string { return tenant + "-authorized-keys" }
+
+// namespaceObject builds the per-tenant namespace.
+func namespaceObject(name, tenant string) *corev1.Namespace {
+	return &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: boxLabels(tenant)},
+	}
+}
+
+// secretObject holds the box's authorized_keys (what dropbear reads — the
+// gateway upstream key in gateway mode) plus the client_keys record (the
+// agent's own keys, served to the sentinel via /authorized-keys).
+func secretObject(ns, tenant string, boxKeys, clientKeys []string) *corev1.Secret {
+	join := func(keys []string) []byte {
+		var buf []byte
+		for _, k := range keys {
+			buf = append(buf, []byte(k)...)
+			buf = append(buf, '\n')
+		}
+		return buf
+	}
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: secretName(tenant), Namespace: ns, Labels: boxLabels(tenant)},
+		Type:       corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			authorizedKeysKey: join(boxKeys),
+			clientKeysKey:     join(clientKeys),
+		},
+	}
+}
+
+// nsNameLabel is the well-known label the kubelet stamps on every Namespace
+// with its own name (Kubernetes >= 1.21). Selecting on it is more robust than
+// requiring operators to hand-label namespaces, which our own manifests do but
+// a hand-rolled install may not.
+const nsNameLabel = "kubernetes.io/metadata.name"
+
+// sshpiperNameLabel matches the gateway Deployment's pod label as shipped in
+// deploy/k8s/sshpiper/30-deployment.yaml. A gateway deployed by other means
+// MUST carry this label or the ingress rule below will not admit it.
+const sshpiperNameLabel = "app.kubernetes.io/name"
+
+// dnsNamespace is where cluster DNS is assumed to run. Standard for
+// CoreDNS/kube-dns; a cluster that runs DNS elsewhere needs this widened or
+// box DNS resolution will fail closed.
+const dnsNamespace = "kube-system"
+
+// networkPolicyObject is the per-tenant default-deny posture: deny all
+// ingress/egress except SSH from the gateway and DNS to cluster DNS.
+//
+// Both rules carry peer selectors deliberately. A NetworkPolicy rule that
+// specifies only `ports` and omits `from`/`to` matches *every* source or
+// destination — so the earlier port-only form left tenant boxes reachable on
+// :22 from any pod in the cluster, and allowed port-53 egress to arbitrary
+// nameservers (a clean DNS-exfiltration channel out of a sandbox running
+// untrusted agent code). See #1193; this completes the narrowing that the v1
+// floor deferred.
+//
+// gatewayNS is the namespace holding the sshpiper Deployment (the daemon's
+// GatewayNamespace config, default "agent-gateway"). When it is empty the
+// ingress rule falls back to port-only — routing is disabled in that
+// configuration anyway (see gateway_sshpiper.go), and emitting a selector that
+// matches nothing would make the box unreachable rather than merely unrouted.
+// tenantEgress, when non-empty, is appended to the DNS allowance as
+// additional permitted egress. Empty leaves the default-deny floor exactly as
+// it was — which is what a box with no tenant policy, and a box whose policy
+// was just removed, must both get (#1188).
+func networkPolicyObject(ns, tenant, gatewayNS string, tenantEgress ...networkingv1.NetworkPolicyEgressRule) *networkingv1.NetworkPolicy {
+	tcp := corev1.ProtocolTCP
+	udp := corev1.ProtocolUDP
+	dnsPort := intstr.FromInt(53)
+	ssh := intstr.FromInt(sshPort)
+
+	ingress := networkingv1.NetworkPolicyIngressRule{
+		Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: &ssh}},
+	}
+	if gatewayNS != "" {
+		// One peer with both selectors set = AND: pods matching the pod
+		// selector *within* namespaces matching the namespace selector. Two
+		// separate peers would be OR, which would admit any pod in the gateway
+		// namespace and any sshpiper-labelled pod anywhere.
+		ingress.From = []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{nsNameLabel: gatewayNS},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{sshpiperNameLabel: "sshpiper"},
+			},
+		}}
+	}
+
+	// The DNS allowance is the floor and always comes first: a box that
+	// cannot resolve names is broken in a way that looks like a policy bug
+	// but is not one, so it is never something a tenant rule can remove.
+	egress := []networkingv1.NetworkPolicyEgressRule{{
+		To: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{nsNameLabel: dnsNamespace},
+			},
+		}},
+		Ports: []networkingv1.NetworkPolicyPort{
+			{Protocol: &udp, Port: &dnsPort},
+			{Protocol: &tcp, Port: &dnsPort},
+		},
+	}}
+	egress = append(egress, tenantEgress...)
+
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "default-deny", Namespace: ns, Labels: boxLabels(tenant)},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: boxLabels(tenant)},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{ingress},
+			Egress:  egress,
+		},
+	}
+}
+
+// memDefaults is the resolved cluster-wide default memory floor (from Config),
+// threaded into the object builders. An empty limit disables the floor — boxes
+// with no explicit memory then run unconstrained.
+type memDefaults struct {
+	request string
+	limit   string
+}
+
+// resourceRequirements maps the runtime-neutral limits onto K8s requests/limits.
+// CPU and Memory strings that aren't valid K8s quantities (e.g. incus-native
+// "4GB") are silently skipped so the pod doesn't fail admission. Explicit CPU
+// and Memory pin request==limit (Guaranteed for that resource) unless the
+// caller also set CPURequest/MemoryRequest (#1557), in which case that value
+// is used for the request instead — an invalid or larger-than-limit request
+// string is ignored (falls back to request==limit) rather than failing
+// admission or silently exceeding the limit.
+//
+// When the spec sets no valid memory limit, the resolved default memory floor
+// (def.request < def.limit) is applied so the scheduler can bin-pack the box
+// and no single box can balloon and pressure its neighbors on the shared host
+// kernel. GPU boxes are exempt — sized explicitly, a small cap would OOM them.
+// An empty def.limit disables the floor (box runs unconstrained). gpuCount > 0
+// adds nvidia.com/gpu (request==limit, as the device plugin requires); the
+// cluster autoscaler uses it to scale up a GPU node pool. Returns nil only when
+// nothing at all is set.
+//
+// def.request / def.limit are pre-validated quantities (resolved in newBackend),
+// so the floor block parses them with MustParse; if the operator's request
+// exceeds the limit it is clamped to the limit (a request may not exceed a
+// limit, which would otherwise fail admission).
+func resourceRequirements(r box.ResourceLimits, gpuCount int, def memDefaults) *corev1.ResourceRequirements {
+	requests := corev1.ResourceList{}
+	limits := corev1.ResourceList{}
+	if r.CPU != "" {
+		if q, err := resource.ParseQuantity(r.CPU); err == nil {
+			requests[corev1.ResourceCPU] = q
+			limits[corev1.ResourceCPU] = q
+			if r.CPURequest != "" {
+				if reqQ, err := resource.ParseQuantity(r.CPURequest); err == nil && reqQ.Cmp(q) <= 0 {
+					requests[corev1.ResourceCPU] = reqQ
+				}
+			}
+		}
+	}
+	if r.Memory != "" {
+		if q, err := resource.ParseQuantity(r.Memory); err == nil {
+			requests[corev1.ResourceMemory] = q
+			limits[corev1.ResourceMemory] = q
+			if r.MemoryRequest != "" {
+				if reqQ, err := resource.ParseQuantity(r.MemoryRequest); err == nil && reqQ.Cmp(q) <= 0 {
+					requests[corev1.ResourceMemory] = reqQ
+				}
+			}
+		}
+	}
+	// Apply the default memory floor when the spec set no valid memory limit.
+	// Skip it for GPU boxes (sized explicitly) and when the floor is disabled.
+	if _, ok := limits[corev1.ResourceMemory]; !ok && gpuCount == 0 && def.limit != "" {
+		limQ := resource.MustParse(def.limit)
+		reqQ := resource.MustParse(def.request)
+		if reqQ.Cmp(limQ) > 0 {
+			reqQ = limQ
+		}
+		requests[corev1.ResourceMemory] = reqQ
+		limits[corev1.ResourceMemory] = limQ
+	}
+	if gpuCount > 0 {
+		q := resource.MustParse(fmt.Sprintf("%d", gpuCount))
+		requests[nvidiaGPUResource] = q
+		limits[nvidiaGPUResource] = q
+	}
+	if len(limits) == 0 && len(requests) == 0 {
+		return nil
+	}
+	return &corev1.ResourceRequirements{Limits: limits, Requests: requests}
+}
