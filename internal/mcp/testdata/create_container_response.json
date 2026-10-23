@@ -8,3 +8,13 @@
     "network": {"ipAddress": "10.0.0.10", "macAddress": "00:16:3e:aa:bb:cc", "interface": "eth0", "bridge": "incusbr0"},
     "createdAt": "1771209160",
     "updatedAt": "0",
+    "labels": {"team": "demo"},
+    "image": "images:ubuntu/24.04",
+    "podmanEnabled": true,
+    "backendId": "backend-a",
+    "osType": "OS_TYPE_UBUNTU_2404",
+    "accessType": "ACCESS_TYPE_SSH"
+  },
+  "message": "Container created successfully",
+  "sshCommand": "ssh alice@10.0.0.10"
+}

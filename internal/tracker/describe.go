@@ -88,3 +88,49 @@ func (k CredentialKind) String() string {
 	default:
 		return "unspecified"
 	}
+}
+
+// CredentialInfo is what DescribeCredential reports about a tracker
+// credential, asked of the upstream rather than the operator (both
+// providers let a token describe itself).
+type CredentialInfo struct {
+	// Scopes are the provider-native scope/permission strings the
+	// credential was granted. May be empty when the provider doesn't
+	// expose them for this credential type (best-effort, not a
+	// validity signal on its own).
+	Scopes []string
+	// ExpiresAt is when the credential expires. Zero means "no expiry,
+	// or the provider doesn't report one for this credential type" —
+	// callers must not treat zero as "never expires" for alerting
+	// purposes without checking which case applies.
+	ExpiresAt time.Time
+	// Breadth classifies the credential against the provider's
+	// preferred type. BreadthUnspecified if classification itself
+	// requires a probe that failed.
+	Breadth CredentialBreadth
+	// Kind is the provider-native kind of the credential.
+	// KindUnspecified if it cannot be determined.
+	Kind CredentialKind
+}
+
+// ErrCredentialInvalid is returned by DescribeCredential when the
+// upstream is reachable but rejects the credential (401/403) — as
+// distinct from a network-level failure (ErrUnreachable). Callers use
+// this split to report "reachable" and "credential_valid" as the two
+// separate booleans the design note's tracker status asks for.
+var ErrCredentialInvalid = errors.New("tracker: credential rejected by provider")
+
+// ErrUnreachable is returned by DescribeCredential when the upstream
+// could not be reached at all (DNS, connect, TLS, timeout) — before any
+// credential was ever presented, so nothing can be said about its
+// validity.
+var ErrUnreachable = errors.New("tracker: upstream unreachable")
+
+// CredentialDescriber is satisfied by each provider adapter
+// (internal/tracker/github, internal/tracker/gitlab). Split out from the
+// full Provider interface (#1922 — GetIssue, Comment, OpenChange, …)
+// because #1921 needs only this one verb: it backs `tracker connect`'s
+// best-effort expiry population and `tracker status`'s live check.
+type CredentialDescriber interface {
+	DescribeCredential(ctx context.Context, conn Conn) (CredentialInfo, error)
+}
