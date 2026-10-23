@@ -127,3 +127,132 @@ func (UnimplementedComposeAutostartServiceServer) Discover(context.Context, *Dis
 	return nil, status.Error(codes.Unimplemented, "method Discover not implemented")
 }
 func (UnimplementedComposeAutostartServiceServer) Enable(context.Context, *EnableRequest) (*EnableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Enable not implemented")
+}
+func (UnimplementedComposeAutostartServiceServer) Disable(context.Context, *DisableRequest) (*DisableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Disable not implemented")
+}
+func (UnimplementedComposeAutostartServiceServer) Status(context.Context, *StatusRequest) (*StatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Status not implemented")
+}
+func (UnimplementedComposeAutostartServiceServer) mustEmbedUnimplementedComposeAutostartServiceServer() {
+}
+func (UnimplementedComposeAutostartServiceServer) testEmbeddedByValue() {}
+
+// UnsafeComposeAutostartServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ComposeAutostartServiceServer will
+// result in compilation errors.
+type UnsafeComposeAutostartServiceServer interface {
+	mustEmbedUnimplementedComposeAutostartServiceServer()
+}
+
+func RegisterComposeAutostartServiceServer(s grpc.ServiceRegistrar, srv ComposeAutostartServiceServer) {
+	// If the following call panics, it indicates UnimplementedComposeAutostartServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ComposeAutostartService_ServiceDesc, srv)
+}
+
+func _ComposeAutostartService_Discover_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DiscoverRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ComposeAutostartServiceServer).Discover(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ComposeAutostartService_Discover_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ComposeAutostartServiceServer).Discover(ctx, req.(*DiscoverRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ComposeAutostartService_Enable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ComposeAutostartServiceServer).Enable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ComposeAutostartService_Enable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ComposeAutostartServiceServer).Enable(ctx, req.(*EnableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ComposeAutostartService_Disable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DisableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ComposeAutostartServiceServer).Disable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ComposeAutostartService_Disable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ComposeAutostartServiceServer).Disable(ctx, req.(*DisableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ComposeAutostartService_Status_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ComposeAutostartServiceServer).Status(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ComposeAutostartService_Status_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ComposeAutostartServiceServer).Status(ctx, req.(*StatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ComposeAutostartService_ServiceDesc is the grpc.ServiceDesc for ComposeAutostartService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ComposeAutostartService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.ComposeAutostartService",
+	HandlerType: (*ComposeAutostartServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Discover",
+			Handler:    _ComposeAutostartService_Discover_Handler,
+		},
+		{
+			MethodName: "Enable",
+			Handler:    _ComposeAutostartService_Enable_Handler,
+		},
+		{
+			MethodName: "Disable",
+			Handler:    _ComposeAutostartService_Disable_Handler,
+		},
+		{
+			MethodName: "Status",
+			Handler:    _ComposeAutostartService_Status_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/compose_autostart.proto",
+}
