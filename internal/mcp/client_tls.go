@@ -59,3 +59,34 @@ func buildMCPTLSConfig(baseURL string) (*tls.Config, error) {
 		// Caller explicitly allowed plaintext; no TLS config
 		// needed, returning nil falls back to the http.Transport
 		// zero value (no TLS attempted).
+		return nil, nil
+	}
+
+	caFile := strings.TrimSpace(os.Getenv(mcpTrustedCAFileEnv))
+	if caFile == "" {
+		// HTTPS with system roots — fine for publicly-trusted
+		// certs. Returning nil lets the transport use defaults.
+		return nil, nil
+	}
+
+	// caFile is the operator-supplied CONTAINARIUM_MCP_TRUSTED_CA_FILE
+	// path. gosec emits both G304 and G703 for the same finding —
+	// the inline #nosec covers both.
+	caBytes, err := os.ReadFile(caFile) // #nosec G304 G703 -- operator config
+	if err != nil {
+		return nil, fmt.Errorf("read CA bundle %s: %w", caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caBytes) {
+		return nil, fmt.Errorf("no PEM certs found in %s; check that the file contains BEGIN CERTIFICATE blocks", caFile)
+	}
+	return &tls.Config{
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS12,
+	}, nil
+}
+
+func mcpInsecureAllowed() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(mcpAllowInsecureEnv)))
+	return v == "true" || v == "1" || v == "yes"
+}
