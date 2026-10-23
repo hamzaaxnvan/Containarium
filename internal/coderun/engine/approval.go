@@ -49,3 +49,37 @@ func WithApprovals(eng Engine, cmd, runName string, pub ed25519.PublicKey, timeo
 }
 
 // ApprovalPromptTool is the --permission-prompt-tool value.
+const ApprovalPromptTool = "mcp__" + approvalServerName + "__" + approvalToolName
+
+// approvalMCPConfig is the inline --mcp-config JSON that starts the approval
+// server. agent-box is found on the same PATH `code` sessions use to reach it.
+// The public key is not a secret; it is on the command line so that nothing on
+// the box can swap it after the run starts.
+func approvalMCPConfig(runName string, pub ed25519.PublicKey, timeout time.Duration) string {
+	script := coderun.AgentBoxPathPrefix + " exec agent-box approval-mcp --run " +
+		shellQuoteSingle(runName) + " --public-key " + hex.EncodeToString(pub) + " --timeout " + timeout.String()
+	type stdioServer struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	cfg := struct {
+		MCPServers map[string]stdioServer `json:"mcpServers"`
+	}{MCPServers: map[string]stdioServer{
+		approvalServerName: {Command: "sh", Args: []string{"-c", script}},
+	}}
+	b, _ := json.Marshal(cfg)
+	return string(b)
+}
+
+// ApprovalProbeCommand checks the box's agent-box has the approval mode, so an
+// older box fails at start instead of denying every prompt silently. stdin is
+// closed so an agent-box without the mode (which would start its MCP server)
+// exits at once.
+func ApprovalProbeCommand() string {
+	return coderun.AgentBoxPathPrefix + " agent-box approval-mcp --probe </dev/null 2>/dev/null"
+}
+
+// ApprovalProbeOK is the line ApprovalProbeCommand prints on a box that has it.
+// "v2" is the prompt-bound answer format (#2184); an older agent-box prints
+// "approval-mcp ok" alone and must not match.
+const ApprovalProbeOK = "approval-mcp ok v2"

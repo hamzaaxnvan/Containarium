@@ -144,3 +144,150 @@ type PostgresCrewRunStore struct {
 // CrewRun message is a small bag of strings today, but the columns that
 // matter for querying — id and state — are lifted out and indexed, so adding
 // a proto field later needs no migration. That is the shape google/ax uses
+// for its event log (conversation_id, step, payload) and it holds up well:
+// the payload evolves with the proto, the queryable keys are explicit.
+func NewPostgresCrewRunStore(ctx context.Context, pool *pgxpool.Pool) (*PostgresCrewRunStore, error) {
+	const schema = `
+		CREATE TABLE IF NOT EXISTS crew_runs (
+			id TEXT PRIMARY KEY,
+			crew_id TEXT NOT NULL DEFAULT '',
+			state INTEGER NOT NULL DEFAULT 0,
+			run JSONB NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS crew_runs_state_idx ON crew_runs (state);
+		-- #1322: which daemon is driving the run. Added separately so an
+		-- existing deployment picks it up without a migration step; existing
+		-- rows default to '' and are treated as unowned.
+		ALTER TABLE crew_runs ADD COLUMN IF NOT EXISTS owner TEXT NOT NULL DEFAULT '';
+	`
+	if _, err := pool.Exec(ctx, schema); err != nil {
+		return nil, fmt.Errorf("init crew_runs schema: %w", err)
+	}
+	return &PostgresCrewRunStore{pool: pool}, nil
+}
+
+func (s *PostgresCrewRunStore) Put(ctx context.Context, r *pb.CrewRun) error {
+	if r == nil {
+		return nil
+	}
+	if r.GetId() == "" {
+		// A run with no id would collide with every other id-less run on the
+		// primary key, silently overwriting them. The in-memory store had the
+		// same hazard under an empty map key; surface it instead.
+		return errors.New("crew run has no id")
+	}
+	body, err := protojson.Marshal(r)
+	if err != nil {
+		return fmt.Errorf("marshal crew run %s: %w", r.GetId(), err)
+	}
+	const q = `
+		INSERT INTO crew_runs (id, crew_id, state, run, owner, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+		ON CONFLICT (id) DO UPDATE SET
+			crew_id = EXCLUDED.crew_id,
+			state = EXCLUDED.state,
+			run = EXCLUDED.run,
+			owner = EXCLUDED.owner,
+			updated_at = NOW()
+	`
+	// owner is stored in its own column as well as inside the JSON body: the
+	// reconciliation sweep filters on it in SQL, and filtering on a JSON field
+	// would cost an index this table does not have.
+	if _, err := s.pool.Exec(ctx, q, r.GetId(), r.GetCrewId(), int32(r.GetState()), body, r.GetOwner()); err != nil {
+		return fmt.Errorf("put crew run %s: %w", r.GetId(), err)
+	}
+	return nil
+}
+
+func (s *PostgresCrewRunStore) Get(ctx context.Context, id string) (*pb.CrewRun, bool, error) {
+	const q = `SELECT run FROM crew_runs WHERE id = $1`
+	var body []byte
+	switch err := s.pool.QueryRow(ctx, q, id).Scan(&body); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("get crew run %s: %w", id, err)
+	}
+	var r pb.CrewRun
+	// DiscardUnknown so a daemon rolled back to an older build can still read
+	// runs written by a newer one, rather than failing every Get.
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &r); err != nil {
+		return nil, false, fmt.Errorf("unmarshal crew run %s: %w", id, err)
+	}
+	return &r, true, nil
+}
+
+// SetRunStore swaps the crew-run store, used at daemon start to upgrade from
+// the in-memory default to Postgres once the connection string is resolved.
+// Called before grpcServer.Serve, so it races with no live RPCs — the same
+// point and the same reasoning as NetworkPolicyServer.SetStore.
+// FailStranded marks rows still RUNNING as FAILED in one statement.
+//
+// The state column and the marshalled proto both carry the state, so both are
+// updated — a row whose column said FAILED while its body still said RUNNING
+// would report differently depending on which one a reader trusted. jsonb_set
+// keeps the rest of the run intact.
+//
+// Not covered by a test that runs: nothing in this repo can execute Postgres
+// SQL today (#1300). The memory implementation's behaviour is tested, and the
+// orchestration is guarded, but this statement itself is reviewed rather than
+// exercised.
+func (s *PostgresCrewRunStore) FailStranded(ctx context.Context, owner, reason string) (int, error) {
+	// owner = $5 OR owner = '' — this daemon's runs and pre-ownership ones.
+	// A peer's run is deliberately excluded: several daemons share this table
+	// and one restarting must not fail another's in-flight runs (#1322).
+	const q = `
+		UPDATE crew_runs
+		SET state = $1,
+		    run = jsonb_set(
+		            jsonb_set(run::jsonb, '{state}', to_jsonb($2::text), true),
+		            '{error}', to_jsonb($3::text), true)::text::json,
+		    updated_at = NOW()
+		WHERE state = $4 AND (owner = $5 OR owner = '')
+	`
+	tag, err := s.pool.Exec(ctx, q,
+		int32(pb.CrewRunState_CREW_RUN_STATE_FAILED),
+		pb.CrewRunState_CREW_RUN_STATE_FAILED.String(),
+		reason,
+		int32(pb.CrewRunState_CREW_RUN_STATE_RUNNING),
+		owner,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("fail stranded crew runs: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// DeleteSkillRun is a no-op if id names a crew run (crew_id set) or does not
+// exist — see the interface doc comment for why that guard matters.
+//
+// Not covered by a test that runs: nothing in this repo can execute Postgres
+// SQL today (#1300), same as FailStranded above. MemCrewRunStore's behavior
+// is tested, and the guard's SQL predicate mirrors that test 1:1.
+func (s *PostgresCrewRunStore) DeleteSkillRun(ctx context.Context, id string) error {
+	const q = `DELETE FROM crew_runs WHERE id = $1 AND crew_id = ''`
+	if _, err := s.pool.Exec(ctx, q, id); err != nil {
+		return fmt.Errorf("delete skill run %s: %w", id, err)
+	}
+	return nil
+}
+
+func (s *CrewServer) SetRunStore(store CrewRunStore) {
+	if store != nil {
+		s.runs = store
+	}
+}
+
+// ownedForReconciliation reports whether a stranded run is this daemon's to
+// fail.
+//
+// True for its own runs and for runs with no recorded owner; false for a
+// peer's. The unowned case is the deliberate compromise: on the single-daemon
+// deployment that is the default they are always this daemon's own, and
+// excluding them would leave every pre-ownership run RUNNING forever — the
+// exact bug reconciliation exists to fix.
+func ownedForReconciliation(runOwner, daemonOwner string) bool {
+	return runOwner == "" || runOwner == daemonOwner
+}
