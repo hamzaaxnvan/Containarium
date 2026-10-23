@@ -92,3 +92,27 @@ func (m *Manager) remind(ctx context.Context, name string, labels map[string]str
 	m.markReminded(ctx, ref, now, email)
 }
 
+func (m *Manager) markReminded(ctx context.Context, ref box.BoxRef, now time.Time, email string) {
+	meta := map[string]string{LabelReminded: now.UTC().Format(time.RFC3339)}
+	if email != "" {
+		meta[LabelRemindEmail] = ""
+	}
+	if err := m.boxes.SetMeta(ctx, ref, meta); err != nil {
+		m.cfg.Logf("[anonbox] %s: could not record the reminder attempt: %v", ref.Name, err)
+	}
+}
+
+// maskEmail keeps logs free of addresses: "a***@example.com".
+func maskEmail(e string) string {
+	at := strings.Index(e, "@")
+	if at <= 0 {
+		return "***"
+	}
+	return e[:1] + "***" + e[at:]
+}
+
+// reminderGuestFile is what provision pre-creates so an unprivileged user
+// inside the box can opt in by writing to it.
+func reminderGuestFile() (path, mode string, content []byte) {
+	return RemindFilePath, "0666", []byte("")
+}
