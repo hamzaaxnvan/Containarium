@@ -90,3 +90,372 @@ func (s *NetworkPolicyServer) SignatureStore() NetworkPolicySignatureStore {
 	return s.sigStore
 }
 
+// SetStore swaps the backing store. Intended for startup only — called during
+// NewDualServer (before the gRPC server starts serving) to upgrade the initial
+// in-memory store to the Postgres-backed one once the DB connection string is
+// resolved. Not safe to call concurrently with live RPCs.
+func (s *NetworkPolicyServer) SetStore(store NetworkPolicyStore) {
+	s.store = store
+}
+
+// SetDurable records whether the current store is the source of truth: true
+// with no Postgres configured (the in-memory store IS the store) or once the
+// Postgres store is installed; false while Postgres was configured but could
+// not be reached at startup (#3131).
+func (s *NetworkPolicyServer) SetDurable(durable bool) { s.degraded.Store(!durable) }
+
+// Durable reports whether the current store is the source of truth. The
+// operator mutation RPCs and the tenant guard's policy source read it on every
+// call.
+func (s *NetworkPolicyServer) Durable() bool { return !s.degraded.Load() }
+
+// InstallDurableStore makes store (the Postgres one) the source of truth and
+// ends the degraded state, so the operator mutation RPCs accept writes again
+// without a restart. Same concurrency contract as SetStore for the swap itself.
+func (s *NetworkPolicyServer) InstallDurableStore(store NetworkPolicyStore) {
+	s.SetStore(store)
+	s.SetDurable(true)
+}
+
+// errNetworkPolicyStoreDegraded is what an operator mutation gets while the
+// store is the in-memory fallback: the write would be lost on restart, so it
+// is refused before anything is touched (#3131).
+var errNetworkPolicyStoreDegraded = status.Error(codes.Unavailable,
+	"network-policy store is degraded: running on the in-memory fallback (Postgres unavailable at startup); nothing was changed")
+
+// requireDurable gates the operator mutation RPCs. Reads are not gated, and
+// neither are the daemon's in-process writers (cloud policy sync, agent-skill
+// launch policy, auto-quarantine), which write to Store() directly: refusing
+// them would drop a live enforcement effect for the degraded window.
+func (s *NetworkPolicyServer) requireDurable() error {
+	if s.degraded.Load() {
+		return errNetworkPolicyStoreDegraded
+	}
+	return nil
+}
+
+// Store returns the backing store. Used by the network-policy enforcer to read
+// stored policies for reconcile; call after any startup-time SetStore swap.
+func (s *NetworkPolicyServer) Store() NetworkPolicyStore {
+	return s.store
+}
+
+func (s *NetworkPolicyServer) SetNetworkPolicy(ctx context.Context, req *pb.SetNetworkPolicyRequest) (*pb.SetNetworkPolicyResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	if err := s.requireDurable(); err != nil {
+		return nil, err
+	}
+	if err := auth.RequireScope(ctx, auth.ScopeNetworkPolicyWrite); err != nil {
+		return nil, err
+	}
+	// Validate + normalize (parse/dedup CIDRs, normalize domains, resolve mode).
+	compiled, err := netpolicy.Compile(req.GetPolicy())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	stored := compiled.ToProto()
+	if err := s.store.Set(ctx, stored); err != nil {
+		return nil, status.Errorf(codes.Internal, "store network policy: %v", err)
+	}
+	return &pb.SetNetworkPolicyResponse{Policy: stored}, nil
+}
+
+func (s *NetworkPolicyServer) GetNetworkPolicy(ctx context.Context, req *pb.GetNetworkPolicyRequest) (*pb.GetNetworkPolicyResponse, error) {
+	if err := auth.RequireRoleOrScope(ctx, auth.RoleAdmin, auth.ScopeNetworkPolicyRead); err != nil {
+		return nil, err
+	}
+	if req.GetTenant() == "" {
+		return nil, status.Error(codes.InvalidArgument, "tenant is required")
+	}
+	p, err := s.store.Get(ctx, req.GetTenant())
+	if err != nil {
+		if errors.Is(err, ErrNetworkPolicyNotFound) {
+			return nil, status.Errorf(codes.NotFound, "no network policy for tenant %q", req.GetTenant())
+		}
+		return nil, status.Errorf(codes.Internal, "get network policy: %v", err)
+	}
+	return &pb.GetNetworkPolicyResponse{Policy: p, Revision: PolicyRevision(p)}, nil
+}
+
+func (s *NetworkPolicyServer) ListNetworkPolicies(ctx context.Context, _ *pb.ListNetworkPoliciesRequest) (*pb.ListNetworkPoliciesResponse, error) {
+	if err := auth.RequireRoleOrScope(ctx, auth.RoleAdmin, auth.ScopeNetworkPolicyRead); err != nil {
+		return nil, err
+	}
+	policies, err := s.store.List(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list network policies: %v", err)
+	}
+	return &pb.ListNetworkPoliciesResponse{Policies: policies}, nil
+}
+
+// PatchNetworkPolicyDenyRules atomically adds/removes a tenant's virtual-patch
+// deny rules (#660). The add rules are validated up front; the merge (remove by
+// CIDR, then add — deny rules are CIDR-keyed, so an add replaces an existing
+// rule for the same CIDR) and re-normalization run inside the store's atomic
+// MutateDenyRules, so concurrent patches can't lose updates.
+func (s *NetworkPolicyServer) PatchNetworkPolicyDenyRules(ctx context.Context, req *pb.PatchNetworkPolicyDenyRulesRequest) (*pb.SetNetworkPolicyResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	if err := s.requireDurable(); err != nil {
+		return nil, err
+	}
+	if err := auth.RequireScope(ctx, auth.ScopeNetworkPolicyWrite); err != nil {
+		return nil, err
+	}
+	tenant := strings.TrimSpace(req.GetTenant())
+	if tenant == "" {
+		return nil, status.Error(codes.InvalidArgument, "tenant is required")
+	}
+	if len(req.GetAdd()) == 0 && len(req.GetRemoveCidrs()) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "patch must add or remove at least one deny rule")
+	}
+	// Validate the add rules up front (cidr/port/proto/expiry) so a bad rule fails
+	// with InvalidArgument before touching the store.
+	if _, err := netpolicy.Compile(&pb.NetworkPolicy{Tenant: tenant, DenyRules: req.GetAdd()}); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	// Normalize the remove CIDRs once (so "1.2.3.4" matches stored "1.2.3.4/32").
+	remove := make(map[string]bool, len(req.GetRemoveCidrs()))
+	for _, c := range req.GetRemoveCidrs() {
+		n, err := normalizeDenyCIDR(c)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "remove cidr %q: %v", c, err)
+		}
+		remove[n] = true
+	}
+
+	pureRemoval := len(req.GetAdd()) == 0
+	stored, err := s.store.MutateDenyRules(ctx, tenant, func(existing []*pb.NetworkPolicyDenyRule) ([]*pb.NetworkPolicyDenyRule, error) {
+		kept := make([]*pb.NetworkPolicyDenyRule, 0, len(existing))
+		removed := 0
+		for _, r := range existing {
+			n, err := normalizeDenyCIDR(r.GetCidr())
+			if err == nil && remove[n] {
+				removed++
+				continue
+			}
+			kept = append(kept, r)
+		}
+		if pureRemoval && removed == 0 {
+			return nil, errDenyRuleNotFound
+		}
+		// Merge then re-normalize via Compile (dedups by CIDR — an added rule wins
+		// for its CIDR — validates, sorts).
+		merged := append(kept, req.GetAdd()...)
+		compiled, err := netpolicy.Compile(&pb.NetworkPolicy{Tenant: tenant, DenyRules: merged})
+		if err != nil {
+			return nil, err
+		}
+		return compiled.ToProto().GetDenyRules(), nil
+	})
+	if err != nil {
+		if errors.Is(err, errDenyRuleNotFound) {
+			return nil, status.Errorf(codes.NotFound, "no matching deny rule to remove for tenant %q", tenant)
+		}
+		return nil, status.Errorf(codes.Internal, "patch deny rules: %v", err)
+	}
+	return &pb.SetNetworkPolicyResponse{Policy: stored}, nil
+}
+
+// normalizeDenyCIDR canonicalizes a deny-rule CIDR (a bare host becomes /32,
+// masked to its network) so removals match stored rules regardless of input form.
+func normalizeDenyCIDR(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", fmt.Errorf("cidr is required")
+	}
+	if strings.Contains(s, "/") {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return "", err
+		}
+		return p.Masked().String(), nil
+	}
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return "", err
+	}
+	return netip.PrefixFrom(a, a.BitLen()).String(), nil
+}
+
+func (s *NetworkPolicyServer) DeleteNetworkPolicy(ctx context.Context, req *pb.DeleteNetworkPolicyRequest) (*pb.DeleteNetworkPolicyResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	if err := s.requireDurable(); err != nil {
+		return nil, err
+	}
+	if err := auth.RequireScope(ctx, auth.ScopeNetworkPolicyWrite); err != nil {
+		return nil, err
+	}
+	if req.GetTenant() == "" {
+		return nil, status.Error(codes.InvalidArgument, "tenant is required")
+	}
+	if err := s.store.Delete(ctx, req.GetTenant()); err != nil {
+		return nil, status.Errorf(codes.Internal, "delete network policy: %v", err)
+	}
+	return &pb.DeleteNetworkPolicyResponse{}, nil
+}
+
+// --- Tier 2 operator signatures (#661 PR-B) ---
+
+func (s *NetworkPolicyServer) SetNetworkPolicySignature(ctx context.Context, req *pb.SetNetworkPolicySignatureRequest) (*pb.SetNetworkPolicySignatureResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	if err := s.requireDurable(); err != nil {
+		return nil, err
+	}
+	if err := auth.RequireScope(ctx, auth.ScopeNetworkPolicyWrite); err != nil {
+		return nil, err
+	}
+	if s.sigStore == nil {
+		return nil, status.Error(codes.Unavailable, "network-policy signatures are not configured on this daemon")
+	}
+	name, pattern, err := netpolicy.ValidateSignature(req.GetSignature())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	// Default enabled=true unless the caller explicitly disabled it. (The proto
+	// bool defaults to false; an operator adding a signature almost always wants it
+	// on, and an explicit disable is the rare case — but we honor what's sent.)
+	stored, err := s.sigStore.Set(ctx, name, pattern, req.GetSignature().GetEnabled(), req.GetSignature().GetNote())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "store signature: %v", err)
+	}
+	return &pb.SetNetworkPolicySignatureResponse{Signature: stored}, nil
+}
+
+func (s *NetworkPolicyServer) ListNetworkPolicySignatures(ctx context.Context, _ *pb.ListNetworkPolicySignaturesRequest) (*pb.ListNetworkPolicySignaturesResponse, error) {
+	if err := auth.RequireRoleOrScope(ctx, auth.RoleAdmin, auth.ScopeNetworkPolicyRead); err != nil {
+		return nil, err
+	}
+	if s.sigStore == nil {
+		return &pb.ListNetworkPolicySignaturesResponse{}, nil
+	}
+	sigs, err := s.sigStore.List(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list signatures: %v", err)
+	}
+	return &pb.ListNetworkPolicySignaturesResponse{Signatures: sigs}, nil
+}
+
+func (s *NetworkPolicyServer) DeleteNetworkPolicySignature(ctx context.Context, req *pb.DeleteNetworkPolicySignatureRequest) (*pb.DeleteNetworkPolicySignatureResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	if err := s.requireDurable(); err != nil {
+		return nil, err
+	}
+	if err := auth.RequireScope(ctx, auth.ScopeNetworkPolicyWrite); err != nil {
+		return nil, err
+	}
+	if s.sigStore == nil {
+		return nil, status.Error(codes.Unavailable, "network-policy signatures are not configured on this daemon")
+	}
+	if req.GetName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "name is required")
+	}
+	if err := s.sigStore.Delete(ctx, req.GetName()); err != nil && !errors.Is(err, ErrSignatureNotFound) {
+		return nil, status.Errorf(codes.Internal, "delete signature: %v", err)
+	}
+	return &pb.DeleteNetworkPolicySignatureResponse{}, nil
+}
+
+const (
+	planDefaultMinutes = 60
+	planMaxMinutes     = 7 * 24 * 60
+	// planRowCap bounds how many audit rows one plan reads per action. A
+	// log-only tenant with a chatty workload can write many; the response
+	// says when the cap was hit.
+	planRowCap = 5000
+)
+
+// PlanNetworkPolicy aggregates a tenant's recent deny audit rows into the
+// destinations an allow-list would need (#2440). Read-only.
+func (s *NetworkPolicyServer) PlanNetworkPolicy(ctx context.Context, req *pb.PlanNetworkPolicyRequest) (*pb.PlanNetworkPolicyResponse, error) {
+	if err := auth.RequireRoleOrScope(ctx, auth.RoleAdmin, auth.ScopeNetworkPolicyRead); err != nil {
+		return nil, err
+	}
+	tenant := strings.TrimSpace(req.GetTenant())
+	if tenant == "" {
+		return nil, status.Error(codes.InvalidArgument, "tenant is required")
+	}
+	if s.auditQuery == nil {
+		return nil, status.Error(codes.Unavailable, "network policy plan needs the audit store, which is not available on this daemon")
+	}
+	minutes := int(req.GetSinceMinutes())
+	if minutes <= 0 {
+		minutes = planDefaultMinutes
+	}
+	if minutes > planMaxMinutes {
+		minutes = planMaxMinutes
+	}
+	since := time.Now().Add(-time.Duration(minutes) * time.Minute)
+
+	// Subtract what the tenant's current policy already allows, so rows from
+	// before an allow-list edit do not read as still-missing.
+	var allowed func(netip.Addr) bool
+	var notes []string
+	if p, err := s.store.Get(ctx, tenant); err == nil {
+		if c, cerr := netpolicy.Compile(p); cerr == nil {
+			implicit := netpolicy.ImplicitEgress(c, s.gateway)
+			allowed = func(ip netip.Addr) bool { return c.Allows(ip, implicit) }
+			if len(c.EgressDomains) > 0 {
+				notes = append(notes, "destinations allowed only through egress_domains are not subtracted; they may appear here even though they are allowed")
+			}
+		}
+	} else if !errors.Is(err, ErrNetworkPolicyNotFound) {
+		return nil, status.Errorf(codes.Internal, "get network policy: %v", err)
+	} else {
+		notes = append(notes, "the tenant has no policy yet; every outbound destination its boxes reached is listed, including any the host's default egress allow-list already allows (it is not subtracted here)")
+	}
+
+	var rows []netpolicy.DenyRow
+	truncated := false
+	for _, action := range []string{"network_policy.deny_logged", "network_policy.deny_dropped"} {
+		entries, total, err := s.auditQuery.Query(ctx, audit.QueryParams{
+			Action: action, ResourceType: "network_policy", ResourceID: tenant,
+			From: since, Limit: planRowCap,
+		})
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "query audit rows: %v", err)
+		}
+		if int(total) > len(entries) {
+			truncated = true
+		}
+		for _, e := range entries {
+			rows = append(rows, netpolicy.DenyRow{Time: e.Timestamp, Detail: e.Detail})
+		}
+	}
+	if truncated {
+		notes = append(notes, "the audit row cap was reached; the oldest flows in the window may be missing")
+	}
+
+	dests := netpolicy.AggregateDenies(rows, allowed)
+	out := &pb.PlanNetworkPolicyResponse{
+		Tenant: tenant, SinceMinutes: int32(minutes), // #nosec G115 -- bounded by planMaxMinutes
+		RowsScanned: clampU32(len(rows)), Truncated: truncated, Notes: notes,
+	}
+	for _, d := range dests {
+		out.Destinations = append(out.Destinations, &pb.PlanDestination{
+			Ip: d.IP.String(), Port: uint32(d.Port), Protocol: d.Proto,
+			Count: d.Count, Dropped: d.Dropped, LastSeen: timestamppb.New(d.LastSeen),
+		})
+	}
+	return out, nil
+}
+
+// clampU32 converts a non-negative count to uint32, saturating.
+func clampU32(n int) uint32 {
+	if n < 0 {
+		return 0
+	}
+	if int64(n) > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(n) // #nosec G115 -- bounded above
+}

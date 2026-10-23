@@ -135,3 +135,141 @@ func runSandboxSpawn(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  state:       %s\n", sb.State)
 	fmt.Printf("  template:    %s\n", sb.Template)
 	fmt.Printf("  served_from: %s\n", sb.ServedFrom)
+	if sb.ExpiresAt != nil {
+		fmt.Printf("  expires_at:  %s\n", sb.ExpiresAt.AsTime().Local().Format("2006-01-02 15:04:05 MST"))
+	}
+	return nil
+}
+
+// runSandboxExec calls os.Exit directly with the REMOTE command's exit
+// code rather than returning an error through cobra — a wrapped error
+// would both print a spurious "Error: ..." line and always exit 1
+// regardless of what the sandboxed command actually returned, breaking
+// the `sandbox exec ... ; echo $?` composability documented on the
+// command itself.
+func runSandboxExec(cmd *cobra.Command, args []string) error {
+	// args[0] is the sandbox-id regardless of where -- appears (cobra never
+	// consumes an arg for the dash itself); everything after it is the
+	// command. Recommending -- in the command's usage/examples is still the
+	// right UX (kubectl exec does the same) — without it, a command whose
+	// own arguments look like flags (e.g. `ls -la`) risks cobra trying to
+	// parse them as flags for this subcommand instead of passing them
+	// through.
+	sandboxID := args[0]
+	command := args[1:]
+	if len(command) == 0 {
+		return fmt.Errorf("a command is required, e.g.: sandbox exec %s -- echo hello", sandboxID)
+	}
+
+	c, err := newSandboxGRPCClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	resp, err := c.ExecInSandbox(&pb.ExecInSandboxRequest{SandboxId: sandboxID, Command: command})
+	if err != nil {
+		return err
+	}
+
+	if resp.Stdout != "" {
+		fmt.Fprint(os.Stdout, resp.Stdout)
+	}
+	if resp.Stderr != "" {
+		fmt.Fprint(os.Stderr, resp.Stderr)
+	}
+	os.Exit(int(resp.ExitCode))
+	return nil // unreachable
+}
+
+func runSandboxWriteFile(cmd *cobra.Command, args []string) error {
+	sandboxID, remotePath := args[0], args[1]
+	if sandboxWriteFrom == "" {
+		return fmt.Errorf("--from is required (local file to write into the sandbox)")
+	}
+
+	content, err := os.ReadFile(sandboxWriteFrom)
+	if err != nil {
+		return fmt.Errorf("failed to read local file %s: %w", sandboxWriteFrom, err)
+	}
+
+	c, err := newSandboxGRPCClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	resp, err := c.WriteFileInSandbox(&pb.WriteFileInSandboxRequest{
+		SandboxId: sandboxID,
+		Path:      remotePath,
+		Content:   content,
+		Mode:      sandboxWriteMode,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ %s\n", resp.Message)
+	return nil
+}
+
+func runSandboxReadFile(cmd *cobra.Command, args []string) error {
+	sandboxID, remotePath := args[0], args[1]
+
+	c, err := newSandboxGRPCClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	resp, err := c.ReadFileInSandbox(sandboxID, remotePath)
+	if err != nil {
+		return err
+	}
+
+	if sandboxReadTo == "" {
+		_, err := os.Stdout.Write(resp.Content)
+		return err
+	}
+	if err := os.WriteFile(sandboxReadTo, resp.Content, 0o600); err != nil {
+		return fmt.Errorf("failed to write local file %s: %w", sandboxReadTo, err)
+	}
+	fmt.Printf("✓ wrote %d byte(s) to %s\n", len(resp.Content), sandboxReadTo)
+	return nil
+}
+
+func runSandboxDelete(cmd *cobra.Command, args []string) error {
+	c, err := newSandboxGRPCClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	resp, err := c.DeleteSandbox(args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ %s\n", resp.Message)
+	return nil
+}
+
+func runSandboxPoolStatus(cmd *cobra.Command, args []string) error {
+	c, err := newSandboxGRPCClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	resp, err := c.GetPoolStatus()
+	if err != nil {
+		return err
+	}
+	if len(resp.Templates) == 0 {
+		fmt.Println("no warm pool configured")
+		return nil
+	}
+	fmt.Printf("%-28s %6s %8s %8s\n", "TEMPLATE", "READY", "WARMING", "MIN_WARM")
+	for _, t := range resp.Templates {
+		fmt.Printf("%-28s %6d %8d %8d\n", t.Template, t.Ready, t.Warming, t.MinWarm)
+	}
+	return nil
+}
