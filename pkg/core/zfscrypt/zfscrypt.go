@@ -1,0 +1,413 @@
+// Package zfscrypt drives the `zfs` CLI for per-tenant native encryption.
+//
+// Phase 3/4 of docs/ZFS-PER-CONTAINER-ENCRYPTION-DESIGN.md: the dataset
+// operations the container lifecycle hooks call. Key custody lives in
+// pkg/core/zfskey; this package only knows how to hand a key to ZFS and
+// how to ask what ZFS did with it.
+//
+// # Verification status
+//
+// VERIFIED against a real pool (#1200). The unit tests here drive a fake
+// runner and prove only the orchestration — what runs, in what order, and
+// what happens on failure. The claims about what ZFS itself does are
+// exercised by zfscrypt_integration_test.go (build tag `zfs`), which runs
+// this same code against a file-backed pool in CI.
+//
+// Confirmed there, each previously assumed and now demonstrated:
+//
+//   - `-o keylocation=file:///dev/stdin` with the raw key on stdin loads
+//     a key without it ever touching argv or a temp file, and a WRONG key
+//     is refused rather than silently accepted.
+//   - `zfs unload-key` fails, rather than succeeding silently, while a
+//     dataset under the encryptionroot is still mounted — and fails with a
+//     message isKeyInUse below recognises.
+//   - `keystatus` reports exactly "available" or "unavailable", and "-"
+//     for an unencrypted dataset.
+//
+// Also learned there, and relied on by the pre-start hook: `zfs load-key`
+// makes a dataset readable but does NOT remount it. Mounting is Incus's
+// job, which is why the hook only loads the key.
+//
+// The headline property — a stopped container's dataset is ciphertext,
+// including to host root — is asserted against the raw vdev bytes, with a
+// positive control proving the search can detect plaintext at all.
+package zfscrypt
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"strings"
+
+	"github.com/footprintai/containarium/pkg/core/zfskey"
+)
+
+// Runner executes a zfs command. Declared as an interface so the hook
+// logic is testable without a pool, and so the daemon can inject a
+// runner that logs or that targets a remote host.
+type Runner interface {
+	// Run executes `zfs <args...>`, writing stdin to the child's stdin
+	// when non-nil, and returns stdout and stderr.
+	Run(ctx context.Context, stdin []byte, args ...string) (stdout, stderr string, err error)
+}
+
+// ExecRunner runs the host's zfs binary.
+type ExecRunner struct{}
+
+// Run implements Runner against the real `zfs` command.
+func (ExecRunner) Run(ctx context.Context, stdin []byte, args ...string) (string, string, error) {
+	// #nosec G204 -- the binary is the literal "zfs"; args are built by
+	// this package from validated dataset names, never from raw caller
+	// input (see validateDataset).
+	cmd := exec.CommandContext(ctx, "zfs", args...)
+	if stdin != nil {
+		cmd.Stdin = strings.NewReader(string(stdin))
+	}
+	var out, errb strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	err := cmd.Run()
+	return out.String(), errb.String(), err
+}
+
+// Manager performs the encryption-related dataset operations.
+type Manager struct {
+	run Runner
+}
+
+// NewManager constructs a Manager over a Runner. Passing nil uses the
+// real zfs binary.
+func NewManager(r Runner) *Manager {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	return &Manager{run: r}
+}
+
+// KeyStatus mirrors ZFS's `keystatus` property.
+type KeyStatus string
+
+const (
+	// KeyAvailable means the key is loaded: the dataset can be mounted
+	// and its contents read.
+	KeyAvailable KeyStatus = "available"
+	// KeyUnavailable means the key is not loaded: the dataset is
+	// ciphertext, including to host root. This is the state a stopped
+	// container's dataset must be in (#1201).
+	KeyUnavailable KeyStatus = "unavailable"
+)
+
+// validateDataset rejects names that could turn a dataset argument into
+// something else — a flag, a second argument, or a shell-ish string.
+//
+// The name is built by the daemon from a pool and a container name, so
+// this is defence in depth rather than the primary control; it is cheap
+// and the failure mode (operating on the wrong dataset) is destructive.
+func validateDataset(name string) error {
+	switch {
+	case name == "":
+		return fmt.Errorf("dataset name is required")
+	case strings.HasPrefix(name, "-"):
+		return fmt.Errorf("invalid dataset name %q: leading dash would be read as a flag", name)
+	case strings.ContainsAny(name, " \t\n\r"):
+		return fmt.Errorf("invalid dataset name %q: contains whitespace", name)
+	case !strings.Contains(name, "/"):
+		// Every container dataset lives under a pool. A bare name is
+		// the pool root itself, and encrypting or destroying that is
+		// never what the caller meant.
+		return fmt.Errorf("invalid dataset name %q: expected <pool>/<path>", name)
+	}
+	return nil
+}
+
+// CreateEncrypted creates a dataset with ZFS native encryption enabled,
+// keyed by the supplied key.
+//
+// The key travels on **stdin**, never on argv and never through a temp
+// file: argv is world-readable through /proc/<pid>/cmdline for the life
+// of the process, and a temp file leaves key material on disk, which is
+// the one thing the whole design forbids.
+func (m *Manager) CreateEncrypted(ctx context.Context, dataset string, key zfskey.Key) error {
+	if err := validateDataset(dataset); err != nil {
+		return err
+	}
+	if key.IsZero() {
+		return fmt.Errorf("refusing to create %s with an empty key", dataset)
+	}
+
+	// VERIFIED on a real pool (#1200): passing the raw key on stdin with
+	// keylocation=file:///dev/stdin is accepted by `zfs create`, and
+	// keyformat=raw expects exactly 32 bytes — which zfskey.Key already
+	// guarantees.
+	_, stderr, err := m.run.Run(ctx, key.Bytes(),
+		"create",
+		"-o", "encryption=on",
+		"-o", "keyformat=raw",
+		"-o", "keylocation=file:///dev/stdin",
+		dataset,
+	)
+	if err != nil {
+		return fmt.Errorf("create encrypted dataset %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// ChangeKey rewraps an encryptionroot onto new key material (#1204).
+//
+// Only the wrapping key changes: ZFS re-encrypts the dataset's master key,
+// not the data, so rotation costs the same on a 1 GB dataset as on a 1 TB
+// one. The data itself is never rewritten, which is what makes rotation a
+// maintenance-window operation rather than a migration.
+//
+// The dataset's key must already be loaded — ZFS cannot rewrap what it
+// cannot open — so callers rotate a running-or-just-loaded encryptionroot,
+// not a cold one.
+//
+// The new key travels on stdin for the same reason every other key does:
+// argv is world-readable through /proc/<pid>/cmdline for the life of the
+// process, and a temp file leaves key material on disk.
+func (m *Manager) ChangeKey(ctx context.Context, dataset string, key zfskey.Key) error {
+	if err := validateDataset(dataset); err != nil {
+		return err
+	}
+	if key.IsZero() {
+		return fmt.Errorf("refusing to rewrap %s with an empty key", dataset)
+	}
+
+	_, stderr, err := m.run.Run(ctx, key.Bytes(),
+		"change-key",
+		"-o", "keyformat=raw",
+		"-o", "keylocation=file:///dev/stdin",
+		dataset,
+	)
+	if err != nil {
+		return fmt.Errorf("change key for %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// LoadKey makes an encrypted dataset readable. It is a no-op when the
+// key is already loaded, so a restarted daemon re-running the pre-start
+// hook does not fail.
+func (m *Manager) LoadKey(ctx context.Context, dataset string, key zfskey.Key) error {
+	if err := validateDataset(dataset); err != nil {
+		return err
+	}
+	if key.IsZero() {
+		return fmt.Errorf("refusing to load an empty key for %s", dataset)
+	}
+
+	status, err := m.KeyStatus(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	if status == KeyAvailable {
+		return nil
+	}
+
+	_, stderr, err := m.run.Run(ctx, key.Bytes(),
+		"load-key", "-L", "file:///dev/stdin", dataset)
+	if err != nil {
+		return fmt.Errorf("load key for %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// UnloadKey drops the key from the kernel, returning the dataset to
+// ciphertext (#1201).
+//
+// Returns ErrKeyInUse when ZFS refuses because something under the
+// encryptionroot is still mounted — the expected case when a tenant has
+// another container running, and not an error the caller should treat as
+// a failure.
+func (m *Manager) UnloadKey(ctx context.Context, dataset string) error {
+	if err := validateDataset(dataset); err != nil {
+		return err
+	}
+
+	status, err := m.KeyStatus(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	if status == KeyUnavailable {
+		// Already ciphertext; nothing to do.
+		return nil
+	}
+
+	_, stderr, err := m.run.Run(ctx, nil, "unload-key", dataset)
+	if err != nil {
+		// VERIFIED on a real pool (#1200): ZFS refuses with a
+		// "busy"/"in use" message rather than silently succeeding while
+		// a dataset under the encryptionroot is mounted. Had it succeeded
+		// instead, a co-tenant's running container would have lost its
+		// key; TestIntegration_UnloadKeyRefusesWhileMounted holds the line.
+		if isKeyInUse(stderr) {
+			return ErrKeyInUse
+		}
+		return fmt.Errorf("unload key for %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// ErrKeyInUse reports that a key could not be unloaded because the
+// encryptionroot still has mounted datasets under it.
+var ErrKeyInUse = fmt.Errorf("encryption key is still in use by a mounted dataset")
+
+func isKeyInUse(stderr string) bool {
+	s := strings.ToLower(stderr)
+	return strings.Contains(s, "busy") || strings.Contains(s, "in use")
+}
+
+// ErrNotEncrypted reports that a dataset carries no encryption at all.
+//
+// A sentinel rather than a message, because it is the one "error" that is
+// often the right answer. Most containers on this platform are unencrypted,
+// so a caller asking a key question about one has to tell "there is no key
+// here" apart from "the key is missing" and from "zfs did not answer" — a
+// guard that cannot tell them apart either blocks the whole fleet or fails
+// open on a broken pool.
+var ErrNotEncrypted = fmt.Errorf("dataset is not encrypted")
+
+// KeyStatus reports whether the dataset's key is currently loaded.
+func (m *Manager) KeyStatus(ctx context.Context, dataset string) (KeyStatus, error) {
+	if err := validateDataset(dataset); err != nil {
+		return "", err
+	}
+	stdout, stderr, err := m.run.Run(ctx, nil, "get", "-H", "-o", "value", "keystatus", dataset)
+	if err != nil {
+		return "", fmt.Errorf("read keystatus for %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+	switch v := strings.TrimSpace(stdout); v {
+	case string(KeyAvailable):
+		return KeyAvailable, nil
+	case string(KeyUnavailable):
+		return KeyUnavailable, nil
+	case "", "-":
+		// An unencrypted dataset reports "-". Still an error, because the
+		// caller asked a key question about a dataset that has no key —
+		// the two sides disagree about what this container is. But it is a
+		// DISTINGUISHABLE error: some callers (EnsureInspectable) have a
+		// correct answer for an unencrypted dataset, and must not confuse
+		// "there is no key to be missing" with "zfs did not answer".
+		return "", fmt.Errorf("dataset %s: %w (keystatus %q)", dataset, ErrNotEncrypted, v)
+	default:
+		return "", fmt.Errorf("unexpected keystatus %q for %s", v, dataset)
+	}
+}
+
+// EncryptionRoot returns the dataset whose key covers this one. Two
+// containers belonging to the same tenant share an encryptionroot; two
+// tenants never do, which is the property the isolation claim rests on.
+func (m *Manager) EncryptionRoot(ctx context.Context, dataset string) (string, error) {
+	if err := validateDataset(dataset); err != nil {
+		return "", err
+	}
+	stdout, stderr, err := m.run.Run(ctx, nil, "get", "-H", "-o", "value", "encryptionroot", dataset)
+	if err != nil {
+		return "", fmt.Errorf("read encryptionroot for %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+	root := strings.TrimSpace(stdout)
+	if root == "" || root == "-" {
+		return "", fmt.Errorf("dataset %s has no encryptionroot: %w", dataset, ErrNotEncrypted)
+	}
+	return root, nil
+}
+
+// Exists reports whether a dataset is present.
+func (m *Manager) Exists(ctx context.Context, dataset string) (bool, error) {
+	if err := validateDataset(dataset); err != nil {
+		return false, err
+	}
+	_, stderr, err := m.run.Run(ctx, nil, "list", "-H", "-o", "name", dataset)
+	if err != nil {
+		if strings.Contains(strings.ToLower(stderr), "does not exist") {
+			return false, nil
+		}
+		return false, fmt.Errorf("list dataset %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+	return true, nil
+}
+
+// EnsureParent makes the parent of a dataset exist, creating the whole chain
+// if it does not.
+//
+// `zfs create` does not make intermediate datasets, and a tenant
+// encryptionroot is created at <root>/<tenant> where <root> is derived from
+// the daemon's storage pool. On a host that has never had an encrypted
+// container, that intermediate does not exist, and every encrypted create
+// fails with "parent does not exist" (#1341).
+//
+// The parent is deliberately created UNencrypted: it is a container for
+// datasets, not a dataset that holds data, and each tenant encryptionroot
+// below it carries its own key. Making it an encryptionroot instead would put
+// every tenant under one key — the opposite of the point.
+//
+// A parent that is a bare pool root is a no-op: pools always exist, and
+// `zfs create tank` would fail.
+func (m *Manager) EnsureParent(ctx context.Context, dataset string) error {
+	if err := validateDataset(dataset); err != nil {
+		return err
+	}
+	parent := dataset[:strings.LastIndex(dataset, "/")]
+	if !strings.Contains(parent, "/") {
+		return nil // a pool root, which always exists
+	}
+
+	exists, err := m.Exists(ctx, parent)
+	if err != nil {
+		return fmt.Errorf("check parent dataset %s: %w", parent, err)
+	}
+	if exists {
+		return nil
+	}
+
+	_, stderr, err := m.run.Run(ctx, nil, "create", "-p", parent)
+	if err != nil {
+		return fmt.Errorf("create parent dataset %s: %w: %s", parent, err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
+
+// HasChildren reports whether a dataset has any descendants.
+//
+// The offboarding guard (#1343): a tenant's encryptionroot with children
+// still holds container datasets, and deleting its pool would destroy them.
+//
+// Asked of ZFS rather than of the daemon's own records deliberately. A record
+// can be lost — a config key cleared, a store restored from an older backup —
+// and an enumeration of records would then report "no containers" for a
+// tenant whose data is still there. Storage is the thing being destroyed, so
+// storage is what gets asked.
+func (m *Manager) HasChildren(ctx context.Context, dataset string) (bool, error) {
+	if err := validateDataset(dataset); err != nil {
+		return false, err
+	}
+	stdout, stderr, err := m.run.Run(ctx, nil, "list", "-H", "-o", "name", "-r", dataset)
+	if err != nil {
+		return false, fmt.Errorf("list children of %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		name := strings.TrimSpace(line)
+		// The recursive listing includes the dataset itself, and a sibling
+		// like <dataset>2 shares its prefix — only a "/" separated descendant
+		// counts, or a tenant could never be offboarded while a
+		// similarly-named one exists.
+		if name != "" && strings.HasPrefix(name, dataset+"/") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Destroy removes a dataset. Used to clean up a half-built container so
+// a failed encrypted create leaves no partial state behind.
+func (m *Manager) Destroy(ctx context.Context, dataset string) error {
+	if err := validateDataset(dataset); err != nil {
+		return err
+	}
+	_, stderr, err := m.run.Run(ctx, nil, "destroy", dataset)
+	if err != nil {
+		return fmt.Errorf("destroy dataset %s: %w: %s", dataset, err, strings.TrimSpace(stderr))
+	}
+	return nil
+}
