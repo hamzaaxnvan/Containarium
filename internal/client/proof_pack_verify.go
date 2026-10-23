@@ -38,3 +38,14 @@ func (c *HTTPClient) VerifyProofPack(ctx context.Context, sealed *pb.SealedProof
 	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(b, &out); err != nil {
 		return nil, fmt.Errorf("verify proof pack: decode response: %w", err)
 	}
+	return &out, nil
+}
+
+// VerifyProofPack is the gRPC transport's counterpart.
+func (c *GRPCClient) VerifyProofPack(ctx context.Context, sealed *pb.SealedProofPack) (*pb.VerifyProofPackResponse, error) {
+	resp, err := c.proofPackClient.VerifyProofPack(ctx, &pb.VerifyProofPackRequest{Sealed: sealed})
+	if err != nil {
+		return nil, fmt.Errorf("verify proof pack: %w", err)
+	}
+	return resp, nil
+}

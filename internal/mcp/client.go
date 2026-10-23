@@ -830,3 +830,1668 @@ type MigrateToEnvelopeResponse struct {
 // per-rule health (#1640).
 func (c *Client) GetSentryStatus() (*SentryStatusResponse, error) {
 	respBody, err := c.doRequest("GET", "/v1/security/sentry/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp SentryStatusResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// ListBadDestinations returns the merged baseline + operator-added
+// known-bad-destination list the bad-destination rule (#1641) matches
+// against.
+func (c *Client) ListBadDestinations() (*ListBadDestinationsResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/security/bad-destinations", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp ListBadDestinationsResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// AddBadDestination adds an operator-supplied entry, effective immediately.
+func (c *Client) AddBadDestination(cidr, label string) (*BadDestinationEntry, error) {
+	respBody, err := c.doRequest("POST", "/v1/security/bad-destinations", map[string]string{
+		"cidr": cidr, "label": label,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var resp AddBadDestinationResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp.Entry, nil
+}
+
+// RemoveBadDestination removes a previously operator-added entry. Baseline
+// entries cannot be removed.
+func (c *Client) RemoveBadDestination(cidr string) error {
+	_, err := c.doRequest("DELETE", "/v1/security/bad-destinations/"+cidr, nil)
+	return err
+}
+
+// ListSecuritySentryFindings lists findings raised by the background
+// threat-detection sentry (#1643), most recently seen first. Every filter
+// is optional; pass "" / 0 to skip it. severity/state are the lowercase
+// CLI-style names ("high", "open") — this converts them to the wire enum
+// names, same normalization the CLI applies.
+func (c *Client) ListSecuritySentryFindings(severity, tenant, since, state string, limit int) (*ListSentryFindingsResponse, error) {
+	q := url.Values{}
+	if severity != "" {
+		q.Set("severity", "THREAT_SEVERITY_"+strings.ToUpper(severity))
+	}
+	if tenant != "" {
+		q.Set("tenant_id", tenant)
+	}
+	if since != "" {
+		q.Set("since", since)
+	}
+	if state != "" {
+		q.Set("state", "FINDING_STATE_"+strings.ToUpper(state))
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/security/findings"
+	if enc := q.Encode(); enc != "" {
+		path += "?" + enc
+	}
+	respBody, err := c.doRequest("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp ListSentryFindingsResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// ResolveSecuritySentryFinding marks an open finding as resolved.
+func (c *Client) ResolveSecuritySentryFinding(id int64) (*ResolveSentryFindingResponse, error) {
+	path := "/v1/security/findings/" + strconv.FormatInt(id, 10) + "/resolve"
+	respBody, err := c.doRequest("POST", path, []byte("{}"))
+	if err != nil {
+		return nil, err
+	}
+	var resp ResolveSentryFindingResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+func (c *Client) GetKMSStatus() (*KMSStatusResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/kms/status", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp KMSStatusResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// GetEnvelopeCoverage reports secret counts by encryption mode.
+func (c *Client) GetEnvelopeCoverage() (*EnvelopeCoverageResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/kms/envelope-coverage", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp EnvelopeCoverageResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// MigrateToEnvelope triggers the legacy→envelope re-wrap.
+func (c *Client) MigrateToEnvelope(req MigrateToEnvelopeBody) (*MigrateToEnvelopeResponse, error) {
+	respBody, err := c.doRequest("POST", "/v1/kms/migrate-to-envelope", req)
+	if err != nil {
+		return nil, err
+	}
+	var resp MigrateToEnvelopeResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// DebugContainer returns a diagnostic report for a container's SSH path.
+// One layer deeper than the agent's raw ssh error — surfaces host-side
+// state the agent can't see directly (user account, shell file, sshd logs).
+func (c *Client) DebugContainer(username string) (*DebugContainerResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/containers/"+username+"/debug", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp DebugContainerResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// ToggleMonitoring enables / disables OTel app telemetry on an
+// existing container. Returns the response with message +
+// monitoring_enabled state.
+func (c *Client) ToggleMonitoring(username string, enabled bool) (*ToggleMonitoringResponse, error) {
+	body, err := json.Marshal(map[string]bool{"enabled": enabled})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	respBody, err := c.doRequest("POST", fmt.Sprintf("/v1/containers/%s/monitoring", username), body)
+	if err != nil {
+		return nil, err
+	}
+	var resp ToggleMonitoringResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// ResizeContainer changes a container's CPU / memory / disk
+// allocation. Empty string for any field means "no change"; disk
+// can only grow (server rejects shrinks). memoryRequest/cpuRequest are the
+// K8s scheduler-request counterparts to memory/cpu (K8s backend only,
+// ignored on LXC); empty leaves the existing request alone, even when the
+// matching limit changes.
+func (c *Client) ResizeContainer(username, cpu, memory, disk, memoryRequest, cpuRequest string) (*ResizeContainerResponse, error) {
+	body, err := json.Marshal(map[string]string{
+		"cpu":           cpu,
+		"memory":        memory,
+		"disk":          disk,
+		"memoryRequest": memoryRequest,
+		"cpuRequest":    cpuRequest,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	respBody, err := c.doRequest("PUT", fmt.Sprintf("/v1/containers/%s/resize", username), body)
+	if err != nil {
+		return nil, err
+	}
+	var resp ResizeContainerResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// SetSecret creates or updates a tenant secret. Idempotent —
+// repeated calls with the same (username, name) bump the version.
+// RevokeToken adds a JWT's jti to the daemon's revocation
+// list via the canonical REST endpoint added in PR #249.
+// Admin-only on the server side. Pass empty strings for
+// `reason` / `expiresAt` to let the daemon default them.
+func (c *Client) RevokeToken(jti, reason, expiresAt string) (string, error) {
+	body := map[string]string{"jti": jti}
+	if reason != "" {
+		body["reason"] = reason
+	}
+	if expiresAt != "" {
+		body["expires_at"] = expiresAt
+	}
+	respBody, err := c.doRequest("POST", "/v1/tokens/revoke", body)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		NewlyRevoked bool   `json:"newlyRevoked"`
+		Message      string `json:"message"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return "", fmt.Errorf("decode: %w", err)
+	}
+	if resp.Message == "" {
+		resp.Message = "jti added to revocation list"
+	}
+	return resp.Message, nil
+}
+
+func (c *Client) SetSecret(username, name, value string) (*SecretResponse, error) {
+	body, err := json.Marshal(map[string]string{
+		"username": username, "name": name, "value": value,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	respBody, err := c.doRequest("POST", "/v1/secrets", body)
+	if err != nil {
+		return nil, err
+	}
+	var resp SecretResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return &resp, nil
+}
+
+// GetSecret reads a single secret's plaintext value.
+func (c *Client) GetSecret(username, name string) (string, error) {
+	respBody, err := c.doRequest("GET", fmt.Sprintf("/v1/secrets/%s/%s", username, name), nil)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return "", fmt.Errorf("decode: %w", err)
+	}
+	return resp.Value, nil
+}
+
+// SecretMetadata mirrors the proto SecretMetadata on the response side.
+// Values are never included — they are readable only via GetSecret,
+// per-name and audit-logged.
+//
+// The tags are lowerCamelCase because grpc-gateway is configured with
+// UseProtoNames=false, so protojson emits `createdAt` / `updatedAt`.
+// Reading these through an untyped map is what hid #1219: the CLI looked
+// up `updated_at`, a key the daemon never sends.
+type SecretMetadata struct {
+	Username  string `json:"username"`
+	Name      string `json:"name"`
+	Version   int32  `json:"version"`
+	CreatedAt string `json:"createdAt"`
+	UpdatedAt string `json:"updatedAt"`
+	Delivery  string `json:"delivery"`
+}
+
+// ListSecrets returns metadata for every tenant secret.
+func (c *Client) ListSecrets(username string) ([]SecretMetadata, error) {
+	respBody, err := c.doRequest("GET", fmt.Sprintf("/v1/secrets/%s", username), nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Secrets []SecretMetadata `json:"secrets"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return resp.Secrets, nil
+}
+
+// DeleteSecret removes a tenant secret.
+func (c *Client) DeleteSecret(username, name string) error {
+	if _, err := c.doRequest("DELETE", fmt.Sprintf("/v1/secrets/%s/%s", username, name), nil); err != nil {
+		return err
+	}
+	return nil
+}
+
+// RefreshSecrets re-stamps env vars on the LXC.
+func (c *Client) RefreshSecrets(username string) (*RefreshSecretsResponse, error) {
+	respBody, err := c.doRequest("POST", fmt.Sprintf("/v1/secrets/%s/refresh", username), []byte("{}"))
+	if err != nil {
+		return nil, err
+	}
+	var resp RefreshSecretsResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return &resp, nil
+}
+
+// DeleteContainer deletes a container
+func (c *Client) DeleteContainer(username string, force bool) (*DeleteContainerResponse, error) {
+	path := fmt.Sprintf("/v1/containers/%s?force=%v", username, force)
+	respBody, err := c.doRequest("DELETE", path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp DeleteContainerResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// StartContainer starts a stopped container. When waitForReady is
+// true the daemon blocks until the container's primary TCP port
+// accepts or the server-side default (30s) elapses; the response's
+// ReadyTimedOut field reports whether the probe gave up.
+func (c *Client) StartContainer(username string, waitForReady bool) (*StartContainerResponse, error) {
+	body := map[string]interface{}{"wait_for_ready": waitForReady}
+	respBody, err := c.doRequest("POST", "/v1/containers/"+username+"/start", body)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp StartContainerResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// ToggleAutoSleep writes the per-container auto-sleep opt-in flag.
+// idleThresholdMinutes is honored only when enabled is true; 0 means
+// "use the existing key or the daemon's 15-minute default".
+func (c *Client) ToggleAutoSleep(username string, enabled bool, idleThresholdMinutes int32) (*ToggleAutoSleepResponse, error) {
+	body := map[string]interface{}{
+		"enabled":                enabled,
+		"idle_threshold_minutes": idleThresholdMinutes,
+	}
+	respBody, err := c.doRequest("POST", "/v1/containers/"+username+"/auto-sleep", body)
+	if err != nil {
+		return nil, err
+	}
+	var resp ToggleAutoSleepResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// StopContainer stops a running container
+func (c *Client) StopContainer(username string, force bool) (*StopContainerResponse, error) {
+	req := map[string]interface{}{
+		"force": force,
+	}
+	respBody, err := c.doRequest("POST", "/v1/containers/"+username+"/stop", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp StopContainerResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// GetMetrics gets container metrics
+func (c *Client) GetMetrics(username string) (*GetMetricsResponse, error) {
+	path := "/v1/metrics"
+	if username != "" {
+		path = "/v1/metrics/" + username
+	}
+
+	respBody, err := c.doRequest("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp GetMetricsResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// GetSystemInfo gets system information
+func (c *Client) GetSystemInfo() (*GetSystemInfoResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/system/info", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp GetSystemInfoResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// metricsExportProviderWireName maps the CLI-facing lowercase provider
+// name ("gcp") to the full CloudMetricsProvider enum name the wire
+// protocol (protojson) expects. Mirrors internal/cmd/monitoring_export.go's
+// parseMetricsExportProvider without importing pkg/pb — this package
+// deliberately keeps its own plain-struct wire types rather than the
+// generated proto types (see the ListBackendsResponse comment above).
+func metricsExportProviderWireName(provider string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "gcp":
+		return "CLOUD_METRICS_PROVIDER_GCP", nil
+	case "aws":
+		// Passed through deliberately — the daemon's Unimplemented for
+		// AWS is the single source of truth, not a second copy of the
+		// allow-list here.
+		return "CLOUD_METRICS_PROVIDER_AWS", nil
+	default:
+		return "", fmt.Errorf("unknown cloud metrics export provider %q (supported: gcp)", provider)
+	}
+}
+
+// metricsExportGroupWireName maps a CLI-facing lowercase metric-group
+// name ("host"/"container"/"platform") to the full CloudMetricsGroup
+// enum name the wire protocol (protojson) expects (#1081). Mirrors
+// internal/cmd/monitoring_export.go's parseMetricsExportGroups without
+// importing pkg/pb — this package keeps its own plain-struct wire types.
+func metricsExportGroupWireName(group string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(group)) {
+	case "host":
+		return "CLOUD_METRICS_GROUP_HOST", nil
+	case "container":
+		return "CLOUD_METRICS_GROUP_CONTAINER", nil
+	case "platform":
+		return "CLOUD_METRICS_GROUP_PLATFORM", nil
+	default:
+		return "", fmt.Errorf("unknown metric group %q (supported: host, container, platform)", group)
+	}
+}
+
+// SetMetricsExport enables or disables opt-in export of host/container
+// infra metrics to the host cloud's native monitoring (#1069). provider
+// is required when enabled=true ("gcp"; "aws" is accepted and rejected
+// server-side with Unimplemented) and ignored when disabling. groups
+// (#1081) selects which series sets export ("host"/"container"/
+// "platform"); empty keeps today's host-only default.
+func (c *Client) SetMetricsExport(enabled bool, provider string, groups []string) (*SetMetricsExportResponse, error) {
+	wireProvider := "CLOUD_METRICS_PROVIDER_UNSPECIFIED"
+	if enabled {
+		wp, err := metricsExportProviderWireName(provider)
+		if err != nil {
+			return nil, err
+		}
+		wireProvider = wp
+	}
+
+	reqBody := map[string]interface{}{
+		"enabled":  enabled,
+		"provider": wireProvider,
+	}
+	if len(groups) > 0 {
+		wireGroups := make([]string, 0, len(groups))
+		for _, g := range groups {
+			wg, err := metricsExportGroupWireName(g)
+			if err != nil {
+				return nil, err
+			}
+			wireGroups = append(wireGroups, wg)
+		}
+		reqBody["groups"] = wireGroups
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	respBody, err := c.doRequest("POST", "/v1/system/metrics-export", body)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp SetMetricsExportResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// GetMetricsExport returns the current cloud-native metrics export
+// configuration and last-known health (#1069).
+func (c *Client) GetMetricsExport() (*GetMetricsExportResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/system/metrics-export", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp GetMetricsExportResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// LatestReleaseResponse is the GET /v1/releases/latest body (#354).
+type LatestReleaseResponse struct {
+	LatestRelease   string `json:"latestRelease"`
+	CurrentVersion  string `json:"currentVersion"`
+	UpdateAvailable bool   `json:"updateAvailable"`
+	TargetVersion   string `json:"targetVersion"` // sentinel-served version (#2171)
+}
+
+// GetLatestRelease reports the latest published Containarium release vs the
+// daemon's running version (cached server-side). #354.
+func (c *Client) GetLatestRelease() (*LatestReleaseResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/releases/latest", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp LatestReleaseResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// ValidateGPURequest is the typed /v1/validate-gpu request body. snake_case
+// tags match the daemon's grpc-gateway field names. #316.
+type ValidateGPURequest struct {
+	BackendID string `json:"backend_id,omitempty"`
+	Pci       string `json:"pci,omitempty"`
+}
+
+// ValidateGPUResult mirrors the /v1/validate-gpu (ValidateGPU) response. Status
+// is the proto enum name, e.g. "GPU_STATUS_OK". #316.
+type ValidateGPUResult struct {
+	Status        string `json:"status"`
+	GpuModel      string `json:"gpuModel"`
+	DriverVersion string `json:"driverVersion"`
+	Detail        string `json:"detail"`
+	BackendID     string `json:"backendId"`
+}
+
+// ValidateGPU asks the daemon to prove GPU passthrough works inside an LXC on a
+// backend (empty backendID = local; a peer id forwards to that peer). The
+// daemon creates and deletes a short-lived nvidia.runtime container, so this
+// can take ~30s. #316.
+func (c *Client) ValidateGPU(backendID, pci string) (*ValidateGPUResult, error) {
+	respBody, err := c.doRequest("POST", "/v1/validate-gpu", ValidateGPURequest{
+		BackendID: backendID,
+		Pci:       pci,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var resp ValidateGPUResult
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// TriggerUpgradeRequest is the typed /v1/backends/upgrade request body. #354.
+type TriggerUpgradeRequest struct {
+	BackendID string `json:"backend_id,omitempty"`
+	Force     bool   `json:"force,omitempty"`
+	// GithubTag installs this release directly from GitHub (#1028).
+	GithubTag string `json:"github_tag,omitempty"`
+	// AllowDowngrade permits a GithubTag older than the running version (#3059).
+	AllowDowngrade bool `json:"allow_downgrade,omitempty"`
+}
+
+// TriggerUpgradeResponse mirrors the TriggerUpgrade response. #354.
+type TriggerUpgradeResponse struct {
+	UpgradeID      string `json:"upgradeId"`
+	Status         string `json:"status"`
+	CurrentVersion string `json:"currentVersion"`
+	Message        string `json:"message"`
+	BackendID      string `json:"backendId"`
+	TargetVersion  string `json:"targetVersion"` // #2171
+}
+
+// TriggerUpgrade asks a backend to upgrade its daemon to the sentinel-served
+// binary now (empty backendID = the local/primary daemon; a peer id forwards to
+// that peer). Admin-only daemon-side. Async — a successful local upgrade
+// restarts the daemon, so confirm via the backend version in list_backends. #354.
+func (c *Client) TriggerUpgrade(req TriggerUpgradeRequest) (*TriggerUpgradeResponse, error) {
+	respBody, err := c.doRequest("POST", "/v1/backends/upgrade", req)
+	if err != nil {
+		return nil, err
+	}
+	var resp TriggerUpgradeResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// UpgradeStatusResponse mirrors the GetUpgradeStatus response. #354.
+type UpgradeStatusResponse struct {
+	Status         string `json:"status"`
+	CurrentVersion string `json:"currentVersion"`
+	Error          string `json:"error"`
+	CompletedAt    string `json:"completedAt"`
+	TargetVersion  string `json:"targetVersion"` // #2171
+}
+
+// GetUpgradeStatus polls an upgrade started by TriggerUpgrade. Returns status
+// "unknown" when the id isn't found — e.g. a local self-upgrade restarted the
+// daemon and dropped the job; compare the backend version instead. #354.
+func (c *Client) GetUpgradeStatus(upgradeID string) (*UpgradeStatusResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/upgrades/"+upgradeID, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp UpgradeStatusResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// AddRoute creates a domain → container:port mapping in the sentinel
+// reverse proxy. Used by the expose_port tool to make a container
+// reachable on the public internet under a chosen hostname.
+func (c *Client) AddRoute(req AddRouteRequest) (*AddRouteResponse, error) {
+	respBody, err := c.doRequest("POST", "/v1/network/routes", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp AddRouteResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// DeleteRoute removes a proxy route by its domain — the unexpose counterpart
+// of AddRoute. Mirrors DELETE /v1/network/routes/{domain}; idempotent
+// server-side (a missing route is a no-op success), so the caller need not
+// pre-check existence. Used by the delete_route tool to free a hostname (and,
+// on the cloud, its subdomain-quota slot).
+func (c *Client) DeleteRoute(domain string) error {
+	_, err := c.doRequest("DELETE", "/v1/network/routes/"+url.PathEscape(domain), nil)
+	return err
+}
+
+// GuardEntryResponse / GuardStatusResponse / NetworkGuardStatusResponse mirror
+// the proto NetworkGuardStatus as grpc-gateway renders it (GET /v1/network/guard).
+type GuardEntryResponse struct {
+	Container string `json:"container"`
+	Subject   string `json:"subject"`
+	IP        string `json:"ip"`
+	ACLName   string `json:"aclName"`
+	Attached  bool   `json:"attached"`
+	LastError string `json:"lastError"`
+}
+
+type GuardStatusResponse struct {
+	Mode           string               `json:"mode"`
+	FirewallDriver string               `json:"firewallDriver"`
+	Unsupported    bool                 `json:"unsupported"`
+	LastPass       string               `json:"lastPass"`
+	LastError      string               `json:"lastError"`
+	StaleSince     string               `json:"staleSince"`
+	Entries        []GuardEntryResponse `json:"entries"`
+	Unresolved     []string             `json:"unresolved"`
+	Unmanaged      []string             `json:"unmanaged"`
+	Subjects       int                  `json:"subjects"`
+}
+
+type NetworkGuardStatusResponse struct {
+	Core   *GuardStatusResponse `json:"core"`
+	Tenant *GuardStatusResponse `json:"tenant"`
+}
+
+// GetNetworkGuardStatus reads both NIC-ACL guards' last-pass state — the
+// same endpoint `containarium network-guard status` uses (#2353).
+func (c *Client) GetNetworkGuardStatus() (*NetworkGuardStatusResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/network/guard", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp NetworkGuardStatusResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// ListRoutes returns all proxy routes the sentinel currently serves. Both
+// filter params are optional — empty `username` or `activeOnly=false`
+// means "no filter on that dimension". Mirrors GET /v1/network/routes.
+func (c *Client) ListRoutes(username string, activeOnly bool) (*ListRoutesResponse, error) {
+	path := "/v1/network/routes"
+	q := ""
+	if username != "" {
+		q = "username=" + username
+	}
+	if activeOnly {
+		if q != "" {
+			q += "&"
+		}
+		q += "activeOnly=true"
+	}
+	if q != "" {
+		path += "?" + q
+	}
+	respBody, err := c.doRequest("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp ListRoutesResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// AddCollaboratorRequest grants a teammate access to req.OwnerUsername's box
+// (#1145 — the agent surface for what a human already has via the CLI/REST/
+// dashboard). OwnerUsername is only used to build the URL path, mirroring
+// CreateContainerRequest's own convention of not round-tripping path-bound
+// fields through the body.
+type AddCollaboratorRequest struct {
+	OwnerUsername         string   `json:"-"`
+	CollaboratorUsername  string   `json:"collaboratorUsername"`
+	SSHPublicKeys         []string `json:"sshPublicKeys,omitempty"`
+	GrantSudo             bool     `json:"grantSudo,omitempty"`
+	GrantContainerRuntime bool     `json:"grantContainerRuntime,omitempty"`
+}
+
+// CollaboratorInfo mirrors the wire shape of proto Collaborator
+// (proto/containarium/v1/container.proto). AddedAt is `,string` because
+// grpc-gateway serializes int64 scalars as JSON strings (see this package's
+// wire_format_test.go — a missing `,string` tag here breaks
+// json.Unmarshal on every real response, silently on a symmetric httptest
+// mock).
+type CollaboratorInfo struct {
+	ID                   string `json:"id"`
+	ContainerName        string `json:"containerName"`
+	OwnerUsername        string `json:"ownerUsername"`
+	CollaboratorUsername string `json:"collaboratorUsername"`
+	AccountName          string `json:"accountName"`
+	// SSHPublicKey is deprecated server-side (#1144): it now carries just the
+	// FIRST authorized key, not every key. Prefer SSHPublicKeys.
+	SSHPublicKey        string   `json:"sshPublicKey,omitempty"`
+	SSHPublicKeys       []string `json:"sshPublicKeys,omitempty"`
+	AddedAt             int64    `json:"addedAt,string"`
+	CreatedBy           string   `json:"createdBy,omitempty"`
+	HasSudo             bool     `json:"hasSudo,omitempty"`
+	HasContainerRuntime bool     `json:"hasContainerRuntime,omitempty"`
+}
+
+type AddCollaboratorResponse struct {
+	Message      string           `json:"message"`
+	Collaborator CollaboratorInfo `json:"collaborator"`
+	SSHCommand   string           `json:"sshCommand,omitempty"`
+}
+
+// AddCollaborator grants a collaborator access to req.OwnerUsername's box.
+// Mirrors POST /v1/containers/{owner}/collaborators — the same endpoint the
+// CLI's remote path (internal/client.{GRPCClient,HTTPClient}.AddCollaborator)
+// and the web UI already call.
+func (c *Client) AddCollaborator(req AddCollaboratorRequest) (*AddCollaboratorResponse, error) {
+	path := fmt.Sprintf("/v1/containers/%s/collaborators", url.PathEscape(req.OwnerUsername))
+	respBody, err := c.doRequest("POST", path, req)
+	if err != nil {
+		return nil, err
+	}
+	var resp AddCollaboratorResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// ListCollaboratorsResponse mirrors proto ListCollaboratorsResponse.
+// TotalCount is a plain int32 (not `,string`) — protojson only stringifies
+// 64-bit integers.
+type ListCollaboratorsResponse struct {
+	Collaborators []CollaboratorInfo `json:"collaborators"`
+	TotalCount    int32              `json:"totalCount"`
+}
+
+// ListCollaborators lists everyone with access to ownerUsername's box.
+// Mirrors GET /v1/containers/{owner}/collaborators.
+func (c *Client) ListCollaborators(ownerUsername string) (*ListCollaboratorsResponse, error) {
+	path := fmt.Sprintf("/v1/containers/%s/collaborators", url.PathEscape(ownerUsername))
+	respBody, err := c.doRequest("GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp ListCollaboratorsResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+type RemoveCollaboratorResponse struct {
+	Message string `json:"message,omitempty"`
+}
+
+// RemoveCollaborator revokes a collaborator's access. Mirrors
+// DELETE /v1/containers/{owner}/collaborators/{collaborator}.
+func (c *Client) RemoveCollaborator(ownerUsername, collaboratorUsername string) (*RemoveCollaboratorResponse, error) {
+	path := fmt.Sprintf("/v1/containers/%s/collaborators/%s", url.PathEscape(ownerUsername), url.PathEscape(collaboratorUsername))
+	respBody, err := c.doRequest("DELETE", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp RemoveCollaboratorResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// AddPassthroughRoute creates a raw TCP/UDP port-forwarding rule (no TLS
+// termination) on the daemon. Used by the add_passthrough_route tool — the
+// passthrough counterpart of AddRoute, for callers who need L4 passthrough
+// (e.g. mTLS gRPC) instead of the HTTPS reverse proxy. See #1550.
+func (c *Client) AddPassthroughRoute(req AddPassthroughRouteRequest) (*AddPassthroughRouteResponse, error) {
+	respBody, err := c.doRequest("POST", "/v1/network/passthrough", req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp AddPassthroughRouteResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// DeletePassthroughRoute removes a TCP/UDP passthrough route by its
+// external port and protocol — the unexpose counterpart of
+// AddPassthroughRoute. Mirrors DELETE /v1/network/passthrough/{external_port}.
+// Used by the delete_passthrough_route tool.
+func (c *Client) DeletePassthroughRoute(externalPort int32, protocol string) error {
+	path := fmt.Sprintf("/v1/network/passthrough/%d", externalPort)
+	if protocol != "" {
+		path += "?protocol=" + url.QueryEscape(protocol)
+	}
+	_, err := c.doRequest("DELETE", path, nil)
+	return err
+}
+
+// ListPassthroughRoutes returns all TCP/UDP passthrough routes the daemon
+// currently forwards. Mirrors GET /v1/network/passthrough. Used by the
+// list_passthrough_routes tool.
+func (c *Client) ListPassthroughRoutes() (*ListPassthroughRoutesResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/network/passthrough", nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp ListPassthroughRoutesResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+	return &resp, nil
+}
+
+// ListBackends returns the cluster topology — the local daemon plus any
+// tunnel-connected peers. Used by the list_backends MCP tool so an
+// agent can reason about peer health, container counts, and GPU
+// inventory without inferring topology from container IPs.
+func (c *Client) ListBackends() (*ListBackendsResponse, error) {
+	respBody, err := c.doRequest("GET", "/v1/backends", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp ListBackendsResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	return &resp, nil
+}
+
+// GetBackend returns a single backend by ID. The daemon doesn't have a
+// dedicated /v1/backends/{id} endpoint (the only path-with-id route is
+// /v1/backends/{id}/system-info, which forwards to that backend), so
+// we implement it client-side as a list-and-filter. The list is small
+// (typically a handful of peers), and this keeps the wire surface
+// stable for now — easy to swap for a dedicated endpoint later.
+func (c *Client) GetBackend(id string) (*Backend, error) {
+	resp, err := c.ListBackends()
+	if err != nil {
+		return nil, err
+	}
+	for i := range resp.Backends {
+		if resp.Backends[i].ID == id {
+			return &resp.Backends[i], nil
+		}
+	}
+	return nil, fmt.Errorf("backend %q not found", id)
+}
+
+// TriggerSecurityScan posts to the daemon's scan-trigger endpoints. For
+// kind="all" it runs the three trigger endpoints sequentially and rolls
+// up the queued counts. Errors from individual triggers are collected
+// but don't abort the others — a partial scan is better than none.
+func (c *Client) TriggerSecurityScan(kind, containerName, username string) (*SecurityScanResponse, error) {
+	kinds := []string{kind}
+	if kind == scanKindAll {
+		kinds = []string{scanKindClamav, scanKindPentest, scanKindZap}
+	}
+
+	type triggerOk struct {
+		Message      string `json:"message"`
+		ScannedCount int    `json:"scannedCount"`
+	}
+
+	var msgs []string
+	var totalQueued int
+	for _, k := range kinds {
+		var path string
+		var body interface{}
+		switch k {
+		case scanKindClamav:
+			path = "/v1/security/clamav-scan"
+			body = map[string]string{"containerName": containerName}
+		case scanKindPentest:
+			// TriggerPentestScanRequest carries containerName as an
+			// optional scope. Empty would trigger a cluster-wide scan;
+			// the MCP tool requires `username` so we always pass the
+			// container through here.
+			path = "/v1/pentest/scan"
+			body = map[string]string{"containerName": containerName}
+		case scanKindZap:
+			// Same shape as pentest — containerName scopes the scan.
+			path = "/v1/zap/scan"
+			body = map[string]string{"containerName": containerName}
+		}
+		respBody, err := c.doRequest("POST", path, body)
+		if err != nil {
+			msgs = append(msgs, fmt.Sprintf("%s: error: %v", k, err))
+			continue
+		}
+		var resp triggerOk
+		_ = json.Unmarshal(respBody, &resp)
+		if resp.Message != "" {
+			msgs = append(msgs, fmt.Sprintf("%s: %s", k, resp.Message))
+		} else {
+			msgs = append(msgs, fmt.Sprintf("%s: triggered", k))
+		}
+		totalQueued += resp.ScannedCount
+		if resp.ScannedCount == 0 {
+			totalQueued++ // some triggers don't return a count
+		}
+	}
+
+	poll := "Call security_findings in ~30s for ClamAV/pentest; ZAP runs minutes."
+	if kind == scanKindClamav {
+		poll = "ClamAV is fast — call security_findings in ~5s."
+	}
+	if kind == scanKindZap {
+		poll = "ZAP can take 1-5 minutes. Call security_findings periodically."
+	}
+	return &SecurityScanResponse{
+		Kind:     kind,
+		Message:  strings.Join(msgs, "; "),
+		Queued:   totalQueued,
+		PollHint: poll,
+	}, nil
+}
+
+// ListSecurityFindings fetches findings from one or all scanner kinds and
+// normalizes them into the unified SecurityFinding shape.
+func (c *Client) ListSecurityFindings(kind, containerName string) ([]SecurityFinding, error) {
+	kinds := []string{kind}
+	if kind == scanKindAll {
+		kinds = []string{scanKindClamav, scanKindPentest, scanKindZap}
+	}
+
+	var out []SecurityFinding
+	for _, k := range kinds {
+		rows, err := c.listOneScanner(k, containerName)
+		if err != nil {
+			// Per-scanner failures shouldn't abort the others — surface
+			// them as a synthetic "info" row so the agent sees why.
+			out = append(out, SecurityFinding{
+				Kind:        k,
+				Severity:    "info",
+				Title:       fmt.Sprintf("scanner %s unreachable", k),
+				Description: err.Error(),
+			})
+			continue
+		}
+		out = append(out, rows...)
+	}
+	return out, nil
+}
+
+// listOneScanner pulls + normalizes findings from one scanner.
+func (c *Client) listOneScanner(kind, containerName string) ([]SecurityFinding, error) {
+	switch kind {
+	case scanKindClamav:
+		path := "/v1/security/clamav-reports?containerName=" + containerName
+		body, err := c.doRequest("GET", path, nil)
+		if err != nil {
+			return nil, err
+		}
+		var resp struct {
+			Reports []struct {
+				// grpc-gateway emits int64 as a JSON string — see the
+				// pentest comment below for why this matters.
+				ID            int64  `json:"id,string"`
+				ContainerName string `json:"containerName"`
+				Status        string `json:"status"`
+				FindingsCount int    `json:"findingsCount"`
+				Findings      string `json:"findings"`
+			} `json:"reports"`
+		}
+		_ = json.Unmarshal(body, &resp)
+		var out []SecurityFinding
+		for _, r := range resp.Reports {
+			if r.Status != "infected" || r.FindingsCount == 0 {
+				continue
+			}
+			out = append(out, SecurityFinding{
+				Kind:          scanKindClamav,
+				ID:            r.ID,
+				Severity:      "critical", // infected = critical by default
+				Title:         fmt.Sprintf("ClamAV found %d infected file(s)", r.FindingsCount),
+				Description:   r.Findings,
+				ContainerName: r.ContainerName,
+				FixAvailable:  false, // ClamAV findings require quarantine workflow, not auto-fix
+			})
+		}
+		return out, nil
+
+	case scanKindPentest:
+		// The pentest proto has no container_name filter, so we pull
+		// all findings and filter client-side on the target prefix.
+		// Sending ?containerName= would just be ignored by grpc-gateway.
+		body, err := c.doRequest("GET", "/v1/pentest/findings", nil)
+		if err != nil {
+			return nil, err
+		}
+		var resp struct {
+			Findings []struct {
+				// grpc-gateway emits proto int64 as a JSON string per
+				// protojson spec — without `,string` this silently
+				// decodes to 0, which breaks RemediatePentestFinding.
+				ID          int64  `json:"id,string"`
+				Category    string `json:"category"`
+				Severity    string `json:"severity"`
+				Title       string `json:"title"`
+				Description string `json:"description"`
+				Target      string `json:"target"`
+				Suppressed  bool   `json:"suppressed"`
+			} `json:"findings"`
+		}
+		_ = json.Unmarshal(body, &resp)
+		var out []SecurityFinding
+		for _, f := range resp.Findings {
+			if f.Suppressed {
+				continue
+			}
+			// Trivy findings encode container in their target as
+			// "<container> (path/to/binary)". Domain-level findings
+			// (SPF, missing CSP, etc.) don't belong to any container,
+			// so they're intentionally absent from per-container queries.
+			if !strings.HasPrefix(f.Target, containerName+" ") {
+				continue
+			}
+			out = append(out, SecurityFinding{
+				Kind:        scanKindPentest,
+				ID:          f.ID,
+				Severity:    f.Severity,
+				Title:       f.Title,
+				Description: f.Description,
+				Target:      f.Target,
+				// Only trivy findings have an auto-fix path —
+				// RemediatePentestFinding refuses other categories.
+				FixAvailable: f.Category == "trivy",
+			})
+		}
+		return out, nil
+
+	case scanKindZap:
+		// ZAP proto has no container_name filter either; same
+		// client-side filter pattern as pentest. We match alerts whose
+		// URL contains the container name as a hostname-ish prefix —
+		// ZAP scans by URL, so the linkage to a container is via the
+		// hostname the scan was pointed at.
+		body, err := c.doRequest("GET", "/v1/zap/alerts", nil)
+		if err != nil {
+			return nil, err
+		}
+		var resp struct {
+			Alerts []struct {
+				// See the pentest comment on `,string` — int64 over
+				// protojson arrives as a JSON string.
+				ID          int64  `json:"id,string"`
+				AlertName   string `json:"alertName"`
+				Risk        string `json:"risk"`
+				Description string `json:"description"`
+				URL         string `json:"url"`
+				Suppressed  bool   `json:"suppressed"`
+			} `json:"alerts"`
+		}
+		_ = json.Unmarshal(body, &resp)
+		var out []SecurityFinding
+		for _, a := range resp.Alerts {
+			if a.Suppressed {
+				continue
+			}
+			if !strings.Contains(a.URL, containerName) {
+				continue
+			}
+			out = append(out, SecurityFinding{
+				Kind:         scanKindZap,
+				ID:           a.ID,
+				Severity:     normalizeZapRisk(a.Risk),
+				Title:        a.AlertName,
+				Description:  a.Description,
+				Target:       a.URL,
+				FixAvailable: false, // ZAP findings need web-app code fixes; no auto-remediation today
+			})
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("unknown kind: %s", kind)
+}
+
+// normalizeZapRisk maps ZAP's "high|medium|low|informational" onto our
+// shared severity set.
+func normalizeZapRisk(r string) string {
+	switch strings.ToLower(r) {
+	case "high":
+		return "high"
+	case "medium":
+		return "medium"
+	case "low":
+		return "low"
+	case "informational", "info":
+		return "info"
+	}
+	return "info"
+}
+
+// RemediateSecurityFinding calls the daemon's RemediatePentestFinding
+// RPC. Only valid for pentest findings; ClamAV/ZAP findings are
+// rejected with FixAvailable=false at security_findings time.
+func (c *Client) RemediateSecurityFinding(findingID int64) (*SecurityRemediateResponse, error) {
+	path := fmt.Sprintf("/v1/pentest/findings/%d/remediate", findingID)
+	body, err := c.doRequest("POST", path, struct{}{})
+	if err != nil {
+		return nil, err
+	}
+	var resp SecurityRemediateResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse remediate response: %w", err)
+	}
+	return &resp, nil
+}
+
+// InstallZap calls the daemon's InstallZap RPC, which downloads and
+// installs OWASP ZAP into the host's security container. Admin-only on
+// the daemon side (RequireRole(RoleAdmin)); this is the one Go call both
+// the `containarium zap-install` CLI subcommand and the install_zap MCP
+// tool go through, per this repo's CLI-first convention. Host-level —
+// there is no per-container scoping, since each daemon manages exactly
+// one security container.
+func (c *Client) InstallZap() (*InstallZapResponse, error) {
+	body, err := c.doRequest("POST", "/v1/zap/install", struct{}{})
+	if err != nil {
+		return nil, err
+	}
+	var resp InstallZapResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse install response: %w", err)
+	}
+	return &resp, nil
+}
+
+// InstallClamav asks the daemon to install ClamAV and its signatures inside
+// one box (#2659). It is the single Go call behind both the
+// `containarium security clamav install` CLI command and the
+// `install_clamav` MCP tool. The install can take minutes (package download
+// and the first signature fetch), so this uses a longer timeout than the
+// default 120s client.
+func (c *Client) InstallClamav(containerName string) (*InstallClamavResponse, error) {
+	long := *c
+	hc := *c.httpClient
+	hc.Timeout = 20 * time.Minute
+	long.httpClient = &hc
+	body, err := long.doRequest("POST", "/v1/security/clamav-install", map[string]string{"container_name": containerName})
+	if err != nil {
+		return nil, err
+	}
+	var resp InstallClamavResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse install response: %w", err)
+	}
+	return &resp, nil
+}
+
+// API Request/Response types
+
+type CreateContainerRequest struct {
+	NetworkTenant string            `json:"networkTenant,omitempty"`
+	Username      string            `json:"username"`
+	Resources     *ResourceLimits   `json:"resources,omitempty"`
+	SSHKeys       []string          `json:"sshKeys,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Image         string            `json:"image,omitempty"`
+	EnablePodman  bool              `json:"enablePodman,omitempty"`
+
+	// DisableAutoSleep asks for a box with no auto-sleep timer (#2759). Only
+	// meaningful on a hosted platform that defaults some orgs to auto-sleep; a
+	// standalone daemon ignores it.
+	DisableAutoSleep bool `json:"disableAutoSleep,omitempty"`
+
+	// GPU is the legacy single-GPU field. Prefer GPUs. When GPUs is set it
+	// supersedes this on the daemon side.
+	GPU string `json:"gpu,omitempty"`
+
+	// GPUs lists the GPU devices to attach (index "0"/"1" or PCI address per
+	// entry) for multi-GPU passthrough. Empty = no GPU.
+	GPUs []string `json:"gpus,omitempty"`
+
+	// Monitoring opts the container into application-emitted
+	// OpenTelemetry. When true, the daemon stamps the LXC with
+	// OTEL_EXPORTER_OTLP_ENDPOINT etc., pointing at the core
+	// collector. Default false (opt-in). See
+	// docs/OTEL-COLLECTOR-DESIGN.md for the full design.
+	Monitoring bool `json:"monitoring,omitempty"`
+
+	// Encrypted requests a tenant-scoped ZFS key for the container's
+	// dataset instead of the pool-wide key (#1198). The daemon refuses
+	// the create with FAILED_PRECONDITION when no KeyProvider is
+	// configured — it never falls back to plaintext.
+	Encrypted bool `json:"encrypted,omitempty"`
+
+	// TenantID scopes the encryption key. A single-tenant daemon accepts
+	// only an empty value or "default".
+	TenantID string `json:"tenantId,omitempty"`
+
+	// Pool selects placement by pool tag. When set with an empty
+	// BackendID, the daemon picks any healthy backend in the pool.
+	// When set with BackendID, the daemon validates that BackendID
+	// belongs to this pool.
+	Pool string `json:"pool,omitempty"`
+
+	// BackendID pins the container to a specific peer. Use Pool
+	// when any backend in a group will do; use BackendID for an
+	// exact placement.
+	BackendID string `json:"backendId,omitempty"`
+
+	// Region places the container on a multi-region hosted control plane
+	// (#1606). A standalone/single-region daemon ignores it.
+	Region string `json:"region,omitempty"`
+
+	// Isolation is the IsolationType enum *name* ("ISOLATION_TYPE_VM"),
+	// which is what grpc-gateway's protojson accepts. Empty = not sent =
+	// the daemon's default (#2196).
+	Isolation string `json:"isolation,omitempty"`
+
+	// OSType is the OSType enum *name* ("OS_TYPE_ROCKY_9"),
+	// which is what grpc-gateway's protojson accepts. Empty = not sent =
+	// the daemon's default (#2208).
+	OSType string `json:"osType,omitempty"`
+}
+
+type ResourceLimits struct {
+	CPU    string `json:"cpu,omitempty"`
+	Memory string `json:"memory,omitempty"`
+	Disk   string `json:"disk,omitempty"`
+}
+
+type CreateContainerResponse struct {
+	Container  Container `json:"container"`
+	Message    string    `json:"message"`
+	SSHCommand string    `json:"sshCommand,omitempty"`
+}
+
+type ListContainersResponse struct {
+	Containers []Container `json:"containers"`
+	TotalCount int         `json:"totalCount"`
+}
+
+type GetContainerResponse struct {
+	Container Container         `json:"container"`
+	Metrics   *ContainerMetrics `json:"metrics,omitempty"`
+}
+
+type DebugContainerResponse struct {
+	ContainerState       string   `json:"containerState"`
+	HostUserExists       bool     `json:"hostUserExists"`
+	HostUserShell        string   `json:"hostUserShell"`
+	HostUserShellExists  bool     `json:"hostUserShellExists"`
+	RecentSshdRejections []string `json:"recentSshdRejections"`
+	LikelyCause          string   `json:"likelyCause"`
+	NextActions          []string `json:"nextActions"`
+	SourceRepo           string   `json:"sourceRepo,omitempty"`
+	DaemonVersion        string   `json:"daemonVersion,omitempty"`
+	// SSHIngressHost is the advertised public SSH entrypoint (sentinel host),
+	// or empty for direct/in-network mode (no external SSH entrypoint — reach
+	// the container by IP or via an in-network deploy pipeline). See #1011.
+	SSHIngressHost string `json:"sshIngressHost,omitempty"`
+}
+
+type DeleteContainerResponse struct {
+	Message       string `json:"message"`
+	ContainerName string `json:"containerName"`
+}
+
+type ToggleMonitoringResponse struct {
+	Message           string `json:"message"`
+	MonitoringEnabled bool   `json:"monitoring_enabled"`
+}
+
+type ResizeContainerResponse struct {
+	Message   string    `json:"message"`
+	Container Container `json:"container"`
+}
+
+type SecretResponse struct {
+	Message string `json:"message"`
+	// The created/updated secret's metadata (never its value). Typed for
+	// the same reason as ListSecrets (#1219): the gateway emits
+	// lowerCamelCase, and a map hides a key mismatch until someone reads
+	// a blank field.
+	Secret SecretMetadata `json:"secret"`
+}
+
+type RefreshSecretsResponse struct {
+	Message string `json:"message"`
+	Stamped int32  `json:"stamped"`
+}
+
+type StartContainerResponse struct {
+	Message       string    `json:"message"`
+	Container     Container `json:"container"`
+	ReadyTimedOut bool      `json:"readyTimedOut"`
+}
+
+type ToggleAutoSleepResponse struct {
+	Message              string `json:"message"`
+	AutoSleepEnabled     bool   `json:"autoSleepEnabled"`
+	IdleThresholdMinutes int32  `json:"idleThresholdMinutes"`
+}
+
+type StopContainerResponse struct {
+	Message   string    `json:"message"`
+	Container Container `json:"container"`
+}
+
+type GetMetricsResponse struct {
+	Metrics []ContainerMetrics `json:"metrics"`
+}
+
+type GetSystemInfoResponse struct {
+	Info SystemInfo `json:"info"`
+}
+
+// SetMetricsExportResponse mirrors the wire response of
+// ContainerService.SetMetricsExport (#1069).
+type SetMetricsExportResponse struct {
+	Message         string   `json:"message"`
+	Enabled         bool     `json:"enabled"`
+	Provider        string   `json:"provider"`
+	IntervalSeconds int32    `json:"intervalSeconds"`
+	Groups          []string `json:"groups,omitempty"`
+}
+
+// GetMetricsExportResponse mirrors the wire response of
+// ContainerService.GetMetricsExport (#1069). LastSuccessAt, LastError,
+// and ExportFailures are zero-valued until the metrics collector
+// (#1070/#1071) is wired.
+type GetMetricsExportResponse struct {
+	Enabled         bool      `json:"enabled"`
+	Provider        string    `json:"provider"`
+	IntervalSeconds int32     `json:"intervalSeconds"`
+	Groups          []string  `json:"groups,omitempty"`
+	LastSuccessAt   string    `json:"lastSuccessAt,omitempty"`
+	LastError       string    `json:"lastError,omitempty"`
+	ExportFailures  flexInt64 `json:"exportFailures,omitempty"`
+}
+
+// ListBackendsResponse mirrors the /v1/backends wire shape — the proto-first
+// ContainerService.ListBackends RPC (BackendInfo), which replaced the former
+// hand-coded handler (#354). The MCP client keeps its own struct rather than
+// importing the generated type.
+//
+// 64-bit int fields use flexInt64: grpc-gateway's protojson serializes int64
+// as a QUOTED STRING ("12345"), not a number. The original plain-int64 fields
+// here therefore failed to decode every response from a proto-first daemon
+// ("cannot unmarshal string into int64"), silently breaking list_backends.
+// flexInt64 accepts both the string and number forms, so it works across
+// mixed daemon versions.
+type ListBackendsResponse struct {
+	Backends []Backend `json:"backends"`
+}
+
+type Backend struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"` // "local" or "tunnel"
+	Healthy bool   `json:"healthy"`
+	Version string `json:"version,omitempty"`
+	// IncusVersion is the Incus server version on the backend; absent when
+	// the backend could not report it.
+	IncusVersion   string       `json:"incusVersion,omitempty"`
+	Hostname       string       `json:"hostname,omitempty"`
+	UptimeSeconds  flexInt64    `json:"uptimeSeconds,omitempty"`
+	LastSeenAt     string       `json:"lastSeenAt,omitempty"`
+	OS             string       `json:"os,omitempty"`
+	ContainerCount int32        `json:"containerCount"`
+	GPUs           []BackendGPU `json:"gpus,omitempty"`
+	// HostLoad is what this machine is actually doing right now, absent
+	// when the daemon had no usable sample (cloud #966). Absent means
+	// "unknown", not "idle" — an agent reading this must not treat a
+	// missing block as a host with spare capacity.
+	HostLoad *BackendHostLoad `json:"hostLoad,omitempty"`
+}
+
+// BackendHostLoad mirrors BackendInfo.host_load: measured live usage for one
+// backend host, including tunnel-connected BYOC hosts. Distinct from any
+// capacity/committed figure — those say what has been allocated, this says
+// what is being used.
+type BackendHostLoad struct {
+	CPULoad1m        float64   `json:"cpuLoad1m,omitempty"`
+	CPULoad5m        float64   `json:"cpuLoad5m,omitempty"`
+	CPULoad15m       float64   `json:"cpuLoad15m,omitempty"`
+	CPUCores         int32     `json:"cpuCores,omitempty"`
+	MemoryUsedBytes  flexInt64 `json:"memoryUsedBytes,omitempty"`
+	MemoryTotalBytes flexInt64 `json:"memoryTotalBytes,omitempty"`
+	DiskUsedBytes    flexInt64 `json:"diskUsedBytes,omitempty"`
+	DiskTotalBytes   flexInt64 `json:"diskTotalBytes,omitempty"`
+	SampledAt        string    `json:"sampledAt,omitempty"`
+}
+
+type BackendGPU struct {
+	Vendor    string    `json:"vendor,omitempty"`
+	ModelName string    `json:"modelName,omitempty"`
+	VRAMBytes flexInt64 `json:"vramBytes,omitempty"`
+}
+
+// flexInt64 decodes an int64 that may arrive as a JSON number OR, as
+// grpc-gateway's protojson encodes 64-bit ints, a quoted string. encoding/json
+// would reject the string form into a plain int64; this accepts both.
+type flexInt64 int64
+
+func (n *flexInt64) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(string(b), `"`)
+	if s == "" || s == "null" {
+		*n = 0
+		return nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("flexInt64: cannot parse %q as int64: %w", s, err)
+	}
+	*n = flexInt64(v)
+	return nil
+}
+
+// AddRouteRequest mirrors network.proto's AddRouteRequest. JSON field
+// names match the grpc-gateway HTTP shape (camelCase) so requests
+// serialized with encoding/json land at /v1/network/routes correctly.
+type AddRouteRequest struct {
+	Domain        string `json:"domain"`
+	TargetIP      string `json:"targetIp"`
+	TargetPort    int32  `json:"targetPort"`
+	ContainerName string `json:"containerName,omitempty"`
+	Description   string `json:"description,omitempty"`
+	// Protocol is "ROUTE_PROTOCOL_HTTP" by default on the server side;
+	// expose_port doesn't surface it because the demo path is HTTP.
+}
+
+type AddRouteResponse struct {
+	Route   ProxyRoute `json:"route"`
+	Message string     `json:"message,omitempty"`
+}
+
+type ProxyRoute struct {
+	// Domain (the one expose_port sets) and the proto's richer fields
+	// (subdomain, fullDomain, active, appId, appName) — accept both shapes
+	// because AddRoute echoes one set and GetRoutes returns the other.
+	Domain        string `json:"domain,omitempty"`
+	Subdomain     string `json:"subdomain,omitempty"`
+	FullDomain    string `json:"fullDomain,omitempty"`
+	ContainerIP   string `json:"containerIp"`
+	Port          int32  `json:"port"`
+	Active        bool   `json:"active,omitempty"`
+	ContainerName string `json:"containerName,omitempty"`
+	Description   string `json:"description,omitempty"`
+	AppID         string `json:"appId,omitempty"`
+	AppName       string `json:"appName,omitempty"`
+}
+
+// ListRoutesResponse mirrors the daemon's GetRoutesResponse.
+type ListRoutesResponse struct {
+	Routes     []ProxyRoute `json:"routes"`
+	TotalCount int          `json:"totalCount"`
+}
+
+// AddPassthroughRouteRequest mirrors network.proto's
+// AddPassthroughRouteRequest. JSON field names match the grpc-gateway HTTP
+// shape (camelCase). Protocol is the proto enum's name (e.g.
+// "ROUTE_PROTOCOL_TCP") — see passthroughProtocolToProto in tools.go for
+// the friendly-string → proto-name mapping the tool handlers use.
+type AddPassthroughRouteRequest struct {
+	ExternalPort  int32  `json:"externalPort"`
+	TargetIP      string `json:"targetIp"`
+	TargetPort    int32  `json:"targetPort"`
+	Protocol      string `json:"protocol,omitempty"`
+	ContainerName string `json:"containerName,omitempty"`
+	Description   string `json:"description,omitempty"`
+}
+
+type AddPassthroughRouteResponse struct {
+	Route   PassthroughRoute `json:"route"`
+	Message string           `json:"message,omitempty"`
+}
+
+// PassthroughRoute mirrors network.proto's PassthroughRoute — unlike
+// ProxyRoute, its field names match the proto directly (no domain/fullDomain
+// split), so no fallback dance is needed in the handlers.
+type PassthroughRoute struct {
+	ExternalPort  int32  `json:"externalPort"`
+	TargetIP      string `json:"targetIp"`
+	TargetPort    int32  `json:"targetPort"`
+	Protocol      string `json:"protocol,omitempty"`
+	Active        bool   `json:"active,omitempty"`
+	ContainerName string `json:"containerName,omitempty"`
+	Description   string `json:"description,omitempty"`
+}
+
+// ListPassthroughRoutesResponse mirrors the daemon's
+// ListPassthroughRoutesResponse.
+type ListPassthroughRoutesResponse struct {
+	Routes     []PassthroughRoute `json:"routes"`
+	TotalCount int                `json:"totalCount"`
+}
+
+type Container struct {
+	NetworkTenant       string          `json:"networkTenant"`
+	NetworkTenantSource string          `json:"networkTenantSource"`
+	Name                string          `json:"name"`
+	Username            string          `json:"username"`
+	State               string          `json:"state"`
+	Resources           *ResourceLimits `json:"resources,omitempty"`
+	SSHKeys             []string        `json:"sshKeys,omitempty"`
+	Network             *NetworkInfo    `json:"network,omitempty"`
+	// CreatedAt / UpdatedAt come back as JSON strings from the platform's
+	// grpc-gateway HTTP layer — int64 protobuf scalars are emitted as
+	// strings to avoid JavaScript number-precision loss. The `,string`
+	// tag makes encoding/json round-trip them correctly on both sides.
+	CreatedAt     int64             `json:"createdAt,string"`
+	UpdatedAt     int64             `json:"updatedAt,string,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Image         string            `json:"image,omitempty"`
+	PodmanEnabled bool              `json:"podmanEnabled"`
+	BackendID     string            `json:"backendId,omitempty"`
+	Pool          string            `json:"pool,omitempty"`
+	// SSHHost is the public SSH endpoint (the sentinel) clients dial to reach
+	// this container: `ssh <username>@<SSHHost>`. The daemon stamps it per
+	// container from its --ssh-host, so it is the source of truth for which
+	// sentinel a container belongs to. Empty in direct / no-sentinel
+	// deployments, where clients fall back to the container IP.
+	SSHHost string `json:"sshHost,omitempty"`
+}
+
+type NetworkInfo struct {
+	IPAddress  string `json:"ipAddress,omitempty"`
+	MacAddress string `json:"macAddress,omitempty"`
+	Interface  string `json:"interface,omitempty"`
+	Bridge     string `json:"bridge,omitempty"`
+}
+
+type ContainerMetrics struct {
+	Name string `json:"name"`
+	// All int64 fields below come back as JSON strings from grpc-gateway
+	// (see Container.CreatedAt for rationale). int32 fields like
+	// ProcessCount stay numeric.
+	CPUUsageSeconds  int64 `json:"cpuUsageSeconds,string"`
+	MemoryUsageBytes int64 `json:"memoryUsageBytes,string"`
+	MemoryPeakBytes  int64 `json:"memoryPeakBytes,string"`
+	DiskUsageBytes   int64 `json:"diskUsageBytes,string"`
+	NetworkRxBytes   int64 `json:"networkRxBytes,string"`
+	NetworkTxBytes   int64 `json:"networkTxBytes,string"`
+	ProcessCount     int32 `json:"processCount"`
+	// CFS throttling counters (#1573) — cumulative, like CPUUsageSeconds.
+	// All zero means the runtime reported no signal, not "never throttled".
+	CPUNrPeriods     int64 `json:"cpuNrPeriods,string"`
+	CPUNrThrottled   int64 `json:"cpuNrThrottled,string"`
+	CPUThrottledUsec int64 `json:"cpuThrottledUsec,string"`
+}
+
+type SystemInfo struct {
+	IncusVersion      string `json:"incusVersion"`
+	OS                string `json:"os"`
+	KernelVersion     string `json:"kernelVersion"`
+	ContainersRunning int    `json:"containersRunning"`
+	ContainersStopped int    `json:"containersStopped"`
+	ContainersTotal   int    `json:"containersTotal"`
+	Hostname          string `json:"hostname"`
+	// DaemonVersion is the Containarium daemon version on this backend
+	// (e.g. "0.21.0") — surfaced so fleet version drift is visible without
+	// SSHing each host. #354.
+	DaemonVersion string `json:"daemonVersion"`
+	// OTelCollectorEndpoint is where monitoring=true containers ship
+	// OTLP telemetry (e.g. "http://10.0.3.5:4318"). Empty when the
+	// daemon has no OTel collector. Surfaced so an agent can configure
+	// docker-in-LXC apps that don't inherit the env-stamped value. #370.
+	OTelCollectorEndpoint string `json:"otelCollectorEndpoint"`
+	// SSHIngressHost is the advertised public SSH entrypoint (sentinel host)
+	// clients dial to reach this backend's containers, or empty for
+	// direct/in-network mode (no external SSH entrypoint). Lets an agent tell
+	// whether an external SSH/deploy entrypoint exists and what host it is,
+	// instead of assuming a sentinel that may not exist. See #1011.
+	SSHIngressHost string `json:"sshIngressHost,omitempty"`
+	// CPU budget (#2284): tenant-committed, core-committed and physical
+	// cores plus the admission gate's posture, exactly as the daemon's
+	// SystemInfo carries them (enum by its proto name). CpuAdmissionMode
+	// empty or UNSPECIFIED means the daemon predates the field.
+	TotalCpus             int32   `json:"totalCpus"`
+	CommittedCpuCores     float64 `json:"committedCpuCores"`
+	CoreCommittedCpuCores float64 `json:"coreCommittedCpuCores"`
+	CpuAdmissionMode      string  `json:"cpuAdmissionMode,omitempty"`
+	CpuOvercommitFactor   float64 `json:"cpuOvercommitFactor"`
+	// StoragePools is each storage pool's fill (#2823), as the daemon's
+	// SystemInfo carries it (int64 as strings, enums by proto name).
+	StoragePools []StoragePoolCapacity `json:"storagePools,omitempty"`
+}
+
+// StoragePoolCapacity mirrors the proto StoragePoolCapacity (#2823).
+type StoragePoolCapacity struct {
+	Pool       string `json:"pool"`
+	Driver     string `json:"driver,omitempty"`
+	UsedBytes  int64  `json:"usedBytes,string"`
+	TotalBytes int64  `json:"totalBytes,string"`
+	Level      string `json:"level,omitempty"`
+}
