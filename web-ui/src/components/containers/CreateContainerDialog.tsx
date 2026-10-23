@@ -181,3 +181,186 @@ export default function CreateContainerDialog({ open, onClose, onSubmit, network
         enablePodman: isWindows ? false : enablePodman,
         stack: isWindows ? undefined : (stack || undefined),
         stackParameters: isWindows || !stack || Object.keys(stackParamValues).length === 0 ? undefined : stackParamValues,
+        staticIp: staticIp || undefined,
+        gpu: gpu || undefined,
+        backendId: backendId || undefined,
+        osType: selectedImage && 'osType' in selectedImage ? (selectedImage as { osType: number }).osType : undefined,
+      };
+
+      const container = await onSubmit(request, (prog) => setProgress(prog));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if ((container as any)?.state === 'Error') {
+        setError('Container creation failed. Check server logs for details.');
+        setGeneratedKeyPair(null); setProgress(null); return;
+      }
+      setSuccess(true);
+      setProgress({ state: 'Running', message: 'Container is ready!' });
+    } catch (err) {
+      setError('Failed to create container: ' + String(err));
+      setGeneratedKeyPair(null); setProgress(null);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const disabled = success || submitting;
+  const selectedStack = stackCatalog.find(s => s.id === stack);
+
+  return (
+    <Modal
+      open={open}
+      onClose={handleClose}
+      title="Create Container"
+      footer={
+        <>
+          <ModalBtn onClick={handleClose} disabled={submitting}>{success ? 'Close' : 'Cancel'}</ModalBtn>
+          {!success && (
+            <ModalBtn variant="primary" onClick={handleSubmit} disabled={submitting || !username || !!staticIpError}>
+              {submitting && <Loader2 size={13} className="animate-spin" />}
+              {submitting ? 'Creating…' : 'Create'}
+            </ModalBtn>
+          )}
+        </>
+      }
+    >
+      <div className="flex flex-col gap-4">
+        {error && (
+          <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-[var(--c-red)]">
+            <XCircle size={14} className="mt-0.5 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {submitting && progress && (
+          <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] p-3 text-xs text-[var(--text-secondary)]">
+            <Loader2 size={13} className="animate-spin text-[var(--accent)]" />
+            {progress.message}
+          </div>
+        )}
+
+        {success && generatedKeyPair && (
+          <div className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-[var(--c-emerald)]">
+            <CheckCircle size={14} className="mt-0.5 shrink-0" />
+            <div className="flex-1">
+              Container created! Download your private key now (it will not be shown again).
+              <button
+                onClick={() => downloadPrivateKey(generatedKeyPair.privateKey, username + '-container.pem')}
+                className="ml-2 flex items-center gap-1 rounded bg-emerald-500/20 px-2 py-0.5 font-medium hover:bg-emerald-500/30 transition-colors"
+              >
+                <Download size={11} /> Download Key
+              </button>
+            </div>
+          </div>
+        )}
+
+        {success && !generatedKeyPair && (
+          <div className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-[var(--c-emerald)]">
+            <CheckCircle size={14} />
+            Container created successfully!
+          </div>
+        )}
+
+        <FormField label="Username / Container Name *" hint="Lowercase letters, numbers, and hyphens only">
+          <Input
+            value={username}
+            onChange={e => setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+            placeholder="mycontainer"
+            disabled={disabled}
+          />
+        </FormField>
+
+        <SelectField label="Image" value={image} onChange={setImage} disabled={disabled}>
+          {IMAGES.map(img => <option key={img.value} value={img.value}>{img.label}</option>)}
+        </SelectField>
+
+        <SelectField label="Software Stack (Optional)" value={stack} onChange={setStack} disabled={disabled}>
+          {stackCatalog.map(s => <option key={s.id} value={s.id}>{s.name} — {s.description}</option>)}
+        </SelectField>
+
+        {selectedStack?.parameters && selectedStack.parameters.length > 0 && (
+          <div className="flex flex-col gap-3 border-l-2 border-blue-500/30 pl-4">
+            <p className="text-[10px] text-[var(--text-muted)]">{selectedStack.name} configuration</p>
+            {selectedStack.parameters.map(p => (
+              <FormField key={p.name} label={p.label} hint={p.description}>
+                <Input
+                  type={p.type === 'password' ? 'password' : p.type === 'number' ? 'number' : 'text'}
+                  value={stackParamValues[p.name] ?? ''}
+                  onChange={e => setStackParamValues({ ...stackParamValues, [p.name]: e.target.value })}
+                  required={p.required}
+                  disabled={disabled}
+                />
+              </FormField>
+            ))}
+          </div>
+        )}
+
+        {backends && backends.length > 1 && (
+          <SelectField label="Backend Node" value={backendId} onChange={setBackendId} disabled={disabled}>
+            <option value="">Auto (Primary)</option>
+            {backends.filter(b => b.healthy).map(b => <option key={b.id} value={b.id}>{b.id} — {b.type} | priority: {b.priority}</option>)}
+          </SelectField>
+        )}
+
+        <FormField label="GPU Device (Optional)" hint="GPU device ID for passthrough (leave empty for no GPU)">
+          <Input
+            value={gpu}
+            onChange={e => {
+              const v = e.target.value;
+              setGpu(v);
+              if (v && !stack) setStack('gpu');
+              if (!v && (stack === 'gpu' || stack === 'gpu-docker')) setStack('');
+            }}
+            placeholder="e.g., 0 for first GPU"
+            disabled={disabled}
+          />
+        </FormField>
+
+        <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)] cursor-pointer">
+          <input type="checkbox" checked={enablePodman} onChange={e => setEnablePodman(e.target.checked)} disabled={disabled} className="accent-[var(--accent)]" />
+          Enable Podman (container runtime for running Docker images)
+        </label>
+
+        <div className="grid grid-cols-3 gap-3">
+          <FormField label="CPU Cores">
+            <Input value={cpu} onChange={e => setCpu(e.target.value)} placeholder="4" disabled={disabled} />
+          </FormField>
+          <FormField label="Memory">
+            <Input value={memory} onChange={e => setMemory(e.target.value)} placeholder="4GB" disabled={disabled} />
+          </FormField>
+          <FormField label="Disk">
+            <Input value={disk} onChange={e => setDisk(e.target.value)} placeholder="50GB" disabled={disabled} />
+          </FormField>
+        </div>
+
+        <FormField label="Static IP (Optional)" hint={`e.g., 10.100.0.100 — must be within ${effectiveCidr}`} error={staticIpError || undefined}>
+          <Input
+            value={staticIp}
+            onChange={e => {
+              const v = e.target.value.replace(/[^0-9.]/g, '');
+              setStaticIp(v);
+              setStaticIpError(v ? (validateStaticIP(v, effectiveCidr).error || null) : null);
+            }}
+            placeholder="Leave empty for DHCP"
+            disabled={disabled}
+            className={staticIpError ? 'border-red-500/50' : ''}
+          />
+        </FormField>
+
+        <FormField label="Labels (Optional)" hint="Comma-separated key=value pairs: team=dev,env=prod">
+          <Input value={labelsText} onChange={e => setLabelsText(e.target.value)} placeholder="team=dev,project=web" disabled={disabled} />
+        </FormField>
+
+        <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)] cursor-pointer">
+          <input type="checkbox" checked={autoGenerateKey} onChange={e => setAutoGenerateKey(e.target.checked)} disabled={disabled} className="accent-[var(--accent)]" />
+          Auto-generate SSH key pair
+        </label>
+
+        {!autoGenerateKey && (
+          <FormField label="SSH Public Key">
+            <Textarea value={sshPublicKey} onChange={e => setSshPublicKey(e.target.value)} placeholder="ssh-ed25519 AAAA... user@host" rows={3} disabled={disabled} />
+          </FormField>
+        )}
+      </div>
+    </Modal>
+  );
+}
