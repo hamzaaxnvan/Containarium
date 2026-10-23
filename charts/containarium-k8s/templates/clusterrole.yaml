@@ -19,3 +19,66 @@ rules:
   # Legacy: pre-Sandbox deployments managed a StatefulSet per box. Kept one
   # release for the migration window (delete of old boxes on the previous
   # object shape); drop after that.
+  - apiGroups: ["apps"]
+    resources: [statefulsets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [services, pods, persistentvolumeclaims]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Read pod logs / exec for debug commands, and for SSH session audit
+  # (#1189): a K8s box logs its logins to stderr, so pods/log is the audit
+  # trail, not just a debugging convenience. Removing it does not fail
+  # loudly — the collector logs a read error per poll and the fleet records
+  # no logins, which reads exactly like a fleet nobody logged into.
+  - apiGroups: [""]
+    resources: [pods/log, pods/exec]
+    verbs: [get, list, create]
+  # Manage per-box SSH keys in tenant namespaces, and the per-tenant Secret
+  # that carries delivered tenant secrets (#1190). Removing this does not
+  # fail loudly for the second: `secret set` still succeeds — the value is
+  # stored and encrypted — and only the delivery into the box is lost.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Enforce NetworkPolicy isolation per tenant namespace
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Manage sshpiper Pipe CRDs in the gateway namespace
+  - apiGroups: [sshpiper.com]
+    resources: [pipes]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Box CRD operator (issue #995): watch Box CRs and reconcile them into the
+  # per-tenant bundle. Only exercised when operator.enabled; harmless otherwise.
+  - apiGroups: [containarium.dev]
+    resources: [boxes]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [containarium.dev]
+    resources: [boxes/status]
+    verbs: [get, update, patch]
+  - apiGroups: [containarium.dev]
+    resources: [boxes/finalizers]
+    verbs: [update]
+---
+{{- if .Values.gateway.enabled }}
+# sshpiper needs read access to Pipe CRDs and the secrets they reference
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "containarium-k8s.fullname" . }}-sshpiper
+  labels:
+    {{- include "containarium-k8s.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [sshpiper.com]
+    resources: [pipes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+{{- end }}

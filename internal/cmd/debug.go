@@ -42,3 +42,91 @@ func init() {
 func runDebug(cmd *cobra.Command, args []string) error {
 	username := args[0]
 	// debug reads a box's host-level diagnostics (sshd journal, shell); the
+	// hosted control plane has no per-tenant equivalent (#456).
+	if isCloudTarget(serverAddr, authToken) {
+		return errUnsupportedOnCloud("debug", "use `containarium connect "+username+"` to inspect the box")
+	}
+
+	report, err := fetchDebugReport(username)
+	if err != nil {
+		return err
+	}
+
+	switch debugFormat {
+	case "json":
+		buf, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(buf))
+	default:
+		printDebugReportHuman(username, report)
+	}
+	return nil
+}
+
+func fetchDebugReport(username string) (*pb.DebugContainerResponse, error) {
+	if httpMode && serverAddr != "" {
+		httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create HTTP client: %w", err)
+		}
+		defer func() { _ = httpClient.Close() }()
+		return httpClient.DebugContainer(username)
+	}
+	if serverAddr != "" {
+		grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to remote server: %w", err)
+		}
+		defer func() { _ = grpcClient.Close() }()
+		return grpcClient.DebugContainer(username)
+	}
+	return nil, fmt.Errorf("debug requires --server (remote daemon): the local-mode CLI does not run the diagnostic logic")
+}
+
+func printDebugReportHuman(username string, r *pb.DebugContainerResponse) {
+	fmt.Printf("=== Debug report for %q ===\n\n", username)
+	fmt.Printf("Container state:        %s\n", valueOrDash(r.ContainerState))
+	fmt.Printf("Host user exists:       %t\n", r.HostUserExists)
+	if r.HostUserShell != "" {
+		fmt.Printf("Host user shell:        %s (exists: %t)\n", r.HostUserShell, r.HostUserShellExists)
+	}
+
+	if len(r.RecentSshdRejections) > 0 {
+		fmt.Println()
+		fmt.Println("Recent sshd journal lines:")
+		for _, line := range r.RecentSshdRejections {
+			fmt.Printf("  %s\n", line)
+		}
+	}
+
+	fmt.Println()
+	fmt.Printf("Likely cause: %s\n", valueOrDash(r.LikelyCause))
+
+	if len(r.NextActions) > 0 {
+		fmt.Println()
+		fmt.Println("Next actions:")
+		for i, action := range r.NextActions {
+			fmt.Printf("  %d. %s\n", i+1, action)
+		}
+	}
+
+	if r.SourceRepo != "" || r.DaemonVersion != "" {
+		fmt.Println()
+		fmt.Println("For deeper investigation:")
+		if r.SourceRepo != "" {
+			fmt.Printf("  Source:  %s\n", r.SourceRepo)
+		}
+		if r.DaemonVersion != "" {
+			fmt.Printf("  Daemon:  %s\n", r.DaemonVersion)
+		}
+	}
+}
+
+func valueOrDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "-"
+	}
+	return s
+}
