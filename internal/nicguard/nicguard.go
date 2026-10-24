@@ -137,3 +137,50 @@ func EnsureACL(be incus.Backend, desired incus.ACLConfig) (bool, error) {
 			return false, fmt.Errorf("create acl %s: %w", desired.Name, cerr)
 		}
 		return true, nil
+	}
+	if ACLEqual(existing, desired) {
+		return false, nil
+	}
+	if uerr := be.UpdateNetworkACL(desired.Name, desired); uerr != nil {
+		return false, fmt.Errorf("update acl %s: %w", desired.Name, uerr)
+	}
+	return true, nil
+}
+
+// ACLEqual compares what Incus holds with what a guard wants, on the fields
+// the guards set. Order-insensitive: Incus may return rules in its own
+// order.
+func ACLEqual(have *api.NetworkACL, want incus.ACLConfig) bool {
+	if have == nil || len(have.Egress) != len(want.EgressRules) || len(have.Ingress) != len(want.IngressRules) {
+		return false
+	}
+	if have.Description != want.Description {
+		return false
+	}
+	key := func(action, src, dst, proto, dport string) string {
+		return action + "|" + src + "|" + dst + "|" + proto + "|" + dport
+	}
+	seen := map[string]int{}
+	for _, rl := range have.Ingress {
+		seen[key(rl.Action, rl.Source, rl.Destination, rl.Protocol, rl.DestinationPort)]++
+	}
+	for _, rl := range want.IngressRules {
+		k := key(rl.Action, rl.Source, rl.Destination, rl.Protocol, rl.DestinationPort)
+		if seen[k] == 0 {
+			return false
+		}
+		seen[k]--
+	}
+	return true
+}
+
+// NICKeys are the per-device keys a guard sets next to the ACL name:
+// ingress default-drop (logged), egress left to the eBPF enforcer.
+func NICKeys(acl string) map[string]string {
+	return map[string]string{
+		"security.acls":                        acl,
+		"security.acls.default.ingress.action": "drop",
+		"security.acls.default.ingress.logged": "true",
+		"security.acls.default.egress.action":  "allow",
+	}
+}
