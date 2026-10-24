@@ -68,3 +68,213 @@ type API interface {
 	ListSecrets(username string) ([]SecretMetadata, error)
 	DeleteSecret(username, name string) error
 	RefreshSecrets(username string) (*RefreshSecretsResponse, error)
+	GetKMSStatus() (*KMSStatusResponse, error)
+	GetEnvelopeCoverage() (*EnvelopeCoverageResponse, error)
+	MigrateToEnvelope(req MigrateToEnvelopeBody) (*MigrateToEnvelopeResponse, error)
+	// Guardrail policy (#2368): read only; the write stays CLI-only.
+	GetGuardrailPolicy() (*pb.GetGuardrailPolicyResponse, error)
+
+	// Model gateway (#1726). Mint only: the key verbs are operator-gated and
+	// deliberately not exposed to an agent (see gateway_tools.go).
+	MintGatewayToken(req MintGatewayTokenBody) (*MintGatewayTokenResponse, error)
+
+	// Network guards (#2353): the tenant ↔ tenant and tenant → core NIC-ACL
+	// posture of the backend, read-only.
+	GetNetworkGuardStatus() (*NetworkGuardStatusResponse, error)
+
+	// Routes / backends.
+	AddRoute(req AddRouteRequest) (*AddRouteResponse, error)
+	ListRoutes(username string, activeOnly bool) (*ListRoutesResponse, error)
+	DeleteRoute(domain string) error
+	AddPassthroughRoute(req AddPassthroughRouteRequest) (*AddPassthroughRouteResponse, error)
+	ListPassthroughRoutes() (*ListPassthroughRoutesResponse, error)
+	DeletePassthroughRoute(externalPort int32, protocol string) error
+	ListBackends() (*ListBackendsResponse, error)
+	GetBackend(id string) (*Backend, error)
+	ValidateGPU(backendID, pci string) (*ValidateGPUResult, error)
+
+	// Collaborators (#1145) — the agent surface for box access a human
+	// already has via the CLI/REST/dashboard.
+	AddCollaborator(req AddCollaboratorRequest) (*AddCollaboratorResponse, error)
+	ListCollaborators(ownerUsername string) (*ListCollaboratorsResponse, error)
+	RemoveCollaborator(ownerUsername, collaboratorUsername string) (*RemoveCollaboratorResponse, error)
+	// SSH sessions (#2522), through the CLI's shared client.
+	TerminateUserSessions(username string) (*pb.TerminateUserSessionsResponse, error)
+
+	// Security.
+	TriggerSecurityScan(kind, containerName, username string) (*SecurityScanResponse, error)
+	ListSecurityFindings(kind, containerName string) ([]SecurityFinding, error)
+	RemediateSecurityFinding(findingID int64) (*SecurityRemediateResponse, error)
+
+	// Threat-detection sentry (#1640).
+	GetSentryStatus() (*SentryStatusResponse, error)
+
+	// Process policy (#2636, #2666): what a HIGH mining finding does to its box.
+	GetProcessPolicy(container string) (*pb.GetProcessPolicyResponse, error)
+	SetProcessPolicy(req *pb.SetProcessPolicyRequest) (*pb.SetProcessPolicyResponse, error)
+	ReleaseProcessAction(container string) (*pb.ReleaseProcessActionResponse, error)
+
+	// Miner-signature list (#2638, #2763).
+	ListMinerSignatures() (*pb.ListMinerSignaturesResponse, error)
+	AddMinerSignature(req *pb.AddMinerSignatureRequest) (*pb.AddMinerSignatureResponse, error)
+	RemoveMinerSignature(kind pb.MinerSignatureKind, pattern string) (*pb.RemoveMinerSignatureResponse, error)
+
+	// Known-bad destination rule (#1641).
+	ListBadDestinations() (*ListBadDestinationsResponse, error)
+	AddBadDestination(cidr, label string) (*BadDestinationEntry, error)
+	RemoveBadDestination(cidr string) error
+
+	// Findings delivery + triage (#1643).
+	ListSecuritySentryFindings(severity, tenant, since, state string, limit int) (*ListSentryFindingsResponse, error)
+	ResolveSecuritySentryFinding(id int64) (*ResolveSentryFindingResponse, error)
+
+	// Tokens.
+	RevokeToken(jti, reason, expiresAt string) (string, error)
+
+	// Tracker broker (#1922) — issue/change-request read and write verbs
+	// an agent's run-scoped JWT can hold (tracker:read / tracker:write).
+	// Connection CRUD and GetTrackerStatus are tracker:admin — deliberately
+	// NOT exposed here, same reasoning as why an agent's token never gets
+	// admin scopes for containers or secrets either.
+	GetTrackerIssue(req GetTrackerIssueRequest) (*TrackerIssue, error)
+	ListTrackerIssues(req ListTrackerIssuesRequest) ([]TrackerIssue, error)
+	GetTrackerChange(req GetTrackerChangeRequest) (*TrackerChange, error)
+	CommentOnTrackerIssue(req CommentOnTrackerIssueRequest) (*TrackerComment, error)
+	ClaimTrackerIssue(req ClaimTrackerIssueRequest) (*ClaimTrackerIssueResult, error)
+	SetTrackerIssueLabels(req SetTrackerIssueLabelsRequest) error
+	SubmitTrackerChange(req SubmitTrackerChangeRequest) (*TrackerChange, error)
+	// ListTrackerRoutes (#2021) is the one tracker:admin read surfaced
+	// here: an operator agent can see which skill a scope label starts.
+	// Route writes stay CLI-only (`containarium tracker route set|delete`).
+	ListTrackerRoutes(req ListTrackerRoutesRequest) ([]TrackerRoute, error)
+	CreateTrackerIssue(req CreateTrackerIssueRequest) (*TrackerIssue, error)
+
+	// Sprint board reads (hosted control plane routes; read-only).
+	ListSprints(req ListSprintsRequest) ([]SprintMirror, error)
+	GetSprintBoard(req GetSprintBoardRequest) (*SprintMirror, error)
+
+	// Host-LEVEL operations — overridden as unsupported on the cloud backend.
+	GetSystemInfo() (*GetSystemInfoResponse, error)
+	GetLatestRelease() (*LatestReleaseResponse, error)
+	DebugContainer(username string) (*DebugContainerResponse, error)
+	TriggerUpgrade(req TriggerUpgradeRequest) (*TriggerUpgradeResponse, error)
+	GetUpgradeStatus(upgradeID string) (*UpgradeStatusResponse, error)
+	// SetMetricsExport / GetMetricsExport (#1069) toggle and inspect
+	// opt-in export of this host's infra metrics to its cloud's native
+	// monitoring. Host-level like GetSystemInfo — the credential probe
+	// (GCP ADC) is specific to the box the daemon runs on, so it has no
+	// tenant-safe meaning on the hosted control plane.
+	SetMetricsExport(enabled bool, provider string, groups []string) (*SetMetricsExportResponse, error)
+	GetMetricsExport() (*GetMetricsExportResponse, error)
+	// InstallZap downloads and installs OWASP ZAP into this host's
+	// security container. Host-level — a daemon manages exactly one
+	// security container, so there's no per-tenant scoping.
+	InstallZap() (*InstallZapResponse, error)
+	// InstallClamav installs ClamAV and its signatures inside one box so the
+	// tenant-run malware scan can run (#2659).
+	InstallClamav(containerName string) (*InstallClamavResponse, error)
+
+	// Transport-level escape hatches used by handlers that issue a raw
+	// request (compose, move, connect) or need the effective token (scope
+	// filtering). Unexported → only this package's types satisfy the
+	// contract. The cloud backend inherits these unchanged from *Client
+	// (they map identically through the cloud's OSS-compatible shim).
+	doRequest(method, path string, body interface{}) ([]byte, error)
+	readToken() (string, error)
+	composeDispatch(verb, username string, body any) (json.RawMessage, error)
+	composeStatus(username, dir string) (json.RawMessage, error)
+}
+
+// Both backends must satisfy the contract; a missing or mistyped method is a
+// compile error here rather than a runtime panic at dispatch.
+var (
+	_ API = (*Client)(nil)
+	_ API = cloudClient{}
+)
+
+// cloudClient is the hosted-control-plane backend. It embeds *Client for the
+// shared surface (create / list / expose / … map identically through the
+// cloud's OSS-compatible REST shim) and overrides ONLY the host-level
+// operations that have no tenant-safe meaning on the cloud.
+type cloudClient struct{ *Client }
+
+// errUnsupportedOnCloud is the clear, actionable error the cloud backend
+// returns for a host-level op — instead of a round-trip the cloud can only
+// 404/501. `alt` names what to use instead (may be empty).
+func errUnsupportedOnCloud(op, alt string) error {
+	msg := fmt.Sprintf("%s is a host-level operation and is not available on the hosted control plane", op)
+	if alt != "" {
+		msg += "; " + alt
+	}
+	return errors.New(msg)
+}
+
+func (cloudClient) GetSystemInfo() (*GetSystemInfoResponse, error) {
+	return nil, errUnsupportedOnCloud("get_system_info", "use list_backends for the (redacted) fleet view")
+}
+
+func (cloudClient) GetLatestRelease() (*LatestReleaseResponse, error) {
+	return nil, errUnsupportedOnCloud("check_for_updates", "the platform keeps the control plane current")
+}
+
+func (cloudClient) DebugContainer(string) (*DebugContainerResponse, error) {
+	return nil, errUnsupportedOnCloud("debug_container", "use connect (exec) to inspect the box")
+}
+
+func (cloudClient) TriggerUpgrade(TriggerUpgradeRequest) (*TriggerUpgradeResponse, error) {
+	return nil, errUnsupportedOnCloud("upgrade_backend", "the platform operator owns control-plane upgrades")
+}
+
+func (cloudClient) GetUpgradeStatus(string) (*UpgradeStatusResponse, error) {
+	return nil, errUnsupportedOnCloud("get_upgrade_status", "")
+}
+
+func (cloudClient) InstallZap() (*InstallZapResponse, error) {
+	return nil, errUnsupportedOnCloud("install_zap", "the platform provisions ZAP on managed hosts")
+}
+
+func (cloudClient) InstallClamav(string) (*InstallClamavResponse, error) {
+	return nil, errUnsupportedOnCloud("install_clamav", "run this against the box owner's own daemon")
+}
+
+func (cloudClient) SetMetricsExport(bool, string, []string) (*SetMetricsExportResponse, error) {
+	return nil, errUnsupportedOnCloud("set_metrics_export", "the credential probe is specific to a BYOC host; run this against the host's own daemon")
+}
+
+func (cloudClient) GetMetricsExport() (*GetMetricsExportResponse, error) {
+	return nil, errUnsupportedOnCloud("get_metrics_export", "")
+}
+
+// KMS is platform-wide and managed per OSS daemon; the control plane
+// deliberately does not proxy it (cloud#2679), so answer client-side instead
+// of a round-trip that can only return 501.
+const kmsCloudAlt = "run `containarium kms status|envelope-coverage` on the OSS daemon's own host"
+
+func (cloudClient) GetKMSStatus() (*KMSStatusResponse, error) {
+	return nil, errUnsupportedOnCloud("kms_status", kmsCloudAlt)
+}
+
+func (cloudClient) GetEnvelopeCoverage() (*EnvelopeCoverageResponse, error) {
+	return nil, errUnsupportedOnCloud("kms_envelope_coverage", kmsCloudAlt)
+}
+
+func (cloudClient) MigrateToEnvelope(MigrateToEnvelopeBody) (*MigrateToEnvelopeResponse, error) {
+	return nil, errUnsupportedOnCloud("kms_migrate_to_envelope", "run `containarium kms migrate-to-envelope` on the OSS daemon's own host")
+}
+
+// newBackend builds the API the handlers use, classifying the target from the
+// credential. Token-file mode (rotation-without-restart) is wired onto the
+// shared base either way; the classification reads the effective token once
+// (best-effort — a token that can't be read yet just yields the daemon
+// backend, and the real per-request error still surfaces on first call).
+func newBackend(cfg *Config) API {
+	base := NewClient(cfg.ServerURL, cfg.JWTToken)
+	if cfg.JWTTokenFile != "" {
+		base.SetTokenFile(cfg.JWTTokenFile)
+	}
+	tok, _ := base.readToken()
+	if credentials.IsCloudToken(tok) {
+		return cloudClient{base}
+	}
+	return base
+}
