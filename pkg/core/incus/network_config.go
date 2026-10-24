@@ -26,3 +26,11 @@ func (c *Client) SetNetworkConfigValue(network, key, value string) error {
 	}
 	if value == "" {
 		delete(put.Config, key)
+	} else {
+		put.Config[key] = value
+	}
+	if err := c.server.UpdateNetwork(network, put, etag); err != nil {
+		return fmt.Errorf("failed to update network %s: %w", network, err)
+	}
+	return nil
+}
