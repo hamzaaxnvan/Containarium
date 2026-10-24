@@ -191,3 +191,133 @@ func (t *primaryAuthTracker) observe(addr string, authenticated bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.clock()
+	var match *primaryAuthEntry
+	n := 0
+	for _, e := range t.entries {
+		if addr != "" && e.addr == addr {
+			match = e
+			n++
+		}
+	}
+	if n == 1 {
+		match.lastFailure = now
+		match.failuresSinceSuccess++
+		return
+	}
+	t.unattributed++
+	t.lastUnattributed = now
+}
+
+// snapshot returns per-primary health sorted by pool, plus the unattributed
+// 401 count and time of the latest one.
+func (t *primaryAuthTracker) snapshot() ([]PrimaryAuthHealthJSON, uint64, time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.prune(t.clock())
+	out := make([]PrimaryAuthHealthJSON, 0, len(t.entries))
+	for pool, e := range t.entries {
+		h := PrimaryAuthHealthJSON{
+			Pool:                 string(pool),
+			State:                PrimaryAuthOK,
+			FailuresSinceSuccess: e.failuresSinceSuccess,
+		}
+		if !e.lastSuccess.IsZero() {
+			h.LastSuccess = e.lastSuccess.Format(time.RFC3339)
+		}
+		if !e.lastFailure.IsZero() {
+			h.LastFailure = e.lastFailure.Format(time.RFC3339)
+		}
+		// Only the primary's own authenticated registration, heartbeat or
+		// deregister (bind) resets the count, so a non-zero count means a 401
+		// from its address since then.
+		if e.failuresSinceSuccess > 0 {
+			h.State = PrimaryAuthFailing401
+		}
+		out = append(out, h)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Pool < out[j].Pool })
+	return out, t.unattributed, t.lastUnattributed
+}
+
+// report is the per-pool detail (tracked primaries plus every live registered
+// primary the tracker has no record of, as unknown) and the per-state counts
+// derived from it. live is the pools currently in the primary registry.
+func (t *primaryAuthTracker) report(live []Pool) ([]PrimaryAuthHealthJSON, PrimaryAuthCountsJSON) {
+	out, _, _ := t.snapshot()
+	tracked := make(map[string]bool, len(out))
+	for _, h := range out {
+		tracked[h.Pool] = true
+	}
+	for _, p := range live {
+		if !tracked[string(p)] {
+			out = append(out, PrimaryAuthHealthJSON{Pool: string(p), State: PrimaryAuthUnknown})
+			tracked[string(p)] = true
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Pool < out[j].Pool })
+	var c PrimaryAuthCountsJSON
+	for _, h := range out {
+		switch h.State {
+		case PrimaryAuthOK:
+			c.OK++
+		case PrimaryAuthFailing401:
+			c.Failing401++
+		default:
+			c.Unknown++
+		}
+	}
+	return out, c
+}
+
+func (m *Manager) primaryAuthReport() ([]PrimaryAuthHealthJSON, PrimaryAuthCountsJSON) {
+	var live []Pool
+	for _, p := range m.primaries.All() {
+		live = append(live, p.Pool)
+	}
+	return m.authHealth.report(live)
+}
+
+// primaryAuthHealthHandler serves the per-pool detail. Register it behind
+// auth.SentinelHMACMiddleware over the ADMIN secret (daemons do not hold it), NOT daemonAuthGate: reading the detail is not a
+// primary's request, so a refused read must not count as a primary's 401.
+func (m *Manager) primaryAuthHealthHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		detail, _ := m.primaryAuthReport()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(PrimaryAuthHealthReportJSON{Primaries: detail})
+	})
+}
+
+// requestSourceAddr is the transport source IP: what a client cannot choose
+// without actually sending from it (unlike any header or pool name).
+func requestSourceAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
+type daemonAuthReachedKey struct{}
+
+// daemonAuthGate is auth.SentinelHMACMiddleware over the daemon AUTH secret,
+// plus recording each request's outcome in m.authHealth. The middleware
+// either rejects with 401 or calls next, so reaching next is exactly
+// "authenticated".
+func (m *Manager) daemonAuthGate(next http.Handler) http.Handler {
+	gated := auth.SentinelHMACMiddleware(m.hmacSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if reached, ok := r.Context().Value(daemonAuthReachedKey{}).(*bool); ok {
+			*reached = true
+		}
+		next.ServeHTTP(w, r)
+	}))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reached bool
+		gated.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), daemonAuthReachedKey{}, &reached)))
+		m.authHealth.observe(requestSourceAddr(r), reached)
+	})
+}

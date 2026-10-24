@@ -41,3 +41,14 @@ func collaboratorToProto(c *collaborator.Collaborator) *pb.Collaborator {
 // the very field meant to remove it.
 func splitSSHPublicKeys(blob string) []string {
 	if strings.TrimSpace(blob) == "" {
+		return nil
+	}
+	parts := strings.Split(blob, "\n")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
