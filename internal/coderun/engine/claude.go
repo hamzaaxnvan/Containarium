@@ -178,3 +178,48 @@ echo none`
 // `claude -p` print ONE JSON result object (type "result", subtype, is_error,
 // result text, session_id, usage, ...) instead of plain text. `json` rather
 // than `stream-json`: stream-json under -p additionally requires --verbose.
+// Appending is safe because it is a trailing flag after -p/--resume/--continue.
+const ClaudeStructuredOutputFlag = " --output-format json"
+
+// RunCommand renders the command process_start spawns.
+//
+// For a tenant secret this is coderun.BuildClaudeRunCommand verbatim — the
+// shipped path, unchanged. For a gateway credential only the sourced env file
+// differs: the box has a scoped gateway token instead of a provider key, and
+// Claude Code reads ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN out of its
+// environment either way.
+func (e claudeEngine) RunCommand(prompt string, streamJSON, continueSession bool, sessionID string) string {
+	var cmd string
+	if e.opts.Credential != nil && e.opts.Credential.Kind() == KindGateway {
+		cmd = sourceEnvPrefix(`"`+claudeGatewayEnvPath+`"`) + claudeRunBody(prompt)
+		if streamJSON {
+			cmd += " --output-format stream-json"
+		}
+	} else {
+		cmd = coderun.BuildClaudeRunCommand(prompt, streamJSON)
+	}
+	switch {
+	case sessionID != "":
+		// --resume names a SPECIFIC session (Claude Code's own session id),
+		// not "the most recent one" — takes priority over continueSession
+		// (#2193; callers must not set both).
+		cmd += " --resume " + shellQuoteSingle(sessionID)
+	case continueSession:
+		cmd += " --continue"
+	}
+	return cmd
+}
+
+// claudeRunBody is everything after the env prefix in a Claude run: the
+// conditional --mcp-config dance plus the non-interactive invocation. Shared by
+// both credential sources so the two cannot drift.
+//
+// --mcp-config is conditional because claude treats a config path that does not
+// exist as a hard startup error, and most boxes have no such file.
+func claudeRunBody(prompt string) string {
+	return "mcpcfg=; [ -f \"" + coderun.ContainariumMCPConfigPath + "\" ] && mcpcfg=\"--mcp-config " +
+		coderun.ContainariumMCPConfigPath + "\"; " +
+		// $mcpcfg is deliberately unquoted: it has to split into the flag and
+		// its value, and is empty when the file is absent.
+		"~/.local/bin/claude $mcpcfg -p " + shellQuoteSingle(prompt)
+}
