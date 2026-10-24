@@ -50,3 +50,21 @@ func (d *debianPkgMgr) MoshInstallScript() string {
 
 func (d *debianPkgMgr) PodmanAvailableInBaseRepos() bool {
 	return false
+}
+
+func (d *debianPkgMgr) PodmanRepoScript() string {
+	return `
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/xUbuntu_24.04/Release.key | gpg --dearmor -o /etc/apt/keyrings/devel_kubic_libcontainers_unstable.gpg
+echo "deb [signed-by=/etc/apt/keyrings/devel_kubic_libcontainers_unstable.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/unstable/xUbuntu_24.04/ /" > /etc/apt/sources.list.d/devel:kubic:libcontainers:unstable.list
+apt-get update
+`
+}
+
+func (d *debianPkgMgr) PipInstallCmd() []string {
+	return []string{"apt-get", "install", "-y", "python3-pip"}
+}
+
+func (d *debianPkgMgr) CleanCmd() []string {
+	return []string{"apt-get", "clean"}
+}

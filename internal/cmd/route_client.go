@@ -44,3 +44,34 @@ type exposeAdapter struct{ c routeAPI }
 
 func (a *exposeAdapter) LookupContainer(_ context.Context, username string) (string, string, string, error) {
 	containers, err := a.c.ListContainers()
+	if err != nil {
+		return "", "", "", err
+	}
+	for _, ci := range containers {
+		// Names follow the "<username>-container" convention; accept either
+		// the full name or the bare username.
+		if ci.Name == username || ci.Name == username+"-container" {
+			return ci.Name, ci.IPAddress, ci.State, nil
+		}
+	}
+	return "", "", "", fmt.Errorf("container %q not found", username)
+}
+
+func (a *exposeAdapter) CreateRoute(_ context.Context, p expose.AddRouteParams) (*expose.RouteResult, error) {
+	route, err := a.c.AddRoute(p.Domain, p.TargetIP, p.TargetPort, p.ContainerName, p.Description)
+	if err != nil {
+		return nil, err
+	}
+	// The ProxyRoute response carries FullDomain, not the request's Domain /
+	// ContainerName; fall back to what the caller asked for.
+	domain := route.GetFullDomain()
+	if domain == "" {
+		domain = p.Domain
+	}
+	return &expose.RouteResult{
+		Domain:        domain,
+		ContainerName: p.ContainerName,
+		ContainerIP:   route.GetContainerIp(),
+		Port:          route.GetPort(),
+	}, nil
+}
