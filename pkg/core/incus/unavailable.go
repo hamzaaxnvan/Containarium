@@ -25,3 +25,86 @@ type UnavailableBackend struct{}
 
 // NewUnavailableBackend returns an UnavailableBackend.
 func NewUnavailableBackend() *UnavailableBackend { return &UnavailableBackend{} }
+
+// Compile-time assertion.
+var _ Backend = (*UnavailableBackend)(nil)
+
+// StoragePool returns the default name rather than an error: it has no
+// signature to fail through, and a caller on a host with no incus never
+// reaches a create path where the value is used.
+func (*UnavailableBackend) StoragePool() string { return DefaultStoragePool }
+
+func (*UnavailableBackend) CreateContainer(ContainerConfig) error       { return ErrUnavailable }
+func (*UnavailableBackend) StartContainer(string) error                 { return ErrUnavailable }
+func (*UnavailableBackend) StopContainer(string, bool) error            { return ErrUnavailable }
+func (*UnavailableBackend) DeleteContainer(string) error                { return ErrUnavailable }
+func (*UnavailableBackend) GetContainer(string) (*ContainerInfo, error) { return nil, ErrUnavailable }
+func (*UnavailableBackend) ListContainers() ([]ContainerInfo, error)    { return nil, ErrUnavailable }
+func (*UnavailableBackend) WaitForNetwork(string, time.Duration) (string, error) {
+	return "", ErrUnavailable
+}
+func (*UnavailableBackend) Exec(string, []string) error                { return ErrUnavailable }
+func (*UnavailableBackend) EnsureToolchainVolume(string, string) error { return ErrUnavailable }
+func (*UnavailableBackend) ExecWithOutput(string, []string) (string, string, error) {
+	return "", "", ErrUnavailable
+}
+func (*UnavailableBackend) ExecWithExitCode(string, []string) (string, string, int, error) {
+	return "", "", 0, ErrUnavailable
+}
+func (*UnavailableBackend) WriteFile(string, string, []byte, string) error { return ErrUnavailable }
+func (*UnavailableBackend) ReadFile(string, string) ([]byte, error)        { return nil, ErrUnavailable }
+func (*UnavailableBackend) ListDir(string, string) ([]string, error)       { return nil, ErrUnavailable }
+func (*UnavailableBackend) SetConfig(string, string, string) error         { return ErrUnavailable }
+func (*UnavailableBackend) SetCPULimit(string, string) error               { return ErrUnavailable }
+func (*UnavailableBackend) SetCPUConfig(string, string, string) error      { return ErrUnavailable }
+func (*UnavailableBackend) FreezeContainer(string) error                   { return ErrUnavailable }
+func (*UnavailableBackend) UnfreezeContainer(string) error                 { return ErrUnavailable }
+func (*UnavailableBackend) UnsetConfig(string, string) error               { return ErrUnavailable }
+func (*UnavailableBackend) SetDeviceSize(string, string, string) error     { return ErrUnavailable }
+func (*UnavailableBackend) UpdateContainerConfig(string, string, string) error {
+	return ErrUnavailable
+}
+func (*UnavailableBackend) GetRawInstance(string) (map[string]string, string, error) {
+	return nil, "", ErrUnavailable
+}
+func (*UnavailableBackend) ResolveGPUInputToPCI(string) (string, error) { return "", ErrUnavailable }
+func (*UnavailableBackend) CleanupDisk(string) (string, int64, error) {
+	return "", 0, ErrUnavailable
+}
+func (*UnavailableBackend) GetConsoleLog(string) (string, error)  { return "", ErrUnavailable }
+func (*UnavailableBackend) AddLabel(string, string, string) error { return ErrUnavailable }
+func (*UnavailableBackend) RemoveLabel(string, string) error      { return ErrUnavailable }
+func (*UnavailableBackend) GetLabels(string) (map[string]string, error) {
+	return nil, ErrUnavailable
+}
+func (*UnavailableBackend) SetLabels(string, map[string]string) error { return ErrUnavailable }
+func (*UnavailableBackend) GetServerInfo() (*api.Server, error)       { return nil, ErrUnavailable }
+func (*UnavailableBackend) GetContainerMetrics(string) (*ContainerMetrics, error) {
+	return nil, ErrUnavailable
+}
+func (*UnavailableBackend) GetContainerImageFingerprint(string) (string, error) {
+	return "", ErrUnavailable
+}
+func (*UnavailableBackend) PublishImage(string, string, map[string]string) (string, error) {
+	return "", ErrUnavailable
+}
+func (*UnavailableBackend) GetImageAliasProperties(string) (map[string]string, bool, error) {
+	return nil, false, ErrUnavailable
+}
+func (*UnavailableBackend) ExportInstance(string) (io.ReadCloser, error) { return nil, ErrUnavailable }
+func (*UnavailableBackend) ImportInstance(string, string, io.Reader, ImportOptions) error {
+	return ErrUnavailable
+}
+
+// Network ACLs + NIC devices (core-infra network guard).
+func (*UnavailableBackend) GetNetworkACL(string) (*api.NetworkACL, error)     { return nil, ErrUnavailable }
+func (*UnavailableBackend) CreateNetworkACL(ACLConfig) error                  { return ErrUnavailable }
+func (*UnavailableBackend) UpdateNetworkACL(string, ACLConfig) error          { return ErrUnavailable }
+func (*UnavailableBackend) ListNetworkACLs() ([]api.NetworkACL, error)        { return nil, ErrUnavailable }
+func (*UnavailableBackend) DeleteNetworkACL(string) error                     { return ErrUnavailable }
+func (*UnavailableBackend) AttachACLToContainer(string, string, string) error { return ErrUnavailable }
+func (*UnavailableBackend) SetOwnedACL(string, string, string, string) error  { return ErrUnavailable }
+func (*UnavailableBackend) EnsureNICDevice(string, NICDevice) error           { return ErrUnavailable }
+func (*UnavailableBackend) SetDeviceConfig(string, string, map[string]string) error {
+	return ErrUnavailable
+}
