@@ -76,3 +76,120 @@ type ExecRunner struct {
 	IncusPath string
 }
 
+func (e *ExecRunner) incus(args ...string) error {
+	bin := e.IncusPath
+	if bin == "" {
+		bin = "incus"
+	}
+	cmd := exec.Command(bin, args...) // #nosec G204 -- args are validated by callers
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("incus %s: %w\nOutput: %s", strings.Join(args, " "), err, string(out))
+	}
+	return nil
+}
+
+// Snapshot — `incus snapshot create <container> <snapshot>` (#1392).
+//
+// `incus snapshot` is a command GROUP in Incus 6.x, not a verb. This used to
+// call `incus snapshot <container> <snapshot>`, which that version rejects
+// with `unknown command "<container>" for "incus snapshot"` — so MoveContainer
+// failed on its very first call, before any copy. No test caught it because
+// every move test substitutes a fake MigrationRunner and the real ExecRunner
+// is wired only in production; the migration logic was covered, the CLI
+// surface under it was not covered at all.
+//
+// If the snapshot already exists (rerun after a partial failure) the CLI errors
+// with "already exists" — swallowed to keep retry idempotent.
+func (e *ExecRunner) Snapshot(container, snapshot string) error {
+	err := e.incus("snapshot", "create", container, snapshot)
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "already exists") {
+		return nil
+	}
+	return err
+}
+
+// DeleteSnapshot — `incus snapshot delete <container> <snapshot>` (#1392).
+//
+// This used to call `incus delete <container>/<snapshot>`, which Incus 6.x
+// rejects with `Invalid instance name`. That message matches neither of the
+// absent-snapshot strings below, so a failed cleanup surfaced as a hard error
+// rather than being swallowed — and every migration left its sync snapshots
+// behind, pinning disk on both hosts.
+func (e *ExecRunner) DeleteSnapshot(container, snapshot string) error {
+	err := e.incus("snapshot", "delete", container, snapshot)
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "doesn't exist") {
+		return nil
+	}
+	return err
+}
+
+func (e *ExecRunner) CopyInitial(container, fromSnap, targetRemote, storagePool string) error {
+	src := fmt.Sprintf("%s/%s", container, fromSnap)
+	dst := fmt.Sprintf("%s:%s", targetRemote, container)
+	args := []string{"copy", src, dst, "--instance-only"}
+	if storagePool != "" {
+		args = append(args, "--storage", storagePool)
+	}
+	return e.incus(args...)
+}
+
+func (e *ExecRunner) CopyRefresh(container, fromSnap, targetRemote, storagePool string) error {
+	src := fmt.Sprintf("%s/%s", container, fromSnap)
+	dst := fmt.Sprintf("%s:%s", targetRemote, container)
+	args := []string{"copy", src, dst, "--refresh"}
+	if storagePool != "" {
+		args = append(args, "--storage", storagePool)
+	}
+	return e.incus(args...)
+}
+
+func (e *ExecRunner) Stop(container string) error {
+	err := e.incus("stop", container)
+	if err == nil {
+		return nil
+	}
+	// Already stopped → still success.
+	if strings.Contains(err.Error(), "is not running") {
+		return nil
+	}
+	return err
+}
+
+func (e *ExecRunner) Start(container string) error {
+	err := e.incus("start", container)
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), "is already running") {
+		return nil
+	}
+	return err
+}
+
+// HasRemote — we just shell out to `incus remote list --format csv`
+// and grep for the name. Cheap, no need for the upstream Go client.
+func (e *ExecRunner) HasRemote(remoteName string) (bool, error) {
+	bin := e.IncusPath
+	if bin == "" {
+		bin = "incus"
+	}
+	cmd := exec.Command(bin, "remote", "list", "--format", "csv") // #nosec G204 -- fixed args
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("incus remote list: %w\nOutput: %s", err, string(out))
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		// CSV row: name,url,protocol,public,static,...
+		if strings.HasPrefix(line, remoteName+",") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
