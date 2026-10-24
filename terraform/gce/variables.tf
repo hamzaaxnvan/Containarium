@@ -69,3 +69,147 @@ variable "boot_disk_auto_delete" {
   type        = bool
   default     = true
 }
+
+variable "admin_ssh_keys" {
+  description = "Map of admin users to their SSH public keys"
+  type        = map(string)
+  default     = {}
+}
+
+variable "allowed_ssh_sources" {
+  description = "List of CIDR blocks allowed to SSH to the jump server"
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "incus_version" {
+  description = "Incus version to install (latest stable if empty)"
+  type        = string
+  default     = ""
+}
+
+variable "enable_monitoring" {
+  description = "Enable GCP monitoring and logging"
+  type        = bool
+  default     = true
+}
+
+variable "service_account_email" {
+  description = "Service account email for the instance (uses default if empty)"
+  type        = string
+  default     = null
+}
+
+variable "labels" {
+  description = "Labels to apply to resources"
+  type        = map(string)
+  default = {
+    managed_by = "terraform"
+    project    = "containarium"
+  }
+}
+
+variable "dns_zone_name" {
+  description = "Cloud DNS zone name for jump server DNS record (optional)"
+  type        = string
+  default     = ""
+}
+
+variable "dns_zone_domain" {
+  description = "Cloud DNS zone domain (e.g., example.com)"
+  type        = string
+  default     = ""
+}
+
+# Spot Instance and Persistent Disk Configuration
+
+variable "use_spot_instance" {
+  description = "Use spot (preemptible) instance for cost savings (60-91% cheaper)"
+  type        = bool
+  default     = false
+}
+
+variable "use_persistent_disk" {
+  description = "Use separate persistent disk for Incus data (survives spot termination)"
+  type        = bool
+  default     = true
+}
+
+variable "data_disk_size" {
+  description = "Size of persistent data disk for containers (GB)"
+  type        = number
+  default     = 500
+
+  validation {
+    condition     = var.data_disk_size >= 100 && var.data_disk_size <= 10000
+    error_message = "Data disk size must be between 100 and 10000 GB"
+  }
+}
+
+variable "data_disk_type" {
+  description = "Type of persistent data disk"
+  type        = string
+  default     = "pd-balanced"
+
+  validation {
+    condition     = contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced", "hyperdisk-throughput"], var.data_disk_type)
+    error_message = "Data disk type must be pd-standard, pd-balanced, pd-ssd, hyperdisk-balanced, or hyperdisk-throughput"
+  }
+}
+
+variable "enable_disk_snapshots" {
+  description = "Enable automated daily snapshots of persistent disk"
+  type        = bool
+  default     = true
+}
+
+# Containarium Daemon Configuration
+
+variable "containarium_version" {
+  description = "Containarium version to install"
+  type        = string
+  default     = "dev"
+}
+
+variable "containarium_binary_url" {
+  description = "URL to download containarium binary (empty = use file provisioner)"
+  type        = string
+  default     = ""
+}
+
+variable "enable_containarium_daemon" {
+  description = "Enable Containarium gRPC daemon service"
+  type        = bool
+  default     = true
+}
+
+# Sentinel HA Configuration
+
+variable "enable_sentinel" {
+  description = "Enable sentinel HA proxy for spot instance recovery (requires use_spot_instance=true)"
+  type        = bool
+  default     = false
+}
+
+variable "sentinel_machine_type" {
+  description = "Machine type for the sentinel VM (e2-micro for free tier)"
+  type        = string
+  default     = "e2-micro"
+}
+
+variable "sentinel_boot_disk_size" {
+  description = "Boot disk size for sentinel VM in GB (up to 30GB for free tier)"
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.sentinel_boot_disk_size >= 10 && var.sentinel_boot_disk_size <= 100
+    error_message = "Sentinel boot disk size must be between 10 and 100 GB"
+  }
+}
+
+variable "ssh_session_log_retention_days" {
+  description = "Days of rotated SSH session records to keep on the sentinel VM (#2415). Passed to the module; default 90."
+  type        = number
+  default     = 90
+}
