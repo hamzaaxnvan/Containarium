@@ -243,3 +243,249 @@ func (s *ContainerServer) SetTenantKMSKey(ctx context.Context, req *pb.SetTenant
 	log.Printf("[secrets] set-tenant-kms-key %s has_tenant_key=%v", req.Username, hasTenantKey)
 	return &pb.SetTenantKMSKeyResponse{
 		Message:      msg,
+		HasTenantKey: hasTenantKey,
+	}, nil
+}
+
+// stampSecretsOnLXC reads every secret owned by `username`,
+// decrypts, and `incus config set environment.<NAME>=<value>`s
+// each one onto `<username>-container`. Used by RefreshSecrets
+// directly and called from CreateContainer / StartContainer once
+// phase 4 wires them up.
+//
+// Best-effort on a per-key basis: if one stamp fails (e.g.
+// container doesn't exist), the rest still proceed. Returns the
+// count of successfully-stamped secrets.
+//
+// Phase 4.3 — dispatches per-secret based on the delivery
+// mode. "env" rows stamp via incus config (as before); "file"
+// rows write to /run/secrets/<NAME> inside the container with
+// mode 0400. /run is tmpfs on every distro the daemon
+// supports, so file-mode secrets get the in-memory ephemeral
+// disposal property for free: when the container stops, the
+// tmpfs evaporates and the plaintext is gone.
+//
+// File-mode secrets must be re-stamped on every container
+// start (since the tmpfs file doesn't survive a stop/start),
+// which the daemon already does at CreateContainer +
+// StartContainer + RefreshSecrets call sites.
+func (s *ContainerServer) stampSecretsOnLXC(ctx context.Context, username string) (int, error) {
+	if s.secretsStore == nil {
+		return 0, errors.New("secrets store not configured")
+	}
+	secretMap, err := s.secretsStore.LoadAllForUserWithDelivery(ctx, username)
+	if err != nil {
+		return 0, fmt.Errorf("load secrets: %w", err)
+	}
+
+	containerName := username + "-container"
+	stamped := 0
+
+	// File mode needs the /run/secrets directory present and
+	// mode-tight before we write into it. Do this once per
+	// stamp pass if any file-mode rows exist. Failure is
+	// fatal for THIS pass (any file-mode write below would
+	// fail anyway), so we surface and count those rows as
+	// not stamped.
+	hasFileMode := false
+	for _, v := range secretMap {
+		if v.Delivery == secrets.DeliveryFile {
+			hasFileMode = true
+			break
+		}
+	}
+	if hasFileMode {
+		// mkdir + chmod is idempotent. Phase B-2 (audit
+		// C-MED-4 polish) — the dir is mode 0750
+		// root:<username> so the tenant's process group
+		// can traverse it but no other user can. /run is
+		// tmpfs on systemd distros so this dir vanishes on
+		// container stop — that's the design.
+		//
+		// Username lookup: the container's tenant user is
+		// `<username>` by convention (created at
+		// CreateContainer time). chown's by-name form
+		// resolves it via the container's /etc/passwd; if
+		// the user doesn't exist (e.g. early-boot race or
+		// a container provisioned outside the daemon) the
+		// chown errors and we fall back to root-only mode
+		// 0700 + file 0400, same as Phase B-1.
+		prepCmd := fmt.Sprintf(
+			"mkdir -p /run/secrets && chown root:%s /run/secrets && chmod 0750 /run/secrets",
+			username,
+		)
+		if err := s.manager.Exec(containerName, []string{"sh", "-c", prepCmd}); err != nil {
+			log.Printf("[secrets] tenant chown on /run/secrets failed for %s (%v) — falling back to root-only mode", containerName, err)
+			// Fallback: root-only dir. Files will be
+			// 0400 root, app must run as root or use
+			// sudo. Better than failing the whole stamp.
+			if err := s.manager.Exec(containerName, []string{"sh", "-c",
+				"mkdir -p /run/secrets && chmod 0700 /run/secrets",
+			}); err != nil {
+				log.Printf("[secrets] failed to prepare /run/secrets on %s: %v (file-mode rows will be skipped)", containerName, err)
+				hasFileMode = false
+			}
+		}
+	}
+
+	// compose-delivery secrets are batched into a single dotenv file
+	// (written once, after the loop) for docker-compose `env_file:`
+	// consumption — the same mechanism OTel uses (#491/#492).
+	composeEnv := map[string]string{}
+
+	for k, sv := range secretMap {
+		switch sv.Delivery {
+		case secrets.DeliveryCompose:
+			composeEnv[k] = sv.Value
+		case secrets.DeliveryFile:
+			if !hasFileMode {
+				continue
+			}
+			path := "/run/secrets/" + k
+			// Write the file mode 0400 (root-only). The
+			// post-write chown/chmod below relaxes the
+			// group bit so the tenant user can read.
+			// We do that as a separate exec rather than
+			// passing uid/gid to WriteFile because the
+			// container's /etc/passwd is the source of
+			// truth for the UID; resolving it server-side
+			// would be fragile.
+			if err := s.manager.WriteFile(containerName, path, []byte(sv.Value), "0400"); err != nil {
+				log.Printf("[secrets] failed to write file-mode %s on %s: %v (continuing)", k, containerName, err)
+				continue
+			}
+			// Try the chown+chmod fix-up. Best-effort —
+			// if the tenant user doesn't exist, the
+			// stamp still succeeds at the file level
+			// (visible to root) and the operator can
+			// debug from the warning.
+			fixupCmd := fmt.Sprintf(
+				"chown root:%s %q && chmod 0440 %q",
+				username, path, path,
+			)
+			if err := s.manager.Exec(containerName, []string{"sh", "-c", fixupCmd}); err != nil {
+				log.Printf("[secrets] chown/chmod %s on %s failed (%v) — file stays root-only 0400", k, containerName, err)
+			}
+		default: // env (and any unknown future mode falls back to env semantics)
+			if err := s.manager.SetEnv(containerName, k, sv.Value); err != nil {
+				log.Printf("[secrets] failed to stamp %s on %s: %v (continuing)", k, containerName, err)
+				continue
+			}
+		}
+		stamped++
+	}
+
+	// Deliver (or tear down) the compose dotenv file once for the whole
+	// tenant. WriteEnvFile is a no-op for an empty map, so the explicit
+	// Remove on the empty branch is what cleans up a stale file after
+	// the last compose secret is deleted or switched to another mode.
+	if len(composeEnv) > 0 {
+		if err := s.manager.WriteEnvFile(containerName, container.SecretsEnvFile, composeEnv); err != nil {
+			log.Printf("[secrets] failed to write compose env_file on %s: %v", containerName, err)
+		}
+	} else if err := s.manager.RemoveEnvFile(containerName, container.SecretsEnvFile); err != nil {
+		log.Printf("[secrets] failed to remove compose env_file on %s: %v (best-effort)", containerName, err)
+	}
+
+	return stamped, nil
+}
+
+// mapSecretError maps store errors to gRPC status codes. Centralized
+// so the RPC methods in this file stay short.
+func mapSecretError(err error) error {
+	if errors.Is(err, secrets.ErrNotFound) {
+		return status.Error(codes.NotFound, "secret not found")
+	}
+	// The model gateway's reserved per-owner key namespace (#1725,
+	// `__gateway/<key_owner>/<provider>`). To the TENANT secrets API that
+	// username is not a tenant, so NotFound is the honest answer — and it says
+	// nothing about the namespace existing. Without this the guard surfaced as
+	// Internal, which reads as a daemon fault rather than a refusal. (#1726)
+	if errors.Is(err, secrets.ErrReservedNamespace) {
+		return status.Error(codes.NotFound, "no such tenant")
+	}
+	if errors.Is(err, secrets.ErrTenantKMSNotSupported) {
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	if errors.Is(err, secrets.ErrBrokerModeImmutable) {
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	// pkg/core/secrets validation errors carry the right message for
+	// the caller — surface as InvalidArgument.
+	msg := err.Error()
+	if isValidationError(msg) {
+		return status.Error(codes.InvalidArgument, msg)
+	}
+	return status.Errorf(codes.Internal, "%v", err)
+}
+
+// isValidationError returns true for the small set of validation
+// errors from pkg/core/secrets. Cheap substring match — these
+// errors are stable strings.
+func isValidationError(msg string) bool {
+	keywords := []string{
+		"name must match",
+		"value exceeds",
+		"username is required",
+	}
+	for _, kw := range keywords {
+		if containsCI(msg, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsCI is a tiny case-insensitive substring check that avoids
+// pulling in strings.ToLower / Contains for one match each — keeps
+// this file's dep footprint local.
+func containsCI(haystack, needle string) bool {
+	if len(needle) > len(haystack) {
+		return false
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if lowerEqual(haystack[i:i+len(needle)], needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func lowerEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if 'A' <= ca && ca <= 'Z' {
+			ca += 32
+		}
+		if 'A' <= cb && cb <= 'Z' {
+			cb += 32
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
+// toProtoSecretMetadata converts the storage-layer struct to the
+// proto-facing one. Times become RFC3339 strings (proto avoids
+// timestamppb for consistency with the rest of the secrets surface).
+func toProtoSecretMetadata(m *secrets.SecretMetadata) *pb.SecretMetadata {
+	if m == nil {
+		return nil
+	}
+	return &pb.SecretMetadata{
+		Username:  m.Username,
+		Name:      m.Name,
+		Version:   m.Version,
+		CreatedAt: m.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		UpdatedAt: m.UpdatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		// Both forms are always populated and always agree: the enum is
+		// the contract, the string keeps existing REST/MCP clients working.
+		Delivery:     m.Delivery, //nolint:staticcheck // deprecated but still served
+		DeliveryMode: deliveryToProto(m.Delivery),
+	}
+}

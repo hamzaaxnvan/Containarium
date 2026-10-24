@@ -310,3 +310,316 @@ func (l *Loader) DeleteEgress(e EgressEntry) error {
 	key := egressKeyBytes(e)
 	if err := l.coll.Maps[mapEgressCIDR].Delete(key[:]); err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("netbpf: delete egress_cidr: %w", err)
+	}
+	return nil
+}
+
+// HasDenyRules reports whether the loaded object carries the virtual-patch
+// deny_cidr map (#660). Like the flows map it is NOT required by Load — an
+// object built before this feature still loads and enforces the allow-list; the
+// daemon just skips deny-rule installation until the operator rebuilds
+// netpolicy.bpf.o. AddDeny/DeleteDeny error if it's absent.
+func (l *Loader) HasDenyRules() bool { return l.coll.Maps[mapDenyCIDR] != nil }
+
+// AddDeny installs (or updates) one virtual-patch deny entry: an LPM key
+// (tenant + CIDR) mapping to the rule's port/proto scope. Update is an upsert, so
+// changing only a rule's port/proto rewrites the same map slot. Errors if the
+// loaded object lacks the deny map (HasDenyRules is false).
+func (l *Loader) AddDeny(e DenyEntry) error {
+	m := l.coll.Maps[mapDenyCIDR]
+	if m == nil {
+		return fmt.Errorf("netbpf: deny_cidr map not present (rebuild netpolicy.bpf.o?)")
+	}
+	key := denyKeyBytes(e.Key())
+	val := denyValueBytes(e)
+	if err := m.Update(key[:], val[:], ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("netbpf: update deny_cidr: %w", err)
+	}
+	return nil
+}
+
+// DeleteDeny removes a virtual-patch deny entry by its LPM key. Used by the
+// reconcile loop to converge the map when a deny rule is removed (or expires) —
+// a stale deny entry would keep blocking traffic after the operator cleared the
+// rule. A missing key is not an error (desired state already reached).
+func (l *Loader) DeleteDeny(k DenyKey) error {
+	m := l.coll.Maps[mapDenyCIDR]
+	if m == nil {
+		return fmt.Errorf("netbpf: deny_cidr map not present (rebuild netpolicy.bpf.o?)")
+	}
+	key := denyKeyBytes(k)
+	if err := m.Delete(key[:]); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("netbpf: delete deny_cidr: %w", err)
+	}
+	return nil
+}
+
+// SetIPTenant maps a managed container IP (network byte order, 4 bytes) to its
+// tenant ID, so the program can distinguish same-tenant peers from external
+// destinations.
+func (l *Loader) SetIPTenant(ip [4]byte, tenantID uint32) error {
+	key := binary.LittleEndian.Uint32(ip[:]) // raw 4 bytes as the map's __u32 key; kernel compares bytes
+	if err := l.coll.Maps[mapIPTenant].Update(&key, &tenantID, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("netbpf: update ip_tenant: %w", err)
+	}
+	return nil
+}
+
+// DeleteIPTenant removes an IP -> tenant mapping. Used by the reconcile loop to
+// converge the map when a container's IP is no longer managed (stopped/deleted)
+// or is excluded from tagging (e.g. the control plane): a stale tag would let
+// the program treat a since-freed or re-purposed IP as a same-tenant peer. A
+// missing key is not an error (the desired state is already reached).
+func (l *Loader) DeleteIPTenant(ip [4]byte) error {
+	key := binary.LittleEndian.Uint32(ip[:])
+	if err := l.coll.Maps[mapIPTenant].Delete(&key); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("netbpf: delete ip_tenant: %w", err)
+	}
+	return nil
+}
+
+// Stats reads the (seen, wouldDeny) counters — the validator's success signal,
+// mirroring the Phase 0 counter read.
+func (l *Loader) Stats() (seen, wouldDeny uint64, err error) {
+	keySeen, keyDeny := statSeen, statWouldDeny
+	if err = l.coll.Maps[mapStats].Lookup(&keySeen, &seen); err != nil {
+		return 0, 0, fmt.Errorf("netbpf: read stats[seen]: %w", err)
+	}
+	if err = l.coll.Maps[mapStats].Lookup(&keyDeny, &wouldDeny); err != nil {
+		return 0, 0, fmt.Errorf("netbpf: read stats[wouldDeny]: %w", err)
+	}
+	return seen, wouldDeny, nil
+}
+
+// EventsMap exposes the perf-event array so the denied-flow consumer (a later
+// increment) can open a perf reader over it.
+func (l *Loader) EventsMap() *ebpf.Map { return l.coll.Maps[mapEvents] }
+
+// InboundReseeds reads the #2618 counter of TCP inbound-flow entries the egress
+// hook re-created from a validated mid-stream segment — a flow whose entry had
+// been evicted (LRU pressure) or had idled out and healed itself. Only inbound
+// packets write the map, so a box cannot inflate it. 0 on an object built
+// before the counter.
+func (l *Loader) InboundReseeds() (uint64, error) {
+	m := l.coll.Maps[mapStats]
+	if m.MaxEntries() <= statInboundReseed {
+		return 0, nil
+	}
+	var n uint64
+	key := statInboundReseed
+	if err := m.Lookup(&key, &n); err != nil {
+		return 0, fmt.Errorf("netbpf: read stats[inbound_reseed]: %w", err)
+	}
+	return n, nil
+}
+
+// SetTrustedIface marks a host interface as an uplink whose UNMARKED frames may
+// seed an inbound flow (#2618): frames routed in from outside the bridge. A
+// no-op on an object without the map.
+func (l *Loader) SetTrustedIface(ifindex int) error {
+	if l.coll == nil {
+		return nil // closed: the map is gone with the collection
+	}
+	m := l.coll.Maps[mapTrustedIif]
+	if m == nil {
+		return nil
+	}
+	key, one := uint32(ifindex), uint8(1) // #nosec G115 -- ifindex is a small positive int
+	if err := m.Update(&key, &one, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("netbpf: update trusted_iif[%d]: %w", ifindex, err)
+	}
+	return nil
+}
+
+// DeleteTrustedIface removes an uplink; a missing key is not an error.
+func (l *Loader) DeleteTrustedIface(ifindex int) error {
+	if l.coll == nil {
+		return nil // closed: the map is gone with the collection
+	}
+	m := l.coll.Maps[mapTrustedIif]
+	if m == nil {
+		return nil
+	}
+	key := uint32(ifindex) // #nosec G115 -- ifindex is a small positive int
+	if err := m.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("netbpf: delete trusted_iif[%d]: %w", ifindex, err)
+	}
+	return nil
+}
+
+// HasFlowAccounting reports whether the loaded object carries the per-flow
+// accounting map (#627). It is intentionally NOT required by Load — an older
+// object built before this feature still loads and enforces; the daemon just
+// skips the traffic-flow poll. The operator rebuilds netpolicy.bpf.o to enable
+// it.
+func (l *Loader) HasFlowAccounting() bool { return l.coll.Maps[mapFlows] != nil }
+
+// Flows snapshots the per-flow accounting map (#627): every observed flow on a
+// managed veth with its cumulative byte/packet tally and first/last timestamps.
+// Read-only — entries are aged out by the map's LRU eviction and the caller's
+// idle pruning, NOT drained here, so the cumulative counters stay monotonic for
+// the active-connection view. Returns an error if the object lacks the map
+// (HasFlowAccounting is false).
+func (l *Loader) Flows() ([]FlowRecord, error) {
+	m := l.coll.Maps[mapFlows]
+	if m == nil {
+		return nil, fmt.Errorf("netbpf: flows map not present (rebuild netpolicy.bpf.o?)")
+	}
+	// Size the value buffer to the map's actual ValueSize so Lookup matches the
+	// kernel map whether the object is the v1 (32-byte) or current (48-byte, with
+	// rx) flow_stat (#631). decodeFlowStat tolerates either length.
+	keyBuf := make([]byte, flowKeySize)
+	valBuf := make([]byte, m.ValueSize())
+	var out []FlowRecord
+	it := m.Iterate()
+	for it.Next(&keyBuf, &valBuf) {
+		var rec FlowRecord
+		if err := decodeFlowKey(keyBuf, &rec); err != nil {
+			return nil, err
+		}
+		if err := decodeFlowStat(valBuf, &rec); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("netbpf: iterate flows: %w", err)
+	}
+	return out, nil
+}
+
+// DeleteFlow removes one entry from the flows map, identified by rec's 5-tuple
+// key. The idle reaper (#632) calls this to "persist + forget" a quiesced flow
+// after writing its final counters to history, so a flow that simply went quiet
+// doesn't linger in the LRU map until eviction (which, on a far-from-full map,
+// effectively never happens). A key that's already gone is not an error.
+func (l *Loader) DeleteFlow(rec FlowRecord) error {
+	m := l.coll.Maps[mapFlows]
+	if m == nil {
+		return fmt.Errorf("netbpf: flows map not present (rebuild netpolicy.bpf.o?)")
+	}
+	if err := m.Delete(encodeFlowKey(rec)); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("netbpf: delete flow: %w", err)
+	}
+	return nil
+}
+
+// encodeFlowKey renders rec's 5-tuple as the 20-byte `struct flow_key` wire
+// layout — the exact inverse of decodeFlowKey (native-endian fields + 3 zero pad
+// bytes, matching the kernel's zero-initialised key). Used to address a specific
+// flow for deletion.
+func encodeFlowKey(rec FlowRecord) []byte {
+	b := make([]byte, flowKeySize)
+	binary.NativeEndian.PutUint32(b[0:4], rec.Ifindex)
+	binary.NativeEndian.PutUint32(b[4:8], rec.Saddr)
+	binary.NativeEndian.PutUint32(b[8:12], rec.Daddr)
+	binary.NativeEndian.PutUint16(b[12:14], rec.Sport)
+	binary.NativeEndian.PutUint16(b[14:16], rec.Dport)
+	b[16] = rec.Proto
+	// b[17:20] padding stays zero
+	return b
+}
+
+// Close detaches every veth link (ingress + egress) and frees the collection.
+func (l *Loader) Close() error {
+	var errs []error
+	for idx, lnk := range l.links {
+		if err := lnk.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close link ifindex %d: %w", idx, err))
+		}
+	}
+	for idx, lnk := range l.egressLinks {
+		if err := lnk.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close egress link ifindex %d: %w", idx, err))
+		}
+	}
+	l.links = nil
+	l.egressLinks = nil
+	if l.coll != nil {
+		l.coll.Close()
+		l.coll = nil
+	}
+	return errors.Join(errs...)
+}
+
+// --- byte-layout helpers (kept next to the C struct definitions they mirror) ---
+
+// vethPolicyValueSize is sizeof(struct policy_cfg) in the current object.
+const vethPolicyValueSize = 16
+
+// vethPolicyValue serializes a PolicyConfig into the 16-byte `struct policy_cfg`
+// layout: u32 tenant_id, u8 mode, u8 allow_intra, u8 allow_metadata,
+// u8 egress_mode (the former pad byte), then the box's IPv4 as its 4 wire bytes,
+// u8 flags and 3 pad bytes (#2618, appended). Native byte order for the
+// integers (the kernel reads the map value with native loads); the address
+// stays in network byte order so the program compares it to ip->saddr as-is.
+func vethPolicyValue(cfg PolicyConfig) [vethPolicyValueSize]byte {
+	var b [vethPolicyValueSize]byte
+	binary.NativeEndian.PutUint32(b[0:4], cfg.TenantID)
+	b[4] = cfg.Mode
+	b[5] = cfg.AllowIntra
+	b[6] = cfg.AllowMetadata
+	b[7] = cfg.EgressMode
+	copy(b[8:12], cfg.BoxIP[:])
+	b[12] = uint8(cfg.Flags)
+	return b
+}
+
+// fitVethPolicyValue returns the value at the loaded object's own policy_cfg
+// size: trimmed for an older object whose struct ends before an appended field
+// (it never reads what is cut), zero-padded for a newer one (an appended field
+// it reads as 0 is "unset" by the struct's convention).
+func fitVethPolicyValue(v [vethPolicyValueSize]byte, size int) []byte {
+	if size <= len(v) {
+		return v[:size]
+	}
+	out := make([]byte, size)
+	copy(out, v[:])
+	return out
+}
+
+// egressKeyBytes serializes an EgressEntry into the 12-byte `struct egress_key`
+// layout: u32 prefixlen, u32 tenant_id, u32 addr. prefixlen and tenant_id are
+// native byte order to match the program's struct loads; addr stays in network
+// byte order (the 4 IPv4 bytes as-is) so the LPM trie prefix-matches CIDRs
+// most-significant-byte first.
+func egressKeyBytes(e EgressEntry) [12]byte {
+	var b [12]byte
+	binary.NativeEndian.PutUint32(b[0:4], e.PrefixLen)
+	binary.NativeEndian.PutUint32(b[4:8], e.TenantID)
+	copy(b[8:12], e.Addr[:])
+	return b
+}
+
+// denyKeyBytes serializes a DenyKey into the 12-byte `struct egress_key` layout
+// the deny_cidr LPM trie shares with egress_cidr (u32 prefixlen, u32 tenant_id,
+// 4 addr bytes). Same byte-order rules as egressKeyBytes.
+func denyKeyBytes(k DenyKey) [12]byte {
+	var b [12]byte
+	binary.NativeEndian.PutUint32(b[0:4], k.PrefixLen)
+	binary.NativeEndian.PutUint32(b[4:8], k.TenantID)
+	copy(b[8:12], k.Addr[:])
+	return b
+}
+
+// denyValueBytes serializes a DenyEntry's scope into the 4-byte `struct deny_val`
+// layout: u16 port (host byte order — the program compares it against the ntoh'd
+// dport), u8 proto, u8 flags (reserved 0).
+func denyValueBytes(e DenyEntry) [4]byte {
+	var b [4]byte
+	binary.NativeEndian.PutUint16(b[0:2], e.Port)
+	b[2] = e.Proto
+	return b
+}
