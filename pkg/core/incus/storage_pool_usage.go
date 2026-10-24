@@ -57,3 +57,63 @@ func ZpoolNameFor(driver string, config map[string]string) string {
 		name = name[:i]
 	}
 	return name
+}
+
+// StoragePoolLevel is a pool's fill classification against the daemon's
+// thresholds (internal/poolcapacity, #2823).
+type StoragePoolLevel int
+
+const (
+	StoragePoolLevelUnknown StoragePoolLevel = iota // total not reported
+	StoragePoolLevelOK
+	StoragePoolLevelWarning
+	StoragePoolLevelCritical
+)
+
+func (l StoragePoolLevel) String() string {
+	switch l {
+	case StoragePoolLevelOK:
+		return "ok"
+	case StoragePoolLevelWarning:
+		return "warning"
+	case StoragePoolLevelCritical:
+		return "critical"
+	default:
+		return "unknown"
+	}
+}
+
+// StoragePoolCapacity is one pool reading with its level.
+type StoragePoolCapacity struct {
+	StoragePoolUsage
+	Level StoragePoolLevel
+}
+
+// StoragePoolUsages reads every pool's used/total through the per-pool
+// resources endpoint only. It never touches GET /1.0/resources, which can hang
+// on a saturated host (#2325), and it is uncached so a full pool is never
+// hidden behind a stale value. Call it on a client built with
+// NewWithSocketAndTimeout so each request is bounded.
+//
+// A pool whose read fails is left out; only a failed pool list is an error.
+func (c *Client) StoragePoolUsages() ([]StoragePoolUsage, error) {
+	pools, err := c.server.GetStoragePools()
+	if err != nil {
+		return nil, fmt.Errorf("list storage pools: %w", err)
+	}
+	out := make([]StoragePoolUsage, 0, len(pools))
+	for _, p := range pools {
+		res, err := c.server.GetStoragePoolResources(p.Name)
+		if err != nil {
+			continue
+		}
+		out = append(out, StoragePoolUsage{
+			Name:       p.Name,
+			Driver:     p.Driver,
+			UsedBytes:  safecast.I64FromU64(res.Space.Used),
+			TotalBytes: safecast.I64FromU64(res.Space.Total),
+			ZpoolName:  ZpoolNameFor(p.Driver, p.Config),
+		})
+	}
+	return out, nil
+}

@@ -46,3 +46,52 @@ func StatusHandler(m *Manager) http.HandlerFunc {
 
 		if lp := m.LastPreemption(); !lp.IsZero() {
 			data.LastPreemption = lp.Format(time.RFC3339)
+		}
+
+		if od := m.OutageDuration(); od > 0 {
+			data.OutageDuration = od.Round(time.Second).String()
+		}
+
+		if m.certStore != nil {
+			data.CertSyncCount = m.certStore.SyncedCount()
+			if ls := m.certStore.LastSync(); !ls.IsZero() {
+				data.CertLastSync = ls.Format(time.RFC3339)
+			}
+			if err := m.certStore.LastSyncErr(); err != nil {
+				data.CertSyncError = err.Error()
+			}
+		}
+
+		if m.keyStore != nil {
+			data.KeySyncCount = m.keyStore.SyncedCount()
+			if ls := m.keyStore.LastSync(); !ls.IsZero() {
+				data.KeyLastSync = ls.Format(time.RFC3339)
+			}
+			if err := m.keyStore.LastSyncErr(); err != nil {
+				data.KeySyncError = err.Error()
+			}
+		}
+
+		if m.tunnelRegistry != nil {
+			stats := m.tunnelRegistry.SessionStats()
+			data.TunnelSessionsTLS = stats.TLS
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		if err := statusTemplate.Execute(w, data); err != nil {
+			log.Printf("[sentinel] status page render error: %v", err)
+		}
+	}
+}
+
+func formatPorts(ports []int) string {
+	if len(ports) == 0 {
+		return "none"
+	}
+	strs := make([]string, len(ports))
+	for i, p := range ports {
+		strs[i] = strconv.Itoa(p)
+	}
+	return strings.Join(strs, ", ")
+}
