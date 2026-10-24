@@ -1787,3 +1787,3581 @@ func (s *ContainerServer) uncancelPendingCreation(username string, cancelled boo
 	if pending, exists := s.pendingCreations[username]; exists {
 		pending.Cancelled = false
 	}
+}
+
+// cascadeContainerCleanup removes the resources that DeleteContainer's
+// LXC-delete leaves behind. Documented as #69 / verified live against
+// the demo cluster on 2026-05-14.
+//
+// Order is deliberate:
+//  1. Route store first — kills the source of truth so RouteSyncJob
+//     will reap the Caddy srv0 route on its next tick (5s). Deleting
+//     directly from Caddy without this step lets the sync job
+//     resurrect the route within seconds, producing the 502-after-
+//     delete trap.
+//  2. TLS subject removal — stops Caddy's ACME renewal loop for the
+//     dead hostname. Harmless to keep (no upstream to challenge) but
+//     wastes rate-limit budget over time.
+//  3. Host user (jump-server account) — removes the Linux user, home,
+//     and the containarium-shell wrapper. sshpiper auto-reaps the
+//     user from its own config on the next keysync (2 min).
+//
+// On-disk Caddy cert at /data/caddy/certificates/... is intentionally
+// left in place — it's harmless after step 2 (no renewal attempts) and
+// avoids a "force" mode that the caller probably doesn't want.
+func (s *ContainerServer) cascadeContainerCleanup(ctx context.Context, containerName, username string) {
+	// 1. Route store: enumerate this container's routes and drop each.
+	//    Skip if routeStore was never wired (daemon without app-hosting).
+	if s.routeStore != nil {
+		routes, err := s.routeStore.ListByContainer(ctx, containerName)
+		if err != nil {
+			log.Printf("[delete-cascade] list routes for %s failed: %v", containerName, err)
+		}
+		for _, r := range routes {
+			if err := s.routeStore.Delete(ctx, r.FullDomain); err != nil {
+				log.Printf("[delete-cascade] delete route %s failed: %v", r.FullDomain, err)
+				continue
+			}
+			log.Printf("[delete-cascade] removed route %s (RouteSyncJob will reap Caddy entry)", r.FullDomain)
+
+			// 2. TLS subject: only if we also have a proxy manager.
+			if s.proxyManager != nil {
+				if err := s.proxyManager.RemoveTLSSubject(r.FullDomain); err != nil {
+					log.Printf("[delete-cascade] remove TLS subject %s failed: %v", r.FullDomain, err)
+				} else {
+					log.Printf("[delete-cascade] removed TLS automation subject %s", r.FullDomain)
+				}
+			}
+		}
+	}
+
+	// 2b. Passthrough store: same cascade, for TCP/UDP passthrough routes
+	//     (#1462). Without this a deleted box's external_port stays claimed
+	//     forever — a later recipe deploy wanting that same port fails with
+	//     a stale "already claimed" conflict against a container that no
+	//     longer exists.
+	if s.passthroughStore != nil {
+		routes, err := s.passthroughStore.ListByContainer(ctx, containerName)
+		if err != nil {
+			log.Printf("[delete-cascade] list passthrough routes for %s failed: %v", containerName, err)
+		}
+		for _, r := range routes {
+			if err := s.passthroughStore.Delete(ctx, r.ExternalPort, r.Protocol); err != nil {
+				log.Printf("[delete-cascade] delete passthrough route %d/%s failed: %v", r.ExternalPort, r.Protocol, err)
+				continue
+			}
+			log.Printf("[delete-cascade] removed passthrough route %d/%s (sync job will reap the iptables rule)",
+				r.ExternalPort, r.Protocol)
+		}
+	}
+
+	// 3. Host user. DeleteJumpServerAccount is idempotent (no-op if the
+	//    user doesn't exist), so calling it when there isn't one is fine.
+	if err := container.DeleteJumpServerAccount(username, false); err != nil {
+		log.Printf("[delete-cascade] delete host user %s failed: %v (manual: sudo userdel -r %s)", username, err, username)
+	} else {
+		log.Printf("[delete-cascade] removed host user %s", username)
+	}
+}
+
+// lifecycleError wraps a start/stop failure with a gRPC code so the gateway
+// stops reporting every failure as Unknown (#3242): a missing instance is
+// NotFound, anything else gets fallback. The message keeps the original text.
+func lifecycleError(fallback codes.Code, msg string, cause error) error {
+	if incus.IsNotFound(cause) {
+		return status.Error(codes.NotFound, msg)
+	}
+	return status.Error(fallback, msg)
+}
+
+// StartContainer starts a stopped container
+func (s *ContainerServer) StartContainer(ctx context.Context, req *pb.StartContainerRequest) (*pb.StartContainerResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	alreadyRunning := false
+	if bb, isK8s := s.k8sBoxes(); isK8s {
+		// K8s runtime: resume the Sandbox (operatingMode=Running); the
+		// agent-sandbox controller recreates the pod with the retained PVC.
+		if err := bb.Start(ctx, box.BoxRef{Tenant: req.Username}); err != nil {
+			return nil, fmt.Errorf("failed to start container: %w", err)
+		}
+	} else {
+		// Pre-start hook (#1199): unlock the dataset before the LXC
+		// boots. A failure stops the start — a container whose storage
+		// is unreadable is worse than one that refused to come up.
+		if err := s.encryption.PreStart(ctx, req.Username+"-container"); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		if c, err := s.manager.StartIfStopped(req.Username); err == nil {
+			alreadyRunning = !c
+		} else {
+			// Try peer
+			if s.peerPool != nil {
+				authToken := extractAuthToken(ctx)
+				peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+				if peer == nil && len(unreachablePeers) > 0 {
+					// #1905: don't report "failed to start" (which reads as
+					// "no such container") when the container may actually
+					// be sitting on a backend we just couldn't reach.
+					return nil, status.Errorf(codes.Unavailable, "cannot start %s: %d backend(s) unreachable (%s)",
+						req.Username, len(unreachablePeers), unreachablePeers[0].Reason)
+				}
+				if peer != nil {
+					body, _ := json.Marshal(map[string]interface{}{
+						"wait_for_ready":        req.WaitForReady,
+						"ready_timeout_seconds": req.ReadyTimeoutSeconds,
+					})
+					_, _, fwdErr := peer.ForwardRequest("POST", fmt.Sprintf("/v1/containers/%s/start", req.Username), authToken, body)
+					if fwdErr == nil {
+						// #1411: a peer-forwarded start reached the local
+						// stamp below only when Start succeeded on THIS
+						// daemon — never on this branch, so a container
+						// woken on a peer got none of the anti-thrash
+						// grace a locally-woken one does, and the very
+						// next autosleep tick could put it straight back
+						// to sleep. Best-effort, same as the local-success
+						// stamp: a failure here just means one extra
+						// wake→sleep flap, not a broken start.
+						if err := s.manager.SetConfig(req.Username+"-container", incus.LastStartedAtKey, time.Now().UTC().Format(time.RFC3339)); err != nil {
+							log.Printf("[autosleep] failed to stamp %s on %s after peer-forward: %v (continuing)", incus.LastStartedAtKey, req.Username, err)
+						}
+						return &pb.StartContainerResponse{
+							Message: fmt.Sprintf("Container for user %s started on backend %s", req.Username, peer.ID),
+						}, nil
+					}
+				}
+			}
+			return nil, lifecycleError(codes.Internal, fmt.Sprintf("failed to start container: %v", err), err)
+		}
+
+		// #3242: the end state already held; nothing changed, so skip the
+		// start-time stamps, secret re-delivery and the started event.
+		if alreadyRunning {
+			info, gerr := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+			if gerr != nil {
+				return nil, fmt.Errorf("container already running but failed to get info: %w", gerr)
+			}
+			resp := &pb.StartContainerResponse{
+				Message: fmt.Sprintf("Container for user %s was already running", req.Username),
+			}
+			if info != nil {
+				resp.Container = toProtoContainer(info)
+			}
+			return resp, nil
+		}
+
+		// Stamp last-start timestamp so the Phase 2 auto-sleep ticker can
+		// enforce its anti-thrash window (don't sleep within 2× threshold
+		// of the most recent start). Best-effort — if the SetConfig fails
+		// the container is already running, and the worst case is one
+		// extra wake → sleep flap.
+		if err := s.manager.SetConfig(req.Username+"-container", incus.LastStartedAtKey, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			log.Printf("[autosleep] failed to stamp %s on %s: %v (continuing)", incus.LastStartedAtKey, req.Username, err)
+		}
+
+		// Two-phase reaping (#525): the box is running again, so clear stopped_at.
+		// This resets the stopped→delete timer — a box someone keeps waking to
+		// investigate never gets reaped; only a box left continuously stopped past
+		// its window does. Best-effort + idempotent (UnsetConfig of an absent key
+		// is a no-op).
+		if err := s.manager.UnsetConfig(req.Username+"-container", incus.StoppedAtKey); err != nil {
+			log.Printf("[ttl] failed to clear %s on %s: %v (continuing)", incus.StoppedAtKey, req.Username, err)
+		}
+
+		// Re-deliver tenant secrets from the current DB state. Picks up
+		// any rotations that happened while the box was stopped; existing
+		// processes won't see the change (POSIX inherit-at-fork), but new
+		// execs and new sessions will.
+		if s.secretsStore != nil {
+			if n, err := s.stampSecrets(ctx, req.Username); err != nil {
+				log.Printf("[secrets] failed to re-deliver on start of %s's box: %v (continuing)", req.Username, err)
+			} else if n > 0 {
+				log.Printf("[secrets] re-delivered %d secret(s) to %s's box at start time", n, req.Username)
+			}
+		}
+	}
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("container started but failed to get info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("container started but not found on read-back")
+	}
+
+	timedOut := false
+	if req.WaitForReady {
+		timeoutSec := req.ReadyTimeoutSeconds
+		if timeoutSec <= 0 {
+			timeoutSec = 30
+		}
+		timedOut = s.waitForContainerReady(ctx, req.Username, info.IPAddress, time.Duration(timeoutSec)*time.Second)
+	}
+
+	s.emitter.EmitContainerStarted(toProtoContainer(info))
+
+	// Post-start: point this container's Caddy routes back at the
+	// container's direct IP/port (undo the wake-mode swap that
+	// StopForAutoSleep applied when the container went to sleep).
+	// Only fires for containers with auto-sleep enabled — that's the
+	// only path that could have left them in wake mode in the first
+	// place. Best-effort; RouteSyncJob re-converges if this fails.
+	if s.wakeRouter != nil && s.routeStore != nil && info != nil && info.AutoSleepEnabled {
+		containerName := req.Username + "-container"
+		routes, err := s.routeStore.ListByContainer(ctx, containerName)
+		if err != nil {
+			log.Printf("[wake] list routes for %s: %v (skipping swap-to-direct)", containerName, err)
+		} else if len(routes) > 0 {
+			if err := s.wakeRouter.SwapToDirect(ctx, containerName, routes); err != nil {
+				log.Printf("[wake] swap-to-direct %s: %v", containerName, err)
+			}
+		}
+	}
+
+	msg := fmt.Sprintf("Container for user %s started successfully", req.Username)
+	if req.WaitForReady && timedOut {
+		msg = fmt.Sprintf("Container for user %s started but readiness probe timed out", req.Username)
+	}
+
+	return &pb.StartContainerResponse{
+		Message:       msg,
+		Container:     toProtoContainer(info),
+		ReadyTimedOut: timedOut,
+	}, nil
+}
+
+// waitForContainerReady polls a TCP dial against the container's
+// primary exposed port until it accepts or the deadline elapses.
+// Returns true when the probe timed out. A nil routeStore, an absent
+// route record, an empty container IP, or a non-positive port all
+// short-circuit to "ready immediately" — the probe is opportunistic.
+func (s *ContainerServer) waitForContainerReady(ctx context.Context, username, containerIP string, total time.Duration) bool {
+	if s.routeStore == nil || containerIP == "" {
+		return false
+	}
+	containerName := username + "-container"
+	routes, err := s.routeStore.ListByContainer(ctx, containerName)
+	if err != nil || len(routes) == 0 {
+		return false
+	}
+	port := routes[0].TargetPort
+	if port <= 0 {
+		return false
+	}
+
+	addr := net.JoinHostPort(containerIP, strconv.Itoa(port))
+	deadline := time.Now().Add(total)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	return true
+}
+
+// StopContainer stops a running container
+func (s *ContainerServer) StopContainer(ctx context.Context, req *pb.StopContainerRequest) (*pb.StopContainerResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	alreadyStopped := false
+	if bb, isK8s := s.k8sBoxes(); isK8s {
+		// K8s runtime: suspend the Sandbox (operatingMode=Suspended); the
+		// controller deletes only the pod — PVC + Service + identity persist.
+		if err := bb.Stop(ctx, box.BoxRef{Tenant: req.Username}, req.Force); err != nil {
+			return nil, fmt.Errorf("failed to stop container: %w", err)
+		}
+	} else if c, err := s.manager.StopIfRunning(req.Username, req.Force); err != nil {
+		// Try peer
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+			if peer == nil && len(unreachablePeers) > 0 {
+				// #1905: don't report "failed to stop" as if the container
+				// didn't exist when its backend was merely unreachable.
+				return nil, status.Errorf(codes.Unavailable, "cannot stop %s: %d backend(s) unreachable (%s)",
+					req.Username, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+			if peer != nil {
+				body, _ := json.Marshal(map[string]bool{"force": req.Force})
+				_, _, fwdErr := peer.ForwardRequest("POST", fmt.Sprintf("/v1/containers/%s/stop", req.Username), authToken, body)
+				if fwdErr == nil {
+					return &pb.StopContainerResponse{
+						Message: fmt.Sprintf("Container for user %s stopped on backend %s", req.Username, peer.ID),
+					}, nil
+				}
+			}
+		}
+		return nil, lifecycleError(codes.Internal, fmt.Sprintf("failed to stop container: %v", err), err)
+	} else if !c {
+		// #3242: the end state already held. Nothing changed, so none of the
+		// post-stop work runs: re-stamping stopped_at would keep postponing the
+		// stopped->delete timer (#525) on every redundant stop.
+		alreadyStopped = true
+	}
+
+	if alreadyStopped {
+		info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+		if err != nil {
+			return nil, fmt.Errorf("container already stopped but failed to get info: %w", err)
+		}
+		resp := &pb.StopContainerResponse{
+			Message: fmt.Sprintf("Container for user %s was already stopped", req.Username),
+		}
+		if info != nil {
+			resp.Container = toProtoContainer(info)
+		}
+		return resp, nil
+	}
+
+	// Post-stop hook (#1201): drop the encryption key so the stopped
+	// container's dataset is ciphertext, including to host root. Runs
+	// only once the LXC is actually down — unloading a key under a
+	// running container would pull its storage away.
+	//
+	// Best-effort by design: the container has already stopped, so a
+	// failed unload cannot be reported as a failed stop. The operator
+	// learns from the log, and "key still in use" (a co-tenant still
+	// running under the same encryptionroot) is the expected case.
+	s.encryption.PostStop(ctx, req.Username+"-container")
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("container stopped but failed to get info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("container stopped but not found on read-back")
+	}
+
+	// Two-phase reaping (#525): record when the box became stopped so the
+	// ttlsweeper's stopped→delete timer runs from here. Best-effort — a failed
+	// stamp just means the stopped→delete clock doesn't start until a later
+	// stop restamps it; it never fails the stop. Only matters for boxes that
+	// opted into delete_after_stopped, but stamping unconditionally keeps the
+	// timestamp honest for any box and costs one config write. LXC-only: the
+	// stopped→delete rule isn't modeled on the k8s runtime yet.
+	if _, isK8s := s.k8sBoxes(); !isK8s {
+		if serr := s.manager.SetConfig(info.Ref.Name, incus.StoppedAtKey, time.Now().UTC().Format(time.RFC3339)); serr != nil {
+			log.Printf("[ttl] failed to stamp %s on %s: %v (stopped→delete timer not started)", incus.StoppedAtKey, info.Ref.Name, serr)
+		}
+	}
+
+	s.emitter.EmitContainerStopped(toProtoContainer(info))
+
+	return &pb.StopContainerResponse{
+		Message:   fmt.Sprintf("Container for user %s stopped successfully", req.Username),
+		Container: toProtoContainer(info),
+	}, nil
+}
+
+// StopForAutoSleep is the entry point for the autosleep ticker. It
+// reuses StopContainer's full plumbing (manager.Stop, event emission)
+// so observers can't distinguish an auto-sleep from a manual stop on
+// the bus — by design — and prepends a tagged log line so operators
+// can grep for the reason that triggered it.
+//
+// Lives on ContainerServer rather than the autosleep package so the
+// ticker depends on a narrow interface (Stopper) rather than the full
+// internal/server import graph.
+func (s *ContainerServer) StopForAutoSleep(ctx context.Context, username, reason string, idleMinutes int) error {
+	// Autosleep is daemon-internal — promote the context to the system
+	// identity so the StopContainer authz check passes.
+	ctx = auth.ContextWithSystemIdentity(ctx)
+	log.Printf("[autosleep] stopping username=%s reason=%q idle_minutes=%d", username, reason, idleMinutes)
+
+	// Swap Caddy routes to the wake handler BEFORE stopping the
+	// container. Doing the swap first means any request arriving in
+	// the brief stop-window lands on /wake/, which (since the
+	// container is still Running at that instant) returns ready=true
+	// immediately and proxies through — one extra hop, but no 502.
+	// The reverse order leaves Caddy pointing at a dead container
+	// for the duration of the graceful stop, which is a guaranteed
+	// 502 window on every auto-sleep event. See #224.
+	if s.wakeRouter != nil && s.routeStore != nil {
+		containerName := username + "-container"
+		routes, err := s.routeStore.ListByContainer(ctx, containerName)
+		if err != nil {
+			log.Printf("[autosleep] list routes for %s: %v (skipping swap-to-wake)", containerName, err)
+		} else if len(routes) > 0 {
+			if err := s.wakeRouter.SwapToWake(ctx, containerName, routes); err != nil {
+				log.Printf("[autosleep] swap-to-wake %s: %v", containerName, err)
+				// Don't fail the stop — RouteSyncJob will re-converge.
+			}
+		}
+	}
+
+	if _, err := s.StopContainer(ctx, &pb.StopContainerRequest{Username: username, Force: false}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ResizeContainer dynamically resizes container resources
+func (s *ContainerServer) ResizeContainer(ctx context.Context, req *pb.ResizeContainerRequest) (*pb.ResizeContainerResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// At least one resource must be specified
+	if req.Cpu == "" && req.Memory == "" && req.Disk == "" && req.CpuRequest == "" && req.MemoryRequest == "" {
+		return nil, fmt.Errorf("at least one resource (cpu, memory, disk, cpu_request, or memory_request) must be specified")
+	}
+
+	containerName := fmt.Sprintf("%s-container", req.Username)
+
+	if bb, isK8s := s.k8sBoxes(); isK8s {
+		ref := box.BoxRef{Tenant: req.Username}
+		if err := bb.Resize(ctx, ref, box.ResourceLimits{CPU: req.Cpu, Memory: req.Memory, Disk: req.Disk, CPURequest: req.CpuRequest, MemoryRequest: req.MemoryRequest}); err != nil {
+			return nil, fmt.Errorf("failed to resize container: %w", err)
+		}
+		// The agent-sandbox controller doesn't restart a live pod on template
+		// drift, so bounce a running box (suspend → resume, i.e. pod recreate)
+		// to apply the new limits now — same downtime as the StatefulSet
+		// rolling restart the old path triggered. A stopped box just picks the
+		// limits up at its next start.
+		if cur, gerr := bb.Get(ctx, ref); gerr == nil && cur != nil && cur.State == pb.ContainerState_CONTAINER_STATE_RUNNING {
+			if err := bb.Stop(ctx, ref, false); err != nil {
+				return nil, fmt.Errorf("resized but failed to restart (stop) container: %w", err)
+			}
+			if err := bb.Start(ctx, ref); err != nil {
+				return nil, fmt.Errorf("resized but failed to restart (start) container: %w", err)
+			}
+		}
+		info, err := s.boxes().Get(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get updated container info: %w", err)
+		}
+		if info == nil {
+			return nil, fmt.Errorf("container resized but not found on read-back")
+		}
+		return &pb.ResizeContainerResponse{
+			Message:   fmt.Sprintf("Container %s resized successfully", containerName),
+			Container: toProtoContainer(info),
+		}, nil
+	}
+
+	// CPU capacity admission (#1579): only when the gate is enabled and the
+	// resize actually names a new CPU value, and only once the container is
+	// confirmed to live on THIS host — checked here, before the local resize
+	// attempt below, rather than unconditionally before the local/peer
+	// dispatch decision, so a resize routed to a peer is never evaluated
+	// against the wrong host's capacity. The peer's own ResizeContainer
+	// handler runs this same check against its own host once the request is
+	// forwarded, so no forwarding-side admission logic is needed here.
+	//
+	// #1588: an admitted resize reserves its cores until cpuRelease runs.
+	// ResizeContainer is fully synchronous with several return points below
+	// (local success, peer-forwarded success, various errors) — deferring a
+	// closure over cpuRelease, rather than calling it inline, releases the
+	// reservation on every one of them uniformly instead of needing a call
+	// at each site.
+	cpuRelease := noopRelease
+	defer func() { cpuRelease() }()
+	if s.cpuOvercommitFactor > 0 && req.Cpu != "" {
+		if current, gerr := s.manager.GetInfo(containerName); gerr == nil && current != nil {
+			rel, aerr := s.admitCPUResize(req.Username, current.CPU, req.Cpu)
+			if aerr != nil {
+				return nil, aerr
+			}
+			cpuRelease = rel
+		}
+	}
+
+	// Perform resize — try local first, then peer
+	if err := s.manager.Resize(containerName, req.Cpu, req.Memory, req.Disk, false); err != nil {
+		// Container not found locally — check peers
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			log.Printf("[resize] container %s not local, searching peers (token len=%d)", containerName, len(authToken))
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+			if peer == nil && len(unreachablePeers) > 0 {
+				// #1905: don't report "failed to resize" as if the
+				// container didn't exist when its backend was merely
+				// unreachable.
+				return nil, fmt.Errorf("cannot resize %s: %d backend(s) unreachable (%s)",
+					req.Username, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+			if peer != nil {
+				log.Printf("[resize] found %s on peer %s, forwarding", containerName, peer.ID)
+				body, _ := json.Marshal(map[string]string{
+					"cpu":           req.Cpu,
+					"memory":        req.Memory,
+					"disk":          req.Disk,
+					"memoryRequest": req.MemoryRequest,
+					"cpuRequest":    req.CpuRequest,
+				})
+				respBody, statusCode, fwdErr := peer.ForwardRequest("PUT", fmt.Sprintf("/v1/containers/%s/resize", req.Username), authToken, body)
+				if fwdErr != nil {
+					return nil, fmt.Errorf("failed to resize container on peer %s: %w", peer.ID, fwdErr)
+				}
+				if statusCode >= 400 {
+					return nil, fmt.Errorf("peer %s returned status %d for resize: %s", peer.ID, statusCode, string(respBody))
+				}
+				return &pb.ResizeContainerResponse{
+					Message: fmt.Sprintf("Container %s resized on backend %s", containerName, peer.ID),
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to resize container: %w", err)
+	}
+
+	// Get updated container info
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get updated container info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("container resized but not found on read-back")
+	}
+
+	// Convert to protobuf
+	protoContainer := toProtoContainer(info)
+
+	return &pb.ResizeContainerResponse{
+		Message:   fmt.Sprintf("Container %s resized successfully", containerName),
+		Container: protoContainer,
+	}, nil
+}
+
+// CleanupDisk frees disk space inside a container
+func (s *ContainerServer) CleanupDisk(ctx context.Context, req *pb.CleanupDiskRequest) (*pb.CleanupDiskResponse, error) {
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	message, freedBytes, err := s.manager.CleanupDisk(req.Username)
+	if err != nil {
+		// Try peer
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+			if peer == nil && len(unreachablePeers) > 0 {
+				// #1905: don't report "failed to cleanup" as if the
+				// container didn't exist when its backend was merely
+				// unreachable.
+				return nil, fmt.Errorf("cannot cleanup disk for %s: %d backend(s) unreachable (%s)",
+					req.Username, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+			if peer != nil {
+				respBody, statusCode, fwdErr := peer.ForwardRequest("POST", fmt.Sprintf("/v1/containers/%s/cleanup-disk", req.Username), authToken, nil)
+				if fwdErr != nil {
+					return nil, fmt.Errorf("failed to cleanup disk on peer %s: %w", peer.ID, fwdErr)
+				}
+				if statusCode >= 400 {
+					return nil, fmt.Errorf("peer %s returned status %d for cleanup: %s", peer.ID, statusCode, string(respBody))
+				}
+				// Parse peer response
+				var peerResp struct {
+					Message    string `json:"message"`
+					FreedBytes int64  `json:"freedBytes"`
+				}
+				if jsonErr := json.Unmarshal(respBody, &peerResp); jsonErr == nil {
+					return &pb.CleanupDiskResponse{
+						Message:    peerResp.Message,
+						FreedBytes: peerResp.FreedBytes,
+					}, nil
+				}
+				return &pb.CleanupDiskResponse{
+					Message: fmt.Sprintf("Disk cleaned on backend %s", peer.ID),
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to clean up disk: %w", err)
+	}
+
+	// Get updated container info
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("disk cleaned but failed to get container info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("disk cleaned but container not found on read-back")
+	}
+
+	return &pb.CleanupDiskResponse{
+		Message:    message,
+		FreedBytes: freedBytes,
+		Container:  toProtoContainer(info),
+	}, nil
+}
+
+// InstallStack installs a software stack or base script on a running container
+func (s *ContainerServer) InstallStack(ctx context.Context, req *pb.InstallStackRequest) (*pb.InstallStackResponse, error) {
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if req.StackId == "" {
+		return nil, fmt.Errorf("stack_id is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// Reject stack installation on Windows VMs
+	if containerInfo, getErr := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username}); getErr == nil && containerInfo != nil {
+		if osLabel, ok := containerInfo.Labels[ostype.OSTypeLabelKey]; ok {
+			if ostype.IsWindows(ostype.OSTypeFromLabel(osLabel)) {
+				return nil, fmt.Errorf("stack installation is not supported on Windows VMs")
+			}
+		}
+	}
+
+	if err := s.manager.InstallStack(req.Username, req.StackId); err != nil {
+		return nil, fmt.Errorf("failed to install stack: %w", err)
+	}
+
+	// Get updated container info
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("stack installed but failed to get container info: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("stack installed but container not found on read-back")
+	}
+
+	return &pb.InstallStackResponse{
+		Message:   fmt.Sprintf("Stack %q installed successfully on %s-container", req.StackId, req.Username),
+		Container: toProtoContainer(info),
+	}, nil
+}
+
+// ListStacks returns the catalog of available software stacks and their
+// parameter schemas. The web UI uses this to render the Create Container
+// dialog's stack dropdown and any dynamically-shown parameter inputs.
+func (s *ContainerServer) ListStacks(ctx context.Context, req *pb.ListStacksRequest) (*pb.ListStacksResponse, error) {
+	// Static built-in stack catalog, but still behind a read scope (#1718):
+	// before this, any caller reaching the surface got it with no token authority
+	// at all.
+	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
+		return nil, err
+	}
+	mgr := stacks.GetDefault()
+	all := mgr.GetAllStacks()
+
+	out := make([]*pb.StackInfo, 0, len(all))
+	for _, stk := range all {
+		params := make([]*pb.StackParameter, 0, len(stk.Parameters))
+		for _, p := range stk.Parameters {
+			params = append(params, &pb.StackParameter{
+				Name:        p.Name,
+				Label:       p.Label,
+				Description: p.Description,
+				Type:        p.Type,
+				Default:     p.Default,
+				Required:    p.Required,
+			})
+		}
+		out = append(out, &pb.StackInfo{
+			Id:          stk.ID,
+			Name:        stk.Name,
+			Description: stk.Description,
+			Icon:        stk.Icon,
+			Parameters:  params,
+		})
+	}
+
+	return &pb.ListStacksResponse{Stacks: out}, nil
+}
+
+// AdoptMigratedContainer is the destination-side helper called by a
+// peer's MoveContainer after the LXC has been `incus copy`'d to this
+// daemon. The LXC exists on this host's incusd but Containarium
+// doesn't know about it yet — no host user, no shell wrapper, no
+// route record. This RPC fills that in and returns the container's
+// new local IP for the source to use in its route store cutover.
+//
+// Idempotent on retry: if the host user already exists,
+// EnsureJumpServerAccount is a no-op; starting an already-running
+// container is a no-op; etc. So a transient network failure
+// mid-adoption can be safely re-driven.
+func (s *ContainerServer) AdoptMigratedContainer(ctx context.Context, req *pb.AdoptMigratedContainerRequest) (*pb.AdoptMigratedContainerResponse, error) {
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	// AdoptMigratedContainer is called peer-to-peer with the
+	// destination daemon's system token (admin role). It has no
+	// user-facing semantic — it's the receiving half of
+	// MoveContainer's handshake. Admin-only at both gates: the
+	// RequireRole check stops any user token from crafting an
+	// adoption request, even one that names their own username
+	// (which AuthorizeTenant would otherwise pass).
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	containerName := fmt.Sprintf("%s-container", req.Username)
+
+	// Encryption placement first: a container this daemon cannot unlock must
+	// be refused before any host-side state is created for it (#1203).
+	if err := s.recordAdoptedPlacement(req); err != nil {
+		return nil, err
+	}
+
+	// Host-side jump-server account. EnsureJumpServerAccount handles
+	// the idempotent case so re-running this RPC won't error.
+	if err := container.EnsureJumpServerAccount(req.Username); err != nil {
+		return nil, fmt.Errorf("ensure jump server account: %w", err)
+	}
+
+	// OTel env-var re-stamping. If the migrated container had
+	// monitoring=true on the source, the OTEL_* env vars are still
+	// pointing at the SOURCE daemon's collector IP — which is unreachable
+	// (or wrong tenant!) from this destination. Re-stamp them with our
+	// local collector endpoint before starting the container, so the
+	// SDK inside picks up the new endpoint on its first batch flush.
+	//
+	// Reading MonitoringEnabled from the just-arrived LXC's Incus config
+	// is reliable: the env vars themselves are the source of truth, and
+	// `incus copy` preserves them, so if the source had monitoring on,
+	// OTEL_EXPORTER_OTLP_ENDPOINT is non-empty in the destination's
+	// config map right now (just pointing at the wrong place).
+	if s.otelCollectorEndpoint != "" {
+		if info, _ := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username}); info != nil && info.MonitoringEnabled {
+			// Phase 2.5 follow-up — re-stamp the bearer at
+			// the destination too. Best-effort; an empty
+			// bearer omits the header so monitoring still
+			// works (collector remains open).
+			bearer, _ := LoadOrCreateOTelBearer()
+			envVars := container.OTelEnvVarsForMigrationWithBearer(
+				req.Username, container.OTelContainerID(info.Labels, containerName), s.localBackendID(), s.otelCollectorEndpoint, bearer,
+			)
+			for k, v := range envVars {
+				if err := s.manager.SetEnv(containerName, k, v); err != nil {
+					log.Printf("[adopt] failed to re-stamp %s on %s: %v (continuing — partial OTel beats none)", k, containerName, err)
+				}
+			}
+			// Re-drop the dotenv file at the destination too, so
+			// docker apps pick up the new collector endpoint. #370.
+			if err := s.manager.WriteOTelEnvFile(containerName, envVars); err != nil {
+				log.Printf("[adopt] failed to write env file on %s: %v (continuing)", containerName, err)
+			}
+			log.Printf("[adopt] re-stamped OTel env vars on %s for destination collector", containerName)
+		}
+	}
+
+	// Start the container — the source already pushed the LXC's
+	// filesystem state. Idempotent if already running.
+	if s.moveRunner != nil {
+		if err := s.moveRunner.Start(containerName); err != nil {
+			return nil, fmt.Errorf("start adopted container: %w", err)
+		}
+	}
+
+	// Get the new IP. The box backend's Get() reads from the substrate.
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, fmt.Errorf("get adopted container info: %w", err)
+	}
+	newIP := ""
+	if info != nil {
+		newIP = info.IPAddress
+	}
+	if newIP == "" {
+		return nil, fmt.Errorf("adopted container has no IP address yet (still initializing?)")
+	}
+
+	// The adopted container now lives on this VM under a new IP —
+	// refresh the local collector's IP map so its OTLP traffic is
+	// attributed correctly. The source VM will refresh its own map
+	// when it deletes/cleans the migrated-out shell.
+	s.refreshContainerIPMap()
+
+	// Note: we deliberately do NOT create matching route store rows
+	// here. The source-side orchestrator owns the route lifecycle —
+	// it updates the existing route rows' target_ip after we return
+	// the new IP. This keeps the source of truth on one side and
+	// avoids a transient "route exists on both sides at different
+	// IPs" window.
+	//
+	// req.SourceRoutes is accepted (and logged) for forward
+	// compatibility: if a future variant of the protocol wants the
+	// destination to be authoritative over its own route store, the
+	// data is already on the wire.
+	if len(req.SourceRoutes) > 0 {
+		log.Printf("[adopt] %s arriving with %d source routes (source owns the swap)", req.Username, len(req.SourceRoutes))
+	}
+
+	return &pb.AdoptMigratedContainerResponse{
+		Message:      fmt.Sprintf("Container %s adopted, ready at %s", req.Username, newIP),
+		NewIpAddress: newIP,
+	}, nil
+}
+
+// otelEnvKeys lists the environment variables the toggle path
+// stamps / unsets. Includes both the legacy OTEL_* form (read by
+// OTel SDKs auto-discovering) and the split CONTAINARIUM_* form
+// (read by the platform sidecar's compose interpolation). Both
+// shapes have to be unset on disable so the LXC's env is fully
+// clean afterward; otherwise a leftover CONTAINARIUM_CONTAINER_ID
+// would still appear in `printenv` and confuse audit / debug.
+var otelEnvKeys = []string{
+	"OTEL_EXPORTER_OTLP_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_PROTOCOL",
+	"OTEL_EXPORTER_OTLP_HEADERS", // Phase 2.5 follow-up — bearer auth
+	"OTEL_SERVICE_NAME",
+	"OTEL_RESOURCE_ATTRIBUTES",
+	"CONTAINARIUM_CONTAINER_ID",
+	"CONTAINARIUM_BACKEND_ID",
+	"CONTAINARIUM_TENANT_ID",
+}
+
+// ToggleMonitoring enables / disables app-emitted OTel on an existing
+// container without recreating it. Per the OTel design doc's v2 TODO.
+//
+// Enable path: requires the daemon to have a collector endpoint
+// configured (FailedPrecondition if not). Stamps the four OTEL_*
+// env vars via incus config-update, then stops + starts the LXC so
+// the env reaches the app process — env-var changes don't take
+// effect on a running container's processes.
+//
+// Disable path: deletes the four OTEL_* env keys from the LXC's
+// Incus config (so the SDK falls back to its no-endpoint defaults
+// rather than seeing literal empty strings, which some SDKs flag
+// as misconfig), then stops + starts the LXC.
+//
+// Core containers are refused — they don't run user code and don't
+// need app-emitted telemetry.
+func (s *ContainerServer) ToggleMonitoring(ctx context.Context, req *pb.ToggleMonitoringRequest) (*pb.ToggleMonitoringResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found: %v", req.Username, err)
+	}
+	if info == nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found", req.Username)
+	}
+	if info.IsCore {
+		return nil, status.Errorf(codes.InvalidArgument, "container %s is a core container; monitoring is for user containers only", info.Ref.Name)
+	}
+
+	containerName := info.Ref.Name
+
+	if req.Enabled {
+		if s.otelCollectorEndpoint == "" {
+			return nil, status.Error(codes.FailedPrecondition, "OTel collector endpoint is not configured on this daemon; cannot enable monitoring")
+		}
+		// Phase 2.5 follow-up — bearer load is best-effort.
+		// On failure the header is omitted and the collector
+		// stays open (pre-2.5 behavior), so monitoring still
+		// works for the operator.
+		bearer, _ := LoadOrCreateOTelBearer()
+		envVars := container.OTelEnvVarsForMigrationWithBearer(
+			req.Username, container.OTelContainerID(info.Labels, containerName), s.localBackendID(), s.otelCollectorEndpoint, bearer,
+		)
+		for k, v := range envVars {
+			if err := s.manager.SetEnv(containerName, k, v); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to stamp %s: %v", k, err)
+			}
+		}
+		// Also drop the dotenv file so nested docker / docker-compose
+		// apps (which don't inherit the LXC env) can consume the config
+		// via `env_file:`. Best-effort — the Incus-config env above
+		// already covers native-LXC apps. See #370.
+		if err := s.manager.WriteOTelEnvFile(containerName, envVars); err != nil {
+			log.Printf("[togglemonitor] %s: failed to write env file: %v (native-LXC env still stamped)", containerName, err)
+		}
+	} else {
+		for _, k := range otelEnvKeys {
+			if err := s.manager.UnsetEnv(containerName, k); err != nil {
+				return nil, status.Errorf(codes.Internal, "failed to unset %s: %v", k, err)
+			}
+		}
+		if err := s.manager.RemoveOTelEnvFile(containerName); err != nil {
+			log.Printf("[togglemonitor] %s: failed to remove env file: %v", containerName, err)
+		}
+	}
+
+	// Restart so the new env reaches the app. The container was
+	// running before — we ignore stop errors (LXC might be already
+	// stopped, in which case stop is a no-op).
+	wasRunning := info.State == pb.ContainerState_CONTAINER_STATE_RUNNING
+	if wasRunning {
+		if err := s.manager.Stop(req.Username, false); err != nil {
+			log.Printf("[togglemonitor] %s stop returned %v (continuing)", containerName, err)
+		}
+		if err := s.manager.Start(req.Username); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to start container after env update: %v", err)
+		}
+	}
+
+	// Refresh the collector's IP map — the container may have a
+	// new IP after restart, and we want source-IP attribution to
+	// stay accurate.
+	s.refreshContainerIPMap()
+
+	msg := "monitoring disabled"
+	if req.Enabled {
+		msg = "monitoring enabled"
+	}
+	if wasRunning {
+		msg += " — container restarted"
+	} else {
+		msg += " — container was stopped; new env takes effect on next start"
+	}
+
+	return &pb.ToggleMonitoringResponse{
+		Message:           msg,
+		MonitoringEnabled: req.Enabled,
+	}, nil
+}
+
+// ToggleAutoSleep writes the per-container auto-sleep opt-in flag
+// (Phase 1 of the serverless feature). Works on running or stopped
+// containers; Incus accepts config updates in either state.
+//
+// On enable, both the flag and the threshold key are written. The
+// threshold key persists across disables so a re-enable restores
+// the prior value; an explicit idle_threshold_minutes > 0 always
+// overwrites, otherwise the existing key or the 15-minute default
+// applies. Core containers are refused — they don't represent user
+// workloads and shouldn't be sleeping.
+func (s *ContainerServer) ToggleAutoSleep(ctx context.Context, req *pb.ToggleAutoSleepRequest) (*pb.ToggleAutoSleepResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	info, err := s.boxes().Get(ctx, box.BoxRef{Tenant: req.Username})
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found: %v", req.Username, err)
+	}
+	if info == nil {
+		return nil, status.Errorf(codes.NotFound, "container for user %s not found", req.Username)
+	}
+	if info.IsCore {
+		return nil, status.Errorf(codes.InvalidArgument, "container %s is a core container; auto-sleep is for user containers only", info.Ref.Name)
+	}
+
+	containerName := info.Ref.Name
+	effectiveThreshold := info.IdleThresholdMinutes
+	if req.IdleThresholdMinutes > 0 {
+		effectiveThreshold = req.IdleThresholdMinutes
+	}
+	if effectiveThreshold < 1 {
+		effectiveThreshold = incus.DefaultIdleThresholdMinutes
+	}
+
+	enabledStr := "false"
+	if req.Enabled {
+		enabledStr = "true"
+	}
+	if err := s.manager.SetConfig(containerName, incus.AutoSleepEnabledKey, enabledStr); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to set %s: %v", incus.AutoSleepEnabledKey, err)
+	}
+	if req.Enabled || req.IdleThresholdMinutes > 0 {
+		if err := s.manager.SetConfig(containerName, incus.IdleThresholdMinutesKey, strconv.Itoa(int(effectiveThreshold))); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to set %s: %v", incus.IdleThresholdMinutesKey, err)
+		}
+	}
+
+	msg := "auto-sleep disabled"
+	if req.Enabled {
+		msg = fmt.Sprintf("auto-sleep enabled at %dm", effectiveThreshold)
+	}
+	return &pb.ToggleAutoSleepResponse{
+		Message:              msg,
+		AutoSleepEnabled:     req.Enabled,
+		IdleThresholdMinutes: effectiveThreshold,
+	}, nil
+}
+
+// AddSSHKey appends an SSH public key to the user's host-side
+// authorized_keys file (/home/<username>/.ssh/authorized_keys).
+//
+// Scope note: this writes the host-side file, not the LXC-internal
+// one. That's the file sshpiper's keysync (running on the sentinel)
+// reads from via /authorized-keys to authenticate inbound SSH. Adding
+// only inside the LXC would not let anyone SSH in via the sentinel.
+//
+// The intended use case is recovery after a lost ephemeral key: an
+// agent or operator generates a fresh keypair locally, calls this RPC
+// with the public half, and the key is live for SSH by the time this
+// returns — the sentinel is told to re-pull immediately rather than
+// the caller waiting out the keysync tick (cloud #971). If the
+// sentinel is unreachable the key still goes live on that next tick.
+//
+// Idempotent — a key already present is a no-op success.
+func (s *ContainerServer) AddSSHKey(ctx context.Context, req *pb.AddSSHKeyRequest) (*pb.AddSSHKeyResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSSHWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if req.SshPublicKey == "" {
+		return nil, fmt.Errorf("ssh_public_key is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// Heal a box created before #2489 without SSH keys: it has a container but
+	// no host-side jump account, so AddAuthorizedKey would refuse it forever
+	// ("host user ... does not exist"). The tenant is already authorized above
+	// and the container must exist, so creating the (idempotent) account here
+	// cannot mint accounts for names that are not boxes.
+	if s.manager != nil {
+		if _, gerr := s.manager.Get(req.Username); gerr == nil {
+			if err := container.EnsureJumpServerAccount(req.Username); err != nil {
+				return nil, fmt.Errorf("ensure host account: %w", err)
+			}
+		}
+	}
+
+	if err := s.authorizedKeys.addKey(req.Username, req.SshPublicKey); err != nil {
+		return nil, fmt.Errorf("add authorized key: %w", err)
+	}
+	// Register after the file write: a registry failure leaves the key in
+	// authorized_keys but unknown to the authorization decider, so report
+	// it and let the caller retry this idempotent call.
+	if err := s.registerSSHKey(ctx, req.Username, req.SshPublicKey, sshauthz.SourceAPI); err != nil {
+		return nil, registryError("add ssh key", err)
+	}
+
+	total, err := s.authorizedKeys.countKeys(req.Username)
+	if err != nil {
+		// Counting failed but the add succeeded — return success with
+		// zero so the caller still knows the add went through.
+		log.Printf("[add-ssh-key] count after add failed for %s: %v", req.Username, err)
+		total = 0
+	}
+
+	s.notifySentinelKeyChange(ctx, "add_ssh_key "+req.Username)
+
+	return &pb.AddSSHKeyResponse{
+		Message:   fmt.Sprintf("SSH key added for %s (sentinel resynced; falls back to the periodic keysync if it was unreachable)", req.Username),
+		TotalKeys: total,
+	}, nil
+}
+
+// setSSHKeysRegistryTimeout bounds the registry work SetSSHKeys does while
+// holding the per-user authorized_keys lock. A var so tests can shorten it.
+var setSSHKeysRegistryTimeout = 10 * time.Second
+
+// SetSSHKeys makes the user's host-side authorized_keys hold exactly the
+// requested keys (#2945). Authorization is AddSSHKey's: ssh:write plus
+// tenant access to the box.
+//
+// Every key is validated before any write, so one bad entry fails the call
+// with no change. Platform-managed lines (the sentinel's upstream key) are
+// preserved by the file layer and never revoked, so a caller cannot lock the
+// platform out. Keys dropped by the call are revoked in the ssh_keys
+// registry exactly as RemoveSSHKey does (only the entries this account owns,
+// #3187), except that a key another account still holds is dropped from this
+// account's file without being revoked (#3222). Kept keys are registered like
+// AddSSHKey does. An empty list is accepted only with allow_empty, so an
+// omitted field cannot wipe a box.
+func (s *ContainerServer) SetSSHKeys(ctx context.Context, req *pb.SetSSHKeysRequest) (*pb.SetSSHKeysResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSSHWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, status.Error(codes.InvalidArgument, "username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+	if len(req.SshPublicKeys) > container.MaxAuthorizedKeys {
+		return nil, status.Errorf(codes.InvalidArgument, "ssh_public_keys has %d entries, over the limit of %d", len(req.SshPublicKeys), container.MaxAuthorizedKeys)
+	}
+	switch {
+	case len(req.SshPublicKeys) == 0 && !req.AllowEmpty:
+		return nil, status.Error(codes.InvalidArgument, "ssh_public_keys is empty: set allow_empty=true to remove every key")
+	case len(req.SshPublicKeys) > 0 && req.AllowEmpty:
+		return nil, status.Error(codes.InvalidArgument, "allow_empty must be false when ssh_public_keys is given")
+	}
+	fingerprints := make(map[string]bool, len(req.SshPublicKeys))
+	for i, k := range req.SshPublicKeys {
+		if err := container.ValidateStrictSSHPublicKey(k); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "ssh_public_keys[%d]: %v", i, err)
+		}
+		rec, err := sshauthz.NewKeyRecord(k, req.Username, sshauthz.SourceAPI, s.sshKeyClock())
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "ssh_public_keys[%d]: %v", i, err)
+		}
+		fingerprints[rec.Fingerprint] = true
+	}
+
+	// Same heal as AddSSHKey for a box created without a host account.
+	if s.manager != nil {
+		if _, gerr := s.manager.Get(req.Username); gerr == nil {
+			if err := container.EnsureJumpServerAccount(req.Username); err != nil {
+				return nil, fmt.Errorf("ensure host account: %w", err)
+			}
+		}
+	}
+
+	// Both registry steps run inside the file layer's per-user critical
+	// section, so concurrent Sets are ordered end to end (a later Set's
+	// revocation can never be undone by an earlier Set's registration), and
+	// each is bounded so a slow registry cannot hold the lock indefinitely.
+	//
+	// Revoke first: if it fails nothing is written and a retry still sees the
+	// keys. (Revoked but still in the file, if the write then fails, is the
+	// safe direction.) Register after the write; it is idempotent, so a
+	// failure here is retried by repeating the call.
+	removed, err := s.authorizedKeys.replaceKeys(req.Username, req.SshPublicKeys, container.ReplaceHooks{
+		BeforeWrite: func(drop []string) error {
+			rctx, cancel := context.WithTimeout(ctx, setSSHKeysRegistryTimeout)
+			defer cancel()
+			for _, k := range drop {
+				err := s.revokeSSHKey(rctx, req.Username, k)
+				if errors.Is(err, sshauthz.ErrKeyHeldByOtherAccount) {
+					// Another account still holds this key: this call only
+					// removes this account's entry (#3222). The registry row
+					// stays active for the other holder.
+					continue
+				}
+				if err != nil {
+					return registryError("set ssh keys", err)
+				}
+			}
+			return nil
+		},
+		AfterWrite: func() error {
+			rctx, cancel := context.WithTimeout(ctx, setSSHKeysRegistryTimeout)
+			defer cancel()
+			for _, k := range req.SshPublicKeys {
+				if err := s.registerSSHKey(rctx, req.Username, k, sshauthz.SourceAPI); err != nil {
+					return registryError("set ssh keys", err)
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("replace authorized keys: %w", err)
+	}
+
+	// Revoked keys left in sshpiper's table would stay working credentials.
+	s.notifySentinelKeyChange(ctx, "set_ssh_keys "+req.Username)
+
+	return &pb.SetSSHKeysResponse{
+		Message:     fmt.Sprintf("SSH keys set for %s", req.Username),
+		RemovedKeys: safecast.I32(len(removed)),
+		TotalKeys:   safecast.I32(len(fingerprints)),
+	}, nil
+}
+
+// RemoveSSHKey removes a specific SSH public key from the user's
+// host-side authorized_keys file. No-op if the key isn't present.
+func (s *ContainerServer) RemoveSSHKey(ctx context.Context, req *pb.RemoveSSHKeyRequest) (*pb.RemoveSSHKeyResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeSSHWrite); err != nil {
+		return nil, err
+	}
+	if req.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+	if req.SshPublicKey == "" {
+		return nil, fmt.Errorf("ssh_public_key is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// Revoke before the file changes, as SetSSHKeys does: a registry failure
+	// leaves the key in place and is reported, so the caller's retry repeats
+	// the revocation. Only the entry this account owns is revoked (#3187), and
+	// not while another account still holds the key (#3222).
+	if err := s.revokeSSHKey(ctx, req.Username, req.SshPublicKey); err != nil {
+		if !errors.Is(err, sshauthz.ErrKeyHeldByOtherAccount) {
+			return nil, registryError("remove ssh key", err)
+		}
+		// Another account still holds this key: only this account's entry is
+		// removed and the registry row stays active for the other holder
+		// (#3222), as SetSSHKeys does. The response does not name the holder; an
+		// unreadable account fails the call with ErrHolderUnknown, which names
+		// no account either (the daemon log does).
+		log.Printf("[remove-ssh-key] %s dropped a key another account still holds; registry entry left active", req.Username)
+	}
+	if err := s.authorizedKeys.removeKey(req.Username, req.SshPublicKey); err != nil {
+		return nil, fmt.Errorf("remove authorized key: %w", err)
+	}
+
+	total, err := s.authorizedKeys.countKeys(req.Username)
+	if err != nil {
+		log.Printf("[remove-ssh-key] count after remove failed for %s: %v", req.Username, err)
+		total = 0
+	}
+
+	// A revoked key that stays in sshpiper's table is still a working
+	// credential, so this one is worth not leaving on a timer.
+	s.notifySentinelKeyChange(ctx, "remove_ssh_key "+req.Username)
+
+	return &pb.RemoveSSHKeyResponse{
+		Message:   fmt.Sprintf("SSH key removed for %s", req.Username),
+		TotalKeys: total,
+	}, nil
+}
+
+// GetMetrics gets runtime metrics for containers
+func (s *ContainerServer) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
+	// Tenant isolation: as with ListContainers, empty username for a
+	// non-admin is rewritten to the authenticated subject (was "all
+	// containers"); a different explicit username is denied.
+	subject, roles, ok := auth.SubjectFromGRPCContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "no authenticated subject")
+	}
+	if !auth.HasRole(roles, auth.RoleAdmin) {
+		if req.Username != "" && req.Username != subject {
+			return nil, status.Error(codes.PermissionDenied, "not authorized for this tenant")
+		}
+		req.Username = subject
+	}
+
+	var protoMetrics []*pb.ContainerMetrics
+	var unreachableBackends []*pb.UnreachableBackend
+
+	if req.Username != "" {
+		// Get metrics for a specific container — try local first, then peers
+		metrics, err := s.manager.GetMetrics(req.Username)
+		if err != nil {
+			// Not found locally — try peers
+			if s.peerPool != nil {
+				authToken := extractAuthToken(ctx)
+				peer, unreachablePeers := s.peerPool.FindContainerPeer(req.Username, authToken)
+				if peer != nil {
+					body, peerErr := peer.ForwardGetMetrics(authToken, req.Username)
+					if peerErr == nil {
+						// Parse and return peer metrics (use protojson for enum handling)
+						var peerResp pb.GetMetricsResponse
+						if jsonErr := protojson.Unmarshal(body, &peerResp); jsonErr == nil {
+							return &peerResp, nil
+						}
+					}
+				}
+				if peer == nil && len(unreachablePeers) > 0 {
+					// #1905: report the unreachable backend structurally
+					// (same contract #1901 introduced) instead of an error
+					// that reads as "no such container."
+					for _, u := range unreachablePeers {
+						unreachableBackends = append(unreachableBackends, &pb.UnreachableBackend{
+							BackendId: u.BackendID,
+							Reason:    u.Reason,
+						})
+					}
+					return &pb.GetMetricsResponse{UnreachableBackends: unreachableBackends}, nil
+				}
+			}
+			return nil, fmt.Errorf("failed to get metrics: %w", err)
+		}
+		protoMetrics = append(protoMetrics, toProtoMetrics(metrics))
+	} else {
+		// Get metrics for all containers (local)
+		allMetrics, err := s.manager.GetAllMetrics()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get metrics: %w", err)
+		}
+		for _, m := range allMetrics {
+			protoMetrics = append(protoMetrics, toProtoMetrics(m))
+		}
+
+		// Merge metrics from all healthy peers. A peer that can't be reached
+		// contributes zero entries to `metrics` — that's reported separately
+		// in `unreachable_backends` so callers can tell "unreachable" from
+		// "genuinely idle/no usage" instead of rendering both as blank (#1901).
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			for _, peer := range s.peerPool.Peers() {
+				if !peer.Healthy {
+					unreachableBackends = append(unreachableBackends, &pb.UnreachableBackend{
+						BackendId: peer.ID,
+						Reason:    "peer marked unhealthy by sentinel",
+					})
+					continue
+				}
+				body, err := peer.ForwardGetMetrics(authToken, "")
+				if err != nil {
+					log.Printf("[metrics] peer %s: %v", peer.ID, err)
+					unreachableBackends = append(unreachableBackends, &pb.UnreachableBackend{
+						BackendId: peer.ID,
+						Reason:    fmt.Sprintf("peer fetch failed: %v", err),
+					})
+					continue
+				}
+				var peerMetricsResp pb.GetMetricsResponse
+				if err := protojson.Unmarshal(body, &peerMetricsResp); err != nil {
+					log.Printf("[metrics] peer %s parse error: %v", peer.ID, err)
+					unreachableBackends = append(unreachableBackends, &pb.UnreachableBackend{
+						BackendId: peer.ID,
+						Reason:    fmt.Sprintf("peer response unparseable: %v", err),
+					})
+					continue
+				}
+				protoMetrics = append(protoMetrics, peerMetricsResp.Metrics...)
+			}
+		}
+	}
+
+	return &pb.GetMetricsResponse{
+		Metrics:             protoMetrics,
+		UnreachableBackends: unreachableBackends,
+	}, nil
+}
+
+// daemonReleaseChecker caches the latest GitHub release across requests so a
+// busy fleet's status checks don't burn the unauthenticated GitHub rate
+// limit. Package-level (not per-request) for that shared cache. #354.
+var daemonReleaseChecker = releasecheck.New()
+
+// GetLatestRelease reports the latest published Containarium release vs this
+// daemon's running version. Admin-only, matching the other System endpoints.
+// Best-effort: a failed/rate-limited GitHub lookup yields an empty
+// latest_release (and update_available=false) rather than an error. #354.
+func (s *ContainerServer) GetLatestRelease(ctx context.Context, req *pb.GetLatestReleaseRequest) (*pb.GetLatestReleaseResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	current := version.GetVersion()
+	latest, _ := daemonReleaseChecker.Latest(ctx) // empty on persistent failure
+	return &pb.GetLatestReleaseResponse{
+		LatestRelease:   latest,
+		CurrentVersion:  current,
+		UpdateAvailable: releasecheck.UpdateAvailable(current, latest),
+		TargetVersion:   s.upgradeTargetVersion(ctx, ""),
+	}, nil
+}
+
+// upgradeTargetVersion is the version a TriggerUpgrade with this github_tag
+// would install: the tag itself (resolving "latest" via the cached release
+// check), or else the sentinel-served binary's version. Best-effort — ""
+// when unknown, never an error, since it only informs the caller. #2171.
+func (s *ContainerServer) upgradeTargetVersion(ctx context.Context, githubTag string) string {
+	switch githubTag {
+	case "":
+	case "latest":
+		latest, _ := daemonReleaseChecker.Latest(ctx)
+		return strings.TrimPrefix(latest, "v")
+	default:
+		return strings.TrimPrefix(githubTag, "v")
+	}
+	if s.autoUpdater == nil {
+		return ""
+	}
+	v, err := s.autoUpdater.ServedVersion(ctx)
+	if err != nil {
+		log.Printf("[upgrade] sentinel-served version unavailable: %v", err)
+		return ""
+	}
+	return v
+}
+
+// ValidateGPU launches a throwaway nvidia.runtime LXC on the target backend,
+// runs nvidia-smi inside, tears it down, and reports whether the GPU is usable.
+// Admin-only. An empty (or local) backend_id runs the check on this daemon's
+// own host; a peer backend_id forwards to that peer's daemon, which runs the
+// same check locally on its host. See #316.
+func (s *ContainerServer) ValidateGPU(ctx context.Context, req *pb.ValidateGPURequest) (*pb.ValidateGPUResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+
+	// Remote backend → forward to the owning peer (it validates its own GPU).
+	if req.BackendId != "" && req.BackendId != s.localBackendID() {
+		if s.peerPool == nil {
+			return nil, status.Errorf(codes.Unavailable, "backend %q: no peer pool configured on this daemon", req.BackendId)
+		}
+		peer := s.peerPool.Get(req.BackendId)
+		if peer == nil {
+			return nil, status.Errorf(codes.NotFound, "backend %q not found (see 'containarium backends list')", req.BackendId)
+		}
+		body, err := protojson.Marshal(req)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "marshal validate-gpu request: %v", err)
+		}
+		respBody, st, err := peer.ForwardRequest("POST", "/v1/validate-gpu", extractAuthToken(ctx), body)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "forward validate-gpu to %s: %v", req.BackendId, err)
+		}
+		if st >= 400 {
+			return nil, status.Errorf(codes.Internal, "peer %s returned status %d for validate-gpu", req.BackendId, st)
+		}
+		var resp pb.ValidateGPUResponse
+		if err := protojson.Unmarshal(respBody, &resp); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse peer %s validate-gpu response: %v", req.BackendId, err)
+		}
+		resp.BackendId = req.BackendId
+		return &resp, nil
+	}
+
+	// Local backend.
+	res := s.manager.ValidateGPU(req.Pci)
+	return &pb.ValidateGPUResponse{
+		Status:        gpuValidationStatusToProto(res.Status),
+		GpuModel:      res.Model,
+		DriverVersion: res.DriverVersion,
+		Detail:        res.Detail,
+		BackendId:     req.BackendId,
+	}, nil
+}
+
+// gpuValidationStatusToProto maps the manager's GPU validation status string to
+// the proto enum.
+func gpuValidationStatusToProto(s string) pb.ValidateGPUResponse_GPUStatus {
+	switch s {
+	case container.GPUStatusOK:
+		return pb.ValidateGPUResponse_GPU_STATUS_OK
+	case container.GPUStatusUnavailable:
+		return pb.ValidateGPUResponse_GPU_STATUS_UNAVAILABLE
+	default:
+		return pb.ValidateGPUResponse_GPU_STATUS_UNSPECIFIED
+	}
+}
+
+// TriggerUpgrade upgrades a backend's daemon to the binary the sentinel
+// currently serves, immediately rather than on the periodic auto-update tick.
+// Admin-only. An empty (or local) backend_id upgrades this daemon; a peer
+// backend_id forwards to that peer, which upgrades itself. The upgrade is
+// async: a successful local swap restarts this daemon, so callers confirm the
+// result via the backend version in ListBackends (the in-memory job is lost on
+// restart, so GetUpgradeStatus then returns "unknown"). #354 Phase B.
+func (s *ContainerServer) TriggerUpgrade(ctx context.Context, req *pb.TriggerUpgradeRequest) (*pb.TriggerUpgradeResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	// #3057: enforce the same scope the MCP layer maps this tool to, so a
+	// scoped admin token cannot bypass it over REST/gRPC. A nil scope claim
+	// stays unrestricted (legacy tokens), per RequireScope.
+	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
+		return nil, err
+	}
+
+	// Remote backend → forward to the owning peer (it upgrades its own daemon).
+	if req.BackendId != "" && req.BackendId != s.localBackendID() {
+		if s.peerPool == nil {
+			return nil, status.Errorf(codes.Unavailable, "backend %q: no peer pool configured on this daemon", req.BackendId)
+		}
+		peer := s.peerPool.Get(req.BackendId)
+		if peer == nil {
+			return nil, status.Errorf(codes.NotFound, "backend %q not found (see 'containarium backends list')", req.BackendId)
+		}
+		body, err := protojson.Marshal(req)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "marshal upgrade request: %v", err)
+		}
+		respBody, st, err := peer.ForwardRequest("POST", "/v1/backends/upgrade", extractAuthToken(ctx), body)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "forward upgrade to %s: %v", req.BackendId, err)
+		}
+		if st >= 400 {
+			return nil, status.Errorf(codes.Internal, "peer %s returned status %d for upgrade", req.BackendId, st)
+		}
+		var resp pb.TriggerUpgradeResponse
+		if err := protojson.Unmarshal(respBody, &resp); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse peer %s upgrade response: %v", req.BackendId, err)
+		}
+		resp.BackendId = req.BackendId
+		return &resp, nil
+	}
+
+	// Local backend. Two upgrade sources: the default sentinel-served binary,
+	// or (opt-in, #1028) a specific GitHub release tag. github_tag chooses
+	// the path; the sentinel path's own gating (autoUpdater == nil) is
+	// unchanged.
+	usingGitHub := req.GithubTag != ""
+	if usingGitHub {
+		if s.binaryPath == "" {
+			return nil, status.Error(codes.Unavailable, "GitHub-direct upgrade is not configured on this daemon (no binary path wired)")
+		}
+		// #3059: report a refused downgrade on the RPC itself rather than as
+		// a failed async job. runGitHubUpgrade re-checks as defense in depth.
+		if err := checkDowngrade(runningVersion(), req.GithubTag, req.AllowDowngrade); err != nil {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+	} else if s.autoUpdater == nil {
+		// cloud#1547: this used to return with NO log line at all — on a BYOC
+		// host whose containariumd was started without --sentinel-url (a
+		// daemon startup flag, separate from `pool join`'s own tunnel
+		// registration; a host can join and heartbeat fine while missing
+		// this), every upgrade attempt died here silently. An operator
+		// SSHed into the target host during a live incident saw nothing
+		// arrive, before or after, which is what made the cloud-side "no
+		// capacity in pool" error look like a fleet/capacity problem
+		// instead of a one-line daemon misconfiguration. Log it, and name
+		// the flag in the error too so the message alone (three hops away,
+		// no log access) is actionable.
+		log.Printf("[upgrade] rejected: TriggerUpgrade called on backend %q with no auto-updater configured (missing --sentinel-url at daemon startup)", s.localBackendID())
+		return nil, status.Error(codes.Unavailable, "auto-update is not configured on this daemon — start containariumd with --sentinel-url (or CONTAINARIUM_SENTINEL_URL) to enable it")
+	}
+
+	current := version.GetVersion()
+	target := s.upgradeTargetVersion(ctx, req.GithubTag)
+	backendKey := s.localBackendID()
+
+	s.upgradeMu.Lock()
+	if s.upgradeJobs == nil {
+		s.upgradeJobs = make(map[string]*upgradeJob)
+		s.upgradeBusy = make(map[string]bool)
+	}
+	if s.upgradeBusy[backendKey] {
+		s.upgradeMu.Unlock()
+		return nil, status.Error(codes.FailedPrecondition, "an upgrade is already in progress on this backend")
+	}
+	id := fmt.Sprintf("upg-%d", time.Now().UnixNano())
+	job := &upgradeJob{id: id, backendID: req.BackendId, status: "in_progress", currentVersion: current, targetVersion: target}
+	s.upgradeJobs[id] = job
+	s.upgradeBusy[backendKey] = true
+	s.upgradeMu.Unlock()
+
+	subject, _, _ := auth.SubjectFromGRPCContext(ctx)
+	if usingGitHub {
+		log.Printf("[upgrade] triggered by %q on backend %q (from %s, github_tag=%s, force=%v, job=%s)", subject, backendKey, current, req.GithubTag, req.Force, id)
+	} else {
+		log.Printf("[upgrade] triggered by %q on backend %q (from %s, force=%v, job=%s)", subject, backendKey, current, req.Force, id)
+	}
+	s.logUpgradeAudit(ctx, subject, backendKey, id, "triggered", "")
+
+	// Run async: a successful swap restarts the daemon, so neither this
+	// goroutine nor the in-memory job survives a local upgrade. We still
+	// record terminal state for the noop/failure paths, which return WITHOUT a
+	// restart. Detach from the request's cancellation (the handler returns
+	// immediately) while keeping its values — the upgrade must outlive the RPC.
+	upgradeCtx := context.WithoutCancel(ctx)
+	go func() {
+		var changed bool
+		var err error
+		if usingGitHub {
+			changed, err = runGitHubUpgrade(upgradeCtx, s.binaryPath, req.GithubTag, req.Force, req.AllowDowngrade)
+		} else {
+			changed, err = s.autoUpdater.TriggerNow(upgradeCtx, req.Force)
+		}
+		s.upgradeMu.Lock()
+		defer s.upgradeMu.Unlock()
+		s.upgradeBusy[backendKey] = false
+		switch {
+		case err != nil:
+			job.status = "failed"
+			job.errMsg = err.Error()
+			job.completedAt = time.Now().UTC().Format(time.RFC3339)
+			log.Printf("[upgrade] job %s failed: %v", id, err)
+			s.logUpgradeAudit(upgradeCtx, subject, backendKey, id, "failed", err.Error())
+		case !changed:
+			job.status = "noop"
+			job.completedAt = time.Now().UTC().Format(time.RFC3339)
+			s.logUpgradeAudit(upgradeCtx, subject, backendKey, id, "noop", "")
+		default:
+			// changed: restart imminent; daemon will not record "completed" since
+			// it is about to die. The post-restart version in ListBackends is the
+			// canonical confirmation.
+			s.logUpgradeAudit(upgradeCtx, subject, backendKey, id, "binary_swapped", "")
+		}
+	}()
+
+	return &pb.TriggerUpgradeResponse{
+		UpgradeId:      id,
+		Status:         "in_progress",
+		CurrentVersion: current,
+		Message:        "upgrade started; if a new binary is applied the daemon restarts — confirm via the backend version in ListBackends",
+		BackendId:      req.BackendId,
+		TargetVersion:  target,
+	}, nil
+}
+
+// GetUpgradeStatus polls an upgrade started by TriggerUpgrade. Admin-only.
+// Returns status "unknown" for an unrecognized id — including the common case
+// where a successful local self-upgrade restarted the daemon and dropped the
+// in-memory job; callers should compare the backend version in ListBackends.
+// #354.
+func (s *ContainerServer) GetUpgradeStatus(ctx context.Context, req *pb.GetUpgradeStatusRequest) (*pb.GetUpgradeStatusResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	// #3057: enforce the same scope the MCP layer maps this tool to, so a
+	// scoped admin token cannot bypass it over REST/gRPC. A nil scope claim
+	// stays unrestricted (legacy tokens), per RequireScope.
+	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
+		return nil, err
+	}
+	if req.UpgradeId == "" {
+		return nil, status.Error(codes.InvalidArgument, "upgrade_id is required")
+	}
+	// Read the job's fields under the same lock TriggerUpgrade's completion
+	// goroutine writes them under — job is a plain struct, not synchronized
+	// itself, so unlocking before reading its fields (as this used to do)
+	// races with that goroutine. Surfaced by -race once a test polled status
+	// immediately after triggering an upgrade (#1028).
+	s.upgradeMu.Lock()
+	defer s.upgradeMu.Unlock()
+	job := s.upgradeJobs[req.UpgradeId]
+	if job == nil {
+		return &pb.GetUpgradeStatusResponse{
+			Status:         "unknown",
+			CurrentVersion: version.GetVersion(),
+		}, nil
+	}
+	return &pb.GetUpgradeStatusResponse{
+		Status:         job.status,
+		CurrentVersion: job.currentVersion,
+		Error:          job.errMsg,
+		CompletedAt:    job.completedAt,
+		TargetVersion:  job.targetVersion,
+	}, nil
+}
+
+// GetSystemInfo gets information about the Incus host
+func (s *ContainerServer) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error) {
+	// Admin-only: exposes fleet-internal details (hostname, OS,
+	// Incus version, container counts across tenants). A user
+	// token has no legitimate reason to read this — they care
+	// about their own container, not the daemon's identity.
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	// Get basic system info from container manager
+	containers, err := s.manager.List()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get containers: %w", err)
+	}
+
+	// Count running/stopped containers
+	var running, stopped int32
+	for _, c := range containers {
+		if c.State == "Running" {
+			running++
+		} else {
+			stopped++
+		}
+	}
+
+	// Get Incus server info
+	client, err := incus.New()
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Incus: %w", err)
+	}
+
+	serverInfo, err := client.GetServerInfo()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get server info: %w", err)
+	}
+
+	// Get network CIDR
+	networkCIDR, err := client.GetNetworkSubnet("incusbr0")
+	if err != nil {
+		// Fallback to default if network info not available
+		networkCIDR = "10.100.0.0/24"
+	}
+
+	// Get system resources (CPU, memory, disk)
+	sysResources, err := client.GetSystemResources()
+	if err != nil {
+		// Log warning but continue - resource info is optional
+		sysResources = &incus.SystemResources{}
+	}
+
+	// Build response
+	info := &pb.SystemInfo{
+		IncusVersion:         serverInfo.Environment.ServerVersion,
+		Os:                   serverInfo.Environment.OSName,
+		KernelVersion:        serverInfo.Environment.KernelVersion,
+		ContainersRunning:    running,
+		ContainersStopped:    stopped,
+		ContainersTotal:      int32(len(containers)), // #nosec G115 -- container count cannot overflow int32
+		Hostname:             serverInfo.Environment.ServerName,
+		NetworkCidr:          networkCIDR,
+		TotalCpus:            sysResources.TotalCPUs,
+		TotalMemoryBytes:     sysResources.TotalMemoryBytes,
+		AvailableMemoryBytes: sysResources.TotalMemoryBytes - sysResources.UsedMemoryBytes,
+		TotalDiskBytes:       sysResources.TotalDiskBytes,
+		AvailableDiskBytes:   sysResources.TotalDiskBytes - sysResources.UsedDiskBytes,
+		CpuLoad_1Min:         sysResources.CPULoad1Min,
+		CpuLoad_5Min:         sysResources.CPULoad5Min,
+		CpuLoad_15Min:        sysResources.CPULoad15Min,
+		// Advertise where monitoring=true containers ship telemetry so
+		// tenants/agents can point docker-in-LXC apps (which don't
+		// inherit the env-stamped value) at the collector. Empty when
+		// the daemon has no OTel collector. See #370.
+		OtelCollectorEndpoint: s.otelCollectorEndpoint,
+		// This backend's daemon version, so the fleet's running versions +
+		// drift are visible via get_system_info / /v1/backends. See #354.
+		DaemonVersion: version.GetVersion(),
+		// Advertised public SSH entrypoint (sentinel host), or empty for
+		// direct/in-network mode — so an agent can tell from get_system_info
+		// whether an external SSH/deploy entrypoint exists. See #1011.
+		SshIngressHost: s.sshHost,
+		// How this daemon's peer calls are secured (#3079).
+		PeerTransport: peerTransportOf(s.peerPool),
+		// Tenant-committed CPU cores on this host — pairs with TotalCpus to
+		// answer "is this host over its CPU overcommit ceiling right now"
+		// (#1580). Reuses the same containers list already fetched above,
+		// and the same core-role exclusion the admission gate (#1029) uses,
+		// via committedTenantCores — one summation shared by both, not two.
+		CommittedCpuCores: committedTenantCores(containers, nil),
+		// Optional API features, so a client can gate request fields an
+		// older daemon would reject.
+		Capabilities: daemonCapabilities(),
+	}
+	// The rest of the CPU budget (#2284): the platform's own core-role
+	// commitment next to the tenant one, and the gate's posture so a
+	// reader can tell whether being over the ceiling is being acted on.
+	// Same container list, one assembly shared with the boot-time log.
+	budget := s.cpuBudget(containers, float64(sysResources.TotalCPUs))
+	info.CoreCommittedCpuCores = budget.CoreCommittedCores
+	info.CpuAdmissionMode = cpuAdmissionModeToProto(budget.AdmissionMode)
+	info.CpuOvercommitFactor = budget.OvercommitFactor
+	s.withBackupKeyInfo(info)
+
+	// The storage pool backing this backend's containers, and whether it
+	// isolates tenant volumes (#1209). Left null when the pool can't be read:
+	// an unread pool must not be reported as isolated. Carried on SystemInfo
+	// so peers report it through the fan-out ListBackends already uses.
+	if driver, derr := client.PoolDriver("default"); derr == nil {
+		info.Storage = backendStorageFromPool("default", driver)
+	}
+	info.StoragePools = s.storagePoolCapacities()
+
+	// This backend's spare-capacity advertisement (#680) and capability
+	// profile (#681), so a peer's GetSystemInfo carries them to the
+	// ListBackends fan-out with no extra forwarded call (#2135). Both stay
+	// null when absent, same as on the local BackendInfo.
+	info.Headroom, info.CapabilityProfile = s.capacitySignals(hostStateFrom(containers, sysResources, time.Now()))
+
+	// Populate GPU info
+	for _, gpu := range sysResources.GPUs {
+		info.Gpus = append(info.Gpus, &pb.GPUInfo{
+			Vendor:        mapGPUVendor(gpu.Vendor),
+			Model:         mapGPUModel(gpu.Model),
+			ModelName:     gpu.Model,
+			PciAddress:    gpu.PCIAddress,
+			DriverVersion: gpu.DriverVersion,
+			CudaVersion:   gpu.CUDAVersion,
+			VramBytes:     gpu.VRAMBytes,
+		})
+	}
+
+	// Fetch system info from all healthy peers
+	var peerInfos []*pb.SystemInfo
+	if s.peerPool != nil {
+		authToken := extractAuthToken(ctx)
+		for _, peer := range s.peerPool.Peers() {
+			if !peer.Healthy {
+				continue
+			}
+			body, err := peer.ForwardGetSystemInfo(authToken)
+			if err != nil {
+				log.Printf("[system-info] peer %s: %v", peer.ID, err)
+				continue
+			}
+			// Use protojson to handle enum string values from gRPC-gateway JSON
+			var peerResp pb.GetSystemInfoResponse
+			if err := protojson.Unmarshal(body, &peerResp); err != nil {
+				log.Printf("[system-info] peer %s parse error: %v", peer.ID, err)
+				continue
+			}
+			if peerResp.Info != nil {
+				peerResp.Info.BackendId = peer.ID
+				peerInfos = append(peerInfos, peerResp.Info)
+			}
+		}
+	}
+
+	return &pb.GetSystemInfoResponse{
+		Info:  info,
+		Peers: peerInfos,
+	}, nil
+}
+
+// ListBackends returns the fleet topology — the local daemon plus any
+// tunnel-connected peers — with per-backend health, version, OS, running
+// container count, and GPU inventory. This is the proto-first replacement
+// for the former hand-coded /v1/backends HTTP handler (#354): the wire
+// shape is now generated from BackendInfo, so the CLI / MCP clients and
+// the cloud control plane all share one contract that cannot drift.
+//
+// Admin-only: the response discloses fleet topology (peer IDs, hostnames,
+// GPU inventory), which is operator-grade, not tenant-grade. The cloud
+// control plane redacts it per-tenant at its own boundary.
+func (s *ContainerServer) ListBackends(ctx context.Context, _ *pb.ListBackendsRequest) (*pb.ListBackendsResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+
+	// Without a peer pool this daemon has no backend identity to report
+	// (the local backend ID comes from the pool), so the fleet view is
+	// empty — same behavior as the handler this replaced.
+	if s.peerPool == nil {
+		return &pb.ListBackendsResponse{}, nil
+	}
+
+	backends := make([]*pb.BackendInfo, 0, 1+len(s.peerPool.Peers()))
+
+	// Local backend. OS / container count / GPUs come from GetSystemInfo;
+	// uptime from the wired process start time.
+	//
+	// Healthy used to be hardcoded true regardless of actual local health —
+	// #920: an operator-visible "3 backends, all healthy" list_backends
+	// response coexisted with a local backend degraded enough (CPU-starved
+	// incusd, #755) to fail real creates. localBackendHealthy is the same
+	// probe resolvePoolPlacement's local-backend auto-placement branch now
+	// gates on — single source of truth, so this listing and placement can
+	// no longer silently disagree about the local backend's health.
+	local := &pb.BackendInfo{
+		Id:      s.peerPool.LocalBackendID(),
+		Type:    "local",
+		Healthy: s.localBackendHealthy(),
+		Version: version.GetVersion(),
+	}
+	if !s.startTime.IsZero() {
+		local.UptimeSeconds = int64(time.Since(s.startTime).Seconds())
+	}
+	// OS / container count / GPUs come from GetSystemInfo, which needs the
+	// container manager + Incus. Guard the nil manager so a daemon (or test)
+	// without one still reports the local backend's identity + health
+	// instead of panicking.
+	// The local probe is bounded by its own deadline (#2318): a wedged or
+	// starved incusd must degrade to "no load block" (UNKNOWN), not block
+	// the whole listing. It runs concurrently with the peer probes below.
+	var localInfo *pb.SystemInfo
+	var localDone chan struct{}
+	if s.manager != nil {
+		localDone = make(chan struct{})
+		go func() {
+			defer close(localDone)
+			localInfo = s.probeLocalSystemInfo(ctx)
+		}()
+	}
+	// Surface the local backend's spare-capacity advertisement (#680) and
+	// last-recorded capability profile (#681); see capacitySignals.
+	local.Headroom, local.CapabilityProfile = s.capacitySignals(s.hostStateSnapshot())
+	backends = append(backends, local)
+
+	// Peer backends. Forward GetSystemInfo to each healthy peer using the
+	// caller's (admin) token — the same mechanism GetSystemInfo's peer
+	// fan-out uses. Peers are probed in parallel, each under its own
+	// deadline, and written to a pre-sized slot so the response keeps the
+	// pool's peer order (#2318).
+	authToken := extractAuthToken(ctx)
+	peers := s.peerPool.Peers()
+	peerInfos := make([]*pb.BackendInfo, len(peers))
+	var wg sync.WaitGroup
+	for i, peer := range peers {
+		pi := &pb.BackendInfo{
+			Id:      peer.ID,
+			Type:    "tunnel",
+			Healthy: peer.Healthy,
+		}
+		if !peer.LastSeenAt.IsZero() {
+			pi.LastSeenAt = peer.LastSeenAt.UTC().Format(time.RFC3339)
+		}
+		peerInfos[i] = pi
+		if !peer.Healthy {
+			continue
+		}
+		wg.Add(1)
+		go func(peer *PeerClient, pi *pb.BackendInfo) {
+			defer wg.Done()
+			pctx, cancel := context.WithTimeout(ctx, listBackendsProbeTimeout)
+			defer cancel()
+			body, err := peer.ForwardGetSystemInfoCtx(pctx, authToken)
+			if err != nil {
+				return
+			}
+			var peerResp pb.GetSystemInfoResponse
+			if protojson.Unmarshal(body, &peerResp) != nil || peerResp.Info == nil {
+				return
+			}
+			pi.Hostname = peerResp.Info.Hostname
+			pi.Os = peerResp.Info.Os
+			pi.Version = peerResp.Info.DaemonVersion
+			pi.IncusVersion = peerResp.Info.IncusVersion
+			pi.ContainerCount = peerResp.Info.ContainersRunning
+			pi.Gpus = backendGPUsFromSystemInfo(peerResp.Info)
+			// Live load for peers — including BYOC tunnel hosts, which had
+			// no load signal anywhere in the product (cloud #966).
+			pi.HostLoad = hostLoadFromSystemInfo(peerResp.Info, time.Now())
+			// Peers report their own pool's driver + isolation over the same
+			// fan-out (#1209).
+			pi.Storage = peerResp.Info.Storage
+			// A peer's spare-capacity advertisement and capability profile
+			// ride the same SystemInfo (#2135); a peer that advertises or
+			// profiled nothing — or predates these fields — leaves them null.
+			pi.Headroom = peerResp.Info.Headroom
+			pi.CapabilityProfile = peerResp.Info.CapabilityProfile
+		}(peer, pi)
+	}
+	wg.Wait()
+	backends = append(backends, peerInfos...)
+
+	// The local probe has its own deadline, so this wait is bounded too.
+	if localDone != nil {
+		<-localDone
+		if localInfo != nil {
+			local.Hostname = localInfo.Hostname
+			local.Os = localInfo.Os
+			local.IncusVersion = localInfo.IncusVersion
+			local.ContainerCount = localInfo.ContainersRunning
+			local.Gpus = backendGPUsFromSystemInfo(localInfo)
+			// The same SystemInfo already carries the host's measured load
+			// and memory/disk usage (cloud #966). Null when unusable.
+			local.HostLoad = hostLoadFromSystemInfo(localInfo, time.Now())
+			// Storage pool + tenant-volume isolation (#1209); null stays
+			// distinguishable from "isolated".
+			local.Storage = localInfo.Storage
+		}
+	}
+
+	return &pb.ListBackendsResponse{Backends: backends}, nil
+}
+
+// listBackendsProbeTimeout bounds each per-backend GetSystemInfo probe made by
+// ListBackends (the local one and every peer), so one wedged backend cannot
+// hold the whole fleet listing hostage (#2318). A var so tests can shrink it.
+var listBackendsProbeTimeout = 5 * time.Second
+
+// probeLocalSystemInfo runs the local GetSystemInfo under
+// listBackendsProbeTimeout and returns nil on error or timeout. The underlying
+// manager/Incus calls take no context and cannot be cancelled, so on timeout
+// the worker goroutine finishes on its own when the call returns; its result
+// channel is buffered so it never blocks on send.
+func (s *ContainerServer) probeLocalSystemInfo(ctx context.Context) *pb.SystemInfo {
+	fn := s.GetSystemInfo
+	if s.systemInfoFn != nil {
+		fn = s.systemInfoFn
+	}
+	ch := make(chan *pb.SystemInfo, 1)
+	go func() {
+		resp, err := fn(ctx, &pb.GetSystemInfoRequest{})
+		if err != nil || resp == nil {
+			ch <- nil
+			return
+		}
+		ch <- resp.Info
+	}()
+	t := time.NewTimer(listBackendsProbeTimeout)
+	defer t.Stop()
+	select {
+	case info := <-ch:
+		return info
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// capStore returns the lazily-initialized per-daemon capacity store. Safe to
+// call from any RPC; the first caller wins.
+func (s *ContainerServer) capStore() *capacity.Store {
+	s.capacityStoreOnce.Do(func() {
+		if s.capacityStore == nil {
+			s.capacityStore = capacity.NewStore()
+		}
+	})
+	return s.capacityStore
+}
+
+// maxDrainWindow caps a caller-supplied drain window so an absurd value can't
+// pin the host (and the drainer's in-flight guard) for an unreasonable time.
+// drainCtxGrace is extra headroom past the window for the final force-stop.
+const (
+	maxDrainWindow = 10 * time.Minute
+	drainCtxGrace  = 30 * time.Second
+)
+
+// drainHandle returns the lazily-initialized per-daemon drainer. A single
+// drainer instance is reused across withdraw calls so its in-flight guard
+// coalesces overlapping drains — repeated advertise/withdraw cycles can't stack
+// concurrent stop storms and wedge the host (#682). The drainer routes each
+// stop back through StopWorkload, which reuses StopContainer's plumbing.
+func (s *ContainerServer) drainHandle() *capacity.Drainer {
+	s.drainerOnce.Do(func() {
+		if s.drainer == nil {
+			s.drainer = capacity.NewDrainer(s)
+		}
+	})
+	return s.drainer
+}
+
+// StopWorkload stops the workload owned by username, satisfying
+// capacity.DrainStopper. It routes through StopContainer so a drained workload
+// emits the same stop event a manual stop does and the control plane can
+// reschedule it — there is no drain-only side door. The daemon context is
+// promoted to the system identity (the drain is daemon-internal, triggered by a
+// headroom withdraw, not by an end-user request).
+func (s *ContainerServer) StopWorkload(ctx context.Context, username string, force bool) error {
+	ctx = auth.ContextWithSystemIdentity(ctx)
+	_, err := s.StopContainer(ctx, &pb.StopContainerRequest{Username: username, Force: force})
+	return err
+}
+
+// hostStateSnapshot gathers the current host-level resource + container
+// snapshot the headroom computation consumes. It reuses the same Incus
+// system-resources call GetSystemInfo uses and the manager's container list,
+// so the figures match what ListBackends already reports. Best-effort: a
+// missing manager or Incus call yields a zero-resource snapshot rather than an
+// error, so advertise/withdraw still work on an unwired server.
+func (s *ContainerServer) hostStateSnapshot() capacity.HostState {
+	if s.manager == nil {
+		return capacity.HostState{Now: time.Now()}
+	}
+	containers, _ := s.manager.List()
+	client, err := incus.New()
+	if err != nil {
+		return hostStateFrom(containers, nil, time.Now())
+	}
+	res, err := client.GetSystemResources()
+	if err != nil {
+		res = nil
+	}
+	return hostStateFrom(containers, res, time.Now())
+}
+
+// hostStateFrom builds the headroom computation's host snapshot from an
+// already-fetched container list and Incus resource read, so GetSystemInfo
+// can compute its headroom (#2135) from the figures it just gathered instead
+// of re-querying Incus. A nil res yields zero resources, same as a failed
+// read in hostStateSnapshot.
+func hostStateFrom(containers []incus.ContainerInfo, res *incus.SystemResources, now time.Time) capacity.HostState {
+	st := capacity.HostState{Now: now, Containers: containers}
+	if res == nil {
+		return st
+	}
+	st.AvailableMemoryBytes = res.TotalMemoryBytes - res.UsedMemoryBytes
+	st.AvailableDiskBytes = res.TotalDiskBytes - res.UsedDiskBytes
+	// Available CPU cores ≈ total cores minus the 1-minute load average,
+	// clamped to [0, TotalCPUs]. This is a COARSE, burstable hint only: load
+	// average counts runnable+uninterruptible tasks (I/O wait can inflate it
+	// without the CPU being busy), so it neither equals idle cores nor is the
+	// binding constraint — RAM and disk are the hard limits on how many guests
+	// a host can take. The upper clamp guards against a bogus/negative load
+	// reading reporting more spare cores than exist.
+	avail := float64(res.TotalCPUs) - res.CPULoad1Min
+	if avail < 0 {
+		avail = 0
+	}
+	if avail > float64(res.TotalCPUs) {
+		avail = float64(res.TotalCPUs)
+	}
+	st.AvailableCPUs = int32(avail)
+	return st
+}
+
+// policyFromProto maps the wire CapacityPolicy onto the internal policy. A nil
+// proto policy yields the zero (always-open, no-exclusion) policy.
+func policyFromProto(p *pb.CapacityPolicy) capacity.Policy {
+	if p == nil {
+		return capacity.Policy{}
+	}
+	return capacity.Policy{
+		WindowStartHour:         p.GetWindowStartHour(),
+		WindowEndHour:           p.GetWindowEndHour(),
+		ExcludedWorkloadClasses: p.GetExcludedWorkloadClasses(),
+		ReserveFraction:         p.GetReserveFraction(),
+	}
+}
+
+// capacitySignals returns this backend's spare-capacity advertisement (#680)
+// and last-recorded capability profile (#681) on the wire types. Each is nil
+// when absent: headroom only when something is actively advertised, so the
+// control plane can tell "not offering" from "offering zero", and the
+// profile only once ProfileBackend has run, so "unprofiled" stays distinct
+// from "profiled CPU-only". Shared by ListBackends' local entry and
+// GetSystemInfo, which carries both to a peer's ListBackends (#2135).
+func (s *ContainerServer) capacitySignals(st capacity.HostState) (*pb.CapacityHeadroom, *pb.CapabilityProfile) {
+	var headroom *pb.CapacityHeadroom
+	if h := s.capStore().Current(st); h.Advertised {
+		headroom = headroomToProto(h)
+	}
+	var profile *pb.CapabilityProfile
+	if p, ok := s.capabStore().Current(); ok {
+		profile = profileToProto(p)
+	}
+	return headroom, profile
+}
+
+// headroomToProto maps the internal headroom onto the wire type.
+func headroomToProto(h capacity.Headroom) *pb.CapacityHeadroom {
+	out := &pb.CapacityHeadroom{
+		Advertised:       h.Advertised,
+		SpareCpus:        h.SpareCPUs,
+		SpareMemoryBytes: h.SpareMemoryBytes,
+		SpareDiskBytes:   h.SpareDiskBytes,
+		IdleFraction:     h.IdleFraction,
+		Policy: &pb.CapacityPolicy{
+			WindowStartHour:         h.Policy.WindowStartHour,
+			WindowEndHour:           h.Policy.WindowEndHour,
+			ExcludedWorkloadClasses: h.Policy.ExcludedWorkloadClasses,
+			ReserveFraction:         h.Policy.ReserveFraction,
+		},
+	}
+	if !h.AdvertisedAt.IsZero() {
+		out.AdvertisedAt = h.AdvertisedAt.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
+// AdvertiseCapacity publishes this backend's spare scheduling headroom to the
+// control plane, bounded by the supplied local policy. The advertisement is
+// surfaced through ListBackends. Admin-only. See #680.
+func (s *ContainerServer) AdvertiseCapacity(ctx context.Context, req *pb.AdvertiseCapacityRequest) (*pb.AdvertiseCapacityResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	// Validate the policy server-side — the CLI checks these, but a direct
+	// gRPC/REST caller must not be trusted. A negative reserve_fraction would
+	// otherwise clamp to a ZERO reservation (advertising 100% of the host as
+	// spare — the opposite of intent); an out-of-range window hour would make
+	// the window silently never open.
+	if pol := req.GetPolicy(); pol != nil {
+		if rf := pol.GetReserveFraction(); rf < 0 || rf >= 1 {
+			return nil, status.Errorf(codes.InvalidArgument, "reserve_fraction must be in [0,1), got %v", rf)
+		}
+		if hs, he := pol.GetWindowStartHour(), pol.GetWindowEndHour(); hs < 0 || hs > 23 || he < 0 || he > 23 {
+			return nil, status.Errorf(codes.InvalidArgument, "window hours must be in [0,23], got start=%d end=%d", hs, he)
+		}
+	}
+	p := policyFromProto(req.GetPolicy())
+	h := s.capStore().Advertise(p, s.hostStateSnapshot())
+	return &pb.AdvertiseCapacityResponse{Headroom: headroomToProto(h)}, nil
+}
+
+// WithdrawCapacity withdraws any active headroom advertisement. Idempotent:
+// withdrawing when nothing is advertised succeeds as a no-op. Admin-only.
+//
+// When req.Drain is set the backend also reclaims the guest workloads it had
+// implicitly offered: it snapshots the host, selects the same candidate set the
+// headroom computation considered free, and drains them gracefully within a
+// bounded window (req.DrainWindowSeconds, default 120s) instead of hard-killing
+// them. Each drained workload is stopped through the normal StopContainer path
+// so the control plane observes a stop event and can reschedule it. Any
+// candidate still running when the window expires is force-stopped so the host
+// is reliably reclaimed — no wedge on repeated advertise/withdraw cycles, since
+// the drainer coalesces an overlapping drain rather than stacking a second one.
+// See #680, #682.
+func (s *ContainerServer) WithdrawCapacity(ctx context.Context, req *pb.WithdrawCapacityRequest) (*pb.WithdrawCapacityResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+
+	// Flip the advertisement off first so no new work is directed here while we
+	// drain. Withdraw is idempotent, so the order is safe even if the drain
+	// fails partway.
+	h := s.capStore().Withdraw()
+	resp := &pb.WithdrawCapacityResponse{Headroom: headroomToProto(h)}
+
+	if !req.GetDrain() {
+		return resp, nil
+	}
+
+	st := s.hostStateSnapshot()
+	candidates := capacity.DrainCandidates(s.capStore().Policy(), st)
+	if len(candidates) == 0 {
+		return resp, nil
+	}
+
+	window := time.Duration(req.GetDrainWindowSeconds()) * time.Second
+	if window > maxDrainWindow {
+		window = maxDrainWindow // clamp an absurd request so the drain can't pin the host for ages
+	}
+	// Detach the drain from the request context and bound it by the window: a
+	// graceful drain can take the full window (default 120s), far longer than a
+	// typical CLI / grpc-gateway HTTP timeout — we must NOT abandon a
+	// half-finished reclaim just because the caller disconnected. (Same posture
+	// as the upgrade path's context.WithoutCancel.) The +grace covers the final
+	// force-stop after the window elapses.
+	effectiveWindow := window
+	if effectiveWindow <= 0 {
+		effectiveWindow = capacity.DefaultDrainWindow
+	}
+	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), effectiveWindow+drainCtxGrace)
+	defer cancel()
+	result, skipped := s.drainHandle().Drain(drainCtx, candidates, window)
+	if skipped {
+		// A drain was already in flight (e.g. a rapid second withdraw). The
+		// advertisement is already off; the running drain reclaims the host.
+		log.Printf("[drain] withdraw coalesced: a drain is already in flight")
+		return resp, nil
+	}
+
+	resp.Drained = result.Drained
+	resp.ForceStopped = result.ForceStopped
+	resp.DrainWindowExceeded = result.WindowExceeded
+	// Surface guests that couldn't be stopped even after force — a non-empty
+	// map means the host is NOT fully reclaimed, so the control plane must not
+	// treat their resources as freed.
+	if len(result.Failed) > 0 {
+		resp.Failed = result.Failed
+	}
+	log.Printf("[drain] withdraw drained=%d force_stopped=%d failed=%d window_exceeded=%t elapsed=%s",
+		len(result.Drained), len(result.ForceStopped), len(result.Failed), result.WindowExceeded, result.Elapsed)
+	return resp, nil
+}
+
+// GetCapacityHeadroom returns this backend's current advertisement with spare
+// figures recomputed against the live host snapshot. Admin-only. See #680.
+func (s *ContainerServer) GetCapacityHeadroom(ctx context.Context, _ *pb.GetCapacityHeadroomRequest) (*pb.GetCapacityHeadroomResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+	h := s.capStore().Current(s.hostStateSnapshot())
+	return &pb.GetCapacityHeadroomResponse{Headroom: headroomToProto(h)}, nil
+}
+
+// capabStore returns the lazily-initialized per-daemon capability-profile
+// store. Safe to call from any RPC; the first caller wins.
+func (s *ContainerServer) capabStore() *capabilities.Store {
+	s.capabilityStoreOnce.Do(func() {
+		if s.capabilityStore == nil {
+			s.capabilityStore = capabilities.NewStore()
+		}
+	})
+	return s.capabilityStore
+}
+
+// gatherHostFacts collects the inputs the capability profile is computed from:
+// host system resources (CPU cores + model, RAM, disk) via the same Incus call
+// GetSystemInfo uses, the GPU passthrough probe (unless skipped), the bounded
+// CPU/memory micro-benchmark, and the operator-set region / reported class.
+// Missing resources, a failed GPU probe or an invalid benchmark leave the
+// previous profile untouched; unknown host capacity must not become a profile.
+func (s *ContainerServer) gatherHostFacts(skipGPU bool) (capabilities.HostFacts, error) {
+	f := capabilities.HostFacts{
+		Now:           time.Now(),
+		Region:        s.region,
+		ReportedClass: s.reportedClass,
+	}
+
+	var res *incus.SystemResources
+	var resourceErr error
+	if s.capabilityResources != nil {
+		res, resourceErr = s.capabilityResources()
+	} else if client, err := incus.New(); err == nil {
+		res, resourceErr = client.GetSystemResources()
+	} else {
+		resourceErr = err
+	}
+	if resourceErr != nil {
+		return capabilities.HostFacts{}, fmt.Errorf("system resource discovery: %w", resourceErr)
+	}
+	if res == nil {
+		return capabilities.HostFacts{}, fmt.Errorf("system resource discovery returned no resources")
+	}
+	if res.TotalCPUs <= 0 || res.TotalMemoryBytes <= 0 {
+		return capabilities.HostFacts{}, fmt.Errorf("system resource discovery returned invalid CPU or memory capacity")
+	}
+	// Only NVIDIA hosts need the nvidia.runtime probe; CPU-only hosts have
+	// no GPU to validate.
+	probeGPU := false
+	f.CPUCores = res.TotalCPUs
+	f.CPUModel = res.CPUModel
+	f.TotalMemoryBytes = res.TotalMemoryBytes
+	f.TotalDiskBytes = res.TotalDiskBytes
+	for _, gpu := range res.GPUs {
+		vendor := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(gpu.Vendor)), "0x")
+		if vendor == "10de" || strings.Contains(vendor, "nvidia") {
+			probeGPU = true
+			break
+		}
+	}
+
+	// GPU model/driver from the existing nvidia.runtime passthrough probe —
+	// the same ValidateGPU the validate-gpu command runs. Skipped on request
+	// (CPU-only backends) or when no container manager is wired.
+	if !skipGPU && probeGPU && (s.manager != nil || s.capabilityGPUProbe != nil) {
+		var res container.GPUValidationResult
+		if s.capabilityGPUProbe != nil {
+			res = s.capabilityGPUProbe()
+		} else {
+			res = s.manager.ValidateGPU("")
+		}
+		if res.Status != container.GPUStatusOK {
+			return capabilities.HostFacts{}, fmt.Errorf("GPU probe: %s", res.Detail)
+		}
+		f.GPUAvailable = true
+		f.GPUModel = res.Model
+		f.GPUDriverVersion = res.DriverVersion
+	}
+
+	// Bounded CPU/memory micro-benchmark.
+	var b container.BenchmarkResult
+	if s.capabilityBenchmark != nil {
+		var err error
+		b, err = s.capabilityBenchmark()
+		if err != nil {
+			return capabilities.HostFacts{}, fmt.Errorf("benchmark: %w", err)
+		}
+	} else {
+		b = container.RunBenchmark()
+	}
+	if b.CPUOpsPerSec <= 0 || b.MemBytesPerSec <= 0 || b.DurationMs <= 0 {
+		return capabilities.HostFacts{}, fmt.Errorf("benchmark returned invalid measurements")
+	}
+	f.Benchmark = capabilities.Benchmark{
+		CPUOpsPerSec:   b.CPUOpsPerSec,
+		MemBytesPerSec: b.MemBytesPerSec,
+		DurationMs:     b.DurationMs,
+	}
+	return f, nil
+}
+
+// recordCapabilityProfile is shared by the explicit RPC and pool startup.
+// Recheck existence under the same lock that protects explicit profiles so
+// startup can never overwrite a profile recorded by a concurrent operator.
+func (s *ContainerServer) recordCapabilityProfile(skipGPU, onlyIfMissing bool) (capabilities.Profile, error) {
+	if !s.profileMu.TryLock() {
+		return capabilities.Profile{}, status.Error(codes.Aborted, "a backend profile is already in progress; retry shortly")
+	}
+	defer s.profileMu.Unlock()
+	if onlyIfMissing {
+		if p, ok := s.capabStore().Current(); ok {
+			return p, nil
+		}
+	}
+	f, err := s.gatherHostFacts(skipGPU)
+	if err != nil {
+		return capabilities.Profile{}, status.Errorf(codes.Internal, "profile backend: %v", err)
+	}
+	return s.capabStore().Record(f), nil
+}
+
+// profileToProto maps the internal capability profile onto the wire type.
+func profileToProto(p capabilities.Profile) *pb.CapabilityProfile {
+	out := &pb.CapabilityProfile{
+		CpuCores:         p.CPUCores,
+		CpuModel:         p.CPUModel,
+		TotalMemoryBytes: p.TotalMemoryBytes,
+		TotalDiskBytes:   p.TotalDiskBytes,
+		GpuModel:         p.GPUModel,
+		GpuDriverVersion: p.GPUDriverVersion,
+		GpuAvailable:     p.GPUAvailable,
+		Region:           p.Region,
+		ReportedClass:    p.ReportedClass,
+		MeasuredClass:    p.MeasuredClass,
+		ClassConsistent:  p.ClassConsistent,
+		Benchmark: &pb.CapabilityBenchmark{
+			CpuOpsPerSec:   p.Benchmark.CPUOpsPerSec,
+			MemBytesPerSec: p.Benchmark.MemBytesPerSec,
+			DurationMs:     p.Benchmark.DurationMs,
+		},
+	}
+	if !p.ProfiledAt.IsZero() {
+		out.ProfiledAt = p.ProfiledAt.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
+// ProfileBackend records a backend's hardware capability profile: read system
+// info, run the GPU passthrough probe + bounded micro-benchmark, derive the
+// measured class, reconcile it against the self-reported class, and persist it.
+// Admin-only. An empty (or local) backend_id profiles this daemon; a peer
+// backend_id forwards to that peer, which profiles itself. See #681.
+func (s *ContainerServer) ProfileBackend(ctx context.Context, req *pb.ProfileBackendRequest) (*pb.ProfileBackendResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+
+	// Remote backend → forward to the owning peer (it profiles its own host).
+	if req.BackendId != "" && req.BackendId != s.localBackendID() {
+		if s.peerPool == nil {
+			return nil, status.Errorf(codes.Unavailable, "backend %q: no peer pool configured on this daemon", req.BackendId)
+		}
+		peer := s.peerPool.Get(req.BackendId)
+		if peer == nil {
+			return nil, status.Errorf(codes.NotFound, "backend %q not found (see 'containarium backends list')", req.BackendId)
+		}
+		body, err := protojson.Marshal(req)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "marshal profile request: %v", err)
+		}
+		respBody, st, err := peer.ForwardRequest("POST", "/v1/capabilities/profile", extractAuthToken(ctx), body)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "forward profile to %s: %v", req.BackendId, err)
+		}
+		if st >= 400 {
+			return nil, status.Errorf(codes.Internal, "peer %s returned status %d for profile", req.BackendId, st)
+		}
+		var resp pb.ProfileBackendResponse
+		if err := protojson.Unmarshal(respBody, &resp); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse peer %s profile response: %v", req.BackendId, err)
+		}
+		resp.BackendId = req.BackendId
+		return &resp, nil
+	}
+
+	// Local backend. Serialize against concurrent profiles: gatherHostFacts
+	// spins a throwaway GPU-probe LXC + runs a benchmark, so a second caller
+	// (retry, multi-replica control plane) must not stack a second probe.
+	p, err := s.recordCapabilityProfile(req.SkipGpu, false)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ProfileBackendResponse{
+		Profile:   profileToProto(p),
+		BackendId: req.BackendId,
+	}, nil
+}
+
+// GetCapabilityProfile returns a backend's last-recorded capability profile
+// without re-running the benchmark/probe. Admin-only. A peer backend_id
+// forwards to that peer. Returns a null profile when nothing has been recorded
+// yet. See #681.
+func (s *ContainerServer) GetCapabilityProfile(ctx context.Context, req *pb.GetCapabilityProfileRequest) (*pb.GetCapabilityProfileResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+
+	if req.BackendId != "" && req.BackendId != s.localBackendID() {
+		if s.peerPool == nil {
+			return nil, status.Errorf(codes.Unavailable, "backend %q: no peer pool configured on this daemon", req.BackendId)
+		}
+		peer := s.peerPool.Get(req.BackendId)
+		if peer == nil {
+			return nil, status.Errorf(codes.NotFound, "backend %q not found (see 'containarium backends list')", req.BackendId)
+		}
+		respBody, st, err := peer.ForwardRequest("GET", "/v1/capabilities/profile", extractAuthToken(ctx), nil)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "forward get-profile to %s: %v", req.BackendId, err)
+		}
+		if st >= 400 {
+			return nil, status.Errorf(codes.Internal, "peer %s returned status %d for get-profile", req.BackendId, st)
+		}
+		var resp pb.GetCapabilityProfileResponse
+		if err := protojson.Unmarshal(respBody, &resp); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse peer %s get-profile response: %v", req.BackendId, err)
+		}
+		resp.BackendId = req.BackendId
+		return &resp, nil
+	}
+
+	resp := &pb.GetCapabilityProfileResponse{BackendId: req.BackendId}
+	if p, ok := s.capabStore().Current(); ok {
+		resp.Profile = profileToProto(p)
+	}
+	return resp, nil
+}
+
+// GetSelfMeasurement computes and signs a fresh integrity self-measurement for
+// a backend: digests of the running daemon binary, the loaded in-kernel
+// network-policy program object(s), and the canonical policy/config state,
+// signed with the node's identity key (the sentinel-issued peer leaf reused
+// from the peer-PKI plumbing). The daemon also emits the same measurement on
+// its heartbeat. A peer backend_id forwards to that peer (which measures
+// itself). Admin-only. The control plane verifies the measurement to detect
+// tampering; the verification half lives elsewhere. See #683.
+func (s *ContainerServer) GetSelfMeasurement(ctx context.Context, req *pb.GetSelfMeasurementRequest) (*pb.GetSelfMeasurementResponse, error) {
+	if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+		return nil, err
+	}
+
+	// Remote backend → forward to the owning peer (it measures its own host).
+	if req.BackendId != "" && req.BackendId != s.localBackendID() {
+		if s.peerPool == nil {
+			return nil, status.Errorf(codes.Unavailable, "backend %q: no peer pool configured on this daemon", req.BackendId)
+		}
+		peer := s.peerPool.Get(req.BackendId)
+		if peer == nil {
+			return nil, status.Errorf(codes.NotFound, "backend %q not found (see 'containarium backends list')", req.BackendId)
+		}
+		respBody, st, err := peer.ForwardRequest("GET", "/v1/integrity/self-measurement", extractAuthToken(ctx), nil)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "forward self-measurement to %s: %v", req.BackendId, err)
+		}
+		if st >= 400 {
+			return nil, status.Errorf(codes.Internal, "peer %s returned status %d for self-measurement", req.BackendId, st)
+		}
+		var resp pb.GetSelfMeasurementResponse
+		if err := protojson.Unmarshal(respBody, &resp); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse peer %s self-measurement response: %v", req.BackendId, err)
+		}
+		resp.BackendId = req.BackendId
+		return &resp, nil
+	}
+
+	// Local backend.
+	m, err := s.computeSelfMeasurement()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "compute self-measurement: %v", err)
+	}
+	return &pb.GetSelfMeasurementResponse{
+		Measurement: measurementToProto(m),
+		BackendId:   req.BackendId,
+	}, nil
+}
+
+// computeSelfMeasurement gathers this backend's integrity inputs (running
+// binary path, loaded in-kernel network-policy program object(s), policy/config
+// state, node identity signer) and computes the signed measurement. The signer
+// is the sentinel-issued peer leaf from the peer pool; when no PKI has been
+// bootstrapped the measurement is produced unsigned.
+func (s *ContainerServer) computeSelfMeasurement() (integrity.Measurement, error) {
+	in := integrity.Inputs{
+		ConfigState:   s.integrityConfigState,
+		DaemonVersion: version.Version,
+		Now:           time.Now(),
+	}
+
+	// Running daemon binary on disk. Best-effort: a path we can't resolve
+	// leaves the binary digest empty rather than failing the measurement.
+	if exe, err := os.Executable(); err == nil {
+		in.BinaryPath = exe
+	}
+
+	// Loaded in-kernel network-policy program object(s). The daemon arms the
+	// per-veth enforcer only when CONTAINARIUM_NETWORK_POLICY_BPF_OBJECT points
+	// at an object (a path on disk, or the one embedded in the binary); those
+	// loaded bytes are exactly what we attest for this object.
+	setting := os.Getenv(appconfig.EnvNetworkPolicyBPFObject)
+	progs, err := integrityProgramObjects(setting, netbpf.EmbeddedObject())
+	if err != nil {
+		return integrity.Measurement{}, err
+	}
+	in.Programs = append(in.Programs, progs...)
+
+	// The exec-watch object (#2637) is loaded from the same setting, but only
+	// when the exec watcher actually loaded it (read live each measurement); an
+	// object that never loaded is not attested (#3120). Running is a snapshot:
+	// a watcher that stops right after the probe can leave one heartbeat's
+	// attestation stale.
+	if s.integrityExecWatch != nil && s.integrityExecWatch() {
+		execProgs, err := integrityExecWatchObjects(setting, netbpf.EmbeddedExecObject())
+		if err != nil {
+			return integrity.Measurement{}, err
+		}
+		in.Programs = append(in.Programs, execProgs...)
+	}
+
+	// Node identity signer: the sentinel-issued peer leaf key.
+	if s.peerPool != nil {
+		signer, certPEM := s.peerPool.IdentitySigner()
+		in.Signer = signer
+		in.SigningCertPEM = certPEM
+		// TPM-backed signing is a future hook; the software peer key signs today.
+		in.TPMBacked = false
+	}
+
+	return integrity.Compute(in)
+}
+
+// integrityProgramObjects maps the network-policy object setting to the program
+// objects the self-measurement digests. A path is digested from disk under its
+// own name. The embedded selector (netbpf.IsEmbeddedValue) has no file, so the
+// bytes the enforcer actually loads (netbpf.EmbeddedObject) are digested under
+// the stable name "embedded" whichever alias was configured (#3079).
+func integrityProgramObjects(setting string, embedded []byte) ([]integrity.ProgramObject, error) {
+	setting = strings.TrimSpace(setting)
+	if setting == "" {
+		return nil, nil
+	}
+	if netbpf.IsEmbeddedValue(setting) {
+		if len(embedded) == 0 {
+			return nil, fmt.Errorf("network-policy object %q selects the embedded BPF object but this build has none", setting)
+		}
+		return []integrity.ProgramObject{{Name: "embedded", Data: embedded}}, nil
+	}
+	return []integrity.ProgramObject{{Name: setting, Path: setting}}, nil
+}
+
+// execWatchEmbeddedName is the stable programDigests name of the embedded
+// exec-watch object, whichever alias selected it (#3120).
+const execWatchEmbeddedName = "execwatch-embedded"
+
+// integrityExecWatchObjects maps the network-policy object setting to the
+// exec-watch object the exec watcher loads from it (netbpf.ExecObjectSource,
+// the same selection netbpf.ResolveExecWatch uses), so the bytes digested are
+// the bytes handed to the loader. The embedded object is digested under
+// "execwatch-embedded"; a sibling file under its own path. An empty setting
+// means no program (the watcher is only started with a non-empty setting). An
+// object the watcher cannot load (none bundled, or the sibling file missing)
+// is skipped, not an error: the watcher reports that itself as
+// `unavailable (...)` and nothing is loaded to attest. Other file errors
+// surface when the measurement digests the path. The stat and the digest are
+// separate reads: the digest is of the file at measurement time, recomputed on
+// every heartbeat.
+func integrityExecWatchObjects(setting string, embedded []byte) ([]integrity.ProgramObject, error) {
+	setting = strings.TrimSpace(setting)
+	if setting == "" {
+		return nil, nil
+	}
+	isEmbedded, path := netbpf.ExecObjectSource(setting)
+	if isEmbedded {
+		if len(embedded) == 0 {
+			return nil, nil
+		}
+		return []integrity.ProgramObject{{Name: execWatchEmbeddedName, Data: embedded}}, nil
+	}
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	return []integrity.ProgramObject{{Name: path, Path: path}}, nil
+}
+
+// wireExecWatcherIntegrity connects a constructed exec watcher to the
+// self-measurement; a nil watcher (sentry off) leaves it unwired.
+func wireExecWatcherIntegrity(cs *ContainerServer, w *ExecWatcher) {
+	if w == nil {
+		return
+	}
+	cs.SetIntegrityExecWatch(w.Running)
+}
+
+// SetIntegrityExecWatch wires a live probe of whether the exec watcher loaded
+// and attached its object, so the self-measurement attests the exec-watch
+// object only while it is loaded. Pass ExecWatcher.Running.
+func (s *ContainerServer) SetIntegrityExecWatch(loaded func() bool) {
+	s.integrityExecWatch = loaded
+}
+
+// SetIntegrityConfig wires the integrity-relevant policy/config posture this
+// backend folds into its signed self-measurement (#683): base domain and the
+// network-policy enforcement posture. Called once from DualServer setup with
+// the resolved config; either field may be empty. The map is canonicalized
+// (sorted keys) before hashing, so caller ordering is irrelevant.
+func (s *ContainerServer) SetIntegrityConfig(state map[string]string) {
+	s.integrityConfigState = state
+}
+
+// measurementToProto maps the internal integrity measurement onto the wire type.
+func measurementToProto(m integrity.Measurement) *pb.SelfMeasurement {
+	out := &pb.SelfMeasurement{
+		HashAlgorithm:      m.HashAlgorithm,
+		BinaryDigest:       m.BinaryDigest,
+		ConfigDigest:       m.ConfigDigest,
+		MeasurementDigest:  m.MeasurementDigest,
+		Signature:          m.Signature,
+		SignatureAlgorithm: m.SignatureAlgorithm,
+		TpmBacked:          m.TPMBacked,
+		Signed:             m.Signed,
+		SigningCertPem:     m.SigningCertPEM,
+		// RFC3339Nano (not RFC3339): the signed canonical form uses nanosecond
+		// precision, so the wire MUST carry the same precision or a verifier
+		// reconstructing the canonical bytes computes a different digest and
+		// the signature never verifies.
+		MeasuredAt:    m.MeasuredAt.UTC().Format(time.RFC3339Nano),
+		DaemonVersion: m.DaemonVersion,
+	}
+	for _, p := range m.ProgramDigests {
+		out.ProgramDigests = append(out.ProgramDigests, &pb.ProgramDigest{
+			Name:   p.Name,
+			Digest: p.Digest,
+		})
+	}
+	return out
+}
+
+// backendGPUsFromSystemInfo projects a SystemInfo's GPU list onto the
+// BackendInfo GPU wire shape (vendor string, model name, VRAM bytes).
+func backendGPUsFromSystemInfo(info *pb.SystemInfo) []*pb.BackendGPU {
+	if len(info.Gpus) == 0 {
+		return nil
+	}
+	out := make([]*pb.BackendGPU, 0, len(info.Gpus))
+	for _, g := range info.Gpus {
+		out = append(out, &pb.BackendGPU{
+			Vendor:    g.Vendor.String(),
+			ModelName: g.ModelName,
+			VramBytes: g.VramBytes,
+		})
+	}
+	return out
+}
+
+// hostLoadFromSystemInfo projects a SystemInfo's measured host sample onto
+// the BackendInfo live-usage wire shape (cloud #966 — the unshipped "live
+// usage" half of #547).
+//
+// No new measurement or transport: GetSystemInfo already carries the host's
+// load averages and memory/disk figures, and ListBackends already fetches it
+// for the local backend and forwards it to every healthy peer. This is the
+// projection that was missing, which is why capacity and committed were
+// visible while actual load was not.
+//
+// Returns nil — not a zero-valued HostLoad — when there is no usable sample.
+// GetSystemInfo swallows a failed GetSystemResources probe and substitutes an
+// empty struct, so zeros mean "the probe failed" at least as often as they
+// mean "idle", and a UI that renders 0% CPU / 0 bytes used for a struggling
+// host is worse than one that renders nothing. total_memory_bytes is the
+// discriminator: every real host has some.
+func hostLoadFromSystemInfo(info *pb.SystemInfo, sampledAt time.Time) *pb.HostLoad {
+	if info == nil || info.TotalMemoryBytes <= 0 {
+		return nil
+	}
+	return &pb.HostLoad{
+		CpuLoad_1M:       info.CpuLoad_1Min,
+		CpuLoad_5M:       info.CpuLoad_5Min,
+		CpuLoad_15M:      info.CpuLoad_15Min,
+		CpuCores:         info.TotalCpus,
+		MemoryUsedBytes:  usedFromTotalAndAvailable(info.TotalMemoryBytes, info.AvailableMemoryBytes),
+		MemoryTotalBytes: info.TotalMemoryBytes,
+		DiskUsedBytes:    usedFromTotalAndAvailable(info.TotalDiskBytes, info.AvailableDiskBytes),
+		DiskTotalBytes:   info.TotalDiskBytes,
+		SampledAt:        sampledAt.UTC().Format(time.RFC3339),
+	}
+}
+
+// usedFromTotalAndAvailable converts the (total, available) pair SystemInfo
+// reports into the (used) figure an operator reads, clamped to [0, total].
+// The clamp matters because the two numbers come from separate probes on the
+// host: a skewed or partial read can make available exceed total, and a
+// negative "bytes in use" rendered in a dashboard reads as a product bug
+// rather than as the bad sample it is.
+func usedFromTotalAndAvailable(total, available int64) int64 {
+	used := total - available
+	if used < 0 {
+		return 0
+	}
+	if used > total {
+		return total
+	}
+	return used
+}
+
+// mapGPUVendor maps a vendor string to the proto enum.
+func mapGPUVendor(vendor string) pb.GPUVendor {
+	v := strings.ToLower(vendor)
+	switch {
+	case strings.Contains(v, "nvidia"):
+		return pb.GPUVendor_GPU_VENDOR_NVIDIA
+	case strings.Contains(v, "amd") || strings.Contains(v, "advanced micro"):
+		return pb.GPUVendor_GPU_VENDOR_AMD
+	case strings.Contains(v, "intel"):
+		return pb.GPUVendor_GPU_VENDOR_INTEL
+	default:
+		return pb.GPUVendor_GPU_VENDOR_UNSPECIFIED
+	}
+}
+
+// mapGPUModel maps a model name string to the proto enum.
+func mapGPUModel(model string) pb.GPUModel {
+	m := strings.ToLower(model)
+	switch {
+	// NVIDIA Consumer
+	case strings.Contains(m, "rtx 5090"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_RTX_5090
+	case strings.Contains(m, "rtx 5080"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_RTX_5080
+	case strings.Contains(m, "rtx 4090"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_RTX_4090
+	case strings.Contains(m, "rtx 4080"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_RTX_4080
+	case strings.Contains(m, "rtx 4070 ti"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_RTX_4070_TI
+	case strings.Contains(m, "rtx 4070"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_RTX_4070
+	case strings.Contains(m, "rtx 3090"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_RTX_3090
+	case strings.Contains(m, "rtx 3080"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_RTX_3080
+	// NVIDIA Datacenter
+	case strings.Contains(m, "b200"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_B200
+	case strings.Contains(m, "h200"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_H200
+	case strings.Contains(m, "h100"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_H100
+	case strings.Contains(m, "a100"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_A100
+	case strings.Contains(m, "a10g"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_A10G
+	case strings.Contains(m, "a10"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_A10
+	case strings.Contains(m, "l40s"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_L40S
+	case strings.Contains(m, "l40"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_L40
+	case strings.Contains(m, "l4"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_L4
+	case strings.Contains(m, "t4"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_T4
+	case strings.Contains(m, "v100"):
+		return pb.GPUModel_GPU_MODEL_NVIDIA_V100
+	// AMD
+	case strings.Contains(m, "mi300x"):
+		return pb.GPUModel_GPU_MODEL_AMD_MI300X
+	case strings.Contains(m, "mi250x"):
+		return pb.GPUModel_GPU_MODEL_AMD_MI250X
+	case strings.Contains(m, "7900 xtx"):
+		return pb.GPUModel_GPU_MODEL_AMD_RX_7900_XTX
+	// Intel
+	case strings.Contains(m, "max 1550"):
+		return pb.GPUModel_GPU_MODEL_INTEL_MAX_1550
+	case strings.Contains(m, "a770"):
+		return pb.GPUModel_GPU_MODEL_INTEL_ARC_A770
+	default:
+		return pb.GPUModel_GPU_MODEL_UNSPECIFIED
+	}
+}
+
+// toProtoMetrics converts internal metrics to protobuf
+func toProtoMetrics(m *incus.ContainerMetrics) *pb.ContainerMetrics {
+	return &pb.ContainerMetrics{
+		Name:             m.Name,
+		CpuUsageSeconds:  m.CPUUsageSeconds,
+		MemoryUsageBytes: m.MemoryUsageBytes,
+		MemoryPeakBytes:  m.MemoryLimitBytes,
+		DiskUsageBytes:   m.DiskUsageBytes,
+		NetworkRxBytes:   m.NetworkRxBytes,
+		NetworkTxBytes:   m.NetworkTxBytes,
+		ProcessCount:     m.ProcessCount,
+		CpuNrPeriods:     m.CPUNrPeriods,
+		CpuNrThrottled:   m.CPUNrThrottled,
+		CpuThrottledUsec: m.CPUThrottledUsec,
+	}
+}
+
+// toProtoContainer converts internal container info to protobuf
+func toProtoContainer(st *box.BoxStatus) *pb.Container {
+	// Resolve OS type from labels
+	var osTypeEnum pb.OSType
+	if osLabel, ok := st.Labels[ostype.OSTypeLabelKey]; ok {
+		osTypeEnum = ostype.OSTypeFromLabel(osLabel)
+	}
+
+	// Determine access type based on OS
+	accessType := pb.AccessType_ACCESS_TYPE_SSH
+	var rdpAddress string
+	if ostype.IsWindows(osTypeEnum) {
+		accessType = pb.AccessType_ACCESS_TYPE_RDP
+		if st.IPAddress != "" {
+			rdpAddress = fmt.Sprintf("%s:3389", st.IPAddress)
+		}
+	}
+
+	pc := &pb.Container{
+		Name:                st.Ref.Name,
+		NetworkTenant:       st.NetworkTenant,
+		NetworkTenantSource: st.NetworkTenantSource,
+		Username:            st.Ref.Tenant,
+		State:               st.State,
+		Resources: &pb.ResourceLimits{
+			Cpu:           st.Resources.CPU,
+			Memory:        st.Resources.Memory,
+			Disk:          st.Resources.Disk,
+			StorageClass:  st.Resources.StorageClass,
+			MemoryRequest: st.Resources.MemoryRequest,
+			CpuRequest:    st.Resources.CPURequest,
+		},
+		Network: &pb.NetworkInfo{
+			IpAddress: st.IPAddress,
+		},
+		Labels:    st.Labels,
+		CreatedAt: st.CreatedAt.Unix(),
+		// Read back from the box (user.containarium.podman_enabled); boxes
+		// created before that key existed report true. See #2858.
+		PodmanEnabled: st.PodmanEnabled,
+		// Empty when no stack is recorded: K8s does not persist it, and LXC
+		// boxes created before user.containarium.stack existed have none.
+		Stack:                st.Stack,
+		GpuDevice:            st.GPU,
+		GpuDevices:           st.GPUs,
+		BackendId:            st.BackendID,
+		OsType:               osTypeEnum,
+		Isolation:            st.Isolation,
+		AccessType:           accessType,
+		RdpAddress:           rdpAddress,
+		MonitoringEnabled:    st.MonitoringEnabled,
+		AutoSleepEnabled:     st.AutoSleepEnabled,
+		IdleThresholdMinutes: st.IdleThresholdMinutes,
+		Image:                st.Image,
+	}
+	// TTL — populated by SetContainerTTL on the writer side. Zero value means
+	// no TTL set (parser silently drops missing/unparseable keys; a corrupted
+	// key shouldn't 5xx the list endpoint).
+	if !st.TTLExpiresAt.IsZero() {
+		pc.TtlExpiresAt = timestamppb.New(st.TTLExpiresAt)
+	}
+	// Two-phase reaping status (#525): stopped_at (cleared on start, so unset
+	// while running) + the stopped→delete window, so a reader sees the full
+	// lifecycle (#264).
+	if !st.StoppedAt.IsZero() {
+		pc.StoppedAt = timestamppb.New(st.StoppedAt)
+	}
+	pc.DeleteAfterStoppedSeconds = st.DeleteAfterStoppedSeconds
+	// Delete policy (#284): protected boxes are skipped by the ttlsweeper
+	// auto-reap and `containarium prune`. Absent / any non-"protected" value
+	// maps to UNSPECIFIED (the default, unprotected).
+	if st.DeletePolicy == incus.DeletePolicyProtected {
+		pc.DeletePolicy = pb.DeletePolicy_DELETE_POLICY_PROTECTED
+	}
+	// Tool-access level for platform-started runs (#2944): absent or any
+	// unrecognised value reads back as UNSPECIFIED (none recorded).
+	pc.ToolAccess = toolaccess.FromConfig(st.ToolAccess)
+	return pc
+}
+
+// GetManager returns the container manager for reuse by other components
+func (s *ContainerServer) GetManager() *container.Manager {
+	return s.manager
+}
+
+// extractAuthToken extracts the JWT token from gRPC metadata.
+func extractAuthToken(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	if vals := md.Get("authorization"); len(vals) > 0 {
+		token := vals[0]
+		if len(token) > 7 && token[:7] == "Bearer " {
+			return token[7:]
+		}
+		return token
+	}
+	return ""
+}
+
+// SetPeerPool sets the peer pool for multi-backend support
+func (s *ContainerServer) SetPeerPool(pool *PeerPool) {
+	s.peerPool = pool
+}
+
+// SetBackupManager wires the backup core's read side in for the metrics
+// export collector's backup-health series (#2294). Called once from
+// DualServer setup, after NewBackupServer exists, via its Manager()
+// getter — BackupServer depends on ContainerServer, not the reverse, so
+// this is the only way the two ever connect.
+func (s *ContainerServer) SetBackupManager(mgr *backup.Manager) {
+	s.backupMgr = mgr
+}
+
+// SetStartTime wires the daemon's process start time so ListBackends can
+// report the local backend's uptime. Called once from DualServer setup.
+func (s *ContainerServer) SetStartTime(t time.Time) {
+	s.startTime = t
+}
+
+// SetCapabilityIdentity wires the region this backend serves and its
+// self-reported hardware class into the capability profile (#681). Both are
+// operator-set: region from --region (falling back to the pool name) and the
+// reported class from the pool name. Called once from DualServer setup; either
+// may be empty.
+func (s *ContainerServer) SetCapabilityIdentity(region, reportedClass string) {
+	s.region = region
+	s.reportedClass = reportedClass
+}
+
+// SetCPUOvercommitPolicy configures create-time CPU capacity admission (#1029
+// direction 2). factor is the ceiling multiple of physical cores a host may
+// commit (<= 0 disables the gate — the default); enforce=false makes an
+// enabled gate advisory (log-only). Called once from DualServer setup. See
+// cpu_admission.go.
+func (s *ContainerServer) SetCPUOvercommitPolicy(factor float64, enforce bool) {
+	s.cpuOvercommitFactor = factor
+	s.cpuOvercommitEnforce = enforce
+}
+
+// SetManagedBackupKeyConfigured records whether this daemon has a managed
+// backup key, for SystemInfo.managed_backup_key_configured (#3213).
+func (s *ContainerServer) SetManagedBackupKeyConfigured(configured bool) {
+	s.managedBackupKey = configured
+}
+
+// withBackupKeyInfo stamps the managed-backup-key report onto info.
+func (s *ContainerServer) withBackupKeyInfo(info *pb.SystemInfo) {
+	info.ManagedBackupKeyConfigured = s.managedBackupKey
+}
+
+// SetSSHHost wires the public SSH host clients dial to reach this daemon's
+// containers (the sentinel's SSH endpoint, from --ssh-host). Stamped onto
+// Container.ssh_host in the read path. Empty leaves ssh_host empty so clients
+// fall back to the container IP. Called once from DualServer setup.
+func (s *ContainerServer) SetSSHHost(host string) {
+	s.sshHost = host
+}
+
+// sshCommandFor builds the ssh_command returned by CreateContainer from the
+// reachable target — the daemon-stamped ssh_host (the sentinel this container
+// belongs to) when set, falling back to the container IP only for direct /
+// no-sentinel deployments. Using the private IP unconditionally produced an
+// ssh_command that callers off the backend LAN (notably MCP agents) couldn't
+// reach — they'd see `ssh user@10.x.x.x` and give up. See #658.
+func sshCommandFor(username, sshHost, ip string) string {
+	target := ip
+	if sshHost != "" {
+		target = sshHost
+	}
+	return fmt.Sprintf("ssh %s@%s", username, target)
+}
+
+// SetAutoUpdater wires the daemon's auto-updater so TriggerUpgrade can run an
+// upgrade on demand (vs only on the periodic tick). DualServer calls this when
+// a sentinel binary source is configured; nil leaves local TriggerUpgrade
+// returning Unavailable. #354.
+func (s *ContainerServer) SetAutoUpdater(u *AutoUpdater) {
+	s.autoUpdater = u
+}
+
+// SetBinaryPath wires this daemon's own executable path so TriggerUpgrade's
+// GitHub-direct path (req.GithubTag, #1028) can swap it in place. DualServer
+// calls this unconditionally at startup, unlike SetAutoUpdater which is only
+// wired when a sentinel URL is configured — the GitHub-direct path has no
+// sentinel dependency. Empty leaves that path returning Unavailable.
+func (s *ContainerServer) SetBinaryPath(path string) {
+	s.binaryPath = path
+}
+
+// SetAuditStore wires the audit store so admin-initiated operations like
+// TriggerUpgrade are persisted. Nil is safe — ops are still log.Printf'd.
+func (s *ContainerServer) SetAuditStore(store *audit.Store) {
+	s.auditStore = store
+}
+
+// logUpgradeAudit records a TriggerUpgrade outcome. Best-effort — audit must
+// never fail the call. No-op until the audit store is wired.
+func (s *ContainerServer) logUpgradeAudit(ctx context.Context, subject, backendID, upgradeID, outcome, detail string) {
+	if s.auditStore == nil {
+		return
+	}
+	username := subject
+	if username == "" {
+		username = "_unknown"
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"upgrade_id": upgradeID,
+		"backend_id": backendID,
+		"outcome":    outcome,
+		"detail":     detail,
+	})
+	if err := s.auditStore.Log(ctx, &audit.AuditEntry{
+		Username:     username,
+		Action:       "backend.upgrade",
+		ResourceType: "backend",
+		ResourceID:   backendID,
+		Detail:       string(payload),
+	}); err != nil {
+		log.Printf("[upgrade] audit %s/%s: %v", upgradeID, outcome, err)
+	}
+}
+
+// SetOTelCollectorEndpoint wires the OTLP/HTTP URL of this daemon's
+// core OTel collector LXC. Stamped into containers created with
+// monitoring=true. DualServer calls this after the collector
+// container is provisioned (or after looking up its IP if it
+// already exists). Empty string disables app-monitoring injection
+// for new containers — they'll log a warning and skip stamping.
+func (s *ContainerServer) SetOTelCollectorEndpoint(endpoint string) {
+	s.otelCollectorEndpoint = endpoint
+}
+
+// SetCoreServices wires the CoreServices manager used by
+// refreshContainerIPMap to push source-IP attribution updates into
+// the collector LXC. Called from dual_server.go alongside
+// SetOTelCollectorEndpoint after the collector is ensured. Separate
+// setter from SetAlertManager because the alerting path is optional
+// and we want OTel attribution to work even on daemons started
+// without --alert-webhook-url.
+func (s *ContainerServer) SetCoreServices(cs *CoreServices) {
+	s.coreServices = cs
+}
+
+// refreshContainerIPMap rebuilds the source-IP → container-name map
+// and pushes it into the collector LXC. Best-effort: errors are
+// logged but never bubbled up — a stale IP map degrades source-IP
+// attribution but does not justify failing a container create/delete.
+//
+// Skips entirely when coreServices is nil (standalone mode) or the
+// collector isn't provisioned yet. Core containers are excluded —
+// their telemetry never carries app-emitted resource attributes.
+func (s *ContainerServer) refreshContainerIPMap() {
+	if s.coreServices == nil || s.coreServices.GetOTelCollectorIP() == "" {
+		return
+	}
+	infos, err := s.manager.List()
+	if err != nil {
+		log.Printf("Warning: failed to list containers for IP map refresh: %v", err)
+		return
+	}
+	if err := s.coreServices.WriteContainerIPMap(buildContainerIPMap(infos)); err != nil {
+		log.Printf("Warning: failed to push container IP map to collector: %v", err)
+	}
+}
+
+// cloudContainerIDLabel is the container label the cloud control plane stamps
+// with its container UUID (ossprimary.LabelCloudContainerID on the cloud side).
+// The OSS daemon is generic about labels; we read this one by its literal key
+// to carry the cloud's join identity into container_ips.json.
+const cloudContainerIDLabel = "cloud_container_id"
+
+// buildContainerIPMap projects the live container list into the source-IP →
+// identity map the OTel collector attributes telemetry by. Pure (no IO) so the
+// projection is unit-tested directly. Core containers and IP-less boxes (not
+// placed yet) are skipped — neither emits app telemetry to attribute.
+func buildContainerIPMap(infos []incus.ContainerInfo) map[string]ContainerIPEntry {
+	ipMap := make(map[string]ContainerIPEntry, len(infos))
+	for _, c := range infos {
+		if c.Role.IsCoreRole() || c.IPAddress == "" {
+			continue
+		}
+		ipMap[c.IPAddress] = ContainerIPEntry{
+			Name:             c.Name,
+			CloudContainerID: c.Labels[cloudContainerIDLabel],
+		}
+	}
+	return ipMap
+}
+
+// localBackendID returns this daemon's backend ID for stamping into
+// OTEL_RESOURCE_ATTRIBUTES. Falls back to "local" if the peer pool
+// isn't configured (single-host deployments) — that way single-host
+// metrics still have a well-known label rather than an empty string,
+// keeping Grafana queries simpler.
+func (s *ContainerServer) localBackendID() string {
+	if s.peerPool == nil {
+		return "local"
+	}
+	if id := s.peerPool.LocalBackendID(); id != "" {
+		return id
+	}
+	return "local"
+}
+
+// resolvePool returns the pool tag for the given backend_id. The local
+// backend's pool comes from the PeerPool's --pool configuration;
+// remote backends carry the tag they registered with the sentinel.
+// Returns "" when the peer pool isn't configured or the backend is
+// unknown.
+func (s *ContainerServer) resolvePool(backendID string) string {
+	if s.peerPool == nil {
+		return ""
+	}
+	if backendID == "" || backendID == s.peerPool.LocalBackendID() {
+		return s.peerPool.LocalPool()
+	}
+	if peer := s.peerPool.Get(backendID); peer != nil {
+		return peer.Pool
+	}
+	return ""
+}
+
+// resolvePoolPlacement validates or assigns req.BackendId based on
+// req.Pool. Called only when req.Pool is non-empty. When backend_id
+// is already set, it must belong to the requested pool. When empty,
+// any healthy backend in the pool (including the local one) is a
+// valid placement; the first healthy candidate wins. Returns an
+// error if no eligible backend can be found.
+func (s *ContainerServer) resolvePoolPlacement(req *pb.CreateContainerRequest) error {
+	if s.peerPool == nil {
+		return fmt.Errorf("pool=%q requested but peer pool is not configured on this daemon", req.Pool)
+	}
+
+	if req.BackendId != "" {
+		actual := s.resolvePool(req.BackendId)
+		if actual != req.Pool {
+			return fmt.Errorf("backend %q is in pool %q, not %q", req.BackendId, actual, req.Pool)
+		}
+		return nil
+	}
+
+	// No explicit backend_id — find a candidate in the requested pool.
+	//
+	// #920: the local backend used to be chosen here UNCONDITIONALLY,
+	// with no health check at all — while the peer branch immediately
+	// below has always required peer.Healthy via HealthyPeersInPool. That
+	// asymmetry let a wedged local backend (e.g. CPU-starved incusd, #755)
+	// keep silently absorbing every no-backend_id create even after it had
+	// already dropped out of ListBackends' fleet view, because the two
+	// call sites disagreed on what "healthy" means for the SAME backend.
+	// localBackendHealthy is now the single source of truth for the local
+	// backend's health, shared with ListBackends (see its local entry) —
+	// if the local backend fails that check, fall through to the
+	// peer-candidate path below exactly as if it weren't in the pool.
+	if s.peerPool.LocalPool() == req.Pool && s.localBackendHealthy() {
+		req.BackendId = s.peerPool.LocalBackendID()
+		return nil
+	}
+	// Capacity-aware ranking (#1029 direction 2): prefer the least-committed
+	// peer instead of an arbitrary (map-order) first-healthy one. Opt-in; when
+	// off, or if no peer's capacity is known yet, this falls back to
+	// first-healthy. See placement_ranking.go.
+	if s.peerPool.CapacityRankingEnabled() {
+		if pick := s.peerPool.PickLeastCommittedInPool(req.Pool); pick != nil {
+			req.BackendId = pick.ID
+			return nil
+		}
+		return fmt.Errorf("no healthy backend found in pool %q", req.Pool)
+	}
+
+	candidates := s.peerPool.HealthyPeersInPool(req.Pool)
+	if len(candidates) == 0 {
+		return fmt.Errorf("no healthy backend found in pool %q", req.Pool)
+	}
+	req.BackendId = candidates[0].ID
+	return nil
+}
+
+// localBackendHealthy reports whether this daemon's own LOCAL backend is
+// currently fit to receive newly scheduled work. It is the single source of
+// truth shared by ListBackends (the local entry's Healthy field) and
+// resolvePoolPlacement's local-backend short-circuit (#920) — previously
+// ListBackends hardcoded Healthy=true for local and resolvePoolPlacement
+// didn't check health at all, so both were blind to real local health. This
+// skips GetSystemInfo's admin-role gate, since it is an internal call made on
+// behalf of any caller's placement decision, not a fresh RPC.
+//
+// The verdict comes from localHealth (local_health.go, #2317): an Incus
+// server-info probe whose cost does not grow with the instance count, shared
+// by concurrent callers, and debounced so one slow sample on a busy host does
+// not make it unplaceable. It still fails closed on a daemon that stays
+// unresponsive. CONTAINARIUM_LOCAL_HEALTH_TIMEOUT tunes the per-call budget.
+//
+// localHealthCheckFn, when set (tests), overrides the real probe.
+func (s *ContainerServer) localBackendHealthy() bool {
+	if s.localHealthCheckFn != nil {
+		return s.localHealthCheckFn()
+	}
+	if s.manager == nil {
+		// No container manager wired (unit-test / non-LXC-runtime
+		// construction) — nothing to probe against; treat as healthy so
+		// tests that don't exercise this signal are unaffected.
+		return true
+	}
+	s.localHealthOnce.Do(func() {
+		timeout := localHealthTimeoutFromEnv()
+		s.localHealthState = newLocalHealth(incusLivenessProbe(probeCeilingFactor*timeout), timeout, localHealthGrace)
+	})
+	return s.localHealthState.Healthy()
+}
+
+// SetRouteCleanupDeps wires the route store + proxy manager so
+// DeleteContainer can cascade-clean a container's routes + TLS
+// subjects. Both may be nil if the daemon was started without
+// --app-hosting; the cascade will skip those steps gracefully.
+func (s *ContainerServer) SetRouteCleanupDeps(routeStore *app.RouteStore, proxyManager *app.ProxyManager) {
+	s.routeStore = routeStore
+	s.proxyManager = proxyManager
+}
+
+// SetPassthroughCleanupDep wires the passthrough store so DeleteContainer can
+// cascade-clean a container's TCP/UDP passthrough routes (#1462), mirroring
+// SetRouteCleanupDeps above. store may be nil if the daemon has no
+// Postgres-backed passthrough store configured; the cascade skips gracefully.
+func (s *ContainerServer) SetPassthroughCleanupDep(store network.PassthroughStore) {
+	s.passthroughStore = store
+}
+
+// SetCollaboratorManager sets the collaborator manager for handling collaborator operations
+func (s *ContainerServer) SetCollaboratorManager(cm *container.CollaboratorManager) {
+	s.collaboratorManager = cm
+}
+
+// AddCollaborator adds a collaborator to a container
+// collaboratorKeysFromRequest resolves the collaborator's SSH keys from
+// the request, preferring the repeated ssh_public_keys and falling back
+// to the legacy single ssh_public_key for back-compat. Returns nil when
+// neither is set. #369.
+func collaboratorKeysFromRequest(req *pb.AddCollaboratorRequest) []string {
+	if len(req.GetSshPublicKeys()) > 0 {
+		return req.GetSshPublicKeys()
+	}
+	if req.GetSshPublicKey() != "" {
+		return []string{req.GetSshPublicKey()}
+	}
+	return nil
+}
+
+func (s *ContainerServer) AddCollaborator(ctx context.Context, req *pb.AddCollaboratorRequest) (*pb.AddCollaboratorResponse, error) {
+	if req.OwnerUsername == "" {
+		return nil, fmt.Errorf("owner_username is required")
+	}
+	if req.CollaboratorUsername == "" {
+		return nil, fmt.Errorf("collaborator_username is required")
+	}
+	// Accept either the repeated ssh_public_keys (preferred) or the
+	// legacy single ssh_public_key. #369.
+	sshKeys := collaboratorKeysFromRequest(req)
+	if len(sshKeys) == 0 {
+		return nil, fmt.Errorf("at least one of ssh_public_keys or ssh_public_key is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.OwnerUsername); err != nil {
+		return nil, err
+	}
+
+	if s.collaboratorManager == nil {
+		// No local collaborator manager — try peer
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.OwnerUsername, authToken)
+			if peer == nil && len(unreachablePeers) > 0 {
+				// #1905: "collaborator management not enabled" would be a
+				// false diagnosis when the real cause is an unreachable backend.
+				return nil, fmt.Errorf("cannot add collaborator for %s: %d backend(s) unreachable (%s)",
+					req.OwnerUsername, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+			if peer != nil {
+				body, _ := json.Marshal(map[string]interface{}{
+					"collaborator_username": req.CollaboratorUsername,
+					// ssh_public_key kept for older peers; ssh_public_keys
+					// carries the full set for #369-aware peers.
+					"ssh_public_key":          sshKeys[0],
+					"ssh_public_keys":         sshKeys,
+					"grant_sudo":              req.GrantSudo,
+					"grant_container_runtime": req.GrantContainerRuntime,
+				})
+				respBody, statusCode, fwdErr := peer.ForwardRequest("POST", fmt.Sprintf("/v1/containers/%s/collaborators", req.OwnerUsername), authToken, body)
+				if fwdErr != nil {
+					return nil, fmt.Errorf("failed to add collaborator on peer %s: %w", peer.ID, fwdErr)
+				}
+				if statusCode >= 400 {
+					return nil, fmt.Errorf("peer %s returned status %d: %s", peer.ID, statusCode, string(respBody))
+				}
+				var peerResp struct {
+					Collaborator *pb.Collaborator `json:"collaborator"`
+					SshCommand   string           `json:"sshCommand"`
+					Message      string           `json:"message"`
+				}
+				if jsonErr := json.Unmarshal(respBody, &peerResp); jsonErr == nil && peerResp.Collaborator != nil {
+					return &pb.AddCollaboratorResponse{
+						Message:      peerResp.Message,
+						Collaborator: peerResp.Collaborator,
+						SshCommand:   peerResp.SshCommand,
+					}, nil
+				}
+				return &pb.AddCollaboratorResponse{
+					Message: fmt.Sprintf("Collaborator added on backend %s", peer.ID),
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("collaborator management not enabled")
+	}
+
+	collab, err := s.collaboratorManager.AddCollaborator(req.OwnerUsername, req.CollaboratorUsername, sshKeys, req.GrantSudo, req.GrantContainerRuntime)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add collaborator: %w", err)
+	}
+	s.registerCollaboratorKeys(ctx, collab.AccountName, sshKeys)
+
+	return &pb.AddCollaboratorResponse{
+		Message:      fmt.Sprintf("Collaborator %s added to %s-container", req.CollaboratorUsername, req.OwnerUsername),
+		Collaborator: collaboratorToProto(collab),
+		SshCommand:   s.collaboratorManager.GenerateSSHCommand(req.OwnerUsername, req.CollaboratorUsername, "jumpserver"),
+	}, nil
+}
+
+// RemoveCollaborator removes a collaborator from a container
+func (s *ContainerServer) RemoveCollaborator(ctx context.Context, req *pb.RemoveCollaboratorRequest) (*pb.RemoveCollaboratorResponse, error) {
+	if req.OwnerUsername == "" {
+		return nil, fmt.Errorf("owner_username is required")
+	}
+	if req.CollaboratorUsername == "" {
+		return nil, fmt.Errorf("collaborator_username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.OwnerUsername); err != nil {
+		return nil, err
+	}
+
+	if s.collaboratorManager == nil {
+		// No local collaborator manager — try peer
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.OwnerUsername, authToken)
+			if peer == nil && len(unreachablePeers) > 0 {
+				// #1905: "collaborator management not enabled" would be a
+				// false diagnosis when the real cause is an unreachable backend.
+				return nil, fmt.Errorf("cannot remove collaborator for %s: %d backend(s) unreachable (%s)",
+					req.OwnerUsername, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+			if peer != nil {
+				_, statusCode, fwdErr := peer.ForwardRequest("DELETE", fmt.Sprintf("/v1/containers/%s/collaborators/%s", req.OwnerUsername, req.CollaboratorUsername), authToken, nil)
+				if fwdErr != nil {
+					return nil, fmt.Errorf("failed to remove collaborator on peer %s: %w", peer.ID, fwdErr)
+				}
+				if statusCode >= 400 {
+					return nil, fmt.Errorf("peer %s returned status %d for remove collaborator", peer.ID, statusCode)
+				}
+				return &pb.RemoveCollaboratorResponse{
+					Message: fmt.Sprintf("Collaborator %s removed on backend %s", req.CollaboratorUsername, peer.ID),
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("collaborator management not enabled")
+	}
+
+	if err := s.collaboratorManager.RemoveCollaborator(req.OwnerUsername, req.CollaboratorUsername); err != nil {
+		return nil, fmt.Errorf("failed to remove collaborator: %w", err)
+	}
+
+	return &pb.RemoveCollaboratorResponse{
+		Message: fmt.Sprintf("Collaborator %s removed from %s-container", req.CollaboratorUsername, req.OwnerUsername),
+	}, nil
+}
+
+// ListCollaborators lists all collaborators for a container
+func (s *ContainerServer) ListCollaborators(ctx context.Context, req *pb.ListCollaboratorsRequest) (*pb.ListCollaboratorsResponse, error) {
+	if req.OwnerUsername == "" {
+		return nil, fmt.Errorf("owner_username is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.OwnerUsername); err != nil {
+		return nil, err
+	}
+
+	if s.collaboratorManager == nil {
+		// No local collaborator manager — try peer
+		if s.peerPool != nil {
+			authToken := extractAuthToken(ctx)
+			peer, unreachablePeers := s.peerPool.FindContainerPeer(req.OwnerUsername, authToken)
+			if peer == nil && len(unreachablePeers) > 0 {
+				// #1905: "collaborator management not enabled" would be a
+				// false diagnosis when the real cause is an unreachable backend.
+				return nil, fmt.Errorf("cannot list collaborators for %s: %d backend(s) unreachable (%s)",
+					req.OwnerUsername, len(unreachablePeers), unreachablePeers[0].Reason)
+			}
+			if peer != nil {
+				respBody, statusCode, fwdErr := peer.ForwardRequest("GET", fmt.Sprintf("/v1/containers/%s/collaborators", req.OwnerUsername), authToken, nil)
+				if fwdErr != nil {
+					return nil, fmt.Errorf("failed to list collaborators on peer %s: %w", peer.ID, fwdErr)
+				}
+				if statusCode >= 400 {
+					return nil, fmt.Errorf("peer %s returned status %d for list collaborators", peer.ID, statusCode)
+				}
+				var peerResp pb.ListCollaboratorsResponse
+				if jsonErr := json.Unmarshal(respBody, &peerResp); jsonErr == nil {
+					return &peerResp, nil
+				}
+				return &pb.ListCollaboratorsResponse{}, nil
+			}
+		}
+		return nil, fmt.Errorf("collaborator management not enabled")
+	}
+
+	collaborators, err := s.collaboratorManager.ListCollaborators(req.OwnerUsername)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list collaborators: %w", err)
+	}
+
+	var protoCollaborators []*pb.Collaborator
+	for _, c := range collaborators {
+		protoCollaborators = append(protoCollaborators, collaboratorToProto(c))
+	}
+
+	return &pb.ListCollaboratorsResponse{
+		Collaborators: protoCollaborators,
+		TotalCount:    safecast.I32(len(protoCollaborators)),
+	}, nil
+}
+
+// SetMonitoringURLs sets the VictoriaMetrics and Grafana URLs for the monitoring info endpoint
+func (s *ContainerServer) SetMonitoringURLs(victoriaMetricsURL, grafanaURL string) {
+	s.victoriaMetricsURL = victoriaMetricsURL
+	s.grafanaURL = grafanaURL
+}
+
+// GetMonitoringInfo returns monitoring configuration (Grafana/VictoriaMetrics URLs)
+func (s *ContainerServer) GetMonitoringInfo(ctx context.Context, req *pb.GetMonitoringInfoRequest) (*pb.GetMonitoringInfoResponse, error) {
+	// Discloses the Grafana/VictoriaMetrics endpoints and whether monitoring is
+	// on — reconnaissance value, so it needs some read authority (#1718).
+	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
+		return nil, err
+	}
+	return &pb.GetMonitoringInfoResponse{
+		Enabled:            s.victoriaMetricsURL != "",
+		GrafanaUrl:         s.grafanaURL,
+		VictoriaMetricsUrl: s.victoriaMetricsURL,
+	}, nil
+}
+
+// guacamoleConnectionIDLabel is the Incus label key for storing the Guacamole connection ID.
+const guacamoleConnectionIDLabel = "guacamole-connection-id"
+
+// SetGuacamoleClient sets the Guacamole client for Windows VM RDP registration.
+func (s *ContainerServer) SetGuacamoleClient(client *guacamole.Client, adminUser, adminPass string) {
+	s.guacamoleClient = client
+	s.guacamoleUser = adminUser
+	s.guacamolePass = adminPass
+}
+
+// registerGuacamoleConnection registers a Windows VM's RDP connection in Guacamole.
+// Returns the connection ID, or "" if Guacamole is not configured.
+func (s *ContainerServer) registerGuacamoleConnection(containerName, hostname, rdpUser, rdpPassword string) string {
+	if s.guacamoleClient == nil {
+		return ""
+	}
+
+	token, err := s.guacamoleClient.Authenticate(s.guacamoleUser, s.guacamolePass)
+	if err != nil {
+		log.Printf("Warning: Guacamole auth failed, skipping RDP registration: %v", err)
+		return ""
+	}
+
+	connID, err := s.guacamoleClient.CreateConnection(token, guacamole.ConnectionConfig{
+		Name:     containerName,
+		Hostname: hostname,
+		Port:     "3389",
+		Username: rdpUser,
+		Password: rdpPassword,
+	})
+	if err != nil {
+		log.Printf("Warning: Failed to register Guacamole connection for %s: %v", containerName, err)
+		return ""
+	}
+
+	log.Printf("Guacamole RDP connection registered for %s (id=%s)", containerName, connID)
+	return connID
+}
+
+// deregisterGuacamoleConnection removes a Windows VM's RDP connection from Guacamole.
+func (s *ContainerServer) deregisterGuacamoleConnection(username string) {
+	if s.guacamoleClient == nil {
+		return
+	}
+
+	// Look up the connection ID from container labels
+	info, err := s.boxes().Get(context.Background(), box.BoxRef{Tenant: username})
+	if err != nil || info == nil {
+		return
+	}
+
+	connID, ok := info.Labels[guacamoleConnectionIDLabel]
+	if !ok || connID == "" {
+		return
+	}
+
+	token, err := s.guacamoleClient.Authenticate(s.guacamoleUser, s.guacamolePass)
+	if err != nil {
+		log.Printf("Warning: Guacamole auth failed during deregistration: %v", err)
+		return
+	}
+
+	if err := s.guacamoleClient.DeleteConnection(token, connID); err != nil {
+		log.Printf("Warning: Failed to deregister Guacamole connection %s: %v", connID, err)
+		return
+	}
+
+	log.Printf("Guacamole RDP connection removed for %s (id=%s)", username, connID)
+}
