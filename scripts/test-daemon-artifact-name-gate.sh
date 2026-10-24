@@ -31,3 +31,36 @@ ALLOWLIST=(
   "hacks/install-cli.sh"
 )
 
+is_allowlisted() {
+  local f="$1"
+  for a in "${ALLOWLIST[@]}"; do
+    [ "$f" = "$a" ] && return 0
+  done
+  return 1
+}
+
+SELF="scripts/$(basename "$0")"
+fail=0
+while IFS= read -r -d '' file; do
+  [ "$file" = "$SELF" ] && continue
+  case "$file" in .github/workflows/*) continue ;; esac
+  hits="$(grep -nE "$PATTERN" "$file" 2>/dev/null || true)"
+  [ -z "$hits" ] && continue
+  is_allowlisted "$file" && continue
+  echo "FAIL  $file consumes a containarium-* artifact (the client build from Phase 2) where the daemon is meant:"
+  echo "$hits" | sed 's/^/        /'
+  fail=1
+done < <(git ls-files -z -- '*.sh' '*.tf' '*.tpl' '*.yaml' '*.yml')
+
+# Dead allow-list entries would silently hide a real regression later.
+for a in "${ALLOWLIST[@]}"; do
+  if [ ! -f "$a" ] || ! grep -qE "$PATTERN" "$a"; then
+    echo "FAIL  allow-list entry '$a' no longer matches — remove it from $SELF"
+    fail=1
+  fi
+done
+
+if [ "$fail" -eq 0 ]; then
+  echo "PASS  no host-side file consumes containarium-<os>-<arch> as the daemon"
+fi
+exit $fail
