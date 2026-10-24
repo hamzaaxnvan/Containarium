@@ -275,3 +275,280 @@ func collectorBearerForConfig() string {
 	}
 	if !on {
 		return ""
+	}
+	bearer, err := LoadOrCreateOTelBearer()
+	if err != nil || bearer == "" {
+		// Auth required but no bearer available — that's a
+		// misconfig. Log noisily and skip enforcement so the
+		// collector doesn't refuse everything.
+		log.Printf("[otel-collector] CONTAINARIUM_OTEL_REQUIRE_AUTH=true but bearer unavailable (%v); collector will NOT enforce auth", err)
+		return ""
+	}
+	log.Printf("[otel-collector] bearer auth ENFORCED on OTLP receivers")
+	return bearer
+}
+
+// ContainerIPEntry is the identity attributed to a source IP in
+// container_ips.json. It carries BOTH the local incus name (for in-cluster
+// Grafana, which keys on container_name) and the cloud_container_id (the
+// cloud control plane's join key — what cloud-daemon's MetricsService queries
+// by; see the cloud's metrics.VictoriaMetrics, which selects
+// {container_id="<cloud uuid>"}). CloudContainerID is empty for standalone /
+// CLI-created boxes that carry no cloud label.
+//
+// The source.ip → container.id join that consumes this (the OTel collector's
+// "v2" attribution step) is still pending — but capturing the cloud id at the
+// source here means that join, however it lands, can stamp the
+// cloud-queryable label rather than only the local name.
+type ContainerIPEntry struct {
+	Name             string `json:"name"`
+	CloudContainerID string `json:"cloud_container_id,omitempty"`
+}
+
+// WriteContainerIPMap pushes the current source-IP → {name, cloud_container_id}
+// map into the collector LXC at containerIPsFile. The collector reads this
+// file (v2: reloads-on-mtime) for source-IP-based identity attribution.
+//
+// Errors are returned (not logged-and-swallowed) so the caller can
+// decide whether to retry; in practice callsites log + continue.
+func (cs *CoreServices) WriteContainerIPMap(ipMap map[string]ContainerIPEntry) error {
+	if cs.otelCollectorIP == "" {
+		// Collector not provisioned yet — silently skip. The
+		// post-ensure code will re-push the map after EnsureOTelCollector.
+		return nil
+	}
+	payload, err := json.MarshalIndent(ipMap, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal container_ips.json: %w", err)
+	}
+	payload = append(payload, '\n')
+	if err := cs.incusClient.WriteFile(CoreOTelCollectorContainer, containerIPsFile, payload, "0644"); err != nil {
+		return fmt.Errorf("failed to push container_ips.json: %w", err)
+	}
+	return nil
+}
+
+// GetOTelCollectorIP returns the collector's IP (empty until ensured).
+func (cs *CoreServices) GetOTelCollectorIP() string {
+	return cs.otelCollectorIP
+}
+
+// GetOTelCollectorEndpoint returns the OTLP/HTTP endpoint to inject
+// into monitoring=true containers' OTEL_EXPORTER_OTLP_ENDPOINT.
+func (cs *CoreServices) GetOTelCollectorEndpoint() string {
+	if cs.otelCollectorIP == "" {
+		return ""
+	}
+	return fmt.Sprintf("http://%s:%d", cs.otelCollectorIP, DefaultOTelOTLPHTTPPort)
+}
+
+// waitForOTelCollector polls the collector's internal healthcheck.
+func (cs *CoreServices) waitForOTelCollector(ctx context.Context) error {
+	log.Printf("Waiting for otelcol-contrib to be ready...")
+	for i := 0; i < 30; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		// otelcol-contrib's default healthcheck extension binds 13133.
+		if err := cs.incusClient.Exec(CoreOTelCollectorContainer, []string{
+			"curl", "-sf", "http://localhost:13133/",
+		}); err == nil {
+			log.Printf("otelcol-contrib is ready")
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("timeout waiting for otelcol-contrib")
+}
+
+// mergeOTelDropLabels returns a sorted, de-duplicated union of two
+// drop-label slices. Exported only via Ensure* — keeping it local
+// avoids leaking the helper into the public API.
+func mergeOTelDropLabels(base, extra []string) []string {
+	seen := make(map[string]struct{}, len(base)+len(extra))
+	for _, s := range base {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		seen[s] = struct{}{}
+	}
+	for _, s := range extra {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		seen[s] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// otelReceiverBindAddress returns the address the OTel collector
+// should bind its OTLP receivers to. Default is 0.0.0.0 — fine in
+// the existing single-LXC deployment where the collector container
+// has no external interface (only the incusbr0 bridge IP), but
+// audit C-HIGH-5 flagged the literal "0.0.0.0" string as a hazard:
+// if a future deployment configures the collector LXC with an
+// extra external interface (NAT mapping, direct bridge to a public
+// VLAN, etc.) the OTLP ports would suddenly accept un-authenticated
+// requests from the internet.
+//
+// Operators in paranoid environments override via
+// CONTAINARIUM_OTEL_COLLECTOR_BIND (e.g. "10.0.3.5" — the
+// collector's specific bridge IP) so the listen socket is pinned
+// to the bridge interface explicitly.
+func otelReceiverBindAddress() string {
+	if v := strings.TrimSpace(os.Getenv(appconfig.EnvOTELCollectorBind)); v != "" {
+		return v
+	}
+	return "0.0.0.0"
+}
+
+// buildOTelCollectorConfig renders config.yaml for the collector.
+// Pure function (no side effects) so it's trivially testable.
+//
+// When `bearer` is non-empty, the OTLP receivers are gated by the
+// bearertokenauth extension — every push must carry
+// `Authorization: Bearer <bearer>` or the collector responds with
+// 401. Empty bearer omits the auth wiring entirely (pre-2.5
+// behavior). See collectorBearerForConfig for the env-gated
+// resolution.
+func buildOTelCollectorConfig(vmIP string, dropLabels []string, bearer string) string {
+	// Compose the OTTL drop-keys regex once. Each label becomes an
+	// anchored alternation: ^request_id$|^trace_id$|...
+	var dropRegex string
+	if len(dropLabels) > 0 {
+		parts := make([]string, 0, len(dropLabels))
+		for _, l := range dropLabels {
+			parts = append(parts, "^"+regexEscape(l)+"$")
+		}
+		dropRegex = strings.Join(parts, "|")
+	}
+
+	bind := otelReceiverBindAddress()
+
+	// Phase 2.5 follow-up — when a bearer is supplied, wire
+	// the bearertokenauth extension onto both OTLP protocol
+	// receivers. The receiver-level `auth.authenticator` key
+	// tells the collector to require a matching token on
+	// every push.
+	authBlock := ""
+	if bearer != "" {
+		authBlock = `
+        auth:
+          authenticator: bearertokenauth`
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, `receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: %s:4318%s
+      grpc:
+        endpoint: %s:4317%s
+
+processors:`, bind, authBlock, bind, authBlock)
+	b.WriteString(`
+
+  # Anti-spoofing: stamp source.ip from the OTLP client.address so a
+  # misbehaving container cannot fake provenance. v1 surfaces the raw
+  # IP; v2 will join it with /var/lib/containarium/container_ips.json
+  # (source.ip → {name, cloud_container_id}) to materialize a
+  # container.id label = the cloud_container_id, which the cloud
+  # control plane's MetricsService queries by.
+  attributes/identity:
+    actions:
+      - key: source.ip
+        action: upsert
+        from_attribute: client.address
+
+`)
+
+	if dropRegex != "" {
+		fmt.Fprintf(&b, `  # Cardinality guard: drop high-cardinality / PII labels per
+  # docs/OTEL-COLLECTOR-DESIGN.md §5. Operators can extend the list
+  # via --otel-drop-labels; defaults are always applied.
+  transform:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - delete_matching_keys(attributes, %q)
+
+`, dropRegex)
+	}
+
+	b.WriteString(`  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+`)
+	// extensions block: always health_check; bearertokenauth
+	// added when bearer is non-empty.
+	if bearer != "" {
+		fmt.Fprintf(&b, `extensions:
+  bearertokenauth:
+    scheme: "Bearer"
+    token: "%s"
+  health_check:
+    endpoint: %s:13133
+
+`, bearer, bind)
+	} else {
+		fmt.Fprintf(&b, `extensions:
+  health_check:
+    endpoint: %s:13133
+
+`, bind)
+	}
+	b.WriteString(`exporters:
+  otlphttp:
+    endpoint: `)
+	fmt.Fprintf(&b, "http://%s:%d/opentelemetry\n", vmIP, DefaultVMPort)
+	b.WriteString(`    tls:
+      insecure: true
+
+service:
+`)
+	if bearer != "" {
+		b.WriteString("  extensions: [bearertokenauth, health_check]\n")
+	} else {
+		b.WriteString("  extensions: [health_check]\n")
+	}
+	b.WriteString(`  pipelines:
+    metrics:
+      receivers: [otlp]
+`)
+	if dropRegex != "" {
+		b.WriteString("      processors: [attributes/identity, transform, batch]\n")
+	} else {
+		b.WriteString("      processors: [attributes/identity, batch]\n")
+	}
+	b.WriteString("      exporters: [otlphttp]\n")
+	return b.String()
+}
+
+// regexEscape escapes the small set of regex metacharacters that
+// could appear in an OTel attribute key. Attribute keys per the OTel
+// spec are dotted lowercase identifiers, so the realistic risk
+// surface is small; we escape conservatively rather than pull in
+// regexp.QuoteMeta and a stdlib dependency for a 10-char input.
+func regexEscape(s string) string {
+	const metas = `.+*?()[]{}|^$\`
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if strings.ContainsRune(metas, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
