@@ -40,3 +40,14 @@ func protoName(proto uint8) string {
 }
 
 // denyReasonName renders a DenyEvent.Reason as the short label an operator
+// sees in a finding's evidence.
+func denyReasonName(reason uint8) string {
+	switch reason {
+	case netbpf.DenyReasonVirtualPatch:
+		return "virtual-patch"
+	case netbpf.DenyReasonSignature:
+		return "signature"
+	default:
+		return "policy"
+	}
+}
