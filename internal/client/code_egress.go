@@ -40,3 +40,46 @@ func (c *GRPCClient) SetCodingToolEgressPolicy(req *pb.SetCodingToolEgressPolicy
 
 func (c *GRPCClient) GetCodingToolEgressPolicy(req *pb.GetCodingToolEgressPolicyRequest) (*pb.GetCodingToolEgressPolicyResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), codeEgressTimeout)
+	defer cancel()
+	return c.codeEgress().GetCodingToolEgressPolicy(ctx, req)
+}
+
+func (c *GRPCClient) DeleteCodingToolEgressPolicy(req *pb.DeleteCodingToolEgressPolicyRequest) (*pb.DeleteCodingToolEgressPolicyResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), codeEgressTimeout)
+	defer cancel()
+	return c.codeEgress().DeleteCodingToolEgressPolicy(ctx, req)
+}
+
+// ---------- HTTP ----------
+
+func (c *HTTPClient) SetCodingToolEgressPolicy(req *pb.SetCodingToolEgressPolicyRequest) (*pb.SetCodingToolEgressPolicyResponse, error) {
+	// body: "policy" in the mapping — the request body is the policy itself.
+	body, err := protojson.Marshal(req.GetPolicy())
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+	out := &pb.SetCodingToolEgressPolicyResponse{}
+	if err := c.trackerDoTimeout(codeEgressTimeout, http.MethodPut,
+		codeegress.PolicyPath(req.GetPolicy().GetTenant()), "set coding-tool egress policy", body, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) GetCodingToolEgressPolicy(req *pb.GetCodingToolEgressPolicyRequest) (*pb.GetCodingToolEgressPolicyResponse, error) {
+	out := &pb.GetCodingToolEgressPolicyResponse{}
+	if err := c.trackerDoTimeout(codeEgressTimeout, http.MethodGet,
+		codeegress.PolicyPath(req.GetTenant()), "get coding-tool egress policy", nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) DeleteCodingToolEgressPolicy(req *pb.DeleteCodingToolEgressPolicyRequest) (*pb.DeleteCodingToolEgressPolicyResponse, error) {
+	out := &pb.DeleteCodingToolEgressPolicyResponse{}
+	if err := c.trackerDoTimeout(codeEgressTimeout, http.MethodDelete,
+		codeegress.PolicyPath(req.GetTenant()), "delete coding-tool egress policy", nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
