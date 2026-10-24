@@ -187,3 +187,67 @@ func resolve(src source, in Inputs, bridge netip.Prefix) []string {
 		return out
 	case fromCore:
 		if a, ok := in.Core[src.role]; ok {
+			return []string{host32(a)}
+		}
+		return nil
+	}
+	return nil
+}
+
+func describe(src source) string {
+	switch src.kind {
+	case fromHost:
+		return "host gateway"
+	case fromBridge:
+		return "tenant bridge"
+	case fromControlPlane:
+		return "control plane"
+	case fromCore:
+		return string(src.role)
+	}
+	return "unknown"
+}
+
+func host32(a netip.Addr) string {
+	return netip.PrefixFrom(a, 32).String()
+}
+
+func validate(in Inputs) error {
+	if !in.BridgeCIDR.IsValid() {
+		return fmt.Errorf("coreguard: bridge CIDR is not set")
+	}
+	if !in.BridgeCIDR.Addr().Is4() {
+		return fmt.Errorf("coreguard: bridge %s is not IPv4 (the guard is IPv4-only, like the bridge it protects)", in.BridgeCIDR)
+	}
+	bridge := in.BridgeCIDR.Masked()
+	if err := inBridge("host gateway", in.HostGateway, bridge); err != nil {
+		return err
+	}
+	for role, a := range in.Core {
+		if err := inBridge(string(role), a, bridge); err != nil {
+			return err
+		}
+		if a == in.HostGateway {
+			return fmt.Errorf("coreguard: %s has the host gateway's address %s", role, a)
+		}
+	}
+	for i, a := range in.ControlPlane {
+		if err := inBridge(fmt.Sprintf("control plane[%d]", i), a, bridge); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func inBridge(what string, a netip.Addr, bridge netip.Prefix) error {
+	if !a.IsValid() {
+		return fmt.Errorf("coreguard: %s has no address", what)
+	}
+	if !a.Is4() {
+		return fmt.Errorf("coreguard: %s address %s is not IPv4", what, a)
+	}
+	if !bridge.Contains(a) {
+		return fmt.Errorf("coreguard: %s address %s is outside the bridge %s", what, a, bridge)
+	}
+	return nil
+}
