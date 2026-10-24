@@ -142,3 +142,220 @@ func (x *RawExtension) GetRaw() []byte {
 //	     runtime.TypeMeta    `json:",inline"`
 //	     ... // other fields
 //	}
+//
+// func (obj *MyAwesomeAPIObject) SetGroupVersionKind(gvk *metav1.GroupVersionKind) { metav1.UpdateTypeMeta(obj,gvk) }; GroupVersionKind() *GroupVersionKind
+//
+// TypeMeta is provided here for convenience. You may use it directly from this package or define
+// your own with the same fields.
+//
+// +k8s:deepcopy-gen=false
+// +protobuf=true
+// +k8s:openapi-gen=true
+type TypeMeta struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// +optional
+	ApiVersion *string `protobuf:"bytes,1,opt,name=apiVersion" json:"apiVersion,omitempty"`
+	// +optional
+	Kind          *string `protobuf:"bytes,2,opt,name=kind" json:"kind,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TypeMeta) Reset() {
+	*x = TypeMeta{}
+	mi := &file_k8s_io_apimachinery_pkg_runtime_generated_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TypeMeta) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TypeMeta) ProtoMessage() {}
+
+func (x *TypeMeta) ProtoReflect() protoreflect.Message {
+	mi := &file_k8s_io_apimachinery_pkg_runtime_generated_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TypeMeta.ProtoReflect.Descriptor instead.
+func (*TypeMeta) Descriptor() ([]byte, []int) {
+	return file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *TypeMeta) GetApiVersion() string {
+	if x != nil && x.ApiVersion != nil {
+		return *x.ApiVersion
+	}
+	return ""
+}
+
+func (x *TypeMeta) GetKind() string {
+	if x != nil && x.Kind != nil {
+		return *x.Kind
+	}
+	return ""
+}
+
+// Unknown allows api objects with unknown types to be passed-through. This can be used
+// to deal with the API objects from a plug-in. Unknown objects still have functioning
+// TypeMeta features-- kind, version, etc.
+// TODO: Make this object have easy access to field based accessors and settors for
+// metadata and field mutatation.
+//
+// +k8s:deepcopy-gen=true
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +protobuf=true
+// +k8s:openapi-gen=true
+type Unknown struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	TypeMeta *TypeMeta              `protobuf:"bytes,1,opt,name=typeMeta" json:"typeMeta,omitempty"`
+	// Raw will hold the complete serialized object which couldn't be matched
+	// with a registered type. Most likely, nothing should be done with this
+	// except for passing it through the system.
+	Raw []byte `protobuf:"bytes,2,opt,name=raw" json:"raw,omitempty"`
+	// ContentEncoding is encoding used to encode 'Raw' data.
+	// Unspecified means no encoding.
+	ContentEncoding *string `protobuf:"bytes,3,opt,name=contentEncoding" json:"contentEncoding,omitempty"`
+	// ContentType  is serialization method used to serialize 'Raw'.
+	// Unspecified means ContentTypeJSON.
+	ContentType   *string `protobuf:"bytes,4,opt,name=contentType" json:"contentType,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Unknown) Reset() {
+	*x = Unknown{}
+	mi := &file_k8s_io_apimachinery_pkg_runtime_generated_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Unknown) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Unknown) ProtoMessage() {}
+
+func (x *Unknown) ProtoReflect() protoreflect.Message {
+	mi := &file_k8s_io_apimachinery_pkg_runtime_generated_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Unknown.ProtoReflect.Descriptor instead.
+func (*Unknown) Descriptor() ([]byte, []int) {
+	return file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *Unknown) GetTypeMeta() *TypeMeta {
+	if x != nil {
+		return x.TypeMeta
+	}
+	return nil
+}
+
+func (x *Unknown) GetRaw() []byte {
+	if x != nil {
+		return x.Raw
+	}
+	return nil
+}
+
+func (x *Unknown) GetContentEncoding() string {
+	if x != nil && x.ContentEncoding != nil {
+		return *x.ContentEncoding
+	}
+	return ""
+}
+
+func (x *Unknown) GetContentType() string {
+	if x != nil && x.ContentType != nil {
+		return *x.ContentType
+	}
+	return ""
+}
+
+var File_k8s_io_apimachinery_pkg_runtime_generated_proto protoreflect.FileDescriptor
+
+const file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDesc = "" +
+	"\n" +
+	"/k8s.io/apimachinery/pkg/runtime/generated.proto\x12\x1fk8s.io.apimachinery.pkg.runtime\" \n" +
+	"\fRawExtension\x12\x10\n" +
+	"\x03raw\x18\x01 \x01(\fR\x03raw\">\n" +
+	"\bTypeMeta\x12\x1e\n" +
+	"\n" +
+	"apiVersion\x18\x01 \x01(\tR\n" +
+	"apiVersion\x12\x12\n" +
+	"\x04kind\x18\x02 \x01(\tR\x04kind\"\xae\x01\n" +
+	"\aUnknown\x12E\n" +
+	"\btypeMeta\x18\x01 \x01(\v2).k8s.io.apimachinery.pkg.runtime.TypeMetaR\btypeMeta\x12\x10\n" +
+	"\x03raw\x18\x02 \x01(\fR\x03raw\x12(\n" +
+	"\x0fcontentEncoding\x18\x03 \x01(\tR\x0fcontentEncoding\x12 \n" +
+	"\vcontentType\x18\x04 \x01(\tR\vcontentTypeB\xae\x02\n" +
+	"#com.k8s.io.apimachinery.pkg.runtimeB\x0eGeneratedProtoP\x01ZUgithub.com/footprintai/containarium/pkg/pb/thirdparty/k8s.io/apimachinery/pkg/runtime\xa2\x02\x05KIAPR\xaa\x02\x1fK8s.Io.Apimachinery.Pkg.Runtime\xca\x02\x1fK8s\\Io\\Apimachinery\\Pkg\\Runtime\xe2\x02+K8s\\Io\\Apimachinery\\Pkg\\Runtime\\GPBMetadata\xea\x02#K8s::Io::Apimachinery::Pkg::Runtime"
+
+var (
+	file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDescOnce sync.Once
+	file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDescData []byte
+)
+
+func file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDescGZIP() []byte {
+	file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDescOnce.Do(func() {
+		file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDesc), len(file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDesc)))
+	})
+	return file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDescData
+}
+
+var file_k8s_io_apimachinery_pkg_runtime_generated_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_k8s_io_apimachinery_pkg_runtime_generated_proto_goTypes = []any{
+	(*RawExtension)(nil), // 0: k8s.io.apimachinery.pkg.runtime.RawExtension
+	(*TypeMeta)(nil),     // 1: k8s.io.apimachinery.pkg.runtime.TypeMeta
+	(*Unknown)(nil),      // 2: k8s.io.apimachinery.pkg.runtime.Unknown
+}
+var file_k8s_io_apimachinery_pkg_runtime_generated_proto_depIdxs = []int32{
+	1, // 0: k8s.io.apimachinery.pkg.runtime.Unknown.typeMeta:type_name -> k8s.io.apimachinery.pkg.runtime.TypeMeta
+	1, // [1:1] is the sub-list for method output_type
+	1, // [1:1] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
+}
+
+func init() { file_k8s_io_apimachinery_pkg_runtime_generated_proto_init() }
+func file_k8s_io_apimachinery_pkg_runtime_generated_proto_init() {
+	if File_k8s_io_apimachinery_pkg_runtime_generated_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDesc), len(file_k8s_io_apimachinery_pkg_runtime_generated_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   3,
+			NumExtensions: 0,
+			NumServices:   0,
+		},
+		GoTypes:           file_k8s_io_apimachinery_pkg_runtime_generated_proto_goTypes,
+		DependencyIndexes: file_k8s_io_apimachinery_pkg_runtime_generated_proto_depIdxs,
+		MessageInfos:      file_k8s_io_apimachinery_pkg_runtime_generated_proto_msgTypes,
+	}.Build()
+	File_k8s_io_apimachinery_pkg_runtime_generated_proto = out.File
+	file_k8s_io_apimachinery_pkg_runtime_generated_proto_goTypes = nil
+	file_k8s_io_apimachinery_pkg_runtime_generated_proto_depIdxs = nil
+}
