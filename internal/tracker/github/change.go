@@ -19,3 +19,89 @@ var _ tracker.Provider = (*Adapter)(nil)
 // responsibility to have already composed into it (#1923's
 // SubmitTrackerChange handler), the same division of labor Comment
 // already has for its own body.
+func (a *Adapter) OpenChange(ctx context.Context, conn tracker.Conn, req tracker.OpenChangeRequest) (tracker.Change, error) {
+	base := apiBase(conn.BaseURL)
+	reqBody := struct {
+		Title string `json:"title"`
+		Body  string `json:"body"`
+		Head  string `json:"head"`
+		Base  string `json:"base"`
+		Draft bool   `json:"draft"`
+	}{
+		Title: req.Title,
+		Body:  req.Description,
+		Head:  req.HeadBranch,
+		Base:  req.BaseBranch,
+		Draft: req.Draft,
+	}
+
+	var pr ghPull
+	if err := a.do(ctx, http.MethodPost, fmt.Sprintf("%s/repos/%s/pulls", base, conn.Project),
+		conn.Credential, reqBody, &pr); err != nil {
+		return tracker.Change{}, err
+	}
+
+	return tracker.Change{
+		Number: pr.Number,
+		// A freshly opened PR is always "open" and unmerged;
+		// pullStateToTracker still goes through the response rather
+		// than hardcoding OPEN, so a provider quirk (e.g. auto-merge
+		// firing instantly) is reflected rather than assumed away.
+		State: pullStateToTracker(pr),
+		// No CI has run yet for a pull request that was just created —
+		// a combined-status lookup would report the same NONE this
+		// avoids the extra API call for.
+		CIVerdict: pb.TrackerCiVerdict_TRACKER_CI_VERDICT_NONE,
+		URL:       pr.HTMLURL,
+		Branch:    req.HeadBranch,
+	}, nil
+}
+
+// FindOpenChange returns the open pull request whose head is headBranch
+// in conn.Project itself (#3288): GET /repos/{owner}/{repo}/pulls with
+// head=<owner>:<branch> and state=open. A pull request from a fork's
+// same-named branch is not a match.
+func (a *Adapter) FindOpenChange(ctx context.Context, conn tracker.Conn, headBranch string) (tracker.Change, bool, error) {
+	owner, _, _ := strings.Cut(conn.Project, "/")
+	q := url.Values{}
+	q.Set("head", owner+":"+headBranch)
+	q.Set("state", "open")
+	var pulls []ghPull
+	if err := a.get(ctx, fmt.Sprintf("%s/repos/%s/pulls?%s", apiBase(conn.BaseURL), conn.Project, q.Encode()), conn.Credential, &pulls); err != nil {
+		return tracker.Change{}, false, err
+	}
+	for _, pr := range pulls {
+		if pr.Head.Ref != headBranch || pr.Head.Repo == nil || !strings.EqualFold(pr.Head.Repo.FullName, conn.Project) {
+			continue
+		}
+		return tracker.Change{
+			Number: pr.Number,
+			State:  pullStateToTracker(pr),
+			// The caller has just pushed a new head commit; no CI has
+			// reported on it yet, as for a freshly opened change.
+			CIVerdict: pb.TrackerCiVerdict_TRACKER_CI_VERDICT_NONE,
+			URL:       pr.HTMLURL,
+			Branch:    pr.Head.Ref,
+		}, true, nil
+	}
+	return tracker.Change{}, false, nil
+}
+
+// ghRepo mirrors the subset of GET /repos/{owner}/{repo} DefaultBranch needs.
+type ghRepo struct {
+	DefaultBranch string `json:"default_branch"`
+}
+
+// DefaultBranch resolves the repository's actual default branch from
+// GitHub itself, never guessed.
+func (a *Adapter) DefaultBranch(ctx context.Context, conn tracker.Conn) (string, error) {
+	base := apiBase(conn.BaseURL)
+	var repo ghRepo
+	if err := a.get(ctx, fmt.Sprintf("%s/repos/%s", base, conn.Project), conn.Credential, &repo); err != nil {
+		return "", err
+	}
+	if repo.DefaultBranch == "" {
+		return "", fmt.Errorf("github: %s reports no default branch", conn.Project)
+	}
+	return repo.DefaultBranch, nil
+}
