@@ -37,3 +37,43 @@ type backupSelection struct {
 
 // validate refuses every combination that would leave the command
 // guessing, before anything is dialed or unwrapped.
+func (s backupSelection) validate() error {
+	if s.managed && s.ageIdentityFile != "" {
+		return fmt.Errorf("--managed and --age-identity-file are mutually exclusive: pick the key source")
+	}
+	if s.latest {
+		if len(s.args) > 0 {
+			return fmt.Errorf("--latest and a backup id are mutually exclusive")
+		}
+		if s.user == "" || s.database == "" {
+			return fmt.Errorf("--latest needs --user and --database")
+		}
+		return nil
+	}
+	if len(s.args) != 1 {
+		return fmt.Errorf("a backup id is required (or --latest with --user and --database)")
+	}
+	return nil
+}
+
+// resolve returns the record to act on. The record itself is only
+// fetched when it is needed: for --latest, or to read a managed key.
+func (s backupSelection) resolve(c backupAPI) (*pb.BackupRecord, error) {
+	if s.latest {
+		recs, err := c.ListBackups(s.user)
+		if err != nil {
+			return nil, err
+		}
+		return backupkey.Newest(recs, s.user, s.database)
+	}
+	if !s.managed {
+		return &pb.BackupRecord{Id: s.args[0]}, nil
+	}
+	return c.GetBackup(s.args[0])
+}
+
+// unwrapManagedIdentity is the CLI's call into the shared unwrap. The
+// caller zeroes the returned buffer after the request is sent.
+func unwrapManagedIdentity(ctx context.Context, rec *pb.BackupRecord) ([]byte, error) {
+	return backupkey.UnwrapIdentity(ctx, managedKMSLoader, rec)
+}
