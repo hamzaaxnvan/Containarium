@@ -118,3 +118,124 @@ func (p *PostgresAgentTaskQueue) Enqueue(ctx context.Context, skillID, inputJSON
 		INSERT INTO agent_tasks (id, skill_id, input_json)
 		VALUES ('task-' || nextval('agent_task_id_seq'), $1, $2)
 		RETURNING id
+	`
+	var id string
+	if err := p.pool.QueryRow(ctx, q, skillID, inputJSON).Scan(&id); err != nil {
+		return "", fmt.Errorf("enqueue task: %w", err)
+	}
+	return id, nil
+}
+
+// Lease claims the oldest visible task in one statement.
+//
+// FOR UPDATE SKIP LOCKED is what makes this safe with many workers polling at
+// once: each concurrent lease takes a different row instead of blocking on the
+// same one and then handing the same task to two workers. The in-memory queue
+// got this from holding a mutex across the whole scan; a database needs to be
+// told.
+func (p *PostgresAgentTaskQueue) Lease(ctx context.Context, skillFilter string, d time.Duration) (leasedTask, bool, error) {
+	if d <= 0 {
+		d = defaultLeaseDuration
+	}
+	const q = `
+		UPDATE agent_tasks SET
+			lease_token = 'lease-' || nextval('agent_lease_token_seq'),
+			lease_deadline = NOW() + $2::interval
+		WHERE id = (
+			SELECT id FROM agent_tasks
+			WHERE ($1 = '' OR skill_id = $1)
+			  AND (lease_token IS NULL OR lease_deadline <= NOW())
+			ORDER BY enqueued_at
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING id, skill_id, input_json, lease_token
+	`
+	var t leasedTask
+	err := p.pool.QueryRow(ctx, q, skillFilter, d.String()).
+		Scan(&t.ID, &t.SkillID, &t.InputJSON, &t.LeaseToken)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return leasedTask{}, false, nil
+	case err != nil:
+		return leasedTask{}, false, fmt.Errorf("lease task: %w", err)
+	}
+	return t, true, nil
+}
+
+// Complete removes the task and records its outcome, atomically, and only when
+// the presented token is the current one.
+func (p *PostgresAgentTaskQueue) Complete(ctx context.Context, taskID, leaseToken, artifactJSON, errMsg string) (bool, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("complete task %s: begin: %w", taskID, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// The token comparison lives in the DELETE, so checking and removing cannot
+	// interleave with a redelivery between them.
+	const del = `
+		DELETE FROM agent_tasks
+		WHERE id = $1 AND lease_token IS NOT NULL AND lease_token = $2
+		RETURNING skill_id
+	`
+	var skillID string
+	switch err := tx.QueryRow(ctx, del, taskID, leaseToken).Scan(&skillID); {
+	case errors.Is(err, pgx.ErrNoRows):
+		// Gone, never leased, or a newer lease owns it now.
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("complete task %s: %w", taskID, err)
+	}
+
+	const ins = `
+		INSERT INTO agent_task_results (id, skill_id, artifact_json, error, completed_at)
+		VALUES ($1, $2, $3, $4, NOW())
+		ON CONFLICT (id) DO UPDATE SET
+			artifact_json = EXCLUDED.artifact_json,
+			error = EXCLUDED.error,
+			completed_at = NOW()
+	`
+	if _, err := tx.Exec(ctx, ins, taskID, skillID, artifactJSON, errMsg); err != nil {
+		return false, fmt.Errorf("record result %s: %w", taskID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("complete task %s: commit: %w", taskID, err)
+	}
+	return true, nil
+}
+
+func (p *PostgresAgentTaskQueue) Depth(ctx context.Context) (int, error) {
+	var n int
+	if err := p.pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_tasks`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("queue depth: %w", err)
+	}
+	return n, nil
+}
+
+func (p *PostgresAgentTaskQueue) Result(ctx context.Context, taskID string) (taskResult, bool, error) {
+	const q = `SELECT skill_id, artifact_json, error, completed_at FROM agent_task_results WHERE id = $1`
+	var r taskResult
+	switch err := p.pool.QueryRow(ctx, q, taskID).
+		Scan(&r.skillID, &r.artifactJSON, &r.errMsg, &r.completedAt); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return taskResult{}, false, nil
+	case err != nil:
+		return taskResult{}, false, fmt.Errorf("get task result %s: %w", taskID, err)
+	}
+	return r, true, nil
+}
+
+// setClock overrides the queue's clock. Test-only: lease expiry is a
+// wall-clock property, and the alternative to injecting a clock is a test that
+// sleeps for the lease duration.
+func (m *MemAgentTaskQueue) setClock(now func() time.Time) { m.q.now = now }
+
+// SetTaskQueue swaps the pull-queue store, used at daemon start to upgrade
+// from the in-memory default to Postgres. Called before grpcServer.Serve, so
+// no lease is in flight across the swap.
+func (s *AgentSkillServer) SetTaskQueue(q AgentTaskQueue) {
+	if q != nil {
+		s.queue = q
+	}
+}
