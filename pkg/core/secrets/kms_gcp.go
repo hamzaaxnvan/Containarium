@@ -163,3 +163,168 @@ func NewGCPKMS(cfg GCPConfig) (*GCPKMS, error) {
 		!strings.Contains(cfg.KeyName, "/cryptoKeys/") {
 		return nil, fmt.Errorf("gcp KMS: key name %q is not a CryptoKey resource path (want projects/.../cryptoKeys/...)", cfg.KeyName)
 	}
+	if cfg.Token == "" && cfg.TokenFile == "" {
+		return nil, errors.New("gcp KMS: access token or token file required")
+	}
+	cfg.Endpoint = strings.TrimRight(strings.TrimSpace(cfg.Endpoint), "/")
+	if cfg.Endpoint == "" {
+		cfg.Endpoint = gcpDefaultEndpoint
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 5 * time.Second
+	}
+	return &GCPKMS{
+		cfg:    cfg,
+		client: &http.Client{Timeout: cfg.Timeout},
+	}, nil
+}
+
+// Wrap encrypts the DEK against the configured CryptoKey.
+// Cloud KMS returns an opaque base64 ciphertext we store
+// verbatim — like Vault's "vault:v<n>:..." blob it carries
+// enough self-description (within the bytes) for decrypt
+// to figure out which key version produced it — and the
+// resource name of the CryptoKeyVersion it used, which
+// becomes the kek_id (#2402). Rows wrapped under different
+// keys, projects or versions get distinct kek_ids;
+// cross-deployment confusion is structurally impossible.
+func (g *GCPKMS) Wrap(ctx context.Context, plaintextDEK []byte) ([]byte, string, error) {
+	if err := checkWrapPlaintext(plaintextDEK); err != nil {
+		return nil, "", err
+	}
+	body := map[string]string{
+		"plaintext": base64.StdEncoding.EncodeToString(plaintextDEK),
+	}
+	var resp struct {
+		Name       string `json:"name"`
+		Ciphertext string `json:"ciphertext"`
+	}
+	if err := g.do(ctx, "encrypt", body, &resp); err != nil {
+		return nil, "", fmt.Errorf("gcp kms encrypt: %w", err)
+	}
+	if resp.Ciphertext == "" {
+		return nil, "", errors.New("gcp kms encrypt: empty ciphertext in response")
+	}
+	// The contract is a key VERSION name: without one the
+	// row could never be tied to the version that must not
+	// be destroyed while it exists, so refuse rather than
+	// record the bare key as if it were a version.
+	if !strings.HasPrefix(resp.Name, g.cfg.KeyName+gcpVersionSegment) {
+		return nil, "", fmt.Errorf("gcp kms encrypt: response did not name a key version (CryptoKeyVersion) of %s (got %q)", g.cfg.KeyName, resp.Name)
+	}
+	// We store the base64 ciphertext string verbatim;
+	// Unwrap just passes it back to Cloud KMS as the
+	// decrypt-request payload. No re-encoding round-trip
+	// in the hot path.
+	return []byte(resp.Ciphertext), GCPKEKPrefix + resp.Name, nil
+}
+
+// Unwrap reverses Wrap. The kek_id must start with the
+// gcp:-prefix; otherwise the row was wrapped by a
+// different backend (Vault, InProc, …) and we refuse
+// rather than spending a Cloud KMS call on a guaranteed
+// mismatch.
+func (g *GCPKMS) Unwrap(ctx context.Context, wrappedDEK []byte, kekID string) ([]byte, error) {
+	if !strings.HasPrefix(kekID, GCPKEKPrefix) {
+		return nil, fmt.Errorf("GCPKMS: refusing to unwrap row whose kek_id=%q (no %q prefix)", kekID, GCPKEKPrefix)
+	}
+	body := map[string]string{
+		"ciphertext": string(wrappedDEK),
+	}
+	var resp struct {
+		Plaintext string `json:"plaintext"`
+	}
+	if err := g.do(ctx, "decrypt", body, &resp); err != nil {
+		return nil, fmt.Errorf("gcp kms decrypt: %w", err)
+	}
+	dek, err := base64.StdEncoding.DecodeString(resp.Plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("gcp kms decrypt: base64: %w", err)
+	}
+	if len(dek) == 0 {
+		return nil, errors.New("gcp kms decrypt: empty plaintext in response")
+	}
+	return dek, nil
+}
+
+// gcpTokenCacheTTL bounds how long a token read from TokenFile is reused before
+// re-reading — short enough to pick up a sidecar refresh promptly, long enough
+// to avoid a file read on every Cloud KMS call.
+const gcpTokenCacheTTL = 30 * time.Second
+
+// token returns the current bearer token. With TokenFile set it re-reads the
+// file (cached for gcpTokenCacheTTL) so a refresh sidecar's rotations are
+// honored without a daemon restart; otherwise it returns the static Token.
+// On a transient read error it serves the last-good token rather than failing.
+func (g *GCPKMS) token() (string, error) {
+	if g.cfg.TokenFile == "" {
+		return g.cfg.Token, nil
+	}
+	g.tokMu.Lock()
+	defer g.tokMu.Unlock()
+	if g.cachedTok != "" && time.Since(g.cachedAt) < gcpTokenCacheTTL {
+		return g.cachedTok, nil
+	}
+	// readBearerLikeFile enforces 0600-ish perms + trims + rejects empty —
+	// the same defense-in-depth the Vault/AWS token-file paths use.
+	tok, err := readBearerLikeFile(g.cfg.TokenFile)
+	if err != nil {
+		if g.cachedTok != "" {
+			return g.cachedTok, nil // serve last-good through a transient read error
+		}
+		return "", err
+	}
+	g.cachedTok = tok
+	g.cachedAt = time.Now()
+	return tok, nil
+}
+
+// do POSTs to the encrypt/decrypt endpoint and decodes
+// the JSON response. Centralized so error mapping and
+// future telemetry sit in one place.
+//
+// op is "encrypt" or "decrypt"; we suffix it onto the
+// CryptoKey resource path with Cloud KMS's `:verb` style.
+func (g *GCPKMS) do(ctx context.Context, op string, body, out any) error {
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1/%s:%s", g.cfg.Endpoint, g.cfg.KeyName, op)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	tok, err := g.token()
+	if err != nil {
+		return fmt.Errorf("gcp kms token: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		// GCP returns {"error":{"code":N,"message":"..."}}
+		// on failure.
+		var errResp struct {
+			Error struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+				Status  string `json:"status"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(respBody, &errResp)
+		if errResp.Error.Message != "" {
+			return fmt.Errorf("status %d: %s", resp.StatusCode, errResp.Error.Message)
+		}
+		return fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+	}
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+	return nil
+}
