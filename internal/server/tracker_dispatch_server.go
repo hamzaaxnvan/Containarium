@@ -81,3 +81,336 @@ func (s *ContainerServer) DispatchTrackerIssues(ctx context.Context, req *pb.Dis
 	// the run timeout after this tick — resolves it again through the
 	// secrets store, so a rotated or short-lived credential is never
 	// reused stale (#2269).
+	d := &tracker.Dispatcher{
+		Store:            s.trackerStore,
+		Provider:         provider,
+		Conn:             conn,
+		Credentials:      s.secretsStore,
+		CredentialSecret: record.CredentialSecret,
+		Runs:             s.trackerRunStarter,
+		Clock:            tracker.SystemClock,
+		// The run's workspace is the connection's own repository, built
+		// from the connection record like SubmitTrackerChange's push
+		// target — never from the issue or the box (#2023).
+		RepoURL: remoteURLFor(record.Provider, record.BaseURL, record.Project),
+		Policy:  &policy,
+		// The sweep (#2026): this daemon's view of its live dispatched
+		// runs, and the success metrics.
+		Observer: trackerDispatchObserverFromGlobal(),
+		// The caller's per-tick budget (#2270); 0 is unlimited.
+		MaxStarts: req.MaxStarts,
+	}
+	if leases, ok := s.trackerRunStarter.(tracker.RunLeases); ok {
+		d.Leases = leases
+	}
+	res, err := d.Tick(ctx, req.Username, req.Connection)
+	if err != nil {
+		return nil, mapTrackerDispatchError(err)
+	}
+
+	out := &pb.DispatchTrackerIssuesResponse{
+		SkippedNeedsApproval: res.SkippedNeedsApproval,
+		SkippedActive:        res.SkippedActive,
+		SkippedUnrouted:      res.SkippedUnrouted,
+		SkippedOverDepth:     res.SkippedOverDepth,
+		LeftUndispatched:     res.LeftUndispatched,
+	}
+	for i := range res.Started {
+		out.Started = append(out.Started, toProtoTrackerDispatch(&res.Started[i]))
+	}
+	for i := range res.Failed {
+		out.Failed = append(out.Failed, toProtoTrackerDispatch(&res.Failed[i]))
+	}
+	for i := range res.TimedOut {
+		out.TimedOut = append(out.TimedOut, toProtoTrackerDispatch(&res.TimedOut[i]))
+	}
+	log.Printf("[tracker] dispatch %s/%s: started=%d failed=%d timed_out=%d skipped(approval=%d active=%d unrouted=%d over_depth=%d) left_undispatched=%d",
+		req.Username, req.Connection, len(res.Started), len(res.Failed), len(res.TimedOut),
+		res.SkippedNeedsApproval, res.SkippedActive, res.SkippedUnrouted, res.SkippedOverDepth, res.LeftUndispatched)
+	return out, nil
+}
+
+// ListTrackerDispatches returns a connection's dispatch rows, newest
+// first.
+func (s *ContainerServer) ListTrackerDispatches(ctx context.Context, req *pb.ListTrackerDispatchesRequest) (*pb.ListTrackerDispatchesResponse, error) {
+	if err := s.requireTrackerRouteAccess(ctx, req.Username, req.Connection); err != nil {
+		return nil, err
+	}
+	rows, err := s.trackerStore.ListDispatches(ctx, req.Username, req.Connection, req.State)
+	if err != nil {
+		return nil, mapTrackerDispatchError(err)
+	}
+	out := make([]*pb.TrackerDispatch, 0, len(rows))
+	for i := range rows {
+		out = append(out, toProtoTrackerDispatch(&rows[i]))
+	}
+	// #2062: show the fan-out slots each run still holds, so a run whose
+	// fan-out looks exhausted shows why.
+	reservations, err := s.trackerStore.ListLineageReservations(ctx, req.Username, req.Connection)
+	if err != nil {
+		return nil, mapTrackerDispatchError(err)
+	}
+	attachLineageReservations(out, reservations)
+	return &pb.ListTrackerDispatchesResponse{Dispatches: out}, nil
+}
+
+// attachLineageReservations sets each row's lineage_reservations and
+// oldest_lineage_reservation_at from its run's reservations. A
+// reservation whose run has no row in the listing is not shown.
+func attachLineageReservations(rows []*pb.TrackerDispatch, reservations []tracker.LineageReservation) {
+	type held struct {
+		count  int32
+		oldest time.Time
+	}
+	byRun := map[string]*held{}
+	for _, r := range reservations {
+		h, ok := byRun[r.CreatedByRun]
+		if !ok {
+			h = &held{oldest: r.CreatedAt}
+			byRun[r.CreatedByRun] = h
+		}
+		h.count++
+		if r.CreatedAt.Before(h.oldest) {
+			h.oldest = r.CreatedAt
+		}
+	}
+	for _, d := range rows {
+		if h, ok := byRun[d.GetRunId()]; ok && d.GetRunId() != "" {
+			d.LineageReservations = h.count
+			d.OldestLineageReservationAt = timestamppb.New(h.oldest)
+		}
+	}
+}
+
+func mapTrackerDispatchError(err error) error {
+	if errors.Is(err, tracker.ErrNotFound) {
+		return status.Error(codes.NotFound, "tracker connection not found")
+	}
+	if _, ok := status.FromError(err); ok && status.Code(err) != codes.Unknown {
+		return err
+	}
+	return status.Errorf(codes.Internal, "%v", err)
+}
+
+func toProtoTrackerDispatch(d *tracker.Dispatch) *pb.TrackerDispatch {
+	if d == nil {
+		return nil
+	}
+	out := &pb.TrackerDispatch{
+		Id:            d.ID,
+		Username:      d.Username,
+		Connection:    d.Connection,
+		IssueNumber:   d.IssueNumber,
+		Scope:         d.Scope,
+		SkillId:       d.SkillID,
+		RunId:         d.RunID,
+		Depth:         d.Depth,
+		State:         d.State,
+		FailureReason: d.FailureReason,
+		Failure:       d.Failure,
+		ChangeUrl:     d.ChangeURL,
+		ChangeNumber:  d.ChangeNumber,
+	}
+	if !d.CreatedAt.IsZero() {
+		out.CreatedAt = timestamppb.New(d.CreatedAt)
+	}
+	if !d.StartedAt.IsZero() {
+		out.StartedAt = timestamppb.New(d.StartedAt)
+	}
+	if !d.EndedAt.IsZero() {
+		out.EndedAt = timestamppb.New(d.EndedAt)
+	}
+	return out
+}
+
+// trackerRunStarter is the production tracker.RunStarter: it starts a
+// dispatched run through beginSkillRun — the same scope check, run id,
+// tracker_connection validation, provisioning, run-JWT mint (bound to
+// the connection via the tracker_conn claim) and run registration as
+// RunAgentSkill. Provisioning is synchronous, so a start failure comes
+// back in the same tick and fails the dispatch row there. The in-box
+// agent then runs in the background and its lease is ended when it
+// returns.
+type trackerRunStarter struct {
+	agents *AgentSkillServer
+}
+
+var _ tracker.RunStarter = trackerRunStarter{}
+
+// NewTrackerRunStarter returns the production RunStarter over agents.
+func NewTrackerRunStarter(agents *AgentSkillServer) tracker.RunStarter {
+	return trackerRunStarter{agents: agents}
+}
+
+// dispatchRunRequest maps a dispatch onto the RunAgentSkill request.
+// input_json is exactly the dispatcher's TrackerDispatchInput. The git
+// source is the connection's repository (#2023) so the run can submit a
+// doc change; no credential is ever passed — the fetch is anonymous, and
+// the push happens daemon-side in SubmitTrackerChange.
+func dispatchRunRequest(req tracker.StartRunRequest) *pb.RunAgentSkillRequest {
+	return &pb.RunAgentSkillRequest{
+		SkillId:           req.SkillID,
+		RunId:             req.RunID,
+		InputJson:         req.InputJSON,
+		TrackerConnection: req.Connection,
+		GitSource:         req.RepoURL,
+	}
+}
+
+// requireDispatchCaller checks that the authenticated subject IS the
+// tenant being dispatched for. The run JWT and the tracker_connection
+// check are both keyed off the caller's tenant; a mismatch would
+// validate (and bind) a same-named connection in the wrong tenant.
+// Checked by the RPC before any write and again by the starter, so the
+// starter is safe on its own too.
+func requireDispatchCaller(ctx context.Context, username string) error {
+	caller, _, ok := auth.SubjectFromGRPCContext(ctx)
+	if !ok || caller == "" {
+		return status.Error(codes.Unauthenticated, "no authenticated subject")
+	}
+	if caller != username {
+		return status.Errorf(codes.PermissionDenied,
+			"dispatch for tenant %q must be run with that tenant's own token (caller is %q)", username, caller)
+	}
+	return nil
+}
+
+func (r trackerRunStarter) StartRun(ctx context.Context, req tracker.StartRunRequest) error {
+	if err := requireDispatchCaller(ctx, req.Username); err != nil {
+		return err
+	}
+	// Held from before provisioning (#2026): the sweep must not take a
+	// run that is still provisioning for a lost one. A start that fails —
+	// or panics — lets go of it again.
+	r.agents.dispatched.track(req.RunID)
+	launched := false
+	defer func() {
+		if !launched {
+			r.agents.dispatched.untrack(req.RunID)
+		}
+	}()
+	// Best-effort workspace: an anonymous fetch of a private repository
+	// fails, and that run must still read the issue and comment.
+	run, err := r.agents.beginSkillRunWith(ctx, dispatchRunRequest(req), provisionOptions{gitSourceBestEffort: true})
+	if err != nil {
+		return err
+	}
+	agent := func(containerName, seedDir string) (string, error) {
+		return r.agents.runInBoxAgentResult(containerName, seedDir, run.runID, run.skillID, run.engineRes, run.model)
+	}
+	if !r.agents.launchDispatchedRun(ctx, run, req.Lifecycle, agent) {
+		return tracker.ErrDispatchEnded
+	}
+	launched = true
+	return nil
+}
+
+// launchDispatchedRun reports the run's start to the dispatch row
+// (QUEUED -> RUNNING, agent:running) and only then launches the in-box
+// agent in the background, so the RUNNING projection can never land
+// after the terminal one. lc is nil for a run with no dispatch row.
+//
+// If the row already went terminal while the run was provisioning (the
+// sweep timed it out, and the issue already says agent:failed), the
+// start report says so and the run is aborted here: its lease is ended
+// at once — JWTs revoked, seed wiped, run unregistered — its agent is
+// never launched, it stops being live, and false is returned (#2026).
+// Letting it go on would leave a run acting with live credentials on an
+// issue that says it is over.
+func (s *AgentSkillServer) launchDispatchedRun(ctx context.Context, run *startedSkillRun, lc tracker.RunLifecycle, agent func(containerName, seedDir string) (string, error)) bool {
+	// Held (and its lease known to the sweep) before the goroutine
+	// exists; finishDispatchedRun lets go of it.
+	h := s.dispatched.track(run.runID)
+	h.setLease(run.lease)
+	if lc != nil && !lc.RunStarted(ctx) {
+		// Once: the sweep may have ended it already, if it saw the lease.
+		s.endDispatchedLease(context.WithoutCancel(ctx), h, dispatchEndedBeforeLaunchReason)
+		s.dispatched.untrack(run.runID)
+		return false
+	}
+	go s.finishDispatchedRun(ctx, run, agent, lc)
+	return true
+}
+
+// finishDispatchedRun is the background half of a dispatched run: run
+// the in-box agent, end the lease (revoke the run's JWTs, wipe the
+// seed, unregister), then report the outcome to the dispatch row — the
+// completion hook (#2023). It is the counterpart of RunAgentSkill's
+// `defer endRunLease`, kept out of the RPC because the run outlives the
+// tick that started it — so it detaches from the tick's cancellation
+// while keeping its auth values, exactly as endRunLease does. The lease
+// ends BEFORE the row is marked done, so nothing the run holds can
+// still write once the issue says agent:done. agent is a seam for
+// tests, which cannot drive a real box; production passes
+// runInBoxAgentResult. An agent error or an empty artifact is a failed
+// run.
+//
+// It runs in a bare goroutine, so a panic in it would skip the lease end
+// (the run's JWTs stay valid, the run stays registered), never report
+// the end, and terminate the daemon (#2050). The lease end and the end
+// report therefore run in defers that recover, in the normal order, and
+// a run that panicked or was ended by runtime.Goexit is reported failed.
+func (s *AgentSkillServer) finishDispatchedRun(ctx context.Context, run *startedSkillRun, agent func(containerName, seedDir string) (string, error), lc tracker.RunLifecycle) {
+	bg := context.WithoutCancel(ctx)
+	h := s.dispatched.track(run.runID)
+	h.setLease(run.lease)
+	// Deferred before everything else so it runs LAST — after the end
+	// report, and also after a panic or runtime.Goexit anywhere below —
+	// so the run is live to the sweep (#2026) exactly until its end has
+	// been reported, and never leaks.
+	defer s.dispatched.untrack(run.runID)
+	// Not completing is the default: only a normal return from the agent
+	// overwrites it. A runtime.Goexit is not a panic (recover returns
+	// nil), so without this default it would be reported as success.
+	err := errDispatchedRunDidNotComplete
+	leaseEnded := false
+	// Deferred first so it runs last, after the lease end, and still runs
+	// when a Goexit inside the lease end unwinds the goroutine.
+	defer func() {
+		if lc == nil {
+			return
+		}
+		defer func() { logDispatchedRunPanic(run.runID, "completion report", recover()) }()
+		if !leaseEnded {
+			// Its credentials may still be live: never report it done.
+			err = errDispatchedRunDidNotComplete
+		}
+		lc.RunEnded(bg, tracker.RunOutcome{Err: err})
+	}()
+	defer func() {
+		if logDispatchedRunPanic(run.runID, "in-box agent", recover()) {
+			err = errDispatchedRunDidNotComplete
+		}
+		defer func() { logDispatchedRunPanic(run.runID, "lease end", recover()) }()
+		// Once: a timeout sweep may already have ended it (#2026).
+		s.endDispatchedLease(bg, h, runExitReason)
+		leaseEnded = true
+	}()
+	artifact, aerr := agent(run.containerName, run.lease.SeedDir)
+	if aerr == nil && strings.TrimSpace(artifact) == "" {
+		// The runtime's exit was clean, so nothing else says why this is a
+		// failure (#2513): name the contract the run broke and where the
+		// evidence is, in the log and in the dispatch row's reason.
+		aerr = errors.New("the agent ended without a final message (no artifact); the skill contract requires one final JSON object — see the run journal for the tool calls it made")
+		log.Printf("[agent-skill] run %s: ended with no artifact (exit clean, empty final message)", run.runID)
+	}
+	err = aerr
+}
+
+// errDispatchedRunDidNotComplete is the outcome of a dispatched run whose
+// background half did not complete (a panic or runtime.Goexit in the
+// agent or the lease end). Generic on purpose: a panic value may carry
+// anything the run held, so it is neither logged nor stored.
+var errDispatchedRunDidNotComplete = errors.New("the dispatched run did not complete")
+
+// logDispatchedRunPanic takes what a deferred function's recover()
+// returned and, for a panic in a dispatched run's background half, logs
+// the run id, the step and the stack — never the panic value. It reports
+// whether there was a panic.
+func logDispatchedRunPanic(runID, step string, recovered any) bool {
+	if recovered == nil {
+		return false
+	}
+	log.Printf("[agent-skill] run %s: %s panicked (value withheld); recovered\n%s", runID, step, debug.Stack())
+	return true
+}
