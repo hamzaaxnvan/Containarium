@@ -247,3 +247,86 @@ func (r *restActuation) GetSSHTrustBundle(ctx context.Context, req *cloudv1.GetS
 		path += "?known_version=" + url.QueryEscape(kv)
 	}
 	var resp cloudv1.GetSSHTrustBundleResponse
+	if err := r.get(ctx, path, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// post sends one protojson request to the control plane and decodes the
+// protojson response. The host bearer (when set) rides the
+// `Grpc-Metadata-Host-Bearer` header → `host-bearer` gRPC metadata at the gateway.
+func (r *restActuation) post(ctx context.Context, path string, in, out proto.Message) error {
+	body, err := protojson.Marshal(in)
+	if err != nil {
+		return fmt.Errorf("cloud-rest: marshal %s: %w", path, err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.base+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("cloud-rest: build %s: %w", path, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	return r.do(httpReq, path, out)
+}
+
+// get sends a bearer-authenticated GET and decodes the protojson response.
+// Shares response handling with post via do.
+func (r *restActuation) get(ctx context.Context, path string, out proto.Message) error {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, r.base+path, nil)
+	if err != nil {
+		return fmt.Errorf("cloud-rest: build %s: %w", path, err)
+	}
+	return r.do(httpReq, path, out)
+}
+
+// do attaches the host-bearer header, sends httpReq, and decodes the
+// protojson response into out. Shared tail of post and get.
+func (r *restActuation) do(httpReq *http.Request, path string, out proto.Message) error {
+	if r.bearer != "" {
+		httpReq.Header.Set("Grpc-Metadata-Host-Bearer", r.bearer)
+	}
+	r.recycleIfPending()
+	hc, release := r.acquire()
+	defer release()
+	resp, err := hc.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("cloud-rest: %s %s: %w", httpReq.Method, path, err)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	_ = resp.Body.Close()
+	// A recycle is only flagged here; the next request closes the idle
+	// connections, once the stream just finished has been released.
+	r.noteResponse(resp.StatusCode)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("cloud-rest: %s %s: %d %s", httpReq.Method, path, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	if len(raw) == 0 {
+		return nil
+	}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("cloud-rest: decode %s %s: %w", httpReq.Method, path, err)
+	}
+	return nil
+}
+
+// enrollREST redeems a join token over REST (POST /v1/actuation/enroll). The
+// join token self-authenticates in the body, so no host bearer is sent. See
+// Enroll's doc comment for why the returned bearer is rebuilt rather than the
+// raw joinToken being reused verbatim.
+func enrollREST(ctx context.Context, controlPlane, joinToken string, opts EnrollOptions) (hostID, bearerToken string, err error) {
+	r := newRESTActuation(controlPlane, "")
+	// Throwaway client: do not leave its connection pooled after enroll.
+	defer r.hc.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	var resp cloudv1.EnrollHostResponse
+	if err := r.post(ctx, "/v1/actuation/enroll", &cloudv1.EnrollHostRequest{
+		JoinToken:    joinToken,
+		DriverToken:  opts.DriverToken,
+		OssBackendId: opts.OSSBackendID,
+		AdoptForeign: opts.AdoptForeign,
+	}, &resp); err != nil {
+		return "", "", fmt.Errorf("cloud: enroll (REST): %w", err)
+	}
+	return resp.GetHostId(), rebuildBearer(resp.GetHostId(), joinToken), nil
+}
