@@ -72,3 +72,114 @@ func runEgressViaClient(cmd *cobra.Command, args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 1. Local SOCKS5 (egresses via this machine).
+	socksAddr, err := egressproxy.ServeSOCKS5(ctx, fmt.Sprintf("127.0.0.1:%d", evcSocksPort), cmd.Printf)
+	if err != nil {
+		return err
+	}
+	_, socksPort := hostport.Split(socksAddr, 0)
+	cmd.Printf("local SOCKS5 on %s (egresses via this machine)\n", socksAddr)
+
+	// 2. ssh -R 127.0.0.1:0:127.0.0.1:<socksPort> — dynamic host port; parse the
+	//    one ssh allocates so there's no collision on the box's host.
+	sshArgs := []string{
+		"-N",
+		"-R", fmt.Sprintf("127.0.0.1:0:127.0.0.1:%d", socksPort),
+		"-o", "IdentitiesOnly=yes",
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "ServerAliveInterval=15",
+	}
+	if evcIdentity != "" {
+		sshArgs = append(sshArgs, "-i", evcIdentity)
+	}
+	sshArgs = append(sshArgs, evcSSHFlags...)
+	sshArgs = append(sshArgs, evcSSH)
+
+	// #nosec G204 -- args are operator-provided flags for their own ssh session
+	ssh := exec.CommandContext(ctx, "ssh", sshArgs...)
+	stderr, err := ssh.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := ssh.Start(); err != nil {
+		return fmt.Errorf("start ssh: %w", err)
+	}
+	defer func() { _ = ssh.Process.Kill() }()
+
+	hostPort, err := readAllocatedPort(stderr, 20*time.Second)
+	if err != nil {
+		return fmt.Errorf("ssh reverse-forward did not come up: %w", err)
+	}
+	cmd.Printf("ssh -R exposed your SOCKS on the box's host loopback :%d\n", hostPort)
+
+	// 3. Ask the control plane (or daemon) to bridge the host-loopback listener
+	//    into the box. --http targets the cloud REST surface (a ctnr_ token);
+	//    otherwise gRPC straight to a daemon (direct / BYOC).
+	ctrl, err := newEgressControlClient()
+	if err != nil {
+		return fmt.Errorf("connect to control plane: %w", err)
+	}
+	defer func() { _ = ctrl.Close() }()
+
+	inBox, err := ctrl.StartEgressProxy(box, int32(hostPort), 0) // #nosec G115 -- port is 1..65535
+	if err != nil {
+		return err
+	}
+	defer func() { _ = ctrl.StopEgressProxy(box) }()
+
+	cmd.Printf("\n✅ egress wired. Inside the box, point apps at:\n    socks5://%s\n    (Chrome: --proxy-server=socks5://%s)\n\nCtrl-C to tear down.\n", inBox, inBox)
+
+	<-ctx.Done()
+	cmd.Printf("\ntearing down egress for %s...\n", box)
+	return nil
+}
+
+// egressControlClient is the control surface egress-via-client needs. Both
+// *client.GRPCClient and *client.HTTPClient satisfy it.
+type egressControlClient interface {
+	StartEgressProxy(containerName string, upstreamPort, proxyPort int32) (string, error)
+	StopEgressProxy(containerName string) error
+	Close() error
+}
+
+// newEgressControlClient picks the transport: --http targets the cloud REST
+// surface (a ctnr_ token via --token / $CONTAINARIUM_TOKEN, the cloud case);
+// otherwise gRPC straight to a daemon (direct / BYOC).
+func newEgressControlClient() (egressControlClient, error) {
+	if evcServer == "" {
+		return nil, fmt.Errorf("--server is required")
+	}
+	if httpMode {
+		return client.NewHTTPClient(evcServer, authToken)
+	}
+	return client.NewGRPCClient(evcServer, certsDir, insecure)
+}
+
+// readAllocatedPort scans ssh stderr for the dynamically-allocated reverse
+// forward port, giving up after timeout.
+func readAllocatedPort(r interface{ Read([]byte) (int, error) }, timeout time.Duration) (int, error) {
+	type res struct {
+		port int
+		err  error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			if m := allocatedPortRE.FindStringSubmatch(sc.Text()); m != nil {
+				p, _ := strconv.Atoi(m[1])
+				ch <- res{port: p}
+				return
+			}
+		}
+		ch <- res{err: fmt.Errorf("ssh exited before allocating a port (check --ssh / -i)")}
+	}()
+	select {
+	case r := <-ch:
+		return r.port, r.err
+	case <-time.After(timeout):
+		return 0, fmt.Errorf("timed out waiting for ssh to allocate the reverse-forward port")
+	}
+}
