@@ -255,3 +255,261 @@ func recoverNetwork(config *RecoveryConfig) error {
 	createCmd := exec.Command("incus", "network", "create", config.NetworkName,
 		fmt.Sprintf("ipv4.address=%s", config.NetworkCIDR),
 		"ipv4.nat=true",
+		"ipv6.address=none",
+	)
+	output, err := createCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to create network: %w\nOutput: %s", err, string(output))
+	}
+
+	fmt.Printf("  ✓ Network %s created with CIDR %s\n", config.NetworkName, config.NetworkCIDR)
+	return nil
+}
+
+func recoverStorage(config *RecoveryConfig) error {
+	fmt.Printf("Step 2: Recovering storage pool %s...\n", config.StoragePoolName)
+
+	// Check if storage pool already exists
+	checkCmd := exec.Command("incus", "storage", "show", config.StoragePoolName)
+	if err := checkCmd.Run(); err == nil {
+		fmt.Printf("  Storage pool %s already exists, skipping\n", config.StoragePoolName)
+		return nil
+	}
+
+	if recoverDryRun {
+		fmt.Printf("  [DRY RUN] Would recover storage pool %s from %s\n", config.StoragePoolName, config.ZFSSource)
+		return nil
+	}
+
+	// Run incus admin recover interactively
+	fmt.Println("  Running incus admin recover...")
+	fmt.Println("  (This may take a moment)")
+
+	// Create the input for incus admin recover
+	input := fmt.Sprintf("yes\n%s\n%s\n%s\n\nno\nyes\nyes\n",
+		config.StoragePoolName,
+		config.StorageDriver,
+		config.ZFSSource,
+	)
+
+	recoverCmd := exec.Command("incus", "admin", "recover")
+	recoverCmd.Stdin = strings.NewReader(input)
+	output, err := recoverCmd.CombinedOutput()
+	if err != nil {
+		// Check if error is because containers were recovered successfully
+		if strings.Contains(string(output), "Starting recovery") {
+			fmt.Printf("  ✓ Storage pool and containers recovered\n")
+			return nil
+		}
+		return fmt.Errorf("failed to recover storage: %w\nOutput: %s", err, string(output))
+	}
+
+	fmt.Printf("  ✓ Storage pool %s recovered from %s\n", config.StoragePoolName, config.ZFSSource)
+	return nil
+}
+
+func recoverDefaultProfile(config *RecoveryConfig) error {
+	fmt.Println("Step 3: Configuring default profile...")
+
+	// Check if eth0 device already exists in default profile
+	showCmd := exec.Command("incus", "profile", "show", "default")
+	output, err := showCmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to show default profile: %w", err)
+	}
+
+	if strings.Contains(string(output), "eth0:") {
+		fmt.Println("  Default profile already has eth0 device, skipping")
+		return nil
+	}
+
+	if recoverDryRun {
+		fmt.Printf("  [DRY RUN] Would add eth0 device to default profile (network: %s)\n", config.NetworkName)
+		return nil
+	}
+
+	// Add eth0 device to default profile
+	addCmd := exec.Command("incus", "profile", "device", "add", "default", "eth0", "nic",
+		fmt.Sprintf("network=%s", config.NetworkName),
+		"name=eth0",
+	)
+	output, err = addCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to add eth0 to default profile: %w\nOutput: %s", err, string(output))
+	}
+
+	fmt.Printf("  ✓ Added eth0 device to default profile (network: %s)\n", config.NetworkName)
+	return nil
+}
+
+func startAllContainers() error {
+	fmt.Println("Step 4: Starting all containers...")
+
+	if recoverDryRun {
+		fmt.Println("  [DRY RUN] Would start all containers")
+		return nil
+	}
+
+	// Start all containers
+	startCmd := exec.Command("incus", "start", "--all")
+	output, err := startCmd.CombinedOutput()
+	if err != nil {
+		// Some containers might fail to start, continue anyway
+		fmt.Printf("  Warning: Some containers may have failed to start: %s\n", string(output))
+	}
+
+	// Wait for containers to get IPs
+	fmt.Println("  Waiting for containers to start and get IPs...")
+	time.Sleep(5 * time.Second)
+
+	// List containers to show status
+	listCmd := exec.Command("incus", "list", "--format", "compact")
+	output, _ = listCmd.Output()
+	fmt.Println()
+	fmt.Println(string(output))
+
+	fmt.Println("  ✓ Containers started")
+	return nil
+}
+
+func syncSSHAccounts() error {
+	fmt.Println("Step 5: Syncing SSH accounts...")
+
+	if recoverDryRun {
+		fmt.Println("  [DRY RUN] Would sync SSH accounts from containers")
+		return nil
+	}
+
+	// Use the container manager to sync accounts
+	mgr, err := container.New()
+	if err != nil {
+		return fmt.Errorf("failed to connect to Incus: %w", err)
+	}
+
+	containers, err := mgr.List()
+	if err != nil {
+		return fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	var restored, skipped, failed int
+
+	for _, c := range containers {
+		username := strings.TrimSuffix(c.Name, "-container")
+		if username == c.Name {
+			skipped++
+			continue
+		}
+
+		// Check if account already exists
+		if container.UserExists(username) {
+			if verbose {
+				fmt.Printf("  Account %s already exists, skipping\n", username)
+			}
+			skipped++
+			continue
+		}
+
+		// Extract EVERY authorized key, not just the first — this is the same
+		// recovery scenario as sync-accounts, and restoring one key out of
+		// several silently revokes the rest (#1477).
+		sshKeys, err := mgr.ExtractSSHKeys(c.Name, username, false)
+		if err != nil || len(sshKeys) == 0 {
+			failed++
+			continue
+		}
+
+		// Seed the account, then authorize the remaining keys.
+		if err := container.CreateJumpServerAccount(username, sshKeys[0], false); err != nil {
+			failed++
+			continue
+		}
+		installed := 1
+		for _, k := range sshKeys[1:] {
+			if err := container.AddAuthorizedKey(username, k); err != nil {
+				fmt.Printf("  ! %s: could not authorize an additional key: %v\n", username, err)
+				continue
+			}
+			installed++
+		}
+
+		fmt.Printf("  ✓ Restored account: %s (%d key(s))\n", username, installed)
+		restored++
+	}
+
+	fmt.Printf("  Owner accounts: %d restored, %d skipped, %d failed\n", restored, skipped, failed)
+
+	// Also sync collaborator accounts from PostgreSQL
+	fmt.Println("  Syncing collaborator accounts...")
+	collabStore, err := collaborator.NewStore(context.Background(), getPostgresConnString())
+	if err != nil {
+		fmt.Printf("  Warning: Could not connect to collaborator database: %v\n", err)
+	} else {
+		defer collabStore.Close()
+		collaboratorMgr := container.NewCollaboratorManager(mgr, collabStore)
+		cr, cs, cf := collaboratorMgr.SyncCollaboratorAccounts(verbose, false)
+		fmt.Printf("  Collaborator accounts: %d restored, %d skipped, %d failed\n", cr, cs, cf)
+	}
+
+	return nil
+}
+
+// SaveRecoveryConfig saves the current recovery configuration to a file
+// This should be called during daemon startup to persist config for recovery
+func SaveRecoveryConfig(config *RecoveryConfig, path string) error {
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}
+
+// GenerateRecoveryConfig creates a recovery config from current system state
+func GenerateRecoveryConfig() (*RecoveryConfig, error) {
+	config := &RecoveryConfig{
+		NetworkName:     "incusbr0",
+		StoragePoolName: "default",
+		StorageDriver:   "zfs",
+	}
+
+	// Try to get network CIDR
+	cmd := exec.Command("incus", "network", "get", "incusbr0", "ipv4.address")
+	output, err := cmd.Output()
+	if err == nil {
+		config.NetworkCIDR = strings.TrimSpace(string(output))
+	}
+
+	// Try to get ZFS source
+	cmd = exec.Command("incus", "storage", "get", "default", "source")
+	output, err = cmd.Output()
+	if err == nil {
+		config.ZFSSource = strings.TrimSpace(string(output))
+	}
+
+	return config, nil
+}
+
+// PromptRecoveryConfig interactively prompts for recovery configuration
+func PromptRecoveryConfig() (*RecoveryConfig, error) {
+	config := &RecoveryConfig{
+		NetworkName:     "incusbr0",
+		StoragePoolName: "default",
+		StorageDriver:   "zfs",
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Print("Network CIDR (e.g., 10.0.3.1/24): ")
+	cidr, _ := reader.ReadString('\n')
+	config.NetworkCIDR = strings.TrimSpace(cidr)
+
+	fmt.Print("ZFS source dataset (e.g., incus-pool/containers): ")
+	source, _ := reader.ReadString('\n')
+	config.ZFSSource = strings.TrimSpace(source)
+
+	return config, nil
+}

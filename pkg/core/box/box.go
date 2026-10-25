@@ -152,3 +152,157 @@ type BoxEndpoint struct {
 	DirectIP string
 	// AccessType distinguishes SSH from RDP (Windows VMs).
 	AccessType pb.AccessType
+}
+
+// BoxStatus is the runtime-neutral view of a box, returned by Create / Get /
+// List. It carries the box concepts the daemon reasons about (lifecycle,
+// addressing, resources, and the metadata that LXC stores in
+// user.containarium.* config keys and K8s would store in pod annotations).
+// The backend is responsible for translating its substrate's native form into
+// this shape — the server depends on BoxStatus, not on any incus type.
+type BoxStatus struct {
+	NetworkTenant       string
+	NetworkTenantSource pb.NetworkTenantSource
+	Ref                 BoxRef
+	State               pb.ContainerState
+	IPAddress           string
+	Resources           ResourceLimits
+	Labels              map[string]string
+	GPU                 string   // first GPU device, for display/back-compat
+	GPUs                []string // all attached GPU devices
+	BackendID           string   // which backend/peer the box runs on
+	CreatedAt           time.Time
+	// Isolation is how the box is actually isolated, read back from the
+	// backend (LXC: the Incus instance type). UNSPECIFIED when unknown.
+	Isolation pb.IsolationType
+	// IsCore marks an infrastructure box (the platform's own core services)
+	// rather than a user/tenant box. The server's user-facing guards (TTL,
+	// delete-policy, monitoring, auto-sleep are "for user containers only")
+	// key off this. On LXC it's derived from the incus core-role label.
+	IsCore bool
+
+	// Lifecycle metadata (LXC: user.containarium.* config keys).
+	MonitoringEnabled         bool
+	AutoSleepEnabled          bool
+	IdleThresholdMinutes      int32
+	TTLExpiresAt              time.Time
+	StoppedAt                 time.Time
+	DeleteAfterStoppedSeconds int64
+	DeletePolicy              string // "protected" or "" (unprotected)
+	ToolAccess                string // "none", "build_tools", "full_sudo", or "" (none recorded)
+
+	// Stack is the software stack the box was created with. LXC only
+	// (user.containarium.stack); empty on K8s, which does not persist it, and
+	// on LXC boxes created before the key existed.
+	Stack string
+
+	// PodmanEnabled is whether the box was created with podman support. LXC
+	// reads user.containarium.podman_enabled back; boxes created before that
+	// key existed report true (the value status always returned). The K8s
+	// backend has no podman toggle and reports true.
+	PodmanEnabled bool
+
+	// Image is a human-readable label for the image the box was launched
+	// from (LXC: Incus's image.description / volatile.base_image config
+	// keys). Empty when the backend has no such data.
+	Image string
+}
+
+// BoxMetrics is the runtime-neutral form of a box's runtime metrics.
+type BoxMetrics struct {
+	CPUUsageSeconds  int64
+	MemoryUsageBytes int64
+	MemoryLimitBytes int64
+	DiskUsageBytes   int64
+	NetworkRxBytes   int64
+	NetworkTxBytes   int64
+	ProcessCount     int32
+
+	// CFS bandwidth-throttling counters, cumulative like CPUUsageSeconds.
+	// They distinguish a throttled box from an idle one (#1573); all zero
+	// means "no signal available", not "never throttled". Populated by the
+	// LXC backend only — K8s exposes no equivalent read today.
+	CPUNrPeriods     int64
+	CPUNrThrottled   int64
+	CPUThrottledUsec int64
+}
+
+// BoxBackend is the runtime-neutral seam. LXC/incus and Kubernetes both
+// implement it. It is coarse-grained on purpose — no Exec/WriteFile/config-key
+// leakage. ctx is threaded for the K8s client; the LXC implementation ignores
+// it (its incus client predates ctx plumbing).
+type BoxBackend interface {
+	// Kind reports which substrate this backend manages.
+	Kind() BackendKind
+
+	// Create makes a box matching spec exist and returns its status.
+	// Idempotent on re-create.
+	Create(ctx context.Context, spec BoxSpec) (*BoxStatus, error)
+	// Start starts a stopped box.
+	Start(ctx context.Context, ref BoxRef) error
+	// Stop stops a running box; force skips graceful shutdown.
+	Stop(ctx context.Context, ref BoxRef, force bool) error
+	// Delete removes a box; force stops it first if running.
+	Delete(ctx context.Context, ref BoxRef, force bool) error
+
+	// Get returns the current status of a box, or (nil, nil) if it does not
+	// exist.
+	Get(ctx context.Context, ref BoxRef) (*BoxStatus, error)
+	// List returns the status of every box this backend manages.
+	List(ctx context.Context) ([]BoxStatus, error)
+
+	// Resolve reports how an agent reaches the box over SSH. This is the
+	// method that makes the K8s value real (gateway host + routing user); on
+	// LXC it reports the direct IP, with the gateway host stamped above the
+	// seam.
+	Resolve(ctx context.Context, ref BoxRef) (*BoxEndpoint, error)
+
+	// SetAuthorizedKeys sets the box's authorized SSH keys to exactly the
+	// given set. Lives below the seam because the mechanism differs per
+	// runtime: LXC writes the box's authorized_keys; K8s reconciles the
+	// per-tenant Secret + PiperUpstream.
+	SetAuthorizedKeys(ctx context.Context, ref BoxRef, keys []string) error
+
+	// Resize updates the box's resource limits; empty fields are left
+	// unchanged.
+	Resize(ctx context.Context, ref BoxRef, r ResourceLimits) error
+
+	// SetMeta replaces the box's runtime-neutral metadata.
+	SetMeta(ctx context.Context, ref BoxRef, meta map[string]string) error
+	// GetMeta reads the box's runtime-neutral metadata.
+	GetMeta(ctx context.Context, ref BoxRef) (map[string]string, error)
+}
+
+// ExecCapable is an optional capability for in-box exec and file seeding.
+// LXC implements it (incus exec / file push). The K8s agent-box is pinned by
+// ForceCommand, so a K8s backend may NOT implement it — provisioning is
+// image-baked. Discover support with a type assertion.
+type ExecCapable interface {
+	Exec(ctx context.Context, ref BoxRef, cmd []string) (stdout, stderr string, err error)
+	WriteFile(ctx context.Context, ref BoxRef, path string, content []byte, mode string) error
+}
+
+// MetricsCapable is an optional capability for per-box runtime metrics.
+type MetricsCapable interface {
+	Metrics(ctx context.Context, ref BoxRef) (*BoxMetrics, error)
+}
+
+// GPUCapable is an optional capability for resolving a user-supplied GPU
+// identifier to a stable device ID. LXC implements it; K8s GPU support is
+// deferred.
+type GPUCapable interface {
+	ResolveGPU(ctx context.Context, input string) (deviceID string, err error)
+}
+
+// TTLCapable is an optional capability: backends that can persist a box's
+// absolute auto-delete time natively in their substrate implement it. The K8s
+// backend maps it onto the agent-sandbox Sandbox's spec.shutdownTime (with
+// shutdownPolicy Retain — the controller stops the pod at the deadline even
+// if the daemon is down; the daemon's sweeper then completes the delete
+// through the full DeleteContainer cascade). LXC persists TTL via Incus
+// config keys on the server side instead and does not implement this.
+//
+// expiresAt nil clears the TTL (the box persists indefinitely).
+type TTLCapable interface {
+	SetTTL(ctx context.Context, ref BoxRef, expiresAt *time.Time) error
+}
