@@ -158,3 +158,164 @@ func (s *Session) callTool(ctx context.Context, name string, args map[string]any
 		return text, err
 	}
 
+	fresh, dialErr := s.dial(ctx)
+	if dialErr != nil {
+		return "", fmt.Errorf("%v (reconnect also failed: %w)", err, dialErr)
+	}
+	s.mu.Lock()
+	_ = s.mcp.Close()
+	s.mcp = fresh
+	s.mu.Unlock()
+
+	return doCallTool(ctx, fresh, name, args)
+}
+
+func doCallTool(ctx context.Context, c mcpConn, name string, args map[string]any) (string, error) {
+	res, err := c.CallTool(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: name, Arguments: args}})
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	for _, content := range res.Content {
+		if tc, ok := content.(mcp.TextContent); ok {
+			sb.WriteString(tc.Text)
+		}
+	}
+	text := sb.String()
+	if res.IsError {
+		return "", fmt.Errorf("%s", strings.TrimSpace(text))
+	}
+	return text, nil
+}
+
+// parseKV splits agent-box's plain-text "key: value\n" tool-result
+// convention into a map. When marker is non-empty and present in body
+// (tail_log's "--- content ---\n" separator), only the text before it is
+// parsed as key:value pairs; everything after is returned separately as
+// raw content, since it is arbitrary file bytes, not more header lines.
+func parseKV(body, marker string) (kv map[string]string, rest string) {
+	head := body
+	if marker != "" {
+		if idx := strings.Index(body, marker); idx >= 0 {
+			head = body[:idx]
+			rest = body[idx+len(marker):]
+		}
+	}
+	kv = make(map[string]string)
+	for _, line := range strings.Split(head, "\n") {
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, ": ")
+		if !ok {
+			continue
+		}
+		kv[k] = v
+	}
+	return kv, rest
+}
+
+// ProcessStartResult is process_start's response, typed (per CLAUDE.md)
+// from agent-box's plain-text body.
+type ProcessStartResult struct {
+	Name, Command, LogPath string
+	PID                    int
+	StartedAt              time.Time
+}
+
+// ProcessStart spawns command on the box. captureMode is "combined" or
+// "framed" ("" defaults to "combined", matching process_start's own
+// default) — see internal/agentbox's CaptureMode for what each means.
+func (s *Session) ProcessStart(ctx context.Context, name, command, cwd, captureMode string) (*ProcessStartResult, error) {
+	args := map[string]any{"command": command}
+	if name != "" {
+		args["name"] = name
+	}
+	if cwd != "" {
+		args["cwd"] = cwd
+	}
+	if captureMode != "" {
+		args["capture_mode"] = captureMode
+	}
+	text, err := s.callTool(ctx, "process_start", args, true)
+	if err != nil {
+		return nil, fmt.Errorf("process_start: %w", err)
+	}
+	kv, _ := parseKV(text, "")
+	pid, _ := strconv.Atoi(kv["pid"])
+	startedAt, _ := time.Parse(time.RFC3339, kv["started_at"])
+	return &ProcessStartResult{
+		Name: kv["name"], Command: kv["command"], LogPath: kv["log_path"],
+		PID: pid, StartedAt: startedAt,
+	}, nil
+}
+
+// ShellExec runs command on the box via agent-box's shell_exec tool and
+// returns its raw text result (agent-box's own key:value-plus-stdout framing,
+// unparsed — callers that need a single value, like HomeDir, parse it
+// themselves). Exported for #2193's session-id discovery, which backgrounds
+// a poll loop on the box; any other caller needing one-off box-side command
+// execution over this session belongs here too, rather than growing its own
+// shell_exec callTool wrapper.
+func (s *Session) ShellExec(ctx context.Context, command string) (string, error) {
+	text, err := s.callTool(ctx, "shell_exec", map[string]any{"command": command}, true)
+	if err != nil {
+		return "", fmt.Errorf("shell_exec: %w", err)
+	}
+	return text, nil
+}
+
+// Read implements LogReader by calling tail_log. followSeconds bounds how
+// long the SERVER blocks polling for new content before returning — most
+// of StreamOutput's "streaming" feel comes from this blocking, not from
+// polling frequency on the client side.
+func (s *Session) Read(ctx context.Context, path string, startOffset int64, follow time.Duration) ([]byte, int64, bool, error) {
+	args := map[string]any{
+		"path":           path,
+		"start_offset":   float64(startOffset),
+		"follow_seconds": follow.Seconds(),
+	}
+	text, err := s.callTool(ctx, "tail_log", args, true)
+	if err != nil {
+		return nil, startOffset, false, fmt.Errorf("tail_log: %w", err)
+	}
+	kv, content := parseKV(text, tailLogContentMarker)
+	end, _ := strconv.ParseInt(kv["end_offset"], 10, 64)
+	truncated := kv["truncated"] == "true"
+	return []byte(content), end, truncated, nil
+}
+
+// ProcessKillResult is process_kill's response, typed from agent-box's
+// plain-text body.
+type ProcessKillResult struct {
+	Name, Signal, LogPath string
+	PID                   int
+	Exited                bool
+}
+
+// ProcessKill stops name on the box.
+func (s *Session) ProcessKill(ctx context.Context, name string, force bool) (*ProcessKillResult, error) {
+	text, err := s.callTool(ctx, "process_kill", map[string]any{"name": name, "force": force}, true)
+	if err != nil {
+		return nil, fmt.Errorf("process_kill: %w", err)
+	}
+	kv, _ := parseKV(text, "")
+	pid, _ := strconv.Atoi(kv["pid"])
+	return &ProcessKillResult{
+		Name: kv["name"], Signal: kv["signal"], LogPath: kv["log_path"],
+		PID: pid, Exited: kv["exited"] == "true",
+	}, nil
+}
+
+// ProcessList returns process_list's raw text body — a multi-process
+// listing agent-box formats for humans, not single-record key:value pairs.
+// Callers that need one run's status (containarium code status) grep this
+// for the run's own block rather than this package re-parsing agent-box's
+// display format into a second, redundant typed shape.
+func (s *Session) ProcessList(ctx context.Context) (string, error) {
+	text, err := s.callTool(ctx, "process_list", nil, true)
+	if err != nil {
+		return "", fmt.Errorf("process_list: %w", err)
+	}
+	return text, nil
+}
