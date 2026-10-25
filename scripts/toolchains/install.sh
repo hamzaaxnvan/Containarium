@@ -17,3 +17,22 @@ destination="$root/releases/$release"
 staged=""
 link="$root/.current.$$"
 cleanup() {
+    if [[ -n "$staged" ]]; then rm -rf -- "$staged"; fi
+    rm -f -- "$link"
+}
+trap cleanup EXIT
+if [[ -e "$destination" ]]; then
+    cmp "$source_dir/manifest.json" "$destination/manifest.json"
+    cmp "$source_dir/checksums.sha256" "$destination/checksums.sha256"
+    (cd "$destination" && sha256sum --quiet -c checksums.sha256)
+else
+    staged=$(mktemp -d "$root/.stage.XXXXXX")
+    cp -a "$source_dir/." "$staged/"
+    chmod -R a+rX,go-w "$staged"
+    if [[ $(id -u) == 0 ]]; then chown -R root:root "$staged"; fi
+    mv -T -- "$staged" "$destination"
+    staged=""
+fi
+ln -s "releases/$release" "$link"
+mv -Tf -- "$link" "$root/current"
+echo "Managed toolchains active: $release ($arch)"
