@@ -56,3 +56,42 @@ func (s *cloudPolicySink) SyncNetworkPolicies(ctx context.Context, policies []*c
 	if store == nil {
 		return nil
 	}
+	desired := make(map[string]bool, len(policies))
+	for _, np := range policies {
+		if np.GetOrgId() == "" {
+			continue
+		}
+		desired[np.GetOrgId()] = true
+		if err := store.Set(ctx, &pb.NetworkPolicy{
+			Tenant:           np.GetOrgId(),
+			AllowIntraTenant: np.GetAllowIntraTenant(),
+			EgressCidrs:      np.GetEgressCidrs(),
+			EgressDomains:    np.GetEgressDomains(),
+			AllowMetadata:    np.GetAllowMetadata(),
+			Mode:             pb.NetworkPolicyMode(int32(np.GetMode())), // same enum values (vendored from one source)
+			EgressMode:       cloudEgressMode(np),
+			// Always the allow-list-only preset (#2994), as the locally
+			// authored default posture uses: the host folds its own bridge
+			// gateway (DNS resolver, model gateway) into the allow-set, so a
+			// narrow cloud-authored list cannot cut a box off from them.
+			EgressPreset: pb.EgressPreset_EGRESS_PRESET_ALLOW_LIST_ONLY,
+			Source:       cloudPolicySource,
+		}); err != nil {
+			return err
+		}
+	}
+
+	// Convergence: drop cloud-authored policies the cloud no longer sends.
+	existing, err := store.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, p := range existing {
+		if p.GetSource() == cloudPolicySource && !desired[p.GetTenant()] {
+			if err := store.Delete(ctx, p.GetTenant()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

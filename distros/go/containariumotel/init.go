@@ -66,3 +66,71 @@ func doInit(ctx context.Context, opts ...Option) (ShutdownFunc, error) {
 	if options.serviceName != "" && cfg.ServiceName == "" {
 		_ = os.Setenv("OTEL_SERVICE_NAME", options.serviceName)
 		cfg.ServiceName = options.serviceName
+	}
+
+	if cfg.Endpoint == "" && options.endpointURL == "" {
+		log.Printf(
+			"containariumotel: OTEL_EXPORTER_OTLP_ENDPOINT not set " +
+				"(and no WithEndpoint option given); telemetry will be " +
+				"a no-op. Enable monitoring on the LXC with " +
+				"`containarium monitoring enable <username>`.",
+		)
+		return noopShutdown, nil
+	}
+
+	res, err := buildResource(ctx, cfg, options.extraAttrs, version)
+	if err != nil {
+		log.Printf("containariumotel: build resource failed: %v", err)
+		return noopShutdown, fmt.Errorf("%w: %v", ErrInitFailed, err)
+	}
+
+	// OTLP/HTTP exporter — reads endpoint, headers, protocol from env
+	// by default. We only pass an explicit endpoint when the caller
+	// gave one via WithEndpoint (e.g. the daemon's dogfood path needs
+	// a non-default URL path).
+	var expOpts []otlpmetrichttp.Option
+	if options.endpointURL != "" {
+		expOpts = append(expOpts, otlpmetrichttp.WithEndpointURL(options.endpointURL))
+	}
+	exporter, err := otlpmetrichttp.New(ctx, expOpts...)
+	if err != nil {
+		log.Printf("containariumotel: create OTLP exporter failed: %v", err)
+		return noopShutdown, fmt.Errorf("%w: %v", ErrInitFailed, err)
+	}
+
+	reader := sdkmetric.NewPeriodicReader(exporter,
+		sdkmetric.WithInterval(options.metricInterval),
+		sdkmetric.WithTimeout(options.metricTimeout),
+	)
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+		sdkmetric.WithReader(reader),
+	)
+	otel.SetMeterProvider(provider)
+
+	// No-op tracer provider so apps that call otel.Tracer(...) don't
+	// crash — v1 collector is metrics-only (D4). v2 traces pipeline
+	// will replace this with a real provider.
+	otel.SetTracerProvider(noop.NewTracerProvider())
+
+	var shutdownOnce sync.Once
+	shutdown := func(ctx context.Context) error {
+		var err error
+		shutdownOnce.Do(func() {
+			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			err = provider.Shutdown(ctx)
+		})
+		return err
+	}
+	return shutdown, nil
+}
+
+// _resetForTests resets the module-level init state. Tests only —
+// not part of the public API. Lowercase so callers from other
+// packages can't reach it.
+func _resetForTests() {
+	initOnce = sync.Once{}
+	initShutdown = noopShutdown
+	initErr = nil
+}
