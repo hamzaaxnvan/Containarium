@@ -151,3 +151,80 @@ func validateNode(n *pb.TaskNode, skills SkillLookup, crews CrewLookup) error {
 		return fmt.Errorf("%w: node %q input_json is not valid JSON", ErrInvalid, n.GetId())
 	}
 	if r := n.GetResources(); r.GetMinCpuCores() < 0 || r.GetMinMemoryBytes() < 0 {
+		return fmt.Errorf("%w: node %q resource minima must be nonnegative", ErrInvalid, n.GetId())
+	}
+	switch a := n.GetAssignee().(type) {
+	case *pb.TaskNode_SkillId:
+		if a.SkillId == "" {
+			return fmt.Errorf("%w: node %q has an empty skill_id", ErrInvalid, n.GetId())
+		}
+		if _, err := skills.Get(a.SkillId); err != nil {
+			return fmt.Errorf("%w: node %q: skill %q not found", ErrUnknownAssignee, n.GetId(), a.SkillId)
+		}
+	case *pb.TaskNode_CrewId:
+		if a.CrewId == "" {
+			return fmt.Errorf("%w: node %q has an empty crew_id", ErrInvalid, n.GetId())
+		}
+		if _, err := crews.Get(a.CrewId); err != nil {
+			return fmt.Errorf("%w: node %q: crew %q not found", ErrUnknownAssignee, n.GetId(), a.CrewId)
+		}
+	default:
+		return fmt.Errorf("%w: node %q needs a crew_id or a skill_id", ErrInvalid, n.GetId())
+	}
+	return nil
+}
+
+// topoOrder runs Kahn's algorithm, computing each node's depth (1 + the
+// deepest node it waits for) on the way. Nodes left unvisited sit on, or
+// downstream of, a cycle.
+func topoOrder(nodes []*pb.TaskNode, deps, dependents [][]int) ([]string, int, error) {
+	pending := make([]int, len(nodes))
+	var ready []int
+	for i := range nodes {
+		pending[i] = len(deps[i])
+		if pending[i] == 0 {
+			ready = append(ready, i)
+		}
+	}
+	byID := func(s []int) {
+		sort.Slice(s, func(a, b int) bool { return nodes[s[a]].GetId() < nodes[s[b]].GetId() })
+	}
+	byID(ready)
+
+	level := make([]int, len(nodes))
+	order := make([]string, 0, len(nodes))
+	depth := 0
+	for len(ready) > 0 {
+		i := ready[0]
+		ready = ready[1:]
+		level[i]++ // its own node on top of the deepest dependency
+		if level[i] > depth {
+			depth = level[i]
+		}
+		order = append(order, nodes[i].GetId())
+		var next []int
+		for _, j := range dependents[i] {
+			if level[i] > level[j] {
+				level[j] = level[i]
+			}
+			pending[j]--
+			if pending[j] == 0 {
+				next = append(next, j)
+			}
+		}
+		ready = append(ready, next...)
+		byID(ready)
+	}
+
+	if len(order) < len(nodes) {
+		var stuck []string
+		for i := range nodes {
+			if pending[i] > 0 {
+				stuck = append(stuck, nodes[i].GetId())
+			}
+		}
+		sort.Strings(stuck)
+		return nil, 0, fmt.Errorf("%w: involving %s", ErrCycle, strings.Join(stuck, ", "))
+	}
+	return order, depth, nil
+}

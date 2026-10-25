@@ -79,3 +79,126 @@ func (piEngine) InstallScript(o InstallOptions) string {
 	if version == "" {
 		version = PiVersion
 	}
+	return `set -e
+# pi requires Node >= ` + PiNodeMinVersion + ` (its own engines.node). Check it here so a
+# box without it says so, instead of failing inside npm's EBADENGINE output.
+if ! command -v node >/dev/null 2>&1; then
+  echo "pi needs Node >= ` + PiNodeMinVersion + ` on the box and none is installed." >&2
+  echo "Install Node on the box (docs/integrations/pi.md step 2), then re-run this command." >&2
+  exit 5
+fi
+if ! node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&(b>19||(b===19&&c>=0)))?0:1)'; then
+  echo "pi needs Node >= ` + PiNodeMinVersion + `; this box has $(node --version). Upgrade Node on the box, then re-run." >&2
+  exit 5
+fi
+mkdir -p "$HOME/.local"
+npm config set prefix "$HOME/.local" >/dev/null
+npm install -g --ignore-scripts --no-fund --no-audit ` + shellQuoteSingle(PiPackage+"@"+version) + `
+# umask before the write, not chmod after: a chmod leaves a window in which the
+# file exists world-readable, and on a box the user shares with an agent that
+# window is not theoretical (same argument as boxbootstrap's apply.sh).
+umask 077
+mkdir -p ` + piAgentDir + `
+printf '%s' ` + shellQuoteSingle(o.ModelsJSON) + ` > ` + piModelsPath + `
+chmod 600 ` + piModelsPath + `
+echo "pi installed at ` + piBin + ` (` + version + `), provider config at ` + piModelsPath + `"`
+}
+
+// VerifyScript proves the box can actually reach a model, which is the whole
+// point of verifying at install time: the alternative is the user discovering a
+// misconfiguration at their first real prompt.
+//
+// The prompt is the AC's: `pi -p "print the current working directory" --mode
+// json`. It runs on whatever credential the box now has — for a gateway
+// credential, a deliberately short-lived token the caller wrote to
+// GatewayEnvPath just before this.
+//
+// As on the Claude path, the credential is reported by NAME only. Nothing here
+// expands the token.
+func (e piEngine) VerifyScript() string {
+	script := `set -e
+` + piBin + ` --version
+echo "credential sources present:"
+found=0`
+	if e.opts.Credential != nil && e.opts.Credential.Kind() == KindGateway {
+		script += `
+if [ -f "` + piGatewayEnvPath + `" ]; then
+  echo "  - ` + GatewayTokenEnvVar + ` in ` + piGatewayEnvPath + ` (containarium model gateway)"
+  found=1
+fi`
+	} else {
+		script += `
+if [ -f /run/containarium/secrets.env ]; then
+  echo "  - /run/containarium/secrets.env (tenant secrets, compose delivery)"
+  found=1
+fi
+if [ -d /run/secrets ]; then
+  echo "  - /run/secrets/<NAME> (tenant secrets, file delivery)"
+  found=1
+fi
+if [ -f "` + piAgentDir + `/auth.json" ]; then
+  echo "  - ` + piAgentDir + `/auth.json (signed in with pi's own /login)"
+  found=1
+fi`
+	}
+	script += `
+if [ "$found" = 0 ]; then
+  echo "  (none yet)"
+fi
+` + e.runPrefix() + piBin + ` -p 'print the current working directory' --mode json`
+	return script
+}
+
+// piCredentialStatusScript probes for a pi credential by NAME only (#2272),
+// the same posture as claudeCredentialStatusScript: pi's own sign-in
+// (`/login`) writes auth.json, which is this engine's "interactive"; a
+// tenant-secret or compose-delivered key visible to the box's shell is
+// "api-key" (containarium's own secrets delivery, not pi's own flow — the
+// closest equivalent on this engine to a user-placed key); anything else is
+// "none".
+const piCredentialStatusScript = `if [ -f "` + piAgentDir + `/auth.json" ]; then
+  echo interactive
+  exit 0
+fi
+if [ -f /run/containarium/secrets.env ] || [ -d /run/secrets ]; then
+  echo api-key
+  exit 0
+fi
+echo none`
+
+// RunCommand renders the command process_start spawns.
+//
+// pi takes the prompt as a POSITIONAL argument after -p/--print (pi's own
+// docs/cli.md: `pi --print "Summarize this repository"`), so the prompt is
+// single-quoted exactly as on the Claude path. --mode json is what makes pi emit
+// JSONL events on stdout, which is what --output-format-stream-json means for
+// this engine; -c resumes the most recent session for the run's working
+// directory.
+func (e piEngine) RunCommand(prompt string, streamJSON, continueSession bool, sessionID string) string {
+	cmd := e.runPrefix() + "~/.local/bin/pi -p " + shellQuoteSingle(prompt)
+	if streamJSON {
+		cmd += " --mode json"
+	}
+	switch {
+	case sessionID != "":
+		// pi's own --session resumes a SPECIFIC session id (docs/cli.md),
+		// which is a better fit than `-c`'s "most recent" semantics and
+		// takes priority over continueSession (#2193; callers must not set
+		// both).
+		cmd += " --session " + shellQuoteSingle(sessionID)
+	case continueSession:
+		cmd += " -c"
+	}
+	if m := strings.TrimSpace(e.opts.Model); m != "" {
+		cmd += " --model " + shellQuoteSingle(m)
+	}
+	return cmd
+}
+
+// runPrefix is the env-loading prefix for this box's credential source.
+func (e piEngine) runPrefix() string {
+	if e.opts.Credential != nil && e.opts.Credential.Kind() == KindGateway {
+		return sourceEnvPrefix(`"` + piGatewayEnvPath + `"`)
+	}
+	return sourceEnvPrefix("/run/containarium/secrets.env")
+}
