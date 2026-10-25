@@ -412,3 +412,142 @@ func RegisterSentinelSSHUpstreamServiceHandler(ctx context.Context, mux *runtime
 func RegisterSentinelSSHUpstreamServiceHandlerClient(ctx context.Context, mux *runtime.ServeMux, client SentinelSSHUpstreamServiceClient) error {
 	mux.Handle(http.MethodPost, pattern_SentinelSSHUpstreamService_OpenSSHUpstreamConnection_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.SentinelSSHUpstreamService/OpenSSHUpstreamConnection", runtime.WithHTTPPathPattern("/containarium.v1.SentinelSSHUpstreamService/OpenSSHUpstreamConnection"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_SentinelSSHUpstreamService_OpenSSHUpstreamConnection_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_SentinelSSHUpstreamService_OpenSSHUpstreamConnection_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_SentinelSSHUpstreamService_BeginSSHUpstreamRoute_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.SentinelSSHUpstreamService/BeginSSHUpstreamRoute", runtime.WithHTTPPathPattern("/containarium.v1.SentinelSSHUpstreamService/BeginSSHUpstreamRoute"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_SentinelSSHUpstreamService_BeginSSHUpstreamRoute_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_SentinelSSHUpstreamService_BeginSSHUpstreamRoute_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_SentinelSSHUpstreamService_AcquireSSHUpstream_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.SentinelSSHUpstreamService/AcquireSSHUpstream", runtime.WithHTTPPathPattern("/containarium.v1.SentinelSSHUpstreamService/AcquireSSHUpstream"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_SentinelSSHUpstreamService_AcquireSSHUpstream_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_SentinelSSHUpstreamService_AcquireSSHUpstream_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_SentinelSSHUpstreamService_CompleteSSHUpstream_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.SentinelSSHUpstreamService/CompleteSSHUpstream", runtime.WithHTTPPathPattern("/containarium.v1.SentinelSSHUpstreamService/CompleteSSHUpstream"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_SentinelSSHUpstreamService_CompleteSSHUpstream_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_SentinelSSHUpstreamService_CompleteSSHUpstream_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_SentinelSSHUpstreamService_ConsumeSSHUpstreamFailure_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.SentinelSSHUpstreamService/ConsumeSSHUpstreamFailure", runtime.WithHTTPPathPattern("/containarium.v1.SentinelSSHUpstreamService/ConsumeSSHUpstreamFailure"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_SentinelSSHUpstreamService_ConsumeSSHUpstreamFailure_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_SentinelSSHUpstreamService_ConsumeSSHUpstreamFailure_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_SentinelSSHUpstreamService_RegisterSSHAnonymousRoute_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.SentinelSSHUpstreamService/RegisterSSHAnonymousRoute", runtime.WithHTTPPathPattern("/containarium.v1.SentinelSSHUpstreamService/RegisterSSHAnonymousRoute"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_SentinelSSHUpstreamService_RegisterSSHAnonymousRoute_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_SentinelSSHUpstreamService_RegisterSSHAnonymousRoute_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	mux.Handle(http.MethodPost, pattern_SentinelSSHUpstreamService_HintSSHUpstreamRecovery_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/containarium.v1.SentinelSSHUpstreamService/HintSSHUpstreamRecovery", runtime.WithHTTPPathPattern("/containarium.v1.SentinelSSHUpstreamService/HintSSHUpstreamRecovery"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_SentinelSSHUpstreamService_HintSSHUpstreamRecovery_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_SentinelSSHUpstreamService_HintSSHUpstreamRecovery_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
+	return nil
+}
+
+var (
+	pattern_SentinelSSHUpstreamService_OpenSSHUpstreamConnection_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"containarium.v1.SentinelSSHUpstreamService", "OpenSSHUpstreamConnection"}, ""))
+	pattern_SentinelSSHUpstreamService_BeginSSHUpstreamRoute_0     = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"containarium.v1.SentinelSSHUpstreamService", "BeginSSHUpstreamRoute"}, ""))
+	pattern_SentinelSSHUpstreamService_AcquireSSHUpstream_0        = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"containarium.v1.SentinelSSHUpstreamService", "AcquireSSHUpstream"}, ""))
+	pattern_SentinelSSHUpstreamService_CompleteSSHUpstream_0       = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"containarium.v1.SentinelSSHUpstreamService", "CompleteSSHUpstream"}, ""))
+	pattern_SentinelSSHUpstreamService_ConsumeSSHUpstreamFailure_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"containarium.v1.SentinelSSHUpstreamService", "ConsumeSSHUpstreamFailure"}, ""))
+	pattern_SentinelSSHUpstreamService_RegisterSSHAnonymousRoute_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"containarium.v1.SentinelSSHUpstreamService", "RegisterSSHAnonymousRoute"}, ""))
+	pattern_SentinelSSHUpstreamService_HintSSHUpstreamRecovery_0   = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"containarium.v1.SentinelSSHUpstreamService", "HintSSHUpstreamRecovery"}, ""))
+)
+
+var (
+	forward_SentinelSSHUpstreamService_OpenSSHUpstreamConnection_0 = runtime.ForwardResponseMessage
+	forward_SentinelSSHUpstreamService_BeginSSHUpstreamRoute_0     = runtime.ForwardResponseMessage
+	forward_SentinelSSHUpstreamService_AcquireSSHUpstream_0        = runtime.ForwardResponseMessage
+	forward_SentinelSSHUpstreamService_CompleteSSHUpstream_0       = runtime.ForwardResponseMessage
+	forward_SentinelSSHUpstreamService_ConsumeSSHUpstreamFailure_0 = runtime.ForwardResponseMessage
+	forward_SentinelSSHUpstreamService_RegisterSSHAnonymousRoute_0 = runtime.ForwardResponseMessage
+	forward_SentinelSSHUpstreamService_HintSSHUpstreamRecovery_0   = runtime.ForwardResponseMessage
+)
