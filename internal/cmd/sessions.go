@@ -33,3 +33,38 @@ Examples:
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		user := strings.TrimSpace(sessionsTerminateUser)
+		if user == "" {
+			return fmt.Errorf("--user is required")
+		}
+		c, err := newSessionsClient()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = c.Close() }()
+		resp, err := c.TerminateUserSessions(user)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "✓ terminated sessions for %s: %d account(s) with live processes ended across %d box(es)\n",
+			user, resp.GetTerminatedSessions(), resp.GetBoxesTouched())
+		return err
+	},
+}
+
+func init() {
+	rootCmd.AddCommand(sessionsCmd)
+	sessionsCmd.AddCommand(sessionsTerminateCmd)
+	sessionsTerminateCmd.Flags().StringVar(&sessionsTerminateUser, "user", "", "User whose sessions to end (required)")
+}
+
+// newSessionsClient dials the daemon over the transport the global flags
+// selected. A variable so tests can substitute a fake.
+var newSessionsClient = func() (client.SessionsAPI, error) {
+	if serverAddr == "" {
+		return nil, fmt.Errorf("--server is required for sessions terminate (the daemon owns the sessions)")
+	}
+	if httpMode {
+		return client.NewHTTPClient(serverAddr, authToken)
+	}
+	return client.NewGRPCClient(serverAddr, certsDir, insecure)
+}
