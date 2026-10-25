@@ -59,3 +59,34 @@ func printBackupList(out io.Writer, records []*pb.BackupRecord) error {
 	for _, r := range records {
 		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			r.Id, r.Username, r.Database, r.CreatedAt, humanBytes(r.SizeBytes),
+			destLabel(r.Destination), encryptedLabel(r), verifiedLabel(r.LastVerification), r.Location)
+	}
+	return w.Flush()
+}
+
+// encryptedLabel renders whether the stored bytes are ciphertext (#3169).
+// Plaintext is upper-case for the same reason "never" is spelled out under
+// VERIFIED: it is the state an operator most needs to notice.
+func encryptedLabel(r *pb.BackupRecord) string {
+	if r.Encrypted {
+		return "yes"
+	}
+	return "NO"
+}
+
+// verifiedLabel renders last-verified state for the list view. An
+// unverified backup says so plainly rather than showing a blank cell —
+// "never" is the state an operator most needs to notice.
+func verifiedLabel(v *pb.BackupVerification) string {
+	if v == nil {
+		return "never"
+	}
+	switch v.Result {
+	case pb.VerificationResult_VERIFICATION_RESULT_PASSED:
+		return "pass " + v.VerifiedAt
+	case pb.VerificationResult_VERIFICATION_RESULT_FAILED:
+		return "FAIL " + v.VerifiedAt
+	default:
+		return "unknown"
+	}
+}
