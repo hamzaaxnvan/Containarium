@@ -24,3 +24,82 @@ run "custom_policy" {
   command = plan
   variables {
     ssh_ban_max_failures     = 240
+    ssh_ban_duration_seconds = 45
+    ssh_ban_ignore_cidrs     = ["192.0.2.4/32", "2001:db8::/48"]
+  }
+  assert {
+    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : strcontains(unit, "--max-failures 240") && strcontains(unit, "--ban-duration 45s") && strcontains(unit, "--ignore-ip 192.0.2.4/32") && strcontains(unit, "--ignore-ip 2001:db8::/48")])
+    error_message = "Both listeners must receive exactly the configured policy and exemptions."
+  }
+}
+
+# The text after the last ssh-ban-plugin mention is that plugin's own flags
+# (it is the final plugin in each chain).
+run "audit_records_off_by_default" {
+  command = plan
+  assert {
+    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : !strcontains(element(split("ssh-ban-plugin", unit), length(split("ssh-ban-plugin", unit)) - 1), "--records-file")])
+    error_message = "Without ssh_ban_audit_records the ban plugin must not be given --records-file (an older binary rejects the flag)."
+  }
+}
+
+run "audit_records_on" {
+  command = plan
+  variables { ssh_ban_audit_records = true }
+  assert {
+    condition     = alltrue([for unit in [local.sshpiper_service_unit, local.sshpiper_anon_service_unit] : strcontains(element(split("ssh-ban-plugin", unit), length(split("ssh-ban-plugin", unit)) - 1), "--records-file /var/log/containarium/ssh-sessions.jsonl")])
+    error_message = "With ssh_ban_audit_records both listeners' ban plugins must write to the shared session records file."
+  }
+}
+
+run "invalid_threshold" {
+  command = plan
+  variables { ssh_ban_max_failures = 0 }
+  expect_failures = [var.ssh_ban_max_failures]
+}
+run "fractional_duration" {
+  command = plan
+  variables { ssh_ban_duration_seconds = 0.5 }
+  expect_failures = [var.ssh_ban_duration_seconds]
+}
+run "invalid_prefix" {
+  command = plan
+  variables { ssh_ban_ignore_cidrs = ["192.0.2.4/32 --control-socket=/tmp/evil"] }
+  expect_failures = [var.ssh_ban_ignore_cidrs]
+}
+
+run "ssh_authz_login_grace" {
+  command = plan
+  assert {
+    condition     = strcontains(local.sshpiper_service_unit, "--login-grace-time 90s \\\n  /usr/local/bin/containarium sentinel ssh-authz-plugin")
+    error_message = "sshpiperd's login grace must outlast the 60s device-approval cap (#2526)."
+  }
+}
+
+run "ssh_authz_audit_only_by_default" {
+  command = plan
+  assert {
+    condition     = strcontains(local.sshpiper_service_unit, "ssh-authz-plugin") && !strcontains(local.sshpiper_service_unit, "--ssh-authz-enforce")
+    error_message = "The tenant listener must stay audit-only unless enforcement is requested."
+  }
+}
+
+run "ssh_authz_enforce" {
+  command = plan
+  variables { ssh_authz_enforce = true }
+  assert {
+    condition     = strcontains(local.sshpiper_service_unit, "--ssh-authz-enforce \\\n  --records-file /var/log/containarium/ssh-sessions.jsonl \\\n  -- \\\n  /usr/local/bin/containarium sentinel ssh-session-plugin")
+    error_message = "Enforcement must be passed to ssh-authz-plugin, with its denied-record sink, before the session plugin."
+  }
+  assert {
+    condition     = strcontains(local.sshpiper_service_unit, "ssh-authz-plugin \\\n  --ssh-authz-grace 5m \\\n  --ssh-authz-timeout 3s \\\n  --ssh-authz-enforce")
+    error_message = "Enforcement must follow the audit flags on ssh-authz-plugin."
+  }
+  # --sshpiper-config equals the flag's default. Passing it would only make
+  # the rendered unit fatal on a sentinel binary that predates the flag, and
+  # with Restart=always that takes port 22 down for every tenant.
+  assert {
+    condition     = !strcontains(local.sshpiper_service_unit, "ssh-authz-plugin \\\n  --ssh-authz-grace 5m \\\n  --ssh-authz-timeout 3s \\\n  --sshpiper-config")
+    error_message = "ssh-authz-plugin must not be passed --sshpiper-config; the default is the same path."
+  }
+}

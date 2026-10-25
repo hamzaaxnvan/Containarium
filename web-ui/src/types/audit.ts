@@ -15,3 +15,12 @@ export interface AuditLogsResponse {
   totalCount: number;
 }
 
+export interface AuditLogsParams {
+  username?: string;
+  action?: string;
+  resource_type?: string;
+  from?: string;
+  to?: string;
+  limit?: number;
+  offset?: number;
+}
