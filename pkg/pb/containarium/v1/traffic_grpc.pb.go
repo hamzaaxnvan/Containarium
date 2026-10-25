@@ -114,3 +114,178 @@ func (c *trafficServiceClient) GetTrafficAggregates(ctx context.Context, in *Get
 // TrafficServiceServer is the server API for TrafficService service.
 // All implementations must embed UnimplementedTrafficServiceServer
 // for forward compatibility.
+//
+// TrafficService provides container traffic monitoring capabilities
+type TrafficServiceServer interface {
+	// GetConnections returns active connections for a container
+	GetConnections(context.Context, *GetConnectionsRequest) (*GetConnectionsResponse, error)
+	// GetConnectionSummary returns aggregate connection statistics
+	GetConnectionSummary(context.Context, *GetConnectionSummaryRequest) (*GetConnectionSummaryResponse, error)
+	// SubscribeTraffic opens a streaming connection for real-time traffic events
+	SubscribeTraffic(*SubscribeTrafficRequest, grpc.ServerStreamingServer[TrafficEvent]) error
+	// QueryTrafficHistory queries persisted traffic data
+	QueryTrafficHistory(context.Context, *QueryTrafficHistoryRequest) (*QueryTrafficHistoryResponse, error)
+	// GetTrafficAggregates returns time-series traffic aggregates
+	GetTrafficAggregates(context.Context, *GetTrafficAggregatesRequest) (*GetTrafficAggregatesResponse, error)
+	mustEmbedUnimplementedTrafficServiceServer()
+}
+
+// UnimplementedTrafficServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedTrafficServiceServer struct{}
+
+func (UnimplementedTrafficServiceServer) GetConnections(context.Context, *GetConnectionsRequest) (*GetConnectionsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetConnections not implemented")
+}
+func (UnimplementedTrafficServiceServer) GetConnectionSummary(context.Context, *GetConnectionSummaryRequest) (*GetConnectionSummaryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetConnectionSummary not implemented")
+}
+func (UnimplementedTrafficServiceServer) SubscribeTraffic(*SubscribeTrafficRequest, grpc.ServerStreamingServer[TrafficEvent]) error {
+	return status.Error(codes.Unimplemented, "method SubscribeTraffic not implemented")
+}
+func (UnimplementedTrafficServiceServer) QueryTrafficHistory(context.Context, *QueryTrafficHistoryRequest) (*QueryTrafficHistoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method QueryTrafficHistory not implemented")
+}
+func (UnimplementedTrafficServiceServer) GetTrafficAggregates(context.Context, *GetTrafficAggregatesRequest) (*GetTrafficAggregatesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTrafficAggregates not implemented")
+}
+func (UnimplementedTrafficServiceServer) mustEmbedUnimplementedTrafficServiceServer() {}
+func (UnimplementedTrafficServiceServer) testEmbeddedByValue()                        {}
+
+// UnsafeTrafficServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to TrafficServiceServer will
+// result in compilation errors.
+type UnsafeTrafficServiceServer interface {
+	mustEmbedUnimplementedTrafficServiceServer()
+}
+
+func RegisterTrafficServiceServer(s grpc.ServiceRegistrar, srv TrafficServiceServer) {
+	// If the following call panics, it indicates UnimplementedTrafficServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&TrafficService_ServiceDesc, srv)
+}
+
+func _TrafficService_GetConnections_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetConnectionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TrafficServiceServer).GetConnections(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TrafficService_GetConnections_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TrafficServiceServer).GetConnections(ctx, req.(*GetConnectionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TrafficService_GetConnectionSummary_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetConnectionSummaryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TrafficServiceServer).GetConnectionSummary(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TrafficService_GetConnectionSummary_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TrafficServiceServer).GetConnectionSummary(ctx, req.(*GetConnectionSummaryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TrafficService_SubscribeTraffic_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SubscribeTrafficRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(TrafficServiceServer).SubscribeTraffic(m, &grpc.GenericServerStream[SubscribeTrafficRequest, TrafficEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type TrafficService_SubscribeTrafficServer = grpc.ServerStreamingServer[TrafficEvent]
+
+func _TrafficService_QueryTrafficHistory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(QueryTrafficHistoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TrafficServiceServer).QueryTrafficHistory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TrafficService_QueryTrafficHistory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TrafficServiceServer).QueryTrafficHistory(ctx, req.(*QueryTrafficHistoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TrafficService_GetTrafficAggregates_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTrafficAggregatesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TrafficServiceServer).GetTrafficAggregates(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TrafficService_GetTrafficAggregates_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TrafficServiceServer).GetTrafficAggregates(ctx, req.(*GetTrafficAggregatesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// TrafficService_ServiceDesc is the grpc.ServiceDesc for TrafficService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var TrafficService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.TrafficService",
+	HandlerType: (*TrafficServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetConnections",
+			Handler:    _TrafficService_GetConnections_Handler,
+		},
+		{
+			MethodName: "GetConnectionSummary",
+			Handler:    _TrafficService_GetConnectionSummary_Handler,
+		},
+		{
+			MethodName: "QueryTrafficHistory",
+			Handler:    _TrafficService_QueryTrafficHistory_Handler,
+		},
+		{
+			MethodName: "GetTrafficAggregates",
+			Handler:    _TrafficService_GetTrafficAggregates_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "SubscribeTraffic",
+			Handler:       _TrafficService_SubscribeTraffic_Handler,
+			ServerStreams: true,
+		},
+	},
+	Metadata: "containarium/v1/traffic.proto",
+}
