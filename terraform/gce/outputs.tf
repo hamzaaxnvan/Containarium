@@ -12,3 +12,48 @@ output "jump_server_name" {
   value       = module.containarium.jump_server_name
 }
 
+output "jump_server_zone" {
+  description = "Zone where the jump server is deployed"
+  value       = module.containarium.jump_server_zone
+}
+
+output "ssh_command" {
+  description = "SSH command to connect to the jump server"
+  value       = module.containarium.ssh_command
+}
+
+output "sentinel_enabled" {
+  description = "Whether sentinel HA is enabled"
+  value       = module.containarium.sentinel_enabled
+}
+
+output "sentinel_vm_name" {
+  description = "Name of the sentinel VM instance"
+  value       = module.containarium.sentinel_vm_name
+}
+
+output "spot_vm_internal_ip" {
+  description = "Internal IP of the spot VM (used by sentinel for forwarding)"
+  value       = module.containarium.spot_vm_internal_ip
+}
+
+output "daemon_enabled" {
+  description = "Whether Containarium gRPC daemon is enabled"
+  value       = module.containarium.daemon_enabled
+}
+
+output "daemon_endpoint" {
+  description = "gRPC daemon endpoint (host:port)"
+  value       = module.containarium.daemon_endpoint
+}
+
+# Aliases for E2E testing
+output "instance_name" {
+  description = "Alias for jump_server_name (for E2E tests)"
+  value       = module.containarium.instance_name
+}
+
+output "zone" {
+  description = "Alias for jump_server_zone (for E2E tests)"
+  value       = module.containarium.zone
+}
