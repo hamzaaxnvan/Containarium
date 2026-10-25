@@ -1,0 +1,39 @@
+{
+  "backends": [
+    {
+      "id": "demo-backend-local.us-west1-a.c.example-project.internal",
+      "type": "local",
+      "healthy": true,
+      "version": "0.16.4",
+      "hostname": "demo-backend-local",
+      "uptimeSeconds": "345600",
+      "lastSeenAt": "2026-05-10T19:00:00Z",
+      "os": "Ubuntu 24.04.1 LTS",
+      "containerCount": 16
+    },
+    {
+      "id": "tunnel-gpu-node-a-gpu",
+      "type": "tunnel",
+      "healthy": true,
+      "lastSeenAt": "2026-05-10T18:59:42Z",
+      "hostname": "gpu-node-a",
+      "os": "Ubuntu 24.04.1 LTS",
+      "containerCount": 4,
+      "gpus": [
+        {"vendor": "NVIDIA", "modelName": "GeForce RTX 3090", "vramBytes": "25769803776"}
+      ]
+    },
+    {
+      "id": "tunnel-gpu-node-b-gpu",
+      "type": "tunnel",
+      "healthy": false,
+      "lastSeenAt": "2026-05-10T18:42:00Z",
+      "hostname": "gpu-node-b",
+      "os": "Ubuntu 24.04.1 LTS",
+      "containerCount": 0,
+      "gpus": [
+        {"vendor": "NVIDIA", "modelName": "GeForce RTX 4090", "vramBytes": "25769803776"}
+      ]
+    }
+  ]
+}

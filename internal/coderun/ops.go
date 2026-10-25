@@ -82,3 +82,87 @@ func RunOutcomeLine(listing, name string) (line string, running bool) {
 		trimmed := strings.TrimSpace(l)
 		fields := strings.Fields(trimmed)
 		if len(fields) < 2 || fields[1] != name {
+			continue
+		}
+		return trimmed, strings.Contains(trimmed, ", running)")
+	}
+	return "", false
+}
+
+// LogPathFromListing extracts name's log path from process_list's raw text.
+// The path is the handle every subsequent read uses, so a listing without one
+// is an error rather than an empty string a caller might tail.
+func LogPathFromListing(listing, name string) (string, error) {
+	lines := strings.Split(listing, "\n")
+	for i, l := range lines {
+		fields := strings.Fields(strings.TrimSpace(l))
+		if len(fields) < 2 || fields[1] != name {
+			continue
+		}
+		for _, follow := range lines[i:] {
+			if strings.HasPrefix(strings.TrimSpace(follow), "Log path:") {
+				return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(follow), "Log path:")), nil
+			}
+		}
+		return "", fmt.Errorf("process_list entry for %q has no Log path line", name)
+	}
+	return "", fmt.Errorf("no run named %q in process_list", name)
+}
+
+// ExitCodeFromListing extracts name's recorded exit code from process_list's raw
+// text, for `containarium code status` (#1727).
+//
+// It returns found=false for a run that is still going, and for one whose record
+// carries no exit code at all. Those are different situations but the same
+// answer here: there is no exit code to report. The second case is real and
+// deliberate — agent-box's RunOutcomeUnknown ("PID dead, no recorded exit code",
+// Part A finding A2) exists precisely so a box that died mid-run does not report
+// a fabricated 0. Callers must render a missing code as "unknown", never as
+// success.
+//
+// Parsing agent-box's display format rather than adding a typed RPC matches what
+// RunOutcomeLine and LogPathFromListing already do: on this path the contract
+// between the CLI and agent-box is text.
+func ExitCodeFromListing(listing, name string) (code int, found bool) {
+	lines := strings.Split(listing, "\n")
+	for i, l := range lines {
+		fields := strings.Fields(strings.TrimSpace(l))
+		if len(fields) < 2 || fields[1] != name {
+			continue
+		}
+		// Scan this run's own block only. A blank line closes the block
+		// agent-box emits per run; without that bound, a run with no exit code
+		// would report the NEXT run's.
+		for _, follow := range lines[i+1:] {
+			trimmed := strings.TrimSpace(follow)
+			if trimmed == "" {
+				return 0, false
+			}
+			if strings.HasPrefix(trimmed, "Exit code:") {
+				v := strings.TrimSpace(strings.TrimPrefix(trimmed, "Exit code:"))
+				n, err := strconv.Atoi(v)
+				if err != nil {
+					return 0, false
+				}
+				return n, true
+			}
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// ExitCodeLine renders name's exit-code line the same way for every caller —
+// `code status` (internal/cmd/code_run.go) and its platform-MCP wrapper
+// (internal/mcp/code_tools.go) both print exactly this string under a
+// finished run's header line, so the two surfaces cannot drift (#2011: before
+// this, only the CLI derived one, and by hand).
+//
+// A missing code renders as "unknown", never a fabricated 0 — see
+// ExitCodeFromListing's own doc comment for why that distinction is real.
+func ExitCodeLine(listing, name string) string {
+	if code, ok := ExitCodeFromListing(listing, name); ok {
+		return fmt.Sprintf("exit_code: %d", code)
+	}
+	return "exit_code: unknown (the run ended without recording one — the box may have died mid-run)"
+}
