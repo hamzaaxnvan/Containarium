@@ -26,3 +26,17 @@ func NewDemuxWriter(stdout, stderr io.Writer) *DemuxWriter {
 
 func (w *DemuxWriter) Write(p []byte) (int, error) {
 	frames, err := w.d.Write(p)
+	for _, f := range frames {
+		dst := w.stdout
+		if f.Stream == logframe.Stderr {
+			dst = w.stderr
+		}
+		if _, werr := dst.Write(f.Payload); werr != nil {
+			return 0, werr
+		}
+	}
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}

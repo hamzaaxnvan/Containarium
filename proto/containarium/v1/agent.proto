@@ -639,3 +639,645 @@ service AgentSkillService {
   // RunAgentSkill launches a single skill in a box and runs one task against
   // it. The agent's JWT is minted with exactly the skill's allowed_scopes.
   rpc RunAgentSkill(RunAgentSkillRequest) returns (RunAgentSkillResponse) {
+    option (google.api.http) = {
+      post: "/v1/agent-skills/{skill_id}/run"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Run an agent skill";
+      description: "Provisions the skill's box, mints a scoped token, runs one task, and returns the artifact.";
+      tags: "Agents";
+    };
+  }
+
+  // SendAgentTask delegates a task to a running peer agent over A2A and returns
+  // the peer's artifact. Phase 1 establishes the transport; Phase 2 adds the
+  // allowed_peers / network-policy enforcement around it. (Server impl: #569.)
+  rpc SendAgentTask(SendAgentTaskRequest) returns (SendAgentTaskResponse) {
+    option (google.api.http) = {
+      post: "/v1/agent-skills/{to_peer_id}/call"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Send a task to a peer agent (A2A)";
+      description: "Delegates a task to a running peer agent over the agent-to-agent transport and returns the peer's artifact.";
+      tags: "Agents";
+    };
+  }
+
+  // TailRunLog reads a run's journal by byte offset (#2096): resumable (pass
+  // end_offset back as start_offset) and bounded (max_bytes, follow_seconds).
+  rpc TailRunLog(TailRunLogRequest) returns (TailRunLogResponse) {
+    option (google.api.http) = {
+      get: "/v1/agent-runs/{run_id}/log"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Tail a run's journal";
+      description: "Returns one byte window of a run member's journal plus the offset to resume from. Resumable across dropped connections; follow_seconds waits briefly for new bytes.";
+      tags: "Agents";
+    };
+  }
+
+  // ===========================================================================
+  // Pull-based run queue (prototype). The push path (RunAgentSkill) provisions
+  // a box and execs the run synchronously. The pull path inverts it: a producer
+  // ENQUEUES a task; long-lived worker boxes LEASE tasks (outbound-only, so no
+  // inbound exec is needed — NAT/tunnel-friendly), run them locally, and report
+  // back with COMPLETE. Lease = an SQS-style visibility timeout: a leased task
+  // is invisible to other workers until completed or the lease expires (then it
+  // is redelivered), giving at-most-one active worker per task with crash
+  // recovery. Phase 0 is an in-memory queue; durability is a follow-up.
+  // See the pull-queue section of docs/AGENT-MODEL-GATEWAY-DESIGN.md.
+  // ===========================================================================
+
+  // EnqueueAgentTask places a task on the queue for the given skill and returns
+  // its id. Producer side of the pull model.
+  rpc EnqueueAgentTask(EnqueueAgentTaskRequest) returns (EnqueueAgentTaskResponse) {
+    option (google.api.http) = {
+      post: "/v1/agent-tasks"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Enqueue an agent task (pull queue)";
+      description: "Places a task on the pull queue for a skill; worker boxes lease and run it.";
+      tags: "Agents";
+    };
+  }
+
+  // LeaseAgentTask hands the caller the next visible task (optionally filtered
+  // to one skill), making it invisible for lease_seconds. Returns has_task=false
+  // when the queue is empty. Worker poll side of the pull model.
+  rpc LeaseAgentTask(LeaseAgentTaskRequest) returns (LeaseAgentTaskResponse) {
+    option (google.api.http) = {
+      post: "/v1/agent-tasks/lease"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Lease the next agent task (pull queue)";
+      description: "Worker boxes poll this to lease the next task; the task is hidden from other workers until completed or the lease expires.";
+      tags: "Agents";
+    };
+  }
+
+  // CompleteAgentTask reports a leased task's result (artifact or error) and
+  // removes it from the queue. Rejected (accepted=false) if the lease token is
+  // stale — i.e. the lease already expired and the task was redelivered.
+  rpc CompleteAgentTask(CompleteAgentTaskRequest) returns (CompleteAgentTaskResponse) {
+    option (google.api.http) = {
+      post: "/v1/agent-tasks/{task_id}/complete"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Complete a leased agent task (pull queue)";
+      description: "Worker boxes report a leased task's artifact/error here; a stale lease is rejected.";
+      tags: "Agents";
+    };
+  }
+
+  // StartAgentWorker provisions (or reuses) a skill's box and launches the
+  // in-box runtime in poll mode: a long-lived worker that leases tasks for the
+  // skill, runs them, and reports back — the consumer side of the pull model.
+  // The daemon mints a SEPARATE queue credential (a JWT scoped to agents:run,
+  // distinct from the skill's in-box token) and seeds it so the box can reach
+  // the queue endpoints; the worker resolves the daemon URL from its default
+  // route (the backend host) at launch.
+  rpc StartAgentWorker(StartAgentWorkerRequest) returns (StartAgentWorkerResponse) {
+    option (google.api.http) = {
+      post: "/v1/agent-skills/{skill_id}/worker"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Start a pull-queue worker for a skill";
+      description: "Provisions the skill's box, mints an agents:run queue credential, and launches the in-box runtime in poll mode to lease and run queued tasks.";
+      tags: "Agents";
+    };
+  }
+}
+
+// EnqueueAgentTaskRequest places one task on the pull queue.
+message EnqueueAgentTaskRequest {
+  // Skill this task is for (workers may filter their lease by it).
+  string skill_id = 1;
+  // Task input as JSON (the same shape RunAgentSkill takes as input_json).
+  string input_json = 2;
+}
+
+message EnqueueAgentTaskResponse {
+  // Server-assigned task id, used later to correlate the completion.
+  string task_id = 1;
+}
+
+// LeaseAgentTaskRequest asks for the next runnable task.
+message LeaseAgentTaskRequest {
+  // Stable id of the polling worker (audit/debug; not a security boundary).
+  string worker_id = 1;
+  // Optional: lease only tasks for this skill. Empty = any skill.
+  string skill_id = 2;
+  // How long the lease is held before the task becomes visible again. 0 = a
+  // server default. Keep it longer than the worst-case run time.
+  int32 lease_seconds = 3;
+}
+
+message LeaseAgentTaskResponse {
+  // False when the queue had nothing visible — the worker should back off.
+  bool has_task = 1;
+  string task_id = 2;
+  string skill_id = 3;
+  string input_json = 4;
+  // Opaque token proving this worker holds the current lease; must be presented
+  // to CompleteAgentTask. A new lease (after expiry) mints a new token, so a
+  // slow worker's stale completion is rejected rather than clobbering a retry.
+  string lease_token = 5;
+}
+
+// CompleteAgentTaskRequest reports a leased task's outcome.
+message CompleteAgentTaskRequest {
+  string task_id = 1;
+  string lease_token = 2;
+  // The run artifact as JSON; empty when error is set.
+  string artifact_json = 3;
+  // Non-empty when the run failed; the task is removed (no auto-retry in the
+  // prototype) and the error is recorded.
+  string error = 4;
+}
+
+message CompleteAgentTaskResponse {
+  // False when the lease was stale (expired + redelivered); the worker should
+  // drop its result — another lease owns the task now.
+  bool accepted = 1;
+}
+
+// StartAgentWorkerRequest launches a poll-mode worker for a skill.
+message StartAgentWorkerRequest {
+  // Skill whose box runs as the worker (its persona is the worker's; the
+  // worker leases only this skill's tasks).
+  string skill_id = 1;
+  // Target backend (must be local in the prototype).
+  string backend_id = 2;
+  // Target pool (unsupported in the prototype).
+  string pool = 3;
+  // Optional stable worker id for audit/debug; defaults to the box name.
+  string worker_id = 4;
+}
+
+message StartAgentWorkerResponse {
+  // The worker box.
+  Container container = 1;
+  // The worker id the daemon used.
+  string worker_id = 2;
+  // The run id the worker's credentials are bound to. A worker is long-lived,
+  // so the daemon holds its lease open rather than ending it when this RPC
+  // returns; this id is how an operator finds and revokes those credentials.
+  string run_id = 3;
+}
+
+// =============================================================================
+// Crews — Phase 3. A crew is a collaborating set of skills bound to a task
+// purpose. The crew mechanism lives here; concrete crew definitions ship
+// outside this repo. The daemon rejects a crew whose topology asks for an A2A
+// edge that the members' allowed_peers (and thus Phase 2 network policy) would
+// drop — the topology and the trust fabric stay consistent.
+// =============================================================================
+
+// CrewTopology describes how a crew's skills are wired together.
+enum CrewTopology {
+  CREW_TOPOLOGY_UNSPECIFIED = 0;
+  // Linear pipeline: output of skill[i] feeds skill[i+1].
+  CREW_TOPOLOGY_PIPELINE = 1;
+  // A coordinator skill fans tasks out to worker skills and synthesizes.
+  CREW_TOPOLOGY_ORCHESTRATOR = 2;
+  // Skills coordinate freely over A2A within the allowed_peers graph; the crew
+  // just bounds the set and the trace.
+  CREW_TOPOLOGY_FREEFORM = 3;
+}
+
+// Crew is a collaborating set of skills bound to a task purpose.
+message Crew {
+  // Stable crew identifier (e.g. "research-crew").
+  string id = 1;
+  // Display name.
+  string name = 2;
+  // Short description of the task purpose.
+  string description = 3;
+  // How the skills are wired.
+  CrewTopology topology = 4;
+  // Skill ids that make up this crew (in pipeline order when PIPELINE;
+  // coordinator first when ORCHESTRATOR).
+  repeated string skill_ids = 5;
+  // Role of each member, parallel to skill_ids (#2799): roles[i] is the role
+  // of skill_ids[i]. Empty means the crew declares no roles. When set it has
+  // one entry per member, and RunCrew rejects a crew whose PACK_PRODUCER is
+  // the same skill as its CODER or would run in the same box.
+  repeated CrewRole roles = 6;
+}
+
+// CrewRole is what one crew member does in a run (#2799).
+enum CrewRole {
+  CREW_ROLE_UNSPECIFIED = 0;
+  // Writes the change.
+  CREW_ROLE_CODER = 1;
+  // Runs the repository's test commands against the final files in its own
+  // box and produces the run's Proof Pack. Never the coder.
+  CREW_ROLE_PACK_PRODUCER = 2;
+  // Reviews and finalizes the coder's change.
+  CREW_ROLE_REVIEWER = 3;
+}
+
+// CrewRunState tracks the lifecycle of a single crew execution.
+enum CrewRunState {
+  CREW_RUN_STATE_UNSPECIFIED = 0;
+  CREW_RUN_STATE_PENDING = 1;
+  CREW_RUN_STATE_RUNNING = 2;
+  CREW_RUN_STATE_COMPLETED = 3;
+  CREW_RUN_STATE_FAILED = 4;
+  CREW_RUN_STATE_CANCELLED = 5;
+}
+
+// CrewRun is one execution of a crew. Every A2A hop and MCP call made by any
+// agent in the run is audit-logged under this run's trace_id, so a run is
+// itself an evidence artifact.
+message CrewRun {
+  // The run id: RunCrewRequest.run_id when the caller supplied one (resolved
+  // the same way RunAgentSkillRequest.run_id is — #1899), otherwise a
+  // daemon-generated UUID. Also the id bound into every member box's
+  // credentials (their `run_id` claim) and the one the run's lease audit rows
+  // carry, so RunCrewResponse needs no separate run_id field.
+  string id = 1;
+  string crew_id = 2;
+  // Shared trace id threaded through every agent's audit entries for this run.
+  string trace_id = 3;
+  CrewRunState state = 4;
+  // JSON input handed to the crew's entry skill(s).
+  string input_json = 5;
+  // JSON artifact produced by the crew. Populated when state is COMPLETED.
+  string artifact_json = 6;
+  // Human-readable error when state is FAILED.
+  string error = 7;
+
+  // The daemon driving this run — its backend id (#1322).
+  //
+  // Startup reconciliation marks in-flight runs FAILED because they have no
+  // resumption point. On a deployment where several daemons share one
+  // database, a restart must only reconcile ITS OWN runs: a peer's run is
+  // that peer's to fail, on its own restart. Without this, one daemon
+  // restarting fails every other daemon's live runs.
+  //
+  // Empty on runs written before ownership existed; those are deliberately
+  // left alone rather than guessed at.
+  string owner = 8;
+
+  // git_source / git_ref echo RunCrewRequest's own fields (empty when the
+  // run had none). git_commit is the SHA every member's fetch resolved to —
+  // populated once RunCrew has provisioned at least one member with a
+  // git_source; empty on a run with no git_source, or if every member's
+  // fetch failed before any commit resolved.
+  string git_source = 9;
+  string git_ref = 10;
+  string git_commit = 11;
+
+  // skill_id: set only on a record for a standalone skill run (RunAgentSkill,
+  // no crew involved), never alongside crew_id. TailRunLog's journal lookup
+  // (#2096) needs a durable run -> member-skill record so a finished skill
+  // run's journal is still resolvable after a daemon restart — the same
+  // durability crew_id + catalog already gives a crew run. Rather than add a
+  // second persistence mechanism, a standalone skill run is recorded through
+  // this same store with crew_id empty and skill_id set; CrewServer.runMembers
+  // resolves it directly instead of through a crew's catalog lookup (#2122).
+  string skill_id = 12;
+  TaskGraph graph = 13;
+  repeated TaskNodeResult node_results = 14;
+  // The Proof Pack outcome of a crew with a PACK_PRODUCER member (#2799).
+  // Unset when the crew has no producer, or the run failed before its last
+  // A2A member returned the final files. The pack's status is the platform's
+  // record of the tests run on those files, and is what should gate opening a
+  // pull request; an agent's own `tests_run` claim should not. A failed or
+  // missing pack does not fail the run: whoever acts on the run reads this.
+  CrewProofPack proof_pack = 15;
+  // The model id each member was driven with (#3259), keyed by skill_id: the
+  // run's model_overrides entry, else the skill's own pinned `model`. A member
+  // that exports no model (none requested or pinned, or no named engine) is
+  // absent: its engine's default ran, and the daemon does not claim to know which.
+  map<string, string> member_models = 16;
+}
+
+// CrewProofPack summarizes the Proof Pack a crew's PACK_PRODUCER produced
+// (#2799). The pack itself is not stored here; sealing and attaching it is
+// #2798.
+message CrewProofPack {
+  // PASSED, FAILED or NO_COMMANDS. UNSPECIFIED when no pack was produced;
+  // error then says why.
+  ProofPackStatus status = 1;
+  // The box the test commands ran in (ProofPack.producer).
+  string producer_box = 2;
+  // The coder's box. Never equal to producer_box: RunCrew rejects such a
+  // crew, and refuses to produce a pack if the two still coincide.
+  string coder_box = 3;
+  // SHA-256 of the pack (proofpack.PackDigest), lowercase hex.
+  string pack_sha256 = 4;
+  // HEAD of the producer's checkout: the commit the final files were
+  // written onto before the commands ran.
+  string git_commit = 5;
+  // Repo-relative paths of the final files written into the producer's
+  // checkout, in artifact order.
+  repeated string applied_files = 6;
+  // Why no pack was produced. Empty when status is set.
+  string error = 7;
+}
+
+message ListCrewsRequest {}
+message ListCrewsResponse {
+  repeated Crew crews = 1;
+}
+
+message GetCrewRequest {
+  string id = 1;
+}
+message GetCrewResponse {
+  Crew crew = 1;
+}
+
+message RunCrewRequest {
+  string crew_id = 1;
+  string backend_id = 2;
+  string pool = 3;
+  // JSON input for the crew's entry skill(s).
+  string input_json = 4;
+  // Optional caller-supplied run id (1-128 chars of [A-Za-z0-9._-]). Empty
+  // means the daemon generates a UUID. Resolved and validated the same way as
+  // RunAgentSkillRequest.run_id (#1826), before any crew/topology lookup, and
+  // becomes CrewRun.id — bound into every member box's credentials (their
+  // `run_id` claim), so a caller's own run-tracking id is the one OSS's audit
+  // trail and every member's lease use (#1899).
+  string run_id = 5;
+  // Optional git source fetched into EVERY member box's own per-run
+  // workspace before the crew is driven (cloud#1554). Same semantics as
+  // RunAgentSkillRequest.git_source (#1859): a shallow fetch of the exact
+  // ref, run inside each box, no caller->box SSH. Every member gets its own
+  // workspace at the same commit — the shared codebase between crew members
+  // is "git at a pinned SHA", not a shared filesystem (design decision,
+  // Containarium-cloud docs/product/coding-skill-on-a-repo.md §Decided,
+  // 2026-09-15: a role hand-off between members is a commit on a branch, so
+  // two members never write the same file at once). Empty means no fetch —
+  // today's behavior, unchanged.
+  string git_source = 6;
+  // Exact ref to check out: full SHA (preferred, reproducible), branch, tag,
+  // or a server ref like "refs/pull/<n>/merge". Empty = the remote's default
+  // branch. Ignored when git_source is empty.
+  string git_ref = 7;
+  // Bearer token for a private git_source. Used daemon-side for each
+  // member's fetch only (an ephemeral http.extraHeader) — never written to
+  // any box's .git/config, never logged. Empty = public repo.
+  string git_credential = 8;
+  // Per-member engine override (#2228), keyed by skill_id: when a member's
+  // id has an entry here, THIS value resolves that member's engine instead
+  // of its own manifest `engine` field — same agentengine.Resolve readiness
+  // check, same refusal text, as RunAgentSkillRequest.engine. A member with
+  // no entry (or AGENT_ENGINE_UNSPECIFIED) keeps its manifest's own choice,
+  // unchanged pre-#2228 behavior.
+  map<string, AgentEngine> engine_overrides = 9;
+  // The organization every member run is attributed to for MODEL KEY RESOLUTION:
+  // when set, the run's gateway token carries key_owner "org:<id>"
+  // and spends that org's registered provider key, instead of the owner
+  // derived from the shared skill box's cloud_org_id label or the calling
+  // identity. The skill box is shared across runs, so the org has to travel
+  // with the request. Honoured ONLY for a service credential carrying the
+  // literal agents:run-for-org scope (a managed control plane that has already
+  // authorized the end user); any other caller setting it is PermissionDenied.
+  // Empty = unchanged behaviour.
+  string on_behalf_of_org_id = 10;
+  // Only ORCHESTRATOR/FREEFORM support graph execution.
+  TaskGraph graph = 11;
+  // Zero defaults to 5; must not exceed the platform node cap.
+  uint32 concurrency = 12;
+  // Per-member model override (#3259), keyed by skill_id: when a member's id has
+  // an entry here, THAT model id is the one its run is driven with, ahead of the
+  // skill's own `model`. Precedence: this override, then the skill's `model`,
+  // then CONTAINARIUM_AGENT_MODEL, then the engine default. The id is opaque (no
+  // tiers are enumerated; ids change with every release) but must be a plain
+  // id, else INVALID_ARGUMENT. Like the skill's own `model`, it is carried to the
+  // box only with a named engine (the skill's, or engine_overrides'), so an
+  // entry for a member with none is FAILED_PRECONDITION rather than ignored. A
+  // key that is not a member of the crew is INVALID_ARGUMENT. An id the engine's
+  // provider does not list is refused before the run starts, when the daemon can
+  // list that provider's models. With `graph` (#3264) a key names a skill used
+  // by a graph node (a skill node, or a member of a crew node) and each node runs
+  // on its entry; the provider-list check then runs when each node starts, so a
+  // later node can be refused after earlier nodes have already run.
+  // CrewRun.member_models reports what each member ran with.
+  map<string, string> model_overrides = 13;
+}
+message RunCrewResponse {
+  CrewRun run = 1;
+}
+
+message GetCrewRunRequest {
+  string id = 1;
+}
+message GetCrewRunResponse {
+  CrewRun run = 1;
+}
+
+// =============================================================================
+// Task graphs — #2369 slice 1 (#2803). A TaskGraph is a high-level goal split
+// into independently-executable subtasks, each assigned to a crew or a skill,
+// wired by depends-on edges. A planner produces one; the crew orchestrator
+// fans its independent nodes out. Validation (pkg/core/taskgraph) rejects a
+// cycle, an assignee the catalogs do not know, and a graph over the cap.
+// =============================================================================
+
+// TaskNode is one subtask of a TaskGraph.
+message TaskNode {
+  // Unique within the graph; edges reference nodes by this id.
+  string id = 1;
+  // What this subtask must achieve, in the planner's words.
+  string goal = 2;
+  // Who runs the subtask: exactly one of a crew or a single skill, by catalog id.
+  oneof assignee {
+    string crew_id = 3;
+    string skill_id = 4;
+  }
+  // JSON input handed to the assignee — the same shape as
+  // RunCrewRequest.input_json / RunAgentSkillRequest.input_json. Empty = {}.
+  string input_json = 5;
+  // Optional minimum host capabilities, checked against this daemon's last
+  // measured profile before graph execution. Nonzero requirements are local
+  // only: remote backends and other pools are rejected. These are host
+  // eligibility constraints, not per-box allocations or resource reservations.
+  // Absent or all-zero requirements preserve legacy placement behavior.
+  TaskNodeResources resources = 6;
+}
+
+// TaskNodeResources describes minimum measured hardware for a graph node.
+// For a crew node the constraint applies to the host of the whole crew;
+// member box limits and ordinary admission checks remain unchanged.
+message TaskNodeResources {
+  // Minimum measured CPU core count; zero means no CPU constraint.
+  // Must be nonnegative.
+  int32 min_cpu_cores = 1;
+  // Minimum measured total RAM in bytes, not currently free RAM.
+  // Zero means no RAM constraint; must be nonnegative.
+  int64 min_memory_bytes = 2;
+  // Require a successful GPU passthrough measurement in the profile.
+  // This does not allocate a GPU or change the skill's recipe.
+  bool requires_gpu = 3;
+}
+
+// TaskEdge says node_id cannot start until depends_on has finished.
+message TaskEdge {
+  // The node that waits.
+  string node_id = 1;
+  // The node it waits for.
+  string depends_on = 2;
+}
+
+// TaskGraphLimits bounds a graph's size. A zero field means the platform
+// default. A graph may tighten a limit below the platform cap but never raise
+// it above — a value over the cap is rejected, not clamped.
+message TaskGraphLimits {
+  // Maximum number of nodes.
+  uint32 max_nodes = 1;
+  // Maximum depth: the number of nodes on the longest depends-on chain (a
+  // graph with no edges has depth 1).
+  uint32 max_depth = 2;
+}
+
+// TaskGraph is a goal decomposed into subtasks with dependencies.
+message TaskGraph {
+  // The high-level goal the graph decomposes.
+  string goal = 1;
+  repeated TaskNode nodes = 2;
+  repeated TaskEdge edges = 3;
+  TaskGraphLimits limits = 4;
+}
+
+message ValidateTaskGraphRequest {
+  TaskGraph graph = 1;
+}
+message ValidateTaskGraphResponse {
+  // Node ids in a dependency-respecting order: every node appears after
+  // everything it depends on.
+  repeated string order = 1;
+  // The graph's depth (see TaskGraphLimits.max_depth).
+  uint32 depth = 2;
+}
+
+// TaskNodeState distinguishes execution failures from dependencies never run.
+enum TaskNodeState {
+  TASK_NODE_STATE_UNSPECIFIED = 0;
+  TASK_NODE_STATE_PENDING = 1;
+  TASK_NODE_STATE_RUNNING = 2;
+  TASK_NODE_STATE_SUCCEEDED = 3;
+  TASK_NODE_STATE_FAILED = 4;
+  TASK_NODE_STATE_BLOCKED = 5;
+  TASK_NODE_STATE_CANCELLED = 6;
+}
+message TaskNodeResult {
+  string node_id = 1;
+  string run_id = 2;
+  TaskNodeState state = 3;
+  string output_json = 4;
+  string error = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp finished_at = 7;
+}
+
+// PlanTaskGraph runs only the planner skill; graph nodes are never executed.
+message PlanTaskGraphRequest {
+  string goal = 1;
+  // Remote git source fetched into the planner's workspace.
+  string repo = 2;
+  string git_ref = 3;
+  // Ephemeral fetch credential, handled like RunAgentSkillRequest.git_credential.
+  string git_credential = 4;
+  string backend_id = 5;
+  string pool = 6;
+}
+message PlanTaskGraphResponse {
+  TaskGraph graph = 1;
+  // Planner run; its terminal state/error is available through GetCrewRun.
+  string run_id = 2;
+  string git_commit = 3;
+}
+
+// CrewService runs collaborating sets of skills bound to a task purpose.
+service CrewService {
+  // PlanTaskGraph reads a repository in a planner box and validates its output
+  // against this daemon's catalogs. It never runs the resulting graph.
+  rpc PlanTaskGraph(PlanTaskGraphRequest) returns (PlanTaskGraphResponse) {
+    option (google.api.http) = {
+      post: "/v1/task-graphs:plan"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Plan a task graph";
+      description: "Run the planner skill against a goal and repository, validate the resulting TaskGraph, and return it without executing its nodes.";
+      tags: "Agents";
+    };
+  }
+  // ListCrews returns all available crews.
+  rpc ListCrews(ListCrewsRequest) returns (ListCrewsResponse) {
+    option (google.api.http) = {
+      get: "/v1/crews"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List crews";
+      description: "Returns all crews (collaborating skill sets) available to run.";
+      tags: "Agents";
+    };
+  }
+
+  // GetCrew returns a single crew definition by id.
+  rpc GetCrew(GetCrewRequest) returns (GetCrewResponse) {
+    option (google.api.http) = {
+      get: "/v1/crews/{id}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get crew";
+      description: "Returns one crew's definition, including its topology and member skills.";
+      tags: "Agents";
+    };
+  }
+
+  // RunCrew launches a crew against an input: validates the topology against the
+  // union of member skills' allowed_peers, provisions each skill's box, compiles
+  // per-agent network policy, threads one trace_id through every hop, and
+  // returns the run handle.
+  rpc RunCrew(RunCrewRequest) returns (RunCrewResponse) {
+    option (google.api.http) = {
+      post: "/v1/crews/{crew_id}/run"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Run a crew";
+      description: "Provisions each skill's box, gates A2A traffic with network policy compiled from allowed_peers, runs the collaboration, and returns the run handle.";
+      tags: "Agents";
+    };
+  }
+
+  // GetCrewRun returns the status and artifact of a crew run.
+  rpc GetCrewRun(GetCrewRunRequest) returns (GetCrewRunResponse) {
+    option (google.api.http) = {
+      get: "/v1/crew-runs/{id}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get crew run";
+      description: "Returns the state, trace id, and (when complete) the artifact of a crew execution.";
+      tags: "Agents";
+    };
+  }
+
+  // ValidateTaskGraph checks a task graph against this daemon's crew and skill
+  // catalogs: acyclic, every assignee known, node count and depth within the
+  // cap. Returns InvalidArgument naming the first problem found.
+  rpc ValidateTaskGraph(ValidateTaskGraphRequest) returns (ValidateTaskGraphResponse) {
+    option (google.api.http) = {
+      post: "/v1/task-graphs:validate"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Validate a task graph";
+      description: "Checks a task graph is acyclic, that every node's crew or skill exists in this daemon's catalogs, and that its node count and depth are within the cap. Returns a dependency-respecting node order and the graph's depth.";
+      tags: "Agents";
+    };
+  }
+}
