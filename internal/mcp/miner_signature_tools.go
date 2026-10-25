@@ -105,3 +105,75 @@ func decodeMinerSignatureInput(args map[string]interface{}) (pb.MinerSignatureKi
 	k, err := parseMinerSignatureKind(in.Kind)
 	if err != nil {
 		return 0, in, err
+	}
+	// The pattern is not trimmed: an argv marker may carry significant
+	// trailing whitespace ("--coin ").
+	if in.Pattern == "" {
+		return 0, in, fmt.Errorf("pattern is required")
+	}
+	return k, in, nil
+}
+
+func handleListMinerSignatures(client API, _ map[string]interface{}) (string, error) {
+	resp, err := client.ListMinerSignatures()
+	if err != nil {
+		return "", fmt.Errorf("list miner signatures: %w", err)
+	}
+	return marshalProto(resp)
+}
+
+func handleAddMinerSignature(client API, args map[string]interface{}) (string, error) {
+	k, in, err := decodeMinerSignatureInput(args)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.AddMinerSignature(&pb.AddMinerSignatureRequest{
+		Signature: &pb.MinerSignature{Kind: k, Pattern: in.Pattern, Label: in.Label},
+	})
+	if err != nil {
+		return "", fmt.Errorf("add miner signature: %w", err)
+	}
+	return marshalProto(resp)
+}
+
+func handleRemoveMinerSignature(client API, args map[string]interface{}) (string, error) {
+	k, in, err := decodeMinerSignatureInput(args)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.RemoveMinerSignature(k, in.Pattern)
+	if err != nil {
+		return "", fmt.Errorf("remove miner signature: %w", err)
+	}
+	return marshalProto(resp)
+}
+
+// ListMinerSignatures reads GET /v1/security/miner-signatures.
+func (c *Client) ListMinerSignatures() (*pb.ListMinerSignaturesResponse, error) {
+	out := &pb.ListMinerSignaturesResponse{}
+	if err := c.processPolicyRoundTrip("GET", minerSignaturesPath, nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AddMinerSignature posts POST /v1/security/miner-signatures.
+func (c *Client) AddMinerSignature(req *pb.AddMinerSignatureRequest) (*pb.AddMinerSignatureResponse, error) {
+	out := &pb.AddMinerSignatureResponse{}
+	if err := c.processPolicyRoundTrip("POST", minerSignaturesPath, req, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RemoveMinerSignature calls DELETE /v1/security/miner-signatures?kind=&pattern=.
+// kind and pattern travel as query parameters (an argv marker can hold
+// slashes and spaces), matching the CLI.
+func (c *Client) RemoveMinerSignature(kind pb.MinerSignatureKind, pattern string) (*pb.RemoveMinerSignatureResponse, error) {
+	q := url.Values{"kind": {kind.String()}, "pattern": {pattern}}
+	out := &pb.RemoveMinerSignatureResponse{}
+	if err := c.processPolicyRoundTrip("DELETE", minerSignaturesPath+"?"+q.Encode(), nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

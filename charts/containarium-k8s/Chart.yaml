@@ -17,3 +17,13 @@ keywords:
   - mcp
   - ssh
   - kubernetes
+  - security
+  - agent-box
+home: https://github.com/FootprintAI/Containarium
+sources:
+  - https://github.com/FootprintAI/Containarium
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial Helm chart for the Kubernetes agent-box backend
