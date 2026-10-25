@@ -6,3 +6,6 @@ require golang.org/x/text v0.3.8
 
 // Explanatory comment, as on the real grpc pin: kept because a fixed
 // release is not tagged yet.
+replace google.golang.org/grpc => google.golang.org/grpc v1.83.2
+
+replace golang.org/x/text => ../text
