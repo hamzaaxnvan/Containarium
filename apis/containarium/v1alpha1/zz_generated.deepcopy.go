@@ -50,3 +50,107 @@ func (in *BoxList) DeepCopyInto(out *BoxList) {
 		in, out := &in.Items, &out.Items
 		*out = make([]Box, len(*in))
 		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+}
+
+// DeepCopy is a deepcopy function, copying the receiver, creating a new BoxList.
+func (in *BoxList) DeepCopy() *BoxList {
+	if in == nil {
+		return nil
+	}
+	out := new(BoxList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyObject is a deepcopy function, copying the receiver, creating a new runtime.Object.
+func (in *BoxList) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
+}
+
+// DeepCopyInto is a deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *BoxResources) DeepCopyInto(out *BoxResources) {
+	*out = *in
+}
+
+// DeepCopy is a deepcopy function, copying the receiver, creating a new BoxResources.
+func (in *BoxResources) DeepCopy() *BoxResources {
+	if in == nil {
+		return nil
+	}
+	out := new(BoxResources)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto is a deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *BoxSpec) DeepCopyInto(out *BoxSpec) {
+	*out = *in
+	if in.SSHKeys != nil {
+		in, out := &in.SSHKeys, &out.SSHKeys
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
+	out.Resources = in.Resources
+	if in.StackParams != nil {
+		in, out := &in.StackParams, &out.StackParams
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
+	if in.Labels != nil {
+		in, out := &in.Labels, &out.Labels
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
+	if in.AutoStart != nil {
+		in, out := &in.AutoStart, &out.AutoStart
+		*out = new(bool)
+		**out = **in
+	}
+	if in.TTLSeconds != nil {
+		in, out := &in.TTLSeconds, &out.TTLSeconds
+		*out = new(int64)
+		**out = **in
+	}
+}
+
+// DeepCopy is a deepcopy function, copying the receiver, creating a new BoxSpec.
+func (in *BoxSpec) DeepCopy() *BoxSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(BoxSpec)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto is a deepcopy function, copying the receiver, writing into out. in must be non-nil.
+func (in *BoxStatus) DeepCopyInto(out *BoxStatus) {
+	*out = *in
+	if in.Conditions != nil {
+		in, out := &in.Conditions, &out.Conditions
+		*out = make([]v1.Condition, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+}
+
+// DeepCopy is a deepcopy function, copying the receiver, creating a new BoxStatus.
+func (in *BoxStatus) DeepCopy() *BoxStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(BoxStatus)
+	in.DeepCopyInto(out)
+	return out
+}

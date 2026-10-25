@@ -14,3 +14,11 @@ class ScanCoverageTest(unittest.TestCase):
         report = {"Results": [{"Target": "go/src/go.mod", "Type": "gomod"}]}
         with self.assertRaisesRegex(ValueError, "binary scan"):
             self.module.validate(report)
+
+    def test_all_managed_go_binaries_must_be_scanned(self):
+        report = {"Results": [{"Target": path, "Type": "gobinary"} for path in
+                               ("go/bin/go", "bin/buf", "staticcheck/staticcheck")]}
+        self.module.validate(report)
+        report["Results"].pop()
+        with self.assertRaisesRegex(ValueError, "staticcheck"):
+            self.module.validate(report)
