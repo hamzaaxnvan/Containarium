@@ -81,3 +81,87 @@ func postAlertPayload(url string, payload alertPayload) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			log.Printf("[sentinel] alert webhook: build request: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("[sentinel] alert webhook POST %s failed: %v", payload.Event, err)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode >= 400 {
+			log.Printf("[sentinel] alert webhook POST %s returned %d", payload.Event, resp.StatusCode)
+			return
+		}
+		log.Printf("[sentinel] alert webhook %s delivered (backend=%s outstanding=%d)", payload.Event, payload.Backend, payload.Outstanding)
+	}()
+}
+
+// MetricsHandler serves Prometheus text-format metrics for the spot
+// preemption/recovery signal. Mounted at /metrics on the sentinel's
+// always-on HTTP server, so an EXTERNAL Prometheus / Grafana Cloud can
+// scrape it (the on-spot VictoriaMetrics can't — it's on the box that goes
+// down). Alert on `sentinel_preempted_total - sentinel_recovered_total > 0`.
+func (m *Manager) MetricsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		state := 0 // 0 = maintenance/down, 1 = proxy/up
+		if m.CurrentState() == StateProxy {
+			state = 1
+		}
+		outageSecs := int64(0)
+		if od := m.OutageDuration(); od > 0 {
+			outageSecs = int64(od.Seconds())
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		fmt.Fprint(w, m.renderMetrics(state, outageSecs))
+		// Process health (#1351) — resident memory, goroutines, fds. Separate
+		// concern from the preemption signal above (that describes the
+		// BACKEND; this describes the sentinel), so it is rendered separately
+		// and simply appended to the same exposition.
+		fmt.Fprint(w, renderProcessMetrics(collectRuntimeStats(), readProcStats()))
+		// Backend failover + per-backend health (#1358). The preemption
+		// counters above miss a loss that failover absorbs — see
+		// backend_metrics.go for the event that proved it.
+		fmt.Fprint(w, renderBackendMetrics(m.FailoverCount(), m.BackendHealthSnapshot()))
+		fmt.Fprint(w, renderFailbackMetrics(m.FailbackCount(), m.primaryIsPreferred()))
+		// Tunnel sessions by transport, so the move to TLS is observable
+		// per sentinel.
+		if m.tunnelRegistry != nil {
+			fmt.Fprint(w, renderTunnelMetrics(m.tunnelRegistry.SessionStats()))
+		}
+		if m.certStore != nil {
+			fmt.Fprint(w, renderCertSyncMetrics(m.certStore.RejectedCounts()))
+		}
+		if controller := m.sshUpstreamController(); controller != nil || m.config.SSHUpstreamPolicy != "" {
+			faulted := 0
+			if m.sshUpstreamStartupFault.Load() || (controller != nil && controller.Faulted()) {
+				faulted = 1
+			}
+			fmt.Fprint(w, "# HELP sentinel_ssh_upstream_faulted Controller startup/storage fault; admission closed until durable retry succeeds.\n# TYPE sentinel_ssh_upstream_faulted gauge\n")
+			fmt.Fprintf(w, "sentinel_ssh_upstream_faulted %d\n", faulted)
+		}
+	}
+}
+
+// renderMetrics builds the Prometheus exposition text. Split out (pure) so
+// it's unit-testable without an HTTP round trip.
+func (m *Manager) renderMetrics(state int, outageSecs int64) string {
+	var b bytes.Buffer
+	fmt.Fprint(&b, "# HELP sentinel_preempted_total Total spot-VM preemption events observed.\n")
+	fmt.Fprint(&b, "# TYPE sentinel_preempted_total counter\n")
+	fmt.Fprintf(&b, "sentinel_preempted_total %d\n", m.PreemptCount())
+	fmt.Fprint(&b, "# HELP sentinel_recovered_total Total returns to proxy after an outage.\n")
+	fmt.Fprint(&b, "# TYPE sentinel_recovered_total counter\n")
+	fmt.Fprintf(&b, "sentinel_recovered_total %d\n", m.RecoveredCount())
+	fmt.Fprint(&b, "# HELP sentinel_state Backend serving state: 1 proxy (up), 0 maintenance (down).\n")
+	fmt.Fprint(&b, "# TYPE sentinel_state gauge\n")
+	fmt.Fprintf(&b, "sentinel_state %d\n", state)
+	fmt.Fprint(&b, "# HELP sentinel_outage_seconds Duration of the current outage; 0 when serving.\n")
+	fmt.Fprint(&b, "# TYPE sentinel_outage_seconds gauge\n")
+	fmt.Fprintf(&b, "sentinel_outage_seconds %d\n", outageSecs)
+	return b.String()
+}
