@@ -23,3 +23,29 @@ check_inert() { # var payload_kind payload
   if [ -e "$proof" ]; then
     echo "  FAIL  $var=<$kind> executed (proof file created)"
     fail=$((fail+1))
+  else
+    echo "  PASS  $var=<$kind> did not execute"
+    pass=$((pass+1))
+  fi
+  rm -f "$proof"
+}
+
+echo "=== malicious overrides must be inert ==="
+for var in VERSION GIT_COMMIT BUILD_TIME BUNDLE_VERSION BUNDLE_OS BUNDLE_ARCH; do
+  check_inert "$var" 'make $(shell ...)'   "\$(shell touch $proof)"
+  check_inert "$var" 'shell $(...)'        "\$(touch $proof)"
+  check_inert "$var" 'shell backtick'      "\`touch $proof\`"
+done
+
+echo "=== legitimate overrides must still reach the build as data ==="
+out="$(make version VERSION=9.9.9-test-marker 2>/dev/null)"
+if [[ "$out" == *"9.9.9-test-marker"* ]]; then
+  echo "  PASS  VERSION override reaches \`make version\`"
+  pass=$((pass+1))
+else
+  echo "  FAIL  VERSION override did not reach \`make version\`: $out"
+  fail=$((fail+1))
+fi
+
+echo "passed=$pass failed=$fail"
+[ "$fail" = "0" ]
