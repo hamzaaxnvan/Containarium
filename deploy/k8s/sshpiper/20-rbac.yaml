@@ -18,3 +18,23 @@ metadata:
   name: sshpiper
   namespace: agent-gateway
 rules:
+  - apiGroups: ["sshpiper.com"]
+    resources: ["pipes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sshpiper
+  namespace: agent-gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sshpiper
+subjects:
+  - kind: ServiceAccount
+    name: sshpiper
+    namespace: agent-gateway
