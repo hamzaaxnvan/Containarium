@@ -54,3 +54,60 @@ func Gate(rescan *pb.GuardrailScanResponse, wiped map[string]string, policy *pb.
 
 	fail := func(format string, a ...any) {
 		res.Verdict = pb.GuardrailVerdict_GUARDRAIL_VERDICT_FAIL
+		res.Reasons = append(res.Reasons, fmt.Sprintf(format, a...))
+	}
+	if res.Gaps > 0 {
+		fail("%d coverage gap(s): the engine could not fully scan part of the subject", res.Gaps)
+	}
+	for _, k := range sortedKinds(blocked) {
+		if blocked[k] > 0 {
+			fail("%d %s finding(s) on the original and the policy says BLOCK", blocked[k], kindName(k))
+		}
+	}
+	limits := map[pb.GuardrailKind]int32{}
+	for _, r := range policy.GetRules() {
+		limits[r.GetKind()] = r.GetMaxResidual()
+	}
+	for _, k := range sortedKinds(res.Residual) {
+		if n := res.Residual[k]; n > int64(limits[k]) {
+			fail("%d residual %s finding(s) after redaction, policy allows %d", n, kindName(k), limits[k])
+		}
+	}
+	return res
+}
+
+// placeholderSpans returns the code-point ranges of every placeholder
+// token in text.
+func placeholderSpans(text string) [][2]int {
+	var out [][2]int
+	for _, m := range placeholderRE.FindAllStringIndex(text, -1) {
+		out = append(out, [2]int{
+			utf8.RuneCountInString(text[:m[0]]),
+			utf8.RuneCountInString(text[:m[1]]),
+		})
+	}
+	return out
+}
+
+func insideAny(holes [][2]int, start, end int) bool {
+	for _, h := range holes {
+		if start >= h[0] && end <= h[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedKinds(m map[pb.GuardrailKind]int64) []pb.GuardrailKind {
+	out := make([]pb.GuardrailKind, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// kindName renders GUARDRAIL_KIND_PII as "PII" for messages.
+func kindName(k pb.GuardrailKind) string {
+	return strings.TrimPrefix(k.String(), "GUARDRAIL_KIND_")
+}
