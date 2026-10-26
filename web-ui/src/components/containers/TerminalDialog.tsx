@@ -117,3 +117,33 @@ export default function TerminalDialog({ open, onClose, containerName, username,
   useEffect(() => { if (!open) cleanup(); }, [open, cleanup]);
 
   useEffect(() => {
+    if (open && fitAddon.current) {
+      const t = setTimeout(() => fitAddon.current?.fit(), 100);
+      return () => clearTimeout(t);
+    }
+  }, [open]);
+
+  const handleClose = () => { cleanup(); onClose(); };
+
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={handleClose} />
+      <div className="relative z-10 flex h-[80vh] w-[90vw] max-w-5xl flex-col rounded-xl border border-[var(--border)] bg-[#09090b] shadow-2xl overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-2.5">
+          <span className="text-xs font-medium text-zinc-300">Terminal: {containerName}</span>
+          {connecting && <Loader2 size={13} className="animate-spin text-zinc-500" />}
+          {connected && <span className="text-[10px] text-[var(--c-emerald)]">Connected</span>}
+          {error && <span className="text-[10px] text-[var(--c-red)]">{error}</span>}
+          <button onClick={handleClose} className="ml-auto rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 transition-colors">
+            <X size={14} />
+          </button>
+        </div>
+        {/* Terminal */}
+        <div ref={terminalRef} className="flex-1 overflow-hidden [&_.xterm]:h-full [&_.xterm]:p-2" />
+      </div>
+    </div>
+  );
+}
