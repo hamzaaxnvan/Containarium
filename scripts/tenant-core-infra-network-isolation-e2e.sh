@@ -62,3 +62,35 @@ for core in $CORE_NAMES; do
   [ -z "$ip" ] && { echo "SKIP $core: no IPv4 address found"; continue; }
 
   # Ports a tenant must NOT be able to reach per role — everything the
+  # guard's table (internal/coreguard) reserves for the host gateway, the
+  # control plane, or a named core peer. Caddy 80/443 and the OTLP receiver
+  # 4317/4318 are *intended* tenant-reachable and are asserted the other
+  # way round in scripts/core-guard-legit-flows-e2e.sh.
+  case "$core" in
+    *postgres*) ports="5432" ;;
+    *victoriametrics*) ports="3000 8428 8880 9093" ;; # grafana, victoriametrics, vmalert, alertmanager
+    *otelcollector*) ports="13133 8888" ;;             # health, self-metrics
+    *caddy*) ports="2019" ;;                           # admin API — a tenant reaching it can rewrite routes
+    *) ports="" ;;
+  esac
+  [ -z "$ports" ] && continue
+
+  for port in $ports; do
+    result=$(incus exec "$TENANT" -- bash -c "timeout 3 bash -c 'echo > /dev/tcp/$ip/$port' 2>&1 && echo succeeded || echo failed")
+    echo "$TENANT -> $core ($ip:$port): TCP connect $result"
+    if [ "$result" = "succeeded" ]; then
+      echo "  FAIL: tenant container reached platform infra at the network layer — no isolation boundary exists for $core:$port"
+      FAILS=$((FAILS + 1))
+    else
+      echo "  OK: connection denied at the network layer"
+    fi
+  done
+done
+
+echo
+if [ "$FAILS" -eq 0 ]; then
+  echo "PASS: no tenant->core-infra network path found"
+else
+  echo "FAILED: $FAILS tenant->core-infra network path(s) exist with no isolation boundary — see docs/security/multi-tenant-isolation.md"
+  exit 1
+fi

@@ -30,3 +30,14 @@ func getPostgresConnString() string {
 
 	// Fall back to the legacy in-cluster default with a
 	// password resolved from a secret file / env / dev
+	// default. The dev default surfaces a WARNING from
+	// ResolvePostgresPassword.
+	password, pwSource, err := server.ResolvePostgresPassword()
+	if err != nil {
+		log.Printf("ERROR: %v", err)
+		return ""
+	}
+	log.Printf("[postgres] DSN source: auto-detect default, password source: %s", pwSource)
+	return server.PostgresDSN(server.DefaultPostgresUser, password,
+		"10.100.0.2", server.DefaultPostgresPort, server.DefaultPostgresDB)
+}
