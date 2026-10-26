@@ -28,3 +28,14 @@ func NewCreateStageObserver(provider *sdkmetric.MeterProvider) (container.StageO
 	hist, err := meter.Float64Histogram("containarium.container.create_stage_duration_seconds",
 		otelmetric.WithDescription("Duration of each stage of container create"),
 		otelmetric.WithUnit("s"),
+		otelmetric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create create-stage histogram: %w", err)
+	}
+
+	return func(stage container.CreateStage, d time.Duration) {
+		hist.Record(context.Background(), d.Seconds(),
+			otelmetric.WithAttributes(attribute.String("stage", string(stage))))
+	}, nil
+}
