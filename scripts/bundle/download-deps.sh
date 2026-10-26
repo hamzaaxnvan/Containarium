@@ -280,3 +280,145 @@ download_apt_packages() {
   fi
 
   # Batched (#3118): the log shows which batch is in flight, so a stall is
+  # placed to a few packages instead of the whole set.
+  APT_PKG_COUNT="${#fetch[@]}"
+  local batches=$(( (${#fetch[@]} + APT_BATCH_SIZE - 1) / APT_BATCH_SIZE ))
+  local b i batch=()
+  log_info "Resolved ${#fetch[@]} packages; downloading into $apt_dir/ in $batches batch(es) of up to $APT_BATCH_SIZE"
+  for (( b = 1, i = 0; i < ${#fetch[@]}; b++, i += APT_BATCH_SIZE )); do
+    batch=("${fetch[@]:i:APT_BATCH_SIZE}")
+    log_info "batch $b/$batches: ${#batch[@]} packages (${batch[0]%%=*} .. ${batch[-1]%%=*})"
+    if ! (cd "$apt_dir" && apt-get download "${APT_NET_OPTS[@]}" "${batch[@]}"); then
+      log_error "apt-get download failed in batch $b/$batches (apt's error above names the host)"
+      return 1
+    fi
+  done
+
+  check_apt_closure "$apt_dir" "${pkgs[@]}"
+  log_success "apt packages downloaded: $(find "$apt_dir" -maxdepth 1 -name '*.deb' | wc -l) .deb files"
+}
+
+# check_apt_closure DIR REQUIRED...
+# Fails unless DIR holds a .deb for every REQUIRED package and every
+# Depends/Pre-Depends group of every .deb in DIR is met by a package in DIR
+# or one of its Provides. Matching is by name: the versions are whatever apt
+# resolved from one archive snapshot, and dpkg checks them at install time.
+check_apt_closure() {
+  local dir="$1"; shift
+  local -A have=() pkgname=() downloaded=()
+  local debs=() deb p field value group alt ok n
+  local groups=() alts=() unmet=() absent=()
+  shopt -s nullglob
+  debs=("$dir"/*.deb)
+  shopt -u nullglob
+  if [ "${#debs[@]}" -eq 0 ]; then
+    log_error "No .deb files in $dir"
+    return 1
+  fi
+
+  for deb in "${debs[@]}"; do
+    p="$(dpkg-deb -f "$deb" Package)"
+    pkgname[$deb]="$p"
+    downloaded[$p]=1
+    have[$p]=1
+    value="$(dpkg-deb -f "$deb" Provides | tr '\n' ' ')"
+    IFS=',' read -r -a groups <<<"$value"
+    for alt in "${groups[@]}"; do
+      alt="$(dep_name "$alt")"
+      [ -n "$alt" ] && have[$alt]=1
+    done
+  done
+
+  for n in "$@"; do
+    # Require the package's own .deb, not just a Provides entry. A set lookup
+    # also avoids printf | grep -q failing with SIGPIPE under pipefail.
+    if [ -z "${downloaded[$n]:-}" ]; then
+      absent+=("$n")
+    fi
+  done
+
+  for deb in "${debs[@]}"; do
+    for field in Pre-Depends Depends; do
+      value="$(dpkg-deb -f "$deb" "$field" | tr '\n' ' ')"
+      [ -z "${value// /}" ] && continue
+      IFS=',' read -r -a groups <<<"$value"
+      for group in "${groups[@]}"; do
+        ok=0
+        IFS='|' read -r -a alts <<<"$group"
+        for alt in "${alts[@]}"; do
+          alt="$(dep_name "$alt")"
+          if [ -n "$alt" ] && [ -n "${have[$alt]:-}" ]; then ok=1; break; fi
+        done
+        if [ "$ok" = 0 ]; then
+          unmet+=("${pkgname[$deb]} $field:${group}")
+        fi
+      done
+    done
+  done
+
+  if [ "${#absent[@]}" -gt 0 ]; then
+    log_error "No .deb downloaded for requested package(s): ${absent[*]}"
+  fi
+  if [ "${#unmet[@]}" -gt 0 ]; then
+    log_error "${#unmet[@]} dependency group(s) not met inside the bundle:"
+    for n in "${unmet[@]}"; do log_error "  $n"; done
+  fi
+  if [ "${#absent[@]}" -gt 0 ] || [ "${#unmet[@]}" -gt 0 ]; then
+    return 1
+  fi
+  log_success "Dependency closure OK: ${#debs[@]} .deb files, every Depends/Pre-Depends met"
+}
+
+# dep_name " libfoo:any (>= 1.2) " -> libfoo
+dep_name() {
+  local a="$1"
+  a="${a%%(*}"; a="${a%%\[*}"; a="${a%%<*}"
+  a="${a//[[:space:]]/}"
+  echo "${a%%:*}"
+}
+
+# write_summary EXIT_STATUS: one line in the GitHub job summary, so a slow or
+# failed step is visible without opening the log (#3118).
+write_summary() {
+  local rc="$1" result pkgs=""
+  [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+  if [ "$rc" -eq 0 ]; then result="ok in ${SECONDS}s"; else result="failed after ${SECONDS}s (exit $rc)"; fi
+  [ -n "$APT_PKG_COUNT" ] && pkgs=", $APT_PKG_COUNT apt packages in batches of $APT_BATCH_SIZE"
+  echo "**Download bundle dependencies** ($DEPS_ONLY): $result$pkgs." \
+       "Expected: a few minutes on a healthy run; build-bundle times out at 30 minutes." \
+       >>"$GITHUB_STEP_SUMMARY" || true
+}
+
+main() {
+  SECONDS=0
+  trap 'write_summary $?' EXIT
+  log_info "Staging dir: $STAGING_DIR"
+  log_info "Target:      $OS/$ARCH"
+  log_info "Steps:       $DEPS_ONLY"
+  log_info "Versions:    Go $GO_VERSION  Node $NODE_VERSION  pnpm $PNPM_VERSION"
+  log_info "             buf $BUF_VERSION  golangci-lint $GOLANGCI_LINT_VERSION"
+  log_info "             actions-runner $RUNNER_VERSION"
+  echo
+
+  case "$DEPS_ONLY" in
+    all|toolchains)
+      download_go
+      download_node
+      download_pnpm
+      download_buf
+      download_golangci_lint
+      download_actions_runner
+      ;;
+  esac
+  case "$DEPS_ONLY" in
+    all|apt) download_apt_packages ;;
+  esac
+
+  echo
+  log_success "All downloads complete. Staging tree:"
+  if command -v find >/dev/null 2>&1; then
+    find "$STAGING_DIR" -maxdepth 3 -type f | sort
+  fi
+}
+
+main "$@"
