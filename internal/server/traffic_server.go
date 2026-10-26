@@ -232,3 +232,82 @@ func historyQueryParams(req *pb.QueryTrafficHistoryRequest, now time.Time) (traf
 // the query spans every box (#2884), which discloses other tenants' history, so
 // it requires the admin role (the same rule as SubscribeTraffic).
 func (s *TrafficServer) QueryTrafficHistory(ctx context.Context, req *pb.QueryTrafficHistoryRequest) (*pb.QueryTrafficHistoryResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrafficRead); err != nil {
+		return nil, err
+	}
+	if req.ContainerName == "" {
+		if err := auth.RequireRole(ctx, auth.RoleAdmin); err != nil {
+			return nil, err
+		}
+	} else if err := auth.AuthorizeContainerAccess(ctx, req.ContainerName); err != nil {
+		return nil, err
+	}
+
+	var store *traffic.Store
+	if s.collector != nil {
+		store = s.collector.GetStore()
+	}
+	if store == nil {
+		return nil, status.Error(codes.FailedPrecondition,
+			"traffic history is not being persisted on this host (collector or database not enabled); an empty result would be misleading")
+	}
+
+	params, err := historyQueryParams(req, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	connections, totalCount, err := store.QueryConnections(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query traffic history: %w", err)
+	}
+	oldest, err := store.OldestRecord(ctx, req.ContainerName)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &pb.QueryTrafficHistoryResponse{
+		Connections: connections,
+		TotalCount:  totalCount,
+	}
+	if oldest != nil {
+		resp.OldestRecordTime = timestamppb.New(*oldest)
+	}
+	return resp, nil
+}
+
+// GetTrafficAggregates returns time-series traffic aggregates.
+// Phase 1.4 — tenant authz via container_name → owner.
+func (s *TrafficServer) GetTrafficAggregates(ctx context.Context, req *pb.GetTrafficAggregatesRequest) (*pb.GetTrafficAggregatesResponse, error) {
+	if err := auth.RequireScope(ctx, auth.ScopeTrafficRead); err != nil {
+		return nil, err
+	}
+	if req.ContainerName == "" {
+		return nil, fmt.Errorf("container_name is required")
+	}
+	if err := auth.AuthorizeContainerAccess(ctx, req.ContainerName); err != nil {
+		return nil, err
+	}
+
+	store := s.collector.GetStore()
+	if store == nil {
+		return nil, fmt.Errorf("traffic persistence not available")
+	}
+
+	params := traffic.AggregateParams{
+		ContainerName:   req.ContainerName,
+		StartTime:       req.StartTime.AsTime(),
+		EndTime:         req.EndTime.AsTime(),
+		Interval:        req.Interval,
+		GroupByDestIP:   req.GroupByDestIp,
+		GroupByDestPort: req.GroupByDestPort,
+	}
+
+	aggregates, err := store.GetAggregates(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get traffic aggregates: %w", err)
+	}
+
+	return &pb.GetTrafficAggregatesResponse{
+		Aggregates: aggregates,
+	}, nil
+}

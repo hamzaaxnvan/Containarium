@@ -56,3 +56,23 @@ func LegacyAccountPolicyKey(key string) (string, bool) {
 	bare, ok := strings.CutPrefix(key, AccountNetworkTenantPrefix)
 	return bare, ok && bare != ""
 }
+
+// NetworkTenantIdentity resolves only current Provider state, never request data.
+func NetworkTenantIdentity(info *ContainerInfo) (string, NetworkTenantSource) {
+	if info.NetworkTenantSource != "" {
+		return info.Tenant, info.NetworkTenantSource
+	}
+	if info.InstanceType != "" && info.InstanceType != "container" {
+		return "", NetworkTenantSourceUnknown
+	}
+	if strings.TrimSpace(info.Tenant) != "" {
+		return strings.TrimSpace(info.Tenant), NetworkTenantSourceNative
+	}
+	if cloud := strings.TrimSpace(info.Labels[CloudOrgIDLabel]); cloud != "" {
+		return cloud, NetworkTenantSourceCloud
+	}
+	if key := strings.TrimSuffix(info.Name, "-container"); key != "" {
+		return key, NetworkTenantSourceName
+	}
+	return "", NetworkTenantSourceUnknown
+}
