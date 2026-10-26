@@ -145,3 +145,151 @@ func runComposeDiscoverCLI(argv []string, stdout, stderr io.Writer) int {
 
 // ----- enable -------------------------------------------------------
 
+func runComposeEnableCLI(argv []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("compose enable", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dir := fs.String("dir", "", "Compose directory (required)")
+	force := fs.Bool("force", false, "Re-install the unit even if already enabled")
+	if err := fs.Parse(argv); err != nil {
+		return 2
+	}
+	if *dir == "" {
+		return writeErr(stdout, stderr, "compose enable: --dir is required")
+	}
+	d := expandUser(*dir)
+	abs, err := filepath.Abs(d)
+	if err != nil {
+		return writeErr(stdout, stderr, "resolve dir: %v", err)
+	}
+	if !hasComposeFile(abs) {
+		return writeErr(stdout, stderr, "no docker-compose.yml / compose.yml found under %s", abs)
+	}
+
+	bin := resolveComposeBin()
+	if bin == "" {
+		return writeErr(stdout, stderr, "no compose runtime found on PATH (looked for podman-compose, docker compose, podman compose)")
+	}
+
+	slug := stackSlug(abs)
+	unitInstance := "containarium-compose@" + slug + ".service"
+
+	if !*force && unitEnabled(unitInstance) {
+		writeOK(stdout, map[string]any{
+			"unit":        unitInstance,
+			"dir":         abs,
+			"compose_bin": bin,
+			"already":     true,
+			"message":     "already enabled (use --force to refresh)",
+		})
+		return 0
+	}
+
+	if err := installComposeUnit(bin, *force); err != nil {
+		return writeErr(stdout, stderr, "install unit template: %v", err)
+	}
+	if err := enableLinger(); err != nil {
+		// Not fatal — autostart still works while user is logged in.
+		// Surface the warning in the result so an operator can fix it
+		// (typically needs root sudo).
+		_ = err
+	}
+	if err := systemctlUser("daemon-reload"); err != nil {
+		return writeErr(stdout, stderr, "daemon-reload: %v", err)
+	}
+	if err := systemctlUser("enable", "--now", unitInstance); err != nil {
+		return writeErr(stdout, stderr, "enable %s: %v", unitInstance, err)
+	}
+
+	writeOK(stdout, map[string]any{
+		"unit":        unitInstance,
+		"dir":         abs,
+		"compose_bin": bin,
+		"already":     false,
+	})
+	return 0
+}
+
+// ----- disable ------------------------------------------------------
+
+func runComposeDisableCLI(argv []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("compose disable", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dir := fs.String("dir", "", "Compose directory (required)")
+	if err := fs.Parse(argv); err != nil {
+		return 2
+	}
+	if *dir == "" {
+		return writeErr(stdout, stderr, "compose disable: --dir is required")
+	}
+	d := expandUser(*dir)
+	abs, _ := filepath.Abs(d)
+	slug := stackSlug(abs)
+	unitInstance := "containarium-compose@" + slug + ".service"
+
+	if !unitEnabled(unitInstance) {
+		writeOK(stdout, map[string]any{
+			"unit":    unitInstance,
+			"dir":     abs,
+			"already": true,
+			"message": "not enabled (nothing to do)",
+		})
+		return 0
+	}
+
+	if err := systemctlUser("disable", "--now", unitInstance); err != nil {
+		return writeErr(stdout, stderr, "disable %s: %v", unitInstance, err)
+	}
+	writeOK(stdout, map[string]any{
+		"unit":    unitInstance,
+		"dir":     abs,
+		"already": false,
+	})
+	return 0
+}
+
+// ----- status -------------------------------------------------------
+
+func runComposeStatusCLI(argv []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("compose status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dir := fs.String("dir", "", "Compose directory (required)")
+	if err := fs.Parse(argv); err != nil {
+		return 2
+	}
+	if *dir == "" {
+		return writeErr(stdout, stderr, "compose status: --dir is required")
+	}
+	d := expandUser(*dir)
+	abs, _ := filepath.Abs(d)
+
+	cf, ok := findComposeFile(abs)
+	if !ok {
+		return writeErr(stdout, stderr, "no compose file under %s", abs)
+	}
+
+	bin := resolveComposeBin()
+	stack := ComposeStack{
+		ComposeDir:  abs,
+		ComposeFile: cf,
+		ComposeBin:  bin,
+	}
+	if info, err := os.Stat(cf); err == nil {
+		stack.ComposeModifiedAt = info.ModTime().UTC().Format(time.RFC3339)
+	}
+	if bin != "" {
+		stack.RunningCount, stack.TotalCount = composeServiceCounts(bin, abs)
+	}
+	fillAutostartStatus(&stack)
+
+	writeOK(stdout, stack)
+	return 0
+}
+
+// ----- helper types -------------------------------------------------
+
+// stringSliceFlag implements flag.Value for repeatable string flags.
+// Same shape as cobra's StringSliceVar but without the cobra dep.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string     { return strings.Join(*s, ",") }
+func (s *stringSliceFlag) Set(v string) error { *s = append(*s, v); return nil }

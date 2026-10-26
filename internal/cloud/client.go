@@ -420,3 +420,425 @@ func (c *Client) reportStatusOnce() {
 	st, err := c.status.Probe(c.ctx)
 	if err != nil {
 		log.Printf("[cloud] status probe failed: %v", err)
+		return
+	}
+	var posture *cloudv1.HostSecurityPosture
+	if st.Posture != nil {
+		posture = &cloudv1.HostSecurityPosture{Checks: hostChecksProto(st.Posture.Checks)}
+		if !st.Posture.MeasuredAt.IsZero() {
+			posture.MeasuredAt = timestamppb.New(st.Posture.MeasuredAt)
+		}
+	}
+	ctx, cancel := context.WithTimeout(c.authContext(c.ctx), 10*time.Second)
+	defer cancel()
+	if _, err := c.ac.ReportHostStatus(ctx, &cloudv1.ReportHostStatusRequest{
+		AgentVersion:  st.AgentVersion,
+		CpuCores:      st.CPUCores,
+		TotalRamMb:    st.TotalRAMMB,
+		TotalDiskGb:   st.TotalDiskGB,
+		TotalGpuCount: st.TotalGPUCount,
+		GpuSpec:       st.GPUSpec,
+		AvailRamMb:    st.AvailRAMMB,
+		AvailDiskGb:   st.AvailDiskGB,
+		AvailGpuCount: st.AvailGPUCount,
+		SelfCheckOk:   st.SelfCheckOK,
+		Checks:        hostChecksProto(st.Checks),
+		Posture:       posture,
+	}); err != nil {
+		log.Printf("[cloud] report host status: %v", err)
+	}
+}
+
+func hostChecksProto(checks []HostCheck) []*cloudv1.HostCapabilityCheck {
+	out := make([]*cloudv1.HostCapabilityCheck, 0, len(checks))
+	for _, ck := range checks {
+		out = append(out, &cloudv1.HostCapabilityCheck{Name: ck.Name, Ok: ck.OK, Detail: ck.Detail})
+	}
+	return out
+}
+
+// driverRefreshLoop re-mints the BYOC driver token on a ~20-day cycle so the
+// cloud-stored credential never reaches the 30-day cap (#557). Fires once
+// immediately on startup so a freshly-enrolled daemon pushes a token right
+// away, then sleeps for driverRefreshInterval between rounds. Best-effort:
+// mint/RPC failures are logged and retried on the next cycle — one missed
+// refresh leaves ~10 days of runway before the old token expires.
+func (c *Client) driverRefreshLoop() {
+	defer c.wg.Done()
+	c.refreshDriverTokenOnce()
+	t := time.NewTicker(driverRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+			c.refreshDriverTokenOnce()
+		}
+	}
+}
+
+func (c *Client) refreshDriverTokenOnce() {
+	tok, err := c.driver()
+	if err != nil {
+		log.Printf("[cloud] driver-token refresh: mint failed: %v", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.authContext(c.ctx), 10*time.Second)
+	defer cancel()
+	if _, err := c.ac.ReportHostStatus(ctx, &cloudv1.ReportHostStatusRequest{
+		DriverToken: tok,
+	}); err != nil {
+		log.Printf("[cloud] driver-token refresh: push failed: %v", err)
+		return
+	}
+	log.Printf("[cloud] driver-token refreshed (next in %s)", driverRefreshInterval)
+}
+
+func (c *Client) heartbeatLoop() {
+	defer c.wg.Done()
+	t := time.NewTicker(c.interval)
+	defer t.Stop()
+	c.beat() // immediate first beat so registration shows up without waiting a full interval
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+			c.beat()
+		}
+	}
+}
+
+func (c *Client) beat() {
+	if err := c.heartbeatOnce(c.ctx); err != nil {
+		c.mu.Lock()
+		c.failures++
+		n := c.failures
+		c.mu.Unlock()
+		log.Printf("[cloud] heartbeat failed (%d consecutive): %v", n, err)
+		return
+	}
+	c.mu.Lock()
+	hadFailures := c.failures > 0
+	c.failures = 0
+	c.mu.Unlock()
+	if hadFailures {
+		log.Printf("[cloud] heartbeat recovered")
+	}
+}
+
+// heartbeatOnce sends a single Heartbeat with the host-bearer metadata.
+func (c *Client) heartbeatOnce(ctx context.Context) error {
+	hbCtx, cancel := context.WithTimeout(c.authContext(ctx), 10*time.Second)
+	defer cancel()
+	resp, err := c.ac.Heartbeat(hbCtx, &cloudv1.HeartbeatRequest{})
+	if err != nil {
+		return err
+	}
+	c.refreshSSHTrustBundleIfStale(ctx, resp.GetSshTrustVersion())
+	return nil
+}
+
+// refreshSSHTrustBundleIfStale fetches and caches a new SSH CA trust bundle
+// when the heartbeat's advertised version differs from what this client has
+// cached (cloud design #1076 Change C, cloud issue #1082 / #1928).
+//
+// Best-effort and separate from the heartbeat's own error return: a fetch
+// failure is logged and retried on the next heartbeat. Failing the heartbeat
+// itself over a stale trust bundle would mark a healthy host stale and get
+// its containers reassigned — wildly disproportionate to "the CA trust hint
+// is a beat behind".
+func (c *Client) refreshSSHTrustBundleIfStale(ctx context.Context, wantVersion string) {
+	if wantVersion == "" {
+		return // this cloud daemon has no SSH CA configured
+	}
+	c.sshTrustMu.Lock()
+	have := c.sshTrustVersion
+	c.sshTrustMu.Unlock()
+	if have == wantVersion {
+		return
+	}
+
+	fetchCtx, cancel := context.WithTimeout(c.authContext(ctx), 10*time.Second)
+	defer cancel()
+	resp, err := c.ac.GetSSHTrustBundle(fetchCtx, &cloudv1.GetSSHTrustBundleRequest{KnownVersion: have})
+	if err != nil {
+		log.Printf("[cloud] ssh trust bundle fetch failed (keeping version %q): %v", have, err)
+		return
+	}
+	if resp.GetUnchanged() {
+		// The version we already had was still current by the time this
+		// request reached the server (the heartbeat hint and this fetch
+		// raced a rotation) — nothing to install, just record the version.
+		c.sshTrustMu.Lock()
+		c.sshTrustVersion = resp.GetVersion()
+		c.sshTrustMu.Unlock()
+		return
+	}
+	if len(resp.GetCaKeys()) == 0 {
+		// Refuse to cache an empty bundle. Mirrors sshca.BuildTrustBundle's
+		// own refusal on the cloud side: a host that installed this would
+		// trust NOTHING, locking out every certificate-auth user, which is
+		// worse than keeping a stale-but-working bundle.
+		log.Printf("[cloud] ssh trust bundle fetch returned no CA keys (keeping version %q)", have)
+		return
+	}
+
+	file := renderTrustedUserCAKeysFile(resp.GetCaKeys())
+	c.sshTrustMu.Lock()
+	c.sshTrustFile = file
+	c.sshTrustVersion = resp.GetVersion()
+	c.sshTrustMu.Unlock()
+	log.Printf("[cloud] ssh trust bundle updated: version=%s keys=%d", resp.GetVersion(), len(resp.GetCaKeys()))
+}
+
+// SSHTrustedUserCAKeys returns the most recently cached SSH CA trust-bundle
+// file content (sshd TrustedUserCAKeys form) and its version. ok is false
+// when nothing has been cached yet — either the cloud daemon has no SSH CA
+// configured, or this client hasn't completed a heartbeat/fetch cycle yet.
+//
+// This is how a host relays trust to a sentinel that has no cloud
+// credential of its own: the sentinel already pulls this host's
+// /authorized-keys on a timer over an existing authenticated channel, and
+// the gateway handler for that endpoint reads this accessor to include the
+// bundle in its response — see internal/gateway/keys_handler.go.
+func (c *Client) SSHTrustedUserCAKeys() (content, version string, ok bool) {
+	c.sshTrustMu.Lock()
+	defer c.sshTrustMu.Unlock()
+	return c.sshTrustFile, c.sshTrustVersion, c.sshTrustVersion != ""
+}
+
+// renderTrustedUserCAKeysFile renders CA keys as sshd's TrustedUserCAKeys
+// file expects: one authorized_keys-form key per line. Mirrors the cloud
+// repo's sshca.TrustBundle.TrustedUserCAKeysFile() rendering exactly, so a
+// host's copy is byte-identical to what the cloud itself would write.
+func renderTrustedUserCAKeysFile(keys []*cloudv1.SSHCAKey) string {
+	var sb strings.Builder
+	for _, k := range keys {
+		state := "retired"
+		if k.GetActive() {
+			state = "active"
+		}
+		// The comment is for an operator reading the file on a host; sshd
+		// ignores it. Seeing WHICH key is which during a rotation is the
+		// difference between a two-minute check and an incident.
+		fmt.Fprintf(&sb, "# kid=%s (%s)\n%s\n", k.GetKeyId(), state, strings.TrimSpace(k.GetPublicKey()))
+	}
+	return sb.String()
+}
+
+// authContext attaches the host bearer the cloud interceptor authenticates on.
+func (c *Client) authContext(ctx context.Context) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, hostBearerMetadataKey, c.cfg.Token)
+}
+
+// watchBackoff is the reconnect schedule for the WatchAssignments stream:
+// exponential with a 60s cap. Jitter is omitted (single host per process; no
+// thundering herd to spread).
+var watchBackoff = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, 60 * time.Second}
+
+// watchLoop opens the WatchAssignments server stream and reconciles each batch,
+// reconnecting with capped exponential backoff on any stream error. Runs until
+// the client context is cancelled.
+func (c *Client) watchLoop() {
+	defer c.wg.Done()
+	attempt := 0
+	for {
+		if c.ctx.Err() != nil {
+			return
+		}
+		err := c.watchOnce()
+		if c.ctx.Err() != nil {
+			return
+		}
+		// Stream ended (error or clean EOF) — back off, then re-open. A fresh
+		// WatchAssignments resends the full snapshot, so the reconcile is
+		// self-correcting; we never lose state by reconnecting.
+		d := watchBackoff[attempt]
+		if attempt < len(watchBackoff)-1 {
+			attempt++
+		}
+		if err != nil {
+			log.Printf("[cloud] watch stream ended (%v); reconnecting in %s", err, d)
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(d):
+		}
+	}
+}
+
+// watchOnce opens one stream and reconciles batches until it errors. On the
+// first successful batch it resets nothing — the caller's backoff index resets
+// only via a successful reconnect cycle (kept simple: any return re-enters the
+// loop). Returns the stream error (nil on a clean server close).
+func (c *Client) watchOnce() error {
+	stream, err := c.watchAC.WatchAssignments(c.authContext(c.ctx), &cloudv1.WatchAssignmentsRequest{})
+	if err != nil {
+		return err
+	}
+	for {
+		batch, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		c.reconcile(batch)
+	}
+}
+
+// reconcile applies one batch: (1) converge per-org network policies into the
+// sink (the #315 cloud-extension loop), then (2) reconcile each assignment's
+// container toward its desired_state (or carry out its other kind).
+func (c *Client) reconcile(batch *cloudv1.AssignmentBatch) {
+	if c.sink != nil {
+		if err := c.sink.SyncNetworkPolicies(c.ctx, batch.GetNetworkPolicies()); err != nil {
+			log.Printf("[cloud] sync network policies: %v", err)
+		}
+	}
+	live := make(map[string]bool, len(batch.GetAssignments()))
+	for _, a := range batch.GetAssignments() {
+		live[a.GetAssignmentId()] = true
+		c.reconcileAssignment(a)
+	}
+	// The batch is the full live set: forget terminations the cloud has
+	// released, so the record stays bounded.
+	c.terminatedMu.Lock()
+	for id := range c.terminated {
+		if !live[id] {
+			delete(c.terminated, id)
+		}
+	}
+	c.terminatedMu.Unlock()
+}
+
+// reconcileAssignment dispatches on the assignment's kind. A container
+// assignment (kind UNSPECIFIED or CONTAINER) drives one container toward its
+// desired_state and reports the observed state back. The reconcile is
+// idempotent (the actuator no-ops a converged container), so re-sent
+// snapshots are safe.
+func (c *Client) reconcileAssignment(a *cloudv1.Assignment) {
+	if a.GetKind() == cloudv1.AssignmentKind_ASSIGNMENT_KIND_TERMINATE_USER_SESSIONS {
+		c.reconcileTermination(a)
+		return
+	}
+	if c.containers == nil {
+		return
+	}
+	name := localContainerName(a.GetContainerId())
+	switch a.GetDesiredState() {
+	case "running":
+		routes := make([]RouteSpec, 0, len(a.GetRoutes()))
+		for _, r := range a.GetRoutes() {
+			routes = append(routes, RouteSpec{Domain: r.GetDomain(), TargetPort: r.GetTargetPort(), Protocol: r.GetProtocol()})
+		}
+		if err := c.containers.EnsureRunning(c.ctx, ContainerSpec{
+			LocalName: name, OrgID: a.GetOrgId(), Image: a.GetImage(),
+			RAMMB: a.GetRamMb(), DiskGB: a.GetDiskGb(), GPUCount: a.GetGpuCount(),
+			SecretEnv: a.GetSecretEnv(), Routes: routes,
+		}); err != nil {
+			log.Printf("[cloud] ensure running %s: %v", name, err)
+			return // leave the cloud's observed state stale; next snapshot retries
+		}
+		c.report(a.GetContainerId(), "active")
+	case "stopped":
+		if err := c.containers.EnsureStopped(c.ctx, name); err != nil {
+			log.Printf("[cloud] ensure stopped %s: %v", name, err)
+			return
+		}
+		c.report(a.GetContainerId(), "stopped")
+	case "deleted":
+		if err := c.containers.EnsureDeleted(c.ctx, name); err != nil {
+			log.Printf("[cloud] ensure deleted %s: %v", name, err)
+		}
+		// No state report — the cloud releases the assignment once the host
+		// stops reporting it (there is no "deleted" observed-state value).
+	default:
+		// Unknown / empty desired_state — leave it alone (informational only).
+	}
+}
+
+// reconcileTermination ends every live SSH session of a.user_id on this host
+// (the deactivation fan-out of docs/architecture/ssh-live-authorization.md).
+// It runs once per assignment_id: a replay of a carried-out assignment is a
+// no-op reported as success. A failure is not recorded, so the next
+// delivery retries. An assignment without an id cannot be deduplicated and
+// runs on every delivery; ending sessions again is harmless.
+//
+// A user_id the host cannot map to a local login (ErrUserNotMapped, #2602)
+// is logged at warn with the assignment id and counted as its own outcome,
+// never as a walk that found no sessions. It is recorded as handled: a
+// retry cannot map it later, since a deactivated user cannot log in again.
+func (c *Client) reconcileTermination(a *cloudv1.Assignment) terminationOutcome {
+	if c.sessions == nil {
+		return terminationIgnored
+	}
+	id, user, org := a.GetAssignmentId(), a.GetUserId(), a.GetOrgId()
+	if user == "" {
+		log.Printf("[cloud] terminate-sessions assignment %q has no user_id; ignored", id)
+		return terminationIgnored
+	}
+	if id != "" && c.terminationDone(id) {
+		return terminationReplayed // already carried out
+	}
+	outcome := terminationEnded
+	if err := c.sessions.TerminateUserSessions(c.ctx, user, org); errors.Is(err, ErrUserNotMapped) {
+		log.Printf("[cloud] WARN terminate-sessions assignment %s: %v; no sessions ended", id, err)
+		outcome = terminationUnmapped
+	} else if err != nil {
+		log.Printf("[cloud] terminate sessions for %s (assignment %s): %v", user, id, err)
+		recordTerminationOutcome(c.ctx, terminationFailed)
+		return terminationFailed
+	}
+	if id != "" {
+		c.terminatedMu.Lock()
+		if c.terminated == nil {
+			c.terminated = map[string]bool{}
+		}
+		c.terminated[id] = true
+		c.terminatedMu.Unlock()
+	}
+	recordTerminationOutcome(c.ctx, outcome)
+	if outcome == terminationEnded {
+		log.Printf("[cloud] terminated sessions for %s (assignment %s)", user, id)
+	}
+	return outcome
+}
+
+func (c *Client) terminationDone(id string) bool {
+	c.terminatedMu.Lock()
+	defer c.terminatedMu.Unlock()
+	return c.terminated[id]
+}
+
+// report sends observed container state back to the cloud (best-effort). Part
+// of the pull/reconcile path, so it only runs in gRPC mode (the REST transport
+// runs no watch loop); watchAC is nil otherwise.
+func (c *Client) report(containerID, state string) {
+	if c.watchAC == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.authContext(c.ctx), 10*time.Second)
+	defer cancel()
+	if _, err := c.watchAC.ReportContainerState(ctx, &cloudv1.ReportContainerStateRequest{
+		ContainerId: containerID, State: state,
+	}); err != nil {
+		log.Printf("[cloud] report state %s=%s: %v", containerID, state, err)
+	}
+}
+
+// localContainerName maps a cloud container UUID to the host-local Incus name.
+// The cld- prefix keeps cloud-assigned containers from colliding with
+// operator-managed <tenant>-container names. Best-effort short form; the cloud
+// container_id is the durable key carried in ReportContainerState.
+func localContainerName(containerID string) string {
+	short := strings.ReplaceAll(containerID, "-", "")
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	if short == "" {
+		short = "unknown"
+	}
+	return "cld-" + short
+}
