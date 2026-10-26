@@ -90,3 +90,96 @@ export default function VersionsView({ server }: VersionsViewProps) {
       <div className="flex items-center gap-2 p-6 text-[var(--text-muted)]">
         <Loader2 className="h-4 w-4 animate-spin" /> Loading versions…
       </div>
+    );
+  }
+
+  return (
+    <div className="p-4">
+      <div className="mb-4 flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-semibold">Versions</h2>
+          <p className="text-xs text-[var(--text-muted)]">
+            Daemon version per backend vs the latest GitHub release
+            {latestTag ? <> — latest: <span className="font-medium">{latestTag}</span></> : <> — latest: unknown</>}
+          </p>
+        </div>
+        <button
+          onClick={() => { setLoading(true); load(); }}
+          className="flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] px-3 py-1.5 text-sm hover:bg-[var(--surface-2)]"
+        >
+          <RefreshCw className="h-3.5 w-3.5" /> Refresh
+        </button>
+      </div>
+
+      {error && (
+        <div className="mb-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-[var(--c-red)]">{error}</div>
+      )}
+      {notice && (
+        <div className="mb-3 rounded-lg border border-blue-500/30 bg-blue-500/10 px-3 py-2 text-sm text-[var(--c-blue)]">{notice}</div>
+      )}
+
+      <div className="overflow-hidden rounded-xl border border-[var(--border-subtle)]">
+        <table className="w-full text-sm">
+          <thead className="bg-[var(--surface-2)] text-left text-xs text-[var(--text-muted)]">
+            <tr>
+              <th className="px-4 py-2 font-medium">Backend</th>
+              <th className="px-4 py-2 font-medium">Type</th>
+              <th className="px-4 py-2 font-medium">Current</th>
+              <th className="px-4 py-2 font-medium">Latest</th>
+              <th className="px-4 py-2 font-medium">Status</th>
+              <th className="px-4 py-2 text-right font-medium">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {backends.map((b) => {
+              const current = b.version || '';
+              const behind = !!latestTag && normalizeVersion(current) !== normalizeVersion(latestTag);
+              const key = b.id || '(local)';
+              const busy = !!upgrading[key];
+              return (
+                <tr key={b.id} className="border-t border-[var(--border-subtle)]">
+                  <td className="px-4 py-2 font-medium">
+                    {b.id}
+                    {b.hostname ? <span className="text-[var(--text-muted)]"> · {b.hostname}</span> : null}
+                  </td>
+                  <td className="px-4 py-2 text-[var(--text-muted)]">{b.type}</td>
+                  <td className="px-4 py-2 font-mono">{current || '—'}</td>
+                  <td className="px-4 py-2 font-mono">{latestTag || '—'}</td>
+                  <td className="px-4 py-2">
+                    {!b.healthy ? (
+                      <span className="inline-flex items-center gap-1 text-[var(--text-muted)]"><AlertTriangle className="h-3.5 w-3.5" /> offline</span>
+                    ) : behind ? (
+                      <span className="inline-flex items-center gap-1 text-[var(--c-amber)]"><AlertTriangle className="h-3.5 w-3.5" /> behind</span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 text-[var(--c-emerald)]"><CheckCircle2 className="h-3.5 w-3.5" /> current</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2 text-right">
+                    <button
+                      onClick={() => handleUpgrade(b.id, current)}
+                      disabled={busy || !b.healthy}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] px-3 py-1.5 text-xs hover:bg-[var(--surface-2)] disabled:cursor-not-allowed disabled:opacity-50"
+                      title="Pull the sentinel-served binary, verify, and restart this daemon"
+                    >
+                      {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowUpCircle className="h-3.5 w-3.5" />}
+                      {busy ? 'Upgrading…' : 'Upgrade now'}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+            {backends.length === 0 && (
+              <tr><td colSpan={6} className="px-4 py-6 text-center text-[var(--text-muted)]">No backends.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="mt-3 text-xs text-[var(--text-muted)]">
+        “Upgrade now” pulls the binary the sentinel currently serves (SHA-verified + smoke-tested), swaps it
+        atomically, and restarts the daemon. The latest-GitHub column is for visibility; bringing the sentinel
+        up to a new release is a separate operator step.
+      </p>
+    </div>
+  );
+}

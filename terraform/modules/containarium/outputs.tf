@@ -49,3 +49,21 @@ output "spot_vm_internal_ip" {
 
 output "daemon_enabled" {
   description = "Whether Containarium gRPC daemon is enabled"
+  value       = var.enable_containarium_daemon
+}
+
+output "daemon_endpoint" {
+  description = "gRPC daemon endpoint (host:port)"
+  value       = var.enable_containarium_daemon ? "${google_compute_address.jump_server_ip.address}:50051" : "Not enabled"
+}
+
+# Aliases for E2E testing
+output "instance_name" {
+  description = "Alias for jump_server_name (for E2E tests)"
+  value       = var.use_spot_instance ? google_compute_instance.jump_server_spot[0].name : google_compute_instance.jump_server[0].name
+}
+
+output "zone" {
+  description = "Alias for jump_server_zone (for E2E tests)"
+  value       = var.use_spot_instance ? google_compute_instance.jump_server_spot[0].zone : google_compute_instance.jump_server[0].zone
+}
