@@ -35,3 +35,29 @@ to a file mode 0400 owned by root on the sentinel:
     containarium pki generate-ca > /etc/containarium/ca.key
     chmod 0400 /etc/containarium/ca.key
 
+Then point the sentinel daemon at it via the systemd environment:
+
+    CONTAINARIUM_CA_KEY_FILE=/etc/containarium/ca.key
+
+On the next sentinel restart the binary generates a self-signed CA
+certificate from this key (10-year validity) and starts issuing
+peer leaf certs over /sentinel/peer-cert. Replacing this file and
+restarting rotates the entire CA — every leaf cert in the fleet
+expires within the leaf-TTL window (default 7 days) and re-issues
+under the new CA on the next renewal tick.`,
+	RunE: func(_ *cobra.Command, _ []string) error {
+		keyPEM, err := pki.GenerateCAKey()
+		if err != nil {
+			return fmt.Errorf("generate CA key: %w", err)
+		}
+		if _, err := os.Stdout.Write(keyPEM); err != nil {
+			return fmt.Errorf("write to stdout: %w", err)
+		}
+		return nil
+	},
+}
+
+func init() {
+	pkiCmd.AddCommand(pkiGenerateCACmd)
+	rootCmd.AddCommand(pkiCmd)
+}
