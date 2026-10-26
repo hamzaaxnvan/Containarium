@@ -72,3 +72,300 @@ const APITokenPrefix = "ctnr_"
 func IsCloudToken(token string) bool {
 	return strings.HasPrefix(strings.TrimSpace(token), APITokenPrefix)
 }
+
+type ServerCreds struct {
+	Token     string     `json:"token"`
+	UserEmail string     `json:"user_email"`
+	OrgID     string     `json:"org_id"`
+	IssuedAt  time.Time  `json:"issued_at"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	// AccessModel records how this server grants box access. Learned at login
+	// from the server's declared model, falling back to a host heuristic, and
+	// cached here so later commands don't re-detect (#637 follow-up). Empty for
+	// credentials written before this field existed.
+	AccessModel AccessModel `json:"access_model,omitempty"`
+}
+
+// CredentialsFile is the on-disk JSON document. DefaultServer is the
+// server the CLI falls back to when --server is unset; it MUST also
+// be a key in Servers (Save enforces this).
+type CredentialsFile struct {
+	DefaultServer string                 `json:"default_server"`
+	Servers       map[string]ServerCreds `json:"servers"`
+}
+
+// NewCredentialsFile returns an empty, valid CredentialsFile. Always
+// prefer this over `&CredentialsFile{}` so the Servers map is
+// initialized (nil-map writes panic).
+func NewCredentialsFile() *CredentialsFile {
+	return &CredentialsFile{
+		Servers: make(map[string]ServerCreds),
+	}
+}
+
+// DefaultPath returns the absolute path to the credentials file
+// under the current user's home directory. Honors $HOME (via
+// os.UserHomeDir) so t.Setenv("HOME", tmpdir) works in tests.
+func DefaultPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	return filepath.Join(home, DefaultRelPath), nil
+}
+
+// Load reads the credentials file at path. If the file does not
+// exist Load returns an empty, valid CredentialsFile and a nil error
+// — callers should not have to distinguish "never logged in" from
+// "log in and then look up". Any other error (perm denied, malformed
+// JSON, …) is propagated.
+func Load(path string) (*CredentialsFile, error) {
+	// #nosec G304 -- path is supplied by the CLI from the user's
+	// home directory or an explicit override (tests); not attacker
+	// controlled.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return NewCredentialsFile(), nil
+		}
+		return nil, fmt.Errorf("read credentials file: %w", err)
+	}
+
+	// Empty file → treat as fresh. Some editors leave 0-byte files
+	// behind; this is friendlier than a json.Unmarshal error.
+	if len(b) == 0 {
+		return NewCredentialsFile(), nil
+	}
+
+	cf := NewCredentialsFile()
+	if err := json.Unmarshal(b, cf); err != nil {
+		return nil, fmt.Errorf("parse credentials file %s: %w", path, err)
+	}
+	if cf.Servers == nil {
+		cf.Servers = make(map[string]ServerCreds)
+	}
+	return cf, nil
+}
+
+// Save writes the credentials file atomically (write to .tmp +
+// rename) with 0600 permissions. The parent directory is created
+// with 0700 if missing.
+//
+// DefaultServer is auto-repaired: if it is unset but Servers has
+// exactly one entry, we point to that. If it is set to a server
+// that no longer exists in Servers (e.g. after Remove), we pick
+// any remaining server, or clear it if none remain.
+func Save(path string, cf *CredentialsFile) error {
+	if cf == nil {
+		return fmt.Errorf("nil credentials file")
+	}
+	if cf.Servers == nil {
+		cf.Servers = make(map[string]ServerCreds)
+	}
+
+	// Repair default_server.
+	if _, ok := cf.Servers[cf.DefaultServer]; !ok || cf.DefaultServer == "" {
+		cf.DefaultServer = ""
+		for srv := range cf.Servers {
+			cf.DefaultServer = srv
+			break
+		}
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create credentials dir %s: %w", dir, err)
+	}
+
+	b, err := json.MarshalIndent(cf, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal credentials: %w", err)
+	}
+
+	// Atomic rename: write to a sibling temp file, fsync, then
+	// rename over the destination. On POSIX rename is atomic on
+	// the same filesystem, so a crash mid-write never leaves the
+	// real file truncated.
+	tmp, err := os.CreateTemp(dir, ".credentials-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp credentials file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	// Best-effort cleanup if anything below fails.
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp credentials file: %w", err)
+	}
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp credentials file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp credentials file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename credentials file into place: %w", err)
+	}
+	return nil
+}
+
+// Get returns the credentials for the given server. The server arg
+// is normalized via NormalizeServer so callers can pass either
+// "cloud.containarium.dev" or "https://cloud.containarium.dev/" and
+// land on the same record.
+//
+// When server is empty, Get returns the DefaultServer's record.
+// Returns (zero, false) if no matching record exists.
+func (cf *CredentialsFile) Get(server string) (ServerCreds, bool) {
+	_, c, ok := cf.Lookup(server)
+	return c, ok
+}
+
+// Lookup is Get that also returns the stored key the record lives under,
+// so a caller handed a bare "host" can recover the full "https://host"
+// URL that login wrote (and that an HTTP client needs to pick the right
+// scheme).
+//
+// Matching, in order:
+//  1. exact match on the normalized form;
+//  2. a tolerant scan over normalized stored keys (older or hand-edited
+//     files with trailing slashes);
+//  3. only when the caller supplied NO scheme: a stored key that differs
+//     solely by its scheme. An explicit "http://x" never matches a stored
+//     "https://x" — that would send the token in the clear.
+func (cf *CredentialsFile) Lookup(server string) (string, ServerCreds, bool) {
+	if cf == nil || cf.Servers == nil {
+		return "", ServerCreds{}, false
+	}
+	key := server
+	if key == "" {
+		key = cf.DefaultServer
+	}
+	if key == "" {
+		return "", ServerCreds{}, false
+	}
+	key = NormalizeServer(key)
+	if c, ok := cf.Servers[key]; ok {
+		return key, c, true
+	}
+	for k, v := range cf.Servers {
+		if NormalizeServer(k) == key {
+			return k, v, true
+		}
+	}
+	if !strings.Contains(key, "://") {
+		// Deterministic when several stored keys share a host: sorted.
+		keys := make([]string, 0, len(cf.Servers))
+		for k := range cf.Servers {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if stripScheme(NormalizeServer(k)) == key {
+				return k, cf.Servers[k], true
+			}
+		}
+	}
+	return "", ServerCreds{}, false
+}
+
+// stripScheme drops a leading "scheme://", if any.
+func stripScheme(s string) string {
+	if i := strings.Index(s, "://"); i >= 0 {
+		return s[i+3:]
+	}
+	return s
+}
+
+// ServerKeys lists the stored server keys, sorted, for error messages that
+// tell the user which servers they are logged in to.
+func (cf *CredentialsFile) ServerKeys() []string {
+	if cf == nil {
+		return nil
+	}
+	keys := make([]string, 0, len(cf.Servers))
+	for k := range cf.Servers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// Set inserts or replaces the record for server. The server key is
+// normalized. If this is the first server in the file, it also
+// becomes the DefaultServer.
+func (cf *CredentialsFile) Set(server string, creds ServerCreds) {
+	if cf.Servers == nil {
+		cf.Servers = make(map[string]ServerCreds)
+	}
+	key := NormalizeServer(server)
+	cf.Servers[key] = creds
+	if cf.DefaultServer == "" {
+		cf.DefaultServer = key
+	}
+}
+
+// Remove deletes the record for server. Returns true if a record
+// was actually removed. If the removed server was the
+// DefaultServer, Save will pick a new default on next write (or
+// clear it if none remain).
+func (cf *CredentialsFile) Remove(server string) bool {
+	if cf == nil || cf.Servers == nil {
+		return false
+	}
+	key := NormalizeServer(server)
+	// First try direct, then tolerant scan (mirrors Get).
+	if _, ok := cf.Servers[key]; ok {
+		delete(cf.Servers, key)
+		if cf.DefaultServer == key {
+			cf.DefaultServer = ""
+		}
+		return true
+	}
+	for k := range cf.Servers {
+		if NormalizeServer(k) == key {
+			delete(cf.Servers, k)
+			if NormalizeServer(cf.DefaultServer) == key {
+				cf.DefaultServer = ""
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeServer canonicalizes a server URL so lookups are stable
+// across "https://x/" vs "https://x" vs "x" inputs.
+//
+// Rules:
+//   - Strip exactly one trailing slash.
+//   - Lower-case the scheme + host portion (paths preserved
+//     case-sensitively, though we don't expect any).
+//   - Leave the scheme as-supplied (we do NOT auto-prepend
+//     https://). The login command is what decides the scheme; the
+//     store just round-trips whatever it's given.
+//
+// The intent is leniency on read, strictness on write — the store
+// is keyed off the normalized form, but callers can look it up
+// loosely.
+func NormalizeServer(server string) string {
+	s := strings.TrimSpace(server)
+	s = strings.TrimRight(s, "/")
+	// Lower-case scheme + host. We do a cheap scheme split rather
+	// than pulling in net/url for the common case.
+	if i := strings.Index(s, "://"); i >= 0 {
+		scheme := strings.ToLower(s[:i])
+		rest := s[i+3:]
+		if j := strings.Index(rest, "/"); j >= 0 {
+			rest = strings.ToLower(rest[:j]) + rest[j:]
+		} else {
+			rest = strings.ToLower(rest)
+		}
+		s = scheme + "://" + rest
+	} else {
+		s = strings.ToLower(s)
+	}
+	return s
+}

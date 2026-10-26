@@ -160,3 +160,58 @@ func (cs *CoreServices) configurePostgresAccess(ctx context.Context) error {
 // the lines this code added: pg_hba.conf is first-match, so a scoped line that
 // still matches the daemon would keep rejecting it in front of the fallback.
 func (cs *CoreServices) applyBroadHBA(ctx context.Context, removeScoped bool) error {
+	if removeScoped {
+		if err := cs.incusClient.Exec(CorePostgresContainer, []string{
+			"bash", "-c", fmt.Sprintf("sed -i '/%s$/d' %s", hbaMarker, pgHbaPath),
+		}); err != nil {
+			return fmt.Errorf("failed to remove the scoped pg_hba.conf rules: %w", err)
+		}
+	}
+	if err := cs.incusClient.Exec(CorePostgresContainer, []string{
+		"bash", "-c", fmt.Sprintf("echo '%s' >> %s", postgresHBABroadLine(cs.config.NetworkCIDR), pgHbaPath),
+	}); err != nil {
+		return fmt.Errorf("failed to update pg_hba.conf: %w", err)
+	}
+	return cs.restartPostgresAndWait(ctx)
+}
+
+func (cs *CoreServices) restartPostgresAndWait(ctx context.Context) error {
+	if err := cs.incusClient.Exec(CorePostgresContainer, []string{"systemctl", "restart", "postgresql"}); err != nil {
+		return fmt.Errorf("failed to restart postgresql: %w", err)
+	}
+	return cs.waitForPostgres(ctx)
+}
+
+// probeDaemonLogin logs in the way the daemon will, retrying briefly because a
+// just-restarted Postgres can refuse connections for a moment.
+func (cs *CoreServices) probeDaemonLogin(ctx context.Context) error {
+	probe := cs.pgLoginProbe
+	if probe == nil {
+		probe = cs.postgresLogin
+	}
+	var err error
+	for i := 0; i < postgresProbeAttempts; i++ {
+		if err = probe(ctx); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(postgresProbeRetryDelay):
+		}
+	}
+	return err
+}
+
+// postgresLogin opens one real connection over the network with the daemon's
+// credentials and pings it.
+func (cs *CoreServices) postgresLogin(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return pgxPing(ctx, pgPingArgs{
+		Host:     net.JoinHostPort(cs.postgresIP, strconv.Itoa(DefaultPostgresPort)),
+		User:     cs.config.PostgresUser,
+		Password: cs.config.PostgresPassword,
+		Database: cs.config.PostgresDB,
+	})
+}
