@@ -82,3 +82,31 @@ func (m *Manager) Observe(ctx context.Context) error {
 		live[all[i].Ref.Name] = knownBox{fpHash: all[i].Labels[LabelFPHash], expiresAt: all[i].TTLExpiresAt, claimed: all[i].Labels[LabelClaimedAt] != ""}
 	}
 
+	m.mu.Lock()
+	prev := m.known
+	m.known = live
+	m.mu.Unlock()
+
+	for name, k := range prev {
+		if _, still := live[name]; still {
+			continue
+		}
+		switch {
+		case k.claimed:
+			// A claimed box is the tenant's; its deletion is not part of
+			// the funnel.
+		case !k.expiresAt.IsZero() && !now.Before(k.expiresAt):
+			m.record(FunnelEvent{Kind: FunnelExpired, FPHash: k.fpHash, BoxName: name})
+		default:
+			m.record(FunnelEvent{Kind: FunnelKilledAbuse, FPHash: k.fpHash, BoxName: name, Reason: "deleted before its TTL"})
+		}
+	}
+	return nil
+}
+
+// knownBox is what Observe remembers between ticks.
+type knownBox struct {
+	fpHash    string
+	expiresAt time.Time
+	claimed   bool
+}

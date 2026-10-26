@@ -28,3 +28,18 @@ func getSystemInfoLocal() (*incus.ServerInfo, []incus.ContainerInfo, error) {
 	}
 
 	return serverInfo, containers, nil
+}
+
+// getContainerInfoLocal is showContainerInfo's local-mode branch.
+func getContainerInfoLocal(username string) (*incus.ContainerInfo, error) {
+	mgr, err := container.New()
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Incus: %w (is Incus running?)", err)
+	}
+
+	info, err := mgr.Get(username)
+	if err != nil {
+		return nil, fmt.Errorf("container not found: %w", err)
+	}
+	return info, nil
+}

@@ -57,3 +57,62 @@ func syncRetryDelays(interval time.Duration) []time.Duration {
 	)
 	for d := syncRetryInitial; len(delays) < maxSyncFastRetries; d *= 2 {
 		if d > syncRetryMax {
+			d = syncRetryMax
+		}
+		if elapsed+d >= interval {
+			break
+		}
+		delays = append(delays, d)
+		elapsed += d
+	}
+	return delays
+}
+
+// runSyncLoop calls attempt every interval, and after any failed attempt
+// retries on the supplied schedule until one succeeds or the schedule is
+// exhausted. Blocks until ctx is done.
+//
+// attempt does its own success/failure logging (the two callers report
+// different things); the error is used only to decide whether to retry.
+//
+// The regular ticker is independent of the retry burst, so a recovered
+// failure does not shift the steady-state cadence — on the success path
+// this is byte-for-byte the old behaviour.
+func runSyncLoop(ctx context.Context, name string, interval time.Duration, delays []time.Duration, attempt func() error) {
+	runOnce := func() {
+		if err := attempt(); err == nil {
+			return
+		}
+		for i, d := range delays {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(d):
+			}
+			log.Printf("[%s] retrying after a failed sync (fast retry %d/%d, waited %s)",
+				name, i+1, len(delays), d)
+			if err := attempt(); err == nil {
+				log.Printf("[%s] recovered on fast retry %d — without this the next attempt "+
+					"would have been up to %s away", name, i+1, interval)
+				return
+			}
+		}
+		if len(delays) > 0 {
+			log.Printf("[%s] %d fast retries did not recover; falling back to the regular %s interval",
+				name, len(delays), interval)
+		}
+	}
+
+	runOnce()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runOnce()
+		}
+	}
+}
