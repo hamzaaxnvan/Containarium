@@ -22,3 +22,52 @@ func sshKeysTools() []Tool {
 				"An empty list removes every caller-managed key and needs allow_empty=true. " +
 				"Same access as adding a key.",
 			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"username": map[string]interface{}{"type": "string", "description": "Username of the box"},
+					"ssh_public_keys": map[string]interface{}{
+						"type":        "array",
+						"items":       map[string]interface{}{"type": "string"},
+						"description": "The complete desired list of public keys",
+					},
+					"allow_empty": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Must be true to send an empty list (removes every caller-managed key)",
+					},
+				},
+				"required": []string{"username"},
+			},
+			Handler: handleSetSSHKeys,
+		},
+	}
+}
+
+func handleSetSSHKeys(client API, args map[string]interface{}) (string, error) {
+	username := getStringArg(args, "username", "")
+	if username == "" {
+		return "", fmt.Errorf("username is required")
+	}
+	req := &pb.SetSSHKeysRequest{Username: username, AllowEmpty: getBoolArg(args, "allow_empty", false)}
+	if raw, ok := args["ssh_public_keys"].([]interface{}); ok {
+		for _, v := range raw {
+			k, ok := v.(string)
+			if !ok {
+				return "", fmt.Errorf("ssh_public_keys must be an array of strings")
+			}
+			req.SshPublicKeys = append(req.SshPublicKeys, k)
+		}
+	}
+	body, err := protojson.Marshal(req)
+	if err != nil {
+		return "", err
+	}
+	respBody, err := client.doRequest("PUT", "/v1/containers/"+url.PathEscape(username)+"/ssh-keys", body)
+	if err != nil {
+		return "", fmt.Errorf("failed to set ssh keys: %w", err)
+	}
+	var resp pb.SetSSHKeysResponse
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(respBody, &resp); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+	return fmt.Sprintf("✅ %s (removed %d, %d caller-managed key(s) now authorized)", resp.Message, resp.RemovedKeys, resp.TotalKeys), nil
+}
