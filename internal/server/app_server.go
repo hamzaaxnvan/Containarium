@@ -239,3 +239,84 @@ func (s *AppServer) RestartApp(ctx context.Context, req *pb.RestartAppRequest) (
 func (s *AppServer) DeleteApp(ctx context.Context, req *pb.DeleteAppRequest) (*pb.DeleteAppResponse, error) {
 	if err := auth.RequireScope(ctx, auth.ScopeContainersWrite); err != nil {
 		return nil, err
+	}
+	if s.isDisabled() {
+		return nil, status.Errorf(codes.Unavailable, "app hosting is not enabled")
+	}
+	if req.Username == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "username is required")
+	}
+	if req.AppName == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "app_name is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return nil, err
+	}
+
+	// Get app ID before deletion for event
+	appInfo, _ := s.store.GetByName(ctx, req.Username, req.AppName)
+	appID := ""
+	if appInfo != nil {
+		appID = appInfo.Id
+	}
+
+	err := s.manager.DeleteApp(ctx, req.Username, req.AppName, req.RemoveData)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to delete app: %v", err)
+	}
+
+	// Emit app deleted event
+	if appID != "" {
+		s.emitter.EmitAppDeleted(appID)
+	}
+
+	return &pb.DeleteAppResponse{
+		Message: fmt.Sprintf("Application %s deleted", req.AppName),
+	}, nil
+}
+
+// GetAppLogs gets application logs (streaming)
+func (s *AppServer) GetAppLogs(req *pb.GetAppLogsRequest, stream pb.AppService_GetAppLogsServer) error {
+	ctx := stream.Context()
+	if err := auth.RequireScope(ctx, auth.ScopeContainersRead); err != nil {
+		return err
+	}
+	if s.isDisabled() {
+		return status.Errorf(codes.Unavailable, "app hosting is not enabled")
+	}
+	if req.Username == "" {
+		return status.Errorf(codes.InvalidArgument, "username is required")
+	}
+	if req.AppName == "" {
+		return status.Errorf(codes.InvalidArgument, "app_name is required")
+	}
+	if err := auth.AuthorizeTenant(ctx, req.Username); err != nil {
+		return err
+	}
+
+	tailLines := req.TailLines
+	if tailLines == 0 {
+		tailLines = 100
+	}
+
+	// Get logs from manager
+	logs, err := s.manager.GetLogs(stream.Context(), req.Username, req.AppName, tailLines, req.Follow)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to get logs: %v", err)
+	}
+
+	// Send logs
+	resp := &pb.GetAppLogsResponse{
+		LogLines:  logs,
+		Timestamp: timestamppb.Now(),
+	}
+
+	if err := stream.Send(resp); err != nil {
+		return status.Errorf(codes.Internal, "failed to send logs: %v", err)
+	}
+
+	// TODO: Implement follow mode with streaming
+	// For now, we just return a single batch of logs
+
+	return nil
+}
