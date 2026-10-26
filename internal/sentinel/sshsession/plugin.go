@@ -226,3 +226,118 @@ func (p *Plugin) Shutdown() {
 }
 
 func (p *Plugin) record(rec Record) {
+	if p.Recorder == nil {
+		return
+	}
+	// Best-effort: a failure to persist a record must never break the
+	// SSH pipe it is trying to observe.
+	_ = p.Recorder.Record(rec)
+}
+
+func (p *Plugin) buildRecord(conn libplugin.ConnMetadata, phase SessionPhase) Record {
+	login := conn.User()
+	ip, port := hostport.Split(conn.RemoteAddr(), 0)
+
+	rec := Record{
+		SessionID:     conn.UniqueID(),
+		Phase:         phase,
+		OccurredAt:    p.now(),
+		ClientIP:      ip,
+		ClientPort:    port,
+		Login:         login,
+		AuthMethod:    AuthMethod(conn.GetMeta(metaAuthMethod)),
+		UserID:        conn.GetMeta(MetaUserID),
+		AuthzDecision: DecisionToProto(AuthzDecision(conn.GetMeta(MetaAuthzDecision))),
+		DenyReason:    ReasonToProto(DenyReason(conn.GetMeta(MetaDenyReason))),
+		Enforced:      conn.GetMeta(MetaEnforced) == "true",
+		Credential: Credential{
+			KeyID:          conn.GetMeta(metaKeyID),
+			CAFingerprint:  conn.GetMeta(metaCAFingerprint),
+			KeyFingerprint: conn.GetMeta(metaKeyFingerprint),
+		},
+	}
+
+	if s := conn.GetMeta(metaSerial); s != "" {
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+			rec.Serial = v
+		}
+	}
+
+	// The target routed at decision time wins over a fresh config.yaml read:
+	// keysync may have re-rendered the file since the session opened.
+	if target := conn.GetMeta(MetaTarget); target != "" {
+		rec.Target = target
+	} else if p.Target != nil {
+		rec.Target = p.Target.Resolve(login)
+	}
+
+	return rec
+}
+
+// classifyCloseReason turns the error WaitWithHook returned (surfaced to
+// the plugin as PipeErrorCallback's err, unconditionally — see sshpiperd's
+// own daemon.go) into one of our typed CloseReasons.
+//
+// WaitWithHook pipes both directions (upstream->downstream and
+// downstream->upstream) into the SAME error channel and returns whichever
+// side's read/write fails first, with no label saying which side that
+// was (see the vendored tg123/sshpiper/libplugin's PipeErrorCallback
+// signature: just a bare `error`). A plain io.EOF or a bare "connection
+// reset"/"broken pipe" string is exactly what an ordinary client closing
+// its own socket after running a command looks like from here — treating
+// that as CloseReasonUpstreamGone would flood any "close_reason ==
+// upstream_gone" alert with routine session ends (containarium#1980 PR
+// review finding 4).
+//
+// The one piece of side information that DOES survive is a *net.OpError's
+// Addr: Go's net package stamps the remote address of the specific TCP
+// socket whose read/write failed, and that's either the session's own
+// downstream client address (known — it's downstreamAddr, straight off
+// conn.RemoteAddr()) or, by elimination, the upstream/backend's. Only that
+// positively-attributed, non-downstream case is classified as
+// CloseReasonUpstreamGone; every other close reason string is still
+// matched, but never defaults to "upstream" on ambiguous evidence alone.
+func classifyCloseReason(err error, downstreamAddr string) CloseReason {
+	if err == nil {
+		return CloseReasonNormal
+	}
+
+	msg := err.Error()
+	if strings.Contains(msg, "disconnected by user") {
+		return CloseReasonNormal
+	}
+
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Addr != nil {
+		if sameHost(opErr.Addr.String(), downstreamAddr) {
+			return CloseReasonNormal
+		}
+		return CloseReasonUpstreamGone
+	}
+
+	switch {
+	case strings.Contains(msg, "EOF"),
+		strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "broken pipe"),
+		strings.Contains(msg, "connection lost"):
+		// Ambiguous: no address to attribute this to either side, and a
+		// normal client-side disconnect commonly presents exactly this
+		// way. Do not misattribute it to the backend.
+		return CloseReasonNormal
+	default:
+		return CloseReasonError
+	}
+}
+
+// sameHost reports whether two "host:port" (or bare host) strings name the
+// same host, ignoring the port — used to compare a *net.OpError's Addr
+// against the session's known downstream client address without being
+// tripped up by incidental formatting differences.
+func sameHost(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ha, _ := hostport.Split(a, 0)
+	hb, _ := hostport.Split(b, 0)
+	return ha != "" && ha == hb
+}

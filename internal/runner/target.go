@@ -93,3 +93,27 @@ func (t Target) ConfigURL() string {
 // a repo-scoped token used against an org endpoint returns a bare 403 that
 // says nothing about which scope is missing. Naming it is the difference
 // between a one-line fix and an afternoon.
+func (t Target) RequiredPATScope() string {
+	if t.Scope == ScopeOrg {
+		return "admin:org"
+	}
+	return "repo"
+}
+
+// String renders the target the way the user typed it.
+func (t Target) String() string {
+	if t.Scope == ScopeOrg {
+		return t.Owner
+	}
+	return t.Owner + "/" + t.Name
+}
+
+// scopeHint turns an authorization failure into one that names the scope the
+// target actually needs.
+func (t Target) scopeHint(status int) string {
+	if status != 403 && status != 401 {
+		return ""
+	}
+	return fmt.Sprintf(" — this is an %s target, which needs a token with the %q scope (a %q-scoped token returns exactly this)",
+		t.Scope, t.RequiredPATScope(), "repo")
+}
