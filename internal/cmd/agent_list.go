@@ -38,3 +38,17 @@ func runAgentList(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	if len(list) == 0 {
+		fmt.Println("No agent skills available.")
+		return nil
+	}
+	fmt.Printf("%-16s %-16s %-24s %s\n", "ID", "BOX", "SCOPES", "DESCRIPTION")
+	fmt.Println(strings.Repeat("-", 90))
+	for _, s := range list {
+		fmt.Printf("%-16s %-16s %-24s %s\n",
+			s.Id, s.GetRecipeId(), strings.Join(s.AllowedScopes, ","), s.Description)
+	}
+	return nil
+}

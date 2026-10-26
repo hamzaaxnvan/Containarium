@@ -311,3 +311,160 @@ stacks:
       # The repo ships install scripts (tests/install_KinD_create_KinD_cluster_install_kustomize.sh)
       # that pin the right Kind, kubectl, and Kustomize versions — we defer to those at setup time
       # rather than pinning here, so upgrades are a simple `git pull`.
+      - "git clone --branch 26.03 --depth 1 https://github.com/kubeflow/manifests.git /opt/kubeflow-manifests"
+    packages: []
+    post_install:
+      # Container user needs docker group to run kind/docker without sudo
+      - 'usermod -aG docker "$(logname 2>/dev/null || id -un 1000)"'
+      # Give the user ownership of manifests (install script writes to $HOME/.local/bin)
+      - 'chown -R "$(logname 2>/dev/null || id -un 1000):$(logname 2>/dev/null || id -un 1000)" /opt/kubeflow-manifests'
+      # Persist stack parameters so setup-kubeflow can find them later. The
+      # CONTAINARIUM_STACK_* env vars are only set while post_install runs;
+      # the user runs setup-kubeflow interactively later (or non-interactively
+      # from a CI job) when those vars are no longer present.
+      - |
+        sudo mkdir -p /etc/containarium
+        {
+          echo "# Stack parameters captured at container creation time"
+          env | grep '^CONTAINARIUM_STACK_' || true
+        } | sudo tee /etc/containarium/stack-params.env >/dev/null
+        sudo chmod 600 /etc/containarium/stack-params.env
+      # Write setup-kubeflow helper — user runs this after SSH'ing in
+      - |
+        cat > /usr/local/bin/setup-kubeflow <<'SCRIPT'
+        #!/bin/bash
+        # Creates a Kind cluster and installs the full Kubeflow AI Reference
+        # Platform (26.03) using the upstream kubeflow/manifests install
+        # scripts. Takes ~20-30 min.
+        #
+        # Customize login credentials with env vars (optional):
+        #   KUBEFLOW_USER      — email, default "user@example.com"
+        #   KUBEFLOW_PASSWORD  — password, default "12341234"
+        #
+        # Examples:
+        #   setup-kubeflow
+        #   KUBEFLOW_USER=me@example.com KUBEFLOW_PASSWORD=s3cret setup-kubeflow
+        set -euo pipefail
+
+        MANIFESTS_DIR="/opt/kubeflow-manifests"
+        if [ ! -d "$MANIFESTS_DIR" ]; then
+            echo "ERROR: $MANIFESTS_DIR not found. Re-install the kind-kubeflow stack."
+            exit 1
+        fi
+
+        # Load stack parameters that were captured at container create time.
+        if [ -f /etc/containarium/stack-params.env ]; then
+            set -a  # auto-export anything sourced
+            . /etc/containarium/stack-params.env
+            set +a
+        fi
+
+        # Credentials resolve in this order:
+        #   1. Explicit env vars when invoking setup-kubeflow manually
+        #   2. Stack parameters set at container create time (web UI form)
+        #   3. Interactive prompt when running in a TTY
+        #   4. Defaults (user@example.com / 12341234)
+        KUBEFLOW_USER="${KUBEFLOW_USER:-${CONTAINARIUM_STACK_kubeflow_user:-}}"
+        KUBEFLOW_PASSWORD="${KUBEFLOW_PASSWORD:-${CONTAINARIUM_STACK_kubeflow_password:-}}"
+        if [ -z "$KUBEFLOW_USER" ] && [ -t 0 ]; then
+            read -rp "Kubeflow username (email) [user@example.com]: " KUBEFLOW_USER
+        fi
+        if [ -z "$KUBEFLOW_PASSWORD" ] && [ -t 0 ]; then
+            read -rsp "Kubeflow password [12341234]: " KUBEFLOW_PASSWORD
+            echo ""
+        fi
+        KUBEFLOW_USER="${KUBEFLOW_USER:-user@example.com}"
+        KUBEFLOW_PASSWORD="${KUBEFLOW_PASSWORD:-12341234}"
+
+        # 1. Patch dex configuration with the chosen credentials
+        #    - Email: in common/dex/base/config-map.yaml
+        #    - Password: bcrypt hash in common/dex/base/dex-passwords.yaml
+        echo "==> Configuring login (user=$KUBEFLOW_USER)..."
+        BCRYPT_HASH=$(python3 -c "from passlib.hash import bcrypt; import os; print(bcrypt.using(rounds=12, ident='2y').hash(os.environ['P']))" P="$KUBEFLOW_PASSWORD")
+        cd "$MANIFESTS_DIR"
+        # Replace email (default: user@example.com)
+        sed -i "s|email: user@example.com|email: $KUBEFLOW_USER|" common/dex/base/config-map.yaml
+        # Replace bcrypt hash — match the DEX_USER_PASSWORD line and substitute
+        python3 -c "
+        import re, os
+        p = 'common/dex/base/dex-passwords.yaml'
+        with open(p) as f: d = f.read()
+        d = re.sub(r'DEX_USER_PASSWORD: \$2[ay]\$[0-9]+\$[A-Za-z0-9./]+',
+                   'DEX_USER_PASSWORD: ' + os.environ['H'], d)
+        open(p,'w').write(d)
+        " H="$BCRYPT_HASH"
+
+        # 2. Tune kernel for many pods (required by Kubeflow)
+        echo "==> Tuning inotify limits..."
+        sudo sysctl fs.inotify.max_user_instances=2280 fs.inotify.max_user_watches=1255360
+
+        # 3. Install Kind + kubectl + kustomize (the manifests repo pins versions)
+        #    Script installs to $HOME/.local/bin and creates a 3-node cluster.
+        echo "==> Installing Kind + kubectl + kustomize and creating Kind cluster..."
+        ./tests/install_KinD_create_KinD_cluster_install_kustomize.sh
+        export PATH="$HOME/.local/bin:$PATH"
+
+        # 4. Persist PATH for future shells
+        grep -q '\.local/bin' "$HOME/.bashrc" 2>/dev/null || \
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+
+        # 5. Save kubeconfig to standard location
+        mkdir -p "$HOME/.kube"
+        kind get kubeconfig --name kubeflow > "$HOME/.kube/config"
+        chmod 600 "$HOME/.kube/config"
+
+        # 6. Run Kubeflow's recommended install loop (retries until CRDs settle)
+        echo "==> Installing full Kubeflow platform (takes 20-30 min)..."
+        while ! kustomize build example | kubectl apply --server-side --force-conflicts -f -; do
+            echo "  Retrying apply... (CRDs/webhooks warming up)"
+            sleep 20
+        done
+
+        echo ""
+        echo "==> Waiting for pods to become ready (another 5-10 min)..."
+        kubectl wait --for=condition=ready pod --all --all-namespaces --timeout=1200s || {
+            echo "  Some pods still not ready. Check: kubectl get pods -A"
+        }
+
+        echo ""
+        echo "==> Kubeflow installed!"
+        echo ""
+        echo "Access the Central Dashboard:"
+        echo "  kubectl port-forward -n istio-system svc/istio-ingressgateway 8080:80 --address 0.0.0.0 &"
+        echo "  Then open: http://<container-ip>:8080/"
+        echo ""
+        echo "Login: $KUBEFLOW_USER"
+        echo "(password set via KUBEFLOW_PASSWORD env var or interactive prompt)"
+        SCRIPT
+        chmod +x /usr/local/bin/setup-kubeflow
+      # Also write a helper to change credentials after install
+      - |
+        cat > /usr/local/bin/kubeflow-set-password <<'SCRIPT'
+        #!/bin/bash
+        # Changes the Kubeflow login password on a running cluster.
+        # Usage: kubeflow-set-password [new-password]
+        set -euo pipefail
+        export PATH="$HOME/.local/bin:$PATH"
+
+        NEW_PASSWORD="${1:-}"
+        if [ -z "$NEW_PASSWORD" ] && [ -t 0 ]; then
+            read -rsp "New Kubeflow password: " NEW_PASSWORD
+            echo ""
+        fi
+        if [ -z "$NEW_PASSWORD" ]; then
+            echo "ERROR: password required"
+            exit 1
+        fi
+
+        BCRYPT_HASH=$(python3 -c "from passlib.hash import bcrypt; import os; print(bcrypt.using(rounds=12, ident='2y').hash(os.environ['P']))" P="$NEW_PASSWORD")
+        kubectl -n auth patch secret dex-passwords --type=json \
+            -p="[{\"op\":\"replace\",\"path\":\"/stringData\",\"value\":{\"DEX_USER_PASSWORD\":\"$BCRYPT_HASH\"}}]" \
+            2>/dev/null || \
+        kubectl -n auth create secret generic dex-passwords \
+            --from-literal="DEX_USER_PASSWORD=$BCRYPT_HASH" --dry-run=client -o yaml | \
+            kubectl apply -f -
+        kubectl -n auth rollout restart deployment dex
+        echo "Password updated. Dex restarting — new login will work in ~30s."
+        SCRIPT
+        chmod +x /usr/local/bin/kubeflow-set-password
+      - echo 'Tools + Kubeflow 26.03 manifests ready. Run "setup-kubeflow" to create the cluster and install. Set KUBEFLOW_USER and KUBEFLOW_PASSWORD env vars to customize login.'
