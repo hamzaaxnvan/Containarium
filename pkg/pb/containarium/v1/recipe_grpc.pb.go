@@ -124,3 +124,130 @@ func (UnimplementedRecipeServiceServer) GetWorkspaceAccess(context.Context, *Get
 }
 func (UnimplementedRecipeServiceServer) ListRecipes(context.Context, *ListRecipesRequest) (*ListRecipesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListRecipes not implemented")
+}
+func (UnimplementedRecipeServiceServer) GetRecipe(context.Context, *GetRecipeRequest) (*GetRecipeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRecipe not implemented")
+}
+func (UnimplementedRecipeServiceServer) DeployRecipe(context.Context, *DeployRecipeRequest) (*DeployRecipeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeployRecipe not implemented")
+}
+func (UnimplementedRecipeServiceServer) mustEmbedUnimplementedRecipeServiceServer() {}
+func (UnimplementedRecipeServiceServer) testEmbeddedByValue()                       {}
+
+// UnsafeRecipeServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to RecipeServiceServer will
+// result in compilation errors.
+type UnsafeRecipeServiceServer interface {
+	mustEmbedUnimplementedRecipeServiceServer()
+}
+
+func RegisterRecipeServiceServer(s grpc.ServiceRegistrar, srv RecipeServiceServer) {
+	// If the following call panics, it indicates UnimplementedRecipeServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&RecipeService_ServiceDesc, srv)
+}
+
+func _RecipeService_GetWorkspaceAccess_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetWorkspaceAccessRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RecipeServiceServer).GetWorkspaceAccess(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RecipeService_GetWorkspaceAccess_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RecipeServiceServer).GetWorkspaceAccess(ctx, req.(*GetWorkspaceAccessRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RecipeService_ListRecipes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListRecipesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RecipeServiceServer).ListRecipes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RecipeService_ListRecipes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RecipeServiceServer).ListRecipes(ctx, req.(*ListRecipesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RecipeService_GetRecipe_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRecipeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RecipeServiceServer).GetRecipe(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RecipeService_GetRecipe_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RecipeServiceServer).GetRecipe(ctx, req.(*GetRecipeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RecipeService_DeployRecipe_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeployRecipeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RecipeServiceServer).DeployRecipe(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RecipeService_DeployRecipe_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RecipeServiceServer).DeployRecipe(ctx, req.(*DeployRecipeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// RecipeService_ServiceDesc is the grpc.ServiceDesc for RecipeService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var RecipeService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "containarium.v1.RecipeService",
+	HandlerType: (*RecipeServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetWorkspaceAccess",
+			Handler:    _RecipeService_GetWorkspaceAccess_Handler,
+		},
+		{
+			MethodName: "ListRecipes",
+			Handler:    _RecipeService_ListRecipes_Handler,
+		},
+		{
+			MethodName: "GetRecipe",
+			Handler:    _RecipeService_GetRecipe_Handler,
+		},
+		{
+			MethodName: "DeployRecipe",
+			Handler:    _RecipeService_DeployRecipe_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "containarium/v1/recipe.proto",
+}
