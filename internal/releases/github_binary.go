@@ -43,3 +43,19 @@ func FetchSHA256(ctx context.Context, tag, binaryName string) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("status %d from %s", resp.StatusCode, sumsURL)
 	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", sumsURL, err)
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		name := strings.TrimPrefix(fields[1], "./")
+		if name == binaryName {
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("%q not found in %s", binaryName, sumsURL)
+}
