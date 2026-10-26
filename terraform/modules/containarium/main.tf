@@ -41,3 +41,134 @@ resource "google_compute_address" "jump_server_ip" {
 # -----------------------------------------------------------------------------
 
 # Operator SSH to jump server. Phase 2.3: sources now from
+# `allowed_management_sources` (defaults to VPC-only) rather than
+# `allowed_ssh_sources` (which still defaults to 0.0.0.0/0 for
+# user-facing services on the sentinel). Operators reach the
+# jump server via VPN / IAP / bastion, not by exposing :22 to
+# the internet.
+resource "google_compute_firewall" "allow_ssh" {
+  name    = "${var.instance_name}-allow-ssh"
+  network = local.network
+  project = var.project_id
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  source_ranges = var.allowed_management_sources
+  target_tags   = var.instance_tags
+
+  description = "Allow SSH access to Containarium jump server (operator-only, VPC default)"
+}
+
+# gRPC daemon API. Phase 2.3: same shift to allowed_management_sources.
+# The gRPC port is for daemon-to-daemon mTLS and operator CLI usage;
+# it is never user-facing.
+resource "google_compute_firewall" "allow_grpc" {
+  count   = var.enable_containarium_daemon ? 1 : 0
+  name    = "${var.instance_name}-allow-grpc"
+  network = local.network
+  project = var.project_id
+
+  allow {
+    protocol = "tcp"
+    ports    = ["50051"]
+  }
+
+  source_ranges = var.allowed_management_sources
+  target_tags   = var.instance_tags
+
+  description = "Allow gRPC API access to Containarium daemon (operator-only, VPC default)"
+}
+
+# IAP SSH firewall rule (needed in VPC environments for IAP tunneling)
+resource "google_compute_firewall" "allow_iap_ssh" {
+  count   = var.enable_iap_firewall ? 1 : 0
+  name    = "${var.instance_name}-allow-iap-ssh"
+  network = local.network
+  project = var.project_id
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22", "2222"]
+  }
+
+  source_ranges = ["35.235.240.0/20"]
+  target_tags   = var.instance_tags
+
+  description = "Allow IAP SSH tunneling to Containarium instances"
+}
+
+# -----------------------------------------------------------------------------
+# Regular (non-spot) VM Instance
+# -----------------------------------------------------------------------------
+
+resource "google_compute_instance" "jump_server" {
+  count = var.use_spot_instance ? 0 : 1
+
+  name         = var.instance_name
+  machine_type = var.machine_type
+  zone         = var.zone
+  project      = var.project_id
+
+  tags = var.instance_tags
+
+  boot_disk {
+    kms_key_self_link = var.kms_key_self_link == "" ? null : var.kms_key_self_link
+    initialize_params {
+      image = var.os_image
+      size  = var.boot_disk_size
+      type  = var.boot_disk_type
+    }
+  }
+
+  network_interface {
+    network    = local.network
+    subnetwork = local.subnetwork
+
+    access_config {
+      nat_ip = google_compute_address.jump_server_ip.address
+    }
+  }
+
+  metadata = {
+    ssh-keys = join("\n", [
+      for user, key in var.admin_ssh_keys :
+      "${user}:${key}"
+    ])
+    startup-script = templatefile("${path.module}/scripts/startup.sh", {
+      incus_version           = var.incus_version
+      admin_users             = keys(var.admin_ssh_keys)
+      enable_monitoring       = var.enable_monitoring
+      containarium_version    = var.containarium_version
+      containarium_binary_url = var.containarium_binary_url
+      jwt_secret              = var.jwt_secret
+      sentinel_auth_secret    = var.sentinel_auth_secret
+      fail2ban_whitelist_cidr = var.fail2ban_whitelist_cidr
+      ssh_authz_keys_command  = var.ssh_authz_keys_command
+      ssh_authz_keys_enforce  = var.ssh_authz_keys_enforce
+    })
+  }
+
+  service_account {
+    email  = var.service_account_email
+    scopes = ["cloud-platform"]
+  }
+
+  labels = merge(
+    var.labels,
+    {
+      component = "containarium"
+      role      = "jump-server"
+    }
+  )
+
+  allow_stopping_for_update = true
+
+  lifecycle {
+    ignore_changes = [
+      metadata["ssh-keys"],
+    ]
+  }
+}
