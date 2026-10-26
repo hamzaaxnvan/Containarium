@@ -48,3 +48,54 @@ func NewResolver(routes []Route, containers []Container) *Resolver {
 	return &Resolver{byHost: byHost}
 }
 
+// Resolve returns the container serving host, or ok=false when the host maps to
+// no known container — a stale route, a core service, or an L4/passthrough host
+// that produced no reverse-proxy route (those have no request-rate series).
+func (r *Resolver) Resolve(host string) (Container, bool) {
+	c, ok := r.byHost[strings.ToLower(host)]
+	return c, ok
+}
+
+// Sample is one container's request rate for a tick, ready to record as the
+// container.request_rate gauge.
+type Sample struct {
+	ContainerName  string
+	ContainerID    string
+	RequestsPerSec float64
+}
+
+// Build joins a host→rate snapshot with a resolver into per-container samples.
+// Several hostnames can front the same container (e.g. the default subdomain
+// plus a custom-domain alias), so their rates are summed. Hosts that resolve to
+// no container are dropped and tallied in dropped (surfaced by the caller for
+// observability). Output is sorted by container name for stable emit ordering.
+func Build(rates map[string]float64, res *Resolver) (samples []Sample, dropped int) {
+	byKey := make(map[string]*Sample)
+	for host, rate := range rates {
+		c, ok := res.Resolve(host)
+		if !ok {
+			dropped++
+			continue
+		}
+		// Key on the cloud container id when present, else the container name,
+		// so two hostnames for the same container coalesce.
+		key := c.ContainerID
+		if key == "" {
+			key = "name:" + c.Name
+		}
+		s := byKey[key]
+		if s == nil {
+			s = &Sample{ContainerName: c.Name, ContainerID: c.ContainerID}
+			byKey[key] = s
+		}
+		s.RequestsPerSec += rate
+	}
+	samples = make([]Sample, 0, len(byKey))
+	for _, s := range byKey {
+		samples = append(samples, *s)
+	}
+	sort.Slice(samples, func(i, j int) bool {
+		return samples[i].ContainerName < samples[j].ContainerName
+	})
+	return samples, dropped
+}
