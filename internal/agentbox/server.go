@@ -20,3 +20,47 @@
 // Resource taxonomy (v0):
 //
 //   - containarium://ci-context — JSON metadata about the current CI run
+//     (PR, commit, failing test), populated by the containarium-run GitHub
+//     Action. Empty stub when the box isn't being used for CI.
+//   - containarium://ci-prompt  — static markdown playbook telling agents
+//     how to debug a failing CI run inside this box. Paired with
+//     ci-context: ci-context is the data, ci-prompt is the behavior.
+//
+// File-ops tools enforce a sandbox in this order:
+//  1. AGENTBOX_ROOT env var (strict floor when set).
+//  2. MCP Roots advertised by the client via roots/list (used as the
+//     sandbox when AGENTBOX_ROOT is unset). Falls back gracefully if
+//     the client doesn't support the capability.
+//  3. Unconstrained (only when both are absent).
+//
+// More tools (provision_postgres, deploy_app, snapshot, etc.) land in
+// subsequent commits.
+package agentbox
+
+import "github.com/mark3labs/mcp-go/server"
+
+// RegisterTools wires every agentbox tool into the given MCPServer. Called
+// once at startup by cmd/agent-box. Each tool is implemented in its own
+// file (shell.go, files.go, …) and registers itself via a Register*
+// function — keeping main.go declarative and the toolset easy to discover.
+//
+// The MCPServer reference is also stashed in the package so file-ops
+// handlers can call s.RequestRoots() to fetch the client's filesystem
+// roots when AGENTBOX_ROOT isn't set. See sandbox.go.
+func RegisterTools(s *server.MCPServer) {
+	mcpServer = s
+	registerShellTool(s)
+	registerFileTools(s)
+	registerTailLogTool(s)
+	registerProcessTools(s)
+	registerComposeTools(s)
+}
+
+// RegisterResources wires every agentbox MCP resource onto the given
+// server. Resources are read-only data the agent fetches via the MCP
+// resources/read RPC — distinct from tools, which are imperative calls.
+// Called once at startup by cmd/agent-box, parallel to RegisterTools.
+func RegisterResources(s *server.MCPServer) {
+	registerCIContextResource(s)
+	registerCIPromptResource(s)
+}

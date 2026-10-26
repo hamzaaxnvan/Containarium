@@ -77,3 +77,123 @@ func parseAllow(allow []string) ([]netip.Prefix, error) {
 		ip, err := netip.ParseAddr(a)
 		if err != nil {
 			return nil, fmt.Errorf("invalid --allow %q: %w", a, err)
+		}
+		out = append(out, netip.PrefixFrom(ip, ip.BitLen()))
+	}
+	return out, nil
+}
+
+// sourceAllowed reports whether src is permitted. Fail-closed: no prefixes ⇒
+// nothing allowed.
+func (r *Relay) sourceAllowed(src netip.Addr) bool {
+	src = src.Unmap()
+	for _, p := range r.allow {
+		if p.Contains(src) {
+			return true
+		}
+	}
+	return false
+}
+
+// Serve binds and forwards until ctx is cancelled or a fatal accept error
+// occurs. Close (or ctx cancel) makes it return.
+func (r *Relay) Serve(ctx context.Context) error {
+	ln, err := net.Listen("tcp", r.listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", r.listen, err)
+	}
+	r.mu.Lock()
+	r.ln = ln
+	r.mu.Unlock()
+	return r.serveListener(ctx, ln)
+}
+
+// StartBackground binds synchronously — returning any bind error to the caller
+// (so a "port in use" surfaces at start time, not silently) — then serves in a
+// background goroutine until ctx is cancelled. Use Addr afterwards to read the
+// actually-bound address (e.g. when the listen port was 0).
+func (r *Relay) StartBackground(ctx context.Context) error {
+	ln, err := net.Listen("tcp", r.listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", r.listen, err)
+	}
+	r.mu.Lock()
+	r.ln = ln
+	r.mu.Unlock()
+	go func() { _ = r.serveListener(ctx, ln) }()
+	return nil
+}
+
+// Addr returns the actually-bound listen address, or "" if not yet bound.
+func (r *Relay) Addr() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ln != nil {
+		return r.ln.Addr().String()
+	}
+	return ""
+}
+
+func (r *Relay) serveListener(ctx context.Context, ln net.Listener) error {
+	r.logf("egress-relay %s -> %s (allow %v)", ln.Addr(), r.upstream, r.allow)
+
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return fmt.Errorf("accept: %w", err)
+			}
+		}
+		go r.handle(c)
+	}
+}
+
+func (r *Relay) handle(c net.Conn) {
+	defer func() { _ = c.Close() }()
+	ap, ok := remoteAddrPort(c.RemoteAddr())
+	if !ok || !r.sourceAllowed(ap.Addr()) {
+		r.logf("egress-relay DENY %s (allow %v)", c.RemoteAddr(), r.allow)
+		return
+	}
+	up, err := net.DialTimeout("tcp", r.upstream, 15*time.Second)
+	if err != nil {
+		r.logf("egress-relay upstream %s dial failed: %v", r.upstream, err)
+		return
+	}
+	defer func() { _ = up.Close() }()
+	// Bidirectional copy; both directions end when either side closes.
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(up, c); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(c, up); done <- struct{}{} }()
+	<-done
+}
+
+// remoteAddrPort extracts a netip.AddrPort from a net.Addr (TCP).
+func remoteAddrPort(a net.Addr) (netip.AddrPort, bool) {
+	if ta, ok := a.(*net.TCPAddr); ok {
+		return ta.AddrPort(), true
+	}
+	ap, err := netip.ParseAddrPort(a.String())
+	if err != nil {
+		return netip.AddrPort{}, false
+	}
+	return ap, true
+}
+
+// Close stops the relay.
+func (r *Relay) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ln != nil {
+		return r.ln.Close()
+	}
+	return nil
+}
