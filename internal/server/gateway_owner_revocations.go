@@ -23,3 +23,16 @@ var _ modelgateway.OwnerRevocationChecker = (*auth.PgOwnerRevocationStore)(nil)
 // so a token minted before its owner's key was removed cannot resolve through
 // the daemon-global key once the daemon comes back.
 //
+// Without Postgres (pg == nil), the in-memory store, with a warning. Chosen
+// through an explicit nil check rather than assigning pg directly: a nil
+// *auth.PgOwnerRevocationStore placed in an interface field is a NON-nil
+// interface holding a nil pointer, so the gateway's `OwnerRevocations == nil`
+// guard would not fire and every keyed model call would dereference nil — the
+// same hazard, same shape, as the gateway's jti revocation wiring.
+func gatewayOwnerRevocations(pg *auth.PgOwnerRevocationStore) modelgateway.OwnerRevocationChecker {
+	if pg != nil {
+		return pg
+	}
+	log.Printf("Warning: model-gateway owner revocations are in-memory (no Postgres) — a daemon restart forgets them, so a token minted before its owner's key was removed can resolve through the daemon-global key again after a restart")
+	return modelgateway.NewMemOwnerRevocations()
+}
