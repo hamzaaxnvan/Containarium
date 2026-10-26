@@ -20,3 +20,11 @@ import (
 // (operation name formatter, span name, filter functions). User
 // options follow ours in the slice, so they win on conflict.
 func HTTPMiddleware(next http.Handler, opts ...otelhttp.Option) http.Handler {
+	defaults := []otelhttp.Option{
+		otelhttp.WithMeterProvider(otel.GetMeterProvider()),
+		otelhttp.WithTracerProvider(otel.GetTracerProvider()),
+		otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+	}
+	return otelhttp.NewHandler(next, "containarium-http-server",
+		append(defaults, opts...)...)
+}
