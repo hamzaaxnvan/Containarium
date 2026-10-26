@@ -433,3 +433,1744 @@ type BackupRecord struct {
 	CreatedAt string `protobuf:"bytes,4,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	// Size of the compressed custom-format dump, in bytes.
 	SizeBytes int64 `protobuf:"varint,5,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	// SHA-256 of the dump bytes, for integrity verification on restore.
+	Sha256 string `protobuf:"bytes,6,opt,name=sha256,proto3" json:"sha256,omitempty"`
+	// Where the dump is stored.
+	Destination BackupDestination `protobuf:"varint,7,opt,name=destination,proto3,enum=containarium.v1.BackupDestination" json:"destination,omitempty"`
+	// Concrete location of the dump: a host path for LOCAL, a gs:// URI
+	// for GCS.
+	Location string `protobuf:"bytes,8,opt,name=location,proto3" json:"location,omitempty"`
+	// Database engine the dump was taken with.
+	//
+	// An enum rather than a string because the valid values are an
+	// enumerated set, so the compiler should be the thing that rejects a
+	// typo rather than a driver lookup failing at dump time (#1157).
+	Engine BackupEngine `protobuf:"varint,9,opt,name=engine,proto3,enum=containarium.v1.BackupEngine" json:"engine,omitempty"`
+	// Outcome of the most recent restore test, unset until the backup has
+	// been verified. A recorded sha256 proves the bytes are intact; only
+	// this proves the dump is restorable (#1159).
+	LastVerification *BackupVerification `protobuf:"bytes,10,opt,name=last_verification,json=lastVerification,proto3" json:"last_verification,omitempty"`
+	// Number of user relations (tables and partitioned tables, excluding
+	// system catalogs) in the source database at dump time — the manifest
+	// a restore test compares the restored schema against.
+	//
+	// Optional because it is absent on backups taken before verification
+	// existed, and because a source that cannot be queried still produces
+	// a valid dump. Unset means "no manifest": verification records what
+	// it found but has nothing to compare it to.
+	RelationCount *int64 `protobuf:"varint,11,opt,name=relation_count,json=relationCount,proto3,oneof" json:"relation_count,omitempty"`
+	// True when the stored bytes are an age ciphertext encrypted to a
+	// user-held key (#1831). size_bytes and sha256 then describe the
+	// ciphertext — what is actually stored — so integrity is verified
+	// before decryption. Restoring requires the matching identity, which
+	// the platform never holds. False means the stored bytes are plaintext
+	// (#3169): readable by anyone with read access to the destination.
+	Encrypted bool `protobuf:"varint,12,opt,name=encrypted,proto3" json:"encrypted,omitempty"`
+	// The age X25519 recipient ("age1…") the dump was encrypted to. A
+	// public key: safe to record, and tells the operator which identity
+	// can restore this backup. Empty when encrypted is false.
+	AgeRecipient string `protobuf:"bytes,13,opt,name=age_recipient,json=ageRecipient,proto3" json:"age_recipient,omitempty"`
+	// For BACKUP_ENGINE_HOOK: the absolute in-container path of the hook
+	// that produced the dump. Empty for pg_dump records.
+	Hook string `protobuf:"bytes,14,opt,name=hook,proto3" json:"hook,omitempty"`
+	// Managed key mode (#2402). wrapped_key is the per-backup age
+	// identity's secret string, wrapped by the daemon's KMS; kek_id is the
+	// key version it was wrapped under (for GCP, the full CryptoKeyVersion
+	// resource name, so a version with backups still under it can be
+	// guarded against destruction). Both empty unless key_mode is MANAGED
+	// or BOTH. The daemon never unwraps wrapped_key: whoever restores or
+	// verifies unwraps it under their own KMS credentials and supplies
+	// the identity in the request, as for any encrypted record.
+	WrappedKey []byte `protobuf:"bytes,15,opt,name=wrapped_key,json=wrappedKey,proto3" json:"wrapped_key,omitempty"`
+	KekId      string `protobuf:"bytes,16,opt,name=kek_id,json=kekId,proto3" json:"kek_id,omitempty"`
+	// Who holds the key: UNSPECIFIED for a plaintext record,
+	// AGE_RECIPIENT for a record encrypted to a tenant-held recipient only
+	// (including every record written before this field existed).
+	KeyMode BackupKeyMode `protobuf:"varint,17,opt,name=key_mode,json=keyMode,proto3,enum=containarium.v1.BackupKeyMode" json:"key_mode,omitempty"`
+	// For BACKUP_ENGINE_HOOK: the format the hook declared for its output
+	// (#2405). OPAQUE for a hook record that declared none. UNSPECIFIED for
+	// pg_dump records.
+	HookFormat HookFormat `protobuf:"varint,18,opt,name=hook_format,json=hookFormat,proto3,enum=containarium.v1.HookFormat" json:"hook_format,omitempty"`
+	// What the backup captured (#2800). Always set on a record the daemon
+	// returns: DATABASE for every database backup, including records
+	// written before this field existed.
+	Scope         BackupScope `protobuf:"varint,19,opt,name=scope,proto3,enum=containarium.v1.BackupScope" json:"scope,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BackupRecord) Reset() {
+	*x = BackupRecord{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupRecord) ProtoMessage() {}
+
+func (x *BackupRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupRecord.ProtoReflect.Descriptor instead.
+func (*BackupRecord) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *BackupRecord) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *BackupRecord) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *BackupRecord) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *BackupRecord) GetCreatedAt() string {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return ""
+}
+
+func (x *BackupRecord) GetSizeBytes() int64 {
+	if x != nil {
+		return x.SizeBytes
+	}
+	return 0
+}
+
+func (x *BackupRecord) GetSha256() string {
+	if x != nil {
+		return x.Sha256
+	}
+	return ""
+}
+
+func (x *BackupRecord) GetDestination() BackupDestination {
+	if x != nil {
+		return x.Destination
+	}
+	return BackupDestination_BACKUP_DESTINATION_UNSPECIFIED
+}
+
+func (x *BackupRecord) GetLocation() string {
+	if x != nil {
+		return x.Location
+	}
+	return ""
+}
+
+func (x *BackupRecord) GetEngine() BackupEngine {
+	if x != nil {
+		return x.Engine
+	}
+	return BackupEngine_BACKUP_ENGINE_UNSPECIFIED
+}
+
+func (x *BackupRecord) GetLastVerification() *BackupVerification {
+	if x != nil {
+		return x.LastVerification
+	}
+	return nil
+}
+
+func (x *BackupRecord) GetRelationCount() int64 {
+	if x != nil && x.RelationCount != nil {
+		return *x.RelationCount
+	}
+	return 0
+}
+
+func (x *BackupRecord) GetEncrypted() bool {
+	if x != nil {
+		return x.Encrypted
+	}
+	return false
+}
+
+func (x *BackupRecord) GetAgeRecipient() string {
+	if x != nil {
+		return x.AgeRecipient
+	}
+	return ""
+}
+
+func (x *BackupRecord) GetHook() string {
+	if x != nil {
+		return x.Hook
+	}
+	return ""
+}
+
+func (x *BackupRecord) GetWrappedKey() []byte {
+	if x != nil {
+		return x.WrappedKey
+	}
+	return nil
+}
+
+func (x *BackupRecord) GetKekId() string {
+	if x != nil {
+		return x.KekId
+	}
+	return ""
+}
+
+func (x *BackupRecord) GetKeyMode() BackupKeyMode {
+	if x != nil {
+		return x.KeyMode
+	}
+	return BackupKeyMode_BACKUP_KEY_MODE_UNSPECIFIED
+}
+
+func (x *BackupRecord) GetHookFormat() HookFormat {
+	if x != nil {
+		return x.HookFormat
+	}
+	return HookFormat_HOOK_FORMAT_UNSPECIFIED
+}
+
+func (x *BackupRecord) GetScope() BackupScope {
+	if x != nil {
+		return x.Scope
+	}
+	return BackupScope_BACKUP_SCOPE_UNSPECIFIED
+}
+
+// VerificationCheck is one engine-appropriate assertion made during a
+// restore test, recorded individually so the evidence shows *what* was
+// checked rather than just a pass/fail bit.
+type VerificationCheck struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Check identifier, e.g. "restore", "connect", "relation_count".
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Whether this individual check passed.
+	Passed bool `protobuf:"varint,2,opt,name=passed,proto3" json:"passed,omitempty"`
+	// Human-readable outcome, e.g. "42 relations in scratch database".
+	// For a failing check this carries the engine's own error text.
+	Detail        string `protobuf:"bytes,3,opt,name=detail,proto3" json:"detail,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerificationCheck) Reset() {
+	*x = VerificationCheck{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerificationCheck) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerificationCheck) ProtoMessage() {}
+
+func (x *VerificationCheck) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerificationCheck.ProtoReflect.Descriptor instead.
+func (*VerificationCheck) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *VerificationCheck) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *VerificationCheck) GetPassed() bool {
+	if x != nil {
+		return x.Passed
+	}
+	return false
+}
+
+func (x *VerificationCheck) GetDetail() string {
+	if x != nil {
+		return x.Detail
+	}
+	return ""
+}
+
+// BackupVerification is the audit artifact for one restore test: who ran
+// it, when, against what, and what the engine said. Persisted on the
+// BackupRecord so `ListBackups` can answer "last verified" and so the
+// evidence outlives the run that produced it (ISO 27001 A.8.13 wants
+// backups *tested*, not just taken).
+type BackupVerification struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// RFC3339 UTC timestamp of when verification completed.
+	VerifiedAt string `protobuf:"bytes,1,opt,name=verified_at,json=verifiedAt,proto3" json:"verified_at,omitempty"`
+	// Outcome.
+	Result VerificationResult `protobuf:"varint,2,opt,name=result,proto3,enum=containarium.v1.VerificationResult" json:"result,omitempty"`
+	// The engine's own error when result is FAILED — pg_restore's own
+	// message, so an operator sees why the dump would not load rather
+	// than a wrapper's summary. Empty on success. This is engine stderr
+	// captured verbatim: it is persisted and returned over the API, so
+	// treat it with the same care as any other diagnostic output.
+	Error string `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	// Container the dump was restored into. Always distinct from the
+	// container the backup was taken from.
+	TargetContainer string `protobuf:"bytes,4,opt,name=target_container,json=targetContainer,proto3" json:"target_container,omitempty"`
+	// Throwaway database created for the test and dropped afterwards.
+	ScratchDatabase string `protobuf:"bytes,5,opt,name=scratch_database,json=scratchDatabase,proto3" json:"scratch_database,omitempty"`
+	// Wall-clock duration of the restore test.
+	DurationMs int64 `protobuf:"varint,6,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	// Authenticated subject that requested verification, for the "who"
+	// half of the audit record. Empty when unauthenticated (dev mode).
+	VerifiedBy string `protobuf:"bytes,7,opt,name=verified_by,json=verifiedBy,proto3" json:"verified_by,omitempty"`
+	// Individual checks performed, in execution order.
+	Checks        []*VerificationCheck `protobuf:"bytes,8,rep,name=checks,proto3" json:"checks,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BackupVerification) Reset() {
+	*x = BackupVerification{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BackupVerification) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BackupVerification) ProtoMessage() {}
+
+func (x *BackupVerification) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BackupVerification.ProtoReflect.Descriptor instead.
+func (*BackupVerification) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *BackupVerification) GetVerifiedAt() string {
+	if x != nil {
+		return x.VerifiedAt
+	}
+	return ""
+}
+
+func (x *BackupVerification) GetResult() VerificationResult {
+	if x != nil {
+		return x.Result
+	}
+	return VerificationResult_VERIFICATION_RESULT_UNSPECIFIED
+}
+
+func (x *BackupVerification) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *BackupVerification) GetTargetContainer() string {
+	if x != nil {
+		return x.TargetContainer
+	}
+	return ""
+}
+
+func (x *BackupVerification) GetScratchDatabase() string {
+	if x != nil {
+		return x.ScratchDatabase
+	}
+	return ""
+}
+
+func (x *BackupVerification) GetDurationMs() int64 {
+	if x != nil {
+		return x.DurationMs
+	}
+	return 0
+}
+
+func (x *BackupVerification) GetVerifiedBy() string {
+	if x != nil {
+		return x.VerifiedBy
+	}
+	return ""
+}
+
+func (x *BackupVerification) GetChecks() []*VerificationCheck {
+	if x != nil {
+		return x.Checks
+	}
+	return nil
+}
+
+// PgConnection carries the connection parameters pg_dump / pg_restore use
+// *inside the container*. Defaults target a per-container local Postgres
+// reached over loopback. db_password is never logged and is passed to the
+// child process via the PGPASSWORD environment variable, not argv.
+type PgConnection struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Logical database to dump or restore into. For CreateBackup, leave
+	// empty to back up EVERY non-template database in the container (#954)
+	// — the default, no-guessing path; a caller doesn't need to already
+	// know a database name, and there's no name left to typo. Set an
+	// explicit name to dump just that one database instead. For
+	// RestoreBackup, empty means "the backup record's own database"
+	// (restore in place) — always required in practice there since a
+	// record always names exactly one database.
+	Database string `protobuf:"bytes,1,opt,name=database,proto3" json:"database,omitempty"`
+	// Postgres role. Defaults to "postgres" when empty.
+	User string `protobuf:"bytes,2,opt,name=user,proto3" json:"user,omitempty"`
+	// Password for the role. Optional (empty for trust/peer auth or when a
+	// PGPASSFILE is configured in the container). Never logged.
+	Password string `protobuf:"bytes,3,opt,name=password,proto3" json:"password,omitempty"`
+	// Host as seen from *inside* the container. Defaults to "127.0.0.1".
+	Host string `protobuf:"bytes,4,opt,name=host,proto3" json:"host,omitempty"`
+	// Port. Defaults to 5432 when zero.
+	Port          int32 `protobuf:"varint,5,opt,name=port,proto3" json:"port,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PgConnection) Reset() {
+	*x = PgConnection{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PgConnection) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PgConnection) ProtoMessage() {}
+
+func (x *PgConnection) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PgConnection.ProtoReflect.Descriptor instead.
+func (*PgConnection) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *PgConnection) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *PgConnection) GetUser() string {
+	if x != nil {
+		return x.User
+	}
+	return ""
+}
+
+func (x *PgConnection) GetPassword() string {
+	if x != nil {
+		return x.Password
+	}
+	return ""
+}
+
+func (x *PgConnection) GetHost() string {
+	if x != nil {
+		return x.Host
+	}
+	return ""
+}
+
+func (x *PgConnection) GetPort() int32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+// CreateBackupRequest dumps a container's database and stores it at the
+// chosen destination.
+type CreateBackupRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Tenant (username) whose container holds the database.
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// Connection parameters for pg_dump inside the container. Leave
+	// connection.database empty to back up every non-template database
+	// found (#954, the default); set it to back up just that one.
+	Connection *PgConnection `protobuf:"bytes,2,opt,name=connection,proto3" json:"connection,omitempty"`
+	// Where to store the dump.
+	Destination BackupDestination `protobuf:"varint,3,opt,name=destination,proto3,enum=containarium.v1.BackupDestination" json:"destination,omitempty"`
+	// For GCS: the destination bucket/prefix, e.g. "gs://my-backups/pg".
+	// Ignored for LOCAL. The object key is appended as "<id>.dump"
+	// ("<id>.dump.age" when age_recipient is set).
+	GcsBucket string `protobuf:"bytes,4,opt,name=gcs_bucket,json=gcsBucket,proto3" json:"gcs_bucket,omitempty"`
+	// Credential-less backup (#1831): the absolute path of an executable
+	// INSIDE the tenant's container whose stdout is the dump. When set, the
+	// pg_dump path and `connection` are bypassed entirely — the hook reaches
+	// its database under the container's own auth, so no credential crosses
+	// to the platform. Must be a bare absolute path with no arguments. The
+	// resulting record has engine BACKUP_ENGINE_HOOK and is opaque to the
+	// platform (stored, listed, fetched, never auto-restored).
+	Hook string `protobuf:"bytes,5,opt,name=hook,proto3" json:"hook,omitempty"`
+	// Optional label for a hook backup, filling the record's `database`
+	// slot and the backup id (default: the hook's basename). Ignored
+	// without `hook`.
+	Label string `protobuf:"bytes,6,opt,name=label,proto3" json:"label,omitempty"`
+	// User-held encryption (#1831): an age X25519 recipient ("age1…"). When
+	// set, the dump is encrypted to it in the daemon process before it is
+	// staged or uploaded, so the daemon's disk, the object store and the
+	// operator only ever hold ciphertext. Restore needs the matching
+	// identity, which the platform never stores.
+	AgeRecipient string `protobuf:"bytes,7,opt,name=age_recipient,json=ageRecipient,proto3" json:"age_recipient,omitempty"`
+	// Who should hold the key (#2402). UNSPECIFIED takes the daemon
+	// default: MANAGED when the daemon has a key wrapper configured
+	// (CONTAINARIUM_BACKUP_KMS_KEY_NAME), BOTH when a recipient also
+	// resolves, otherwise AGE_RECIPIENT with a recipient or plaintext
+	// without. An explicit mode the daemon cannot satisfy — MANAGED or
+	// BOTH with no wrapper (FAILED_PRECONDITION), AGE_RECIPIENT or BOTH
+	// with no recipient (INVALID_ARGUMENT) — is rejected, never silently
+	// downgraded.
+	KeyMode BackupKeyMode `protobuf:"varint,8,opt,name=key_mode,json=keyMode,proto3,enum=containarium.v1.BackupKeyMode" json:"key_mode,omitempty"`
+	// Declared format of the hook's output (#2405). UNSPECIFIED means
+	// OPAQUE, today's behaviour. Set PG_CUSTOM only for a hook that emits a
+	// `pg_dump -Fc` archive: the record then gets a relation-count manifest
+	// read from the archive's table of contents (when pg_restore is
+	// available in the container) and can be restore-tested. Rejected
+	// without `hook`.
+	HookFormat HookFormat `protobuf:"varint,9,opt,name=hook_format,json=hookFormat,proto3,enum=containarium.v1.HookFormat" json:"hook_format,omitempty"`
+	// What to back up (#2800). UNSPECIFIED and DATABASE are today's database
+	// backup, unchanged. BOX backs up the whole box named by `username`; it
+	// is rejected with INVALID_ARGUMENT when `connection`, `hook` or
+	// `hook_format` is set, or when key_mode is UNSPECIFIED (a BOX backup is
+	// never plaintext, so the mode is named, not defaulted). `destination`,
+	// `gcs_bucket`, `age_recipient` and `key_mode` mean what they mean for a
+	// database backup.
+	Scope BackupScope `protobuf:"varint,10,opt,name=scope,proto3,enum=containarium.v1.BackupScope" json:"scope,omitempty"`
+	// Refuse to store plaintext (#3169). When true and the dump would be
+	// stored with no key at all — no age_recipient given, none registered
+	// for the tenant (CONTAINARIUM_BACKUP_AGE_RECIPIENT), and no managed key
+	// on this daemon — the request fails with FAILED_PRECONDITION before any
+	// container is touched, so no object is written. False keeps today's
+	// behaviour: such a dump is stored unencrypted (and logged as a WARNING).
+	RequireEncryption bool `protobuf:"varint,11,opt,name=require_encryption,json=requireEncryption,proto3" json:"require_encryption,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *CreateBackupRequest) Reset() {
+	*x = CreateBackupRequest{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateBackupRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateBackupRequest) ProtoMessage() {}
+
+func (x *CreateBackupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateBackupRequest.ProtoReflect.Descriptor instead.
+func (*CreateBackupRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *CreateBackupRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *CreateBackupRequest) GetConnection() *PgConnection {
+	if x != nil {
+		return x.Connection
+	}
+	return nil
+}
+
+func (x *CreateBackupRequest) GetDestination() BackupDestination {
+	if x != nil {
+		return x.Destination
+	}
+	return BackupDestination_BACKUP_DESTINATION_UNSPECIFIED
+}
+
+func (x *CreateBackupRequest) GetGcsBucket() string {
+	if x != nil {
+		return x.GcsBucket
+	}
+	return ""
+}
+
+func (x *CreateBackupRequest) GetHook() string {
+	if x != nil {
+		return x.Hook
+	}
+	return ""
+}
+
+func (x *CreateBackupRequest) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *CreateBackupRequest) GetAgeRecipient() string {
+	if x != nil {
+		return x.AgeRecipient
+	}
+	return ""
+}
+
+func (x *CreateBackupRequest) GetKeyMode() BackupKeyMode {
+	if x != nil {
+		return x.KeyMode
+	}
+	return BackupKeyMode_BACKUP_KEY_MODE_UNSPECIFIED
+}
+
+func (x *CreateBackupRequest) GetHookFormat() HookFormat {
+	if x != nil {
+		return x.HookFormat
+	}
+	return HookFormat_HOOK_FORMAT_UNSPECIFIED
+}
+
+func (x *CreateBackupRequest) GetScope() BackupScope {
+	if x != nil {
+		return x.Scope
+	}
+	return BackupScope_BACKUP_SCOPE_UNSPECIFIED
+}
+
+func (x *CreateBackupRequest) GetRequireEncryption() bool {
+	if x != nil {
+		return x.RequireEncryption
+	}
+	return false
+}
+
+type CreateBackupResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Operator-facing summary.
+	Message string `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	// The committed backup record. Populated only when connection.database
+	// named exactly one database (single-database create, back-compat
+	// shape). For a "back up all" create (connection.database empty),
+	// this is unset — use records instead.
+	Record *BackupRecord `protobuf:"bytes,2,opt,name=record,proto3" json:"record,omitempty"`
+	// Every committed backup record from this call. Always populated:
+	// one entry for a single-database create (mirrors record above), or
+	// one entry per database for a "back up all" create (#954).
+	Records []*BackupRecord `protobuf:"bytes,3,rep,name=records,proto3" json:"records,omitempty"`
+	// Per-database failures from a "back up all" create — a database that
+	// failed to dump (e.g. transient pg_dump error) does not abort the
+	// others; its failure is reported here instead. Always empty for a
+	// single-database create (that path fails the whole RPC on error, as
+	// before).
+	Failures      []string `protobuf:"bytes,4,rep,name=failures,proto3" json:"failures,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateBackupResponse) Reset() {
+	*x = CreateBackupResponse{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateBackupResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateBackupResponse) ProtoMessage() {}
+
+func (x *CreateBackupResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateBackupResponse.ProtoReflect.Descriptor instead.
+func (*CreateBackupResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *CreateBackupResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *CreateBackupResponse) GetRecord() *BackupRecord {
+	if x != nil {
+		return x.Record
+	}
+	return nil
+}
+
+func (x *CreateBackupResponse) GetRecords() []*BackupRecord {
+	if x != nil {
+		return x.Records
+	}
+	return nil
+}
+
+func (x *CreateBackupResponse) GetFailures() []string {
+	if x != nil {
+		return x.Failures
+	}
+	return nil
+}
+
+// ListBackupsRequest enumerates stored backups, newest first.
+type ListBackupsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional tenant filter. Empty lists backups for all tenants
+	// (admin view).
+	Username      string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListBackupsRequest) Reset() {
+	*x = ListBackupsRequest{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListBackupsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListBackupsRequest) ProtoMessage() {}
+
+func (x *ListBackupsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListBackupsRequest.ProtoReflect.Descriptor instead.
+func (*ListBackupsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ListBackupsRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+type ListBackupsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Records       []*BackupRecord        `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListBackupsResponse) Reset() {
+	*x = ListBackupsResponse{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListBackupsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListBackupsResponse) ProtoMessage() {}
+
+func (x *ListBackupsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListBackupsResponse.ProtoReflect.Descriptor instead.
+func (*ListBackupsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *ListBackupsResponse) GetRecords() []*BackupRecord {
+	if x != nil {
+		return x.Records
+	}
+	return nil
+}
+
+// GetBackupRequest fetches a single backup record by ID.
+type GetBackupRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetBackupRequest) Reset() {
+	*x = GetBackupRequest{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetBackupRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetBackupRequest) ProtoMessage() {}
+
+func (x *GetBackupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetBackupRequest.ProtoReflect.Descriptor instead.
+func (*GetBackupRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GetBackupRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type GetBackupResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Record        *BackupRecord          `protobuf:"bytes,1,opt,name=record,proto3" json:"record,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetBackupResponse) Reset() {
+	*x = GetBackupResponse{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetBackupResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetBackupResponse) ProtoMessage() {}
+
+func (x *GetBackupResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetBackupResponse.ProtoReflect.Descriptor instead.
+func (*GetBackupResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetBackupResponse) GetRecord() *BackupRecord {
+	if x != nil {
+		return x.Record
+	}
+	return nil
+}
+
+// RestoreBackupRequest streams a stored dump back into a container's
+// database via pg_restore. Destructive: with `clean` set it drops and
+// recreates objects before loading.
+type RestoreBackupRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Backup to restore. A SNAPSHOT backup restarts its source box on a new
+	// PVC in the same namespace, retaining the old PVC. connection, clean,
+	// age_identity and target_container must be unset for snapshot restores.
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Connection parameters for pg_restore inside the target container.
+	// If connection.database is empty, the backup record's database is
+	// used (restore in place).
+	Connection *PgConnection `protobuf:"bytes,2,opt,name=connection,proto3" json:"connection,omitempty"`
+	// Pass --clean --if-exists to pg_restore (drop objects before
+	// recreating). Off by default so a restore into a fresh database
+	// does not error on missing objects.
+	Clean bool `protobuf:"varint,3,opt,name=clean,proto3" json:"clean,omitempty"`
+	// For a record with encrypted=true: the age X25519 identity
+	// ("AGE-SECRET-KEY-1…") that matches the record's age_recipient (#1831).
+	// Used to decrypt for this one call and never stored or logged. Required
+	// for an encrypted record; the daemon refuses the restore without it
+	// because it holds no decryption key of its own.
+	AgeIdentity string `protobuf:"bytes,4,opt,name=age_identity,json=ageIdentity,proto3" json:"age_identity,omitempty"`
+	// Container to restore into, by its container name
+	// ("<username>-container"). Empty restores into the backup's own source
+	// container, in place (#2403). The caller must be authorized for the
+	// target's tenant as well as the backup's. A hook record declared
+	// HOOK_FORMAT_PG_CUSTOM can only be restored this way, into a target
+	// other than its source (#2405).
+	TargetContainer string `protobuf:"bytes,5,opt,name=target_container,json=targetContainer,proto3" json:"target_container,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *RestoreBackupRequest) Reset() {
+	*x = RestoreBackupRequest{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestoreBackupRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestoreBackupRequest) ProtoMessage() {}
+
+func (x *RestoreBackupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestoreBackupRequest.ProtoReflect.Descriptor instead.
+func (*RestoreBackupRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *RestoreBackupRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *RestoreBackupRequest) GetConnection() *PgConnection {
+	if x != nil {
+		return x.Connection
+	}
+	return nil
+}
+
+func (x *RestoreBackupRequest) GetClean() bool {
+	if x != nil {
+		return x.Clean
+	}
+	return false
+}
+
+func (x *RestoreBackupRequest) GetAgeIdentity() string {
+	if x != nil {
+		return x.AgeIdentity
+	}
+	return ""
+}
+
+func (x *RestoreBackupRequest) GetTargetContainer() string {
+	if x != nil {
+		return x.TargetContainer
+	}
+	return ""
+}
+
+type RestoreBackupResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Message       string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestoreBackupResponse) Reset() {
+	*x = RestoreBackupResponse{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestoreBackupResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestoreBackupResponse) ProtoMessage() {}
+
+func (x *RestoreBackupResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestoreBackupResponse.ProtoReflect.Descriptor instead.
+func (*RestoreBackupResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *RestoreBackupResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// VerifyBackupRequest restore-tests a stored dump: it loads the dump into
+// a throwaway database inside a *target* container and runs
+// engine-appropriate sanity checks, then drops the scratch database.
+//
+// The target is always a container other than the one the backup came
+// from — verification must never touch the source database. Supply a
+// different tenant's disposable container as the target (admin only), or
+// the backup's own tenant for a daemon-managed isolated verification container.
+type VerifyBackupRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Backup to verify.
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Required target tenant. The backup's own tenant selects a fresh,
+	// daemon-managed isolated Postgres 16 container, deleted after verification.
+	// A different tenant selects that tenant's existing container (admin only).
+	TargetUsername string `protobuf:"bytes,2,opt,name=target_username,json=targetUsername,proto3" json:"target_username,omitempty"`
+	// Connection parameters for the *target* container's Postgres. The
+	// scratch database name is generated by the daemon, so
+	// connection.database is ignored here. All connection fields are ignored
+	// for the daemon-managed target, which uses generated local credentials.
+	Connection *PgConnection `protobuf:"bytes,3,opt,name=connection,proto3" json:"connection,omitempty"`
+	// For a record with encrypted=true: the age X25519 identity
+	// ("AGE-SECRET-KEY-1…") that matches the record's age_recipient
+	// (#1831). Used to decrypt for this one call and never stored or
+	// logged, same contract as RestoreBackupRequest.age_identity.
+	// Required for an encrypted record — the daemon refuses to even
+	// attempt the test without it, because it holds no decryption key of
+	// its own. A wrong identity comes back as a FAILED verification
+	// result, not an RPC error (#2295).
+	AgeIdentity   string `protobuf:"bytes,4,opt,name=age_identity,json=ageIdentity,proto3" json:"age_identity,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerifyBackupRequest) Reset() {
+	*x = VerifyBackupRequest{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyBackupRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyBackupRequest) ProtoMessage() {}
+
+func (x *VerifyBackupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyBackupRequest.ProtoReflect.Descriptor instead.
+func (*VerifyBackupRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *VerifyBackupRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *VerifyBackupRequest) GetTargetUsername() string {
+	if x != nil {
+		return x.TargetUsername
+	}
+	return ""
+}
+
+func (x *VerifyBackupRequest) GetConnection() *PgConnection {
+	if x != nil {
+		return x.Connection
+	}
+	return nil
+}
+
+func (x *VerifyBackupRequest) GetAgeIdentity() string {
+	if x != nil {
+		return x.AgeIdentity
+	}
+	return ""
+}
+
+type VerifyBackupResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Operator-facing summary, e.g. "verification passed: <id>".
+	Message string `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	// The verification artifact, including per-check detail and the
+	// engine's own error on failure.
+	Verification *BackupVerification `protobuf:"bytes,2,opt,name=verification,proto3" json:"verification,omitempty"`
+	// The backup record with last_verification updated.
+	Record        *BackupRecord `protobuf:"bytes,3,opt,name=record,proto3" json:"record,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VerifyBackupResponse) Reset() {
+	*x = VerifyBackupResponse{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VerifyBackupResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VerifyBackupResponse) ProtoMessage() {}
+
+func (x *VerifyBackupResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VerifyBackupResponse.ProtoReflect.Descriptor instead.
+func (*VerifyBackupResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *VerifyBackupResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *VerifyBackupResponse) GetVerification() *BackupVerification {
+	if x != nil {
+		return x.Verification
+	}
+	return nil
+}
+
+func (x *VerifyBackupResponse) GetRecord() *BackupRecord {
+	if x != nil {
+		return x.Record
+	}
+	return nil
+}
+
+// DeleteBackupRequest removes a stored dump and its index entry.
+type DeleteBackupRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteBackupRequest) Reset() {
+	*x = DeleteBackupRequest{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteBackupRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteBackupRequest) ProtoMessage() {}
+
+func (x *DeleteBackupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteBackupRequest.ProtoReflect.Descriptor instead.
+func (*DeleteBackupRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *DeleteBackupRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type DeleteBackupResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Message       string                 `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteBackupResponse) Reset() {
+	*x = DeleteBackupResponse{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteBackupResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteBackupResponse) ProtoMessage() {}
+
+func (x *DeleteBackupResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteBackupResponse.ProtoReflect.Descriptor instead.
+func (*DeleteBackupResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *DeleteBackupResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// PruneBackupsRequest deletes older backups for a tenant, keeping only the
+// newest `keep` per (username, database) group — or per (username, label)
+// for a `--hook` backup, since a hook backup's label fills the same
+// database field (#1839). Retention POLICY (when, how often, how many) is
+// still the caller's decision; this RPC is the mechanism that makes
+// "how many" actually enforceable instead of a cron job hand-rolling
+// `rm` against the daemon's backup directory.
+type PruneBackupsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Tenant whose backups to prune.
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// Optional database (or hook label) filter. Empty prunes every
+	// database this tenant has backups for, each independently down to
+	// `keep` — one database's history never counts against another's.
+	Database string `protobuf:"bytes,2,opt,name=database,proto3" json:"database,omitempty"`
+	// Number of newest records to keep per group. Must be >= 1: pruning a
+	// specific backup down to zero is `DeleteBackup` making an explicit
+	// per-record choice, not this RPC guessing zero was intended.
+	Keep          int32 `protobuf:"varint,3,opt,name=keep,proto3" json:"keep,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PruneBackupsRequest) Reset() {
+	*x = PruneBackupsRequest{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PruneBackupsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PruneBackupsRequest) ProtoMessage() {}
+
+func (x *PruneBackupsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PruneBackupsRequest.ProtoReflect.Descriptor instead.
+func (*PruneBackupsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *PruneBackupsRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *PruneBackupsRequest) GetDatabase() string {
+	if x != nil {
+		return x.Database
+	}
+	return ""
+}
+
+func (x *PruneBackupsRequest) GetKeep() int32 {
+	if x != nil {
+		return x.Keep
+	}
+	return 0
+}
+
+type PruneBackupsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Operator-facing summary.
+	Message string `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	// IDs of the records actually deleted.
+	DeletedIds []string `protobuf:"bytes,2,rep,name=deleted_ids,json=deletedIds,proto3" json:"deleted_ids,omitempty"`
+	// Per-record delete failures, as "<id>: <error>" strings. One bad
+	// record (e.g. a transient object-store error) never aborts pruning
+	// the rest — mirrors CreateBackupResponse.failures (#954).
+	Failures      []string `protobuf:"bytes,3,rep,name=failures,proto3" json:"failures,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PruneBackupsResponse) Reset() {
+	*x = PruneBackupsResponse{}
+	mi := &file_containarium_v1_backup_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PruneBackupsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PruneBackupsResponse) ProtoMessage() {}
+
+func (x *PruneBackupsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_backup_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PruneBackupsResponse.ProtoReflect.Descriptor instead.
+func (*PruneBackupsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_backup_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *PruneBackupsResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *PruneBackupsResponse) GetDeletedIds() []string {
+	if x != nil {
+		return x.DeletedIds
+	}
+	return nil
+}
+
+func (x *PruneBackupsResponse) GetFailures() []string {
+	if x != nil {
+		return x.Failures
+	}
+	return nil
+}
+
+var File_containarium_v1_backup_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_backup_proto_rawDesc = "" +
+	"\n" +
+	"\x1ccontainarium/v1/backup.proto\x12\x0fcontainarium.v1\x1a\x1cgoogle/api/annotations.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\"\x92\x06\n" +
+	"\fBackupRecord\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
+	"\busername\x18\x02 \x01(\tR\busername\x12\x1a\n" +
+	"\bdatabase\x18\x03 \x01(\tR\bdatabase\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\x04 \x01(\tR\tcreatedAt\x12\x1d\n" +
+	"\n" +
+	"size_bytes\x18\x05 \x01(\x03R\tsizeBytes\x12\x16\n" +
+	"\x06sha256\x18\x06 \x01(\tR\x06sha256\x12D\n" +
+	"\vdestination\x18\a \x01(\x0e2\".containarium.v1.BackupDestinationR\vdestination\x12\x1a\n" +
+	"\blocation\x18\b \x01(\tR\blocation\x125\n" +
+	"\x06engine\x18\t \x01(\x0e2\x1d.containarium.v1.BackupEngineR\x06engine\x12P\n" +
+	"\x11last_verification\x18\n" +
+	" \x01(\v2#.containarium.v1.BackupVerificationR\x10lastVerification\x12*\n" +
+	"\x0erelation_count\x18\v \x01(\x03H\x00R\rrelationCount\x88\x01\x01\x12\x1c\n" +
+	"\tencrypted\x18\f \x01(\bR\tencrypted\x12#\n" +
+	"\rage_recipient\x18\r \x01(\tR\fageRecipient\x12\x12\n" +
+	"\x04hook\x18\x0e \x01(\tR\x04hook\x12\x1f\n" +
+	"\vwrapped_key\x18\x0f \x01(\fR\n" +
+	"wrappedKey\x12\x15\n" +
+	"\x06kek_id\x18\x10 \x01(\tR\x05kekId\x129\n" +
+	"\bkey_mode\x18\x11 \x01(\x0e2\x1e.containarium.v1.BackupKeyModeR\akeyMode\x12<\n" +
+	"\vhook_format\x18\x12 \x01(\x0e2\x1b.containarium.v1.HookFormatR\n" +
+	"hookFormat\x122\n" +
+	"\x05scope\x18\x13 \x01(\x0e2\x1c.containarium.v1.BackupScopeR\x05scopeB\x11\n" +
+	"\x0f_relation_count\"W\n" +
+	"\x11VerificationCheck\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06passed\x18\x02 \x01(\bR\x06passed\x12\x16\n" +
+	"\x06detail\x18\x03 \x01(\tR\x06detail\"\xdc\x02\n" +
+	"\x12BackupVerification\x12\x1f\n" +
+	"\vverified_at\x18\x01 \x01(\tR\n" +
+	"verifiedAt\x12;\n" +
+	"\x06result\x18\x02 \x01(\x0e2#.containarium.v1.VerificationResultR\x06result\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12)\n" +
+	"\x10target_container\x18\x04 \x01(\tR\x0ftargetContainer\x12)\n" +
+	"\x10scratch_database\x18\x05 \x01(\tR\x0fscratchDatabase\x12\x1f\n" +
+	"\vduration_ms\x18\x06 \x01(\x03R\n" +
+	"durationMs\x12\x1f\n" +
+	"\vverified_by\x18\a \x01(\tR\n" +
+	"verifiedBy\x12:\n" +
+	"\x06checks\x18\b \x03(\v2\".containarium.v1.VerificationCheckR\x06checks\"\x82\x01\n" +
+	"\fPgConnection\x12\x1a\n" +
+	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x12\n" +
+	"\x04user\x18\x02 \x01(\tR\x04user\x12\x1a\n" +
+	"\bpassword\x18\x03 \x01(\tR\bpassword\x12\x12\n" +
+	"\x04host\x18\x04 \x01(\tR\x04host\x12\x12\n" +
+	"\x04port\x18\x05 \x01(\x05R\x04port\"\x80\x04\n" +
+	"\x13CreateBackupRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12=\n" +
+	"\n" +
+	"connection\x18\x02 \x01(\v2\x1d.containarium.v1.PgConnectionR\n" +
+	"connection\x12D\n" +
+	"\vdestination\x18\x03 \x01(\x0e2\".containarium.v1.BackupDestinationR\vdestination\x12\x1d\n" +
+	"\n" +
+	"gcs_bucket\x18\x04 \x01(\tR\tgcsBucket\x12\x12\n" +
+	"\x04hook\x18\x05 \x01(\tR\x04hook\x12\x14\n" +
+	"\x05label\x18\x06 \x01(\tR\x05label\x12#\n" +
+	"\rage_recipient\x18\a \x01(\tR\fageRecipient\x129\n" +
+	"\bkey_mode\x18\b \x01(\x0e2\x1e.containarium.v1.BackupKeyModeR\akeyMode\x12<\n" +
+	"\vhook_format\x18\t \x01(\x0e2\x1b.containarium.v1.HookFormatR\n" +
+	"hookFormat\x122\n" +
+	"\x05scope\x18\n" +
+	" \x01(\x0e2\x1c.containarium.v1.BackupScopeR\x05scope\x12-\n" +
+	"\x12require_encryption\x18\v \x01(\bR\x11requireEncryption\"\xbc\x01\n" +
+	"\x14CreateBackupResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\x125\n" +
+	"\x06record\x18\x02 \x01(\v2\x1d.containarium.v1.BackupRecordR\x06record\x127\n" +
+	"\arecords\x18\x03 \x03(\v2\x1d.containarium.v1.BackupRecordR\arecords\x12\x1a\n" +
+	"\bfailures\x18\x04 \x03(\tR\bfailures\"0\n" +
+	"\x12ListBackupsRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\"N\n" +
+	"\x13ListBackupsResponse\x127\n" +
+	"\arecords\x18\x01 \x03(\v2\x1d.containarium.v1.BackupRecordR\arecords\"\"\n" +
+	"\x10GetBackupRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"J\n" +
+	"\x11GetBackupResponse\x125\n" +
+	"\x06record\x18\x01 \x01(\v2\x1d.containarium.v1.BackupRecordR\x06record\"\xc9\x01\n" +
+	"\x14RestoreBackupRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12=\n" +
+	"\n" +
+	"connection\x18\x02 \x01(\v2\x1d.containarium.v1.PgConnectionR\n" +
+	"connection\x12\x14\n" +
+	"\x05clean\x18\x03 \x01(\bR\x05clean\x12!\n" +
+	"\fage_identity\x18\x04 \x01(\tR\vageIdentity\x12)\n" +
+	"\x10target_container\x18\x05 \x01(\tR\x0ftargetContainer\"1\n" +
+	"\x15RestoreBackupResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\"\xb0\x01\n" +
+	"\x13VerifyBackupRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12'\n" +
+	"\x0ftarget_username\x18\x02 \x01(\tR\x0etargetUsername\x12=\n" +
+	"\n" +
+	"connection\x18\x03 \x01(\v2\x1d.containarium.v1.PgConnectionR\n" +
+	"connection\x12!\n" +
+	"\fage_identity\x18\x04 \x01(\tR\vageIdentity\"\xb0\x01\n" +
+	"\x14VerifyBackupResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\x12G\n" +
+	"\fverification\x18\x02 \x01(\v2#.containarium.v1.BackupVerificationR\fverification\x125\n" +
+	"\x06record\x18\x03 \x01(\v2\x1d.containarium.v1.BackupRecordR\x06record\"%\n" +
+	"\x13DeleteBackupRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"0\n" +
+	"\x14DeleteBackupResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\"a\n" +
+	"\x13PruneBackupsRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x1a\n" +
+	"\bdatabase\x18\x02 \x01(\tR\bdatabase\x12\x12\n" +
+	"\x04keep\x18\x03 \x01(\x05R\x04keep\"m\n" +
+	"\x14PruneBackupsResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\x12\x1f\n" +
+	"\vdeleted_ids\x18\x02 \x03(\tR\n" +
+	"deletedIds\x12\x1a\n" +
+	"\bfailures\x18\x03 \x03(\tR\bfailures*\x92\x01\n" +
+	"\x11BackupDestination\x12\"\n" +
+	"\x1eBACKUP_DESTINATION_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18BACKUP_DESTINATION_LOCAL\x10\x01\x12\x1a\n" +
+	"\x16BACKUP_DESTINATION_GCS\x10\x02\x12\x1f\n" +
+	"\x1bBACKUP_DESTINATION_SNAPSHOT\x10\x03*x\n" +
+	"\fBackupEngine\x12\x1d\n" +
+	"\x19BACKUP_ENGINE_UNSPECIFIED\x10\x00\x12\x1a\n" +
+	"\x16BACKUP_ENGINE_POSTGRES\x10\x01\x12\x16\n" +
+	"\x12BACKUP_ENGINE_HOOK\x10\x02\x12\x15\n" +
+	"\x11BACKUP_ENGINE_BOX\x10\x03*\x8a\x01\n" +
+	"\rBackupKeyMode\x12\x1f\n" +
+	"\x1bBACKUP_KEY_MODE_UNSPECIFIED\x10\x00\x12!\n" +
+	"\x1dBACKUP_KEY_MODE_AGE_RECIPIENT\x10\x01\x12\x1b\n" +
+	"\x17BACKUP_KEY_MODE_MANAGED\x10\x02\x12\x18\n" +
+	"\x14BACKUP_KEY_MODE_BOTH\x10\x03*\\\n" +
+	"\n" +
+	"HookFormat\x12\x1b\n" +
+	"\x17HOOK_FORMAT_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12HOOK_FORMAT_OPAQUE\x10\x01\x12\x19\n" +
+	"\x15HOOK_FORMAT_PG_CUSTOM\x10\x02*\\\n" +
+	"\vBackupScope\x12\x1c\n" +
+	"\x18BACKUP_SCOPE_UNSPECIFIED\x10\x00\x12\x19\n" +
+	"\x15BACKUP_SCOPE_DATABASE\x10\x01\x12\x14\n" +
+	"\x10BACKUP_SCOPE_BOX\x10\x02*y\n" +
+	"\x12VerificationResult\x12#\n" +
+	"\x1fVERIFICATION_RESULT_UNSPECIFIED\x10\x00\x12\x1e\n" +
+	"\x1aVERIFICATION_RESULT_PASSED\x10\x01\x12\x1e\n" +
+	"\x1aVERIFICATION_RESULT_FAILED\x10\x022\xdc\x12\n" +
+	"\rBackupService\x12\xfa\x03\n" +
+	"\fCreateBackup\x12$.containarium.v1.CreateBackupRequest\x1a%.containarium.v1.CreateBackupResponse\"\x9c\x03\x92A\x82\x03\n" +
+	"\aBackups\x12\x0fCreate a backup\x1a\xe5\x02Runs pg_dump inside the tenant's container and stores the dump at the chosen off-host destination (local backup dir or GCS). Leave connection.database empty to back up every non-template database found; set it to back up just one. scope=BACKUP_SCOPE_BOX backs up the whole box instead: no connection or hook, and an explicit encryption key_mode is required.\x82\xd3\xe4\x93\x02\x10:\x01*\"\v/v1/backups\x12\xd3\x01\n" +
+	"\vListBackups\x12#.containarium.v1.ListBackupsRequest\x1a$.containarium.v1.ListBackupsResponse\"y\x92Ac\n" +
+	"\aBackups\x12\fList backups\x1aJLists stored backup records (newest first), optionally filtered by tenant.\x82\xd3\xe4\x93\x02\r\x12\v/v1/backups\x12\xb8\x01\n" +
+	"\tGetBackup\x12!.containarium.v1.GetBackupRequest\x1a\".containarium.v1.GetBackupResponse\"d\x92AI\n" +
+	"\aBackups\x12\fGet a backup\x1a0Returns the metadata for a single stored backup.\x82\xd3\xe4\x93\x02\x12\x12\x10/v1/backups/{id}\x12\x88\x02\n" +
+	"\rRestoreBackup\x12%.containarium.v1.RestoreBackupRequest\x1a&.containarium.v1.RestoreBackupResponse\"\xa7\x01\x92A\x80\x01\n" +
+	"\aBackups\x12\x10Restore a backup\x1acStreams a stored dump back into a container's database via pg_restore. Destructive when clean=true.\x82\xd3\xe4\x93\x02\x1d:\x01*\"\x18/v1/backups/{id}/restore\x12\x90\x04\n" +
+	"\fVerifyBackup\x12$.containarium.v1.VerifyBackupRequest\x1a%.containarium.v1.VerifyBackupResponse\"\xb2\x03\x92A\x8c\x03\n" +
+	"\aBackups\x12\x0fVerify a backup\x1a\xef\x02Restore-tests a stored dump by loading it into a throwaway database inside a target container and running sanity checks, then dropping the scratch database. Never touches the source container. An encrypted backup needs age_identity to decrypt; a wrong identity comes back as a FAILED result, not an error. Records the outcome on the backup as durable A.8.13 evidence.\x82\xd3\xe4\x93\x02\x1c:\x01*\"\x17/v1/backups/{id}/verify\x12\x95\x02\n" +
+	"\fDeleteBackup\x12$.containarium.v1.DeleteBackupRequest\x1a%.containarium.v1.DeleteBackupResponse\"\xb7\x01\x92A\x9b\x01\n" +
+	"\aBackups\x12\x0fDelete a backup\x1a\x7fDeletes a stored dump and its metadata by id. See PruneBackups for keep-newest-N retention instead of naming ids one at a time.\x82\xd3\xe4\x93\x02\x12*\x10/v1/backups/{id}\x12\x86\x03\n" +
+	"\fPruneBackups\x12$.containarium.v1.PruneBackupsRequest\x1a%.containarium.v1.PruneBackupsResponse\"\xa8\x02\x92A\x88\x02\n" +
+	"\aBackups\x124Prune old backups, keeping the newest N per database\x1a\xc6\x01Deletes older backup records for a tenant, keeping the newest `keep` per (username, database) — or per (username, label) for a hook backup. One failing delete never aborts pruning the rest. #1839.\x82\xd3\xe4\x93\x02\x16:\x01*\"\x11/v1/backups/pruneBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_backup_proto_rawDescOnce sync.Once
+	file_containarium_v1_backup_proto_rawDescData []byte
+)
+
+func file_containarium_v1_backup_proto_rawDescGZIP() []byte {
+	file_containarium_v1_backup_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_backup_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_backup_proto_rawDesc), len(file_containarium_v1_backup_proto_rawDesc)))
+	})
+	return file_containarium_v1_backup_proto_rawDescData
+}
+
+var file_containarium_v1_backup_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
+var file_containarium_v1_backup_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_containarium_v1_backup_proto_goTypes = []any{
+	(BackupDestination)(0),        // 0: containarium.v1.BackupDestination
+	(BackupEngine)(0),             // 1: containarium.v1.BackupEngine
+	(BackupKeyMode)(0),            // 2: containarium.v1.BackupKeyMode
+	(HookFormat)(0),               // 3: containarium.v1.HookFormat
+	(BackupScope)(0),              // 4: containarium.v1.BackupScope
+	(VerificationResult)(0),       // 5: containarium.v1.VerificationResult
+	(*BackupRecord)(nil),          // 6: containarium.v1.BackupRecord
+	(*VerificationCheck)(nil),     // 7: containarium.v1.VerificationCheck
+	(*BackupVerification)(nil),    // 8: containarium.v1.BackupVerification
+	(*PgConnection)(nil),          // 9: containarium.v1.PgConnection
+	(*CreateBackupRequest)(nil),   // 10: containarium.v1.CreateBackupRequest
+	(*CreateBackupResponse)(nil),  // 11: containarium.v1.CreateBackupResponse
+	(*ListBackupsRequest)(nil),    // 12: containarium.v1.ListBackupsRequest
+	(*ListBackupsResponse)(nil),   // 13: containarium.v1.ListBackupsResponse
+	(*GetBackupRequest)(nil),      // 14: containarium.v1.GetBackupRequest
+	(*GetBackupResponse)(nil),     // 15: containarium.v1.GetBackupResponse
+	(*RestoreBackupRequest)(nil),  // 16: containarium.v1.RestoreBackupRequest
+	(*RestoreBackupResponse)(nil), // 17: containarium.v1.RestoreBackupResponse
+	(*VerifyBackupRequest)(nil),   // 18: containarium.v1.VerifyBackupRequest
+	(*VerifyBackupResponse)(nil),  // 19: containarium.v1.VerifyBackupResponse
+	(*DeleteBackupRequest)(nil),   // 20: containarium.v1.DeleteBackupRequest
+	(*DeleteBackupResponse)(nil),  // 21: containarium.v1.DeleteBackupResponse
+	(*PruneBackupsRequest)(nil),   // 22: containarium.v1.PruneBackupsRequest
+	(*PruneBackupsResponse)(nil),  // 23: containarium.v1.PruneBackupsResponse
+}
+var file_containarium_v1_backup_proto_depIdxs = []int32{
+	0,  // 0: containarium.v1.BackupRecord.destination:type_name -> containarium.v1.BackupDestination
+	1,  // 1: containarium.v1.BackupRecord.engine:type_name -> containarium.v1.BackupEngine
+	8,  // 2: containarium.v1.BackupRecord.last_verification:type_name -> containarium.v1.BackupVerification
+	2,  // 3: containarium.v1.BackupRecord.key_mode:type_name -> containarium.v1.BackupKeyMode
+	3,  // 4: containarium.v1.BackupRecord.hook_format:type_name -> containarium.v1.HookFormat
+	4,  // 5: containarium.v1.BackupRecord.scope:type_name -> containarium.v1.BackupScope
+	5,  // 6: containarium.v1.BackupVerification.result:type_name -> containarium.v1.VerificationResult
+	7,  // 7: containarium.v1.BackupVerification.checks:type_name -> containarium.v1.VerificationCheck
+	9,  // 8: containarium.v1.CreateBackupRequest.connection:type_name -> containarium.v1.PgConnection
+	0,  // 9: containarium.v1.CreateBackupRequest.destination:type_name -> containarium.v1.BackupDestination
+	2,  // 10: containarium.v1.CreateBackupRequest.key_mode:type_name -> containarium.v1.BackupKeyMode
+	3,  // 11: containarium.v1.CreateBackupRequest.hook_format:type_name -> containarium.v1.HookFormat
+	4,  // 12: containarium.v1.CreateBackupRequest.scope:type_name -> containarium.v1.BackupScope
+	6,  // 13: containarium.v1.CreateBackupResponse.record:type_name -> containarium.v1.BackupRecord
+	6,  // 14: containarium.v1.CreateBackupResponse.records:type_name -> containarium.v1.BackupRecord
+	6,  // 15: containarium.v1.ListBackupsResponse.records:type_name -> containarium.v1.BackupRecord
+	6,  // 16: containarium.v1.GetBackupResponse.record:type_name -> containarium.v1.BackupRecord
+	9,  // 17: containarium.v1.RestoreBackupRequest.connection:type_name -> containarium.v1.PgConnection
+	9,  // 18: containarium.v1.VerifyBackupRequest.connection:type_name -> containarium.v1.PgConnection
+	8,  // 19: containarium.v1.VerifyBackupResponse.verification:type_name -> containarium.v1.BackupVerification
+	6,  // 20: containarium.v1.VerifyBackupResponse.record:type_name -> containarium.v1.BackupRecord
+	10, // 21: containarium.v1.BackupService.CreateBackup:input_type -> containarium.v1.CreateBackupRequest
+	12, // 22: containarium.v1.BackupService.ListBackups:input_type -> containarium.v1.ListBackupsRequest
+	14, // 23: containarium.v1.BackupService.GetBackup:input_type -> containarium.v1.GetBackupRequest
+	16, // 24: containarium.v1.BackupService.RestoreBackup:input_type -> containarium.v1.RestoreBackupRequest
+	18, // 25: containarium.v1.BackupService.VerifyBackup:input_type -> containarium.v1.VerifyBackupRequest
+	20, // 26: containarium.v1.BackupService.DeleteBackup:input_type -> containarium.v1.DeleteBackupRequest
+	22, // 27: containarium.v1.BackupService.PruneBackups:input_type -> containarium.v1.PruneBackupsRequest
+	11, // 28: containarium.v1.BackupService.CreateBackup:output_type -> containarium.v1.CreateBackupResponse
+	13, // 29: containarium.v1.BackupService.ListBackups:output_type -> containarium.v1.ListBackupsResponse
+	15, // 30: containarium.v1.BackupService.GetBackup:output_type -> containarium.v1.GetBackupResponse
+	17, // 31: containarium.v1.BackupService.RestoreBackup:output_type -> containarium.v1.RestoreBackupResponse
+	19, // 32: containarium.v1.BackupService.VerifyBackup:output_type -> containarium.v1.VerifyBackupResponse
+	21, // 33: containarium.v1.BackupService.DeleteBackup:output_type -> containarium.v1.DeleteBackupResponse
+	23, // 34: containarium.v1.BackupService.PruneBackups:output_type -> containarium.v1.PruneBackupsResponse
+	28, // [28:35] is the sub-list for method output_type
+	21, // [21:28] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_backup_proto_init() }
+func file_containarium_v1_backup_proto_init() {
+	if File_containarium_v1_backup_proto != nil {
+		return
+	}
+	file_containarium_v1_backup_proto_msgTypes[0].OneofWrappers = []any{}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_backup_proto_rawDesc), len(file_containarium_v1_backup_proto_rawDesc)),
+			NumEnums:      6,
+			NumMessages:   18,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_backup_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_backup_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_backup_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_backup_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_backup_proto = out.File
+	file_containarium_v1_backup_proto_goTypes = nil
+	file_containarium_v1_backup_proto_depIdxs = nil
+}

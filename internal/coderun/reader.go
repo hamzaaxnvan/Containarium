@@ -53,3 +53,31 @@ func StreamOutput(ctx context.Context, r LogReader, w io.Writer, path string, st
 			return offset, ctx.Err()
 		default:
 		}
+
+		// truncated is not branched on: every non-error path already loops
+		// back to the top immediately, with no client-side delay of any
+		// kind — the only throttle anywhere in this loop is retryBackoff
+		// on an actual error. So a truncated read is, by construction,
+		// already re-read as fast as any other read; there is no separate
+		// "sleep the poll interval" behavior here to skip.
+		data, end, _, err := r.Read(ctx, path, offset, follow)
+		if err != nil {
+			if onErr != nil {
+				onErr(err)
+			}
+			select {
+			case <-ctx.Done():
+				return offset, ctx.Err()
+			case <-time.After(retryBackoff):
+			}
+			continue
+		}
+
+		if len(data) > 0 {
+			if _, werr := w.Write(data); werr != nil {
+				return offset, werr
+			}
+		}
+		offset = end
+	}
+}
