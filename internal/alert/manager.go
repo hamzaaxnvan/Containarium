@@ -57,3 +57,63 @@ func (m *Manager) SyncRules(ctx context.Context) error {
 	return nil
 }
 
+// generateRulesYAML converts alert rules to vmalert-compatible YAML
+func generateRulesYAML(rules []*AlertRule) string {
+	if len(rules) == 0 {
+		return "groups: []\n"
+	}
+
+	var b strings.Builder
+	b.WriteString("groups:\n")
+	b.WriteString("  - name: custom_alerts\n")
+	b.WriteString("    interval: 30s\n")
+	b.WriteString("    rules:\n")
+
+	for _, rule := range rules {
+		fmt.Fprintf(&b, "      - alert: %s\n", sanitizeAlertName(rule.Name))
+		fmt.Fprintf(&b, "        expr: %s\n", rule.Expr)
+		if rule.Duration != "" {
+			fmt.Fprintf(&b, "        for: %s\n", rule.Duration)
+		}
+
+		// Labels
+		b.WriteString("        labels:\n")
+		fmt.Fprintf(&b, "          severity: %s\n", rule.Severity)
+		b.WriteString("          source: custom\n")
+		fmt.Fprintf(&b, "          rule_id: %s\n", rule.ID)
+		for k, v := range rule.Labels {
+			fmt.Fprintf(&b, "          %s: %q\n", k, v)
+		}
+
+		// Annotations
+		if rule.Description != "" || len(rule.Annotations) > 0 {
+			b.WriteString("        annotations:\n")
+			if rule.Description != "" {
+				fmt.Fprintf(&b, "          description: %q\n", rule.Description)
+			}
+			for k, v := range rule.Annotations {
+				fmt.Fprintf(&b, "          %s: %q\n", k, v)
+			}
+		}
+	}
+
+	return b.String()
+}
+
+// sanitizeAlertName converts a human-readable name to a valid alert name
+// (alphanumeric + underscores only)
+func sanitizeAlertName(name string) string {
+	var b strings.Builder
+	for _, c := range name {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			b.WriteRune(c)
+		} else if c == ' ' || c == '-' {
+			b.WriteRune('_')
+		}
+	}
+	result := b.String()
+	if result == "" {
+		return "unnamed_alert"
+	}
+	return result
+}
