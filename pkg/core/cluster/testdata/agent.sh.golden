@@ -23,3 +23,10 @@ RestartSec=5
 # restarted, and never joins (#1450). Upstream k3s's unit does the same.
 TimeoutStartSec=0
 LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now k3s-agent.service
