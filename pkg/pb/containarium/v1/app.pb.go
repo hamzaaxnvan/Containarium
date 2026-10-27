@@ -1035,3 +1035,695 @@ func (x *StartAppRequest) Reset() {
 	mi := &file_containarium_v1_app_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartAppRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartAppRequest) ProtoMessage() {}
+
+func (x *StartAppRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartAppRequest.ProtoReflect.Descriptor instead.
+func (*StartAppRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *StartAppRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *StartAppRequest) GetAppName() string {
+	if x != nil {
+		return x.AppName
+	}
+	return ""
+}
+
+type StartAppResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Updated app
+	App *App `protobuf:"bytes,1,opt,name=app,proto3" json:"app,omitempty"`
+	// Status message
+	Message       string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartAppResponse) Reset() {
+	*x = StartAppResponse{}
+	mi := &file_containarium_v1_app_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartAppResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartAppResponse) ProtoMessage() {}
+
+func (x *StartAppResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartAppResponse.ProtoReflect.Descriptor instead.
+func (*StartAppResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *StartAppResponse) GetApp() *App {
+	if x != nil {
+		return x.App
+	}
+	return nil
+}
+
+func (x *StartAppResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// RestartAppRequest restarts an app
+type RestartAppRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// App name
+	AppName       string `protobuf:"bytes,2,opt,name=app_name,json=appName,proto3" json:"app_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestartAppRequest) Reset() {
+	*x = RestartAppRequest{}
+	mi := &file_containarium_v1_app_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestartAppRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestartAppRequest) ProtoMessage() {}
+
+func (x *RestartAppRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestartAppRequest.ProtoReflect.Descriptor instead.
+func (*RestartAppRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *RestartAppRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *RestartAppRequest) GetAppName() string {
+	if x != nil {
+		return x.AppName
+	}
+	return ""
+}
+
+type RestartAppResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Updated app
+	App *App `protobuf:"bytes,1,opt,name=app,proto3" json:"app,omitempty"`
+	// Status message
+	Message       string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestartAppResponse) Reset() {
+	*x = RestartAppResponse{}
+	mi := &file_containarium_v1_app_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestartAppResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestartAppResponse) ProtoMessage() {}
+
+func (x *RestartAppResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestartAppResponse.ProtoReflect.Descriptor instead.
+func (*RestartAppResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *RestartAppResponse) GetApp() *App {
+	if x != nil {
+		return x.App
+	}
+	return nil
+}
+
+func (x *RestartAppResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// DeleteAppRequest deletes an app
+type DeleteAppRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// App name
+	AppName string `protobuf:"bytes,2,opt,name=app_name,json=appName,proto3" json:"app_name,omitempty"`
+	// Remove persistent data volumes
+	RemoveData    bool `protobuf:"varint,3,opt,name=remove_data,json=removeData,proto3" json:"remove_data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteAppRequest) Reset() {
+	*x = DeleteAppRequest{}
+	mi := &file_containarium_v1_app_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteAppRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteAppRequest) ProtoMessage() {}
+
+func (x *DeleteAppRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteAppRequest.ProtoReflect.Descriptor instead.
+func (*DeleteAppRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *DeleteAppRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *DeleteAppRequest) GetAppName() string {
+	if x != nil {
+		return x.AppName
+	}
+	return ""
+}
+
+func (x *DeleteAppRequest) GetRemoveData() bool {
+	if x != nil {
+		return x.RemoveData
+	}
+	return false
+}
+
+type DeleteAppResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Status message
+	Message       string `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteAppResponse) Reset() {
+	*x = DeleteAppResponse{}
+	mi := &file_containarium_v1_app_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteAppResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteAppResponse) ProtoMessage() {}
+
+func (x *DeleteAppResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteAppResponse.ProtoReflect.Descriptor instead.
+func (*DeleteAppResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *DeleteAppResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+// GetAppLogsRequest gets logs for an app
+type GetAppLogsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Username
+	Username string `protobuf:"bytes,1,opt,name=username,proto3" json:"username,omitempty"`
+	// App name
+	AppName string `protobuf:"bytes,2,opt,name=app_name,json=appName,proto3" json:"app_name,omitempty"`
+	// Number of lines from end (default: 100)
+	TailLines int32 `protobuf:"varint,3,opt,name=tail_lines,json=tailLines,proto3" json:"tail_lines,omitempty"`
+	// Stream logs (Server-Sent Events)
+	Follow        bool `protobuf:"varint,4,opt,name=follow,proto3" json:"follow,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetAppLogsRequest) Reset() {
+	*x = GetAppLogsRequest{}
+	mi := &file_containarium_v1_app_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetAppLogsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetAppLogsRequest) ProtoMessage() {}
+
+func (x *GetAppLogsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetAppLogsRequest.ProtoReflect.Descriptor instead.
+func (*GetAppLogsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *GetAppLogsRequest) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *GetAppLogsRequest) GetAppName() string {
+	if x != nil {
+		return x.AppName
+	}
+	return ""
+}
+
+func (x *GetAppLogsRequest) GetTailLines() int32 {
+	if x != nil {
+		return x.TailLines
+	}
+	return 0
+}
+
+func (x *GetAppLogsRequest) GetFollow() bool {
+	if x != nil {
+		return x.Follow
+	}
+	return false
+}
+
+type GetAppLogsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Log lines
+	LogLines []string `protobuf:"bytes,1,rep,name=log_lines,json=logLines,proto3" json:"log_lines,omitempty"`
+	// Timestamp of logs
+	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetAppLogsResponse) Reset() {
+	*x = GetAppLogsResponse{}
+	mi := &file_containarium_v1_app_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetAppLogsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetAppLogsResponse) ProtoMessage() {}
+
+func (x *GetAppLogsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_app_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetAppLogsResponse.ProtoReflect.Descriptor instead.
+func (*GetAppLogsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_app_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *GetAppLogsResponse) GetLogLines() []string {
+	if x != nil {
+		return x.LogLines
+	}
+	return nil
+}
+
+func (x *GetAppLogsResponse) GetTimestamp() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Timestamp
+	}
+	return nil
+}
+
+var File_containarium_v1_app_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_app_proto_rawDesc = "" +
+	"\n" +
+	"\x19containarium/v1/app.proto\x12\x0fcontainarium.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1cgoogle/api/annotations.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\x1a\x1dcontainarium/v1/network.proto\"\x87\a\n" +
+	"\x03App\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x1a\n" +
+	"\busername\x18\x03 \x01(\tR\busername\x12%\n" +
+	"\x0econtainer_name\x18\x04 \x01(\tR\rcontainerName\x12\x1c\n" +
+	"\tsubdomain\x18\x05 \x01(\tR\tsubdomain\x12\x1f\n" +
+	"\vfull_domain\x18\x06 \x01(\tR\n" +
+	"fullDomain\x12\x12\n" +
+	"\x04port\x18\a \x01(\x05R\x04port\x12/\n" +
+	"\x05state\x18\b \x01(\x0e2\x19.containarium.v1.AppStateR\x05state\x12'\n" +
+	"\x0fcontainer_image\x18\t \x01(\tR\x0econtainerImage\x12'\n" +
+	"\x0fdockerfile_path\x18\n" +
+	" \x01(\tR\x0edockerfilePath\x12<\n" +
+	"\benv_vars\x18\v \x03(\v2!.containarium.v1.App.EnvVarsEntryR\aenvVars\x129\n" +
+	"\n" +
+	"created_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
+	"\n" +
+	"updated_at\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12;\n" +
+	"\vdeployed_at\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"deployedAt\x12#\n" +
+	"\rerror_message\x18\x0f \x01(\tR\ferrorMessage\x12#\n" +
+	"\rrestart_count\x18\x10 \x01(\x05R\frestartCount\x12!\n" +
+	"\fcontainer_ip\x18\x11 \x01(\tR\vcontainerIp\x129\n" +
+	"\n" +
+	"acl_preset\x18\x12 \x01(\x0e2\x1a.containarium.v1.ACLPresetR\taclPreset\x121\n" +
+	"\x05route\x18\x13 \x01(\v2\x1b.containarium.v1.ProxyRouteR\x05route\x12;\n" +
+	"\tresources\x18\x14 \x01(\v2\x1d.containarium.v1.AppResourcesR\tresources\x1a:\n" +
+	"\fEnvVarsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"L\n" +
+	"\fAppResources\x12\x10\n" +
+	"\x03cpu\x18\x01 \x01(\tR\x03cpu\x12\x16\n" +
+	"\x06memory\x18\x02 \x01(\tR\x06memory\x12\x12\n" +
+	"\x04disk\x18\x03 \x01(\tR\x04disk\"\xbf\x01\n" +
+	"\x10BuildpackOptions\x12!\n" +
+	"\fnode_version\x18\x01 \x01(\tR\vnodeVersion\x12%\n" +
+	"\x0epython_version\x18\x02 \x01(\tR\rpythonVersion\x12\x1d\n" +
+	"\n" +
+	"go_version\x18\x03 \x01(\tR\tgoVersion\x12!\n" +
+	"\frust_version\x18\x04 \x01(\tR\vrustVersion\x12\x1f\n" +
+	"\vauto_detect\x18\x05 \x01(\bR\n" +
+	"autoDetect\"q\n" +
+	"\x10DetectedLanguage\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x12/\n" +
+	"\x13dockerfile_provided\x18\x03 \x01(\bR\x12dockerfileProvided\"\x93\x03\n" +
+	"\x10DeployAppRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x19\n" +
+	"\bapp_name\x18\x02 \x01(\tR\aappName\x12%\n" +
+	"\x0esource_tarball\x18\x03 \x01(\fR\rsourceTarball\x12'\n" +
+	"\x0fdockerfile_path\x18\x04 \x01(\tR\x0edockerfilePath\x12\x12\n" +
+	"\x04port\x18\x05 \x01(\x05R\x04port\x12I\n" +
+	"\benv_vars\x18\x06 \x03(\v2..containarium.v1.DeployAppRequest.EnvVarsEntryR\aenvVars\x12\x1c\n" +
+	"\tsubdomain\x18\a \x01(\tR\tsubdomain\x12?\n" +
+	"\tbuildpack\x18\b \x01(\v2!.containarium.v1.BuildpackOptionsR\tbuildpack\x1a:\n" +
+	"\fEnvVarsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc9\x01\n" +
+	"\x11DeployAppResponse\x12&\n" +
+	"\x03app\x18\x01 \x01(\v2\x14.containarium.v1.AppR\x03app\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\x12\"\n" +
+	"\rbuild_log_url\x18\x03 \x01(\tR\vbuildLogUrl\x12N\n" +
+	"\x11detected_language\x18\x04 \x01(\v2!.containarium.v1.DetectedLanguageR\x10detectedLanguage\"k\n" +
+	"\x0fListAppsRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12<\n" +
+	"\fstate_filter\x18\x02 \x01(\x0e2\x19.containarium.v1.AppStateR\vstateFilter\"]\n" +
+	"\x10ListAppsResponse\x12(\n" +
+	"\x04apps\x18\x01 \x03(\v2\x14.containarium.v1.AppR\x04apps\x12\x1f\n" +
+	"\vtotal_count\x18\x02 \x01(\x05R\n" +
+	"totalCount\"F\n" +
+	"\rGetAppRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x19\n" +
+	"\bapp_name\x18\x02 \x01(\tR\aappName\"8\n" +
+	"\x0eGetAppResponse\x12&\n" +
+	"\x03app\x18\x01 \x01(\v2\x14.containarium.v1.AppR\x03app\"G\n" +
+	"\x0eStopAppRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x19\n" +
+	"\bapp_name\x18\x02 \x01(\tR\aappName\"S\n" +
+	"\x0fStopAppResponse\x12&\n" +
+	"\x03app\x18\x01 \x01(\v2\x14.containarium.v1.AppR\x03app\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"H\n" +
+	"\x0fStartAppRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x19\n" +
+	"\bapp_name\x18\x02 \x01(\tR\aappName\"T\n" +
+	"\x10StartAppResponse\x12&\n" +
+	"\x03app\x18\x01 \x01(\v2\x14.containarium.v1.AppR\x03app\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"J\n" +
+	"\x11RestartAppRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x19\n" +
+	"\bapp_name\x18\x02 \x01(\tR\aappName\"V\n" +
+	"\x12RestartAppResponse\x12&\n" +
+	"\x03app\x18\x01 \x01(\v2\x14.containarium.v1.AppR\x03app\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"j\n" +
+	"\x10DeleteAppRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x19\n" +
+	"\bapp_name\x18\x02 \x01(\tR\aappName\x12\x1f\n" +
+	"\vremove_data\x18\x03 \x01(\bR\n" +
+	"removeData\"-\n" +
+	"\x11DeleteAppResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\"\x81\x01\n" +
+	"\x11GetAppLogsRequest\x12\x1a\n" +
+	"\busername\x18\x01 \x01(\tR\busername\x12\x19\n" +
+	"\bapp_name\x18\x02 \x01(\tR\aappName\x12\x1d\n" +
+	"\n" +
+	"tail_lines\x18\x03 \x01(\x05R\ttailLines\x12\x16\n" +
+	"\x06follow\x18\x04 \x01(\bR\x06follow\"k\n" +
+	"\x12GetAppLogsResponse\x12\x1b\n" +
+	"\tlog_lines\x18\x01 \x03(\tR\blogLines\x128\n" +
+	"\ttimestamp\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp*\xb4\x01\n" +
+	"\bAppState\x12\x19\n" +
+	"\x15APP_STATE_UNSPECIFIED\x10\x00\x12\x17\n" +
+	"\x13APP_STATE_UPLOADING\x10\x01\x12\x16\n" +
+	"\x12APP_STATE_BUILDING\x10\x02\x12\x15\n" +
+	"\x11APP_STATE_RUNNING\x10\x03\x12\x15\n" +
+	"\x11APP_STATE_STOPPED\x10\x04\x12\x14\n" +
+	"\x10APP_STATE_FAILED\x10\x05\x12\x18\n" +
+	"\x14APP_STATE_RESTARTING\x10\x062\xf0\x0f\n" +
+	"\n" +
+	"AppService\x12\xa4\x02\n" +
+	"\tDeployApp\x12!.containarium.v1.DeployAppRequest\x1a\".containarium.v1.DeployAppResponse\"\xcf\x01\x92A\xb8\x01\n" +
+	"\fApplications\x12\x15Deploy an application\x1a\x90\x01Deploys a new application or updates an existing one. Accepts source code + Dockerfile/Containerfile or auto-detects language and generates one.\x82\xd3\xe4\x93\x02\r:\x01*\"\b/v1/apps\x12\xdd\x01\n" +
+	"\bListApps\x12 .containarium.v1.ListAppsRequest\x1a!.containarium.v1.ListAppsResponse\"\x8b\x01\x92Ax\n" +
+	"\fApplications\x12\x11List applications\x1aUReturns a list of deployed applications with optional filtering by state or username.\x82\xd3\xe4\x93\x02\n" +
+	"\x12\b/v1/apps\x12\x84\x02\n" +
+	"\x06GetApp\x12\x1e.containarium.v1.GetAppRequest\x1a\x1f.containarium.v1.GetAppResponse\"\xb8\x01\x92A\x8e\x01\n" +
+	"\fApplications\x12\x17Get application details\x1aeReturns detailed information about a specific application including state, domain, and configuration.\x82\xd3\xe4\x93\x02 \x12\x1e/v1/apps/{username}/{app_name}\x12\xf7\x01\n" +
+	"\aStopApp\x12\x1f.containarium.v1.StopAppRequest\x1a .containarium.v1.StopAppResponse\"\xa8\x01\x92Aw\n" +
+	"\x16Application Operations\x12\x13Stop an application\x1aHStops a running application. The application can be started again later.\x82\xd3\xe4\x93\x02(:\x01*\"#/v1/apps/{username}/{app_name}/stop\x12\xd0\x01\n" +
+	"\bStartApp\x12 .containarium.v1.StartAppRequest\x1a!.containarium.v1.StartAppResponse\"\x7f\x92AM\n" +
+	"\x16Application Operations\x12\x14Start an application\x1a\x1dStarts a stopped application.\x82\xd3\xe4\x93\x02):\x01*\"$/v1/apps/{username}/{app_name}/start\x12\xf2\x01\n" +
+	"\n" +
+	"RestartApp\x12\".containarium.v1.RestartAppRequest\x1a#.containarium.v1.RestartAppResponse\"\x9a\x01\x92Af\n" +
+	"\x16Application Operations\x12\x16Restart an application\x1a4Restarts an application by stopping and starting it.\x82\xd3\xe4\x93\x02+:\x01*\"&/v1/apps/{username}/{app_name}/restart\x12\xf7\x01\n" +
+	"\tDeleteApp\x12!.containarium.v1.DeleteAppRequest\x1a\".containarium.v1.DeleteAppResponse\"\xa2\x01\x92Ay\n" +
+	"\fApplications\x12\x15Delete an application\x1aRPermanently deletes an application and optionally removes associated data volumes.\x82\xd3\xe4\x93\x02 *\x1e/v1/apps/{username}/{app_name}\x12\x97\x02\n" +
+	"\n" +
+	"GetAppLogs\x12\".containarium.v1.GetAppLogsRequest\x1a#.containarium.v1.GetAppLogsResponse\"\xbd\x01\x92A\x8e\x01\n" +
+	"\x16Application Operations\x12\x14Get application logs\x1a^Returns application logs with optional streaming. Use follow=true for real-time log streaming.\x82\xd3\xe4\x93\x02%\x12#/v1/apps/{username}/{app_name}/logs0\x01BKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_app_proto_rawDescOnce sync.Once
+	file_containarium_v1_app_proto_rawDescData []byte
+)
+
+func file_containarium_v1_app_proto_rawDescGZIP() []byte {
+	file_containarium_v1_app_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_app_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_app_proto_rawDesc), len(file_containarium_v1_app_proto_rawDesc)))
+	})
+	return file_containarium_v1_app_proto_rawDescData
+}
+
+var file_containarium_v1_app_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_containarium_v1_app_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_containarium_v1_app_proto_goTypes = []any{
+	(AppState)(0),                 // 0: containarium.v1.AppState
+	(*App)(nil),                   // 1: containarium.v1.App
+	(*AppResources)(nil),          // 2: containarium.v1.AppResources
+	(*BuildpackOptions)(nil),      // 3: containarium.v1.BuildpackOptions
+	(*DetectedLanguage)(nil),      // 4: containarium.v1.DetectedLanguage
+	(*DeployAppRequest)(nil),      // 5: containarium.v1.DeployAppRequest
+	(*DeployAppResponse)(nil),     // 6: containarium.v1.DeployAppResponse
+	(*ListAppsRequest)(nil),       // 7: containarium.v1.ListAppsRequest
+	(*ListAppsResponse)(nil),      // 8: containarium.v1.ListAppsResponse
+	(*GetAppRequest)(nil),         // 9: containarium.v1.GetAppRequest
+	(*GetAppResponse)(nil),        // 10: containarium.v1.GetAppResponse
+	(*StopAppRequest)(nil),        // 11: containarium.v1.StopAppRequest
+	(*StopAppResponse)(nil),       // 12: containarium.v1.StopAppResponse
+	(*StartAppRequest)(nil),       // 13: containarium.v1.StartAppRequest
+	(*StartAppResponse)(nil),      // 14: containarium.v1.StartAppResponse
+	(*RestartAppRequest)(nil),     // 15: containarium.v1.RestartAppRequest
+	(*RestartAppResponse)(nil),    // 16: containarium.v1.RestartAppResponse
+	(*DeleteAppRequest)(nil),      // 17: containarium.v1.DeleteAppRequest
+	(*DeleteAppResponse)(nil),     // 18: containarium.v1.DeleteAppResponse
+	(*GetAppLogsRequest)(nil),     // 19: containarium.v1.GetAppLogsRequest
+	(*GetAppLogsResponse)(nil),    // 20: containarium.v1.GetAppLogsResponse
+	nil,                           // 21: containarium.v1.App.EnvVarsEntry
+	nil,                           // 22: containarium.v1.DeployAppRequest.EnvVarsEntry
+	(*timestamppb.Timestamp)(nil), // 23: google.protobuf.Timestamp
+	(ACLPreset)(0),                // 24: containarium.v1.ACLPreset
+	(*ProxyRoute)(nil),            // 25: containarium.v1.ProxyRoute
+}
+var file_containarium_v1_app_proto_depIdxs = []int32{
+	0,  // 0: containarium.v1.App.state:type_name -> containarium.v1.AppState
+	21, // 1: containarium.v1.App.env_vars:type_name -> containarium.v1.App.EnvVarsEntry
+	23, // 2: containarium.v1.App.created_at:type_name -> google.protobuf.Timestamp
+	23, // 3: containarium.v1.App.updated_at:type_name -> google.protobuf.Timestamp
+	23, // 4: containarium.v1.App.deployed_at:type_name -> google.protobuf.Timestamp
+	24, // 5: containarium.v1.App.acl_preset:type_name -> containarium.v1.ACLPreset
+	25, // 6: containarium.v1.App.route:type_name -> containarium.v1.ProxyRoute
+	2,  // 7: containarium.v1.App.resources:type_name -> containarium.v1.AppResources
+	22, // 8: containarium.v1.DeployAppRequest.env_vars:type_name -> containarium.v1.DeployAppRequest.EnvVarsEntry
+	3,  // 9: containarium.v1.DeployAppRequest.buildpack:type_name -> containarium.v1.BuildpackOptions
+	1,  // 10: containarium.v1.DeployAppResponse.app:type_name -> containarium.v1.App
+	4,  // 11: containarium.v1.DeployAppResponse.detected_language:type_name -> containarium.v1.DetectedLanguage
+	0,  // 12: containarium.v1.ListAppsRequest.state_filter:type_name -> containarium.v1.AppState
+	1,  // 13: containarium.v1.ListAppsResponse.apps:type_name -> containarium.v1.App
+	1,  // 14: containarium.v1.GetAppResponse.app:type_name -> containarium.v1.App
+	1,  // 15: containarium.v1.StopAppResponse.app:type_name -> containarium.v1.App
+	1,  // 16: containarium.v1.StartAppResponse.app:type_name -> containarium.v1.App
+	1,  // 17: containarium.v1.RestartAppResponse.app:type_name -> containarium.v1.App
+	23, // 18: containarium.v1.GetAppLogsResponse.timestamp:type_name -> google.protobuf.Timestamp
+	5,  // 19: containarium.v1.AppService.DeployApp:input_type -> containarium.v1.DeployAppRequest
+	7,  // 20: containarium.v1.AppService.ListApps:input_type -> containarium.v1.ListAppsRequest
+	9,  // 21: containarium.v1.AppService.GetApp:input_type -> containarium.v1.GetAppRequest
+	11, // 22: containarium.v1.AppService.StopApp:input_type -> containarium.v1.StopAppRequest
+	13, // 23: containarium.v1.AppService.StartApp:input_type -> containarium.v1.StartAppRequest
+	15, // 24: containarium.v1.AppService.RestartApp:input_type -> containarium.v1.RestartAppRequest
+	17, // 25: containarium.v1.AppService.DeleteApp:input_type -> containarium.v1.DeleteAppRequest
+	19, // 26: containarium.v1.AppService.GetAppLogs:input_type -> containarium.v1.GetAppLogsRequest
+	6,  // 27: containarium.v1.AppService.DeployApp:output_type -> containarium.v1.DeployAppResponse
+	8,  // 28: containarium.v1.AppService.ListApps:output_type -> containarium.v1.ListAppsResponse
+	10, // 29: containarium.v1.AppService.GetApp:output_type -> containarium.v1.GetAppResponse
+	12, // 30: containarium.v1.AppService.StopApp:output_type -> containarium.v1.StopAppResponse
+	14, // 31: containarium.v1.AppService.StartApp:output_type -> containarium.v1.StartAppResponse
+	16, // 32: containarium.v1.AppService.RestartApp:output_type -> containarium.v1.RestartAppResponse
+	18, // 33: containarium.v1.AppService.DeleteApp:output_type -> containarium.v1.DeleteAppResponse
+	20, // 34: containarium.v1.AppService.GetAppLogs:output_type -> containarium.v1.GetAppLogsResponse
+	27, // [27:35] is the sub-list for method output_type
+	19, // [19:27] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_app_proto_init() }
+func file_containarium_v1_app_proto_init() {
+	if File_containarium_v1_app_proto != nil {
+		return
+	}
+	file_containarium_v1_network_proto_init()
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_app_proto_rawDesc), len(file_containarium_v1_app_proto_rawDesc)),
+			NumEnums:      1,
+			NumMessages:   22,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_app_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_app_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_app_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_app_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_app_proto = out.File
+	file_containarium_v1_app_proto_goTypes = nil
+	file_containarium_v1_app_proto_depIdxs = nil
+}
