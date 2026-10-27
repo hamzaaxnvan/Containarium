@@ -69,3 +69,21 @@ func (l *Loader) SetScanEnabled(on bool) error {
 	if on {
 		v = 1
 	}
+	if err := m.Update(&key, &v, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("netbpf: update sig_config: %w", err)
+	}
+	return nil
+}
+
+// signatureValue serializes a SignatureEntry into the 36-byte `struct signature`
+// layout: u8 len, u8 enabled, u16 id (native byte order), pat[SigMaxLen].
+func signatureValue(e SignatureEntry) [signatureValueSize]byte {
+	var b [signatureValueSize]byte
+	b[0] = e.Len
+	if e.Enabled {
+		b[1] = 1
+	}
+	binary.NativeEndian.PutUint16(b[2:4], e.ID)
+	copy(b[4:signatureValueSize], e.Pattern[:])
+	return b
+}

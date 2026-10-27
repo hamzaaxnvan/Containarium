@@ -74,3 +74,156 @@ func ReadRecords(r io.Reader, filter Filter) ([]Record, error) {
 	}
 	if err := scanner.Err(); err != nil {
 		return out, fmt.Errorf("read records: %w", err)
+	}
+	return out, nil
+}
+
+// ReadRecordsFile opens path and reads every matching record via
+// ReadRecords. A missing file is reported as zero records, not an error:
+// running `ssh-sessions list` before the plugin has ever written a session
+// (or before it has been wired into sshpiperd's chain at all) is the
+// expected first-run case, not a failure.
+func ReadRecordsFile(path string, filter Filter) ([]Record, error) {
+	f, err := os.Open(path) // #nosec G304 -- operator-supplied --records-file, see plugin.go's own justification.
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	return ReadRecords(f, filter)
+}
+
+// FollowPollInterval is how often Follow checks the sink file for new
+// content and, before the file exists yet, for its creation. It is a
+// package var rather than a const so tests can dial it down instead of
+// sleeping through the production cadence — the same pattern
+// internal/cmd/login.go uses for pollIntervalOverride.
+var FollowPollInterval = 500 * time.Millisecond
+
+// Follow tails path for records appended after Follow starts, sending
+// each match on out as it is decoded, until ctx is cancelled (Follow then
+// returns ctx.Err()). Like `tail -f` (not `tail -f -c +0`): it starts
+// reading from the file's current end, so history is not replayed — a
+// caller wanting both should call ReadRecordsFile first and then Follow.
+//
+// A path that does not exist yet is not an error: Follow waits for it to
+// be created, matching `tail -f`'s own behavior against a not-yet-existing
+// log file (e.g. before the ssh-session-plugin process has started).
+//
+// out must have spare capacity or an active reader: Follow blocks sending
+// on it (respecting ctx cancellation), by design — silently dropping a
+// session record because nobody was listening would defeat the point of
+// an audit trail.
+func Follow(ctx context.Context, path string, filter Filter, out chan<- Record) error {
+	f, offset, err := openAtCurrentEnd(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	var pending []byte
+	chunk := make([]byte, 64*1024)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n, readErr := f.ReadAt(chunk, offset)
+		if n > 0 {
+			offset += int64(n)
+			pending = append(pending, chunk[:n]...)
+
+			for {
+				i := bytes.IndexByte(pending, '\n')
+				if i < 0 {
+					break
+				}
+				line := pending[:i]
+				pending = pending[i+1:]
+
+				text := strings.TrimSpace(string(line))
+				if text == "" {
+					continue
+				}
+				var rec Record
+				if uerr := json.Unmarshal([]byte(text), &rec); uerr != nil {
+					return fmt.Errorf("parse record: %w", uerr)
+				}
+				if !filter.matches(rec) {
+					continue
+				}
+				select {
+				case out <- rec:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			// Progress was made; go straight back to try reading more
+			// rather than sleeping through a poll interval for no
+			// reason.
+			continue
+		}
+
+		if readErr != nil && readErr != io.EOF {
+			return fmt.Errorf("read %q: %w", path, readErr)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(FollowPollInterval):
+		}
+	}
+}
+
+// openAtCurrentEnd opens path and returns it positioned to start reading
+// "from now" — Follow's doc comment promise.
+//
+// What "now" means depends on whether the file already existed when Follow
+// was asked to start:
+//   - It already exists: skip its current content (that's history — a
+//     caller wanting it calls ReadRecordsFile separately) and start at its
+//     present end-of-file.
+//   - It does not exist yet: there IS no history to skip, so once it's
+//     created, start at offset 0. Anchoring to "current end" in this case
+//     would race the very first write against Follow's own poll loop and
+//     could silently skip it depending on exactly when the writer and the
+//     poll happen to interleave.
+func openAtCurrentEnd(ctx context.Context, path string) (*os.File, int64, error) {
+	if info, err := os.Stat(path); err == nil {
+		f, err := os.Open(path) // #nosec G304 -- operator-supplied --records-file, see plugin.go's own justification.
+		if err != nil {
+			return nil, 0, fmt.Errorf("open %q: %w", path, err)
+		}
+		return f, info.Size(), nil
+	} else if !os.IsNotExist(err) {
+		return nil, 0, fmt.Errorf("stat %q: %w", path, err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		default:
+		}
+
+		f, err := os.Open(path) // #nosec G304 -- operator-supplied --records-file, see plugin.go's own justification.
+		if err == nil {
+			return f, 0, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, 0, fmt.Errorf("open %q: %w", path, err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		case <-time.After(FollowPollInterval):
+		}
+	}
+}
