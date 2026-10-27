@@ -97,3 +97,201 @@ func NewWakeProxy(
 	routeLookup RouteLookup,
 	routeStore RouteStore,
 	router *Router,
+	audit AuditLogger,
+	waitTimeout time.Duration,
+) *WakeProxy {
+	if waitTimeout <= 0 {
+		waitTimeout = 30 * time.Second
+	}
+	return &WakeProxy{
+		starter:     starter,
+		routeLookup: routeLookup,
+		routeStore:  routeStore,
+		router:      router,
+		audit:       audit,
+		waitTimeout: waitTimeout,
+		inflight:    make(map[string]*inflightWake),
+	}
+}
+
+// ServeHTTP handles a wake request. The container is resolved from the
+// incoming Host header (which Caddy preserves on its reverse-proxy
+// hop), the container is started, then the request is proxied through
+// to the now-running upstream.
+//
+// httputil.NewSingleHostReverseProxy handles WebSocket upgrades
+// correctly out of the box (Go 1.12+), so no extra logic is needed for
+// `Upgrade: websocket` requests — they just work.
+func (w *WakeProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	start := time.Now()
+
+	// Phase 1.9: source-IP gate. Only loopback (Caddy on the
+	// same host, the production shape) or explicitly trusted
+	// proxies may invoke /wake/. Other sources see 403 — the
+	// wake handler is not a public primitive.
+	if !isTrustedSource(req, w.trustedProxies) {
+		log.Printf("[wake] refused: remote=%s host=%q (not in trusted-proxy allowlist)", req.RemoteAddr, req.Host)
+		http.Error(rw, "wake: source not permitted", http.StatusForbidden)
+		return
+	}
+
+	host := req.Host
+	// Strip the daemon-test prefix if present. Caddy proxies the
+	// original path through unchanged, but humans hitting the daemon
+	// directly to smoke-test the endpoint will send /wake/foo.
+	if strings.HasPrefix(req.URL.Path, "/wake/") {
+		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/wake")
+		if req.URL.Path == "" {
+			req.URL.Path = "/"
+		}
+	}
+
+	// Resolve incoming Host → container.
+	route, ok, err := w.routeLookup.ResolveByHost(req.Context(), host)
+	if err != nil {
+		log.Printf("[wake] route lookup for %q: %v", host, err)
+		http.Error(rw, "wake: route lookup failed", http.StatusBadGateway)
+		return
+	}
+	if !ok {
+		http.Error(rw, "wake: no matching route", http.StatusNotFound)
+		return
+	}
+	containerName := route.ContainerName
+	// A resolved route with no container is not wake-eligible. The
+	// platform's own apex / base-domain routes carry an empty
+	// ContainerName; without this guard the starter is invoked with an
+	// empty username and StartContainer rejects it with a confusing
+	// "username is required" 503. A 404 matches the no-route case and
+	// is what an unmatched path on a container-less host should get.
+	if containerName == "" {
+		http.Error(rw, "wake: no matching route", http.StatusNotFound)
+		return
+	}
+	username := strings.TrimSuffix(containerName, "-container")
+
+	// Coalesce concurrent wakes for the same container.
+	w.inflightMu.Lock()
+	entry, leader := w.inflight[containerName], false
+	if entry == nil {
+		entry = &inflightWake{done: make(chan struct{})}
+		w.inflight[containerName] = entry
+		leader = true
+	}
+	w.inflightMu.Unlock()
+
+	if leader {
+		// Leader: run the actual wake on a derived context so
+		// followers' cancellations don't abort the whole group.
+		//
+		// Wake is a daemon-internal action: the inbound request that
+		// triggered it may be unauthenticated (a public route, a health
+		// probe), but StartContainer is authz-gated (RequireScope +
+		// AuthorizeTenant). Stamp the _system identity so the wake call
+		// passes those gates — the same pattern the autosleep ticker
+		// and peer forwarders use. Without it, every wake fails with
+		// "no authenticated subject in request context".
+		ctx, cancel := context.WithTimeout(auth.ContextWithSystemIdentity(context.Background()), w.waitTimeout)
+		ready, ip, port, werr := w.starter.WakeForRequest(ctx, username)
+		cancel()
+		if werr != nil {
+			entry.err = werr
+		} else if !ready {
+			entry.err = fmt.Errorf("wake: timeout after %s", w.waitTimeout)
+		} else {
+			entry.ip = ip
+			entry.port = port
+			// Fall back to route's target if starter didn't
+			// report them (some adapters may not have a cheap
+			// IP lookup).
+			if entry.ip == "" {
+				entry.ip = route.TargetIP
+			}
+			if entry.port <= 0 {
+				entry.port = route.TargetPort
+			}
+		}
+		close(entry.done)
+		// Remove ourselves from inflight so the next wake (after
+		// the next sleep cycle) starts fresh.
+		w.inflightMu.Lock()
+		delete(w.inflight, containerName)
+		w.inflightMu.Unlock()
+	} else {
+		// Follower: wait on the leader.
+		select {
+		case <-entry.done:
+		case <-req.Context().Done():
+			http.Error(rw, "wake: client cancelled", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
+	latencyMs := time.Since(start).Milliseconds()
+
+	if entry.err != nil {
+		w.logEvent(username, latencyMs, "error", entry.err.Error())
+		rw.Header().Set("Retry-After", "5")
+		http.Error(rw, fmt.Sprintf("wake: %v", entry.err), http.StatusServiceUnavailable)
+		return
+	}
+
+	// Successful wake. Schedule the SwapToDirect so subsequent
+	// requests bypass the daemon. Fire-and-forget — don't block the
+	// response on Caddy mutation latency.
+	if leader && w.router != nil && w.routeStore != nil {
+		go w.scheduleSwapToDirect(containerName)
+	}
+
+	w.logEvent(username, latencyMs, "ready", "")
+
+	// Proxy the request through to the container. SetURL's default rewrites
+	// Host to the upstream's; many app backends key on the original Host
+	// header for vhost routing, so preserve it. X-Forwarded-* is left to the
+	// first hop (Caddy already added them; we're the second hop).
+	target := &url.URL{
+		Scheme: "http",
+		Host:   fmt.Sprintf("%s:%d", entry.ip, entry.port),
+	}
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.Host = pr.In.Host
+		},
+	}
+	proxy.ServeHTTP(rw, req)
+}
+
+// scheduleSwapToDirect fetches the container's routes and asks the
+// router to flip Caddy back to the direct upstream. Best-effort; if
+// the lookup or the Caddy mutation fails, RouteSyncJob will eventually
+// re-converge (the tracker entry was already cleared by SwapToDirect).
+func (w *WakeProxy) scheduleSwapToDirect(containerName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	routes, err := w.routeStore.ListByContainer(ctx, containerName)
+	if err != nil {
+		log.Printf("[wake] post-wake route lookup for %s: %v", containerName, err)
+		return
+	}
+	if err := w.router.SwapToDirect(ctx, containerName, routes); err != nil {
+		log.Printf("[wake] post-wake swap-to-direct for %s: %v", containerName, err)
+	}
+}
+
+func (w *WakeProxy) logEvent(username string, latencyMs int64, result, errMsg string) {
+	fields := map[string]any{
+		"username":        username,
+		"wake_latency_ms": latencyMs,
+		"triggered_by":    "http",
+		"result":          result,
+	}
+	if errMsg != "" {
+		fields["error"] = errMsg
+	}
+	if w.audit != nil {
+		w.audit.Log("autosleep.woken", fields)
+		return
+	}
+	log.Printf("[wake] username=%s result=%s latency_ms=%d err=%q", username, result, latencyMs, errMsg)
+}

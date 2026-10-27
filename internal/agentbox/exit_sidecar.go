@@ -93,3 +93,67 @@ func buildRunScript(command, sidecar string, f *framingSpec) string {
 // quote around any embedded single quote. sanitizeName already constrains
 // the name, but the log dir is configurable, so the path is quoted rather
 // than assumed safe.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// readExitSidecar reads a sidecar written by the wrapper. Returns found=false
+// when absent or unparseable — a corrupt sidecar must leave the run
+// "unknown" rather than assert a wrong exit code.
+func readExitSidecar(dir, name string) (code int, finishedAt time.Time, found bool) {
+	data, err := os.ReadFile(exitSidecarPath(dir, name)) // #nosec G304 -- path built from sanitizeName + the configured log dir
+	if err != nil {
+		return 0, time.Time{}, false
+	}
+	return parseExitSidecar(data)
+}
+
+// parseExitSidecar parses a sidecar's "<code> <unix-seconds>" content.
+func parseExitSidecar(data []byte) (code int, finishedAt time.Time, found bool) {
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0, time.Time{}, false
+	}
+	code, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return 0, time.Time{}, false
+	}
+	finishedAt = time.Now()
+	if len(fields) > 1 {
+		if secs, cerr := strconv.ParseInt(fields[1], 10, 64); cerr == nil {
+			finishedAt = time.Unix(secs, 0).UTC()
+		}
+	}
+	return code, finishedAt, true
+}
+
+// applyExitSidecar fills in ExitCode/FinishedAt from the sidecar when the
+// record itself carries no outcome. A record that already has an ExitCode
+// wins: the in-process reaper wrote it with cmd.ProcessState, which
+// distinguishes a signaled exit that the shell's $? flattens.
+func applyExitSidecar(dir string, record RunRecord) RunRecord {
+	if record.ExitCode != nil {
+		return record
+	}
+	code, finishedAt, found := readExitSidecar(dir, record.Name)
+	return foldExit(record, code, finishedAt, found)
+}
+
+// FoldExitSidecar is applyExitSidecar over sidecar bytes already read (empty
+// = no sidecar), for the daemon's box-run reader (#2123).
+func FoldExitSidecar(record RunRecord, sidecar []byte) RunRecord {
+	if record.ExitCode != nil {
+		return record
+	}
+	code, finishedAt, found := parseExitSidecar(sidecar)
+	return foldExit(record, code, finishedAt, found)
+}
+
+func foldExit(record RunRecord, code int, finishedAt time.Time, found bool) RunRecord {
+	if !found {
+		return record
+	}
+	record.ExitCode = &code
+	record.FinishedAt = &finishedAt
+	return record
+}
