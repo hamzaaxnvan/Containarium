@@ -148,3 +148,230 @@ func (s *approvalServer) answerPath(id string) string {
 func (s *approvalServer) setPublicKey(h string) {
 	pub, err := coderun.ParseApprovalPublicKey(h)
 	if err != nil {
+		s.journal(coderun.InputEvent{Kind: coderun.KindInputStatus,
+			Text: "no usable approval public key for this run (" + err.Error() + "); every permission request is denied"})
+		return
+	}
+	s.pub = pub
+}
+
+// journal appends one line. O_APPEND with one write per line keeps lines whole
+// for concurrent readers.
+func (s *approvalServer) journal(e coderun.InputEvent) {
+	if e.T.IsZero() {
+		e.T = s.now().UTC()
+	}
+	line, err := e.MarshalLine()
+	if err != nil {
+		log.Printf("[approval-mcp] marshal journal line: %v", err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.OpenFile(s.journalPath(), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600) // #nosec G304 -- <log dir>/<run>.input.jsonl, run passed ValidApprovalRunName
+	if err != nil {
+		log.Printf("[approval-mcp] open journal: %v", err)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.Write(line); err != nil {
+		log.Printf("[approval-mcp] write journal: %v", err)
+	}
+}
+
+// promptInput is the permission-prompt tool's arguments, as Claude Code sends
+// them (verified on Claude Code 2.1.311: tool_name, input, tool_use_id).
+type promptInput struct {
+	ToolName  string          `json:"tool_name"`
+	Input     json.RawMessage `json:"input"`
+	ToolUseID string          `json:"tool_use_id"`
+}
+
+// promptDecision is the tool's reply: Claude Code reads the text content as
+// this JSON. updatedInput is echoed unchanged on allow.
+type promptDecision struct {
+	Behavior     string          `json:"behavior"`
+	UpdatedInput json.RawMessage `json:"updatedInput,omitempty"`
+	Message      string          `json:"message,omitempty"`
+}
+
+func (s *approvalServer) handleApprove(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var in promptInput
+	raw, err := json.Marshal(req.GetArguments())
+	if err == nil {
+		err = json.Unmarshal(raw, &in)
+	}
+	if err != nil {
+		return decisionResult(promptDecision{Behavior: "deny", Message: "malformed permission request"}), nil
+	}
+	if len(in.Input) == 0 {
+		in.Input = json.RawMessage("{}")
+	}
+
+	id, err := newRequestID()
+	if err != nil {
+		return decisionResult(promptDecision{Behavior: "deny", Message: "could not open a permission request"}), nil
+	}
+	now := s.now().UTC()
+	// Kept in memory: answers are verified against these, not the journal
+	// line, and an allow returns exactly this input, the one the answer was
+	// signed for. Both are in the form a client reads back from the journal.
+	tool := journalForm(in.ToolName)
+	input := journalForm(string(in.Input))
+	request := coderun.InputEvent{
+		Kind:        coderun.KindInputRequest,
+		T:           now,
+		RequestID:   id,
+		RequestKind: coderun.RequestKindPermission,
+		Tool:        tool,
+		Prompt:      describeToolCall(in.ToolName, in.Input),
+		Input:       input,
+		Options:     []coderun.Answer{coderun.AnswerAllow, coderun.AnswerDeny},
+		Default:     coderun.AnswerDeny,
+		ExpiresAt:   now.Add(s.timeout),
+	}
+
+	var answer coderun.Answer
+	var reason coderun.ResponseReason
+	if len(input) > coderun.MaxApprovalInput {
+		// Too large for a human to read before allowing it all.
+		request.Input = ""
+		s.journal(request)
+		answer, reason = coderun.AnswerDeny, coderun.ReasonTooLarge
+	} else {
+		s.journal(request)
+		answer, reason = s.wait(ctx, id, coderun.RequestDigest(tool, input), now.Add(s.timeout), progressTokenOf(req))
+	}
+	s.journal(coderun.InputEvent{Kind: coderun.KindInputResponse, RequestID: id, Answer: answer, Reason: reason})
+
+	if answer == coderun.AnswerAllow {
+		return decisionResult(promptDecision{Behavior: "allow", UpdatedInput: json.RawMessage(input)}), nil
+	}
+	msg := "The user denied this action."
+	switch reason {
+	case coderun.ReasonExpired:
+		msg = "Nobody answered this permission request before it expired, so it was denied."
+	case coderun.ReasonNoKey:
+		msg = "This run has no way to receive answers to permission requests, so it was denied."
+	case coderun.ReasonCancelled:
+		msg = "The permission request was cancelled."
+	case coderun.ReasonTooLarge:
+		msg = "This tool call's input is too large to be shown for approval, so it was denied."
+	}
+	return decisionResult(promptDecision{Behavior: "deny", Message: msg}), nil
+}
+
+// wait blocks until a valid answer for id and the request whose digest is
+// digest arrives, the deadline passes, or ctx ends. A file with a bad
+// signature is journaled once and ignored: it is a mistake, an answer to a
+// forged request, or an attempt to approve without the key.
+func (s *approvalServer) wait(ctx context.Context, id string, digest []byte, deadline time.Time, progress mcp.ProgressToken) (coderun.Answer, coderun.ResponseReason) {
+	if s.pub == nil {
+		return coderun.AnswerDeny, coderun.ReasonNoKey
+	}
+	path := s.answerPath(id)
+	var rejected string
+	tick := time.NewTicker(s.pollInterval)
+	defer tick.Stop()
+	lastProgress := s.now()
+	for {
+		// The deadline is checked first, so an answer that lands after expiry
+		// is never accepted.
+		if !s.now().Before(deadline) {
+			return coderun.AnswerDeny, coderun.ReasonExpired
+		}
+		// #nosec G304 -- <log dir>/<run>.answers/<id>: run passed ValidApprovalRunName, id is this process's own random request id
+		if content, err := os.ReadFile(path); err == nil && string(content) != rejected {
+			a, verr := coderun.VerifyAnswer(s.pub, s.run, id, digest, string(content))
+			if verr == nil {
+				return a, coderun.ReasonAnswered
+			}
+			rejected = string(content)
+			s.journal(coderun.InputEvent{Kind: coderun.KindInputStatus, RequestID: id,
+				Text: "ignored an answer to " + id + ": " + verr.Error()})
+		}
+		if progress != nil && s.now().Sub(lastProgress) >= approvalProgressInterval {
+			lastProgress = s.now()
+			if srv := server.ServerFromContext(ctx); srv != nil {
+				_ = srv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
+					"progressToken": progress,
+					"progress":      int(time.Until(deadline).Seconds()),
+					"message":       "waiting for an answer to " + id,
+				})
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return coderun.AnswerDeny, coderun.ReasonCancelled
+		case <-tick.C:
+		}
+	}
+}
+
+func progressTokenOf(req mcp.CallToolRequest) mcp.ProgressToken {
+	if req.Params.Meta == nil {
+		return nil
+	}
+	return req.Params.Meta.ProgressToken
+}
+
+func decisionResult(d promptDecision) *mcp.CallToolResult {
+	b, _ := json.Marshal(d)
+	return mcp.NewToolResultText(string(b))
+}
+
+// newRequestID is unguessable so an answer cannot be prepared before its
+// request exists.
+func newRequestID() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "req-" + hex.EncodeToString(b), nil
+}
+
+// describeToolCall is the one-line prompt a human answers: the command for a
+// shell call, the path for a file tool, otherwise the input as JSON.
+func describeToolCall(tool string, input json.RawMessage) string {
+	var fields struct {
+		Command  string `json:"command"`
+		FilePath string `json:"file_path"`
+		URL      string `json:"url"`
+	}
+	_ = json.Unmarshal(input, &fields)
+	detail := string(input)
+	switch {
+	case fields.Command != "":
+		detail = fields.Command
+	case fields.FilePath != "":
+		detail = fields.FilePath
+	case fields.URL != "":
+		detail = fields.URL
+	}
+	p := tool + ": " + detail
+	if len(p) > approvalPromptMax {
+		cut := approvalPromptMax
+		for cut > 0 && !utf8.RuneStart(p[cut]) {
+			cut--
+		}
+		p = p[:cut] + "…"
+	}
+	return journalForm(p)
+}
+
+// journalForm is s as a client reads it back from the journal. Answers are
+// verified against the digest of the tool call held here, and a client signs
+// the digest of what it read from the journal, so the two must be the same
+// strings: JSON encoding replaces invalid UTF-8, so they are passed through
+// that encoding before anything is hashed or shown.
+func journalForm(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return s
+	}
+	var out string
+	if err := json.Unmarshal(b, &out); err != nil {
+		return s
+	}
+	return out
+}
