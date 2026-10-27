@@ -167,3 +167,342 @@ func (r *TunnelRegistry) Register(hs *TunnelHandshake, session *yamux.Session, t
 		// not exist, and nothing re-adds it, because this branch previously
 		// only ever reused the recorded address. That is the shape operators
 		// recover from by restarting the sentinel by hand.
+		//
+		// Cheap insurance: addLoopbackAlias is already idempotent — it
+		// treats "already exists" as reuse — so the normal path costs one
+		// `ip addr add` that immediately reports the alias is present.
+		if err := addAlias(localIP); err != nil {
+			return "", 0, fmt.Errorf("re-assert loopback alias %s on reconnect: %w", localIP, err)
+		}
+	} else {
+		var err error
+		octet, err = r.allocateOctet(spotID)
+		if err != nil {
+			return "", 0, err
+		}
+		localIP = fmt.Sprintf("127.0.0.%d", octet)
+		if err := addAlias(localIP); err != nil {
+			delete(r.usedIPs, octet)
+			return "", 0, fmt.Errorf("add loopback alias %s: %w", localIP, err)
+		}
+	}
+
+	externalPort := ExternalPortBase + int(octet)
+
+	r.nextGen++
+	gen := r.nextGen
+
+	spot := &TunnelSpot{
+		ID:                spotID,
+		Session:           session,
+		LocalIP:           localIP,
+		ExternalPort:      externalPort,
+		Ports:             hs.Ports,
+		Pool:              hs.Pool,
+		PublicHostname:    hs.PublicHostname,
+		PublicAliases:     hs.PublicAliases,
+		PublicBaseDomains: hs.PublicBaseDomains,
+		PublicPort:        hs.PublicPort,
+		Connected:         time.Now(),
+		Transport:         transport,
+		Generation:        gen,
+	}
+	r.spots[spotID] = spot
+
+	log.Printf("[tunnel-registry] registered spot %q at %s gen=%d transport=%s (ports: %v, pool: %q, primary_host: %q)", spotID, localIP, gen, transport, hs.Ports, hs.Pool, hs.PublicHostname)
+	return localIP, gen, nil
+}
+
+// UnregisterIfCurrent removes the spot ONLY when the registered entry is still
+// generation gen, and reports the spot it removed (nil when it removed
+// nothing).
+//
+// This is the fix for #769's "stale forwarding after a backend reboot". When a
+// spot reconnects, Register closes the previous yamux session and installs a
+// fresh entry under the same spotID. That close wakes the goroutine monitoring
+// the OLD session, which then runs its ordinary disconnect cleanup — closing
+// proxy listeners, dropping the loopback alias, removing the backend's users
+// from the sshpiper config — except the thing it tears down is now the LIVE
+// registration that replaced it. The tunnel is up, and nothing routes over it
+// until the sentinel is restarted by hand.
+//
+// The generation check makes the compare-and-remove atomic under the registry
+// lock, so a superseded watcher can observe that it no longer owns the entry
+// and leave it alone.
+func (r *TunnelRegistry) UnregisterIfCurrent(spotID string, gen uint64) *TunnelSpot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	spot, ok := r.spots[spotID]
+	if !ok {
+		return nil
+	}
+	if spot.Generation != gen {
+		log.Printf("[tunnel-registry] ignoring cleanup for superseded spot %q gen=%d (current gen=%d)", spotID, gen, spot.Generation)
+		return nil
+	}
+	r.unregisterLocked(spotID)
+	return spot
+}
+
+// UnregisterAll iterates every registered spot and unregisters it.
+// Used on sentinel shutdown so the loopback aliases (127.0.0.x)
+// don't persist into the next start. Without this, restarting the
+// sentinel can leave the previous run's aliases blocking fresh
+// allocations — operators had to `ip addr del` them by hand
+// (#337 §"Related observations").
+//
+// Safe to call concurrently with Register; takes the registry lock.
+// Each Unregister closes the yamux session and removes the alias.
+func (r *TunnelRegistry) UnregisterAll() {
+	r.mu.Lock()
+	ids := make([]string, 0, len(r.spots))
+	for id := range r.spots {
+		ids = append(ids, id)
+	}
+	r.mu.Unlock()
+	for _, id := range ids {
+		r.Unregister(id)
+	}
+}
+
+// Unregister removes a spot from the registry and cleans up its loopback alias.
+func (r *TunnelRegistry) Unregister(spotID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.unregisterLocked(spotID)
+}
+
+// unregisterLocked is the shared body of Unregister / UnregisterIfCurrent.
+// Caller holds r.mu.
+func (r *TunnelRegistry) unregisterLocked(spotID string) {
+	spot, ok := r.spots[spotID]
+	if !ok {
+		return
+	}
+
+	if spot.Session != nil {
+		_ = spot.Session.Close()
+	}
+	removeAlias(spot.LocalIP)
+	delete(r.spots, spotID)
+
+	for octet, id := range r.usedIPs {
+		if id == spotID {
+			delete(r.usedIPs, octet)
+			break
+		}
+	}
+
+	log.Printf("[tunnel-registry] unregistered spot %q gen=%d (was at %s)", spotID, spot.Generation, spot.LocalIP)
+}
+
+// DialTunnel opens a yamux stream to the spot's local service on the given
+// port. Used by the SNI router to forward inbound TLS bytes to a
+// tunnel-promoted primary's :443 without going through a loopback proxy
+// listener (which would conflict with the sentinel's own ConnMux on 443).
+//
+// The returned net.Conn is a yamux stream — bidirectional, closing it
+// closes the stream cleanly.
+func (r *TunnelRegistry) DialTunnel(spotID string, port int) (net.Conn, error) {
+	r.mu.RLock()
+	spot, ok := r.spots[spotID]
+	r.mu.RUnlock()
+	if !ok || spot == nil || spot.Session == nil {
+		return nil, fmt.Errorf("spot %q not registered (or already closed)", spotID)
+	}
+	stream, err := spot.Session.Open()
+	if err != nil {
+		return nil, fmt.Errorf("yamux open for spot %q: %w", spotID, err)
+	}
+	// Wire protocol: 2-byte big-endian port number, then bidirectional copy.
+	// Same handshake the existing proxyConnection() uses on the loopback path.
+	portBytes := []byte{byte((port >> 8) & 0xff), byte(port & 0xff)}
+	if _, err := stream.Write(portBytes); err != nil {
+		_ = stream.Close()
+		return nil, fmt.Errorf("write port header to spot %q: %w", spotID, err)
+	}
+	return stream, nil
+}
+
+// Get returns the TunnelSpot for the given spotID, or nil.
+func (r *TunnelRegistry) Get(spotID string) *TunnelSpot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.spots[spotID]
+}
+
+// GetFirst returns the first (and typically only) connected spot.
+func (r *TunnelRegistry) GetFirst() *TunnelSpot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, spot := range r.spots {
+		return spot
+	}
+	return nil
+}
+
+// Connected returns true if at least one spot is connected.
+func (r *TunnelRegistry) Connected() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.spots) > 0
+}
+
+// Count returns the number of connected spots.
+func (r *TunnelRegistry) Count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.spots)
+}
+
+// Spots returns a snapshot of all connected spots.
+func (r *TunnelRegistry) Spots() []*TunnelSpot {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]*TunnelSpot, 0, len(r.spots))
+	for _, spot := range r.spots {
+		result = append(result, spot)
+	}
+	return result
+}
+
+// allocateOctet picks the 127.0.0.X octet for spotID. The slot is
+// derived deterministically from a hash of spotID so a backend that
+// disconnects and reconnects (e.g., after a network blip, sshpiper
+// reload, or sentinel restart) lands on the same loopback alias
+// across the lifetime of the registry — keysync's sshpiper config
+// stays valid through churn, and "ss -tlnp" output matches the
+// config without operator confusion (#342).
+//
+// When the preferred slot is occupied by a *different* spotID, we
+// linear-probe forward to the next free slot. This keeps the
+// existing capacity (127.0.0.2..127.0.0.254 = 253 slots) and only
+// drifts under genuine contention. Two backends with the same hash
+// land in adjacent slots; the first one keeps the preferred slot,
+// the second pays one extra probe.
+func (r *TunnelRegistry) allocateOctet(spotID string) (byte, error) {
+	preferred := preferredOctet(spotID)
+	for i := byte(0); i < 253; i++ {
+		// step through the 2..254 range starting from `preferred`,
+		// wrapping if we run off the top.
+		candidate := preferred + i
+		if candidate < 2 || candidate > 254 {
+			candidate = safecast.U8(2 + (int(preferred)+int(i)-2)%253)
+		}
+		if _, used := r.usedIPs[candidate]; !used {
+			r.usedIPs[candidate] = spotID
+			return candidate, nil
+		}
+	}
+	return 0, fmt.Errorf("no available loopback addresses (all 127.0.0.2-254 in use)")
+}
+
+// preferredOctet maps a spotID to a deterministic octet in [2, 254].
+// FNV-1a is a non-cryptographic hash — collision resistance is
+// irrelevant here because we linear-probe on collision. We just want
+// a uniform spread so independent spotIDs don't pile up at slot 2.
+func preferredOctet(spotID string) byte {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(spotID))
+	return byte(2 + (h.Sum32() % 253))
+}
+
+// addLoopbackAlias adds an IP alias to the loopback interface. Idempotent:
+// if the alias is already present, that's treated as success rather than
+// an error.
+//
+// This matters because allocateOctet's slot for a given spotID is a pure
+// function of spotID (#342) but the registry's usedIPs bookkeeping is
+// purely in-memory — it has no cross-restart memory. If the sentinel
+// process ever exits without running UnregisterAll (a crash, an OOM kill,
+// `kill -9`, anything that skips the graceful-shutdown path — the same
+// failure class #337 already flagged for restarts), the OS-level alias
+// for a still-connected spot survives the process death. On the next
+// startup, usedIPs starts empty, so allocateOctet freely reassigns that
+// spot's (deterministic, unchanged) preferred octet — and `ip addr add`
+// then fails with "RTNETLINK answers: File exists" because the address is
+// still there. Before this fix, that error aborted Register() and the
+// spot's tunnel client would retry, hash to the exact same octet, and
+// hit the exact same "already exists" error — forever, with no operator
+// visibility beyond an opaque "exit status 2" on the client side (found
+// live: a BYOC peer's tunnel silently wedged this way for a full week).
+// Since the goal of addLoopbackAlias is just "make sure this alias
+// exists," an already-present alias already satisfies that — so treat it
+// as success instead of a fatal error.
+func addLoopbackAlias(ip string) error {
+	if runtime.GOOS != "linux" {
+		log.Printf("[tunnel-registry] loopback alias %s: skipping on %s", ip, runtime.GOOS)
+		return nil
+	}
+	out, err := runIP(loopbackAliasArgs("add", ip))
+	if err != nil {
+		if isAlreadyExistsErr(out) {
+			log.Printf("[tunnel-registry] loopback alias %s already present (stale from a prior crash?) — reusing", ip)
+			return nil
+		}
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// loopbackAliasArgs builds the `ip` invocation for adding or removing a
+// loopback alias.
+//
+// Split out so the command is checkable without privileges. The end-to-end
+// tunnel tests used to exercise this call by side effect, but only ever
+// established that it did not error — and on Linux they pass without the
+// alias at all, since 127.0.0.0/8 already routes to loopback. So a malformed
+// invocation here (a dropped /32, the wrong device) would show up on macOS,
+// or on a reconnect against a stale alias, and nowhere in the test suite.
+func loopbackAliasArgs(op, ip string) []string {
+	return []string{"ip", "addr", op, ip + "/32", "dev", "lo"}
+}
+
+// runIPCmd executes an `ip` invocation. Indirected so a test can assert which
+// invocation each caller issues — without it, a remove path that issued `add`
+// would leak an alias per disconnect and no test would notice, because the
+// callers are only reached through a seam the tests already substitute.
+var runIPCmd atomic.Pointer[func([]string) ([]byte, error)]
+
+func init() {
+	run := func(args []string) ([]byte, error) {
+		return exec.Command(args[0], args[1:]...).CombinedOutput() // #nosec G204 -- args come from loopbackAliasArgs; the address is "127.0.0.<octet>", built internally by allocateOctet, never user input
+	}
+	runIPCmd.Store(&run)
+}
+
+// runIP calls whichever implementation is currently installed.
+func runIP(args []string) ([]byte, error) { return (*runIPCmd.Load())(args) }
+
+// isAlreadyExistsErr reports whether `ip addr add`'s output indicates the
+// alias already exists rather than some other, genuinely fatal failure (bad
+// address, missing interface, permission denied, ...). Split out from
+// addLoopbackAlias so the detection logic is unit-testable without
+// shelling out to `ip` or needing CAP_NET_ADMIN.
+//
+// Matches TWO distinct message formats for the identical condition, since
+// different iproute2 builds phrase it differently:
+//   - "RTNETLINK answers: File exists" (older/raw-netlink-style iproute2)
+//   - "Error: ipv4: Address already assigned." (newer libnl-style iproute2)
+//
+// Live-confirmed gap: the original fix (#927) only matched "File exists",
+// so a sentinel running the newer message format still hit the exact fatal
+// error #927 set out to eliminate — found live when a BYOC host's tunnel
+// registration kept failing with "Error: ipv4: Address already assigned."
+// on every reconnect attempt, indistinguishable from a genuine fatal error
+// on the client side beyond an opaque "exit status 2".
+func isAlreadyExistsErr(cmdOutput []byte) bool {
+	out := string(cmdOutput)
+	return strings.Contains(out, "File exists") || strings.Contains(out, "Address already assigned")
+}
+
+// removeLoopbackAlias removes an IP alias from the loopback interface.
+func removeLoopbackAlias(ip string) {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	if _, err := runIP(loopbackAliasArgs("del", ip)); err != nil {
+		log.Printf("[tunnel-registry] failed to remove loopback alias %s: %v", ip, err)
+	}
+}
