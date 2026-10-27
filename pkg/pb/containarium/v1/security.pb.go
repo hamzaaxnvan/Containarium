@@ -328,3 +328,996 @@ type ClamavContainerSummary struct {
 	sizeCache     protoimpl.SizeCache
 }
 
+func (x *ClamavContainerSummary) Reset() {
+	*x = ClamavContainerSummary{}
+	mi := &file_containarium_v1_security_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClamavContainerSummary) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClamavContainerSummary) ProtoMessage() {}
+
+func (x *ClamavContainerSummary) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClamavContainerSummary.ProtoReflect.Descriptor instead.
+func (*ClamavContainerSummary) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *ClamavContainerSummary) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+func (x *ClamavContainerSummary) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *ClamavContainerSummary) GetLastScanAt() string {
+	if x != nil {
+		return x.LastScanAt
+	}
+	return ""
+}
+
+func (x *ClamavContainerSummary) GetLastStatus() string {
+	if x != nil {
+		return x.LastStatus
+	}
+	return ""
+}
+
+func (x *ClamavContainerSummary) GetLastFindingsCount() int32 {
+	if x != nil {
+		return x.LastFindingsCount
+	}
+	return 0
+}
+
+func (x *ClamavContainerSummary) GetTotalScans() int32 {
+	if x != nil {
+		return x.TotalScans
+	}
+	return 0
+}
+
+func (x *ClamavContainerSummary) GetInfectedScans() int32 {
+	if x != nil {
+		return x.InfectedScans
+	}
+	return 0
+}
+
+func (x *ClamavContainerSummary) GetBackendId() string {
+	if x != nil {
+		return x.BackendId
+	}
+	return ""
+}
+
+type ListClamavReportsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Filter by container name (optional)
+	ContainerName string `protobuf:"bytes,1,opt,name=container_name,json=containerName,proto3" json:"container_name,omitempty"`
+	// Filter by status: "clean" or "infected" (optional)
+	Status string `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	// Start date filter (ISO 8601, optional)
+	From string `protobuf:"bytes,3,opt,name=from,proto3" json:"from,omitempty"`
+	// End date filter (ISO 8601, optional)
+	To string `protobuf:"bytes,4,opt,name=to,proto3" json:"to,omitempty"`
+	// Maximum number of reports to return (default: 50)
+	Limit int32 `protobuf:"varint,5,opt,name=limit,proto3" json:"limit,omitempty"`
+	// Offset for pagination
+	Offset        int32 `protobuf:"varint,6,opt,name=offset,proto3" json:"offset,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListClamavReportsRequest) Reset() {
+	*x = ListClamavReportsRequest{}
+	mi := &file_containarium_v1_security_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListClamavReportsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListClamavReportsRequest) ProtoMessage() {}
+
+func (x *ListClamavReportsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListClamavReportsRequest.ProtoReflect.Descriptor instead.
+func (*ListClamavReportsRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ListClamavReportsRequest) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+func (x *ListClamavReportsRequest) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *ListClamavReportsRequest) GetFrom() string {
+	if x != nil {
+		return x.From
+	}
+	return ""
+}
+
+func (x *ListClamavReportsRequest) GetTo() string {
+	if x != nil {
+		return x.To
+	}
+	return ""
+}
+
+func (x *ListClamavReportsRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+func (x *ListClamavReportsRequest) GetOffset() int32 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+type ListClamavReportsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// List of scan reports
+	Reports []*ClamavReport `protobuf:"bytes,1,rep,name=reports,proto3" json:"reports,omitempty"`
+	// Total count matching query
+	TotalCount    int32 `protobuf:"varint,2,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListClamavReportsResponse) Reset() {
+	*x = ListClamavReportsResponse{}
+	mi := &file_containarium_v1_security_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListClamavReportsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListClamavReportsResponse) ProtoMessage() {}
+
+func (x *ListClamavReportsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListClamavReportsResponse.ProtoReflect.Descriptor instead.
+func (*ListClamavReportsResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *ListClamavReportsResponse) GetReports() []*ClamavReport {
+	if x != nil {
+		return x.Reports
+	}
+	return nil
+}
+
+func (x *ListClamavReportsResponse) GetTotalCount() int32 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+type GetClamavSummaryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetClamavSummaryRequest) Reset() {
+	*x = GetClamavSummaryRequest{}
+	mi := &file_containarium_v1_security_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetClamavSummaryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetClamavSummaryRequest) ProtoMessage() {}
+
+func (x *GetClamavSummaryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetClamavSummaryRequest.ProtoReflect.Descriptor instead.
+func (*GetClamavSummaryRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{4}
+}
+
+// Counts are self-reported: the scan runs inside each tenant's own box (#2631),
+// so a compromised box can report "clean". Treat them as a tenant-visible
+// signal, not as platform assurance.
+type GetClamavSummaryResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Per-container summaries
+	Containers []*ClamavContainerSummary `protobuf:"bytes,1,rep,name=containers,proto3" json:"containers,omitempty"`
+	// Total number of containers
+	TotalContainers int32 `protobuf:"varint,2,opt,name=total_containers,json=totalContainers,proto3" json:"total_containers,omitempty"`
+	// Number of containers with clean last scan
+	CleanContainers int32 `protobuf:"varint,3,opt,name=clean_containers,json=cleanContainers,proto3" json:"clean_containers,omitempty"`
+	// Number of containers with infected last scan
+	InfectedContainers int32 `protobuf:"varint,4,opt,name=infected_containers,json=infectedContainers,proto3" json:"infected_containers,omitempty"`
+	// Number of containers never scanned
+	NeverScannedContainers int32 `protobuf:"varint,5,opt,name=never_scanned_containers,json=neverScannedContainers,proto3" json:"never_scanned_containers,omitempty"`
+	// When the summary was last collected
+	LastCollectionAt string `protobuf:"bytes,6,opt,name=last_collection_at,json=lastCollectionAt,proto3" json:"last_collection_at,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *GetClamavSummaryResponse) Reset() {
+	*x = GetClamavSummaryResponse{}
+	mi := &file_containarium_v1_security_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetClamavSummaryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetClamavSummaryResponse) ProtoMessage() {}
+
+func (x *GetClamavSummaryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetClamavSummaryResponse.ProtoReflect.Descriptor instead.
+func (*GetClamavSummaryResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *GetClamavSummaryResponse) GetContainers() []*ClamavContainerSummary {
+	if x != nil {
+		return x.Containers
+	}
+	return nil
+}
+
+func (x *GetClamavSummaryResponse) GetTotalContainers() int32 {
+	if x != nil {
+		return x.TotalContainers
+	}
+	return 0
+}
+
+func (x *GetClamavSummaryResponse) GetCleanContainers() int32 {
+	if x != nil {
+		return x.CleanContainers
+	}
+	return 0
+}
+
+func (x *GetClamavSummaryResponse) GetInfectedContainers() int32 {
+	if x != nil {
+		return x.InfectedContainers
+	}
+	return 0
+}
+
+func (x *GetClamavSummaryResponse) GetNeverScannedContainers() int32 {
+	if x != nil {
+		return x.NeverScannedContainers
+	}
+	return 0
+}
+
+func (x *GetClamavSummaryResponse) GetLastCollectionAt() string {
+	if x != nil {
+		return x.LastCollectionAt
+	}
+	return ""
+}
+
+type InstallClamavRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Box to install ClamAV into. Required.
+	ContainerName string `protobuf:"bytes,1,opt,name=container_name,json=containerName,proto3" json:"container_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstallClamavRequest) Reset() {
+	*x = InstallClamavRequest{}
+	mi := &file_containarium_v1_security_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallClamavRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallClamavRequest) ProtoMessage() {}
+
+func (x *InstallClamavRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallClamavRequest.ProtoReflect.Descriptor instead.
+func (*InstallClamavRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *InstallClamavRequest) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+type InstallClamavResponse struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Outcome ClamavInstallOutcome   `protobuf:"varint,1,opt,name=outcome,proto3,enum=containarium.v1.ClamavInstallOutcome" json:"outcome,omitempty"`
+	// Short human-readable result. Never contains package-manager output or paths.
+	Message       string `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstallClamavResponse) Reset() {
+	*x = InstallClamavResponse{}
+	mi := &file_containarium_v1_security_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallClamavResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallClamavResponse) ProtoMessage() {}
+
+func (x *InstallClamavResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallClamavResponse.ProtoReflect.Descriptor instead.
+func (*InstallClamavResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *InstallClamavResponse) GetOutcome() ClamavInstallOutcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return ClamavInstallOutcome_CLAMAV_INSTALL_OUTCOME_UNSPECIFIED
+}
+
+func (x *InstallClamavResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+type TriggerClamavScanRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Container name to scan. Required: the platform no longer scans every box
+	// (#2631); a scan is started per box by its owner.
+	ContainerName string `protobuf:"bytes,1,opt,name=container_name,json=containerName,proto3" json:"container_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TriggerClamavScanRequest) Reset() {
+	*x = TriggerClamavScanRequest{}
+	mi := &file_containarium_v1_security_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TriggerClamavScanRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TriggerClamavScanRequest) ProtoMessage() {}
+
+func (x *TriggerClamavScanRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TriggerClamavScanRequest.ProtoReflect.Descriptor instead.
+func (*TriggerClamavScanRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *TriggerClamavScanRequest) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+type TriggerClamavScanResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Human-readable result message
+	Message string `protobuf:"bytes,1,opt,name=message,proto3" json:"message,omitempty"`
+	// Number of containers queued for scanning
+	ScannedCount  int32 `protobuf:"varint,2,opt,name=scanned_count,json=scannedCount,proto3" json:"scanned_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TriggerClamavScanResponse) Reset() {
+	*x = TriggerClamavScanResponse{}
+	mi := &file_containarium_v1_security_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TriggerClamavScanResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TriggerClamavScanResponse) ProtoMessage() {}
+
+func (x *TriggerClamavScanResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TriggerClamavScanResponse.ProtoReflect.Descriptor instead.
+func (*TriggerClamavScanResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *TriggerClamavScanResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
+func (x *TriggerClamavScanResponse) GetScannedCount() int32 {
+	if x != nil {
+		return x.ScannedCount
+	}
+	return 0
+}
+
+// ScanJob represents a queued ClamAV scan job
+type ScanJob struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Database ID
+	Id int64 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Container name to scan
+	ContainerName string `protobuf:"bytes,2,opt,name=container_name,json=containerName,proto3" json:"container_name,omitempty"`
+	// Username associated with the container
+	Username string `protobuf:"bytes,3,opt,name=username,proto3" json:"username,omitempty"`
+	// Job status: pending, running, completed, failed
+	Status string `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"`
+	// Number of retry attempts so far
+	RetryCount int32 `protobuf:"varint,5,opt,name=retry_count,json=retryCount,proto3" json:"retry_count,omitempty"`
+	// Error message if the job failed
+	ErrorMessage string `protobuf:"bytes,6,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	// When the job was created (ISO 8601)
+	CreatedAt string `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	// When the job started running (ISO 8601)
+	StartedAt string `protobuf:"bytes,8,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	// When the job completed (ISO 8601)
+	CompletedAt string `protobuf:"bytes,9,opt,name=completed_at,json=completedAt,proto3" json:"completed_at,omitempty"`
+	// Backend ID identifying which node owns this job
+	BackendId     string `protobuf:"bytes,10,opt,name=backend_id,json=backendId,proto3" json:"backend_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ScanJob) Reset() {
+	*x = ScanJob{}
+	mi := &file_containarium_v1_security_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ScanJob) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ScanJob) ProtoMessage() {}
+
+func (x *ScanJob) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ScanJob.ProtoReflect.Descriptor instead.
+func (*ScanJob) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ScanJob) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *ScanJob) GetContainerName() string {
+	if x != nil {
+		return x.ContainerName
+	}
+	return ""
+}
+
+func (x *ScanJob) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *ScanJob) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *ScanJob) GetRetryCount() int32 {
+	if x != nil {
+		return x.RetryCount
+	}
+	return 0
+}
+
+func (x *ScanJob) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
+}
+
+func (x *ScanJob) GetCreatedAt() string {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return ""
+}
+
+func (x *ScanJob) GetStartedAt() string {
+	if x != nil {
+		return x.StartedAt
+	}
+	return ""
+}
+
+func (x *ScanJob) GetCompletedAt() string {
+	if x != nil {
+		return x.CompletedAt
+	}
+	return ""
+}
+
+func (x *ScanJob) GetBackendId() string {
+	if x != nil {
+		return x.BackendId
+	}
+	return ""
+}
+
+type GetScanStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetScanStatusRequest) Reset() {
+	*x = GetScanStatusRequest{}
+	mi := &file_containarium_v1_security_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetScanStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetScanStatusRequest) ProtoMessage() {}
+
+func (x *GetScanStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetScanStatusRequest.ProtoReflect.Descriptor instead.
+func (*GetScanStatusRequest) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{11}
+}
+
+type GetScanStatusResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Recent scan jobs
+	Jobs []*ScanJob `protobuf:"bytes,1,rep,name=jobs,proto3" json:"jobs,omitempty"`
+	// Count of jobs by status
+	PendingCount   int32 `protobuf:"varint,2,opt,name=pending_count,json=pendingCount,proto3" json:"pending_count,omitempty"`
+	RunningCount   int32 `protobuf:"varint,3,opt,name=running_count,json=runningCount,proto3" json:"running_count,omitempty"`
+	CompletedCount int32 `protobuf:"varint,4,opt,name=completed_count,json=completedCount,proto3" json:"completed_count,omitempty"`
+	FailedCount    int32 `protobuf:"varint,5,opt,name=failed_count,json=failedCount,proto3" json:"failed_count,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *GetScanStatusResponse) Reset() {
+	*x = GetScanStatusResponse{}
+	mi := &file_containarium_v1_security_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetScanStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetScanStatusResponse) ProtoMessage() {}
+
+func (x *GetScanStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_containarium_v1_security_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetScanStatusResponse.ProtoReflect.Descriptor instead.
+func (*GetScanStatusResponse) Descriptor() ([]byte, []int) {
+	return file_containarium_v1_security_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *GetScanStatusResponse) GetJobs() []*ScanJob {
+	if x != nil {
+		return x.Jobs
+	}
+	return nil
+}
+
+func (x *GetScanStatusResponse) GetPendingCount() int32 {
+	if x != nil {
+		return x.PendingCount
+	}
+	return 0
+}
+
+func (x *GetScanStatusResponse) GetRunningCount() int32 {
+	if x != nil {
+		return x.RunningCount
+	}
+	return 0
+}
+
+func (x *GetScanStatusResponse) GetCompletedCount() int32 {
+	if x != nil {
+		return x.CompletedCount
+	}
+	return 0
+}
+
+func (x *GetScanStatusResponse) GetFailedCount() int32 {
+	if x != nil {
+		return x.FailedCount
+	}
+	return 0
+}
+
+var File_containarium_v1_security_proto protoreflect.FileDescriptor
+
+const file_containarium_v1_security_proto_rawDesc = "" +
+	"\n" +
+	"\x1econtainarium/v1/security.proto\x12\x0fcontainarium.v1\x1a\x1cgoogle/api/annotations.proto\x1a.protoc-gen-openapiv2/options/annotations.proto\"\x9a\x03\n" +
+	"\fClamavReport\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12%\n" +
+	"\x0econtainer_name\x18\x02 \x01(\tR\rcontainerName\x12\x1a\n" +
+	"\busername\x18\x03 \x01(\tR\busername\x12\x16\n" +
+	"\x06status\x18\x04 \x01(\tR\x06status\x12%\n" +
+	"\x0efindings_count\x18\x05 \x01(\x05R\rfindingsCount\x12\x1a\n" +
+	"\bfindings\x18\x06 \x01(\tR\bfindings\x12\x1d\n" +
+	"\n" +
+	"scanned_at\x18\a \x01(\tR\tscannedAt\x12#\n" +
+	"\rscan_duration\x18\b \x01(\tR\fscanDuration\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\t \x01(\tR\tcreatedAt\x12\x1d\n" +
+	"\n" +
+	"backend_id\x18\n" +
+	" \x01(\tR\tbackendId\x12B\n" +
+	"\vstatus_enum\x18\v \x01(\x0e2!.containarium.v1.ClamavScanStatusR\n" +
+	"statusEnum\x12\x16\n" +
+	"\x06reason\x18\f \x01(\tR\x06reason\"\xb5\x02\n" +
+	"\x16ClamavContainerSummary\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\x12\x1a\n" +
+	"\busername\x18\x02 \x01(\tR\busername\x12 \n" +
+	"\flast_scan_at\x18\x03 \x01(\tR\n" +
+	"lastScanAt\x12\x1f\n" +
+	"\vlast_status\x18\x04 \x01(\tR\n" +
+	"lastStatus\x12.\n" +
+	"\x13last_findings_count\x18\x05 \x01(\x05R\x11lastFindingsCount\x12\x1f\n" +
+	"\vtotal_scans\x18\x06 \x01(\x05R\n" +
+	"totalScans\x12%\n" +
+	"\x0einfected_scans\x18\a \x01(\x05R\rinfectedScans\x12\x1d\n" +
+	"\n" +
+	"backend_id\x18\b \x01(\tR\tbackendId\"\xab\x01\n" +
+	"\x18ListClamavReportsRequest\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\x12\x16\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\x12\x12\n" +
+	"\x04from\x18\x03 \x01(\tR\x04from\x12\x0e\n" +
+	"\x02to\x18\x04 \x01(\tR\x02to\x12\x14\n" +
+	"\x05limit\x18\x05 \x01(\x05R\x05limit\x12\x16\n" +
+	"\x06offset\x18\x06 \x01(\x05R\x06offset\"u\n" +
+	"\x19ListClamavReportsResponse\x127\n" +
+	"\areports\x18\x01 \x03(\v2\x1d.containarium.v1.ClamavReportR\areports\x12\x1f\n" +
+	"\vtotal_count\x18\x02 \x01(\x05R\n" +
+	"totalCount\"\x19\n" +
+	"\x17GetClamavSummaryRequest\"\xd2\x02\n" +
+	"\x18GetClamavSummaryResponse\x12G\n" +
+	"\n" +
+	"containers\x18\x01 \x03(\v2'.containarium.v1.ClamavContainerSummaryR\n" +
+	"containers\x12)\n" +
+	"\x10total_containers\x18\x02 \x01(\x05R\x0ftotalContainers\x12)\n" +
+	"\x10clean_containers\x18\x03 \x01(\x05R\x0fcleanContainers\x12/\n" +
+	"\x13infected_containers\x18\x04 \x01(\x05R\x12infectedContainers\x128\n" +
+	"\x18never_scanned_containers\x18\x05 \x01(\x05R\x16neverScannedContainers\x12,\n" +
+	"\x12last_collection_at\x18\x06 \x01(\tR\x10lastCollectionAt\"=\n" +
+	"\x14InstallClamavRequest\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\"r\n" +
+	"\x15InstallClamavResponse\x12?\n" +
+	"\aoutcome\x18\x01 \x01(\x0e2%.containarium.v1.ClamavInstallOutcomeR\aoutcome\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"A\n" +
+	"\x18TriggerClamavScanRequest\x12%\n" +
+	"\x0econtainer_name\x18\x01 \x01(\tR\rcontainerName\"Z\n" +
+	"\x19TriggerClamavScanResponse\x12\x18\n" +
+	"\amessage\x18\x01 \x01(\tR\amessage\x12#\n" +
+	"\rscanned_count\x18\x02 \x01(\x05R\fscannedCount\"\xba\x02\n" +
+	"\aScanJob\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12%\n" +
+	"\x0econtainer_name\x18\x02 \x01(\tR\rcontainerName\x12\x1a\n" +
+	"\busername\x18\x03 \x01(\tR\busername\x12\x16\n" +
+	"\x06status\x18\x04 \x01(\tR\x06status\x12\x1f\n" +
+	"\vretry_count\x18\x05 \x01(\x05R\n" +
+	"retryCount\x12#\n" +
+	"\rerror_message\x18\x06 \x01(\tR\ferrorMessage\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\a \x01(\tR\tcreatedAt\x12\x1d\n" +
+	"\n" +
+	"started_at\x18\b \x01(\tR\tstartedAt\x12!\n" +
+	"\fcompleted_at\x18\t \x01(\tR\vcompletedAt\x12\x1d\n" +
+	"\n" +
+	"backend_id\x18\n" +
+	" \x01(\tR\tbackendId\"\x16\n" +
+	"\x14GetScanStatusRequest\"\xdb\x01\n" +
+	"\x15GetScanStatusResponse\x12,\n" +
+	"\x04jobs\x18\x01 \x03(\v2\x18.containarium.v1.ScanJobR\x04jobs\x12#\n" +
+	"\rpending_count\x18\x02 \x01(\x05R\fpendingCount\x12#\n" +
+	"\rrunning_count\x18\x03 \x01(\x05R\frunningCount\x12'\n" +
+	"\x0fcompleted_count\x18\x04 \x01(\x05R\x0ecompletedCount\x12!\n" +
+	"\ffailed_count\x18\x05 \x01(\x05R\vfailedCount*\x8d\x02\n" +
+	"\x10ClamavScanStatus\x12\"\n" +
+	"\x1eCLAMAV_SCAN_STATUS_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18CLAMAV_SCAN_STATUS_CLEAN\x10\x01\x12\x1f\n" +
+	"\x1bCLAMAV_SCAN_STATUS_INFECTED\x10\x02\x12!\n" +
+	"\x1dCLAMAV_SCAN_STATUS_INCOMPLETE\x10\x03\x12$\n" +
+	" CLAMAV_SCAN_STATUS_NEVER_SCANNED\x10\x04\x12'\n" +
+	"#CLAMAV_SCAN_STATUS_UNSUPPORTED_SIZE\x10\x05\x12$\n" +
+	" CLAMAV_SCAN_STATUS_NOT_INSTALLED\x10\x06*\x8f\x02\n" +
+	"\x14ClamavInstallOutcome\x12&\n" +
+	"\"CLAMAV_INSTALL_OUTCOME_UNSPECIFIED\x10\x00\x12$\n" +
+	" CLAMAV_INSTALL_OUTCOME_INSTALLED\x10\x01\x12*\n" +
+	"&CLAMAV_INSTALL_OUTCOME_ALREADY_PRESENT\x10\x02\x12-\n" +
+	")CLAMAV_INSTALL_OUTCOME_UNSUPPORTED_FAMILY\x10\x03\x12+\n" +
+	"'CLAMAV_INSTALL_OUTCOME_UNSUPPORTED_SIZE\x10\x04\x12!\n" +
+	"\x1dCLAMAV_INSTALL_OUTCOME_FAILED\x10\x052\x9c\v\n" +
+	"\x0fSecurityService\x12\x92\x02\n" +
+	"\x11ListClamavReports\x12).containarium.v1.ListClamavReportsRequest\x1a*.containarium.v1.ListClamavReportsResponse\"\xa5\x01\x92A\x7f\n" +
+	"\bSecurity\x12\x18List ClamAV scan reports\x1aYReturns ClamAV scan reports with optional filtering by container, status, and date range.\x82\xd3\xe4\x93\x02\x1d\x12\x1b/v1/security/clamav-reports\x12\x8e\x02\n" +
+	"\x11TriggerClamavScan\x12).containarium.v1.TriggerClamavScanRequest\x1a*.containarium.v1.TriggerClamavScanResponse\"\xa1\x01\x92A{\n" +
+	"\bSecurity\x12\x13Trigger ClamAV scan\x1aZTriggers an on-demand ClamAV scan for a specific container or all running user containers.\x82\xd3\xe4\x93\x02\x1d:\x01*\"\x18/v1/security/clamav-scan\x12\xbb\x02\n" +
+	"\rInstallClamav\x12%.containarium.v1.InstallClamavRequest\x1a&.containarium.v1.InstallClamavResponse\"\xda\x01\x92A\xb0\x01\n" +
+	"\bSecurity\x12\x17Install ClamAV in a box\x1a\x8a\x01Installs ClamAV and its signatures inside the named box so the tenant-run scan can run. Idempotent. Requires a box with at least 4 GB RAM.\x82\xd3\xe4\x93\x02 :\x01*\"\x1b/v1/security/clamav-install\x12\xa2\x02\n" +
+	"\x10GetClamavSummary\x12(.containarium.v1.GetClamavSummaryRequest\x1a).containarium.v1.GetClamavSummaryResponse\"\xb8\x01\x92A\x91\x01\n" +
+	"\bSecurity\x12\x17Get ClamAV scan summary\x1alReturns a summary of ClamAV scan status across all containers including last scan time and infection status.\x82\xd3\xe4\x93\x02\x1d\x12\x1b/v1/security/clamav-summary\x12\xff\x01\n" +
+	"\rGetScanStatus\x12%.containarium.v1.GetScanStatusRequest\x1a&.containarium.v1.GetScanStatusResponse\"\x9e\x01\x92A{\n" +
+	"\bSecurity\x12\x19Get scan job queue status\x1aTReturns recent scan jobs and counts by status (pending, running, completed, failed).\x82\xd3\xe4\x93\x02\x1a\x12\x18/v1/security/scan-statusBKZIgithub.com/footprintai/containarium/pkg/pb/containarium/v1;containariumv1b\x06proto3"
+
+var (
+	file_containarium_v1_security_proto_rawDescOnce sync.Once
+	file_containarium_v1_security_proto_rawDescData []byte
+)
+
+func file_containarium_v1_security_proto_rawDescGZIP() []byte {
+	file_containarium_v1_security_proto_rawDescOnce.Do(func() {
+		file_containarium_v1_security_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_containarium_v1_security_proto_rawDesc), len(file_containarium_v1_security_proto_rawDesc)))
+	})
+	return file_containarium_v1_security_proto_rawDescData
+}
+
+var file_containarium_v1_security_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_containarium_v1_security_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_containarium_v1_security_proto_goTypes = []any{
+	(ClamavScanStatus)(0),             // 0: containarium.v1.ClamavScanStatus
+	(ClamavInstallOutcome)(0),         // 1: containarium.v1.ClamavInstallOutcome
+	(*ClamavReport)(nil),              // 2: containarium.v1.ClamavReport
+	(*ClamavContainerSummary)(nil),    // 3: containarium.v1.ClamavContainerSummary
+	(*ListClamavReportsRequest)(nil),  // 4: containarium.v1.ListClamavReportsRequest
+	(*ListClamavReportsResponse)(nil), // 5: containarium.v1.ListClamavReportsResponse
+	(*GetClamavSummaryRequest)(nil),   // 6: containarium.v1.GetClamavSummaryRequest
+	(*GetClamavSummaryResponse)(nil),  // 7: containarium.v1.GetClamavSummaryResponse
+	(*InstallClamavRequest)(nil),      // 8: containarium.v1.InstallClamavRequest
+	(*InstallClamavResponse)(nil),     // 9: containarium.v1.InstallClamavResponse
+	(*TriggerClamavScanRequest)(nil),  // 10: containarium.v1.TriggerClamavScanRequest
+	(*TriggerClamavScanResponse)(nil), // 11: containarium.v1.TriggerClamavScanResponse
+	(*ScanJob)(nil),                   // 12: containarium.v1.ScanJob
+	(*GetScanStatusRequest)(nil),      // 13: containarium.v1.GetScanStatusRequest
+	(*GetScanStatusResponse)(nil),     // 14: containarium.v1.GetScanStatusResponse
+}
+var file_containarium_v1_security_proto_depIdxs = []int32{
+	0,  // 0: containarium.v1.ClamavReport.status_enum:type_name -> containarium.v1.ClamavScanStatus
+	2,  // 1: containarium.v1.ListClamavReportsResponse.reports:type_name -> containarium.v1.ClamavReport
+	3,  // 2: containarium.v1.GetClamavSummaryResponse.containers:type_name -> containarium.v1.ClamavContainerSummary
+	1,  // 3: containarium.v1.InstallClamavResponse.outcome:type_name -> containarium.v1.ClamavInstallOutcome
+	12, // 4: containarium.v1.GetScanStatusResponse.jobs:type_name -> containarium.v1.ScanJob
+	4,  // 5: containarium.v1.SecurityService.ListClamavReports:input_type -> containarium.v1.ListClamavReportsRequest
+	10, // 6: containarium.v1.SecurityService.TriggerClamavScan:input_type -> containarium.v1.TriggerClamavScanRequest
+	8,  // 7: containarium.v1.SecurityService.InstallClamav:input_type -> containarium.v1.InstallClamavRequest
+	6,  // 8: containarium.v1.SecurityService.GetClamavSummary:input_type -> containarium.v1.GetClamavSummaryRequest
+	13, // 9: containarium.v1.SecurityService.GetScanStatus:input_type -> containarium.v1.GetScanStatusRequest
+	5,  // 10: containarium.v1.SecurityService.ListClamavReports:output_type -> containarium.v1.ListClamavReportsResponse
+	11, // 11: containarium.v1.SecurityService.TriggerClamavScan:output_type -> containarium.v1.TriggerClamavScanResponse
+	9,  // 12: containarium.v1.SecurityService.InstallClamav:output_type -> containarium.v1.InstallClamavResponse
+	7,  // 13: containarium.v1.SecurityService.GetClamavSummary:output_type -> containarium.v1.GetClamavSummaryResponse
+	14, // 14: containarium.v1.SecurityService.GetScanStatus:output_type -> containarium.v1.GetScanStatusResponse
+	10, // [10:15] is the sub-list for method output_type
+	5,  // [5:10] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
+}
+
+func init() { file_containarium_v1_security_proto_init() }
+func file_containarium_v1_security_proto_init() {
+	if File_containarium_v1_security_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_containarium_v1_security_proto_rawDesc), len(file_containarium_v1_security_proto_rawDesc)),
+			NumEnums:      2,
+			NumMessages:   13,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_containarium_v1_security_proto_goTypes,
+		DependencyIndexes: file_containarium_v1_security_proto_depIdxs,
+		EnumInfos:         file_containarium_v1_security_proto_enumTypes,
+		MessageInfos:      file_containarium_v1_security_proto_msgTypes,
+	}.Build()
+	File_containarium_v1_security_proto = out.File
+	file_containarium_v1_security_proto_goTypes = nil
+	file_containarium_v1_security_proto_depIdxs = nil
+}

@@ -493,3 +493,995 @@ func (p *PeerPool) discover() {
 	// Dual-accept (#688): ed25519 (CONTAINARIUM_SENTINEL_PUBLIC_KEY) and/or
 	// the legacy HMAC (CONTAINARIUM_SENTINEL_AUTH_SECRET).
 	verifier := auth.NewSentinelVerifier(loadSentinelPublicKey(), loadSentinelHMACSecret())
+	if verifier.Configured() {
+		if err := verifier.VerifyResponse(resp, body, time.Now()); err != nil {
+			log.Printf("[peers] discovery signature verify failed; refusing to update peer map (set CONTAINARIUM_SENTINEL_PUBLIC_KEY or _AUTH_SECRET to match the sentinel): %v", err)
+			return
+		}
+	} else {
+		// Loud warning, but stay backwards-compatible while operators
+		// roll out the keys on both ends. Once 100% of fleets carry a
+		// sentinel key this branch should become an unconditional return.
+		log.Printf("[peers] no sentinel verifier configured (set CONTAINARIUM_SENTINEL_PUBLIC_KEY or _AUTH_SECRET) — accepting unsigned discovery response (vulnerable to C-CRIT-2 until configured)")
+	}
+
+	var result struct {
+		Peers []struct {
+			ID        string `json:"id"`
+			ProxyPath string `json:"proxy_path"`
+			Pool      string `json:"pool,omitempty"`
+			Healthy   bool   `json:"healthy"`
+		} `json:"peers"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		log.Printf("[peers] discovery parse error: %v", err)
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Build new peer set from discovery
+	// Peer address is the sentinel's binary server (port 8888) + proxy path
+	// e.g., "10.130.0.13:8888/peer/tunnel-node-a-gpu"
+	sentinelHost := extractHost(p.sentinelURL)
+	sentinelPort := extractPort(p.sentinelURL)
+
+	discovered := make(map[string]bool)
+	for _, peer := range result.Peers {
+		discovered[peer.ID] = true
+
+		// The peer addr includes the proxy path prefix
+		// API calls will be: http://sentinelHost:sentinelPort/peer/<id>/v1/containers
+		peerAddr := fmt.Sprintf("%s:%s%s", sentinelHost, sentinelPort, peer.ProxyPath)
+
+		if existing, ok := p.peers[peer.ID]; ok {
+			existing.Addr = peerAddr
+			existing.Pool = peer.Pool
+			existing.Healthy = peer.Healthy
+			if peer.Healthy {
+				existing.LastSeenAt = time.Now()
+			}
+		} else {
+			pc := &PeerClient{
+				ID:      peer.ID,
+				Addr:    peerAddr,
+				Pool:    peer.Pool,
+				Healthy: peer.Healthy,
+				client:  buildPeerHTTPClient(p.pki),
+			}
+			if p.pki != nil {
+				pc.scheme = "https"
+			}
+			if peer.Healthy {
+				pc.LastSeenAt = time.Now()
+			}
+			p.peers[peer.ID] = pc
+			log.Printf("[peers] discovered new peer: %s pool=%q via %s://%s", peer.ID, peer.Pool, pc.urlScheme(), peerAddr)
+		}
+	}
+
+	// Remove peers that are no longer in the sentinel's list
+	// (but don't remove static peers)
+	for id := range p.peers {
+		if !discovered[id] && isDiscoveredPeer(id) {
+			log.Printf("[peers] peer removed: %s", id)
+			delete(p.peers, id)
+		}
+	}
+
+	// Cache system info for healthy peers (best-effort, no auth needed for internal calls)
+	var rankTokenFn func() (string, error)
+	if p.capacityRanking {
+		rankTokenFn = p.capacityTokenFn // copy the func under the lock; call it in the goroutine
+	}
+	for _, pc := range p.peers {
+		if !pc.Healthy {
+			continue
+		}
+		go pc.refreshCachedInfo()
+		// Placement-ranking capacity (#1029 direction 2), best-effort and only
+		// when ranking is enabled — the two extra admin-scoped reads per peer
+		// per tick are wasted work otherwise.
+		if rankTokenFn != nil {
+			go p.refreshPeerCapacity(pc, rankTokenFn)
+		}
+	}
+}
+
+// refreshPeerCapacity fetches a peer's physical core count (system-info) and
+// its committed tenant cores (container list, already core-infra-filtered
+// server-side), then caches them for the placement ranker. Best-effort: on any
+// error the peer keeps its previous cached value (and stays unknown until the
+// first success), so a transient blip never makes it look idle or overloaded.
+// The HTTP calls run without any lock held; only the cache write is guarded.
+func (p *PeerPool) refreshPeerCapacity(pc *PeerClient, tokenFn func() (string, error)) {
+	serviceToken, err := tokenFn()
+	if err != nil {
+		log.Printf("[placement] capacity probe for %s skipped: internal token unavailable: %v", pc.ID, err)
+		return
+	}
+	physical, perr := pc.fetchPhysicalCores(serviceToken)
+	if perr != nil {
+		return
+	}
+	containers, cerr := pc.fetchContainers(serviceToken)
+	if cerr != nil {
+		return
+	}
+	var committed float64
+	for i := range containers {
+		committed += incus.CommittedCores(containers[i].CPU)
+	}
+
+	p.mu.Lock()
+	pc.CachedPhysicalCores = physical
+	pc.CachedCommittedCores = committed
+	pc.CapacityKnown = true
+	p.mu.Unlock()
+}
+
+// fetchPhysicalCores reads a peer's total physical core count from its
+// (admin-only) system-info endpoint.
+func (pc *PeerClient) fetchPhysicalCores(serviceToken string) (float64, error) {
+	body, err := pc.ForwardGetSystemInfo(serviceToken)
+	if err != nil {
+		return 0, err
+	}
+	var result struct {
+		Info struct {
+			TotalCpus int32 `json:"totalCpus"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, err
+	}
+	return float64(result.Info.TotalCpus), nil
+}
+
+// LocalBackendID returns this daemon's backend ID.
+func (p *PeerPool) LocalBackendID() string {
+	return p.localBackendID
+}
+
+// SentinelURL returns the sentinel base URL this daemon was configured with
+// (e.g. "http://10.128.0.5:8888"), or "" when none was set. Nil-safe so
+// callers on an unwired daemon (standalone, tests) can treat "no sentinel"
+// as "nothing to notify".
+func (p *PeerPool) SentinelURL() string {
+	if p == nil {
+		return ""
+	}
+	return p.sentinelURL
+}
+
+// IdentitySigner returns the daemon's node identity key (the
+// sentinel-issued peer leaf) as a crypto.Signer plus the leaf cert
+// PEM, for signing the integrity self-measurement (#683). Returns
+// (nil, "") when no peer PKI has been bootstrapped — the measurement
+// is then produced unsigned.
+func (p *PeerPool) IdentitySigner() (crypto.Signer, string) {
+	p.mu.RLock()
+	pki := p.pki
+	p.mu.RUnlock()
+	return pki.IdentitySigner()
+}
+
+// LocalPool returns the pool tag this daemon's PeerPool was configured
+// with. The local backend is considered a member of this pool for the
+// purpose of pool-scoped placement decisions.
+func (p *PeerPool) LocalPool() string {
+	return p.pool
+}
+
+// Peers returns all current peers.
+func (p *PeerPool) Peers() []*PeerClient {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]*PeerClient, 0, len(p.peers))
+	for _, peer := range p.peers {
+		result = append(result, peer)
+	}
+	return result
+}
+
+// HealthyPeersInPool returns healthy peers tagged with the given pool.
+// An empty pool argument matches peers whose Pool tag is also empty
+// (legacy untagged behavior).
+func (p *PeerPool) HealthyPeersInPool(pool string) []*PeerClient {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]*PeerClient, 0, len(p.peers))
+	for _, peer := range p.peers {
+		if peer.Pool != pool {
+			continue
+		}
+		if !peer.Healthy {
+			continue
+		}
+		result = append(result, peer)
+	}
+	return result
+}
+
+// Snapshot returns a point-in-time health snapshot of every currently
+// registered peer (#1084), for the cloudexport platform group's
+// connectivity series. ID is always the enrolled host name — the
+// enrollment path already forbids org/tenant identifiers in it — so the
+// exported tunnel.state series' peer_id label can never carry a tenant
+// identifier. Isolated from concurrent registry mutation only up to the
+// RLock's hold; a peer registered or removed mid-discovery-churn simply
+// appears or not, same as every other read of p.peers.
+func (p *PeerPool) Snapshot() []cloudexport.PeerState {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]cloudexport.PeerState, 0, len(p.peers))
+	for _, peer := range p.peers {
+		result = append(result, cloudexport.PeerState{ID: peer.ID, Healthy: peer.Healthy})
+	}
+	return result
+}
+
+// Get returns a peer by ID.
+func (p *PeerPool) Get(id string) *PeerClient {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.peers[id]
+}
+
+// UnreachablePeer names one peer backend a fan-out call couldn't reach, and
+// why — the same shape GetMetricsResponse.unreachable_backends reports
+// (#1901), applied here to ListContainers (#1902): a peer skipped for being
+// unhealthy, or whose fetch failed, must be distinguishable from a peer
+// that genuinely has zero containers, not silently absent from the result.
+type UnreachablePeer struct {
+	BackendID string
+	Reason    string
+}
+
+// ListContainers fans out to all healthy peers and returns the merged
+// container list, plus any peer that couldn't be reached this call
+// (unhealthy per the sentinel, or a failed/errored fetch) so a caller can
+// tell "this backend is unreachable right now" from "this backend has no
+// containers" instead of the two looking identical (#1902).
+// Each container gets a backend_id field set to the peer's ID.
+func (p *PeerPool) ListContainers(authToken string) ([]incus.ContainerInfo, []UnreachablePeer) {
+	peers := p.Peers()
+	if len(peers) == 0 {
+		return nil, nil
+	}
+
+	type result struct {
+		peerID     string
+		containers []incus.ContainerInfo
+		err        error
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan result, len(peers))
+
+	var unreachable []UnreachablePeer
+	for _, peer := range peers {
+		if !peer.Healthy {
+			unreachable = append(unreachable, UnreachablePeer{
+				BackendID: peer.ID,
+				Reason:    "peer marked unhealthy by sentinel",
+			})
+			continue
+		}
+		wg.Add(1)
+		go func(pc *PeerClient) {
+			defer wg.Done()
+			containers, err := pc.fetchContainers(authToken)
+			if err != nil {
+				log.Printf("[peers] failed to list containers from %s: %v", pc.ID, err)
+				results <- result{peerID: pc.ID, err: err}
+				return
+			}
+			results <- result{peerID: pc.ID, containers: containers}
+		}(peer)
+	}
+
+	wg.Wait()
+	close(results)
+
+	var all []incus.ContainerInfo
+	for res := range results {
+		if res.err != nil {
+			unreachable = append(unreachable, UnreachablePeer{
+				BackendID: res.peerID,
+				Reason:    fmt.Sprintf("peer fetch failed: %v", res.err),
+			})
+			continue
+		}
+		all = append(all, res.containers...)
+	}
+	return all, unreachable
+}
+
+// fetchContainers fetches containers from a single peer.
+func (pc *PeerClient) fetchContainers(authToken string) ([]incus.ContainerInfo, error) {
+	// Addr includes proxy path, e.g. "10.130.0.13:8888/peer/tunnel-node-a-gpu"
+	url := fmt.Sprintf("%s://%s/v1/containers", pc.urlScheme(), pc.Addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+
+	resp, err := pc.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var data struct {
+		Containers []struct {
+			Name      string `json:"name"`
+			Username  string `json:"username"`
+			State     string `json:"state"`
+			Resources struct {
+				CPU    string `json:"cpu"`
+				Memory string `json:"memory"`
+				Disk   string `json:"disk"`
+				GPU    string `json:"gpu"`
+			} `json:"resources"`
+			Network struct {
+				IPAddress string `json:"ipAddress"`
+			} `json:"network"`
+			Labels    map[string]string `json:"labels"`
+			GpuDevice string            `json:"gpuDevice"`
+			BackendID string            `json:"backendId"`
+			// A pointer so a peer that predates the field (omits it) is
+			// distinguishable from an explicit false (#2858).
+			PodmanEnabled *bool `json:"podmanEnabled"`
+		} `json:"containers"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, fmt.Errorf("parse error: %w", err)
+	}
+
+	containers := make([]incus.ContainerInfo, 0, len(data.Containers))
+	for _, c := range data.Containers {
+		// Map state string
+		state := c.State
+		switch state {
+		case "CONTAINER_STATE_RUNNING":
+			state = "Running"
+		case "CONTAINER_STATE_STOPPED":
+			state = "Stopped"
+		}
+
+		// Absent = an older peer: report true, as every box did before the
+		// flag was recorded.
+		podmanEnabled := c.PodmanEnabled == nil || *c.PodmanEnabled
+
+		containers = append(containers, incus.ContainerInfo{
+			Name:          c.Name,
+			PodmanEnabled: podmanEnabled,
+			State:         state,
+			IPAddress:     c.Network.IPAddress,
+			CPU:           c.Resources.CPU,
+			Memory:        c.Resources.Memory,
+			Disk:          c.Resources.Disk,
+			GPU:           c.GpuDevice,
+			Labels:        c.Labels,
+			BackendID:     pc.ID, // Tag with peer's backend ID
+		})
+	}
+	return containers, nil
+}
+
+// ForwardCreateContainer forwards a create container request to a specific peer.
+func (pc *PeerClient) ForwardCreateContainer(authToken string, pbReq *pb.CreateContainerRequest) (*pb.CreateContainerResponse, error) {
+	// Marshal the REQUEST ITSELF rather than hand-copying a subset of its
+	// fields into a map (#1001).
+	//
+	// The map form silently dropped every field nobody remembered to add to
+	// it: monitoring, pool, the four git_* provisioning fields, ttl_seconds,
+	// idle_stop_minutes, delete_after_stopped_seconds, and — worst —
+	// encrypted and tenant_id, so `create --encrypted` against a
+	// tunnel-connected backend produced an UNENCRYPTED container and said
+	// nothing. Creating remotely and creating locally silently meant
+	// different things.
+	//
+	// Nothing catches that: a map literal missing a key compiles, passes
+	// review, and looks exactly like a complete one. Forwarding the message
+	// means the set of forwarded fields is the set of fields that exist, by
+	// construction, and a field added to the proto later is carried without
+	// anyone having to remember this function. It is also what CLAUDE.md
+	// asks for — a typed message, not map[string]interface{}, for a wire
+	// payload.
+	//
+	// protojson with UseProtoNames=false emits the camelCase names
+	// grpc-gateway unmarshals on the peer, matching what the map produced by
+	// hand.
+	fwd, ok := proto.Clone(pbReq).(*pb.CreateContainerRequest)
+	if !ok {
+		return nil, fmt.Errorf("clone create request: unexpected type")
+	}
+	// The peer IS the target. Leaving backend_id set would have it evaluate
+	// routing again and forward onwards, rather than creating locally.
+	fwd.BackendId = ""
+
+	bodyBytes, err := protojson.MarshalOptions{UseProtoNames: false}.Marshal(fwd)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s://%s/v1/containers", pc.urlScheme(), pc.Addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+
+	resp, err := pc.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("peer returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Decode the RESPONSE into its proto type for the same reason (#1001).
+	//
+	// The hand-rolled struct dropped everything it did not name — created_at,
+	// ssh_host, pool, labels, os_type — and it parsed `state` into a field it
+	// then never assigned, so a container created on a peer came back
+	// reporting no state at all.
+	//
+	// DiscardUnknown so a peer running a newer daemon, and therefore sending
+	// fields this build has never heard of, is decoded rather than rejected.
+	var out pb.CreateContainerResponse
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+
+	// The peer does not know its own ID in this exchange; stamp it so the
+	// caller can tell which backend the container landed on.
+	if out.Container != nil {
+		out.Container.BackendId = pc.ID
+	}
+	return &out, nil
+}
+
+// ForwardRequest forwards an arbitrary HTTP request to the peer and returns the response body.
+// GET requests use a 5s timeout to avoid blocking the UI; POST/PUT use 30s for mutations.
+func (pc *PeerClient) ForwardRequest(method, path, authToken string, body []byte) ([]byte, int, error) {
+	timeout := 5 * time.Second
+	if method != "GET" {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return pc.ForwardRequestCtx(ctx, method, path, authToken, body)
+}
+
+// ForwardRequestCtx is ForwardRequest with a caller-supplied context, so a
+// caller with its own (shorter) budget can cancel the in-flight request
+// instead of leaving it running to the fixed default timeout.
+func (pc *PeerClient) ForwardRequestCtx(ctx context.Context, method, path, authToken string, body []byte) ([]byte, int, error) {
+	url := fmt.Sprintf("%s://%s%s", pc.urlScheme(), pc.Addr, path)
+
+	var bodyReader io.Reader
+	if body != nil {
+		bodyReader = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	if err != nil {
+		return nil, 0, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+authToken)
+	}
+
+	resp, err := pc.client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return respBody, resp.StatusCode, nil
+}
+
+// installForwardTimeout bounds one forwarded ClamAV install: a package download
+// plus the first signature fetch inside the box.
+const installForwardTimeout = 20 * time.Minute
+
+// errPeerRouteMissing: the peer answered 404 for a route it should serve, i.e. a
+// backend older than the feature. Callers report it as "backend too old", not as
+// a failed operation.
+var errPeerRouteMissing = errors.New("peer has no such route (backend too old)")
+
+// ForwardInstallClamav asks the peer that OWNS a box to install ClamAV inside it
+// (POST /v1/security/clamav-install, #2659) and returns the peer's typed answer
+// (#2683).
+//
+// Two differences from ForwardRequest, both because an install takes minutes:
+// the HTTP client's overall 30 s timeout is lifted for this call (the context,
+// not the client, bounds it), and the body is marshalled rather than formatted
+// by hand so a name cannot break or inject into the JSON.
+func (pc *PeerClient) ForwardInstallClamav(ctx context.Context, authToken, containerName string) (*pb.InstallClamavResponse, error) {
+	payload, err := json.Marshal(map[string]string{"container_name": containerName})
+	if err != nil {
+		return nil, err
+	}
+	long := *pc
+	lc := *pc.client
+	lc.Timeout = 0
+	long.client = &lc
+
+	body, status, err := long.ForwardRequestCtx(ctx, "POST", "/v1/security/clamav-install", authToken, payload)
+	if err != nil {
+		return nil, fmt.Errorf("forward install to %s: %w", pc.ID, err)
+	}
+	if status == http.StatusNotFound {
+		return nil, fmt.Errorf("peer %s: %w", pc.ID, errPeerRouteMissing)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for install", pc.ID, status)
+	}
+	var resp pb.InstallClamavResponse
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode install reply from %s: %w", pc.ID, err)
+	}
+	return &resp, nil
+}
+
+// ForwardGetMetrics fetches container metrics from a peer.
+// Returns raw JSON response body for the caller to merge.
+func (pc *PeerClient) ForwardGetMetrics(authToken string, username string) ([]byte, error) {
+	path := "/v1/metrics"
+	if username != "" {
+		path = fmt.Sprintf("/v1/metrics/%s", username)
+	}
+	body, status, err := pc.ForwardRequest("GET", path, authToken, nil)
+	if err != nil {
+		return nil, fmt.Errorf("forward metrics to %s: %w", pc.ID, err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for metrics", pc.ID, status)
+	}
+	return body, nil
+}
+
+// ForwardDebugContainer fetches a debug diagnostic for a container from a peer.
+func (pc *PeerClient) ForwardDebugContainer(authToken string, username string) ([]byte, error) {
+	path := fmt.Sprintf("/v1/containers/%s/debug", username)
+	body, status, err := pc.ForwardRequest("GET", path, authToken, nil)
+	if err != nil {
+		return nil, fmt.Errorf("forward debug to %s: %w", pc.ID, err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for debug", pc.ID, status)
+	}
+	return body, nil
+}
+
+// ForwardListStacks returns the stack IDs the peer's own catalog defines, read
+// from its GET /v1/stacks (#2952). That endpoint exists on every daemon, so this
+// works against a peer of any version and, unlike a forwarded dry run, can never
+// be misread by an older peer as a real create. An empty result is returned as
+// such: the caller decides what an empty catalog means.
+func (pc *PeerClient) ForwardListStacks(ctx context.Context, authToken string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	body, status, err := pc.ForwardRequestCtx(ctx, "GET", "/v1/stacks", authToken, nil)
+	if err != nil {
+		return nil, fmt.Errorf("forward list-stacks to %s: %w", pc.ID, err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for list-stacks", pc.ID, status)
+	}
+	var result struct {
+		Stacks []struct {
+			ID string `json:"id"`
+		} `json:"stacks"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse list-stacks from %s: %w", pc.ID, err)
+	}
+	ids := make([]string, 0, len(result.Stacks))
+	for _, st := range result.Stacks {
+		if st.ID != "" {
+			ids = append(ids, st.ID)
+		}
+	}
+	return ids, nil
+}
+
+// refreshCachedInfo fetches system info from a peer and caches key fields.
+func (pc *PeerClient) refreshCachedInfo() {
+	body, err := pc.ForwardGetSystemInfo("")
+	if err != nil {
+		return
+	}
+	var result struct {
+		Info struct {
+			Hostname          string `json:"hostname"`
+			OS                string `json:"os"`
+			IncusVersion      string `json:"incusVersion"`
+			ContainersRunning int32  `json:"containersRunning"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return
+	}
+	pc.CachedHostname = result.Info.Hostname
+	pc.CachedOS = result.Info.OS
+	pc.CachedContainerCount = result.Info.ContainersRunning
+	// Version is not in system info — peers report it separately or we skip it
+}
+
+// ForwardGetSystemInfo fetches system info from a peer.
+func (pc *PeerClient) ForwardGetSystemInfo(authToken string) ([]byte, error) {
+	return pc.ForwardGetSystemInfoCtx(context.Background(), authToken)
+}
+
+// ForwardGetSystemInfoCtx is ForwardGetSystemInfo bounded by ctx (the fixed
+// per-request default still applies on top of it).
+func (pc *PeerClient) ForwardGetSystemInfoCtx(ctx context.Context, authToken string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	body, status, err := pc.ForwardRequestCtx(ctx, "GET", "/v1/system/info", authToken, nil)
+	if err != nil {
+		return nil, fmt.Errorf("forward system-info to %s: %w", pc.ID, err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for system-info", pc.ID, status)
+	}
+	return body, nil
+}
+
+// ForwardSecuritySummary fetches security summary from a peer.
+func (pc *PeerClient) ForwardSecuritySummary(authToken string) ([]byte, error) {
+	body, status, err := pc.ForwardRequest("GET", "/v1/security/clamav-summary", authToken, nil)
+	if err != nil {
+		return nil, fmt.Errorf("forward security summary to %s: %w", pc.ID, err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for security summary", pc.ID, status)
+	}
+	return body, nil
+}
+
+// ForwardSecurityReports fetches ClamAV scan reports from a peer.
+func (pc *PeerClient) ForwardSecurityReports(authToken string, queryParams string) ([]byte, error) {
+	path := "/v1/security/clamav-reports"
+	if queryParams != "" {
+		path = path + "?" + queryParams
+	}
+	body, status, err := pc.ForwardRequest("GET", path, authToken, nil)
+	if err != nil {
+		return nil, fmt.Errorf("forward security reports to %s: %w", pc.ID, err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for security reports", pc.ID, status)
+	}
+	return body, nil
+}
+
+// ForwardScanStatus fetches scan job status from a peer.
+func (pc *PeerClient) ForwardScanStatus(authToken string) ([]byte, error) {
+	body, status, err := pc.ForwardRequest("GET", "/v1/security/scan-status", authToken, nil)
+	if err != nil {
+		return nil, fmt.Errorf("forward scan status to %s: %w", pc.ID, err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for scan status", pc.ID, status)
+	}
+	return body, nil
+}
+
+// ForwardTriggerScan triggers a ClamAV scan on a peer.
+func (pc *PeerClient) ForwardTriggerScan(authToken string, containerName string) ([]byte, error) {
+	payload := []byte(`{}`)
+	if containerName != "" {
+		payload = []byte(fmt.Sprintf(`{"container_name":"%s"}`, containerName))
+	}
+	body, status, err := pc.ForwardRequest("POST", "/v1/security/clamav-scan", authToken, payload)
+	if err != nil {
+		return nil, fmt.Errorf("forward trigger scan to %s: %w", pc.ID, err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for trigger scan", pc.ID, status)
+	}
+	return body, nil
+}
+
+// ForwardContainerTraffic fetches traffic data for a container on a peer.
+func (pc *PeerClient) ForwardContainerTraffic(authToken string, path string) ([]byte, error) {
+	body, status, err := pc.ForwardRequest("GET", path, authToken, nil)
+	if err != nil {
+		return nil, fmt.Errorf("forward traffic to %s: %w", pc.ID, err)
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("peer %s returned status %d for traffic", pc.ID, status)
+	}
+	return body, nil
+}
+
+// FindContainerPeer searches all peers for a container by username.
+// Returns the peer that has it, or nil if not found on any *reachable*
+// peer — paired with the peers that were skipped during the search
+// (unhealthy per the sentinel, or a failed fetch). A nil peer with a
+// non-empty unreachable list means "might be on one of these, we
+// couldn't check" — a caller must not treat that the same as a
+// definitive "not found on any peer" (#1905, same anti-pattern as
+// #1901/#1902 but with a worse symptom: callers that skip this
+// distinction report a container as gone when its backend is merely
+// unreachable right now).
+func (pp *PeerPool) FindContainerPeer(username, authToken string) (*PeerClient, []UnreachablePeer) {
+	containerName := username + "-container"
+	var unreachable []UnreachablePeer
+	for _, peer := range pp.Peers() {
+		if !peer.Healthy {
+			log.Printf("[FindContainerPeer] skipping unhealthy peer %s", peer.ID)
+			unreachable = append(unreachable, UnreachablePeer{
+				BackendID: peer.ID,
+				Reason:    "peer marked unhealthy by sentinel",
+			})
+			continue
+		}
+		containers, err := peer.fetchContainers(authToken)
+		if err != nil {
+			log.Printf("[FindContainerPeer] peer %s fetchContainers failed: %v", peer.ID, err)
+			unreachable = append(unreachable, UnreachablePeer{
+				BackendID: peer.ID,
+				Reason:    fmt.Sprintf("peer fetch failed: %v", err),
+			})
+			continue
+		}
+		for _, c := range containers {
+			if c.Name == containerName {
+				return peer, unreachable
+			}
+		}
+	}
+	return nil, unreachable
+}
+
+// extractHost extracts the hostname/IP from a URL like "http://10.128.0.5:8081"
+func extractHost(rawURL string) string {
+	// Simple extraction — strip scheme and port
+	host := rawURL
+	if idx := len("http://"); len(host) > idx && host[:idx] == "http://" {
+		host = host[idx:]
+	}
+	if idx := len("https://"); len(host) > idx && host[:idx] == "https://" {
+		host = host[idx:]
+	}
+	// Strip port
+	for i := len(host) - 1; i >= 0; i-- {
+		if host[i] == ':' {
+			return host[:i]
+		}
+		if host[i] == '/' {
+			return host[:i]
+		}
+	}
+	return host
+}
+
+// extractPort extracts the port from a URL like "http://10.128.0.5:8888"
+func extractPort(rawURL string) string {
+	host := rawURL
+	// Strip scheme
+	if idx := strings.Index(host, "://"); idx >= 0 {
+		host = host[idx+3:]
+	}
+	// Strip path
+	if idx := strings.Index(host, "/"); idx >= 0 {
+		host = host[:idx]
+	}
+	// Extract port
+	if idx := strings.LastIndex(host, ":"); idx >= 0 {
+		return host[idx+1:]
+	}
+	return "8888" // default
+}
+
+// isDiscoveredPeer returns true if the peer ID looks like a tunnel-discovered peer.
+func isDiscoveredPeer(id string) bool {
+	return len(id) > 7 && id[:7] == "tunnel-"
+}
+
+// PeerTerminalURL implements gateway.PeerTerminalProxy.
+// It checks if a container lives on a peer and returns the WebSocket URL for its terminal.
+// Returns ("", nil) if the container is not on any peer (i.e., it's local).
+func (pp *PeerPool) PeerTerminalURL(username, authToken string) (string, error) {
+	peer, unreachable := pp.FindContainerPeer(username, authToken)
+	if peer == nil {
+		if len(unreachable) > 0 {
+			return "", fmt.Errorf("cannot open terminal for %q: %d backend(s) unreachable (%s)",
+				username, len(unreachable), unreachable[0].Reason)
+		}
+		return "", nil
+	}
+	// Build ws:// URL pointing at the peer's terminal endpoint via sentinel proxy
+	wsURL := fmt.Sprintf("ws://%s/v1/containers/%s/terminal", peer.Addr, username)
+	return wsURL, nil
+}
+
+// PeerMetricsFetcherAdapter adapts PeerPool to the metrics.PeerMetricsFetcher interface.
+type PeerMetricsFetcherAdapter struct {
+	Pool *PeerPool
+	// TokenFn mints/returns the internal admin JWT for peer calls when the
+	// caller passes no auth token. Backed by a renewing serviceTokenSource so
+	// a long-lived daemon never falls off a one-shot token. May be nil (then
+	// only an explicit authToken is used).
+	TokenFn func() (string, error)
+}
+
+// serviceToken returns the internal token from TokenFn, or "" if unset/failed.
+// Callers treat "" as "no token" and skip (peer admin endpoints will 401),
+// which is the same best-effort posture as before — never a hard failure.
+func (a *PeerMetricsFetcherAdapter) serviceToken() string {
+	if a.TokenFn == nil {
+		return ""
+	}
+	tok, err := a.TokenFn()
+	if err != nil {
+		log.Printf("[peer-metrics] internal service token unavailable: %v", err)
+		return ""
+	}
+	return tok
+}
+
+// FetchPeerMetrics implements metrics.PeerMetricsFetcher.
+func (a *PeerMetricsFetcherAdapter) FetchPeerMetrics(authToken string) []peerMetricsResult {
+	var results []peerMetricsResult
+	if a.Pool == nil {
+		return results
+	}
+	// Use service token if no auth token provided
+	token := authToken
+	if token == "" {
+		token = a.serviceToken()
+	}
+	peers := a.Pool.Peers()
+	if len(peers) == 0 {
+		return results
+	}
+	for _, peer := range peers {
+		if !peer.Healthy {
+			continue
+		}
+		body, err := peer.ForwardGetMetrics(token, "")
+		if err != nil {
+			log.Printf("[peer-metrics] failed to fetch from %s: %v", peer.ID, err)
+			continue
+		}
+		// Parse the JSON response — values may be strings or numbers from gRPC-gateway
+		var resp struct {
+			Metrics []struct {
+				Name             string      `json:"name"`
+				CpuUsageSeconds  json.Number `json:"cpuUsageSeconds"`
+				MemoryUsageBytes json.Number `json:"memoryUsageBytes"`
+				DiskUsageBytes   json.Number `json:"diskUsageBytes"`
+				NetworkRxBytes   json.Number `json:"networkRxBytes"`
+				NetworkTxBytes   json.Number `json:"networkTxBytes"`
+				ProcessCount     json.Number `json:"processCount"`
+			} `json:"metrics"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			log.Printf("[peer-metrics] parse error from %s: %v (body: %.200s)", peer.ID, err, string(body))
+			continue
+		}
+		for _, m := range resp.Metrics {
+			cpuS, _ := m.CpuUsageSeconds.Int64()
+			memB, _ := m.MemoryUsageBytes.Int64()
+			diskB, _ := m.DiskUsageBytes.Int64()
+			netRx, _ := m.NetworkRxBytes.Int64()
+			netTx, _ := m.NetworkTxBytes.Int64()
+			procs, _ := m.ProcessCount.Int64()
+			results = append(results, peerMetricsResult{
+				ContainerName:    m.Name,
+				BackendID:        peer.ID,
+				CPUUsageSeconds:  cpuS,
+				MemoryUsageBytes: memB,
+				DiskUsageBytes:   diskB,
+				NetworkRxBytes:   netRx,
+				NetworkTxBytes:   netTx,
+				ProcessCount:     procs,
+			})
+		}
+	}
+	return results
+}
+
+// FetchPeerSystemMetrics implements metrics.PeerMetricsFetcher.
+func (a *PeerMetricsFetcherAdapter) FetchPeerSystemMetrics(authToken string) []metricsPackage.PeerSystemMetrics {
+	var results []metricsPackage.PeerSystemMetrics
+	if a.Pool == nil {
+		return results
+	}
+	token := authToken
+	if token == "" {
+		token = a.serviceToken()
+	}
+	for _, peer := range a.Pool.Peers() {
+		if !peer.Healthy {
+			continue
+		}
+		body, err := peer.ForwardGetSystemInfo(token)
+		if err != nil {
+			continue
+		}
+		// protojson against the contract (int64 as strings, enums by name);
+		// DiscardUnknown so a newer peer's extra fields never drop it.
+		var resp pb.GetSystemInfoResponse
+		if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, &resp); err != nil {
+			continue
+		}
+		in := resp.GetInfo()
+		results = append(results, metricsPackage.PeerSystemMetrics{
+			BackendID:         peer.ID,
+			TotalCPUs:         int64(in.GetTotalCpus()),
+			TotalMemoryBytes:  in.GetTotalMemoryBytes(),
+			UsedMemoryBytes:   in.GetTotalMemoryBytes() - in.GetAvailableMemoryBytes(),
+			TotalDiskBytes:    in.GetTotalDiskBytes(),
+			UsedDiskBytes:     in.GetTotalDiskBytes() - in.GetAvailableDiskBytes(),
+			CPULoad1Min:       in.GetCpuLoad_1Min(),
+			CPULoad5Min:       in.GetCpuLoad_5Min(),
+			CPULoad15Min:      in.GetCpuLoad_15Min(),
+			ContainersRunning: int64(in.GetContainersRunning()),
+			ContainersStopped: int64(in.GetContainersStopped()),
+			StoragePools:      storagePoolUsagesFromProto(in.GetStoragePools()),
+		})
+	}
+	return results
+}
+
+// FetchPeerHealth implements metrics.PeerMetricsFetcher.
+func (a *PeerMetricsFetcherAdapter) FetchPeerHealth() []metricsPackage.PeerBackendHealth {
+	var results []metricsPackage.PeerBackendHealth
+	if a.Pool == nil {
+		return results
+	}
+	for _, peer := range a.Pool.Peers() {
+		results = append(results, metricsPackage.PeerBackendHealth{
+			BackendID: peer.ID,
+			Healthy:   peer.Healthy,
+			LastSeen:  peer.LastSeenAt,
+		})
+	}
+	return results
+}
+
+// peerMetricsResult matches metrics.PeerMetrics to avoid circular import.
+type peerMetricsResult = metricsPackage.PeerMetrics
