@@ -48,3 +48,78 @@ Examples:
 
 var unprotectCmd = &cobra.Command{
 	Use:   "unprotect <username>",
+	Short: "Clear a container's delete protection (back to the default)",
+	Long: `Clear the protected delete policy on a container (#284), returning it
+to the default — eligible for the TTL sweeper auto-reap and 'containarium prune'.
+
+Examples:
+  containarium unprotect ci-runner`,
+	Args: cobra.ExactArgs(1),
+	RunE: runUnprotect,
+}
+
+func init() {
+	rootCmd.AddCommand(protectCmd)
+	rootCmd.AddCommand(unprotectCmd)
+}
+
+func runProtect(cmd *cobra.Command, args []string) error {
+	username := args[0]
+
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (delete policy is a server-side feature)")
+	}
+
+	err := setContainerDeletePolicyViaServer(username, pb.DeletePolicy_DELETE_POLICY_PROTECTED)
+	if isUnimplemented(err) {
+		fmt.Printf("⚠ Delete policy not yet supported by this server (daemon does not implement SetContainerDeletePolicy); %s is NOT protected.\n", username)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to protect %s: %w", username, err)
+	}
+
+	fmt.Printf("✓ %s is now protected (skipped by auto-reap + prune; a deliberate delete still removes it)\n", username)
+	return nil
+}
+
+func runUnprotect(cmd *cobra.Command, args []string) error {
+	username := args[0]
+
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (delete policy is a server-side feature)")
+	}
+
+	err := setContainerDeletePolicyViaServer(username, pb.DeletePolicy_DELETE_POLICY_UNSPECIFIED)
+	if isUnimplemented(err) {
+		fmt.Printf("⚠ Delete policy not yet supported by this server (daemon does not implement SetContainerDeletePolicy); nothing to clear.\n")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to unprotect %s: %w", username, err)
+	}
+
+	fmt.Printf("✓ %s is no longer protected (eligible for auto-reap + prune)\n", username)
+	return nil
+}
+
+// setContainerDeletePolicyViaServer dispatches over grpc or http per the global
+// httpMode flag, mirroring setContainerTTLViaServer in ttl.go.
+func setContainerDeletePolicyViaServer(username string, policy pb.DeletePolicy) error {
+	if httpMode {
+		hc, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = hc.Close() }()
+		_, err = hc.SetContainerDeletePolicy(username, policy)
+		return err
+	}
+	gc, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = gc.Close() }()
+	_, err = gc.SetContainerDeletePolicy(username, policy)
+	return err
+}
