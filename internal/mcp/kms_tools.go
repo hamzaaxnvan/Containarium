@@ -77,3 +77,43 @@ func handleKMSStatus(client API, args map[string]interface{}) (string, error) {
 	fmt.Fprintf(&b, "Require envelope: %t\n", resp.RequireEnvelope)
 	return b.String(), nil
 }
+
+func handleKMSCoverage(client API, args map[string]interface{}) (string, error) {
+	resp, err := client.GetEnvelopeCoverage()
+	if err != nil {
+		return "", err
+	}
+	out := fmt.Sprintf("Secrets envelope coverage — total: %s, legacy: %s, envelope: %s",
+		resp.Total, resp.Legacy, resp.Envelope)
+	if resp.Legacy == "0" && resp.Total != "0" {
+		out += "\n✓ Fully migrated."
+	} else if resp.Legacy != "0" {
+		out += fmt.Sprintf("\n%s legacy row(s) remain — run kms_migrate_to_envelope.", resp.Legacy)
+	}
+	return out, nil
+}
+
+func handleKMSMigrate(client API, args map[string]interface{}) (string, error) {
+	maxRows := 0
+	if v, ok := getIntArg(args, "max_rows"); ok {
+		maxRows = v
+	}
+	resp, err := client.MigrateToEnvelope(MigrateToEnvelopeBody{
+		DryRun:  getBoolArg(args, "dry_run", false),
+		MaxRows: int64(maxRows),
+	})
+	if err != nil {
+		return "", err
+	}
+	mode := "MIGRATE"
+	if resp.DryRun {
+		mode = "DRY-RUN"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s — scanned: %s, migrated: %s, already done: %s, failed: %s\n",
+		mode, resp.Scanned, resp.Migrated, resp.AlreadyDone, resp.Failed)
+	for _, e := range resp.Errors {
+		fmt.Fprintf(&b, "  ✗ %s/%s — %s\n", e.Username, e.Name, e.Error)
+	}
+	return b.String(), nil
+}
