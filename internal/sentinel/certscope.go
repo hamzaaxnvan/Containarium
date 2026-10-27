@@ -64,3 +64,69 @@ func (s CertScope) match(domain string) int {
 
 // Validate checks every name in the scope is a lowercase DNS name with at
 // least two labels and no wildcard. An empty scope is valid.
+func (s CertScope) Validate() error {
+	if s.Hostname != "" {
+		if err := validateScopeName(s.Hostname); err != nil {
+			return fmt.Errorf("hostname %q: %w", s.Hostname, err)
+		}
+	}
+	for _, a := range s.Aliases {
+		if err := validateScopeName(a); err != nil {
+			return fmt.Errorf("alias %q: %w", a, err)
+		}
+	}
+	for _, bd := range s.BaseDomains {
+		if err := validateScopeName(bd); err != nil {
+			return fmt.Errorf("base domain %q: %w", bd, err)
+		}
+	}
+	return nil
+}
+
+func validateScopeName(name string) error {
+	if name == "" {
+		return fmt.Errorf("empty name")
+	}
+	if len(name) > 253 {
+		return fmt.Errorf("longer than 253 characters")
+	}
+	labels := strings.Split(name, ".")
+	if len(labels) < 2 {
+		return fmt.Errorf("need at least two labels")
+	}
+	for _, l := range labels {
+		if l == "" || len(l) > 63 {
+			return fmt.Errorf("each label must be 1-63 characters")
+		}
+		if l[0] == '-' || l[len(l)-1] == '-' {
+			return fmt.Errorf("label %q starts or ends with a hyphen", l)
+		}
+		for _, c := range l {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return fmt.Errorf("label %q: only lowercase letters, digits and hyphens are allowed", l)
+			}
+		}
+	}
+	return nil
+}
+
+// renderCertSyncMetrics builds the Prometheus exposition for certificates
+// dropped by scope checks, one series per backend. Empty when nothing has
+// been dropped.
+func renderCertSyncMetrics(rejected map[string]uint64) string {
+	if len(rejected) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(rejected))
+	for id := range rejected {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	var b bytes.Buffer
+	fmt.Fprint(&b, "# HELP sentinel_cert_sync_rejected_total Certificates from a backend's /certs response that were dropped because they name a domain the backend is not registered for.\n")
+	fmt.Fprint(&b, "# TYPE sentinel_cert_sync_rejected_total counter\n")
+	for _, id := range ids {
+		fmt.Fprintf(&b, "sentinel_cert_sync_rejected_total{backend=%q} %d\n", id, rejected[id])
+	}
+	return b.String()
+}

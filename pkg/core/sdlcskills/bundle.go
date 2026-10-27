@@ -82,3 +82,87 @@ func LoadBundleBytes(data []byte, lock Lock) (*Bundle, error) {
 	files := map[string]string{}
 	tr := tar.NewReader(gz)
 	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("sdlcskills: read bundle entry: %w", err)
+		}
+		name := h.Name
+		// Nothing in the pinned set is absolute or walks up; refuse the whole
+		// bundle if anything does, the same posture as the installer.
+		if strings.HasPrefix(name, "/") || name != path.Clean(name) || strings.HasPrefix(name, "..") || strings.Contains(name, "/../") {
+			return nil, fmt.Errorf("sdlcskills: unsafe path in bundle: %q", name)
+		}
+		if h.Typeflag != tar.TypeReg {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(tr, maxBundleBytes))
+		if err != nil {
+			return nil, fmt.Errorf("sdlcskills: read %s: %w", name, err)
+		}
+		files[name] = string(body)
+	}
+	ref := lock.Ref
+	if len(ref) > 12 {
+		ref = ref[:12]
+	}
+	return &Bundle{pin: lock.Repo + "@" + ref, files: files}, nil
+}
+
+// SkillBody returns the markdown body of <skill>/SKILL.md with its YAML
+// frontmatter removed, or false if the bundle has no such skill.
+func (b *Bundle) SkillBody(skill string) (string, bool) {
+	raw, ok := b.files[skill+"/SKILL.md"]
+	if !ok {
+		return "", false
+	}
+	return StripFrontmatter(raw), true
+}
+
+// StripFrontmatter removes a leading `---` ... `---` YAML block, if any.
+func StripFrontmatter(md string) string {
+	if !strings.HasPrefix(md, "---\n") {
+		return strings.TrimLeft(md, "\n")
+	}
+	rest := md[len("---\n"):]
+	end := strings.Index(rest, "\n---\n")
+	if end < 0 {
+		return strings.TrimLeft(md, "\n")
+	}
+	return strings.TrimLeft(rest[end+len("\n---\n"):], "\n")
+}
+
+// boldHeading matches a line that is only a bold phrase, which is how the
+// open-sdlc-skills files mark their sections ("**Engineering principles**").
+var boldHeading = regexp.MustCompile(`^\*\*[^*]+\*\*\s*$`)
+
+// ExtractSection returns the text under the bold heading `**<heading>**`, up
+// to the next bold or `#` heading, without the heading line itself. It is
+// deliberately one section: the rest of a role skill describes an interactive
+// workflow a hosted run cannot perform, and feeding that to a model with an
+// instruction to ignore it degrades the output.
+func ExtractSection(body, heading string) (string, bool) {
+	want := "**" + heading + "**"
+	lines := strings.Split(body, "\n")
+	start := -1
+	for i, l := range lines {
+		if strings.TrimSpace(l) == want {
+			start = i + 1
+			break
+		}
+	}
+	if start < 0 {
+		return "", false
+	}
+	end := len(lines)
+	for i := start; i < len(lines); i++ {
+		t := strings.TrimSpace(lines[i])
+		if boldHeading.MatchString(t) || strings.HasPrefix(t, "#") {
+			end = i
+			break
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines[start:end], "\n")), true
+}
