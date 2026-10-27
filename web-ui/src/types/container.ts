@@ -144,3 +144,150 @@ export interface SystemInfo {
   kernel: string;
   containerCount: number;
   runningCount: number;
+  networkCidr: string; // Container network CIDR (e.g., "10.100.0.0/24")
+  // System resource info
+  totalCpus: number;
+  totalMemoryBytes: number;
+  availableMemoryBytes: number;
+  totalDiskBytes: number;
+  availableDiskBytes: number;
+  // CPU load averages
+  cpuLoad1min?: number;
+  cpuLoad5min?: number;
+  cpuLoad15min?: number;
+  // GPU devices
+  gpus?: GPUInfo[];
+  // Backend identifier (set for peer backends)
+  backendId?: string;
+}
+
+/**
+ * System info response including peer backends
+ */
+export interface SystemInfoResponse {
+  info: SystemInfo;
+  peers?: SystemInfo[];
+}
+
+/**
+ * GPU device information
+ */
+export interface GPUInfo {
+  vendor: string;   // enum string: GPU_VENDOR_NVIDIA, GPU_VENDOR_AMD, etc.
+  model: string;    // enum string: GPU_MODEL_NVIDIA_RTX_4090, etc.
+  modelName: string; // raw model name from driver
+  pciAddress: string;
+  driverVersion: string;
+  cudaVersion: string;
+  vramBytes: number;
+}
+
+/**
+ * Get display name for a GPU vendor enum
+ */
+export function gpuVendorDisplayName(vendor: string): string {
+  switch (vendor) {
+    case 'GPU_VENDOR_NVIDIA': return 'NVIDIA';
+    case 'GPU_VENDOR_AMD': return 'AMD';
+    case 'GPU_VENDOR_INTEL': return 'Intel';
+    default: return vendor || 'Unknown';
+  }
+}
+
+/**
+ * Get display name for a GPU model enum
+ */
+export function gpuModelDisplayName(model: string, modelName?: string): string {
+  const map: Record<string, string> = {
+    'GPU_MODEL_NVIDIA_RTX_5090': 'RTX 5090',
+    'GPU_MODEL_NVIDIA_RTX_5080': 'RTX 5080',
+    'GPU_MODEL_NVIDIA_RTX_4090': 'RTX 4090',
+    'GPU_MODEL_NVIDIA_RTX_4080': 'RTX 4080',
+    'GPU_MODEL_NVIDIA_RTX_4070_TI': 'RTX 4070 Ti',
+    'GPU_MODEL_NVIDIA_RTX_4070': 'RTX 4070',
+    'GPU_MODEL_NVIDIA_RTX_3090': 'RTX 3090',
+    'GPU_MODEL_NVIDIA_RTX_3080': 'RTX 3080',
+    'GPU_MODEL_NVIDIA_A100': 'A100',
+    'GPU_MODEL_NVIDIA_A10': 'A10',
+    'GPU_MODEL_NVIDIA_A10G': 'A10G',
+    'GPU_MODEL_NVIDIA_H100': 'H100',
+    'GPU_MODEL_NVIDIA_H200': 'H200',
+    'GPU_MODEL_NVIDIA_L4': 'L4',
+    'GPU_MODEL_NVIDIA_L40': 'L40',
+    'GPU_MODEL_NVIDIA_L40S': 'L40S',
+    'GPU_MODEL_NVIDIA_T4': 'T4',
+    'GPU_MODEL_NVIDIA_V100': 'V100',
+    'GPU_MODEL_NVIDIA_B200': 'B200',
+    'GPU_MODEL_AMD_MI300X': 'MI300X',
+    'GPU_MODEL_AMD_MI250X': 'MI250X',
+    'GPU_MODEL_AMD_RX_7900_XTX': 'RX 7900 XTX',
+    'GPU_MODEL_INTEL_MAX_1550': 'Max 1550',
+    'GPU_MODEL_INTEL_ARC_A770': 'Arc A770',
+  };
+  return map[model] || modelName || model || 'Unknown GPU';
+}
+
+/**
+ * Container runtime metrics (raw from API)
+ */
+export interface ContainerMetrics {
+  name: string;
+  cpuUsageSeconds: number;
+  memoryUsageBytes: number;
+  memoryPeakBytes: number;
+  diskUsageBytes: number;
+  networkRxBytes: number;
+  networkTxBytes: number;
+  processCount: number;
+}
+
+/**
+ * Container metrics with calculated values (CPU percentage)
+ */
+export interface ContainerMetricsWithRate extends ContainerMetrics {
+  cpuUsagePercent: number; // CPU utilization rate (0-100 per core, can exceed 100 with multiple cores)
+}
+
+/**
+ * Response from metrics endpoint
+ */
+export interface MetricsResponse {
+  metrics: ContainerMetrics[];
+}
+
+/**
+ * Collaborator with access to a container
+ */
+export interface Collaborator {
+  id: string;
+  containerName: string;
+  ownerUsername: string;
+  collaboratorUsername: string;
+  accountName: string;
+  /** @deprecated First authorized key only — prefer sshPublicKeys. Kept for back-compat display. */
+  sshPublicKey: string;
+  /** All keys this collaborator is authorized with (#1144). */
+  sshPublicKeys: string[];
+  addedAt: number;
+  createdBy: string;
+  hasSudo: boolean;
+  hasContainerRuntime: boolean;
+}
+
+/**
+ * Request to add a collaborator
+ */
+export interface AddCollaboratorRequest {
+  collaboratorUsername: string;
+  sshPublicKeys: string[];
+  grantSudo?: boolean;
+  grantContainerRuntime?: boolean;
+}
+
+/**
+ * Response from listing collaborators
+ */
+export interface ListCollaboratorsResponse {
+  collaborators: Collaborator[];
+  totalCount: number;
+}
