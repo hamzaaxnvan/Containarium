@@ -257,3 +257,522 @@ func isOCIImageReference(ref string) bool {
 			return false
 		}
 	}
+	return true
+}
+
+func buildRestConfig(kubeconfig string) (*rest.Config, error) {
+	if kubeconfig != "" {
+		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	}
+	if c, err := rest.InClusterConfig(); err == nil {
+		return c, nil
+	}
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{}).ClientConfig()
+}
+
+func (b *Backend) Kind() box.BackendKind { return box.KindK8s }
+
+// Clientset exposes the backend's Kubernetes client.
+//
+// Narrow on purpose: the SSH session collector (#1189) has to read box pod
+// logs, which is an apiserver call and not something the BoxBackend contract
+// covers. Rather than widen that contract with a method only one caller
+// wants, the daemon type-asserts for this when the backend is K8s.
+func (b *Backend) Clientset() kubernetes.Interface { return b.clientset }
+
+func (b *Backend) namespaceFor(tenant string) string {
+	return b.cfg.TenantNamespacePrefix + tenant
+}
+
+// validateTenantName rejects a tenant whose derived namespace would not be
+// a valid Kubernetes name (#1490). Without this, a tenant name containing
+// '/' or other illegal characters reaches the apiserver, which rejects the
+// Namespace create with a multi-field, low-level validation error
+// ("metadata.name: ... RFC 1123 label ...", "metadata.labels: ...") that
+// gives no hint the tenant name itself was the problem — it reads as an
+// internal error, not a bad request.
+func (b *Backend) validateTenantName(tenant string) error {
+	ns := b.namespaceFor(tenant)
+	if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
+		return fmt.Errorf("k8s: invalid tenant name %q: derived namespace %q is not usable on this backend (%s); "+
+			"use a name with only lowercase letters, digits, and '-'", tenant, ns, strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// Create reconciles the per-tenant namespace + Secrets + default-deny
+// NetworkPolicy + the Sandbox CR, then returns the box's status. The
+// agent-sandbox controller creates the pod and the headless Service from the
+// Sandbox. Each step is idempotent (AlreadyExists is success) so re-create
+// reuses the box rather than erroring (#669).
+func (b *Backend) Create(ctx context.Context, spec box.BoxSpec) (*box.BoxStatus, error) {
+	if spec.NetworkTenant != "" {
+		return nil, fmt.Errorf("native network Tenant requires local Linux LXC")
+	}
+	// A pod is a container. Refuse a VM request outright rather than hand
+	// back a shared-kernel box the caller believed was VM-isolated (#2196).
+	if spec.Isolation == pb.IsolationType_ISOLATION_TYPE_VM {
+		return nil, fmt.Errorf("isolation=vm is not supported on the kubernetes backend")
+	}
+	tenant := spec.Ref.Tenant
+	if err := b.validateTenantName(tenant); err != nil {
+		return nil, err
+	}
+	ns := b.namespaceFor(tenant)
+	// A reference kubelet cannot parse - in practice the create path's
+	// Incus-style default (#1524) - is treated like an absent one and replaced
+	// by the configured agent-box image; see isOCIImageReference. Either way,
+	// with nothing usable to run we fail here rather than hand the apiserver a
+	// Sandbox whose pod can never start while create reports success.
+	if spec.Image == "" {
+		spec.Image = b.cfg.BoxImage // default to the configured agent-box image
+		if spec.Image == "" {
+			return nil, fmt.Errorf("k8s: no image for box %s: none requested and no default box image is configured", tenant)
+		}
+	} else if !isOCIImageReference(spec.Image) {
+		if b.cfg.BoxImage == "" {
+			return nil, fmt.Errorf("k8s: %q is not an OCI image reference and no default box image is configured", spec.Image)
+		}
+		log.Printf("[k8s] image %q is not an OCI reference; falling back to the configured box image %q", spec.Image, b.cfg.BoxImage)
+		spec.Image = b.cfg.BoxImage
+	}
+
+	if _, err := b.clientset.CoreV1().Namespaces().Create(ctx, namespaceObject(ns, tenant), metav1.CreateOptions{}); ignoreExists(err) != nil {
+		return nil, fmt.Errorf("k8s: ensure namespace: %w", err)
+	}
+	// Provision the data PVC before the Sandbox so the pod can mount it on
+	// first start. Per-box spec.Resources.StorageClass takes precedence over the
+	// global Config.StorageClass; skipped when both are empty (backward compat).
+	storageClass := b.cfg.StorageClass
+	if spec.Resources.StorageClass != "" {
+		storageClass = spec.Resources.StorageClass
+	}
+	if storageClass != "" {
+		pvc := pvcObject(ns, tenant, storageClass, spec.Resources.Disk)
+		if _, err := b.clientset.CoreV1().PersistentVolumeClaims(ns).Create(ctx, pvc, metav1.CreateOptions{}); ignoreExists(err) != nil {
+			return nil, fmt.Errorf("k8s: ensure pvc: %w", err)
+		}
+	}
+	if _, err := b.clientset.CoreV1().Secrets(ns).Create(ctx, secretObject(ns, tenant, b.boxAuthorizedKeys(spec.SSHKeys), spec.SSHKeys), metav1.CreateOptions{}); ignoreExists(err) != nil {
+		return nil, fmt.Errorf("k8s: ensure secret: %w", err)
+	}
+	if _, err := b.clientset.NetworkingV1().NetworkPolicies(ns).Create(ctx, networkPolicyObject(ns, tenant, b.cfg.GatewayNamespace), metav1.CreateOptions{}); ignoreExists(err) != nil {
+		return nil, fmt.Errorf("k8s: ensure networkpolicy: %w", err)
+	}
+	// Stable per-box host key Secret — created before the Sandbox, whose pod
+	// mounts it (and dropbear uses it so the gateway can pin it).
+	if _, err := b.ensureHostKey(ctx, tenant); err != nil {
+		return nil, fmt.Errorf("k8s: ensure host key: %w", err)
+	}
+	// Per-box spec.Mode overrides the daemon-wide default (Config.BoxMode).
+	boxMode := spec.Mode
+	if boxMode == "" {
+		boxMode = b.cfg.BoxMode
+	}
+	opts := podOptions{BoxMode: boxMode, RuntimeClass: b.cfg.RuntimeClass}
+	if _, err := b.sandboxes.AgentsV1beta1().Sandboxes(ns).Create(ctx, sandboxObject(ns, spec, storageClass != "", b.memDefaults(), opts), metav1.CreateOptions{}); ignoreExists(err) != nil {
+		return nil, fmt.Errorf("k8s: ensure sandbox: %w", err)
+	}
+	// Program the SSH gateway so username=<tenant> routes to this box (no-op
+	// when the gateway isn't configured).
+	if err := b.router.ProgramRoute(ctx, tenant, spec.SSHKeys); err != nil {
+		return nil, fmt.Errorf("k8s: ensure gateway pipe: %w", err)
+	}
+	return b.Get(ctx, spec.Ref)
+}
+
+// Get reads the box's Sandbox CR into a BoxStatus, or (nil, nil) when the box
+// does not exist.
+func (b *Backend) Get(ctx context.Context, ref box.BoxRef) (*box.BoxStatus, error) {
+	ns := b.namespaceFor(ref.Tenant)
+	sb, err := b.sandboxes.AgentsV1beta1().Sandboxes(ns).Get(ctx, sandboxName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return b.statusOf(ref.Tenant, sb), nil
+}
+
+// List returns every box this backend manages (all namespaces, by label).
+func (b *Backend) List(ctx context.Context) ([]box.BoxStatus, error) {
+	sbl, err := b.sandboxes.AgentsV1beta1().Sandboxes("").List(ctx, metav1.ListOptions{
+		LabelSelector: managedByLabel + "=" + managedByValue,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]box.BoxStatus, 0, len(sbl.Items))
+	for i := range sbl.Items {
+		sb := &sbl.Items[i]
+		out = append(out, *b.statusOf(sb.Labels[tenantLabel], sb))
+	}
+	return out, nil
+}
+
+// statusOf maps a Sandbox CR onto the runtime-neutral BoxStatus.
+func (b *Backend) statusOf(tenant string, sb *sandboxv1beta1.Sandbox) *box.BoxStatus {
+	st := &box.BoxStatus{
+		Ref:       box.BoxRef{Tenant: tenant, Name: sandboxName},
+		State:     stateOf(sb),
+		Resources: resourcesOf(sb),
+		Labels:    metaFromAnnotations(sb.Annotations),
+		BackendID: "k8s",
+		// No podman toggle on K8s; keep reporting the long-standing true.
+		PodmanEnabled: true,
+	}
+	// Pod IP, populated by the controller once the pod is scheduled.
+	if len(sb.Status.PodIPs) > 0 {
+		st.IPAddress = sb.Status.PodIPs[0]
+	}
+	return st
+}
+
+// Delete removes the box's compute objects (the Sandbox CR — which cascades
+// to its pod and Service — plus Secrets, NetworkPolicy, gateway Pipe) but
+// retains the PVC and namespace so the persistent data survives. Call Purge
+// to permanently remove the PVC and namespace.
+//
+// When StorageClass is unset (no PVC), Delete falls back to removing the entire
+// namespace (original behaviour, backward compat).
+func (b *Backend) Delete(ctx context.Context, ref box.BoxRef, force bool) error {
+	ns := b.namespaceFor(ref.Tenant)
+	if err := b.router.RemoveRoute(ctx, ref.Tenant); err != nil {
+		return fmt.Errorf("k8s: delete gateway pipe: %w", err)
+	}
+	// No persistent storage: delete the whole namespace (original behaviour).
+	if b.cfg.StorageClass == "" {
+		err := b.clientset.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	// Persistent storage: delete compute objects individually; keep namespace+PVC.
+	// Deleting the Sandbox cascades to its controller-owned children (pod +
+	// headless Service) via owner references; the daemon-owned data PVC carries
+	// no owner reference and survives.
+	dels := []func() error{
+		func() error {
+			return ignoreNotFound(b.sandboxes.AgentsV1beta1().Sandboxes(ns).Delete(ctx, sandboxName, metav1.DeleteOptions{}))
+		},
+		func() error {
+			return ignoreNotFound(b.clientset.NetworkingV1().NetworkPolicies(ns).Delete(ctx, "default-deny", metav1.DeleteOptions{}))
+		},
+		func() error {
+			return ignoreNotFound(b.clientset.CoreV1().Secrets(ns).Delete(ctx, secretName(ref.Tenant), metav1.DeleteOptions{}))
+		},
+		func() error {
+			return ignoreNotFound(b.clientset.CoreV1().Secrets(ns).Delete(ctx, hostKeySecretName(ref.Tenant), metav1.DeleteOptions{}))
+		},
+	}
+	for _, del := range dels {
+		if err := del(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Purge permanently removes the box's PVC and namespace. Call after Delete
+// when the box's data should be discarded (e.g. DeletePolicy=DeleteOnStop).
+// No-op when the namespace does not exist.
+func (b *Backend) Purge(ctx context.Context, ref box.BoxRef) error {
+	ns := b.namespaceFor(ref.Tenant)
+	if b.cfg.StorageClass != "" {
+		if err := ignoreNotFound(b.clientset.CoreV1().PersistentVolumeClaims(ns).Delete(ctx, pvcName, metav1.DeleteOptions{})); err != nil {
+			return fmt.Errorf("k8s: purge pvc: %w", err)
+		}
+	}
+	err := b.clientset.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// Start resumes the box: operatingMode=Running makes the agent-sandbox
+// controller (re)create the pod, reattaching the retained PVC and identity.
+func (b *Backend) Start(ctx context.Context, ref box.BoxRef) error {
+	return b.setOperatingMode(ctx, ref, sandboxv1beta1.SandboxOperatingModeRunning)
+}
+
+// Stop suspends the box: operatingMode=Suspended makes the controller delete
+// only the pod — PVC, Service, Secrets, and the Sandbox identity all persist.
+func (b *Backend) Stop(ctx context.Context, ref box.BoxRef, force bool) error {
+	return b.setOperatingMode(ctx, ref, sandboxv1beta1.SandboxOperatingModeSuspended)
+}
+
+// setOperatingMode merge-patches spec.operatingMode. A merge patch (not
+// strategic) — CRDs don't support strategic merge, and for a scalar field the
+// two are equivalent.
+func (b *Backend) setOperatingMode(ctx context.Context, ref box.BoxRef, mode sandboxv1beta1.SandboxOperatingMode) error {
+	return b.setSandboxOperatingMode(ctx, ref.Tenant, sandboxName, mode)
+}
+
+func (b *Backend) setSandboxOperatingMode(ctx context.Context, tenant, name string, mode sandboxv1beta1.SandboxOperatingMode) error {
+	patch := []byte(fmt.Sprintf(`{"spec":{"operatingMode":%q}}`, mode))
+	_, err := b.sandboxes.AgentsV1beta1().Sandboxes(b.namespaceFor(tenant)).
+		Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
+	return err
+}
+
+// Resolve reports the gateway SSH endpoint sshpiper routes to the tenant's pod.
+func (b *Backend) Resolve(ctx context.Context, ref box.BoxRef) (*box.BoxEndpoint, error) {
+	return &box.BoxEndpoint{
+		SSHHost:    b.cfg.GatewayHost,
+		SSHPort:    b.cfg.GatewaySSHPort,
+		SSHUser:    ref.Tenant,
+		AccessType: pb.AccessType_ACCESS_TYPE_SSH,
+	}, nil
+}
+
+// SetAuthorizedKeys rotates the keys that authenticate the agent.
+//
+// In the gateway path (sshpiper authenticates to the box with its own upstream
+// key) the box's authorized_keys stays the gateway key — the agent's keys live
+// in the Pipe's spec.from, so we only re-program the Pipe. In the direct path
+// the agent's keys authorize the box itself, so we update the box Secret too.
+func (b *Backend) SetAuthorizedKeys(ctx context.Context, ref box.BoxRef, keys []string) error {
+	// The Secret is always rewritten: the box-authorized half follows the
+	// access mode (gateway key vs client keys) and the client_keys record
+	// must track rotations in both modes — the sentinel sync reads it.
+	if err := b.upsertTenantSecret(ctx, ref.Tenant, b.boxAuthorizedKeys(keys), keys); err != nil {
+		return err
+	}
+	// Re-program the gateway Pipe so the rotated client keys take effect at the
+	// front (no-op when the gateway isn't configured).
+	return b.router.ProgramRoute(ctx, ref.Tenant, keys)
+}
+
+// boxAuthorizedKeys returns the keys the box itself should authorize: the
+// gateway's upstream key when routing through sshpiper, else the agent's keys
+// (direct access).
+func (b *Backend) boxAuthorizedKeys(agentKeys []string) []string {
+	if b.router.Enabled() && b.cfg.GatewayUpstreamPublicKey != "" {
+		return []string{b.cfg.GatewayUpstreamPublicKey}
+	}
+	return agentKeys
+}
+
+// Resize updates the box container's resource limits on the Sandbox's pod
+// template. Unparseable (incus-native) quantities are skipped; a no-op resize
+// returns nil.
+//
+// Get→mutate→Update rather than a patch: CRDs don't support strategic merge,
+// and a plain merge patch would replace the whole containers list.
+//
+// The mutation MERGES into the container's existing requirements rather than
+// replacing them (#1582). Replacing meant every axis the caller did not name
+// was dropped — `resize --cpu 4` deleted the box's memory limit outright,
+// leaving an already-running box memory-unbounded on a shared kernel, which is
+// exactly the guarantee the create-time memory floor exists to provide. The
+// contract this function's comment always claimed, "empty = unchanged", is now
+// what it does.
+//
+// Behavioral note vs the old StatefulSet path: the agent-sandbox controller
+// does not recreate a live pod on template drift, so a resize takes effect at
+// the NEXT pod creation (the next Stop→Start cycle), not immediately. The
+// server-side dispatch layer decides whether to bounce the box.
+func (b *Backend) Resize(ctx context.Context, ref box.BoxRef, r box.ResourceLimits) error {
+	if r.CPU == "" && r.Memory == "" && r.CPURequest == "" && r.MemoryRequest == "" {
+		return nil
+	}
+	ns := b.namespaceFor(ref.Tenant)
+	sb, err := b.sandboxes.AgentsV1beta1().Sandboxes(ns).Get(ctx, sandboxName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	found := false
+	for i := range sb.Spec.PodTemplate.Spec.Containers {
+		if sb.Spec.PodTemplate.Spec.Containers[i].Name == "agent-box" {
+			mergeResizeInto(&sb.Spec.PodTemplate.Spec.Containers[i].Resources, r)
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	_, err = b.sandboxes.AgentsV1beta1().Sandboxes(ns).Update(ctx, sb, metav1.UpdateOptions{})
+	return err
+}
+
+// mergeResizeInto applies a resize onto a container's existing resource
+// requirements in place, leaving untouched everything the caller did not name.
+//
+// Per axis:
+//   - A new limit replaces the old limit. An unparseable quantity (an
+//     incus-native "4GB" reaching the K8s path) is skipped, matching
+//     resourceRequirements, so a bad string can't fail pod admission.
+//   - An explicit request replaces the old request.
+//   - With no explicit request, the existing request is KEPT — a limit-only
+//     resize must not move the box's scheduler reservation, which is what
+//     silently flipped a deliberately Burstable box to Guaranteed (#1572).
+//   - A box with no request at all gets request == limit, matching what
+//     create would have produced for it.
+//   - A request may never exceed its limit (K8s rejects the pod), so a request
+//     carried over from a larger previous limit is clamped down to the new one.
+func mergeResizeInto(cur *corev1.ResourceRequirements, r box.ResourceLimits) {
+	if cur.Limits == nil {
+		cur.Limits = corev1.ResourceList{}
+	}
+	if cur.Requests == nil {
+		cur.Requests = corev1.ResourceList{}
+	}
+
+	apply := func(name corev1.ResourceName, limit, request string) {
+		if limit != "" {
+			if q, err := resource.ParseQuantity(limit); err == nil {
+				cur.Limits[name] = q
+			}
+		}
+		if request != "" {
+			if q, err := resource.ParseQuantity(request); err == nil {
+				cur.Requests[name] = q
+			}
+		} else if _, ok := cur.Requests[name]; !ok {
+			// No existing reservation to preserve — mirror create's
+			// request == limit default.
+			if lim, ok := cur.Limits[name]; ok {
+				cur.Requests[name] = lim
+			}
+		}
+		// A request above its limit fails admission; clamp rather than write a
+		// spec the API server will reject.
+		lim, hasLim := cur.Limits[name]
+		req, hasReq := cur.Requests[name]
+		if hasLim && hasReq && req.Cmp(lim) > 0 {
+			cur.Requests[name] = lim
+		}
+	}
+
+	apply(corev1.ResourceCPU, r.CPU, r.CPURequest)
+	apply(corev1.ResourceMemory, r.Memory, r.MemoryRequest)
+}
+
+// SetMeta writes the runtime-neutral metadata as prefixed Sandbox annotations.
+func (b *Backend) SetMeta(ctx context.Context, ref box.BoxRef, meta map[string]string) error {
+	ann := map[string]string{}
+	for k, v := range meta {
+		ann[metaAnnotationPrefix+k] = v
+	}
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": ann}})
+	if err != nil {
+		return err
+	}
+	_, err = b.sandboxes.AgentsV1beta1().Sandboxes(b.namespaceFor(ref.Tenant)).
+		Patch(ctx, sandboxName, types.MergePatchType, patch, metav1.PatchOptions{})
+	return err
+}
+
+// GetMeta reads the prefixed annotations back into the metadata map.
+func (b *Backend) GetMeta(ctx context.Context, ref box.BoxRef) (map[string]string, error) {
+	sb, err := b.sandboxes.AgentsV1beta1().Sandboxes(b.namespaceFor(ref.Tenant)).Get(ctx, sandboxName, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return metaFromAnnotations(sb.Annotations), nil
+}
+
+// stateOf maps a Sandbox onto the proto state, preferring *observed* status
+// over *desired* spec.
+//
+// spec.operatingMode is only a request. Reporting STOPPED the moment Stop()
+// writes it — as this function used to — tells a caller polling for shutdown
+// that the box is down while its pod is still terminating. agent-sandbox
+// >= 0.5.4 makes the observation available: the Suspended condition is always
+// present after the first reconcile, True only once the backing Pod is
+// actually gone (reason PodTerminated), and False while it is still going away
+// (reason PodTerminating). See #1186.
+//
+// Version skew is deliberate here: bumping the Go module upgrades the API
+// types, not the controller running in a cluster. Against a 0.5.3 controller
+// the condition is absent, so we fall back to the old spec-derived answer
+// rather than reporting a box that never stops. An Unknown condition (reason
+// PodStateUnknown — the controller failed to reconcile the Pod) is treated the
+// same way: no usable observation, so trust the request.
+//
+// Within Running, Ready distinguishes a live pod (RUNNING) from one still
+// coming up (PROVISIONING). Finished means the pod hit a terminal phase —
+// for a long-lived SSH box that is effectively stopped.
+func stateOf(sb *sandboxv1beta1.Sandbox) pb.ContainerState {
+	suspendRequested := sb.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended
+	suspended := apimeta.FindStatusCondition(sb.Status.Conditions, string(sandboxv1beta1.SandboxConditionSuspended))
+
+	switch {
+	case suspended == nil, suspended.Status == metav1.ConditionUnknown:
+		// No usable observation (pre-0.5.4 controller, or reconcile failed) —
+		// fall back to the desired state.
+		if suspendRequested {
+			return pb.ContainerState_CONTAINER_STATE_STOPPED
+		}
+	case suspended.Status == metav1.ConditionTrue:
+		// Observed suspended: the pod is genuinely gone.
+		return pb.ContainerState_CONTAINER_STATE_STOPPED
+	case suspended.Status == metav1.ConditionFalse:
+		// Not suspended yet. If a suspend was requested, the pod is still
+		// terminating — report RUNNING, not STOPPED, so a caller waiting for
+		// shutdown keeps waiting instead of acting on a box that is still up.
+		if suspendRequested {
+			return pb.ContainerState_CONTAINER_STATE_RUNNING
+		}
+	}
+
+	if apimeta.IsStatusConditionTrue(sb.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished)) {
+		return pb.ContainerState_CONTAINER_STATE_STOPPED
+	}
+	if apimeta.IsStatusConditionTrue(sb.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady)) {
+		return pb.ContainerState_CONTAINER_STATE_RUNNING
+	}
+	return pb.ContainerState_CONTAINER_STATE_PROVISIONING
+}
+
+// resourcesOf reads the box container's limits back into the runtime-neutral
+// shape (K8s quantity strings, e.g. "2"/"4Gi").
+func resourcesOf(sb *sandboxv1beta1.Sandbox) box.ResourceLimits {
+	var r box.ResourceLimits
+	for _, c := range sb.Spec.PodTemplate.Spec.Containers {
+		if c.Name != "agent-box" {
+			continue
+		}
+		if q, ok := c.Resources.Limits[corev1.ResourceCPU]; ok {
+			r.CPU = q.String()
+		}
+		if q, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			r.Memory = q.String()
+		}
+	}
+	return r
+}
+
+// ignoreExists turns an AlreadyExists error into nil (idempotent reconcile).
+func ignoreExists(err error) error {
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
+}
+
+// ignoreNotFound turns a NotFound error into nil (idempotent delete).
+func ignoreNotFound(err error) error {
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// metaFromAnnotations extracts the containarium.dev/meta.* annotations.
+func metaFromAnnotations(ann map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range ann {
+		if strings.HasPrefix(k, metaAnnotationPrefix) {
+			out[strings.TrimPrefix(k, metaAnnotationPrefix)] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
