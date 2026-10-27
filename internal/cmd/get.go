@@ -40,3 +40,66 @@ func init() {
 
 func runGet(cmd *cobra.Command, args []string) error {
 	username := args[0]
+
+	var info *incus.ContainerInfo
+	var err error
+
+	switch {
+	case httpMode && serverAddr != "":
+		info, err = getRemoteHTTP(username)
+	case serverAddr != "":
+		info, err = getRemote(username)
+	default:
+		info, err = getLocal(username)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get container %q: %w", username, err)
+	}
+	if info == nil {
+		return fmt.Errorf("container %q not found", username)
+	}
+
+	containers := []incus.ContainerInfo{*info}
+	switch containerGetFormat {
+	case "table":
+		if info.NetworkTenantSource != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "Network Tenant: %s (%s)\n", info.Tenant, info.NetworkTenantSource)
+		}
+		printTableFormat(containers, boolToCount(info.State == "Running"), boolToCount(info.State != "Running"), false)
+	case "json":
+		return printJSONFormat(containers)
+	case "yaml":
+		printYAMLFormat(containers)
+	default:
+		return fmt.Errorf("unknown format: %s (use: table, json, yaml)", containerGetFormat)
+	}
+	return nil
+}
+
+// boolToCount turns a single container's running/not-running check into the
+// running/stopped counts printTableFormat's footer expects, without
+// duplicating that footer logic for a one-item list.
+func boolToCount(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func getRemote(username string) (*incus.ContainerInfo, error) {
+	grpcClient, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = grpcClient.Close() }()
+	return grpcClient.GetContainer(username)
+}
+
+func getRemoteHTTP(username string) (*incus.ContainerInfo, error) {
+	httpClient, err := client.NewHTTPClient(serverAddr, authToken)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = httpClient.Close() }()
+	return httpClient.GetContainer(username)
+}
