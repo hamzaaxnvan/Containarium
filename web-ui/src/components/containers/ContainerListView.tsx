@@ -140,3 +140,145 @@ export default function ContainerListView({
                       );
                       return (
                         <button title={`${badge.medium} medium CVEs — click to view`}
+                          onClick={() => onSecurityClick?.(c.name)}
+                          className={`inline-flex items-center gap-0.5 rounded-full border border-amber-500/30 bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-400 ${cls}`}>
+                          <ShieldAlert size={9} />
+                          {badge.medium}
+                        </button>
+                      );
+                    })()}
+                  </div>
+                </td>
+
+                {/* IP */}
+                <td className="px-3 py-2.5 font-mono text-[var(--text-secondary)]">
+                  {c.ipAddress || <span className="text-[var(--text-muted)]">—</span>}
+                </td>
+
+                {/* CPU */}
+                <td className="px-3 py-2.5">
+                  {isRunning && cpuCores > 0 ? (
+                    <div title={`${cpuPct.toFixed(1)}% of ${cpuCores} cores`}>
+                      <p className="text-[var(--text)]">{cpuPct.toFixed(1)}% / {cpuCores}c</p>
+                      <MiniBar pct={cpuPct / cpuCores} />
+                    </div>
+                  ) : (
+                    <span className="text-[var(--text-muted)]">{cpuCores > 0 ? `${cpuCores}c` : '—'}</span>
+                  )}
+                </td>
+
+                {/* Memory */}
+                <td className="px-3 py-2.5">
+                  {isRunning && memLimit > 0 ? (
+                    <div title={`${formatBytes(memUsed)} / ${formatBytes(memLimit)}`}>
+                      <p className="text-[var(--text)]">{formatBytes(memUsed)} / {c.memory}</p>
+                      <MiniBar pct={memPct} />
+                    </div>
+                  ) : (
+                    <span className="text-[var(--text-muted)]">{c.memory || '—'}</span>
+                  )}
+                </td>
+
+                {/* Disk */}
+                <td className="px-3 py-2.5">
+                  {isRunning && diskLimit > 0 ? (
+                    <div title={`${formatBytes(diskUsed)} / ${formatBytes(diskLimit)}`}>
+                      <p className="text-[var(--text)]">{formatBytes(diskUsed)} / {c.disk}</p>
+                      <MiniBar pct={diskPct} />
+                    </div>
+                  ) : isRunning && diskUsed > 0 ? (
+                    <span className="text-[var(--text)]">{formatBytes(diskUsed)} used</span>
+                  ) : (
+                    <span className="text-[var(--text-muted)]">{c.disk || '—'}</span>
+                  )}
+                </td>
+
+                {/* Node */}
+                <td className="px-3 py-2.5">
+                  {c.backendId ? (
+                    <span className={`rounded border px-1.5 py-0.5 text-[10px] ${c.backendId.startsWith('tunnel-') ? 'border-indigo-500/30 bg-indigo-500/10 text-indigo-400' : 'border-blue-500/30 bg-blue-500/10 text-[var(--c-blue)]'}`}>
+                      {c.backendId}
+                    </span>
+                  ) : <span className="text-[var(--text-muted)]">—</span>}
+                </td>
+
+                {/* Labels */}
+                <td className="px-3 py-2.5">
+                  <div className="flex flex-wrap items-center gap-1 max-w-[180px]">
+                    {c.labels && Object.keys(c.labels).length > 0 ? (
+                      Object.entries(c.labels).slice(0, 3).map(([k, v]) => (
+                        <span key={k} title={`${k}=${v}`} className="max-w-[130px] truncate rounded bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]">
+                          {k}={v}
+                        </span>
+                      ))
+                    ) : <span className="text-[var(--text-muted)]">—</span>}
+                    {onEditLabels && (
+                      <IconBtn title="Edit Labels" onClick={() => onEditLabels(username, c.labels || {})}>
+                        <Tag size={11} />
+                      </IconBtn>
+                    )}
+                  </div>
+                </td>
+
+                {/* Actions */}
+                <td className="px-3 py-2.5">
+                  <div className="flex items-center justify-end gap-0.5">
+                    {isRunning && c.accessType === 'ACCESS_TYPE_RDP' && (
+                      <IconBtn title="Remote Desktop" onClick={() => window.open('/guacamole/', '_blank')}>
+                        <Monitor size={13} />
+                      </IconBtn>
+                    )}
+                    {isRunning && c.accessType !== 'ACCESS_TYPE_RDP' && onTerminal && (
+                      <IconBtn title="Terminal" onClick={() => onTerminal(username)} className="hover:text-[var(--c-blue)]">
+                        <Terminal size={13} />
+                      </IconBtn>
+                    )}
+                    {onResize && (
+                      <IconBtn title="Resize" onClick={() => onResize(username, { cpu: c.cpu, memory: c.memory, disk: c.disk })}>
+                        <SlidersHorizontal size={13} />
+                      </IconBtn>
+                    )}
+                    {isRunning && onManageCollaborators && (
+                      <IconBtn title="Collaborators" onClick={() => onManageCollaborators(username)}>
+                        <Users size={13} />
+                      </IconBtn>
+                    )}
+                    {onEditFirewall && (
+                      <IconBtn title="Firewall" onClick={() => onEditFirewall(username)} className="hover:text-[var(--c-amber)]">
+                        <Shield size={13} />
+                      </IconBtn>
+                    )}
+                    {onToggleAutoSleep && (
+                      <IconBtn
+                        title={c.autoSleepEnabled ? `Auto-sleep · idle ${c.idleThresholdMinutes ?? 15}m` : 'Auto-sleep'}
+                        onClick={() => onToggleAutoSleep(username, {
+                          enabled: c.autoSleepEnabled ?? false,
+                          threshold: c.idleThresholdMinutes ?? 15,
+                        })}
+                        className={c.autoSleepEnabled ? 'text-indigo-400 hover:text-indigo-300' : 'hover:text-indigo-400'}
+                      >
+                        <Moon size={13} />
+                      </IconBtn>
+                    )}
+                    {isRunning ? (
+                      <IconBtn title="Stop" onClick={() => onStop?.(username)} className="hover:text-[var(--c-amber)]">
+                        <Square size={13} />
+                      </IconBtn>
+                    ) : (
+                      <IconBtn title="Start" onClick={() => onStart?.(username)} className="hover:text-[var(--c-emerald)]">
+                        <Play size={13} />
+                      </IconBtn>
+                    )}
+                    <IconBtn title="Delete" onClick={() => onDelete(username)} className="hover:text-[var(--c-red)] hover:bg-red-500/10">
+                      <Trash2 size={13} />
+                    </IconBtn>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
