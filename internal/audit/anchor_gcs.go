@@ -184,3 +184,189 @@ func (g *GCSAnchorSink) LastPublished(ctx context.Context) (int64, string, bool,
 }
 
 func (g *GCSAnchorSink) readRecord(ctx context.Context, uri string) (anchorRecord, error) {
+	rec, problem, err := g.fetchRecord(ctx, uri)
+	if err != nil {
+		return anchorRecord{}, err
+	}
+	if problem != "" {
+		return anchorRecord{}, errors.New(problem)
+	}
+	return rec, nil
+}
+
+// fetchRecord reads one anchor object. A failure to read it is err; content
+// that is not a record for its own name is problem, which verify-anchor
+// reports as tampering rather than aborting on.
+func (g *GCSAnchorSink) fetchRecord(ctx context.Context, uri string) (rec anchorRecord, problem string, err error) {
+	out, err := g.run(ctx, nil, "storage", "cat", uri)
+	if err != nil {
+		return anchorRecord{}, "", fmt.Errorf("audit: read anchor %s: %w", uri, err)
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rec); err != nil {
+		return anchorRecord{}, fmt.Sprintf("audit: anchor %s is not a valid record: %v", uri, err), nil
+	}
+	if want := g.objectURI(rec.Checkpoint); want != uri {
+		return anchorRecord{}, fmt.Sprintf("audit: anchor %s records checkpoint %d, which belongs at %s", uri, rec.Checkpoint, want), nil
+	}
+	return rec, "", nil
+}
+
+// RetentionLockStatus is what the bucket's retention policy says.
+type RetentionLockStatus struct {
+	HasPolicy       bool
+	Locked          bool
+	RetentionPeriod string // seconds, as gcloud prints it
+}
+
+type gcsRetentionPolicy struct {
+	IsLocked        bool   `json:"isLocked"`
+	RetentionPeriod string `json:"retentionPeriod"`
+}
+
+// gcsBucketDescribe is the slice of `gcloud storage buckets describe
+// --format=json` we read. gcloud prints the top-level key snake_case; the
+// camelCase spelling is accepted too in case a gcloud release changes it.
+type gcsBucketDescribe struct {
+	RetentionPolicy      *gcsRetentionPolicy `json:"retention_policy"`
+	RetentionPolicyCamel *gcsRetentionPolicy `json:"retentionPolicy"`
+}
+
+// CheckRetentionLock reports whether the bucket's retention policy is
+// locked — the property that makes the anchors immutable.
+func (g *GCSAnchorSink) CheckRetentionLock(ctx context.Context) (RetentionLockStatus, error) {
+	out, err := g.run(ctx, nil, "storage", "buckets", "describe", "gs://"+g.bucket, "--format=json")
+	if err != nil {
+		return RetentionLockStatus{}, fmt.Errorf("audit: describe bucket gs://%s: %w", g.bucket, err)
+	}
+	var d gcsBucketDescribe
+	if err := json.Unmarshal([]byte(out), &d); err != nil {
+		return RetentionLockStatus{}, fmt.Errorf("audit: parse bucket gs://%s description: %w", g.bucket, err)
+	}
+	p := d.RetentionPolicy
+	if p == nil {
+		p = d.RetentionPolicyCamel
+	}
+	if p == nil {
+		return RetentionLockStatus{}, nil
+	}
+	return RetentionLockStatus{HasPolicy: true, Locked: p.IsLocked, RetentionPeriod: p.RetentionPeriod}, nil
+}
+
+// MinAnchorRetentionSeconds is the shortest locked retention period (365
+// days) that does not trigger a startup warning. A locked policy shorter
+// than this still makes anchors immutable, but only for a window shorter
+// than the audit-retention horizon. Decision Q31 on #2957; see
+// docs/security/DATA-FLOW-AND-RETENTION.md.
+const MinAnchorRetentionSeconds int64 = 365 * 24 * 3600
+
+// RetentionLockWarning turns a CheckRetentionLock result into the loud
+// warning the daemon logs, or "" when the bucket is locked for at least MinAnchorRetentionSeconds. Decision Q18.3
+// on #2727: an unlocked bucket is still used, with this warning.
+func RetentionLockWarning(uri string, st RetentionLockStatus, err error) string {
+	switch {
+	case err != nil:
+		return fmt.Sprintf("WARNING: could not check the retention lock on %s: %v — the external anchor copy may NOT be immutable", uri, err)
+	case !st.HasPolicy:
+		return fmt.Sprintf("WARNING: %s has no retention policy — anchors are still published, but the external copy is NOT immutable: anyone with delete rights on the bucket can remove them", uri)
+	case !st.Locked:
+		return fmt.Sprintf("WARNING: %s has a retention policy (%ss) that is not locked — anchors are still published, but the external copy is NOT immutable until the policy is locked", uri, st.RetentionPeriod)
+	}
+	secs, perr := strconv.ParseInt(strings.TrimSpace(st.RetentionPeriod), 10, 64)
+	switch {
+	case perr != nil:
+		return fmt.Sprintf("WARNING: %s has a locked retention policy but its period %q is unparsable — cannot confirm it meets the %d-second (365-day) minimum", uri, st.RetentionPeriod, MinAnchorRetentionSeconds)
+	case secs < MinAnchorRetentionSeconds:
+		return fmt.Sprintf("WARNING: %s has a locked retention policy of %d seconds, shorter than the %d-second (365-day) minimum — anchors are immutable only for that window", uri, secs, MinAnchorRetentionSeconds)
+	}
+	return ""
+}
+
+var (
+	gcsBucketName   = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$`)
+	gcsObjectPrefix = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+	gcsURI          = regexp.MustCompile(`gs://\S*`)
+	httpStatus412   = regexp.MustCompile(`\b412\b`)
+)
+
+func isGcloudPreconditionFailed(err error) bool {
+	// Drop object URIs first: a checkpoint or prefix containing "412" is not
+	// an HTTP status.
+	s := strings.ToLower(gcsURI.ReplaceAllString(err.Error(), ""))
+	return httpStatus412.MatchString(s) || strings.Contains(s, "precondition") || strings.Contains(s, "pre-condition")
+}
+
+func isGcloudNoMatch(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "matched no objects") || strings.Contains(s, "no urls matched")
+}
+
+// AnchorSinkFor picks the daemon's anchor sink from its config. An empty
+// bucketURI returns the file sink alone (behaviour before #2880). Otherwise
+// it returns TeeSink(file, bucket) and the bucket sink, for the startup lock
+// check. If the bucket sink cannot be built (bad URI, no gcloud on PATH),
+// it returns the file sink alone plus the error, so the daemon keeps
+// anchoring locally and logs why external anchoring is off.
+func AnchorSinkFor(file *FileSink, bucketURI string, newBucket func(string) (*GCSAnchorSink, error)) (RootSink, *GCSAnchorSink, error) {
+	if strings.TrimSpace(bucketURI) == "" {
+		return file, nil, nil
+	}
+	bucket, err := newBucket(bucketURI)
+	if err != nil {
+		return file, nil, err
+	}
+	return NewTeeSink(file, bucket), bucket, nil
+}
+
+// TeeSink publishes to the local file first, then to each external sink
+// (the GCS bucket from #2880, the TSA from #2728) in order.
+//
+// Ordering: the external sinks are written only after the file write
+// succeeded, so no external copy ever holds a checkpoint the local file lacks
+// (verify-anchor flags such a checkpoint as tampering). If the file write
+// fails, every external write is skipped and the error returned.
+//
+// The external sinks are independent: one failing does not skip the others.
+// If any fails, the file record stays and the joined error is returned, so
+// AnchorManager does not advance: the next tick publishes again — the file
+// write and every external sink that already holds the checkpoint are
+// idempotent no-ops, and the failed one is retried. If the chain has grown by
+// then, the next tick anchors the newer checkpoint instead, and the failed one
+// exists only in the local file (each external copy holds a subset of the
+// file's checkpoints, never a superset).
+type TeeSink struct {
+	file      RootSink
+	externals []RootSink
+}
+
+// NewTeeSink builds a TeeSink. No sink may be nil, and there must be at least
+// one external sink.
+func NewTeeSink(file RootSink, externals ...RootSink) *TeeSink {
+	if file == nil || len(externals) == 0 {
+		panic("audit: NewTeeSink needs the file sink and at least one external sink")
+	}
+	for _, e := range externals {
+		if e == nil {
+			panic("audit: nil sink passed to NewTeeSink")
+		}
+	}
+	return &TeeSink{file: file, externals: append([]RootSink(nil), externals...)}
+}
+
+func (t *TeeSink) PublishRoot(ctx context.Context, checkpoint int64, root string) error {
+	if err := t.file.PublishRoot(ctx, checkpoint, root); err != nil {
+		return fmt.Errorf("local anchor file (external anchor skipped): %w", err)
+	}
+	var errs []error
+	for _, e := range t.externals {
+		if err := e.PublishRoot(ctx, checkpoint, root); err != nil {
+			errs = append(errs, fmt.Errorf("external anchor (local file has checkpoint %d; retried next tick): %w", checkpoint, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// LastPublished reports the local file's last anchor — what `audit
+// verify-anchor` reads without an external sink configured.
+func (t *TeeSink) LastPublished(ctx context.Context) (int64, string, bool, error) {
+	return t.file.LastPublished(ctx)
+}
