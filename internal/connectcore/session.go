@@ -87,3 +87,92 @@ fi
 DIR="${TMPDIR:-/tmp}"
 CMDF="$DIR/cntr-$MARKER.cmd"; OUTF="$DIR/cntr-$MARKER.out"; RCF="$DIR/cntr-$MARKER.rc"
 if ! printf '%s' "$B64" | base64 -d > "$CMDF" 2>/dev/null; then
+  printf 'CNTR_DECODE_FAIL_%s\n' "$MARKER"; exit 2
+fi
+tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION"
+tmux send-keys -t "$SESSION" "source '$CMDF' > '$OUTF' 2>&1; echo \$? > '$RCF'" Enter
+i=0; lim=$((TIMEOUT*5))
+while [ ! -s "$RCF" ]; do
+  i=$((i+1))
+  if [ "$i" -gt "$lim" ]; then break; fi
+  sleep 0.2
+done
+RC="timeout"
+if [ -s "$RCF" ]; then RC="$(tr -d '[:space:]' < "$RCF")"; fi
+printf 'CNTR_RC_%s=%s\n' "$MARKER" "$RC"
+printf 'CNTR_OUT_BEGIN_%s\n' "$MARKER"
+[ -f "$OUTF" ] && cat "$OUTF"
+printf '\nCNTR_OUT_END_%s\n' "$MARKER"
+rm -f "$CMDF" "$OUTF" "$RCF"
+`
+
+// SessionExecScript returns the orchestration script to pipe to `bash -s`
+// on the box.
+func SessionExecScript() string { return sessionExecScript }
+
+// BuildSessionExecArgs returns the ssh argv that runs the orchestration on
+// the box: ssh opts + user@host + `bash -s -- <session> <marker> <b64> <timeout>`.
+// The script itself is supplied on stdin by the caller.
+func BuildSessionExecArgs(t Target, identity, session, marker, b64cmd string, timeoutSec int) []string {
+	if timeoutSec <= 0 {
+		timeoutSec = 60
+	}
+	args := BuildSSHArgs(t, identity, "") // opts + user@host, no remote command tail
+	return append(args, "bash", "-s", "--", session, marker, b64cmd, strconv.Itoa(timeoutSec))
+}
+
+// BuildAttachArgs returns the ssh argv that attaches a human terminal to
+// the named tmux session, creating it if absent (`new-session -A`). `-t`
+// forces a PTY so the attach is interactive.
+func BuildAttachArgs(t Target, identity, session string) []string {
+	args := []string{"-t", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new"}
+	if identity != "" {
+		args = append(args, "-i", identity)
+	}
+	if t.Port != 0 && t.Port != 22 {
+		args = append(args, "-p", strconv.Itoa(t.Port))
+	}
+	return append(args, t.User+"@"+t.Host, "tmux", "new-session", "-A", "-s", session)
+}
+
+// ParseSessionResult extracts stdout + exit code from the script's framed
+// output. Returns ErrNoTmux / ErrSessionTimeout for those terminal states.
+func ParseSessionResult(raw, marker string) (stdout string, exitCode int, err error) {
+	if strings.Contains(raw, "CNTR_NO_TMUX_"+marker) {
+		return "", 0, ErrNoTmux
+	}
+	if strings.Contains(raw, "CNTR_DECODE_FAIL_"+marker) {
+		return "", 0, fmt.Errorf("the box failed to decode the command")
+	}
+
+	// stdout is framed between BEGIN and END delimiters.
+	beginTag := "CNTR_OUT_BEGIN_" + marker + "\n"
+	endTag := "\nCNTR_OUT_END_" + marker
+	if b := strings.Index(raw, beginTag); b >= 0 {
+		after := raw[b+len(beginTag):]
+		if e := strings.Index(after, endTag); e >= 0 {
+			stdout = after[:e]
+		} else {
+			stdout = after
+		}
+	}
+
+	rcTag := "CNTR_RC_" + marker + "="
+	idx := strings.Index(raw, rcTag)
+	if idx < 0 {
+		return stdout, 0, fmt.Errorf("malformed session result (no exit-code marker)")
+	}
+	rcLine := raw[idx+len(rcTag):]
+	if nl := strings.IndexByte(rcLine, '\n'); nl >= 0 {
+		rcLine = rcLine[:nl]
+	}
+	rcStr := strings.TrimSpace(rcLine)
+	if rcStr == "timeout" {
+		return stdout, 0, ErrSessionTimeout
+	}
+	code, convErr := strconv.Atoi(rcStr)
+	if convErr != nil {
+		return stdout, 0, fmt.Errorf("unparseable exit code %q", rcStr)
+	}
+	return stdout, code, nil
+}
