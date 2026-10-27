@@ -151,3 +151,54 @@ func runSecretsCoverage(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  coverage: %.1f%%\n", pct)
 	}
 	if c.Legacy == 0 && c.Total > 0 {
+		fmt.Printf("\nAll rows are envelope-encoded. Master-key retirement (Phase E) is safe.\n")
+	}
+	return nil
+}
+
+// openSecretsStoreWithKMS wires a Store using the KMS
+// backend the env selects (CONTAINARIUM_KMS_BACKEND). The
+// daemon uses the same selector, so the migration writes
+// rows with the same kek_id shape that the daemon will
+// later read.
+//
+// If the env points at a real backend (vault) but it's
+// misconfigured, this returns an error rather than
+// silently falling back to InProc — the operator running
+// the migration explicitly chose a backend; mis-routing
+// the migration to InProc would produce rows the daemon
+// then can't decrypt.
+//
+// If the env is unset / "none", the migration refuses to
+// run — there's nothing to migrate INTO. Operators must
+// pick at least "inproc" to backfill rows.
+func openSecretsStoreWithKMS(ctx context.Context, masterKeyPath string) (*internalsecrets.Store, func(), error) {
+	masterKey, _, err := corecrypto.LoadOrCreateMasterKey(masterKeyPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load master key: %w", err)
+	}
+	cipher, err := corecrypto.NewCipher(masterKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build cipher: %w", err)
+	}
+	kms, kmsDesc, err := internalsecrets.LoadKMSClient(masterKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load KMS backend: %w", err)
+	}
+	if kms == nil {
+		return nil, nil, fmt.Errorf(`migration requires a KMS backend; set CONTAINARIUM_KMS_BACKEND=inproc|vault (current: %s)`, kmsDesc)
+	}
+	fmt.Fprintf(os.Stderr, "[migrate] KMS backend: %s\n", kmsDesc)
+
+	dsn := getPostgresConnString()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	store, err := internalsecrets.NewStore(ctx, pool, cipher, internalsecrets.WithKMS(kms))
+	if err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("open store: %w", err)
+	}
+	return store, func() { pool.Close() }, nil
+}
