@@ -76,3 +76,81 @@ type OpenChangeRequest struct {
 	Description string
 	Draft       bool
 }
+
+// ReaderProvider is the read half of Provider: GetIssue, ListIssues,
+// GetChange, and DescribeCredential (#1921). This PR (#1922 build-order
+// step 4) lands only these — both adapters implement exactly this
+// interface today. The next stacked PR (step 5) adds the write verbs
+// below and widens callers from ReaderProvider to the full Provider.
+type ReaderProvider interface {
+	CredentialDescriber
+	GetIssue(ctx context.Context, c Conn, number int64) (Issue, error)
+	ListIssues(ctx context.Context, c Conn, f IssueFilter) ([]Issue, error)
+	GetChange(ctx context.Context, c Conn, number int64) (Change, error)
+}
+
+// WriterProvider is the write half of Provider needed by #1922's write
+// verbs (CommentOnTrackerIssue, ClaimTrackerIssue, SetTrackerIssueLabels).
+// OpenChange — the remaining Provider method — is #1923's submit path
+// and isn't implemented by either adapter yet, so it stays out of this
+// interface rather than forcing a stub.
+type WriterProvider interface {
+	ReaderProvider
+	// Comment posts a comment and returns its normalized form.
+	Comment(ctx context.Context, c Conn, number int64, body string) (Comment, error)
+	// AssignIfUnassigned assigns the connection's credential's own
+	// account to the issue, but only if it currently has no assignee —
+	// never replaces an existing one. Returns whether it actually
+	// assigned (false when already assigned by someone else, which is
+	// not an error — the caller's claim logic decides what that means).
+	AssignIfUnassigned(ctx context.Context, c Conn, number int64) (assigned bool, err error)
+	// SetLabels adds and removes labels in one call. Allow-list
+	// enforcement is the broker core's job, not the adapter's.
+	SetLabels(ctx context.Context, c Conn, number int64, add, remove []string) error
+	// WhoAmI resolves the connection's own credential to the account
+	// name it authenticates as — the same identity every Comment/
+	// AssignIfUnassigned call under this credential is attributed to.
+	// ClaimTrackerIssue uses it to authenticate claim/yield markers
+	// before trusting them (caught in review of #1924, CWE-345): a
+	// marker's syntax is trivially reproducible by any tracker
+	// commenter, so a marker whose comment Author isn't this identity
+	// must never be treated as claim state.
+	WhoAmI(ctx context.Context, c Conn) (login string, err error)
+	// CreateIssue files an issue and returns it normalized exactly as
+	// GetIssue would (#2024). Body arrives fully composed — sanitized,
+	// parent link and identity stamp already appended by the daemon —
+	// and Labels already allow-listed; the adapter only translates to
+	// the provider's wire shape (GitHub: labels array; GitLab:
+	// description + comma-joined labels).
+	CreateIssue(ctx context.Context, c Conn, n NewIssue) (Issue, error)
+}
+
+// NewIssue is CreateIssue's input.
+type NewIssue struct {
+	Title  string
+	Body   string
+	Labels []string
+}
+
+// Provider is the full per-tracker verb set, adding OpenChange (#1923's
+// submit path) to WriterProvider. Not yet satisfied by either adapter —
+// lands once #1923 implements OpenChange.
+type Provider interface {
+	WriterProvider
+	// OpenChange pushes a change request. #1923.
+	OpenChange(ctx context.Context, c Conn, req OpenChangeRequest) (Change, error)
+	// DefaultBranch resolves the project's actual default branch (e.g.
+	// "main", "master", or an operator-renamed default) from the
+	// provider itself — never guessed. SubmitTrackerChange (#1923) needs
+	// this for a run whose recorded git_source had no explicit ref: the
+	// change must target whatever branch the project actually treats as
+	// default, not a hardcoded assumption.
+	DefaultBranch(ctx context.Context, c Conn) (string, error)
+	// FindOpenChange returns the open change request whose head is
+	// headBranch in the connection's own project (never a fork's
+	// same-named branch), and whether one exists (#3288).
+	// SubmitTrackerChangeFiles reuses it instead of opening a second
+	// change for a branch that already has one. Its CIVerdict is NONE,
+	// as from OpenChange: the caller has just pushed a new head commit.
+	FindOpenChange(ctx context.Context, c Conn, headBranch string) (Change, bool, error)
+}

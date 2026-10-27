@@ -96,3 +96,102 @@ type ConfigKV interface {
 	Get(ctx context.Context, key string) (string, error)
 	Set(ctx context.Context, key, value string) error
 }
+
+// MiningThresholdsConfig holds the operator's mining-behavior thresholds,
+// cached in memory and persisted to the daemon config store. Effective is
+// what the engine's RuleContext reads on every sweep, so it never touches
+// the store.
+type MiningThresholdsConfig struct {
+	store ConfigKV // nil = in-memory only for this process's lifetime
+
+	mu  sync.RWMutex
+	cur *pb.MiningBehaviorThresholds
+}
+
+// NewMiningThresholdsConfig loads previously persisted thresholds from store
+// (nil: in-memory only, like the bad-destination list without Postgres).
+func NewMiningThresholdsConfig(ctx context.Context, store ConfigKV) (*MiningThresholdsConfig, error) {
+	c := &MiningThresholdsConfig{store: store, cur: &pb.MiningBehaviorThresholds{}}
+	if store == nil {
+		return c, nil
+	}
+	raw, err := store.Get(ctx, MiningThresholdsConfigKey)
+	if err != nil {
+		if errors.Is(err, app.ErrDaemonConfigNotFound) {
+			return c, nil
+		}
+		return nil, fmt.Errorf("threatdetect: load mining-behavior thresholds: %w", err)
+	}
+	stored := &pb.MiningBehaviorThresholds{}
+	if err := protojson.Unmarshal([]byte(raw), stored); err != nil {
+		return nil, fmt.Errorf("threatdetect: decode mining-behavior thresholds: %w", err)
+	}
+	c.cur = stored
+	return c, nil
+}
+
+// Get returns a copy of the stored (unresolved) thresholds message.
+func (c *MiningThresholdsConfig) Get() *pb.MiningBehaviorThresholds {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return proto.Clone(c.cur).(*pb.MiningBehaviorThresholds)
+}
+
+// Set validates, persists and applies new thresholds; the next sweep uses
+// them. It is the Go entry point #2636's `process-policy set` will call.
+func (c *MiningThresholdsConfig) Set(ctx context.Context, m *pb.MiningBehaviorThresholds) error {
+	if err := validateMiningThresholds(m); err != nil {
+		return err
+	}
+	next := proto.Clone(m).(*pb.MiningBehaviorThresholds)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.store != nil {
+		raw, err := protojson.Marshal(next)
+		if err != nil {
+			return fmt.Errorf("threatdetect: encode mining-behavior thresholds: %w", err)
+		}
+		if err := c.store.Set(ctx, MiningThresholdsConfigKey, string(raw)); err != nil {
+			return fmt.Errorf("threatdetect: persist mining-behavior thresholds: %w", err)
+		}
+	}
+	c.cur = next
+	return nil
+}
+
+// Effective returns the stored thresholds with defaults applied.
+func (c *MiningThresholdsConfig) Effective() MiningThresholds {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return MiningThresholdsFromProto(c.cur)
+}
+
+func validateMiningThresholds(m *pb.MiningBehaviorThresholds) error {
+	switch {
+	case m == nil:
+		return errors.New("threatdetect: mining-behavior thresholds: nil")
+	case m.GetMinCores() < 0:
+		return errors.New("threatdetect: mining-behavior thresholds: min_cores must be >= 0")
+	case m.GetMinFractionOfLimit() < 0:
+		return errors.New("threatdetect: mining-behavior thresholds: min_fraction_of_limit must be >= 0")
+	case m.GetWindow() != nil && m.GetWindow().AsDuration() < 0:
+		return errors.New("threatdetect: mining-behavior thresholds: window must be >= 0")
+	case m.GetFlowMinAge() != nil && m.GetFlowMinAge().AsDuration() < 0:
+		return errors.New("threatdetect: mining-behavior thresholds: flow_min_age must be >= 0")
+	}
+	for _, p := range m.GetStratumPorts() {
+		if p == 0 || p > 65535 {
+			return fmt.Errorf("threatdetect: mining-behavior thresholds: stratum port %d out of range 1-65535", p)
+		}
+	}
+	// Checked on the resolved values, so a window set below the default
+	// flow_min_age (or the reverse) is caught too.
+	if eff := MiningThresholdsFromProto(m); eff.Window < eff.FlowMinAge {
+		return fmt.Errorf("threatdetect: mining-behavior thresholds: window %s is shorter than flow_min_age %s", eff.Window, eff.FlowMinAge)
+	} else if eff.Window < MinMiningWindow {
+		return fmt.Errorf("threatdetect: mining-behavior thresholds: window %s is below the minimum %s (the 30 s CPU sample cadence cannot cover the required share of a shorter window, so the rule would never fire)", eff.Window, MinMiningWindow)
+	} else if eff.Window > MaxMiningWindow {
+		return fmt.Errorf("threatdetect: mining-behavior thresholds: window %s exceeds the maximum %s (the per-container sample cap cannot cover a longer window)", eff.Window, MaxMiningWindow)
+	}
+	return nil
+}
