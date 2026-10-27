@@ -139,3 +139,39 @@ func blockMetadataFromBridge(run runner, bridge string) (bool, string, error) {
 
 // metadataRule is the FORWARD rule BlockMetadataFromBridge inserts and
 // MetadataBlockPresent looks for — one definition, so the posture check can
+// never look for a different rule than the one enrollment applies.
+func metadataRule(subnet string) []string {
+	return []string{"FORWARD", "-s", subnet, "-d", MetadataIP, "-j", "DROP"}
+}
+
+// MetadataBlockPresent reports whether BlockMetadataFromBridge's rule is in
+// the kernel right now, changing nothing (#2298). It backs the host posture
+// check, so it keeps "absent" and "could not tell" apart: present=false with
+// a nil error means `iptables -C` ran and found no such rule; a non-nil error
+// means the answer is unknown (bridge has no subnet, iptables missing, not
+// root, nftables-only host, or a command that did not finish within
+// probeTimeout).
+func MetadataBlockPresent(bridge string) (present bool, detail string, err error) {
+	return metadataBlockPresent(timeoutRunner(probeTimeout), bridge)
+}
+
+func metadataBlockPresent(run runner, bridge string) (bool, string, error) {
+	subnet, err := bridgeSubnet(run, bridge)
+	if err != nil {
+		return false, "", fmt.Errorf("resolve bridge subnet: %w", err)
+	}
+	rule := metadataRule(subnet)
+	checkArgs := append([]string{"-C"}, rule...)
+	out, err := run("iptables", checkArgs...)
+	if err == nil {
+		return true, fmt.Sprintf("present: iptables -A %s", strings.Join(rule, " ")), nil
+	}
+	// `iptables -C` exits 1 for "no such rule"; any other failure (exit 4
+	// for permission denied, a missing binary with no exit code at all) says
+	// nothing about the rule.
+	var exit interface{ ExitCode() int }
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, fmt.Sprintf("absent: iptables -A %s", strings.Join(rule, " ")), nil
+	}
+	return false, "", fmt.Errorf("iptables %s: %w: %s", strings.Join(checkArgs, " "), err, strings.TrimSpace(string(out)))
+}
