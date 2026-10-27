@@ -35,3 +35,13 @@ func Split(addr string, defaultPort int) (host string, port int) {
 	if h, p, err := net.SplitHostPort(addr); err == nil {
 		if pi, err := strconv.Atoi(p); err == nil {
 			return h, pi
+		}
+		return h, defaultPort
+	}
+
+	if strings.HasPrefix(addr, "[") && strings.HasSuffix(addr, "]") {
+		return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), defaultPort
+	}
+
+	return addr, defaultPort
+}
