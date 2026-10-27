@@ -120,3 +120,126 @@ func showSystemInfo() error {
 		fmt.Printf("  Available:       %.1f GiB\n", float64(serverInfo.AvailableMemoryBytes)/(1<<30))
 		fmt.Println()
 	}
+
+	// Count by state
+	running := 0
+	stopped := 0
+	for _, c := range containers {
+		if c.State == "Running" {
+			running++
+		} else {
+			stopped++
+		}
+	}
+
+	fmt.Println("Containers:")
+	fmt.Printf("  Total:           %d\n", len(containers))
+	fmt.Printf("  Running:         %d\n", running)
+	fmt.Printf("  Stopped:         %d\n", stopped)
+	fmt.Println()
+
+	// CPU budget + admission-gate posture (#2284); empty in local mode or
+	// against a daemon that predates the field.
+	fmt.Print(renderCPUBudget(serverInfo.CPUBudget))
+	fmt.Print(renderStoragePools(serverInfo.StoragePools))
+
+	// Show container list if any exist
+	if len(containers) > 0 {
+		fmt.Println("Container List:")
+		for _, c := range containers {
+			username := strings.TrimSuffix(c.Name, "-container")
+			status := c.State
+			ip := c.IPAddress
+			if ip == "" {
+				ip = "N/A"
+			}
+			fmt.Printf("  %-20s  %-10s  %s\n", username, status, ip)
+		}
+		fmt.Println()
+	}
+
+	return nil
+}
+
+func showContainerInfo(username string) error {
+	containerName := username + "-container"
+
+	fmt.Printf("=== Container Information: %s ===\n", containerName)
+	fmt.Println()
+
+	// Get container info - use remote or local mode
+	var info *incus.ContainerInfo
+	var err error
+
+	if httpMode && serverAddr != "" {
+		// Remote mode via HTTP
+		var httpClient *client.HTTPClient
+		httpClient, err = client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return fmt.Errorf("failed to create HTTP client: %w", err)
+		}
+		defer func() { _ = httpClient.Close() }()
+
+		info, err = httpClient.GetContainer(username)
+		if err != nil {
+			return fmt.Errorf("container not found: %w", err)
+		}
+	} else if serverAddr != "" {
+		// Remote mode via gRPC
+		var grpcClient *client.GRPCClient
+		grpcClient, err = client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return fmt.Errorf("failed to connect to remote server: %w", err)
+		}
+		defer func() { _ = grpcClient.Close() }()
+
+		info, err = grpcClient.GetContainer(username)
+		if err != nil {
+			return fmt.Errorf("container not found: %w", err)
+		}
+	} else {
+		// Local mode via Incus
+		info, err = getContainerInfoLocal(username)
+		if err != nil {
+			return err
+		}
+	}
+
+	fmt.Println("General:")
+	fmt.Printf("  Name:            %s\n", info.Name)
+	fmt.Printf("  Username:        %s\n", username)
+	fmt.Printf("  State:           %s\n", info.State)
+	fmt.Printf("  Created:         %s\n", info.CreatedAt.Format("2006-01-02 15:04:05 MST"))
+	fmt.Println()
+
+	fmt.Println("Resources:")
+	if info.CPU != "" {
+		fmt.Printf("  CPU Limit:       %s cores\n", info.CPU)
+	} else {
+		fmt.Println("  CPU Limit:       unlimited")
+	}
+	if info.Memory != "" {
+		fmt.Printf("  Memory Limit:    %s\n", info.Memory)
+	} else {
+		fmt.Println("  Memory Limit:    unlimited")
+	}
+	fmt.Println()
+
+	if info.IPAddress != "" {
+		fmt.Println("Network:")
+		fmt.Printf("  IP Address:      %s\n", info.IPAddress)
+		fmt.Println()
+
+		fmt.Println("SSH Access:")
+		fmt.Printf("  Direct:          ssh %s@%s\n", username, info.IPAddress)
+		fmt.Printf("  Via ProxyJump:   ssh -J admin@<jump-server> %s@%s\n", username, info.IPAddress)
+		fmt.Println()
+	}
+
+	if showMetrics {
+		fmt.Println("Note: Detailed metrics are not yet implemented.")
+		fmt.Printf("Use 'incus info %s' for detailed resource usage.\n", containerName)
+	}
+
+	return nil
+}
