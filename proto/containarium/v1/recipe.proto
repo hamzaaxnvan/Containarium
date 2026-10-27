@@ -158,3 +158,163 @@ message GuardrailGateInput {
   // A directory under the daemon's guardrail staging root (the daemon flag
   // --guardrail-staging-root), as a clean relative path. Nothing on the
   // platform stages a dataset there yet: an operator or an out-of-band copy
+  // does (the `ship` verb is a documented gap).
+  string staging_ref = 1;
+
+  // The attestation `containarium guardrail apply` wrote for that directory.
+  GuardrailAttestation attestation = 2;
+}
+
+// ListRecipesRequest is the request to list available recipes.
+message ListRecipesRequest {}
+
+// ListRecipesResponse returns all built-in recipes.
+message ListRecipesResponse {
+  repeated Recipe recipes = 1;
+}
+
+// GetRecipeRequest fetches a single recipe definition.
+message GetRecipeRequest {
+  string id = 1;
+}
+
+// GetRecipeResponse returns a single recipe definition.
+message GetRecipeResponse {
+  Recipe recipe = 1;
+}
+
+// DeployRecipeRequest provisions a new dedicated container from a recipe.
+message DeployRecipeRequest {
+  // Recipe to deploy (e.g. "ollama").
+  string recipe_id = 1;
+
+  // Deployment / container identity (the new container is named
+  // "<name>-container", same identity scheme as `containarium create`).
+  string name = 2;
+
+  // GPU device ID for passthrough (e.g. "0" or a PCI address). Required for
+  // recipes with requires_gpu unless a GPU-capable backend is selected.
+  string gpu = 3;
+
+  // Target backend ID for placement (empty = primary backend).
+  string backend_id = 4;
+
+  // Pool selector for placement (empty = untagged backends only).
+  string pool = 5;
+
+  // Overrides for the recipe's declared parameters (by name).
+  map<string, string> parameters = 6;
+
+  // Optional overrides for the recipe's default resource limits.
+  RecipeResources resource_overrides = 7;
+
+  // Custom labels stamped on the provisioned container (forwarded to
+  // CreateContainer). Lets a control plane attribute a recipe-deployed box to
+  // a tenant/org the same way it does for a plain CreateContainer — without
+  // labels, a cloud front-end that filters containers by label can't see a
+  // recipe-deployed box. Same key/value rules as CreateContainerRequest.labels.
+  map<string, string> labels = 8;
+
+  // async runs the recipe's post_start in the background: the RPC returns as
+  // soon as the container is created (state CREATING) instead of blocking until
+  // post_start finishes. Set this when the deploy is driven over a connection
+  // with a request/idle timeout shorter than the post_start (e.g. a control
+  // plane reaching a BYOC host through a peer-proxy): a recipe that pulls a
+  // multi-GB image can exceed that timeout, which would otherwise abort the
+  // deploy mid-pull. The CLI leaves this false so a human sees post_start's
+  // result inline. The box becomes fully functional once the background
+  // post_start completes; poll the container / its workspace access to detect
+  // readiness.
+  bool async = 9;
+
+  // The dataset and attestation for a recipe with guardrail_gate set.
+  // Required for such a recipe (absent is FAILED_PRECONDITION); ignored for
+  // an ungated one. A gated recipe cannot be deployed async.
+  GuardrailGateInput guardrail_input = 10;
+}
+
+// DeployRecipeResponse is the result of a recipe deployment.
+message DeployRecipeResponse {
+  // The created container.
+  Container container = 1;
+
+  // Public URL of the first exposed port, if any.
+  string url = 2;
+
+  // Human-readable status message.
+  string message = 3;
+}
+
+// GetWorkspaceAccessRequest fetches a zero-click access URL for an
+// agent-workspace box.
+message GetWorkspaceAccessRequest {
+  // The box identity (the container is named "<name>-container"), same scheme
+  // as DeployRecipeRequest.name.
+  string name = 1;
+}
+
+// GetWorkspaceAccessResponse carries a bootstrap URL the console can load in an
+// iframe to sign the user into the in-box workspace proxy without a prompt.
+message GetWorkspaceAccessResponse {
+  // The in-box auth proxy's per-box session token.
+  string token = 1;
+
+  // Ready-to-embed bootstrap URL (https://<workspace-domain>/__ws_login?t=...);
+  // loading it sets the session cookie and redirects to the workspace UI.
+  string url = 2;
+}
+
+// RecipeService provides one-command deployment of declarative GPU/app
+// recipes onto Containarium backends.
+service RecipeService {
+  // GetWorkspaceAccess returns a zero-click bootstrap URL for an
+  // agent-workspace box: it reads the box's in-box auth token and composes the
+  // URL the console embeds to sign the user in without a prompt.
+  rpc GetWorkspaceAccess(GetWorkspaceAccessRequest) returns (GetWorkspaceAccessResponse) {
+    option (google.api.http) = {
+      get: "/v1/recipes/workspace/{name}/access"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get workspace access URL";
+      description: "Returns a zero-click bootstrap URL for an agent-workspace box, embeddable in the console to authenticate the in-box workspace UI seamlessly.";
+      tags: "Recipes";
+    };
+  }
+
+  // ListRecipes returns all available built-in recipes.
+  rpc ListRecipes(ListRecipesRequest) returns (ListRecipesResponse) {
+    option (google.api.http) = {
+      get: "/v1/recipes"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "List recipes";
+      description: "Returns all built-in recipes that can be deployed as dedicated containers.";
+      tags: "Recipes";
+    };
+  }
+
+  // GetRecipe returns a single recipe definition by ID.
+  rpc GetRecipe(GetRecipeRequest) returns (GetRecipeResponse) {
+    option (google.api.http) = {
+      get: "/v1/recipes/{id}"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get recipe";
+      description: "Returns the definition of a single recipe, including its parameters, ports, and resource defaults.";
+      tags: "Recipes";
+    };
+  }
+
+  // DeployRecipe provisions a new dedicated container from a recipe.
+  rpc DeployRecipe(DeployRecipeRequest) returns (DeployRecipeResponse) {
+    option (google.api.http) = {
+      post: "/v1/recipes/{recipe_id}/deploy"
+      body: "*"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Deploy a recipe";
+      description: "Provisions a new dedicated container (with optional GPU passthrough), runs the recipe's image inside it, and exposes the configured ports.";
+      tags: "Recipes";
+    };
+  }
+}
