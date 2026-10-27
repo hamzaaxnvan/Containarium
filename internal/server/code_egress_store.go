@@ -118,3 +118,84 @@ func NewPostgresCodingToolEgressPolicyStore(ctx context.Context, pool *pgxpool.P
 			mode INTEGER NOT NULL DEFAULT 0,
 			egress_cidrs TEXT[] NOT NULL DEFAULT '{}',
 			egress_domains TEXT[] NOT NULL DEFAULT '{}',
+			revision BIGINT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_by TEXT NOT NULL DEFAULT ''
+		);
+	`
+	if _, err := pool.Exec(ctx, schema); err != nil {
+		return nil, fmt.Errorf("init coding_tool_egress_policies schema: %w", err)
+	}
+	return &PostgresCodingToolEgressPolicyStore{pool: pool}, nil
+}
+
+func (s *PostgresCodingToolEgressPolicyStore) Set(ctx context.Context, p *pb.CodingToolEgressPolicy, updatedBy string) (*pb.CodingToolEgressPolicy, int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after a successful Commit
+
+	var prev int64
+	err = tx.QueryRow(ctx, `SELECT revision FROM coding_tool_egress_policies WHERE tenant = $1 FOR UPDATE`, p.GetTenant()).Scan(&prev)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, 0, fmt.Errorf("read previous revision: %w", err)
+	}
+
+	stored := cloneCodeEgressPolicy(p)
+	stored.UpdatedBy = updatedBy
+	var updatedAt time.Time
+	// nonNilStrings: pgx writes a nil slice as NULL, which the NOT NULL
+	// array columns reject.
+	err = tx.QueryRow(ctx, `
+		INSERT INTO coding_tool_egress_policies (tenant, mode, egress_cidrs, egress_domains, revision, updated_at, updated_by)
+		VALUES ($1, $2, $3, $4, nextval('coding_tool_egress_policy_revision_seq'), NOW(), $5)
+		ON CONFLICT (tenant) DO UPDATE SET
+			mode = EXCLUDED.mode,
+			egress_cidrs = EXCLUDED.egress_cidrs,
+			egress_domains = EXCLUDED.egress_domains,
+			revision = EXCLUDED.revision,
+			updated_at = EXCLUDED.updated_at,
+			updated_by = EXCLUDED.updated_by
+		RETURNING revision, updated_at`,
+		p.GetTenant(), int32(p.GetMode()), nonNilStrings(p.GetEgressCidrs()), nonNilStrings(p.GetEgressDomains()), updatedBy,
+	).Scan(&stored.Revision, &updatedAt)
+	if err != nil {
+		return nil, 0, fmt.Errorf("save coding-tool egress policy: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, 0, fmt.Errorf("commit: %w", err)
+	}
+	stored.UpdatedAt = timestamppb.New(updatedAt)
+	return stored, prev, nil
+}
+
+func (s *PostgresCodingToolEgressPolicyStore) Get(ctx context.Context, tenant string) (*pb.CodingToolEgressPolicy, error) {
+	p := &pb.CodingToolEgressPolicy{}
+	var mode int32
+	var updatedAt time.Time
+	err := s.pool.QueryRow(ctx, `SELECT tenant, mode, egress_cidrs, egress_domains, revision, updated_at, updated_by
+		FROM coding_tool_egress_policies WHERE tenant = $1`, tenant).
+		Scan(&p.Tenant, &mode, &p.EgressCidrs, &p.EgressDomains, &p.Revision, &updatedAt, &p.UpdatedBy)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrCodingToolEgressPolicyNotFound
+		}
+		return nil, fmt.Errorf("get coding-tool egress policy: %w", err)
+	}
+	p.Mode = pb.NetworkPolicyMode(mode)
+	p.UpdatedAt = timestamppb.New(updatedAt)
+	return p, nil
+}
+
+func (s *PostgresCodingToolEgressPolicyStore) Delete(ctx context.Context, tenant string) (int64, error) {
+	var removed int64
+	err := s.pool.QueryRow(ctx, `DELETE FROM coding_tool_egress_policies WHERE tenant = $1 RETURNING revision`, tenant).Scan(&removed)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("delete coding-tool egress policy: %w", err)
+	}
+	return removed, nil
+}
