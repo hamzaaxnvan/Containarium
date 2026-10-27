@@ -274,3 +274,95 @@ func (r *StreamsResolver) fetchIndexFromNetwork(ctx context.Context, server stri
 // TTL expires (e.g., after a release-ship workflow).
 func (r *StreamsResolver) InvalidateCache() {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cache = make(map[string]cachedIndex)
+}
+
+// collectDigests walks products whose alias list contains
+// the requested alias and gathers every sha256 across
+// every version's items. Pure-function for testability.
+//
+// Alias matching is case-insensitive and tolerates the
+// simplestreams convention of comma-separating multiple
+// aliases per product. We also tolerate the operator
+// passing either "ubuntu/24.04" or "24.04" — we accept
+// any exact match within the comma-split list, but NOT
+// substring matches (an alias entry "24.04" doesn't
+// satisfy a request for "4.04").
+func collectDigests(idx imagesIndex, alias string) []string {
+	want := strings.ToLower(strings.TrimSpace(alias))
+	seen := make(map[string]struct{})
+	var out []string
+	for _, p := range idx.Products {
+		if !productMatchesAlias(p.Aliases, want) {
+			continue
+		}
+		for _, v := range p.Versions {
+			for _, item := range v.Items {
+				digest := strings.ToLower(strings.TrimSpace(item.SHA256))
+				if digest == "" {
+					continue
+				}
+				if _, dup := seen[digest]; dup {
+					continue
+				}
+				seen[digest] = struct{}{}
+				out = append(out, digest)
+			}
+		}
+	}
+	return out
+}
+
+// productMatchesAlias returns true when `aliases` (the
+// product's comma-separated list) contains `want` as a
+// distinct entry. Whitespace + case insensitive.
+func productMatchesAlias(aliases, want string) bool {
+	for _, raw := range strings.Split(aliases, ",") {
+		if strings.ToLower(strings.TrimSpace(raw)) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// DigestMatchesSet returns true when `requested` (a
+// lowercase 64-char hex string, e.g. from an
+// `@sha256:...` reference) appears in `published`. Helper
+// for Phase B's gate; lives here so the lookup semantics
+// stay co-located with the resolver.
+//
+// We normalize both sides — leading whitespace, optional
+// "sha256:" prefix, case — so the caller can pass whatever
+// shape the operator wrote.
+func DigestMatchesSet(requested string, published []string) bool {
+	want := normalizeDigest(requested)
+	if want == "" {
+		return false
+	}
+	for _, p := range published {
+		if normalizeDigest(p) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeDigest strips "sha256:" prefix and whitespace,
+// lowercases hex. Returns "" for anything that doesn't
+// look like a 64-char hex string after normalization.
+func normalizeDigest(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "sha256:")
+	s = strings.TrimPrefix(s, "SHA256:")
+	s = strings.ToLower(s)
+	if len(s) != 64 {
+		return ""
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return ""
+		}
+	}
+	return s
+}
