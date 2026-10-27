@@ -126,3 +126,46 @@ func (c *Client) CreateConnection(authToken string, config ConnectionConfig) (st
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("guacamole create connection failed (status %d): %s", resp.StatusCode, respBody)
+	}
+
+	var connResp connectionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&connResp); err != nil {
+		return "", fmt.Errorf("failed to decode connection response: %w", err)
+	}
+
+	return connResp.Identifier, nil
+}
+
+// DeleteConnection removes a connection from Guacamole.
+func (c *Client) DeleteConnection(authToken, connectionID string) error {
+	reqURL := fmt.Sprintf("%s/api/session/data/postgresql/connections/%s?token=%s", c.baseURL, connectionID, authToken)
+	req, err := http.NewRequest(http.MethodDelete, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create delete request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("guacamole delete connection failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("guacamole delete connection failed (status %d): %s", resp.StatusCode, body)
+	}
+
+	return nil
+}
+
+// GetConnectionURL returns the Guacamole client URL for a given connection ID.
+// The returned path is relative to the Guacamole base URL.
+func GetConnectionURL(connectionID string) string {
+	// Guacamole client URL format: /#/client/{base64-encoded-id}
+	// The connection identifier for PostgreSQL datasource is: {id}\0c\0postgresql
+	// Base64-encoded for URL embedding
+	return fmt.Sprintf("/#/client/%s", connectionID)
+}

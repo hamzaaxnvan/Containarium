@@ -61,3 +61,35 @@ func nicACLKeys() map[string]string {
 func (m *Manager) applyEgressGuard(boxName string) error {
 	desired := egressACL()
 	if _, err := m.acls.GetNetworkACL(desired.Name); err != nil {
+		// Any read failure is treated as absent; a create against an ACL
+		// that does exist fails loudly rather than silently reusing
+		// yesterday's rules.
+		if cerr := m.acls.CreateNetworkACL(desired); cerr != nil {
+			return fmt.Errorf("create acl %s: %w", desired.Name, cerr)
+		}
+	} else if err := m.acls.UpdateNetworkACL(desired.Name, desired); err != nil {
+		return fmt.Errorf("update acl %s: %w", desired.Name, err)
+	}
+	if err := m.acls.EnsureNICDevice(boxName, incus.NICDevice{Name: m.cfg.NICDevice, Network: m.cfg.Bridge}); err != nil {
+		return fmt.Errorf("nic device: %w", err)
+	}
+	if err := m.acls.SetDeviceConfig(boxName, m.cfg.NICDevice, nicACLKeys()); err != nil {
+		return fmt.Errorf("nic acl keys: %w", err)
+	}
+	return nil
+}
+
+// liftEgressGuard detaches the anon ACL from the box's NIC and clears the
+// default-action keys so the NIC falls back to Incus's defaults (allow) —
+// what a claimed box on the tenant's plan gets (#2199). Clearing a device
+// key is setting it to "", which SetDeviceConfig merges like any other.
+func (m *Manager) liftEgressGuard(boxName string) error {
+	keys := map[string]string{}
+	for k := range nicACLKeys() {
+		keys[k] = ""
+	}
+	if err := m.acls.SetDeviceConfig(boxName, m.cfg.NICDevice, keys); err != nil {
+		return fmt.Errorf("nic acl keys: %w", err)
+	}
+	return nil
+}
