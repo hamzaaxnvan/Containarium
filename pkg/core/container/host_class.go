@@ -46,3 +46,35 @@ const (
 func getHostClass() hostClass {
 	hostClassOnce.Do(func() {
 		hostClassResult = hostClassDetector()
+	})
+	return hostClassResult
+}
+
+// isGCPHost reports whether this daemon is running on a GCP VM.
+// Use it to gate code that talks to GCP-specific services
+// (google-guest-agent, OS Login, the metadata server's user feed).
+func isGCPHost() bool {
+	return getHostClass() == hostClassGCP
+}
+
+// detectHostClassViaSystemd asks systemd-detect-virt what we're on.
+// On GCP that returns "gcp"; KVM/AWS/Azure return their own strings;
+// VirtualBox returns "oracle"; bare metal returns "none". Anything
+// other than "gcp" is treated as "not GCP" — we can extend the enum
+// if other platforms grow their own special-cased code paths.
+//
+// systemd-detect-virt is in systemd-tools / systemd-container / the
+// base systemd package on every host we currently support. If it's
+// missing (very old / minimal containers), we treat that as unknown
+// rather than crashing — the gated code paths fall back to
+// generic behavior, which is the safe default.
+func detectHostClassViaSystemd() hostClass {
+	out, err := exec.Command("systemd-detect-virt").Output()
+	if err != nil {
+		return hostClassUnknown
+	}
+	if strings.TrimSpace(string(out)) == "gcp" {
+		return hostClassGCP
+	}
+	return hostClassUnknown
+}
