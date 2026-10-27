@@ -116,3 +116,122 @@ type ClaimResult struct {
 // actually posted the comment would let anyone force a false
 // ALREADY_CLAIMED. Every genuine claim/yield — even one made through a
 // DIFFERENT daemon instance — shares this same identity, since every
+// daemon for a given connection posts through the same one broker-only
+// credential.
+func ClaimTrackerIssue(ctx context.Context, provider WriterProvider, conn Conn, number int64, id Identity, resolver RunResolver, clock Clock, staleAfter time.Duration) (ClaimResult, error) {
+	if staleAfter <= 0 {
+		staleAfter = DefaultStaleAfter
+	}
+
+	brokerAuthor, err := provider.WhoAmI(ctx, conn)
+	if err != nil {
+		return ClaimResult{}, fmt.Errorf("resolve broker identity: %w", err)
+	}
+
+	issue, err := provider.GetIssue(ctx, conn, number)
+	if err != nil {
+		return ClaimResult{}, fmt.Errorf("read issue: %w", err)
+	}
+
+	if holder, when, found := latestClaim(issue.Comments, brokerAuthor); found {
+		if holder == id.RunID {
+			return ClaimResult{Claimed: true}, nil // idempotent re-claim
+		}
+		if resolver.Live(holder) || clock.Now().Sub(when) < staleAfter {
+			return ClaimResult{AlreadyClaimedByRunID: holder}, nil
+		}
+		// Stale and not live: fall through and take over.
+	}
+
+	myClaim, err := provider.Comment(ctx, conn, number, Stamp(id, KindClaim))
+	if err != nil {
+		return ClaimResult{}, fmt.Errorf("post claim: %w", err)
+	}
+
+	assigned, err := provider.AssignIfUnassigned(ctx, conn, number)
+	if err != nil {
+		return ClaimResult{}, fmt.Errorf("assign after claim: %w", err)
+	}
+
+	reread, err := provider.GetIssue(ctx, conn, number)
+	if err != nil {
+		return ClaimResult{}, fmt.Errorf("re-read after claim: %w", err)
+	}
+	if holder, when, found := earliestForeignClaimBefore(reread.Comments, id.RunID, myClaim.CreatedAt, brokerAuthor); found {
+		if resolver.Live(holder) || clock.Now().Sub(when) < staleAfter {
+			// KindYield, not KindComment: this marks id.RunID's own
+			// just-posted claim (above) as superseded, so a LATER call's
+			// latestClaim scan — which otherwise finds the newest
+			// kind=claim marker regardless of who actually won — never
+			// mistakes this run's losing claim for the current holder.
+			yield := fmt.Sprintf("Yielding to an earlier claim by %s.\n\n%s", holder, Stamp(id, KindYield))
+			_, _ = provider.Comment(ctx, conn, number, yield) // best-effort
+			return ClaimResult{AlreadyClaimedByRunID: holder}, nil
+		}
+	}
+
+	return ClaimResult{Claimed: true, Assigned: assigned}, nil
+}
+
+// latestClaim scans comments (oldest-first, as both providers return
+// them) for the newest kind=claim marker NOT superseded by that same
+// run's own later kind=yield marker — considering ONLY comments
+// authored by brokerAuthor (the connection's own credential identity;
+// see ClaimTrackerIssue's doc comment on why unauthenticated markers
+// must never be trusted).
+//
+// A losing run's claim comment is never retracted or edited — it stays
+// in the comment history exactly as posted, chronologically AFTER the
+// winning claim it lost to. Scanning purely for "newest kind=claim"
+// would therefore hand a losing run's stale claim back as the current
+// holder on every call after the race resolved (caught in review on
+// #1924 — see docs/architecture/agent-tracker-broker.md's discussion).
+// Scanning backward and tracking which run IDs have since posted a
+// kind=yield skips exactly those superseded claims, so a run that lost
+// a race is never mistaken for the holder again — including by itself,
+// which is what makes its own idempotent re-claim check safe.
+func latestClaim(comments []Comment, brokerAuthor string) (holder string, when time.Time, found bool) {
+	voided := make(map[string]bool)
+	for i := len(comments) - 1; i >= 0; i-- {
+		if comments[i].Author != brokerAuthor {
+			continue
+		}
+		runID, _, kind, ok := ParseMarker(comments[i].Body)
+		if !ok {
+			continue
+		}
+		switch kind {
+		case KindYield:
+			voided[runID] = true
+		case KindClaim:
+			if voided[runID] {
+				continue
+			}
+			return runID, comments[i].CreatedAt, true
+		}
+	}
+	return "", time.Time{}, false
+}
+
+// earliestForeignClaimBefore finds the first (oldest) kind=claim
+// marker — authored by brokerAuthor, same reasoning as latestClaim —
+// from a run other than myRunID whose comment predates "before" — the
+// timestamp of the claim this call just posted. Used only by the
+// post-claim re-read: a foreign claim satisfying this arrived in the
+// race window between this call's initial read and its own post, and
+// — being earlier — is the one that should win.
+func earliestForeignClaimBefore(comments []Comment, myRunID string, before time.Time, brokerAuthor string) (holder string, when time.Time, found bool) {
+	for _, c := range comments {
+		if c.Author != brokerAuthor {
+			continue
+		}
+		runID, _, kind, ok := ParseMarker(c.Body)
+		if !ok || kind != KindClaim || runID == myRunID {
+			continue
+		}
+		if c.CreatedAt.Before(before) {
+			return runID, c.CreatedAt, true
+		}
+	}
+	return "", time.Time{}, false
+}
