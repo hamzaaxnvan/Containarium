@@ -173,3 +173,354 @@ func (m *Manager) abandon(name string, cause error) error {
 	if err := m.DeleteVM(name); err != nil {
 		log.Printf("[cluster] %s failed to provision (%v) and could not be removed (%v); "+
 			"it will not be retried while the instance exists", name, cause, err)
+	}
+	return cause
+}
+
+// ErrNodePasswordNotCleared reports that a node's instance was removed
+// but the control plane still holds its node-password secret.
+//
+// It is deliberately distinct from a removal failure: the node IS
+// gone, so the caller must not retry the deletion, but the residue is
+// not harmless — the next node to take that name can never join. A
+// caller that only logs this re-arms #1498 from a single flaky exec,
+// so callers are expected to record it where operators look.
+var ErrNodePasswordNotCleared = errors.New("node-password secret not cleared")
+
+// NodePasswordSecret is the secret k3s stores per node in kube-system
+// and checks on every join. Deleting the Kubernetes Node object does
+// not remove it, so a node name that is released and reused is
+// refused forever unless it is cleared (#1498).
+func NodePasswordSecret(node string) string { return node + ".node-password.k3s" }
+
+// ForgetNode removes a worker node AND the control plane's memory of
+// it: the instance, then the k3s node-password secret that would
+// otherwise refuse any future node of the same name.
+//
+// Why the secret matters. k3s writes `<node>.node-password.k3s` into
+// kube-system on first join and compares it on every subsequent one.
+// cluster-autoscaler deletes the Kubernetes Node; we delete the
+// instance; neither touches that secret. Node names are derived from
+// the group and an index, so a released name comes back — and when it
+// does the new agent generates a fresh password, the stored hash does
+// not match, and the control plane answers 403 indefinitely:
+//
+//	unable to verify password for node <name>: hash does not match
+//
+// The node never registers, so it is invisible to kubectl and absent
+// from `cluster status` while consuming its full size (#1498, run 21:
+// 19 minutes of retries at ~8s intervals).
+//
+// Order is deliberate: the instance goes FIRST. A running agent
+// re-creates the secret on its next request, so clearing it while the
+// node still runs would simply leave a fresh stale password behind.
+//
+// A control plane that cannot be reached does NOT fail the removal.
+// The instance is already gone; returning an error would have the
+// autoscaler retry a deletion that has nothing left to delete. The
+// stale secret is real, so it is logged rather than swallowed.
+func (m *Manager) ForgetNode(tenant, clusterName, vmName string) error {
+	if err := m.DeleteVM(vmName); err != nil {
+		return err
+	}
+	cp := CPName(tenant, clusterName)
+	if _, err := m.host.Exec(cp, []string{
+		K3sBinaryPath, "kubectl", "delete", "secret",
+		NodePasswordSecret(vmName), "-n", "kube-system", "--ignore-not-found",
+	}); err != nil {
+		log.Printf("[cluster] %s deleted, but its node-password secret could not be cleared on %s: %v; "+
+			"a future node named %s will be refused with \"hash does not match\" until it is removed",
+			vmName, cp, err, vmName)
+		return fmt.Errorf("%w on %s: %v", ErrNodePasswordNotCleared, cp, err)
+	}
+	return nil
+}
+
+const bootstrapScriptPath = "/root/containarium-bootstrap.sh"
+
+// pushFile writes a file into a node, creating its parent directory
+// first. Incus answers "Not Found" when the parent is missing, and
+// none of the directories the cluster flow writes into
+// (/etc/containarium, its ca/ subdir, k3s's manifests dir) exist in a
+// fresh node image — so every push failed until the parent was made
+// (#1442). mkdir -p is idempotent, so this is safe on the paths whose
+// parent already exists.
+func (m *Manager) pushFile(name, path string, content []byte, mode string) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "/" && dir != "." {
+		if _, err := m.host.Exec(name, []string{"mkdir", "-p", dir}); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
+	}
+	return m.host.Push(name, path, content, mode)
+}
+
+// observedNodeCapacity asks a BOOTED node what it observes as its own
+// capacity, by reading the two files cadvisor derives node capacity
+// from inside the node itself.
+//
+// This vantage point is the whole correction of #1466. The daemon
+// host's /proc cannot answer the question: on a plain Incus host
+// lxcfs masks these files and the node sees its real limits, while on
+// a nested host masking does not reach the inner instance and the node
+// sees the outer host. The two are indistinguishable from outside, and
+// guessing wrong in either direction has already shipped a bug —
+// #1456 (reservation applied where none was needed; kubelet refused to
+// start) and #1466 (no reservation where one was needed; autoscaling
+// silently disabled).
+func (m *Manager) observedNodeCapacity(name string) (int, int64, error) {
+	cpuinfo, err := m.host.Exec(name, []string{"cat", ProcCPUInfoPath})
+	if err != nil {
+		return 0, 0, fmt.Errorf("read %s on %s: %w", ProcCPUInfoPath, name, err)
+	}
+	meminfo, err := m.host.Exec(name, []string{"cat", ProcMemInfoPath})
+	if err != nil {
+		return 0, 0, fmt.Errorf("read %s on %s: %w", ProcMemInfoPath, name, err)
+	}
+	return ParseProcCapacity(cpuinfo, meminfo)
+}
+
+// containerKubeletArgs assembles the kubelet flags a container-class
+// node needs, given what that node — already booted — reports about
+// itself.
+//
+// Two flags, for two different failures:
+//
+//   - The user-namespace gate (#1452), always. kubelet writes kernel
+//     sysctls an unprivileged container may not touch, and without the
+//     gate ContainerManager never starts.
+//   - A reservation, ONLY when the node actually misreports (#1466).
+//     Allocatable = capacity - reserved, and both the scheduler and
+//     cluster-autoscaler's fit simulation read allocatable; a node
+//     advertising the outer host's 8 cpu instead of its own 2 gets
+//     packed with pods it cannot run and never triggers the scale-up
+//     that should have happened.
+//
+// The trigger is what took three attempts to get right. #1452 computed
+// the reservation from (daemon host capacity - requested size) and
+// applied it unconditionally, on the premise that a container node
+// always reports the host's capacity. That premise holds only on a
+// NESTED host. On a plain host the node sees its real limit, the
+// reservation exceeded the node's entire capacity, and kubelet refused
+// to start ("capacity >= reservation") — so the correction meant to
+// make allocatable truthful stopped the node running at all (#1456,
+// removed in #1457). Asking the node is the only thing that
+// distinguishes the two, so that is what this does.
+//
+// A zero reservation renders no flags: where the node already observes
+// its own size the stock kubelet is correct.
+func (m *Manager) containerKubeletArgs(iso Isolation, spec NodeSpec) ([]string, error) {
+	if iso != IsolationContainer {
+		return nil, nil
+	}
+	cpu, mem, err := m.observedNodeCapacity(spec.Name)
+	if err != nil {
+		// Fail closed. An unmeasurable node is not a node that
+		// observes itself correctly — proceeding without a
+		// reservation is precisely the silent failure #1466 exists to
+		// end, and it would leave no trace anywhere.
+		return nil, fmt.Errorf(
+			"cannot establish %s's observed capacity, so its allocatable cannot be made truthful: %w",
+			spec.Name, err)
+	}
+	reserved, err := NodeReservation(cpu, mem, spec)
+	if err != nil {
+		return nil, fmt.Errorf("node %s: %w", spec.Name, err)
+	}
+	return ContainerKubeletArgs(KubeletReservedArgs(reserved)), nil
+}
+
+// ProvisionCP creates and bootstraps the control-plane VM: create →
+// start → wait → push pinned binary + rendered script → exec. Returns
+// the VM's IP (workers join over it). cpSize is the smallest preset —
+// the control plane is platform overhead, not tenant capacity.
+func (m *Manager) ProvisionCP(tenant, clusterName string, iso Isolation, cpSize DesiredGroup, tlsSANs []string) (string, error) {
+	name := CPName(tenant, clusterName)
+	spec := NodeSpec{
+		Name: name, CPU: cpSize.CPU, Memory: cpSize.Memory, Disk: cpSize.Disk,
+		Labels: VMLabels(tenant, clusterName, RoleControlPlane, ""),
+	}
+	if err := m.host.CreateNode(spec, iso); err != nil {
+		return "", fmt.Errorf("create control-plane node: %w", err)
+	}
+	ip, err := m.host.WaitReady(name, m.waitReadyTimeout)
+	if err != nil {
+		return "", m.abandon(name, fmt.Errorf("control-plane VM %s not ready: %w", name, err))
+	}
+	bin, err := m.k3sBinary()
+	if err != nil {
+		return "", m.abandon(name, err)
+	}
+	if err := m.pushFile(name, K3sBinaryPath, bin, "0755"); err != nil {
+		return "", m.abandon(name, fmt.Errorf("push k3s binary: %w", err))
+	}
+	kubeletArgs, err := m.containerKubeletArgs(iso, spec)
+	if err != nil {
+		return "", m.abandon(name, fmt.Errorf("control-plane kubelet args: %w", err))
+	}
+	script := RenderServerScript(ServerBootstrap{
+		TLSSANs:     append([]string{ip}, tlsSANs...),
+		Isolation:   iso,
+		KubeletArgs: kubeletArgs,
+	})
+	if err := m.pushFile(name, bootstrapScriptPath, []byte(script), "0755"); err != nil {
+		return "", m.abandon(name, fmt.Errorf("push bootstrap script: %w", err))
+	}
+	if _, err := m.host.Exec(name, []string{"sh", bootstrapScriptPath}); err != nil {
+		return "", m.abandon(name, fmt.Errorf("control-plane bootstrap: %w", err))
+	}
+	return ip, nil
+}
+
+// ProvisionWorker creates and joins one worker VM to a running control
+// plane. The join token is read from the CP and pushed 0600 — it never
+// leaves the host or lands in a store.
+func (m *Manager) ProvisionWorker(tenant, clusterName string, iso Isolation, g DesiredGroup, vmName, cpIP string) error {
+	cp := CPName(tenant, clusterName)
+	token, err := m.host.Read(cp, NodeTokenPath)
+	if err != nil {
+		return fmt.Errorf("read join token from %s: %w", cp, err)
+	}
+	spec := NodeSpec{
+		Name: vmName, CPU: g.CPU, Memory: g.Memory, Disk: g.Disk,
+		Labels: VMLabels(tenant, clusterName, RoleWorker, g.Name),
+	}
+	// Container nodes read the host's /proc as their own capacity, so
+	// a host too small for this size would produce a node advertising
+	// resources it does not have (#1439). Refuse before creating it:
+	// the scheduler and the autoscaler's fit simulation both trust
+	// node allocatable, so the lie is not locally contained. VM nodes
+	// get their own kernel and report honestly, so they skip this.
+	if iso == IsolationContainer {
+		if err := m.host.NodeCapacityCapable(spec); err != nil {
+			return fmt.Errorf("worker node capacity: %w", err)
+		}
+	}
+	if err := m.host.CreateNode(spec, iso); err != nil {
+		return fmt.Errorf("create worker node: %w", err)
+	}
+	if _, err := m.host.WaitReady(vmName, m.waitReadyTimeout); err != nil {
+		return m.abandon(vmName, fmt.Errorf("worker VM %s not ready: %w", vmName, err))
+	}
+	bin, err := m.k3sBinary()
+	if err != nil {
+		return err
+	}
+	if err := m.pushFile(vmName, K3sBinaryPath, bin, "0755"); err != nil {
+		return m.abandon(vmName, fmt.Errorf("push k3s binary: %w", err))
+	}
+	if err := m.pushFile(vmName, AgentTokenPath, token, "0600"); err != nil {
+		return m.abandon(vmName, fmt.Errorf("push join token: %w", err))
+	}
+	// A container-class worker cannot derive its own containerd
+	// template: k3s agent writes config.toml only after retrieving
+	// configuration from the server, so waiting for it in the bootstrap
+	// blocks on something downstream of the startup being blocked
+	// (#1448). Derive from the control plane's generated config — same
+	// pinned k3s version, same base shape — and push it before boot.
+	if iso == IsolationContainer {
+		generated, err := m.host.Read(cp, ContainerdGeneratedConfigPath)
+		if err != nil {
+			return m.abandon(vmName, fmt.Errorf("read containerd config from %s: %w", cp, err))
+		}
+		tmpl, err := DeriveContainerdTemplate(generated)
+		if err != nil {
+			return m.abandon(vmName, fmt.Errorf("derive containerd template: %w", err))
+		}
+		if err := m.pushFile(vmName, ContainerdConfigTemplatePath, tmpl, "0644"); err != nil {
+			return m.abandon(vmName, fmt.Errorf("push containerd template: %w", err))
+		}
+	}
+	kubeletArgs, err := m.containerKubeletArgs(iso, spec)
+	if err != nil {
+		return m.abandon(vmName, fmt.Errorf("worker kubelet args: %w", err))
+	}
+	script := RenderAgentScript(AgentBootstrap{
+		ServerURL:   "https://" + cpIP + ":6443",
+		Isolation:   iso,
+		KubeletArgs: kubeletArgs,
+	})
+	if err := m.pushFile(vmName, bootstrapScriptPath, []byte(script), "0755"); err != nil {
+		return m.abandon(vmName, fmt.Errorf("push bootstrap script: %w", err))
+	}
+	if _, err := m.host.Exec(vmName, []string{"sh", bootstrapScriptPath}); err != nil {
+		return m.abandon(vmName, fmt.Errorf("worker bootstrap: %w", err))
+	}
+	return nil
+}
+
+// Kubeconfig reads the CP's admin kubeconfig on demand and rewrites
+// its server URL to the published endpoint. Never persisted.
+func (m *Manager) Kubeconfig(tenant, clusterName, endpoint string) (string, error) {
+	raw, err := m.host.Read(CPName(tenant, clusterName), KubeconfigPath)
+	if err != nil {
+		return "", fmt.Errorf("read kubeconfig: %w", err)
+	}
+	kc := string(raw)
+	if endpoint != "" {
+		kc = RewriteKubeconfigServer(kc, endpoint)
+	}
+	return kc, nil
+}
+
+// CPIP returns the control-plane VM's current IP.
+func (m *Manager) CPIP(tenant, clusterName string) (string, error) {
+	return m.host.WaitReady(CPName(tenant, clusterName), 30*time.Second)
+}
+
+// ReadyNodes counts Ready nodes as the cluster's own API reports them,
+// via `k3s kubectl` on the CP — observed state from the cluster, not
+// from our rows.
+func (m *Manager) ReadyNodes(tenant, clusterName string) (int, error) {
+	out, err := m.host.Exec(CPName(tenant, clusterName),
+		[]string{K3sBinaryPath, "kubectl", "get", "nodes", "--no-headers"})
+	if err != nil {
+		return 0, fmt.Errorf("kubectl get nodes: %w", err)
+	}
+	ready := 0
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == "Ready" {
+			ready++
+		}
+	}
+	return ready, nil
+}
+
+// CACredentials is the per-cluster mTLS client credential the CA unit
+// presents to the daemon's provider listener.
+type CACredentials struct {
+	ClientCertPEM []byte
+	ClientKeyPEM  []byte
+	CACertPEM     []byte
+}
+
+// DeployCA installs the cluster-autoscaler onto a provisioned control
+// plane: credential files (key 0600), the externalgrpc cloud-config,
+// and the digest-pinned unit. Idempotent — re-running replaces the
+// files and re-enables the unit.
+func (m *Manager) DeployCA(tenant, clusterName string, d CADeploy, creds CACredentials) error {
+	cp := CPName(tenant, clusterName)
+	files := []struct {
+		path    string
+		content []byte
+		mode    string
+	}{
+		{CAClientCertPath, creds.ClientCertPEM, "0644"},
+		{CAClientKeyPath, creds.ClientKeyPEM, "0600"},
+		{CACACertPath, creds.CACertPEM, "0644"},
+		{CACloudConfigPath, []byte(RenderCACloudConfig(d)), "0644"},
+	}
+	for _, f := range files {
+		if err := m.pushFile(cp, f.path, f.content, f.mode); err != nil {
+			return fmt.Errorf("push %s: %w", f.path, err)
+		}
+	}
+	script := RenderCAUnitScript(d)
+	if err := m.pushFile(cp, "/root/containarium-ca-bootstrap.sh", []byte(script), "0755"); err != nil {
+		return fmt.Errorf("push CA bootstrap: %w", err)
+	}
+	if _, err := m.host.Exec(cp, []string{"sh", "/root/containarium-ca-bootstrap.sh"}); err != nil {
+		return fmt.Errorf("CA bootstrap: %w", err)
+	}
+	return nil
+}
