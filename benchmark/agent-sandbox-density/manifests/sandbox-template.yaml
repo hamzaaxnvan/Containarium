@@ -15,3 +15,21 @@ kind: Sandbox
 metadata:
   name: __NAME__
   namespace: sandbox-density-bench
+  labels:
+    benchmark: agent-sandbox-density
+spec:
+  podTemplate:
+    spec:
+      runtimeClassName: __GVISOR_RUNTIME_CLASS__
+      containers:
+        - name: sandbox
+          image: busybox:1.36
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "__SANDBOX_CPU_REQUEST__"
+              memory: "__SANDBOX_MEM_REQUEST__"
+            limits:
+              cpu: "__SANDBOX_CPU_LIMIT__"
+              memory: "__SANDBOX_MEM_LIMIT__"
+      restartPolicy: Never
