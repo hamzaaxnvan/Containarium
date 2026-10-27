@@ -45,3 +45,19 @@ type ThreatDetect struct {
 	// (EnvThreatDenyBurstCountLogOnly). Default false: enforced drops only.
 	DenyBurstCountLogOnly bool
 	// WebhookRenotify is the re-delivery interval for a finding that stays
+	// open (EnvThreatWebhookRenotifyMinutes). Zero means the default.
+	WebhookRenotify time.Duration
+}
+
+// LoadThreatDetect reads the CONTAINARIUM_THREAT_* namespace once, using the
+// shared truthy convention (1/true/yes/on) for the enable flag.
+func LoadThreatDetect() ThreatDetect {
+	return ThreatDetect{
+		SentryEnabled:   getBool(EnvThreatSentry),
+		DenyBurstN:      getInt(EnvThreatDenyBurstN, 0),
+		DenyBurstWindow: time.Duration(getInt(EnvThreatDenyBurstWindowMinutes, 0)) * time.Minute,
+
+		DenyBurstCountLogOnly: getBool(EnvThreatDenyBurstCountLogOnly),
+		WebhookRenotify:       time.Duration(getInt(EnvThreatWebhookRenotifyMinutes, 0)) * time.Minute,
+	}
+}
