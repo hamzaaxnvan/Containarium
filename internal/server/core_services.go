@@ -843,3 +843,848 @@ WantedBy=multi-user.target
 // reconcileCaddyDNSEnv (below) to keep credentials in sync, but never
 // re-ran setupCaddy/verifyCaddyModules, so an operator switching DNS-01
 // providers on a host whose Caddy binary came from the xcaddy
+// source-build fallback (buildCaddyFromSource only bakes in the
+// provider configured AT BUILD TIME) would get a binary silently
+// missing the new provider's module — reconcileCaddyDNSEnv would still
+// happily restart Caddy with the new provider's env var set, pointed at
+// a binary that can't use it.
+//
+// Only ever reinstalls something for that source-build case: the
+// prebuilt release binary (#1617's default path) bakes in every known
+// provider, so verifyCaddyModules always passes for it and this is a
+// cheap `caddy list-modules` no-op on every normal EnsureCaddy call —
+// it does not turn every daemon restart into a Caddy reinstall+restart.
+func (cs *CoreServices) ensureCaddyModules(ctx context.Context, baseDomain string) error {
+	if err := cs.verifyCaddyModules(); err == nil {
+		return nil
+	}
+	log.Printf("Installed Caddy binary is missing the configured DNS-01 provider's module; reinstalling...")
+	return cs.setupCaddy(ctx, baseDomain)
+}
+
+// reconcileCaddyDNSEnv keeps an ALREADY-provisioned core-caddy container's
+// systemd Environment= lines in sync with the daemon's current DNS-01
+// provider config. setupCaddy only runs once, at container creation (or
+// when ensureCaddyModules above reinstalls it) — an operator who sets (or
+// rotates) CONTAINARIUM_ACME_DNS_PROVIDER on a host whose Caddy container
+// already exists would otherwise never see it reach Caddy at all. This is
+// the exact incident #1597 traced: a credential "believed set" for five
+// weeks, silently never wired through.
+//
+// Only writes and restarts when the rendered unit actually changed — the
+// common case, every daemon startup, is a ReadFile and a string compare.
+// Called from both of EnsureCaddy's "container already exists" paths.
+func (cs *CoreServices) reconcileCaddyDNSEnv() {
+	present := resolveDNSProviderCredential()
+	desired := caddyServiceUnit(present)
+	if current, err := cs.incusClient.ReadFile(CoreCaddyContainer, "/etc/systemd/system/caddy.service"); err == nil && string(current) == desired {
+		return
+	}
+
+	if err := cs.incusClient.WriteFile(CoreCaddyContainer, "/etc/systemd/system/caddy.service", []byte(desired), "0644"); err != nil {
+		log.Printf("Warning: failed to update caddy.service with current DNS-01 provider credentials: %v", err)
+		return
+	}
+	if err := cs.incusClient.Exec(CoreCaddyContainer, []string{"systemctl", "daemon-reload"}); err != nil {
+		log.Printf("Warning: systemctl daemon-reload failed: %v", err)
+	}
+	if err := cs.incusClient.Exec(CoreCaddyContainer, []string{"systemctl", "restart", "caddy"}); err != nil {
+		log.Printf("Warning: failed to restart caddy after updating DNS-01 provider credentials: %v", err)
+		return
+	}
+	log.Printf("caddy.service DNS-01 provider credentials changed; reloaded and restarted")
+}
+
+// getCaddyAdminURL returns the Caddy admin API URL
+func (cs *CoreServices) getCaddyAdminURL() string {
+	return fmt.Sprintf("http://%s:%d", cs.caddyIP, DefaultCaddyAdminPort)
+}
+
+// GetCaddyIP returns the Caddy container IP
+func (cs *CoreServices) GetCaddyIP() string {
+	return cs.caddyIP
+}
+
+// updateGrafanaDashboard re-writes the dashboard JSON to pick up new panels on daemon restart.
+func (cs *CoreServices) updateGrafanaDashboard() {
+	if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/var/lib/grafana/dashboards/overview.json", []byte(OverviewDashboard), "0644"); err != nil {
+		log.Printf("Warning: failed to update Grafana dashboard: %v", err)
+	} else {
+		log.Printf("Grafana dashboard updated")
+	}
+}
+
+// EnsureVictoriaMetrics ensures the Victoria Metrics + Grafana container is running
+func (cs *CoreServices) EnsureVictoriaMetrics(ctx context.Context, postgresIP string) (string, error) {
+	// Reserve 2GB so metrics/alerts keep flowing even when pool is full
+	cs.ensureCoreReservation(CoreVictoriaMetricsContainer, "2G")
+
+	// Check if container already exists
+	info, err := cs.incusClient.GetContainer(CoreVictoriaMetricsContainer)
+	if err == nil {
+		// Backfill role label and boot priority
+		cs.backfillConfig(CoreVictoriaMetricsContainer, incus.RoleVictoriaMetrics, "80")
+
+		// Container exists
+		if info.State == "Running" {
+			cs.victoriaMetricsIP = info.IPAddress
+			log.Printf("VictoriaMetrics container already running at %s", cs.victoriaMetricsIP)
+			// Close anonymous dashboard access on hosts provisioned before
+			// the template turned it off (#2079); no-op once converged.
+			cs.backfillGrafanaAnonymous()
+			// Keep Grafana's database password equal to the daemon's (#2091);
+			// no-op once converged, and only written when it actually connects.
+			cs.backfillGrafanaDBPassword()
+			// Always re-provision the Grafana dashboard to pick up new panels
+			cs.updateGrafanaDashboard()
+			return cs.victoriaMetricsIP, nil
+		}
+		// Container exists but not running, start it
+		log.Printf("Starting existing VictoriaMetrics container...")
+		if err := cs.incusClient.StartContainer(CoreVictoriaMetricsContainer); err != nil {
+			return "", fmt.Errorf("failed to start victoriametrics container: %w", err)
+		}
+		ip, err := cs.incusClient.WaitForNetwork(CoreVictoriaMetricsContainer, 60*time.Second)
+		if err != nil {
+			return "", fmt.Errorf("failed to get victoriametrics IP: %w", err)
+		}
+		cs.victoriaMetricsIP = ip
+		// Wait for services
+		if err := cs.waitForVictoriaMetrics(ctx); err != nil {
+			return "", err
+		}
+		cs.backfillGrafanaAnonymous()
+		cs.backfillGrafanaDBPassword()
+		cs.updateGrafanaDashboard()
+		return cs.victoriaMetricsIP, nil
+	}
+
+	// Container doesn't exist, create it
+	log.Printf("Creating VictoriaMetrics + Grafana container...")
+
+	config := incus.ContainerConfig{
+		Name:      CoreVictoriaMetricsContainer,
+		Image:     "images:ubuntu/24.04",
+		CPU:       "1",
+		Memory:    "1GB",
+		AutoStart: true,
+		Disk: &incus.DiskDevice{
+			Path: "/",
+			Pool: cs.incusClient.StoragePool(),
+			Size: "10GB",
+		},
+	}
+
+	cs.pinCoreIP(&config, CoreVictoriaMetricsContainer)
+
+	if err := cs.incusClient.CreateContainer(config); err != nil {
+		return "", fmt.Errorf("failed to create victoriametrics container: %w", err)
+	}
+
+	// Set role label and boot priority
+	cs.setContainerConfigBestEffort(CoreVictoriaMetricsContainer, incus.RoleKey, string(incus.RoleVictoriaMetrics))
+	cs.setContainerConfigBestEffort(CoreVictoriaMetricsContainer, "boot.autostart", "true")
+	cs.setContainerConfigBestEffort(CoreVictoriaMetricsContainer, "boot.autostart.priority", "80")
+
+	// Start container
+	if err := cs.incusClient.StartContainer(CoreVictoriaMetricsContainer); err != nil {
+		return "", fmt.Errorf("failed to start victoriametrics container: %w", err)
+	}
+
+	// Wait for network
+	ip, err := cs.incusClient.WaitForNetwork(CoreVictoriaMetricsContainer, 60*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("failed to get victoriametrics IP: %w", err)
+	}
+	cs.victoriaMetricsIP = ip
+	log.Printf("VictoriaMetrics container IP: %s", cs.victoriaMetricsIP)
+
+	// Install and configure Victoria Metrics + Grafana
+	if err := cs.setupVictoriaMetrics(ctx, postgresIP); err != nil {
+		return "", fmt.Errorf("failed to setup victoriametrics: %w", err)
+	}
+
+	// Apply base scripts (timezone, clamav) — best-effort
+	cs.applyBaseScripts(CoreVictoriaMetricsContainer, "ubuntu")
+
+	return cs.victoriaMetricsIP, nil
+}
+
+// setupVictoriaMetrics installs Victoria Metrics and Grafana in the container
+func (cs *CoreServices) setupVictoriaMetrics(ctx context.Context, postgresIP string) error {
+	log.Printf("Installing Victoria Metrics + Grafana...")
+
+	// Wait for apt to be available
+	time.Sleep(5 * time.Second)
+
+	// Install prerequisites
+	commands := [][]string{
+		{"apt-get", "update"},
+		{"apt-get", "install", "-y", "curl", "wget", "apt-transport-https", "software-properties-common", "gnupg"},
+	}
+
+	for _, cmd := range commands {
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, cmd); err != nil {
+			return fmt.Errorf("failed to run %v: %w", cmd, err)
+		}
+	}
+
+	// Install Victoria Metrics single-node binary
+	vmCommands := [][]string{
+		{"bash", "-c", "wget -qO /tmp/victoria-metrics.tar.gz https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.108.1/victoria-metrics-linux-amd64-v1.108.1.tar.gz"},
+		{"bash", "-c", "tar -xzf /tmp/victoria-metrics.tar.gz -C /usr/local/bin/ victoria-metrics-prod"},
+		{"bash", "-c", "chmod +x /usr/local/bin/victoria-metrics-prod"},
+		{"mkdir", "-p", "/var/lib/victoria-metrics"},
+	}
+
+	for _, cmd := range vmCommands {
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, cmd); err != nil {
+			return fmt.Errorf("failed to install victoria-metrics: %w", err)
+		}
+	}
+
+	// Create Victoria Metrics systemd service
+	vmService := `[Unit]
+Description=Victoria Metrics
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/victoria-metrics-prod -storageDataPath=/var/lib/victoria-metrics -retentionPeriod=30d -httpListenAddr=:8428 -opentelemetry.usePrometheusNaming
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`
+	if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/etc/systemd/system/victoria-metrics.service", []byte(vmService), "0644"); err != nil {
+		return fmt.Errorf("failed to write victoria-metrics service: %w", err)
+	}
+
+	// Start Victoria Metrics
+	vmStartCommands := [][]string{
+		{"systemctl", "daemon-reload"},
+		{"systemctl", "enable", "victoria-metrics"},
+		{"systemctl", "start", "victoria-metrics"},
+	}
+
+	for _, cmd := range vmStartCommands {
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, cmd); err != nil {
+			return fmt.Errorf("failed to start victoria-metrics: %w", err)
+		}
+	}
+
+	// Wait for Victoria Metrics
+	if err := cs.waitForVictoriaMetrics(ctx); err != nil {
+		return fmt.Errorf("victoria-metrics not ready: %w", err)
+	}
+
+	// Install Grafana OSS
+	grafanaCommands := [][]string{
+		{"bash", "-c", "wget -q -O /usr/share/keyrings/grafana.key https://apt.grafana.com/gpg.key"},
+		{"bash", "-c", "echo 'deb [signed-by=/usr/share/keyrings/grafana.key] https://apt.grafana.com stable main' | tee /etc/apt/sources.list.d/grafana.list"},
+		{"apt-get", "update"},
+		{"apt-get", "install", "-y", "grafana"},
+	}
+
+	for _, cmd := range grafanaCommands {
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, cmd); err != nil {
+			return fmt.Errorf("failed to install grafana: %w", err)
+		}
+	}
+
+	// Create grafana database in PostgreSQL container
+	createGrafanaDBCmd := "CREATE DATABASE grafana OWNER containarium;"
+	if err := cs.incusClient.Exec(CorePostgresContainer, []string{
+		"su", "-", "postgres", "-c", fmt.Sprintf("psql -c \"%s\"", createGrafanaDBCmd),
+	}); err != nil {
+		log.Printf("Note: Grafana database might already exist")
+	}
+
+	// Configure Grafana (anonymous access off — see renderGrafanaIni)
+	grafanaIni := renderGrafanaIni(postgresIP, DefaultPostgresUser, cs.config.PostgresPassword, cs.grafanaAdminPasswordForProvisioning())
+
+	if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, grafanaIniPath, []byte(grafanaIni), "0644"); err != nil {
+		return fmt.Errorf("failed to write grafana.ini: %w", err)
+	}
+
+	// Provision Victoria Metrics datasource
+	if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, []string{"mkdir", "-p", "/etc/grafana/provisioning/datasources"}); err != nil {
+		return fmt.Errorf("failed to create datasource dir: %w", err)
+	}
+
+	datasourceYaml := `apiVersion: 1
+deleteDatasources:
+  - name: VictoriaMetrics
+    orgId: 1
+datasources:
+  - name: VictoriaMetrics
+    uid: victoriametrics
+    type: prometheus
+    access: proxy
+    url: http://localhost:8428
+    isDefault: true
+    editable: false
+`
+	if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/etc/grafana/provisioning/datasources/vm.yaml", []byte(datasourceYaml), "0644"); err != nil {
+		return fmt.Errorf("failed to write datasource config: %w", err)
+	}
+
+	// Provision dashboards
+	if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, []string{"mkdir", "-p", "/etc/grafana/provisioning/dashboards"}); err != nil {
+		return fmt.Errorf("failed to create dashboard provisioning dir: %w", err)
+	}
+
+	dashboardProvisionYaml := `apiVersion: 1
+providers:
+  - name: 'default'
+    orgId: 1
+    folder: 'Containarium'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
+`
+	if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/etc/grafana/provisioning/dashboards/default.yaml", []byte(dashboardProvisionYaml), "0644"); err != nil {
+		return fmt.Errorf("failed to write dashboard provisioning config: %w", err)
+	}
+
+	// Create dashboards directory and write the single consolidated dashboard
+	if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, []string{"mkdir", "-p", "/var/lib/grafana/dashboards"}); err != nil {
+		return fmt.Errorf("failed to create dashboards dir: %w", err)
+	}
+
+	if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/var/lib/grafana/dashboards/overview.json", []byte(OverviewDashboard), "0644"); err != nil {
+		return fmt.Errorf("failed to write overview dashboard: %w", err)
+	}
+
+	// Start Grafana
+	grafanaStartCommands := [][]string{
+		{"systemctl", "daemon-reload"},
+		{"systemctl", "enable", "grafana-server"},
+		{"systemctl", "start", "grafana-server"},
+	}
+
+	for _, cmd := range grafanaStartCommands {
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, cmd); err != nil {
+			return fmt.Errorf("failed to start grafana: %w", err)
+		}
+	}
+
+	// Wait for Grafana
+	if err := cs.waitForGrafana(ctx); err != nil {
+		return fmt.Errorf("grafana not ready: %w", err)
+	}
+
+	log.Printf("VictoriaMetrics + Grafana setup complete")
+	return nil
+}
+
+// waitForVictoriaMetrics waits for Victoria Metrics to be ready
+func (cs *CoreServices) waitForVictoriaMetrics(ctx context.Context) error {
+	log.Printf("Waiting for Victoria Metrics to be ready...")
+
+	for i := 0; i < 30; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, []string{
+			"curl", "-sf", "http://localhost:8428/health",
+		}); err == nil {
+			log.Printf("Victoria Metrics is ready")
+			return nil
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("timeout waiting for Victoria Metrics to be ready")
+}
+
+// waitForGrafana waits for Grafana to be ready
+func (cs *CoreServices) waitForGrafana(ctx context.Context) error {
+	log.Printf("Waiting for Grafana to be ready...")
+
+	for i := 0; i < 30; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, []string{
+			"curl", "-sf", "http://localhost:3000/api/health",
+		}); err == nil {
+			log.Printf("Grafana is ready")
+			return nil
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("timeout waiting for Grafana to be ready")
+}
+
+// GetVictoriaMetricsIP returns the Victoria Metrics container IP
+func (cs *CoreServices) GetVictoriaMetricsIP() string {
+	return cs.victoriaMetricsIP
+}
+
+// GetVictoriaMetricsURL returns the Victoria Metrics HTTP API URL
+func (cs *CoreServices) GetVictoriaMetricsURL() string {
+	return fmt.Sprintf("http://%s:%d", cs.victoriaMetricsIP, DefaultVMPort)
+}
+
+// applyBaseScripts runs all base scripts on a container using the given username.
+// Errors are logged but not fatal — base scripts are best-effort on core containers.
+func (cs *CoreServices) applyBaseScripts(containerName, username string) {
+	stackMgr := stacks.GetDefault()
+	baseScripts := stackMgr.GetAllBaseScripts()
+	if len(baseScripts) == 0 {
+		return
+	}
+
+	log.Printf("Applying base scripts to %s (user=%s)...", containerName, username)
+
+	// Collect all packages
+	var allPkgs []string
+	for _, bs := range baseScripts {
+		// Pre-install
+		for _, cmd := range bs.PreInstall {
+			cmd = strings.ReplaceAll(cmd, "{{USERNAME}}", username)
+			_ = cs.incusClient.Exec(containerName, []string{"bash", "-c", cmd})
+		}
+		allPkgs = append(allPkgs, bs.Packages...)
+	}
+
+	// Install packages in one shot
+	if len(allPkgs) > 0 {
+		_ = cs.incusClient.Exec(containerName, []string{"apt-get", "update"})
+		installCmd := append([]string{"apt-get", "install", "-y"}, allPkgs...)
+		_ = cs.incusClient.Exec(containerName, installCmd)
+	}
+
+	// Post-install
+	for _, bs := range baseScripts {
+		for _, cmd := range bs.PostInstall {
+			cmd = strings.ReplaceAll(cmd, "{{USERNAME}}", username)
+			_ = cs.incusClient.Exec(containerName, []string{"bash", "-c", cmd})
+		}
+	}
+
+	log.Printf("Base scripts applied to %s", containerName)
+}
+
+// GetGrafanaURL returns the Grafana URL
+func (cs *CoreServices) GetGrafanaURL() string {
+	return fmt.Sprintf("http://%s:%d", cs.victoriaMetricsIP, DefaultGrafanaPort)
+}
+
+// GetGuacamoleIP returns the IP of the Guacamole core container, or "" if not found.
+func (cs *CoreServices) GetGuacamoleIP() string {
+	containers, err := cs.incusClient.ListContainers()
+	if err != nil {
+		return ""
+	}
+	for _, c := range containers {
+		if c.Role == incus.RoleGuacamole && c.State == "Running" {
+			return c.IPAddress
+		}
+	}
+	return ""
+}
+
+// SetupAlerting installs vmalert and Alertmanager inside the VictoriaMetrics
+// container. It writes default rules, configures Alertmanager with the
+// webhook URL, creates systemd services, and starts both.
+// Idempotent: if vmalert is already running, it only updates rules and config.
+func (cs *CoreServices) SetupAlerting(ctx context.Context, webhookURL string) error {
+	// Auto-detect VictoriaMetrics IP if not already set
+	if cs.victoriaMetricsIP == "" {
+		info, err := cs.incusClient.GetContainer(CoreVictoriaMetricsContainer)
+		if err != nil {
+			return fmt.Errorf("VictoriaMetrics container not found: %w", err)
+		}
+		if info.State != "Running" {
+			return fmt.Errorf("VictoriaMetrics container is not running (state: %s)", info.State)
+		}
+		cs.victoriaMetricsIP = info.IPAddress
+	}
+
+	// Check if vmalert is already installed.
+	// Use ExecWithOutput which properly checks exit codes (unlike Exec).
+	_, _, checkErr := cs.incusClient.ExecWithOutput(CoreVictoriaMetricsContainer, []string{
+		"test", "-x", "/usr/local/bin/vmalert-prod",
+	})
+	alreadyInstalled := checkErr == nil
+
+	if alreadyInstalled {
+		log.Printf("vmalert already installed, updating rules and config...")
+	} else {
+		log.Printf("Setting up alerting (vmalert + Alertmanager)...")
+	}
+
+	// Create directories
+	mkdirCmds := [][]string{
+		{"mkdir", "-p", "/etc/vmalert/rules"},
+		{"mkdir", "-p", "/etc/alertmanager"},
+		{"mkdir", "-p", "/var/lib/alertmanager"},
+	}
+	for _, cmd := range mkdirCmds {
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, cmd); err != nil {
+			return fmt.Errorf("failed to create dirs: %w", err)
+		}
+	}
+
+	if !alreadyInstalled {
+		// Download vmalert binary (from VictoriaMetrics release, same version as VM)
+		vmAlertCmds := [][]string{
+			{"bash", "-c", "wget -qO /tmp/vmutils.tar.gz https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.108.1/vmutils-linux-amd64-v1.108.1.tar.gz"},
+			{"bash", "-c", "tar -xzf /tmp/vmutils.tar.gz -C /usr/local/bin/ vmalert-prod"},
+			{"chmod", "+x", "/usr/local/bin/vmalert-prod"},
+		}
+		for _, cmd := range vmAlertCmds {
+			if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, cmd); err != nil {
+				return fmt.Errorf("failed to install vmalert: %w", err)
+			}
+		}
+
+		// Download Alertmanager binary
+		amCmds := [][]string{
+			{"bash", "-c", "wget -qO /tmp/alertmanager.tar.gz https://github.com/prometheus/alertmanager/releases/download/v0.27.0/alertmanager-0.27.0.linux-amd64.tar.gz"},
+			{"bash", "-c", "tar -xzf /tmp/alertmanager.tar.gz -C /tmp/ alertmanager-0.27.0.linux-amd64/alertmanager"},
+			{"bash", "-c", "mv /tmp/alertmanager-0.27.0.linux-amd64/alertmanager /usr/local/bin/alertmanager"},
+			{"chmod", "+x", "/usr/local/bin/alertmanager"},
+			{"bash", "-c", "rm -rf /tmp/alertmanager-0.27.0.linux-amd64"},
+		}
+		for _, cmd := range amCmds {
+			if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, cmd); err != nil {
+				return fmt.Errorf("failed to install alertmanager: %w", err)
+			}
+		}
+	}
+
+	// Write default alert rules (always update to latest)
+	if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/etc/vmalert/rules/default.yml", []byte(DefaultAlertRules), "0644"); err != nil {
+		return fmt.Errorf("failed to write default rules: %w", err)
+	}
+
+	// Write empty custom rules file
+	if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/etc/vmalert/rules/custom.yml", []byte("groups: []\n"), "0644"); err != nil {
+		return fmt.Errorf("failed to write custom rules: %w", err)
+	}
+
+	// Write Alertmanager config
+	amConfig := cs.generateAlertmanagerConfig(webhookURL)
+	if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/etc/alertmanager/alertmanager.yml", []byte(amConfig), "0644"); err != nil {
+		return fmt.Errorf("failed to write alertmanager config: %w", err)
+	}
+
+	if !alreadyInstalled {
+		// Create vmalert systemd service
+		vmAlertService := fmt.Sprintf(`[Unit]
+Description=vmalert - VictoriaMetrics alerting engine
+After=network.target victoria-metrics.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vmalert-prod \
+  -datasource.url=http://localhost:%d \
+  -remoteRead.url=http://localhost:%d \
+  -remoteWrite.url=http://localhost:%d \
+  -notifier.url=http://localhost:%d \
+  -rule="/etc/vmalert/rules/*.yml" \
+  -evaluationInterval=30s \
+  -httpListenAddr=:%d
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, DefaultVMPort, DefaultVMPort, DefaultVMPort, DefaultAlertmanagerPort, DefaultVMAlertPort)
+
+		if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/etc/systemd/system/vmalert.service", []byte(vmAlertService), "0644"); err != nil {
+			return fmt.Errorf("failed to write vmalert service: %w", err)
+		}
+
+		// Create Alertmanager systemd service
+		amService := fmt.Sprintf(`[Unit]
+Description=Prometheus Alertmanager
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/alertmanager \
+  --config.file=/etc/alertmanager/alertmanager.yml \
+  --storage.path=/var/lib/alertmanager \
+  --web.listen-address=:%d \
+  --web.external-url=http://localhost:%d/alertmanager/
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`, DefaultAlertmanagerPort, DefaultAlertmanagerPort)
+
+		if err := cs.incusClient.WriteFile(CoreVictoriaMetricsContainer, "/etc/systemd/system/alertmanager.service", []byte(amService), "0644"); err != nil {
+			return fmt.Errorf("failed to write alertmanager service: %w", err)
+		}
+	}
+
+	// Start/restart services (always run to pick up config/rules changes)
+	startCmds := [][]string{
+		{"systemctl", "daemon-reload"},
+		{"systemctl", "enable", "alertmanager"},
+		{"systemctl", "restart", "alertmanager"},
+		{"systemctl", "enable", "vmalert"},
+		{"systemctl", "restart", "vmalert"},
+	}
+	for _, cmd := range startCmds {
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, cmd); err != nil {
+			return fmt.Errorf("failed to start alerting services: %w", err)
+		}
+	}
+
+	// Wait for health
+	if err := cs.waitForVMAlert(ctx); err != nil {
+		return fmt.Errorf("vmalert not ready: %w", err)
+	}
+	if err := cs.waitForAlertmanager(ctx); err != nil {
+		return fmt.Errorf("alertmanager not ready: %w", err)
+	}
+
+	log.Printf("Alerting setup complete (vmalert :%d, Alertmanager :%d)", DefaultVMAlertPort, DefaultAlertmanagerPort)
+	return nil
+}
+
+// generateAlertmanagerConfig creates the Alertmanager YAML configuration
+func (cs *CoreServices) generateAlertmanagerConfig(webhookURL string) string {
+	if webhookURL == "" {
+		// No webhook configured — use a null receiver
+		return `global:
+  resolve_timeout: 5m
+
+route:
+  receiver: 'null'
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: 'null'
+`
+	}
+
+	return fmt.Sprintf(`global:
+  resolve_timeout: 5m
+
+route:
+  receiver: 'webhook'
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - match:
+        severity: critical
+      repeat_interval: 1h
+      receiver: 'webhook'
+
+receivers:
+  - name: 'webhook'
+    webhook_configs:
+      - url: '%s'
+        send_resolved: true
+`, webhookURL)
+}
+
+// UpdateAlertmanagerWebhook regenerates the Alertmanager config with a new webhook URL
+// and restarts Alertmanager to apply the change.
+func (cs *CoreServices) UpdateAlertmanagerWebhook(ctx context.Context, webhookURL string) error {
+	amConfig := cs.generateAlertmanagerConfig(webhookURL)
+
+	// Write updated config to container
+	if err := cs.incusClient.WriteFile(
+		CoreVictoriaMetricsContainer,
+		"/etc/alertmanager/alertmanager.yml",
+		[]byte(amConfig),
+		"0644",
+	); err != nil {
+		return fmt.Errorf("failed to write alertmanager config: %w", err)
+	}
+
+	// Restart alertmanager to pick up new config
+	if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, []string{
+		"systemctl", "restart", "alertmanager",
+	}); err != nil {
+		return fmt.Errorf("failed to restart alertmanager: %w", err)
+	}
+
+	log.Printf("Alertmanager webhook updated and restarted")
+	return nil
+}
+
+// waitForVMAlert waits for vmalert to be ready
+func (cs *CoreServices) waitForVMAlert(ctx context.Context) error {
+	log.Printf("Waiting for vmalert to be ready...")
+
+	for i := 0; i < 30; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, []string{
+			"curl", "-sf", fmt.Sprintf("http://localhost:%d/-/healthy", DefaultVMAlertPort),
+		}); err == nil {
+			log.Printf("vmalert is ready")
+			return nil
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("timeout waiting for vmalert to be ready")
+}
+
+// waitForAlertmanager waits for Alertmanager to be ready
+func (cs *CoreServices) waitForAlertmanager(ctx context.Context) error {
+	log.Printf("Waiting for Alertmanager to be ready...")
+
+	for i := 0; i < 30; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if err := cs.incusClient.Exec(CoreVictoriaMetricsContainer, []string{
+			"curl", "-sf", fmt.Sprintf("http://localhost:%d/alertmanager/-/healthy", DefaultAlertmanagerPort),
+		}); err == nil {
+			log.Printf("Alertmanager is ready")
+			return nil
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("timeout waiting for Alertmanager to be ready")
+}
+
+// EnsureSecurity ensures the ClamAV security container is running
+func (cs *CoreServices) EnsureSecurity(ctx context.Context) error {
+	// Reserve 2GB so scans can continue even when pool is full
+	cs.ensureCoreReservation(CoreSecurityContainer, "2G")
+
+	// Check if container already exists
+	info, err := cs.incusClient.GetContainer(CoreSecurityContainer)
+	if err == nil {
+		cs.backfillConfig(CoreSecurityContainer, incus.RoleSecurity, "70")
+
+		if info.State == "Running" {
+			log.Printf("Security container already running at %s", info.IPAddress)
+			return nil
+		}
+		log.Printf("Starting existing Security container...")
+		if err := cs.incusClient.StartContainer(CoreSecurityContainer); err != nil {
+			return fmt.Errorf("failed to start security container: %w", err)
+		}
+		if _, err := cs.incusClient.WaitForNetwork(CoreSecurityContainer, 60*time.Second); err != nil {
+			return fmt.Errorf("failed to get security container IP: %w", err)
+		}
+		return nil
+	}
+
+	// Container doesn't exist, create it
+	log.Printf("Creating ClamAV security container...")
+
+	config := incus.ContainerConfig{
+		Name:      CoreSecurityContainer,
+		Image:     "images:ubuntu/24.04",
+		CPU:       "4",
+		Memory:    "4GB",
+		AutoStart: true,
+		Disk: &incus.DiskDevice{
+			Path: "/",
+			Pool: cs.incusClient.StoragePool(),
+			Size: "5GB",
+		},
+	}
+
+	cs.pinCoreIP(&config, CoreSecurityContainer)
+
+	if err := cs.incusClient.CreateContainer(config); err != nil {
+		return fmt.Errorf("failed to create security container: %w", err)
+	}
+
+	cs.setContainerConfigBestEffort(CoreSecurityContainer, incus.RoleKey, string(incus.RoleSecurity))
+	cs.setContainerConfigBestEffort(CoreSecurityContainer, "boot.autostart", "true")
+	cs.setContainerConfigBestEffort(CoreSecurityContainer, "boot.autostart.priority", "70")
+
+	if err := cs.incusClient.StartContainer(CoreSecurityContainer); err != nil {
+		return fmt.Errorf("failed to start security container: %w", err)
+	}
+
+	if _, err := cs.incusClient.WaitForNetwork(CoreSecurityContainer, 60*time.Second); err != nil {
+		return fmt.Errorf("failed to get security container IP: %w", err)
+	}
+
+	if err := cs.setupSecurity(ctx); err != nil {
+		return fmt.Errorf("failed to setup security: %w", err)
+	}
+
+	// Apply base scripts (timezone) — best-effort
+	cs.applyBaseScripts(CoreSecurityContainer, "ubuntu")
+
+	return nil
+}
+
+// setupSecurity prepares the security container. ClamAV is deliberately NOT
+// installed here any more (#2631): the central scanner mounted tenant rootfs
+// into this container, could not read them, and has been removed; malware
+// scanning moves inside each tenant's own box. The container stays because the
+// ZAP scanner is installed into it (internal/zap).
+func (cs *CoreServices) setupSecurity(ctx context.Context) error {
+	log.Printf("Security container ready (no ClamAV: malware scanning runs inside the tenant's own box, #2631)")
+	return nil
+}
+
+// backfillConfig ensures role label and boot priority are set on an existing
+// setContainerConfigBestEffort applies a non-critical container config key
+// (role label, boot autostart/priority). These are cosmetic/boot-tuning
+// settings the creation flow should not fail on; a failure is logged.
+func (cs *CoreServices) setContainerConfigBestEffort(containerName, key, value string) {
+	if err := cs.incusClient.UpdateContainerConfig(containerName, key, value); err != nil {
+		log.Printf("Warning: failed to set %s=%s on %s: %v", key, value, containerName, err)
+	}
+}
+
+// container. This handles upgrades from older versions that lack these keys.
+func (cs *CoreServices) backfillConfig(containerName string, role incus.Role, priority string) {
+	cfg, _, err := cs.incusClient.GetRawInstance(containerName)
+	if err != nil {
+		return
+	}
+	if cfg[incus.RoleKey] == "" {
+		if err := cs.incusClient.UpdateContainerConfig(containerName, incus.RoleKey, string(role)); err != nil {
+			log.Printf("Warning: failed to backfill role on %s: %v", containerName, err)
+		} else {
+			log.Printf("Backfilled role=%s on %s", role, containerName)
+		}
+	}
+	if cfg["boot.autostart.priority"] == "" {
+		if err := cs.incusClient.UpdateContainerConfig(containerName, "boot.autostart.priority", priority); err != nil {
+			log.Printf("Warning: failed to backfill boot priority on %s: %v", containerName, err)
+		}
+	}
+	if cfg["boot.autostart"] == "" {
+		cs.setContainerConfigBestEffort(containerName, "boot.autostart", "true")
+	}
+}
