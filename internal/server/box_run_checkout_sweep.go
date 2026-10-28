@@ -182,3 +182,371 @@ func liveRunsFromList(out string) (live runCheckoutLiveRuns, records int) {
 
 // decideRunCheckout is the sweep's whole decision for one entry of home/work.
 // cutoff is now minus the maximum age: an entry is removable only when its
+// newest modification is strictly before it.
+func decideRunCheckout(e runCheckoutEntry, home string, cutoff time.Time, live runCheckoutLiveRuns) pb.BoxRunCheckoutDisposition {
+	switch {
+	case !runCheckoutNamePattern.MatchString(e.name):
+		return pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_UNSPECIFIED
+	case e.kind == 'l':
+		return pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_KEPT_SYMLINK
+	case e.kind != 'd':
+		return pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_KEPT_NOT_DIRECTORY
+	case e.inUse:
+		return pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_KEPT_IN_USE
+	}
+	dir := home + "/work/" + e.name
+	for _, c := range live.cwds {
+		if c == dir || strings.HasPrefix(c, dir+"/") {
+			return pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_KEPT_LIVE_RUN
+		}
+	}
+	// A run's checkout is created after the run starts, so anything modified
+	// at or after the start of a run still going may be that run's.
+	if !live.since.IsZero() && e.hasTime && !e.newest.Before(live.since) {
+		return pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_KEPT_LIVE_RUN
+	}
+	if !e.hasTime || !e.newest.Before(cutoff) {
+		return pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_KEPT_RECENT
+	}
+	return pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_WOULD_REMOVE
+}
+
+// runCheckoutSweep is one sweep of one box: the seams it needs and its
+// settings, so the whole path runs against a temp directory in tests.
+type runCheckoutSweep struct {
+	exec   boxScriptFunc
+	box    string
+	now    time.Time
+	maxAge time.Duration
+	dryRun bool
+	live   runCheckoutLiveRuns
+	logf   func(format string, args ...any)
+}
+
+// sweepHome sweeps user's ~/work (home is that user's home directory, already
+// validated) and returns every matching entry with its disposition.
+func (sw runCheckoutSweep) sweepHome(user, home string) ([]*pb.BoxRunCheckout, error) {
+	if !validHomePath(home) {
+		return nil, fmt.Errorf("refusing to sweep %q: not a plain absolute home path", home)
+	}
+	out, err := sw.exec(sw.box, runCheckoutListScript(home))
+	if err != nil {
+		return nil, fmt.Errorf("list %s's ~/work: %w", user, err)
+	}
+	entries, refused := parseRunCheckoutList(out)
+	if refused {
+		sw.logf("[run-checkout-sweep] %s: %s's ~/work is a symlink or under one; not swept", sw.box, user)
+		return nil, nil
+	}
+	cutoff := sw.now.Add(-sw.maxAge)
+	result := make([]*pb.BoxRunCheckout, 0, len(entries))
+	byName := map[string]*pb.BoxRunCheckout{}
+	var remove []string
+	for _, e := range entries {
+		d := decideRunCheckout(e, home, cutoff, sw.live)
+		if d == pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_UNSPECIFIED {
+			continue
+		}
+		c := &pb.BoxRunCheckout{User: user, Name: e.name, SizeBytes: e.sizeKiB * 1024, Disposition: d}
+		if e.hasTime {
+			c.NewestModification = timestamppb.New(e.newest)
+		}
+		result = append(result, c)
+		byName[e.name] = c
+		if d == pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_WOULD_REMOVE {
+			remove = append(remove, e.name)
+		}
+	}
+	if sw.dryRun || len(remove) == 0 {
+		return result, nil
+	}
+
+	out, err = sw.exec(sw.box, runCheckoutRemoveScript(home, remove, cutoff.Unix()))
+	if err != nil {
+		return nil, fmt.Errorf("remove from %s's ~/work: %w", user, err)
+	}
+	// Anything chosen that the script did not report on was not removed.
+	for _, name := range remove {
+		byName[name].Disposition = pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_KEPT_CHANGED
+	}
+	for _, line := range strings.Split(out, "\n") {
+		verdict, name, ok := strings.Cut(strings.TrimSpace(line), " ")
+		c := byName[name]
+		if !ok || c == nil || c.Disposition != pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_KEPT_CHANGED {
+			continue
+		}
+		switch verdict {
+		case "R":
+			c.Disposition = pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_REMOVED
+			sw.logf("[run-checkout-sweep] %s: removed %s from %s's ~/work (%d bytes)", sw.box, name, user, c.SizeBytes)
+		case "F":
+			c.Disposition = pb.BoxRunCheckoutDisposition_BOX_RUN_CHECKOUT_DISPOSITION_REMOVE_FAILED
+			sw.logf("[run-checkout-sweep] %s: removing %s from %s's ~/work failed", sw.box, name, user)
+		}
+	}
+	return result, nil
+}
+
+// runCheckoutHomesScript prints "H <user> <home>" for each user that exists.
+func runCheckoutHomesScript(users []string) string {
+	quoted := make([]string, len(users))
+	for i, u := range users {
+		quoted[i] = shellSingleQuote(u)
+	}
+	return "for u in " + strings.Join(quoted, " ") + `; do
+  h=$(getent passwd "$u" | cut -d: -f6) && [ -n "$h" ] && echo "H $u $h"
+done
+exit 0
+`
+}
+
+// SetRunCheckoutMaxAge sets the per-run checkout sweep's maximum age
+// (--run-checkout-max-age). Zero turns the sweep off; negative keeps the
+// default.
+func (s *ContainerServer) SetRunCheckoutMaxAge(d time.Duration) {
+	if d < 0 {
+		d = DefaultRunCheckoutMaxAge
+	}
+	s.runCheckoutMaxAge, s.runCheckoutMaxAgeSet = d, true
+}
+
+func (s *ContainerServer) runCheckoutMaxAgeOrDefault() time.Duration {
+	if s.runCheckoutMaxAgeSet {
+		return s.runCheckoutMaxAge
+	}
+	return DefaultRunCheckoutMaxAge
+}
+
+func (s *ContainerServer) runCheckoutLogf(format string, args ...any) {
+	if s.runCheckoutLog != nil {
+		s.runCheckoutLog(format, args...)
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func (s *ContainerServer) runCheckoutClock() time.Time {
+	if s.runCheckoutNow != nil {
+		return s.runCheckoutNow()
+	}
+	return time.Now()
+}
+
+// runCheckoutUserHomes resolves the homes of the box's owner and of the run
+// user, skipping a user that does not exist and any home that is not a plain
+// absolute path.
+func (s *ContainerServer) runCheckoutUserHomes(exec boxScriptFunc, boxName, owner string) ([][2]string, error) {
+	users := []string{owner, boxRunUnprivilegedUser}
+	var homes map[string]string
+	if s.runCheckoutHomes != nil {
+		var err error
+		if homes, err = s.runCheckoutHomes(boxName, users); err != nil {
+			return nil, err
+		}
+	} else {
+		out, err := exec(boxName, runCheckoutHomesScript(users))
+		if err != nil {
+			return nil, err
+		}
+		homes = map[string]string{}
+		for _, line := range strings.Split(out, "\n") {
+			if f := strings.Fields(line); len(f) == 3 && f[0] == "H" {
+				homes[f[1]] = f[2]
+			}
+		}
+	}
+	var res [][2]string
+	seen := map[string]bool{}
+	for _, u := range users {
+		h, ok := homes[u]
+		if !ok || !validHomePath(h) || seen[h] {
+			continue
+		}
+		seen[h] = true
+		res = append(res, [2]string{u, h})
+	}
+	return res, nil
+}
+
+// sweepBoxRunCheckouts sweeps one running box. toolAccess is the box's
+// recorded level ("" = none). platformRuns is false, and nothing is touched,
+// when the box has neither a recorded level nor a run record.
+func (s *ContainerServer) sweepBoxRunCheckouts(username, toolAccess string, dryRun bool) (platformRuns bool, checkouts []*pb.BoxRunCheckout, err error) {
+	exec := s.boxRunExecFn()
+	if exec == nil {
+		return false, nil, status.Error(codes.Unavailable, "no container backend to sweep run checkouts on")
+	}
+	boxName := username + "-container"
+	lockAny, _ := s.runCheckoutLocks.LoadOrStore(boxName, &sync.Mutex{})
+	lock := lockAny.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	out, err := exec(boxName, boxRunListScript(s.boxRunDir()))
+	if err != nil {
+		return false, nil, status.Errorf(codes.Unavailable, "read run records of %q: %v", username, err)
+	}
+	live, records := liveRunsFromList(out)
+	if toolAccess == "" && records == 0 {
+		return false, nil, nil
+	}
+	homes, err := s.runCheckoutUserHomes(exec, boxName, username)
+	if err != nil {
+		return true, nil, status.Errorf(codes.Unavailable, "resolve home directories on %q: %v", username, err)
+	}
+	sw := runCheckoutSweep{
+		exec:   exec,
+		box:    boxName,
+		now:    s.runCheckoutClock(),
+		maxAge: s.runCheckoutMaxAgeOrDefault(),
+		dryRun: dryRun,
+		live:   live,
+		logf:   s.runCheckoutLogf,
+	}
+	for _, uh := range homes {
+		got, err := sw.sweepHome(uh[0], uh[1])
+		if err != nil {
+			return true, checkouts, status.Errorf(codes.Unavailable, "%q: %v", username, err)
+		}
+		checkouts = append(checkouts, got...)
+	}
+	sort.SliceStable(checkouts, func(i, j int) bool {
+		if checkouts[i].GetUser() != checkouts[j].GetUser() {
+			return checkouts[i].GetUser() < checkouts[j].GetUser()
+		}
+		return checkouts[i].GetName() < checkouts[j].GetName()
+	})
+	return true, checkouts, nil
+}
+
+// runCheckoutGetBox reads one box's status (nil when it does not exist).
+func (s *ContainerServer) runCheckoutGetBox(ctx context.Context, username string) (*box.BoxStatus, error) {
+	if s.runCheckoutBoxes != nil {
+		all, err := s.runCheckoutBoxes(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for i := range all {
+			if all[i].Ref.Tenant == username {
+				return &all[i], nil
+			}
+		}
+		return nil, nil
+	}
+	if s.manager == nil && s.boxBackend == nil {
+		return nil, fmt.Errorf("no box backend")
+	}
+	return s.boxes().Get(ctx, box.BoxRef{Tenant: username})
+}
+
+// SweepBoxRunCheckouts runs the per-run checkout sweep once on one box
+// (#3296). dry_run reports the same removal set and removes nothing.
+func (s *ContainerServer) SweepBoxRunCheckouts(ctx context.Context, req *pb.SweepBoxRunCheckoutsRequest) (*pb.SweepBoxRunCheckoutsResponse, error) {
+	if err := validateBoxRunOwner(req.GetUsername()); err != nil {
+		return nil, err
+	}
+	if err := s.authorizeBoxRuns(ctx, req.GetUsername()); err != nil {
+		return nil, err
+	}
+	maxAge := s.runCheckoutMaxAgeOrDefault()
+	if maxAge == 0 {
+		return nil, status.Error(codes.FailedPrecondition, "the run checkout sweep is turned off on this daemon (--run-checkout-max-age=0)")
+	}
+	if s.boxRunExecFn() == nil {
+		return nil, status.Error(codes.Unavailable, "no container backend to sweep run checkouts on")
+	}
+	info, err := s.runCheckoutGetBox(ctx, req.GetUsername())
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "look up %q: %v", req.GetUsername(), err)
+	}
+	if info == nil {
+		return nil, status.Errorf(codes.NotFound, "no box for %q", req.GetUsername())
+	}
+	if info.State != pb.ContainerState_CONTAINER_STATE_RUNNING {
+		return nil, status.Errorf(codes.FailedPrecondition, "%q is not running; a stopped box is not swept", req.GetUsername())
+	}
+	platformRuns, checkouts, err := s.sweepBoxRunCheckouts(req.GetUsername(), info.ToolAccess, req.GetDryRun())
+	if err != nil {
+		return nil, err
+	}
+	return &pb.SweepBoxRunCheckoutsResponse{PlatformRuns: platformRuns, MaxAge: durationpb.New(maxAge), Checkouts: checkouts}, nil
+}
+
+// sweepAllBoxRunCheckouts is one timer tick: every running, non-core box with a
+// valid owner name. Best-effort per box.
+func (s *ContainerServer) sweepAllBoxRunCheckouts(ctx context.Context) {
+	if s.runCheckoutMaxAgeOrDefault() == 0 || s.boxRunExecFn() == nil {
+		return
+	}
+	var all []box.BoxStatus
+	var err error
+	switch {
+	case s.runCheckoutBoxes != nil:
+		all, err = s.runCheckoutBoxes(ctx)
+	case s.manager == nil && s.boxBackend == nil:
+		return
+	default:
+		all, err = s.boxes().List(ctx)
+	}
+	if err != nil {
+		s.runCheckoutLogf("[run-checkout-sweep] list boxes: %v", err)
+		return
+	}
+	for _, b := range all {
+		if ctx.Err() != nil {
+			return
+		}
+		// The sweep addresses a box as <tenant>-container, like every box-run
+		// RPC; a box whose name differs is not one of those.
+		if b.IsCore || b.State != pb.ContainerState_CONTAINER_STATE_RUNNING || !validRunPathID(b.Ref.Tenant) ||
+			(b.Ref.Name != "" && b.Ref.Name != b.Ref.Tenant+"-container") {
+			continue
+		}
+		if _, _, err := s.sweepBoxRunCheckouts(b.Ref.Tenant, b.ToolAccess, false); err != nil {
+			s.runCheckoutLogf("[run-checkout-sweep] %s-container: %v", b.Ref.Tenant, err)
+		}
+	}
+}
+
+// sweepBoxRunCheckoutsAfterRun sweeps one box in the background after a run on
+// it ended (StopBoxRun). Errors are logged; a stopped box is skipped.
+func (s *ContainerServer) sweepBoxRunCheckoutsAfterRun(username string) {
+	if s.runCheckoutMaxAgeOrDefault() == 0 || s.boxRunExecFn() == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		info, err := s.runCheckoutGetBox(ctx, username)
+		if err != nil || info == nil || info.State != pb.ContainerState_CONTAINER_STATE_RUNNING {
+			return
+		}
+		if _, _, err := s.sweepBoxRunCheckouts(username, info.ToolAccess, false); err != nil {
+			s.runCheckoutLogf("[run-checkout-sweep] %s-container: %v", username, err)
+		}
+	}()
+}
+
+// StartRunCheckoutSweeper sweeps every eligible box now and then hourly until
+// ctx ends. A daemon with the sweep turned off starts nothing.
+func (s *ContainerServer) StartRunCheckoutSweeper(ctx context.Context) {
+	maxAge := s.runCheckoutMaxAgeOrDefault()
+	if maxAge == 0 {
+		log.Printf("[run-checkout-sweep] off (--run-checkout-max-age=0)")
+		return
+	}
+	log.Printf("[run-checkout-sweep] removing per-run checkouts older than %s, every %s", maxAge, runCheckoutSweepInterval)
+	go func() {
+		s.sweepAllBoxRunCheckouts(ctx)
+		t := time.NewTicker(runCheckoutSweepInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.sweepAllBoxRunCheckouts(ctx)
+			}
+		}
+	}()
+}

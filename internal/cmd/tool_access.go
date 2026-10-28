@@ -118,3 +118,123 @@ func runToolAccessSet(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	return setToolAccess(args[0], level, fmt.Sprintf("✓ %s: tool access recorded as %s (for platform-started runs only)\n", args[0], toolAccessName(level)))
+}
+
+func runToolAccessClear(cmd *cobra.Command, args []string) error {
+	return setToolAccess(args[0], pb.BoxToolAccess_BOX_TOOL_ACCESS_UNSPECIFIED, fmt.Sprintf("✓ %s: recorded tool access cleared\n", args[0]))
+}
+
+func setToolAccess(username string, level pb.BoxToolAccess, okMsg string) error {
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (tool access is a server-side feature)")
+	}
+	err := setContainerToolAccessViaServer(username, level)
+	if isUnimplemented(err) {
+		fmt.Printf("⚠ Tool access not yet supported by this server (daemon does not implement SetContainerToolAccess); nothing changed on %s.\n", username)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to set tool access on %s: %w", username, err)
+	}
+	fmt.Print(okMsg)
+	return nil
+}
+
+func runToolAccessGet(cmd *cobra.Command, args []string) error {
+	username := args[0]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (tool access is a server-side feature)")
+	}
+	var info *incus.ContainerInfo
+	var err error
+	if httpMode {
+		hc, e := client.NewHTTPClient(serverAddr, authToken)
+		if e != nil {
+			return e
+		}
+		defer func() { _ = hc.Close() }()
+		info, err = hc.GetContainer(username)
+	} else {
+		gc, e := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if e != nil {
+			return e
+		}
+		defer func() { _ = gc.Close() }()
+		info, err = gc.GetContainer(username)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get %s: %w", username, err)
+	}
+	level := pb.BoxToolAccess_BOX_TOOL_ACCESS_UNSPECIFIED
+	if info != nil {
+		level = toolaccess.FromConfig(info.ToolAccess)
+	}
+	fmt.Printf("%s: %s\n", username, toolAccessName(level))
+	return nil
+}
+
+// setContainerToolAccessViaServer dispatches over grpc or http per the global
+// httpMode flag, mirroring setContainerDeletePolicyViaServer.
+func setContainerToolAccessViaServer(username string, level pb.BoxToolAccess) error {
+	if httpMode {
+		hc, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = hc.Close() }()
+		_, err = hc.SetContainerToolAccess(username, level)
+		return err
+	}
+	gc, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = gc.Close() }()
+	_, err = gc.SetContainerToolAccess(username, level)
+	return err
+}
+
+func runToolAccessRunUser(cmd *cobra.Command, args []string) error {
+	username := args[0]
+	if serverAddr == "" {
+		return fmt.Errorf("--server is required (tool access is a server-side feature)")
+	}
+	var resp *pb.GetBoxRunUserStatusResponse
+	var err error
+	if httpMode {
+		hc, e := client.NewHTTPClient(serverAddr, authToken)
+		if e != nil {
+			return e
+		}
+		defer func() { _ = hc.Close() }()
+		resp, err = hc.GetBoxRunUserStatus(username)
+	} else {
+		gc, e := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if e != nil {
+			return e
+		}
+		defer func() { _ = gc.Close() }()
+		resp, err = gc.GetBoxRunUserStatus(username)
+	}
+	if isUnimplemented(err) {
+		fmt.Printf("⚠ Run-user status not yet supported by this server (daemon does not implement GetBoxRunUserStatus).\n")
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get the run user status of %s: %w", username, err)
+	}
+	fmt.Print(renderRunUserStatus(username, resp))
+	return nil
+}
+
+// renderRunUserStatus is the human form of the run-user status: one line, the
+// credential source's name only.
+func renderRunUserStatus(username string, r *pb.GetBoxRunUserStatusResponse) string {
+	if !r.GetToolAccessRecorded() {
+		return fmt.Sprintf("%s: no tool-access level recorded; platform runs use the owner's identity (no run user)\n", username)
+	}
+	if !r.GetRunUserExists() {
+		return fmt.Sprintf("%s: run user %s does not exist yet (created by the first platform run); sign-in: %s\n", username, r.GetRunUser(), credentialSourceDisplay(r.GetState()))
+	}
+	return fmt.Sprintf("%s: run user %s sign-in: %s\n", username, r.GetRunUser(), credentialSourceDisplay(r.GetState()))
+}
