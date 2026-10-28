@@ -41,3 +41,91 @@
           "url": "https://registry.npmjs.org/npm/-/npm-12.2.1.tgz",
           "sha256": "228bd64aaef23270dbdbd2cf3d5ef5c467602ef38c4066246cef1984adab9a67",
           "format": "tar"
+        },
+        "arm64": {
+          "url": "https://registry.npmjs.org/npm/-/npm-12.2.1.tgz",
+          "sha256": "228bd64aaef23270dbdbd2cf3d5ef5c467602ef38c4066246cef1984adab9a67",
+          "format": "tar"
+        }
+      },
+      "security_dependencies": [
+        {
+          "name": "undici",
+          "version": "6.29.1",
+          "integrity": "sha512-EvRlUt/QqAEvXdQeRMYUfwOQsfzpDztykrG2owGEE/rBOBoYv9uF39ZzsNDh4lTFHhTr2XOZjKkYgueD12ZmGA==",
+          "artifact": {
+            "url": "https://registry.npmjs.org/undici/-/undici-6.29.1.tgz",
+            "sha256": "29c4b8e0b2d86cb8795571c1959012ce057a14ecfd34858335f47c31e770a04f",
+            "format": "tar"
+          }
+        }
+      ]
+    },
+    {
+      "name": "pnpm",
+      "version": "12.16.1",
+      "artifacts": {
+        "amd64": {
+          "url": "https://github.com/pnpm/pnpm/releases/download/v12.16.1/pnpm-linux-x64.tar.gz",
+          "sha256": "565ff81174a14f6f7bd5d84c1b17e51031a80230d370a1fe24be5d16bd02a825",
+          "format": "tar"
+        },
+        "arm64": {
+          "url": "https://github.com/pnpm/pnpm/releases/download/v12.16.1/pnpm-linux-arm64.tar.gz",
+          "sha256": "f5847699e5d528f8f8e9bcfb385e58cb9fba7482af1b1aa7b70737be42277f81",
+          "format": "tar"
+        }
+      }
+    },
+    {
+      "name": "buf",
+      "version": "1.75.0",
+      "artifacts": {
+        "amd64": {
+          "url": "https://github.com/bufbuild/buf/releases/download/v1.75.0/buf-Linux-x86_64",
+          "sha256": "fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b",
+          "format": "binary"
+        },
+        "arm64": {
+          "url": "https://github.com/bufbuild/buf/releases/download/v1.75.0/buf-Linux-aarch64",
+          "sha256": "00eb190aa82df17f393e05b04889cc60a0b13b3259d336e21a87d5f23ab4fd26",
+          "format": "binary"
+        }
+      }
+    },
+    {
+      "name": "protoc",
+      "version": "36.2",
+      "artifacts": {
+        "amd64": {
+          "url": "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-x86_64.zip",
+          "sha256": "121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278",
+          "format": "zip"
+        },
+        "arm64": {
+          "url": "https://github.com/protocolbuffers/protobuf/releases/download/v36.2/protoc-36.2-linux-aarch_64.zip",
+          "sha256": "8b8f18bd2b30346efbc698dd5a73dd7c805f3ef8380f6dfc95c768f3f1852f6a",
+          "format": "zip"
+        }
+      }
+    },
+    {
+      "name": "staticcheck",
+      "version": "2026.2.2",
+      "module": "honnef.co/go/tools",
+      "module_version": "v0.8.2",
+      "module_sum": "h1:+jPbCzuYxYrcoOvCecYUFDj+XJQRmzIhJmlbpps21Zk=",
+      "built_with": "go1.27.3"
+    }
+  ],
+  "system_tools": [
+    "python3",
+    "make",
+    "git",
+    "gcc"
+  ],
+  "system_libraries": [
+    "libatomic.so.1",
+    "libstdc++.so.6"
+  ]
+}
