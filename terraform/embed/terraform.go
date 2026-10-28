@@ -53,3 +53,58 @@ func AllFiles() map[string]string {
 	for _, f := range scriptFiles {
 		content, err := os.ReadFile(filepath.Join(ModuleDir(), "scripts", f))
 		if err == nil {
+			files[filepath.Join("modules", "containarium", "scripts", f)] = string(content)
+		}
+	}
+
+	// Read consumer files
+	consumerFiles := []string{
+		"main.tf",
+		"variables.tf",
+		"outputs.tf",
+	}
+	for _, f := range consumerFiles {
+		content, err := os.ReadFile(filepath.Join(ConsumerDir(), f))
+		if err == nil {
+			files[filepath.Join("gce", f)] = string(content)
+		}
+	}
+
+	return files
+}
+
+// TerraformFiles returns module Terraform files by reading from disk.
+func TerraformFiles() map[string]string {
+	files := make(map[string]string)
+	moduleFiles := []string{
+		"main.tf",
+		"sentinel.tf",
+		"spot-instance.tf",
+		"variables.tf",
+		"outputs.tf",
+	}
+	for _, f := range moduleFiles {
+		content, err := os.ReadFile(filepath.Join(ModuleDir(), f))
+		if err == nil {
+			files[f] = string(content)
+		}
+	}
+	return files
+}
+
+// ScriptFiles returns script files by reading from disk.
+func ScriptFiles() map[string]string {
+	files := make(map[string]string)
+	scriptFiles := []string{
+		"startup.sh",
+		"startup-spot.sh",
+		"startup-sentinel.sh",
+	}
+	for _, f := range scriptFiles {
+		content, err := os.ReadFile(filepath.Join(ModuleDir(), "scripts", f))
+		if err == nil {
+			files[filepath.Join("scripts", f)] = string(content)
+		}
+	}
+	return files
+}
