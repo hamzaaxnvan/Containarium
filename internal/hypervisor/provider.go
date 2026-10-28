@@ -32,3 +32,37 @@ type VirtualBoxProvider struct {
 	SocketPath func(target string) (string, error)
 }
 
+// NewVirtualBoxProvider returns a VirtualBoxProvider using the convention
+// "<baseDir>/<target>.sock" — the path this package's own provisioning
+// helper (see docs/architecture/byoc-vm-console-access.md) uses when it
+// sets up a guest's serial redirect. A deployment that names its sockets
+// differently can build a VirtualBoxProvider directly with a custom
+// SocketPath instead.
+func NewVirtualBoxProvider(baseDir string) *VirtualBoxProvider {
+	return &VirtualBoxProvider{
+		SocketPath: func(target string) (string, error) {
+			if target == "" {
+				return "", fmt.Errorf("hypervisor: target is required")
+			}
+			return filepath.Join(baseDir, target+".sock"), nil
+		},
+	}
+}
+
+// OpenConsole implements ConsoleProvider.
+func (p *VirtualBoxProvider) OpenConsole(ctx context.Context, target string) (io.ReadWriteCloser, error) {
+	if p.SocketPath == nil {
+		return nil, fmt.Errorf("hypervisor: VirtualBoxProvider has no SocketPath resolver configured")
+	}
+	path, err := p.SocketPath(target)
+	if err != nil {
+		return nil, fmt.Errorf("hypervisor: resolve console socket for %q: %w", target, err)
+	}
+
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("hypervisor: dial console socket %q for %q: %w", path, target, err)
+	}
+	return conn, nil
+}

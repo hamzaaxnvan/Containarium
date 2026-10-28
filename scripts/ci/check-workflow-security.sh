@@ -39,3 +39,45 @@ for f in json.load(sys.stdin):
     d = f["determinations"]
     if f.get("ignored") or f["ident"] not in rules:
         continue
+    if rank.get(d["severity"], 0) < 2 or rank.get(d["confidence"], 0) < 2:
+        continue
+    loc = f["locations"][0]
+    path = loc["symbolic"]["key"].get("Local", {}).get("verbatim_path", "?")
+    row = loc["concrete"]["location"]["start_point"]["row"] + 1
+    note = loc["symbolic"]["annotation"]
+    print(path + ":" + str(row) + ": " + f["ident"] + " (" + d["severity"] + "): " + note)
+    bad = 1
+sys.exit(bad)
+PY
+)
+
+# run [--no-config] path... : zizmor over the paths, filtered to $RULES.
+run() {
+  local out rc=0 cfg=(--config "$CONFIG")
+  if [[ "$1" == "--no-config" ]]; then cfg=(--no-config); shift; fi
+  out=$("$ZIZMOR" --offline --quiet --format json --persona auditor "${cfg[@]}" "$@") || rc=$?
+  # zizmor exits 10-14 when it has findings; anything else non-zero is an error.
+  if [[ $rc -ne 0 && ( $rc -lt 10 || $rc -gt 14 ) ]]; then
+    echo "zizmor failed (exit $rc)" >&2; return 2
+  fi
+  RULES="$RULES" python3 -I -c "$FILTER" <<<"$out"
+}
+
+self_test() {
+  local dir="$HERE/testdata/zizmor" f bad=0 n=0
+  [[ -d "$dir" ]] || { echo "missing $dir" >&2; return 1; }
+  run --no-config "$dir/good.yml" >/dev/null || { echo "self-test FAIL: good.yml rejected"; run --no-config "$dir/good.yml"; bad=1; }
+  for f in "$dir"/bad-*.yml; do
+    n=$((n + 1))
+    if run --no-config "$f" >/dev/null; then echo "self-test FAIL: $(basename "$f") was accepted"; bad=1; fi
+  done
+  [[ $bad -eq 0 ]] || return 1
+  echo "self-test ok: good.yml accepted, $n seeded violations rejected"
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then self_test; exit; fi
+[[ $# -gt 0 ]] || set -- .github/workflows .github/actions
+if run "$@"; then echo "workflow security rules ($RULES): no findings"; else
+  echo "Fix the finding(s) above. A justified exception goes in .github/zizmor.yml with a reason." >&2
+  exit 1
+fi
