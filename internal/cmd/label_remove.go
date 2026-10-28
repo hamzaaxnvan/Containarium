@@ -58,3 +58,24 @@ func removeLabelsRemoteHTTP(username string, keys []string) error {
 
 	// Find which keys exist
 	removedCount := 0
+	for _, key := range keys {
+		if _, exists := info.Labels[key]; exists {
+			if err := httpClient.RemoveLabel(username, key); err != nil {
+				return fmt.Errorf("failed to remove label %q: %w", key, err)
+			}
+			fmt.Printf("Removed label: %s\n", key)
+			removedCount++
+		} else {
+			if verbose {
+				fmt.Printf("Label not found: %s (skipped)\n", key)
+			}
+		}
+	}
+
+	if removedCount > 0 {
+		fmt.Printf("\nRemoved %d label(s) from container %s-container\n", removedCount, username)
+	} else {
+		fmt.Println("No labels were removed (none matched)")
+	}
+	return nil
+}
