@@ -54,3 +54,32 @@ check() {
 self_test() {
   local d rc=0
   d=$(mktemp -d); trap 'rm -rf "$d"' RETURN
+  local good="$d/good"
+  : >"$good"
+  for p in "${REQUIRED_PATHS[@]}"; do echo "$p ${REQUIRED_OWNERS[*]}" >>"$good"; done
+  # a comment line naming a pattern must not count as coverage
+  printf '# terraform/** @nobody\n' >"$d/comment-only"
+  grep -v '^terraform/' "$good" >>"$d/comment-only"
+  grep -v '^deploy/' "$good" >"$d/missing-path"
+  sed 's/^go.sum .*/go.sum @hsinhoyeh/' "$good" >"$d/missing-owner"
+  sed 's#^install.sh #/install.sh #' "$good" >"$d/respelled"
+
+  check "$good" >/dev/null || { echo "SELF-TEST FAIL: complete file rejected"; rc=1; }
+  local bad
+  for bad in missing-path missing-owner respelled comment-only; do
+    if check "$d/$bad" >/dev/null; then
+      echo "SELF-TEST FAIL: seeded '$bad' was accepted"; rc=1
+    fi
+  done
+  if check "$d/does-not-exist" >/dev/null; then
+    echo "SELF-TEST FAIL: absent file was accepted"; rc=1
+  fi
+  [[ $rc -eq 0 ]] && echo "self-test ok"
+  return "$rc"
+}
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  self_test
+else
+  check "${1:-.github/CODEOWNERS}"
+fi

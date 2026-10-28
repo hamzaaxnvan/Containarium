@@ -228,3 +228,465 @@ func runQuickstart(cmd *cobra.Command, args []string) error {
 		}
 		if added {
 			fmt.Printf("  added Include line to %s\n", filepath.Join(home, ".ssh", "config"))
+		} else {
+			fmt.Println("  Include line already present")
+		}
+	}
+
+	// ── Step 3: agent MCP wiring ────────────────────────────────────────
+	// Always wire the chosen --agent; also wire any OTHER supported agent
+	// already configured on this machine, so switching agents later Just Works.
+	if !qsSkipMCP {
+		fmt.Println("\n③ point your agent at the box")
+		for _, t := range agentMCPTargets(home, qsAgent) {
+			changed, err := t.spec.wireMCP(t.path, qsAgentName, name)
+			if err != nil {
+				return fmt.Errorf("merge %s MCP config %s: %w", t.agent, t.path, err)
+			}
+			chownUnderHome(t.path, uid, gid)
+			if changed {
+				fmt.Printf("  wrote %q server into %s (%s)\n", qsAgentName, t.path, t.agent)
+			} else {
+				fmt.Printf("  %s already had %q — left as-is\n", t.path, qsAgentName)
+			}
+		}
+	}
+
+	// ── Step 4: --prompt → expose URL, then launch YOUR agent ───────────
+	if qsPrompt != "" {
+		fmt.Println("\n④ expose URL + launch your agent")
+		if qsExposePort != 0 {
+			// expose-port is a daemon route op — needs --server. In local mode
+			// we can't reserve the hostname; tell the user to run it later.
+			if serverAddr == "" {
+				fmt.Printf("  (local mode) after the build, run:\n")
+				fmt.Printf("    containarium expose-port %s --container-port %d --domain %s\n", name, qsExposePort, qsDomain)
+			} else {
+				exposePortPort = qsExposePort
+				exposePortDomain = qsDomain
+				exposePortDescription = "quickstart build"
+				if err := qsStepExposePort(cmd, []string{name}); err != nil {
+					return fmt.Errorf("pre-expose: %w", err)
+				}
+			}
+		}
+
+		instruction := buildInstruction(qsAgentName, qsPrompt, qsDomain, qsExposePort)
+		if launching {
+			// #2013: the agent's first act is `ssh <box> agent-box`. A box this
+			// invocation just created reaches sshpiper only on the sentinel's
+			// keysync, so wait that out here rather than have the agent's
+			// first call fail publickey-denied. Direct mode has no sentinel
+			// hop; a reused box fails once, as before.
+			if created && qsSentinel != "" {
+				ctx := cmd.Context()
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				if err := qsStepWaitForKey(ctx, name, sshConfigOutPath); err != nil {
+					return err
+				}
+			}
+			// Hand off: replace this process with the user's agent so they land
+			// straight in the session, already working. Never returns on success.
+			return qsStepLaunchAgent(qsAgent, instruction)
+		}
+		// --no-launch: print the exact command instead of exec'ing it.
+		spec := agentSpecs[qsAgent]
+		fmt.Printf("  agent + box are wired. Build with:\n\n    %s\n", spec.pretty(instruction))
+		return nil
+	}
+
+	printQuickstartNextSteps(name)
+	return nil
+}
+
+// ─── new helpers: the logic quickstart adds on top of existing commands ───
+
+// waitQuickstartKey probes `ssh -F <sshConfig> <box> true` until the sentinel
+// accepts the key (#2013). Only a key the sentinel never learned within the
+// window is an error; any other probe failure (host key, refused, timeout)
+// is reported and the launch proceeds exactly as it did before this wait.
+func waitQuickstartKey(ctx context.Context, name, sshConfig string) error {
+	kw, err := newKeyWait(qsKeyWait, true, os.Stdout)
+	if err != nil {
+		return err
+	}
+	err = waitForKeyByProbe(ctx, kw, probeSSHArgs([]string{"-F", sshConfig, name}))
+	if err == nil || errors.Is(err, connectcore.ErrKeyNotLearned) {
+		return err
+	}
+	fmt.Printf("  (could not pre-check SSH to %s: %v — launching anyway)\n", name, err)
+	return nil
+}
+
+// invokingUserHome returns the home dir + uid/gid of the human who ran the
+// command, unwrapping sudo (local Incus dev runs as root). SUDO_USER points
+// back at the real account. Falls back to the current user when not under
+// sudo, returning uid/gid -1 to mean "leave ownership alone".
+func invokingUserHome() (home string, uid, gid int, err error) {
+	if su := os.Getenv("SUDO_USER"); su != "" && su != "root" {
+		u, lookErr := user.Lookup(su)
+		if lookErr != nil {
+			return "", 0, 0, fmt.Errorf("lookup SUDO_USER %q: %w", su, lookErr)
+		}
+		uid, _ = strconv.Atoi(u.Uid)
+		gid, _ = strconv.Atoi(u.Gid)
+		return u.HomeDir, uid, gid, nil
+	}
+	h, e := os.UserHomeDir()
+	if e != nil {
+		return "", 0, 0, e
+	}
+	return h, -1, -1, nil
+}
+
+// resolveSSHKey picks the public key to seed into the box. If the user passed
+// --ssh-key, use it verbatim (no managed identity — ssh_config falls back to
+// the default identities). Otherwise reuse an existing personal ~/.ssh key or
+// generate a containarium-managed one under <home>/.ssh, returning the private-
+// key path (identity) so ssh_config can point IdentityFile at it. Idempotent:
+// a second run locates the key the first run generated instead of regenerating.
+func resolveSSHKey(home, userProvided string) (pubPath, identity string, generated bool, err error) {
+	if userProvided != "" {
+		return userProvided, "", false, nil
+	}
+	pp, _, gen, err := sshkey.LocateOrGenerate(sshkey.LocateOpts{HomeDir: home})
+	if err != nil {
+		return "", "", false, err
+	}
+	return pp, strings.TrimSuffix(pp, ".pub"), gen, nil
+}
+
+// chownUnderHome best-effort restores ownership to the invoking user for a
+// file we wrote while (possibly) running as root. No-op when uid<0.
+func chownUnderHome(path string, uid, gid int) {
+	if uid < 0 {
+		return
+	}
+	_ = os.Chown(path, uid, gid)
+}
+
+// ensureSSHInclude prepends `Include <includePath>` to ~/.ssh/config if no
+// Include for that path is already present. Creates file (0600) and dir
+// (0700) if missing. Returns whether it added the line. Idempotent.
+func ensureSSHInclude(sshConfigPath, includePath string, uid, gid int) (bool, error) {
+	dir := filepath.Dir(sshConfigPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return false, err
+	}
+	chownUnderHome(dir, uid, gid)
+
+	// #nosec G304 -- sshConfigPath is the caller's own ~/.ssh/config, not
+	// attacker-controlled.
+	existing, err := os.ReadFile(sshConfigPath)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(existing)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "Include ") && strings.Contains(line, includePath) {
+			return false, nil
+		}
+	}
+
+	// Prepend so the Include wins over later `Host *` catch-alls (OpenSSH
+	// takes the first value for most keywords).
+	var b strings.Builder
+	fmt.Fprintf(&b, "Include %s\n", includePath)
+	if len(existing) > 0 {
+		if existing[len(existing)-1] != '\n' {
+			b.WriteByte('\n')
+		}
+		b.Write(existing)
+	}
+	if err := os.WriteFile(sshConfigPath, []byte(b.String()), 0o600); err != nil {
+		return false, err
+	}
+	chownUnderHome(sshConfigPath, uid, gid)
+	return true, nil
+}
+
+// mcpServerEntry is the JSON shape claude/gemini expect: an ssh command that
+// runs `agent-box` inside the named host and speaks MCP over stdio.
+type mcpServerEntry struct {
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+}
+
+type codexMCPConfig struct {
+	Servers map[string]mcpServerEntry `toml:"mcp_servers"`
+}
+
+// mergeMCPServerJSON inserts the box's MCP server or upgrades its legacy bare
+// agent-box command, preserving custom entries and every other key.
+// Round-trips through a generic map so unrelated settings survive verbatim —
+// the one legitimate map[string]any use (a foreign JSON doc we don't own).
+// Used for claude (~/.claude.json) and gemini (~/.gemini/settings.json), which
+// share the "mcpServers" object shape.
+func mergeMCPServerJSON(path, mcpKey, name, sshHost string) (bool, error) {
+	root := map[string]any{}
+	// #nosec G304 -- path is the caller's own agent config under $HOME, not
+	// attacker-controlled.
+	raw, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if len(strings.TrimSpace(string(raw))) > 0 {
+			if err := json.Unmarshal(raw, &root); err != nil {
+				return false, fmt.Errorf("%s is not valid JSON: %w", path, err)
+			}
+		}
+	case os.IsNotExist(err):
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return false, err
+		}
+	default:
+		return false, err
+	}
+
+	servers, _ := root[mcpKey].(map[string]any)
+	if servers == nil {
+		servers = map[string]any{}
+	}
+	args := []string{sshHost, coderun.AgentBoxRemoteCommand}
+	if existing, present := servers[name]; present {
+		entry, ok := existing.(map[string]any)
+		oldArgs, argsOK := entry["args"].([]any)
+		if !ok || entry["command"] != "ssh" || !argsOK || len(oldArgs) != 2 || oldArgs[0] != sshHost || oldArgs[1] != "agent-box" {
+			return false, nil // don't clobber a user's custom entry
+		}
+		entry["args"] = args // retain optional settings on the legacy entry
+	} else {
+		servers[name] = mcpServerEntry{Command: "ssh", Args: args}
+	}
+	root[mcpKey] = servers
+
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	if err := os.WriteFile(path, append(out, '\n'), 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// codexAppendMCP wires the box server into codex's TOML config
+// (~/.codex/config.toml) under [mcp_servers.<name>]. codex uses TOML, not
+// JSON, so we append a table rather than merge a map. Existing custom entries
+// stay untouched; legacy ssh/host/agent-box entries are upgraded in place so
+// comments, formatting, and unrelated settings survive. Re-runs are no-ops
+// once the entry is current.
+//
+// name/sshHost are box identifiers (already validated by create's naming
+// rules), so they need no TOML escaping here.
+func codexAppendMCP(path, name, sshHost string) (bool, error) {
+	header := fmt.Sprintf("[mcp_servers.%s]", name)
+	table := fmt.Sprintf("%s\ncommand = \"ssh\"\nargs = [%q, %q]\n", header, sshHost, coderun.AgentBoxRemoteCommand)
+	// #nosec G304 -- path is the caller's own ~/.codex/config.toml, not
+	// attacker-controlled.
+	existing, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if strings.Contains(string(existing), header) {
+			updated, changed := upgradeCodexMCPTable(string(existing), name, sshHost)
+			if !changed {
+				return false, nil
+			}
+			if err := os.WriteFile(path, []byte(updated), 0o600); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+	case os.IsNotExist(err):
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return false, err
+		}
+	default:
+		return false, err
+	}
+
+	var b strings.Builder
+	if len(existing) > 0 {
+		b.Write(existing)
+		if existing[len(existing)-1] != '\n' {
+			b.WriteByte('\n')
+		}
+		b.WriteByte('\n')
+	}
+	b.WriteString(table)
+
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// upgradeCodexMCPTable recognizes the legacy entry by its parsed command/args,
+// regardless of optional settings or their order. Only replace a quoted token
+// when decoding the result confirms the target server's args were upgraded:
+// lookalikes in comments, other tables, or multiline strings cannot match.
+func upgradeCodexMCPTable(existing, name, sshHost string) (string, bool) {
+	var config codexMCPConfig
+	if _, err := toml.Decode(existing, &config); err != nil {
+		return existing, false
+	}
+	entry := config.Servers[name]
+	if entry.Command != "ssh" || !slices.Equal(entry.Args, []string{sshHost, "agent-box"}) {
+		return existing, false
+	}
+	args := []string{sshHost, coderun.AgentBoxRemoteCommand}
+	for _, token := range []string{`"agent-box"`, `'agent-box'`} {
+		for offset := 0; offset < len(existing); {
+			index := strings.Index(existing[offset:], token)
+			if index < 0 {
+				break
+			}
+			index += offset
+			offset = index + len(token)
+			updated := existing[:index] + strconv.Quote(coderun.AgentBoxRemoteCommand) + existing[offset:]
+			var decoded codexMCPConfig
+			if _, err := toml.Decode(updated, &decoded); err == nil && slices.Equal(decoded.Servers[name].Args, args) {
+				return updated, true
+			}
+		}
+	}
+	return existing, false
+}
+
+// ─── agent launch (BYOA: your agent, your key, your laptop) ───────────────
+
+// agentSpec describes how to wire + invoke a local agent CLI. The agent reads
+// its MCP config from disk (step 3 writes it via wireMCP), so launchArgs does
+// NOT pass an --mcp-config flag; the box is already wired.
+type agentSpec struct {
+	bin           string
+	launchArgs    func(instruction string) []string
+	mcpConfigPath func(home string) string
+	wireMCP       func(path, name, sshHost string) (bool, error)
+}
+
+func (s agentSpec) pretty(instruction string) string {
+	return s.bin + " " + strings.Join(s.launchArgs(instruction), " ")
+}
+
+// supportedAgents is the ordered set surfaced to users and iterated for
+// deterministic wiring output.
+var supportedAgents = []string{"claude", "gemini", "codex"}
+
+// agentSpecs is the adapter table. Invocations are confirmed against each
+// shipping CLI:
+//   - claude: `claude "<prompt>"` — positional prompt seeds an interactive
+//     session (Claude Code); MCP read from ~/.claude.json.
+//   - gemini: `gemini -i "<prompt>"` — --prompt-interactive: "execute prompt
+//     and continue in interactive mode"; MCP read from ~/.gemini/settings.json
+//     (top-level mcpServers object, same JSON shape as claude).
+//   - codex:  `codex "<prompt>"` — positional [PROMPT], "optional user prompt
+//     to start the session" (codex-rs tui Cli); MCP read from
+//     ~/.codex/config.toml ([mcp_servers.<id>] with command/args).
+var agentSpecs = map[string]agentSpec{
+	"claude": {
+		bin:           "claude",
+		launchArgs:    func(p string) []string { return []string{p} },
+		mcpConfigPath: func(h string) string { return filepath.Join(h, ".claude.json") },
+		wireMCP: func(path, name, host string) (bool, error) {
+			return mergeMCPServerJSON(path, "mcpServers", name, host)
+		},
+	},
+	"gemini": {
+		bin:           "gemini",
+		launchArgs:    func(p string) []string { return []string{"-i", p} },
+		mcpConfigPath: func(h string) string { return filepath.Join(h, ".gemini", "settings.json") },
+		wireMCP: func(path, name, host string) (bool, error) {
+			return mergeMCPServerJSON(path, "mcpServers", name, host)
+		},
+	},
+	"codex": {
+		bin:           "codex",
+		launchArgs:    func(p string) []string { return []string{p} },
+		mcpConfigPath: func(h string) string { return filepath.Join(h, ".codex", "config.toml") },
+		wireMCP:       codexAppendMCP,
+	},
+}
+
+// mcpTarget pairs a resolved config path with the agent that owns it.
+type mcpTarget struct {
+	agent string
+	spec  agentSpec
+	path  string
+}
+
+// agentMCPTargets returns the config files to wire: the chosen agent always,
+// plus any other supported agent already configured on this machine (so a
+// user who later switches agents finds the box already wired). Deterministic
+// order (primary first, then supportedAgents order).
+func agentMCPTargets(home, primary string) []mcpTarget {
+	out := []mcpTarget{{agent: primary, spec: agentSpecs[primary], path: agentSpecs[primary].mcpConfigPath(home)}}
+	for _, a := range supportedAgents {
+		if a == primary {
+			continue
+		}
+		spec := agentSpecs[a]
+		if _, err := os.Stat(spec.mcpConfigPath(home)); err == nil {
+			out = append(out, mcpTarget{agent: a, spec: spec, path: spec.mcpConfigPath(home)})
+		}
+	}
+	return out
+}
+
+// resolveAgent looks up the spec AND confirms the binary is on PATH, so
+// --prompt can fail fast before creating a box.
+func resolveAgent(agent string) (agentSpec, error) {
+	spec, ok := agentSpecs[agent]
+	if !ok {
+		return agentSpec{}, fmt.Errorf("unknown --agent %q (supported: %s)", agent, strings.Join(supportedAgents, ", "))
+	}
+	if _, err := exec.LookPath(spec.bin); err != nil {
+		return agentSpec{}, fmt.Errorf("--agent %q selected but %q is not on PATH — install it or pass --no-launch to get the command to run", agent, spec.bin)
+	}
+	return spec, nil
+}
+
+// launchAgent replaces this process with the user's agent, dropping them into
+// a session already working on the build. Uses syscall.Exec (not os/exec) so
+// the terminal is handed straight over. Never returns on success.
+func launchAgent(agent, instruction string) error {
+	spec, err := resolveAgent(agent)
+	if err != nil {
+		return err
+	}
+	bin, err := exec.LookPath(spec.bin)
+	if err != nil {
+		return err
+	}
+	argv := append([]string{spec.bin}, spec.launchArgs(instruction)...)
+	fmt.Printf("  launching %s on the task…\n\n", spec.bin)
+	// #nosec G204 -- launching the user-selected local agent is the whole point
+	// (BYOA); bin is resolved from the fixed agentSpecs allowlist via LookPath,
+	// not from arbitrary user input.
+	return syscall.Exec(bin, argv, os.Environ())
+}
+
+// buildInstruction is the opening message handed to the agent. It names the
+// MCP server (so the agent uses the box's tools, which run inside the box) and
+// pins the serve port + public URL so "done" means "live at that URL".
+func buildInstruction(serverName, prompt, domain string, port int) string {
+	url := "the exposed URL"
+	if domain != "" {
+		url = "https://" + domain + "/"
+	}
+	return fmt.Sprintf(
+		"Use the %q MCP tools (they run inside a remote Containarium box) to build: %s. "+
+			"Write files and run commands with those tools, install dependencies, and serve the app on container port %d. "+
+			"It is exposed at %s, so once it's listening the site is live there.",
+		serverName, prompt, port, url,
+	)
+}
+
+func printQuickstartNextSteps(name string) {
+	fmt.Println("\n✓ quickstart complete")
+	fmt.Printf("  • ssh %s              # shell into the box\n", name)
+	fmt.Printf("  • your agent now sees the %q box via MCP\n", qsAgentName)
+	fmt.Printf("  • re-run with --prompt \"…\" --domain <host> to build + go live in one step\n")
+}
