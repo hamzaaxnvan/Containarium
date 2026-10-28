@@ -77,3 +77,82 @@ func (l *AuthFailureLimiter) Allow(ip string, now time.Time) bool {
 	if !ok {
 		b = &authBucket{tokens: float64(authFailureBurst), lastSeen: now}
 		l.buckets[ip] = b
+	}
+	// Refill based on elapsed time since lastSeen.
+	elapsed := now.Sub(b.lastSeen).Minutes()
+	b.tokens += elapsed * float64(authFailureRefillPerMin)
+	if b.tokens > float64(authFailureBurst) {
+		b.tokens = float64(authFailureBurst)
+	}
+	b.lastSeen = now
+
+	// Opportunistic eviction. Every Allow call sweeps a few
+	// neighbors — bounded so a /16 attack can't push GC into
+	// the hot path.
+	if len(l.buckets) > 1024 {
+		l.evictLocked(now)
+	}
+
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+func (l *AuthFailureLimiter) evictLocked(now time.Time) {
+	cutoff := now.Add(-authFailureTTL)
+	for ip, b := range l.buckets {
+		if b.lastSeen.Before(cutoff) {
+			delete(l.buckets, ip)
+		}
+	}
+}
+
+// clientIPFromRequest extracts a best-effort client IP for
+// rate-limit bucketing. Honors X-Forwarded-For only on calls that
+// the daemon's PROXY-protocol setup already trusted (the trusted
+// frontend rewrote the header). For untrusted requests we use the
+// raw remote-addr — an attacker spoofing XFF still gets bucketed
+// by their true source.
+//
+// Returns "" if no IP can be determined; callers should not
+// throttle in that case (fail-open on parse rather than block
+// legitimate traffic).
+func clientIPFromRequest(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// XFF is comma-separated; the leftmost is the original
+		// client. Caddy with PROXY trust list strips spoofed
+		// values from untrusted hops, so this is the most
+		// authoritative input we have.
+		if comma := indexComma(xff); comma >= 0 {
+			return trimSpace(xff[:comma])
+		}
+		return trimSpace(xff)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr // fallback — not a host:port shape
+	}
+	return host
+}
+
+func indexComma(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' {
+			return i
+		}
+	}
+	return -1
+}
+
+func trimSpace(s string) string {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	return s[start:end]
+}
