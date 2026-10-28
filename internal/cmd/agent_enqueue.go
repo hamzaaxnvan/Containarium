@@ -23,3 +23,28 @@ the box is needed (NAT/tunnel-friendly).
 Examples:
   containarium agent enqueue hello-agent --input '{"q":"hi"}' --server <host>`,
 	Args: cobra.ExactArgs(1),
+	RunE: runAgentEnqueue,
+}
+
+func init() {
+	agentCmd.AddCommand(agentEnqueueCmd)
+	agentEnqueueCmd.Flags().StringVar(&agentEnqueueInput, "input", "",
+		"Task input as a JSON string (defaults to {})")
+}
+
+func runAgentEnqueue(cmd *cobra.Command, args []string) error {
+	skillID := args[0]
+
+	c, err := newAgentClient()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+
+	resp, err := c.EnqueueAgentTask(skillID, agentEnqueueInput)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✓ enqueued task %s for skill %q\n", resp.TaskId, skillID)
+	return nil
+}
