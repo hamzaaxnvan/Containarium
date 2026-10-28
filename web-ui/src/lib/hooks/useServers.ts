@@ -71,3 +71,77 @@ export function useServers() {
     }
   }, [servers]);
 
+  /**
+   * Add a new server
+   */
+  const addServer = useCallback(async (name: string, endpoint: string, token: string): Promise<Server> => {
+    const newServer = addServerToStorage(name, endpoint, token);
+    const serverWithStatus: ServerWithStatus = {
+      ...newServer,
+      status: 'connecting',
+    };
+
+    setServers(prev => [...prev, serverWithStatus]);
+    setActiveServerId(newServer.id);
+
+    // Test connection
+    setTimeout(() => testServerConnection(newServer.id), 100);
+
+    return newServer;
+  }, [testServerConnection]);
+
+  /**
+   * Remove a server
+   */
+  const removeServer = useCallback((serverId: string) => {
+    removeServerFromStorage(serverId);
+    setServers(prev => {
+      const filtered = prev.filter(s => s.id !== serverId);
+
+      // If we removed the active server, switch to another one
+      if (activeServerId === serverId && filtered.length > 0) {
+        setActiveServerId(filtered[0].id);
+      } else if (filtered.length === 0) {
+        setActiveServerId(null);
+      }
+
+      return filtered;
+    });
+  }, [activeServerId]);
+
+  /**
+   * Update a server
+   */
+  const updateServer = useCallback(async (serverId: string, name: string, endpoint: string, token: string): Promise<Server | null> => {
+    const updated = updateServerInStorage(serverId, { name, endpoint, token });
+    if (!updated) return null;
+
+    setServers(prev => prev.map(s =>
+      s.id === serverId
+        ? { ...s, name, endpoint, token, status: 'connecting' as const }
+        : s
+    ));
+
+    // Test connection after update
+    setTimeout(() => testServerConnection(serverId), 100);
+
+    return updated;
+  }, [testServerConnection]);
+
+  /**
+   * Get the currently active server
+   */
+  const activeServer = servers.find(s => s.id === activeServerId) || null;
+
+  return {
+    servers,
+    activeServer,
+    activeServerId,
+    setActiveServerId,
+    addServer,
+    removeServer,
+    updateServer,
+    testServerConnection,
+    isLoading,
+  };
+}
