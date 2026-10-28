@@ -163,3 +163,251 @@ const (
 	// fetches the kubeconfig — the kubeconfig is deliberately behind
 	// the WRITE scope because it is cluster-admin material (holding it
 	// mutates the cluster's workloads), so an inspection-only token
+	// cannot take control of a cluster.
+	ScopeClustersRead  = "clusters:read"
+	ScopeClustersWrite = "clusters:write"
+	// clusters:scale is the cluster-autoscaler machine credential's
+	// ONLY scope (#1415): resize the token's own cluster's node pool
+	// within server-enforced bounds. It grants no read of other
+	// clusters, no kubeconfig, no create/delete.
+	ScopeClustersScale = "clusters:scale"
+
+	// read-only scopes for surfaces that were admin-only, so a least-privilege
+	// (e.g. compliance/evidence) token can read one without full admin (#621).
+	ScopeAuditRead          = "audit:read"          // audit-log query
+	ScopeNetworkPolicyRead  = "network-policy:read" // NetworkPolicyService Get/List
+	ScopeNetworkPolicyWrite = "network-policy:write"
+	ScopeTokensRead         = "tokens:read" // token listing
+
+	// audit:ingest (#2415) is the ONLY scope that may append externally
+	// sourced rows to the tamper-evident audit chain — today, the
+	// sentinel's SSH session records via AuditService.IngestSSHSessionRecords.
+	// It is deliberately not implied by audit:read, by any role, or by an
+	// unscoped token: the handler gates on RequireExplicitScope, so a token
+	// must name it.
+	ScopeAuditIngest = "audit:ingest"
+
+	// code-egress:read lets a tenant read its own coding-tool egress policy
+	// (CodingToolEgressPolicyService Get, #2378). Writes stay admin-only.
+	ScopeCodeEgressRead = "code-egress:read"
+
+	// ephemeral sandboxes (SandboxServer, #1488). A sandbox has no
+	// per-tenant Linux account and no SSH — spawn/exec/file/delete is its
+	// entire access surface, and an agent's own token is what reaches it,
+	// so it's gated separately from the persistent-box containers scope
+	// rather than folded into it.
+	ScopeSandboxesRead  = "sandboxes:read"
+	ScopeSandboxesWrite = "sandboxes:write"
+
+	// tracker broker (TrackerService, #1920/#1921). tracker:read /
+	// tracker:write are for the verbs an agent's run-scoped JWT carries
+	// (get/list issues, comment, claim, label, submit — #1922/#1923).
+	// tracker:admin is separate and gates connection CRUD only: naming
+	// where a tracker is and which credential to trust is an operator
+	// decision, so an agent run granted tracker:write to comment on
+	// issues must not also be able to repoint the connection at a
+	// different project or credential.
+	ScopeTrackerRead  = "tracker:read"
+	ScopeTrackerWrite = "tracker:write"
+	ScopeTrackerAdmin = "tracker:admin"
+
+	// model gateway (ModelGatewayService, #1726). Two scopes, not one, and
+	// neither folded into secrets:write or containers:write, because the two
+	// halves of this surface have different blast radii:
+	//
+	//   - gateway:admin registers and removes the REAL upstream provider key
+	//     one key owner pays with. It is a control-plane / operator verb: the
+	//     credential itself goes in under it. secrets:write would be the wrong
+	//     home — that scope is a tenant's own secrets, and a tenant must never
+	//     be able to write the key its own calls are billed against.
+	//   - gateway:mint issues a SCOPED, short-lived token for a box the caller
+	//     owns. That is a tenant-reachable verb, so it must be grantable
+	//     without also granting the ability to read or replace a real key.
+	//
+	// A token holding only one of the two can do exactly half of this service
+	// and nothing of the other half.
+	ScopeGatewayAdmin = "gateway:admin"
+	ScopeGatewayMint  = "gateway:mint"
+)
+
+// AllScopes is the catalog of every known scope. It backs IsKnownScope so
+// callers (e.g. the skill catalog) can reject a manifest that declares a
+// scope that does not exist — turning a typo into a load-time error instead
+// of a silently-overbroad token.
+var AllScopes = []string{
+	ScopeContainersRead, ScopeContainersWrite,
+	ScopeSecretsRead, ScopeSecretsWrite,
+	ScopeKMSAdmin,
+	ScopeBackupsRead, ScopeBackupsWrite, ScopeBackupsVerify,
+	ScopeVolumesRead, ScopeVolumesWrite,
+	ScopeRoutesRead, ScopeRoutesWrite,
+	ScopeSecurityRead, ScopeSecurityWrite, ScopeSecurityTriggerForOwner,
+	ScopeAlertsRead, ScopeAlertsWrite,
+	ScopeTrafficRead,
+	ScopeCodeWrite, ScopeSSHWrite, ScopeCodeAnswer,
+	ScopeTokensWrite, ScopeTokensDelegate,
+	ScopeAgentsRead, ScopeAgentsRun, ScopeAgentsRunForOrg, ScopeAgentsCall,
+	ScopeCrewsRead, ScopeCrewsRun,
+	ScopeAnonDoor, ScopeAnonAdmin,
+	ScopeSSHAuthorize,
+	ScopeClustersRead, ScopeClustersWrite, ScopeClustersScale,
+	ScopeAuditRead, ScopeNetworkPolicyRead, ScopeNetworkPolicyWrite, ScopeTokensRead,
+	ScopeAuditIngest,
+	ScopeCodeEgressRead,
+	ScopeSandboxesRead, ScopeSandboxesWrite,
+	ScopeTrackerRead, ScopeTrackerWrite, ScopeTrackerAdmin,
+	ScopeGatewayAdmin, ScopeGatewayMint,
+}
+
+// HasExplicitScope reports whether want is explicitly in granted (or the
+// wildcard is). Unlike HasScope, a nil/absent scopes claim does NOT match —
+// use this when *granting* access by scope (a missing claim must not silently
+// unlock an otherwise admin-only read).
+func HasExplicitScope(granted []string, want string) bool {
+	for _, s := range granted {
+		if s = strings.TrimSpace(s); s == want || s == ScopeWildcard {
+			return true
+		}
+	}
+	return false
+}
+
+// IsKnownScope reports whether s is a defined scope (the wildcard counts).
+func IsKnownScope(s string) bool {
+	if s == ScopeWildcard {
+		return true
+	}
+	for _, k := range AllScopes {
+		if k == s {
+			return true
+		}
+	}
+	return false
+}
+
+// HasScope returns true when the granted-scopes set covers
+// the required scope. Semantics:
+//
+//   - `granted == nil` → no scope restriction. Returns true
+//     for any required scope. This is the backwards-compat
+//     path: tokens minted before Phase 1.7 don't carry a
+//     scopes claim, and they keep working.
+//   - `granted == []string{"*"}` (or includes "*") → any
+//     scope is allowed.
+//   - otherwise → exact membership check.
+//
+// Empty required scope is interpreted as "no scope needed"
+// (some MCP tools are pure-introspection — list_backends,
+// get_system_info — and don't gate on a resource); these
+// always return true. Use this sparingly; the explicit
+// catalog is the supply chain of trust.
+func HasScope(granted []string, required string) bool {
+	if required == "" {
+		return true
+	}
+	if granted == nil {
+		return true
+	}
+	for _, s := range granted {
+		s = strings.TrimSpace(s)
+		if s == ScopeWildcard || s == required {
+			return true
+		}
+	}
+	return false
+}
+
+// IntersectScopes bounds a manifest's scopes by the caller's own granted
+// scopes, so a scope catalog (e.g. a skill's allowed_scopes) is a ceiling and
+// never a floor (#1676). Semantics mirror HasScope:
+//
+//   - caller == nil → unrestricted caller (no scopes claim, the Phase 1.7
+//     backwards-compat path); the manifest passes through unchanged.
+//   - caller containing the wildcard → same as unrestricted.
+//   - manifest containing the wildcard → the caller's own scopes pass through
+//     unchanged (the manifest imposes no additional ceiling).
+//   - otherwise → the set intersection: only scopes present in both.
+//
+// A non-nil but empty caller (explicit zero-scope token) intersects to empty
+// regardless of the manifest — fail closed, matching HasScope's explicit-deny
+// semantics for an empty granted list.
+//
+// Always returns a non-nil slice, so a caller can safely range over or mint a
+// token from the result without a nil check.
+func IntersectScopes(caller, manifest []string) []string {
+	if caller == nil || HasExplicitScope(caller, ScopeWildcard) {
+		out := make([]string, len(manifest))
+		copy(out, manifest)
+		return out
+	}
+	if HasExplicitScope(manifest, ScopeWildcard) {
+		out := make([]string, len(caller))
+		copy(out, caller)
+		return out
+	}
+	callerSet := make(map[string]struct{}, len(caller))
+	for _, s := range caller {
+		callerSet[strings.TrimSpace(s)] = struct{}{}
+	}
+	out := make([]string, 0, len(manifest))
+	for _, s := range manifest {
+		s = strings.TrimSpace(s)
+		if _, ok := callerSet[s]; ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// ExcludeScopes returns scopes with every entry in exclude removed,
+// preserving order. Used to hold a floor under IntersectScopes: some
+// scopes (e.g. tracker:admin) must never reach a minted run token no
+// matter how permissive the caller or the skill manifest are — a
+// wildcard caller/manifest, or an operator manifest that lists an
+// admin scope in allowed_scopes by mistake, would otherwise still let
+// IntersectScopes hand it out. nil in, nil out (a nil scope set stays
+// nil, which HasScope reads as unrestricted — excluding from "no
+// restriction" would be a contradiction, and the caller is expected to
+// have already decided that's not the case before minting a run token).
+func ExcludeScopes(scopes []string, exclude ...string) []string {
+	if scopes == nil {
+		return nil
+	}
+	excludeSet := make(map[string]struct{}, len(exclude))
+	for _, s := range exclude {
+		excludeSet[s] = struct{}{}
+	}
+	out := make([]string, 0, len(scopes))
+	for _, s := range scopes {
+		if _, ok := excludeSet[strings.TrimSpace(s)]; ok {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// ParseScopes normalizes a comma-separated scope string
+// into a []string suitable for the JWT claim. Whitespace
+// and empty elements are dropped; the order of remaining
+// entries is preserved.
+//
+// Returns nil for an empty or whitespace-only input — the
+// caller decides whether that means "no restriction" (omit
+// the claim) or "deny everything" (set an empty array).
+// HasScope treats nil as "no restriction".
+func ParseScopes(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
