@@ -56,3 +56,33 @@ func runPortforwardRemove(cmd *cobra.Command, args []string) error {
 		}
 
 		fmt.Println("Auto-detecting Caddy container IP...")
+		incusClient, err := incus.New()
+		if err != nil {
+			return fmt.Errorf("failed to connect to Incus: %w", err)
+		}
+
+		detectedIP, err := incusClient.FindCaddyContainerIP()
+		if err != nil {
+			return fmt.Errorf("failed to auto-detect Caddy IP: %w", err)
+		}
+		caddyIP = detectedIP
+		fmt.Printf("Detected Caddy at: %s\n", caddyIP)
+	}
+
+	if caddyIP == "" {
+		return fmt.Errorf("--caddy-ip or --auto is required")
+	}
+
+	// Remove port forwarding
+	portForwarder := network.NewPortForwarder(caddyIP)
+	if err := portForwarder.RemovePortForwarding(); err != nil {
+		return fmt.Errorf("failed to remove port forwarding: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Println("Port forwarding rules removed!")
+	fmt.Println()
+	fmt.Println("Run 'containarium portforward show' to verify.")
+
+	return nil
+}

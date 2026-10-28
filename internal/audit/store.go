@@ -370,3 +370,375 @@ func (s *Store) LogBatch(ctx context.Context, entries []BatchEntry) ([]BatchOutc
 		e.Timestamp = e.Timestamp.Truncate(time.Microsecond)
 
 		rowHash, _, inserted, err := insertChained(ctx, tx, &e, prevHash, entries[i].DedupeKey)
+		if err != nil {
+			return nil, fmt.Errorf("batch entry %d: %w", i, err)
+		}
+		if inserted {
+			outcomes[i] = BatchInserted
+			prevHash = rowHash
+		} else {
+			outcomes[i] = BatchDuplicate
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("audit: commit: %w", err)
+	}
+	return outcomes, nil
+}
+
+// MaxRowID returns the highest id currently in
+// audit_logs, or 0 if the table is empty. Used by the
+// audit-verify CLI to detect "scanned to the end" without
+// the Store API needing to surface a per-batch terminator.
+//
+// Cheap on a B-tree primary key — Postgres reads the last
+// page directly.
+func (s *Store) MaxRowID(ctx context.Context) (int64, error) {
+	var max *int64
+	if err := s.pool.QueryRow(ctx, `SELECT MAX(id) FROM audit_logs`).Scan(&max); err != nil {
+		return 0, fmt.Errorf("audit: max row id: %w", err)
+	}
+	if max == nil {
+		return 0, nil
+	}
+	return *max, nil
+}
+
+// VerifyChainSinceID walks the hash chain forward from
+// `fromID` (exclusive) and returns the ID of the first row that
+// fails verification, or 0 if the chain is intact. Pass 0 to
+// verify from the chain start.
+//
+// The function reads up to `limit` rows in one pass — callers
+// verifying long ranges should loop, passing the last verified
+// ID back in as the next fromID, so memory stays bounded.
+func (s *Store) VerifyChainSinceID(ctx context.Context, fromID int64, limit int) (firstBad int64, err error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	// The base and the rows are read in one snapshot: a purge that commits
+	// between two separate reads would move the base after the rows were
+	// chosen, and the first retained row would then look like a break.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return -1, fmt.Errorf("audit: begin verify snapshot: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // read-only snapshot
+
+	// After a retention purge (#2878) verification starts at the stored base,
+	// not at genesis: a from-id inside the purged range is clamped to it, and
+	// the first retained row must chain from the base hash.
+	base, purged, err := ReadChainBase(ctx, tx)
+	if err != nil {
+		return -1, err
+	}
+	atBase := purged && fromID <= base.ID
+	if atBase {
+		fromID = base.ID
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT id, timestamp, username, action, resource_type,
+		       resource_id, detail, source_ip, status_code,
+		       actor, delegation_chain, token_id, org_id, run_id,
+		       row_hash, prev_hash, hash_version
+		FROM audit_logs
+		WHERE id > $1 AND row_hash <> ''
+		ORDER BY id ASC
+		LIMIT $2
+	`, fromID, limit)
+	if err != nil {
+		return -1, fmt.Errorf("audit: query chain: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []ChainEntry
+	for rows.Next() {
+		var c ChainEntry
+		if err := rows.Scan(&c.ID, &c.Timestamp, &c.Username, &c.Action,
+			&c.ResourceType, &c.ResourceID, &c.Detail, &c.SourceIP, &c.StatusCode,
+			&c.Actor, &c.DelegationChain, &c.TokenID, &c.OrgID, &c.RunID,
+			&c.RowHash, &c.PrevHash, &c.HashVersion); err != nil {
+			return -1, fmt.Errorf("audit: scan chain row: %w", err)
+		}
+		entries = append(entries, c)
+	}
+	if err := rows.Err(); err != nil {
+		return -1, fmt.Errorf("audit: iterate chain rows: %w", err)
+	}
+	if len(entries) == 0 {
+		return 0, nil // empty range
+	}
+
+	// The expected prev_hash for the first row in this batch is
+	// whatever its stored prev_hash claims to be — we can't
+	// reach back beyond the WHERE without an extra query. The
+	// VerifyChain helper compares prev_hash to the value passed
+	// in. For a fromID=0 verification, the first row's
+	// prev_hash should be HashEmpty; on a purged chain it is the base hash.
+	expectedRoot := entries[0].PrevHash
+	switch {
+	case atBase:
+		expectedRoot = base.Hash
+	case fromID == 0:
+		expectedRoot = HashEmpty
+	}
+	return VerifyChain(entries, expectedRoot)
+}
+
+// Query retrieves audit log entries with optional filters and pagination
+func (s *Store) Query(ctx context.Context, params QueryParams) ([]AuditEntry, int32, error) {
+	baseQuery := `SELECT id, timestamp, username, action, resource_type, resource_id,
+		detail, source_ip, status_code, actor, delegation_chain, token_id, org_id, run_id
+		FROM audit_logs WHERE 1=1`
+	countQuery := `SELECT COUNT(*) FROM audit_logs WHERE 1=1`
+
+	var args []interface{}
+	argIdx := 1
+
+	if params.Username != "" {
+		baseQuery += fmt.Sprintf(" AND username = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND username = $%d", argIdx)
+		args = append(args, params.Username)
+		argIdx++
+	}
+
+	if params.Action != "" {
+		baseQuery += fmt.Sprintf(" AND action = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND action = $%d", argIdx)
+		args = append(args, params.Action)
+		argIdx++
+	}
+
+	if params.ResourceType != "" {
+		baseQuery += fmt.Sprintf(" AND resource_type = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND resource_type = $%d", argIdx)
+		args = append(args, params.ResourceType)
+		argIdx++
+	}
+
+	if params.ResourceID != "" {
+		baseQuery += fmt.Sprintf(" AND resource_id = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND resource_id = $%d", argIdx)
+		args = append(args, params.ResourceID)
+		argIdx++
+	}
+
+	// #1678 — attribution filters, same exact-match convention as above.
+	if params.Actor != "" {
+		baseQuery += fmt.Sprintf(" AND actor = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND actor = $%d", argIdx)
+		args = append(args, params.Actor)
+		argIdx++
+	}
+
+	if params.TokenID != "" {
+		baseQuery += fmt.Sprintf(" AND token_id = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND token_id = $%d", argIdx)
+		args = append(args, params.TokenID)
+		argIdx++
+	}
+
+	if params.OrgID != "" {
+		baseQuery += fmt.Sprintf(" AND org_id = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND org_id = $%d", argIdx)
+		args = append(args, params.OrgID)
+		argIdx++
+	}
+
+	if params.RunID != "" {
+		baseQuery += fmt.Sprintf(" AND run_id = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND run_id = $%d", argIdx)
+		args = append(args, params.RunID)
+		argIdx++
+	}
+
+	if !params.From.IsZero() {
+		baseQuery += fmt.Sprintf(" AND timestamp >= $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND timestamp >= $%d", argIdx)
+		args = append(args, params.From)
+		argIdx++
+	}
+
+	if !params.To.IsZero() {
+		baseQuery += fmt.Sprintf(" AND timestamp <= $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND timestamp <= $%d", argIdx)
+		args = append(args, params.To)
+		argIdx++
+	}
+
+	// Get total count
+	var totalCount int32
+	err := s.pool.QueryRow(ctx, countQuery, args...).Scan(&totalCount)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to count audit logs: %w", err)
+	}
+
+	// Apply pagination
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	baseQuery += fmt.Sprintf(" ORDER BY timestamp DESC LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
+	args = append(args, limit, params.Offset)
+
+	rows, err := s.pool.Query(ctx, baseQuery, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to query audit logs: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []AuditEntry
+	for rows.Next() {
+		var e AuditEntry
+		if err := rows.Scan(&e.ID, &e.Timestamp, &e.Username, &e.Action,
+			&e.ResourceType, &e.ResourceID, &e.Detail, &e.SourceIP, &e.StatusCode,
+			&e.Actor, &e.DelegationChain, &e.TokenID, &e.OrgID, &e.RunID); err != nil {
+			return nil, 0, fmt.Errorf("failed to scan audit row: %w", err)
+		}
+		entries = append(entries, e)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating audit rows: %w", err)
+	}
+
+	return entries, totalCount, nil
+}
+
+// Close closes the underlying connection pool
+func (s *Store) Close() {
+	s.pool.Close()
+}
+
+// RowHashAt returns the row_hash stored at audit-log row id, and whether
+// that row exists. found=false (rather than an error) is the expected,
+// meaningful outcome when the row has been deleted — a fact
+// VerifyChainAgainstAnchor treats as evidence of tampering, not a failure
+// to report as "unknown."
+func (s *Store) RowHashAt(ctx context.Context, id int64) (hash string, found bool, err error) {
+	err = s.pool.QueryRow(ctx, `SELECT row_hash FROM audit_logs WHERE id = $1`, id).Scan(&hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The last purged row (#2878) is gone, but its hash is the chain
+		// base, so an anchor at exactly that checkpoint can still be checked.
+		base, purged, berr := s.ChainBase(ctx)
+		if berr != nil {
+			return "", false, berr
+		}
+		if purged && base.ID == id {
+			return base.Hash, true, nil
+		}
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("audit: row hash at id=%d: %w", id, err)
+	}
+	return hash, true, nil
+}
+
+// ChainEntryAt returns audit-log row id with its hash-chain columns, and
+// whether it exists. A purged or deleted row is found=false.
+func (s *Store) ChainEntryAt(ctx context.Context, id int64) (ChainEntry, bool, error) {
+	var c ChainEntry
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, timestamp, username, action, resource_type,
+		       resource_id, detail, source_ip, status_code,
+		       actor, delegation_chain, token_id, org_id, run_id,
+		       row_hash, prev_hash, hash_version
+		FROM audit_logs WHERE id = $1`, id).Scan(&c.ID, &c.Timestamp, &c.Username, &c.Action,
+		&c.ResourceType, &c.ResourceID, &c.Detail, &c.SourceIP, &c.StatusCode,
+		&c.Actor, &c.DelegationChain, &c.TokenID, &c.OrgID, &c.RunID,
+		&c.RowHash, &c.PrevHash, &c.HashVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ChainEntry{}, false, nil
+	}
+	if err != nil {
+		return ChainEntry{}, false, fmt.Errorf("audit: chain entry at id=%d: %w", id, err)
+	}
+	return c, true, nil
+}
+
+// AnchorVerifyResult is VerifyChainAgainstAnchor's outcome. Two independent
+// checks, because they catch two different attacks (#1706):
+//
+//   - AnchorRoot vs CurrentRoot: was the row AT the anchored checkpoint (or
+//     anything before it) rewritten since it was anchored? Internal chain
+//     consistency alone cannot see this — a rewrite followed by a correct
+//     recompute forward preserves internal consistency by construction.
+//     Only a hash held outside the database can catch it.
+//   - FirstBadAfterCheckpoint: is everything AFTER the checkpoint still
+//     internally consistent? A break here means tampering since the last
+//     anchor that was NOT (or not yet) followed by a correct recompute —
+//     the ordinary hash_chain.go case, just scoped to the post-anchor tail.
+type AnchorVerifyResult struct {
+	// Checkpoint is the anchored row id this result was checked against.
+	Checkpoint int64
+	// AnchorRoot is the externally-anchored hash at Checkpoint.
+	AnchorRoot string
+	// CurrentRoot is what's in the database at Checkpoint right now.
+	// Empty means the row no longer exists (deleted) — also a mismatch.
+	CurrentRoot string
+	// FirstBadAfterCheckpoint is VerifyChainSinceID's result for rows after
+	// Checkpoint: 0 if intact, otherwise the first bad row's id.
+	FirstBadAfterCheckpoint int64
+}
+
+// OK reports whether both halves of the result are clean.
+func (r AnchorVerifyResult) OK() bool {
+	return r.AnchorRoot == r.CurrentRoot && r.FirstBadAfterCheckpoint == 0
+}
+
+// ErrNoAnchor is returned by VerifyChainAgainstAnchor when sink has never
+// had a root published to it. Not a chain-integrity failure — there is
+// simply nothing yet to check against.
+var ErrNoAnchor = errors.New("audit: no anchor has been published yet")
+
+// VerifyChainAgainstAnchor checks the chain against the last root sink
+// published, catching a privileged rewrite-and-recompute that internal
+// consistency (VerifyChain / VerifyChainSinceID) cannot: see
+// AnchorVerifyResult's doc comment for why both checks are needed.
+func (s *Store) VerifyChainAgainstAnchor(ctx context.Context, sink RootSink) (AnchorVerifyResult, error) {
+	checkpoint, anchorRoot, ok, err := sink.LastPublished(ctx)
+	if err != nil {
+		return AnchorVerifyResult{}, fmt.Errorf("audit: read last anchor: %w", err)
+	}
+	if !ok {
+		return AnchorVerifyResult{}, ErrNoAnchor
+	}
+	currentRoot, _, err := s.RowHashAt(ctx, checkpoint)
+	if err != nil {
+		return AnchorVerifyResult{}, fmt.Errorf("audit: row hash at anchored checkpoint %d: %w", checkpoint, err)
+	}
+
+	// VerifyChainSinceID caps a single call at `limit` rows (default 1000)
+	// to keep memory bounded — the same reason runAuditVerify (CLI) loops
+	// rather than trusting one call to cover an arbitrary range. Mirrored
+	// here so a chain with many rows logged since the last anchor is still
+	// checked in full, not just its first 1000 post-checkpoint rows.
+	maxID, err := s.MaxRowID(ctx)
+	if err != nil {
+		return AnchorVerifyResult{}, fmt.Errorf("audit: max row id: %w", err)
+	}
+	var firstBad int64
+	for from := checkpoint; from < maxID; {
+		firstBad, err = s.VerifyChainSinceID(ctx, from, 0)
+		if err != nil {
+			return AnchorVerifyResult{}, fmt.Errorf("audit: verify chain since checkpoint %d: %w", checkpoint, err)
+		}
+		if firstBad != 0 {
+			break
+		}
+		from += defaultVerifyBatch
+	}
+	return AnchorVerifyResult{
+		Checkpoint:              checkpoint,
+		AnchorRoot:              anchorRoot,
+		CurrentRoot:             currentRoot,
+		FirstBadAfterCheckpoint: firstBad,
+	}, nil
+}
