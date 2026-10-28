@@ -58,3 +58,34 @@ func runTrackerChangeSubmit(cmd *cobra.Command, args []string) error {
 		Username:    username,
 		Connection:  connection,
 		Issue:       issue,
+		Title:       trackerChangeSubmitTitle,
+		Description: trackerChangeSubmitDescription,
+		Draft:       trackerChangeSubmitDraft,
+	}
+	var change *pb.TrackerChange
+	if httpMode {
+		h, err := client.NewHTTPClient(serverAddr, authToken)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = h.Close() }()
+		if change, err = h.SubmitTrackerChange(req); err != nil {
+			return err
+		}
+	} else {
+		g, err := client.NewGRPCClient(serverAddr, certsDir, insecure)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = g.Close() }()
+		if change, err = g.SubmitTrackerChange(req); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("#%d opened on branch %s\n", change.GetNumber(), change.GetBranch())
+	if change.GetUrl() != "" {
+		fmt.Printf("url: %s\n", change.GetUrl())
+	}
+	return nil
+}

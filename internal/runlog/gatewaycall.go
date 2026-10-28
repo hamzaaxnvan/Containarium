@@ -97,3 +97,37 @@ func journalTime(line []byte) (time.Time, bool) {
 		T string `json:"t"`
 	}
 	if json.Unmarshal(line, &l) != nil || l.T == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, l.T)
+	return t, err == nil
+}
+
+// mergeByTime writes lines (whole journal lines) to w with the pending events
+// placed before the first line that is later than them, and returns the events
+// not yet placed (later than every line). A line without a time inherits the
+// previous line's.
+func mergeByTime(w io.Writer, lines []byte, pending []*pb.GatewayCall) ([]*pb.GatewayCall, error) {
+	sort.SliceStable(pending, func(i, j int) bool { return pending[i].GetTime().AsTime().Before(pending[j].GetTime().AsTime()) })
+	var last time.Time
+	for len(lines) > 0 {
+		end := bytes.IndexByte(lines, '\n') + 1
+		line := lines[:end]
+		lines = lines[end:]
+		if t, ok := journalTime(line); ok {
+			last = t
+		}
+		n := 0
+		for n < len(pending) && !pending[n].GetTime().AsTime().After(last) {
+			n++
+		}
+		if err := WriteGatewayCalls(w, pending[:n]); err != nil {
+			return pending, err
+		}
+		pending = pending[n:]
+		if _, err := w.Write(line); err != nil {
+			return pending, err
+		}
+	}
+	return pending, nil
+}
