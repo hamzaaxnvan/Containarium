@@ -91,3 +91,97 @@ func runGitHubUpgrade(ctx context.Context, binaryPath, tag string, force, allowD
 	if err := checkDowngrade(runningVersion(), tag, allowDowngrade); err != nil {
 		return false, err
 	}
+	remoteChecksum, err := releases.FetchSHA256(ctx, tag, githubUpgradeBinaryName)
+	if err != nil {
+		return false, fmt.Errorf("fetch SHA256SUMS for %s: %w", tag, err)
+	}
+
+	localChecksum, err := checksumFile(binaryPath)
+	if err != nil {
+		return false, fmt.Errorf("checksum local binary: %w", err)
+	}
+
+	if remoteChecksum == localChecksum && !force {
+		return false, nil
+	}
+	if remoteChecksum == localChecksum {
+		log.Printf("[github-upgrade] forced upgrade; binary already matches %s (%s...)", tag, localChecksum[:12])
+	} else {
+		log.Printf("[github-upgrade] installing %s (local=%s..., remote=%s...)", tag, localChecksum[:12], remoteChecksum[:12])
+	}
+
+	tmpPath := binaryPath + ".new"
+	if err := downloadGitHubBinary(ctx, tag, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("download: %w", err)
+	}
+
+	dlChecksum, err := checksumFile(tmpPath)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("verify download: %w", err)
+	}
+	if dlChecksum != remoteChecksum {
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("checksum mismatch after download (got %s, want %s)", dlChecksum[:12], remoteChecksum[:12])
+	}
+
+	if err := os.Chmod(tmpPath, 0755); err != nil { // #nosec G302 -- executable binary needs 0755
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("chmod: %w", err)
+	}
+
+	// Smoke-test before committing the swap, same safeguard checkAndUpdate
+	// applies: the new binary must at least execute and print its version.
+	smokeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	smokeOut, smokeErr := exec.CommandContext(smokeCtx, tmpPath, "version").CombinedOutput() // #nosec G204 -- tmpPath derived from trusted binaryPath
+	cancel()
+	if smokeErr != nil {
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("smoke test failed (new binary did not run `version`): %w; output: %s", smokeErr, strings.TrimSpace(string(smokeOut)))
+	}
+
+	oldPath := binaryPath + ".old"
+	_ = os.Remove(oldPath)
+	if err := os.Rename(binaryPath, oldPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, fmt.Errorf("rename old binary: %w", err)
+	}
+	if err := os.Rename(tmpPath, binaryPath); err != nil {
+		_ = os.Rename(oldPath, binaryPath)
+		return false, fmt.Errorf("rename new binary: %w", err)
+	}
+
+	log.Printf("[github-upgrade] binary replaced with %s, restarting...", tag)
+	restartAfterGitHubSwap(binaryPath)
+
+	return true, nil
+}
+
+func downloadGitHubBinary(ctx context.Context, tag, destPath string) error {
+	url := releases.BinaryDownloadURL(tag, githubUpgradeBinaryName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d from %s", resp.StatusCode, url)
+	}
+
+	f, err := os.Create(destPath) // #nosec G304 -- destPath is a temp file derived from trusted binaryPath config
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		return err
+	}
+	return f.Close()
+}

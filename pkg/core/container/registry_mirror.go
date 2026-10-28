@@ -39,3 +39,86 @@ const registryMirrorsPath = "/etc/containers/registries.conf.d/00-containarium-m
 // registryMirrorsDir is the drop-in directory (podman ships it, but a minimal
 // base image may not — we mkdir -p before writing).
 const registryMirrorsDir = "/etc/containers/registries.conf.d"
+
+// RegistryMirror is one upstream->mirror redirect for the box's podman.
+type RegistryMirror struct {
+	Upstream string // e.g. "docker.io", "ghcr.io"
+	Location string // mirror host[:port], no scheme, e.g. "mirror.lan:5000"
+	Insecure bool   // plain-HTTP mirror (no TLS)
+}
+
+// defaultRegistryMirrors reads the configured mirrors from the environment.
+func defaultRegistryMirrors() []RegistryMirror {
+	return parseRegistryMirrors(os.Getenv(envRegistryMirrors))
+}
+
+// parseRegistryMirrors parses the CONTAINARIUM_REGISTRY_MIRRORS value. Malformed
+// entries (no '=', empty upstream/mirror) are skipped rather than failing — a
+// bad env var must not brick box creation.
+func parseRegistryMirrors(s string) []RegistryMirror {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var out []RegistryMirror
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		up, mir, ok := strings.Cut(part, "=")
+		up = strings.TrimSpace(up)
+		mir = strings.TrimSpace(mir)
+		if !ok || up == "" || mir == "" {
+			continue
+		}
+		insecure := false
+		if rest, found := strings.CutPrefix(mir, "http://"); found {
+			mir, insecure = rest, true
+		} else if rest, found := strings.CutPrefix(mir, "https://"); found {
+			mir = rest
+		}
+		mir = strings.Trim(strings.TrimRight(mir, "/"), " ")
+		if mir == "" {
+			continue
+		}
+		out = append(out, RegistryMirror{Upstream: up, Location: mir, Insecure: insecure})
+	}
+	return out
+}
+
+// renderMirrorsConf renders the registries.conf.d drop-in (containers-registries
+// v2 TOML). One [[registry]] block per upstream, each with a single mirror.
+func renderMirrorsConf(mirrors []RegistryMirror) string {
+	var b strings.Builder
+	b.WriteString("# Managed by Containarium (#908) — registry pull-through mirrors.\n")
+	b.WriteString("# Boxes resolve these upstreams via the operator-provided mirror\n")
+	b.WriteString("# first, falling back to the upstream on a miss or mirror outage.\n")
+	for _, m := range mirrors {
+		b.WriteString("\n[[registry]]\n")
+		fmt.Fprintf(&b, "location = %q\n", m.Upstream)
+		b.WriteString("[[registry.mirror]]\n")
+		fmt.Fprintf(&b, "location = %q\n", m.Location)
+		if m.Insecure {
+			b.WriteString("insecure = true\n")
+		}
+	}
+	return b.String()
+}
+
+// writeRegistryMirrors installs the mirror drop-in into a box. No-op when no
+// mirror is configured. Returns an error only on a substrate failure; the
+// caller treats it as best-effort (a good box must not be lost over mirror
+// config — podman still pulls upstream).
+func (m *Manager) writeRegistryMirrors(containerName string) error {
+	if len(m.mirrors) == 0 {
+		return nil
+	}
+	if err := m.incus.Exec(containerName, []string{"mkdir", "-p", registryMirrorsDir}); err != nil {
+		return fmt.Errorf("registry-mirror: mkdir %s: %w", registryMirrorsDir, err)
+	}
+	if err := m.incus.WriteFile(containerName, registryMirrorsPath, []byte(renderMirrorsConf(m.mirrors)), "0644"); err != nil {
+		return fmt.Errorf("registry-mirror: write %s: %w", registryMirrorsPath, err)
+	}
+	return nil
+}
