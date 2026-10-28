@@ -147,3 +147,53 @@ func runCertGenerate(cmd *cobra.Command, args []string) error {
 	log.Printf("  Client Key:         %s", paths.ClientKey)
 
 	log.Printf("\nNext steps:")
+	log.Printf("  1. Start the daemon with mTLS:")
+	log.Printf("     sudo containarium daemon --mtls")
+	log.Printf("\n  2. Connect from CLI (will use certificates automatically):")
+	log.Printf("     containarium list")
+	log.Printf("\n  3. For remote servers, copy client certificates:")
+	log.Printf("     scp %s <user>@<remote>:~/.config/containarium/", paths.ClientCert)
+	log.Printf("     scp %s <user>@<remote>:~/.config/containarium/", paths.ClientKey)
+	log.Printf("     scp %s <user>@<remote>:~/.config/containarium/", paths.CACert)
+
+	return nil
+}
+
+func runCertGenerateWithCA(cmd *cobra.Command, args []string) error {
+	log.Printf("Generating TLS certificates with existing CA...")
+	log.Printf("  CA Certificate: %s", certCAPath)
+	log.Printf("  CA Key: %s", certCAKeyPath)
+	log.Printf("  Organization: %s", certOrganization)
+	log.Printf("  DNS names: %v", certDNSNames)
+	log.Printf("  IP addresses: %v", certIPAddresses)
+	log.Printf("  Valid for: %v", certDuration)
+	log.Printf("  Output directory: %s", certOutputDir)
+
+	opts := mtls.GenerateOptions{
+		Organization: certOrganization,
+		DNSNames:     certDNSNames,
+		IPAddresses:  certIPAddresses,
+		Duration:     certDuration,
+		OutputDir:    certOutputDir,
+	}
+
+	if err := mtls.GenerateWithExistingCA(certCAPath, certCAKeyPath, opts); err != nil {
+		return fmt.Errorf("failed to generate certificates: %w", err)
+	}
+
+	paths := mtls.CertPathsFromDir(certOutputDir)
+
+	log.Printf("\n✓ Certificates generated successfully!")
+	log.Printf("\nGenerated files:")
+	log.Printf("  CA Certificate:     %s (copied from %s)", paths.CACert, certCAPath)
+	log.Printf("  Server Certificate: %s", paths.ServerCert)
+	log.Printf("  Server Key:         %s", paths.ServerKey)
+	log.Printf("  Client Certificate: %s", paths.ClientCert)
+	log.Printf("  Client Key:         %s", paths.ClientKey)
+
+	log.Printf("\nNext steps:")
+	log.Printf("  1. Start the daemon with mTLS:")
+	log.Printf("     sudo containarium daemon --mtls --certs-dir %s", certOutputDir)
+
+	return nil
+}
