@@ -68,3 +68,38 @@ check() {
       echo "::error file=${script#"$ROOT"/}::50051/tcp not opened with --mtls"
       rc=1
     fi
+  done
+  return "$rc"
+}
+
+self_test() {
+  local dir rc=0 good
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' RETURN
+  good="$ROOT/hacks/install.sh"
+  # shellcheck disable=SC2016 # the ${...} is literal text to match, not an expansion
+  # Always opens 50051: the pre-fix behavior.
+  sed 's/if \[ "\${ENABLE_MTLS:-0}" = "1" \]; then/if true; then/' "$good" > "$dir/always.sh"
+  # Never opens 50051: --mtls would silently do nothing.
+  # shellcheck disable=SC2016
+  sed 's/if \[ "\${ENABLE_MTLS:-0}" = "1" \]; then/if false; then/' "$good" > "$dir/never.sh"
+  if cmp -s "$good" "$dir/always.sh" || cmp -s "$good" "$dir/never.sh"; then
+    echo "self-test FAIL: mutation did not apply (guard line changed?)"
+    return 1
+  fi
+  local f
+  for f in always never; do
+    if check "$dir/$f.sh" > /dev/null; then
+      echo "self-test FAIL: $f.sh is broken but passed"
+      rc=1
+    fi
+  done
+  [ "$rc" -eq 0 ] && echo "self-test ok: always-open and never-open installers caught"
+  return "$rc"
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  self_test
+else
+  check "$ROOT/hacks/install.sh" "$ROOT/hacks/offline-install/install.sh"
+fi
