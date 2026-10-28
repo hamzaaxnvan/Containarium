@@ -246,3 +246,251 @@ configure_zfs() {
     fi
 
     log_success "ZFS configured"
+}
+
+configure_kernel_modules() {
+    log_info "Configuring kernel modules for Docker support..."
+
+    MODULES=("overlay" "br_netfilter" "nf_nat")
+
+    for module in "${MODULES[@]}"; do
+        if ! lsmod | grep -q "^$module"; then
+            log_info "Loading kernel module: $module"
+            modprobe "$module" || log_warn "modprobe $module failed"
+        fi
+
+        if ! grep -q "^$module$" /etc/modules-load.d/containarium.conf 2>/dev/null; then
+            echo "$module" >> /etc/modules-load.d/containarium.conf
+        fi
+    done
+
+    log_success "Kernel modules configured"
+}
+
+install_binaries() {
+    log_info "Installing Containarium binaries from $BIN_DIR (no network)"
+
+    install -m 0755 "$BIN_DIR/containariumd" "$INSTALL_DIR/containariumd"
+    install -m 0755 "$BIN_DIR/mcp-server"    "$INSTALL_DIR/mcp-server"
+    install -m 0755 "$BIN_DIR/agent-box"     "$INSTALL_DIR/agent-box"
+    # #1781 rollout compat symlink: keeps the pre-#1780 name working for any
+    # runbook/cron this inventory missed.
+    ln -sf "$INSTALL_DIR/containariumd" "$INSTALL_DIR/containarium"
+
+    local v
+    v="$("$INSTALL_DIR/containariumd" version 2>/dev/null || echo "unknown")"
+    log_success "Containarium installed: $v"
+    log_success "mcp-server installed:   $INSTALL_DIR/mcp-server"
+    log_success "agent-box installed:    $INSTALL_DIR/agent-box"
+}
+
+generate_tls_certificates() {
+    log_info "Generating TLS certificates for mTLS..."
+
+    if [ -f "$CONFIG_DIR/certs/server.crt" ]; then
+        log_info "TLS certificates already exist"
+        return 0
+    fi
+
+    "$INSTALL_DIR/containariumd" cert generate --output "$CONFIG_DIR/certs"
+
+    log_success "TLS certificates generated: $CONFIG_DIR/certs"
+}
+
+setup_jwt_secret() {
+    log_info "Setting up JWT secret for REST API..."
+
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+
+    if [ ! -f "$CONFIG_DIR/jwt.secret" ]; then
+        # `openssl rand` is local CSPRNG (no network). If openssl is
+        # missing in the air-gapped image, fall back to /dev/urandom.
+        if command -v openssl >/dev/null 2>&1; then
+            openssl rand -base64 32 > "$CONFIG_DIR/jwt.secret"
+        else
+            head -c 32 /dev/urandom | base64 > "$CONFIG_DIR/jwt.secret"
+        fi
+        chmod 600 "$CONFIG_DIR/jwt.secret"
+        log_success "JWT secret generated: $CONFIG_DIR/jwt.secret"
+    else
+        log_info "JWT secret already exists: $CONFIG_DIR/jwt.secret"
+    fi
+}
+
+create_systemd_service() {
+    log_info "Creating systemd service via 'containariumd service install'..."
+
+    /usr/local/bin/containariumd service install
+
+    log_success "Systemd service created"
+}
+
+setup_firewall() {
+    if [ "$SKIP_FIREWALL" = "1" ]; then
+        log_info "Skipping firewall setup (--skip-firewall)"
+        return 0
+    fi
+
+    log_info "Configuring firewall..."
+
+    if command -v ufw &> /dev/null; then
+        ufw allow 22/tcp comment 'SSH' || true
+        # The daemon serves an external gRPC listener only with --mtls; without
+        # it 50051 has nothing behind it, so leave the port closed (#3063).
+        if [ "${ENABLE_MTLS:-0}" = "1" ]; then
+            ufw allow 50051/tcp comment 'Containarium gRPC (mTLS)' || true
+        fi
+        ufw allow 8080/tcp comment 'Containarium REST API' || true
+
+        if ! ufw status | grep -q "Status: active"; then
+            log_warn "UFW is installed but not active. Enable with: sudo ufw enable"
+        else
+            log_success "Firewall rules configured"
+        fi
+    else
+        log_warn "UFW not installed. Consider installing for security: apt install ufw"
+    fi
+}
+
+generate_initial_token() {
+    log_info "Generating initial admin token..."
+
+    if [ -f "$CONFIG_DIR/jwt.secret" ]; then
+        TOKEN=$("$INSTALL_DIR/containariumd" token generate \
+            --username admin \
+            --roles admin \
+            --expiry 720h \
+            --secret-file "$CONFIG_DIR/jwt.secret" 2>/dev/null | grep "^eyJ" || echo "")
+
+        if [ -n "$TOKEN" ]; then
+            echo "$TOKEN" > "$CONFIG_DIR/admin.token"
+            chmod 600 "$CONFIG_DIR/admin.token"
+            log_success "Admin token saved to: $CONFIG_DIR/admin.token"
+        fi
+    fi
+}
+
+import_sidecars() {
+    if [ "$SKIP_SIDECARS" = "1" ]; then
+        log_info "Skipping sidecar imports (--skip-sidecars)"
+        return 0
+    fi
+
+    if [ ! -d "$SIDECAR_DIR" ]; then
+        log_info "No sidecars/ directory in bundle — skipping"
+        return 0
+    fi
+
+    shopt -s nullglob
+    local imports=0
+    for tar in "$SIDECAR_DIR"/*.tar; do
+        local name
+        name="$(basename "$tar" .tar)"
+        if command -v docker >/dev/null 2>&1; then
+            log_info "docker load < $tar"
+            if docker load -i "$tar"; then
+                imports=$((imports + 1))
+            else
+                log_warn "docker load failed for $name (skipping)"
+            fi
+        else
+            log_warn "docker not available; cannot import sidecar $name"
+            log_warn "If using Incus to run sidecars, import manually:"
+            log_warn "  incus image import $tar --alias $name"
+        fi
+    done
+    shopt -u nullglob
+
+    if [ "$imports" -gt 0 ]; then
+        log_success "Loaded $imports sidecar image(s)"
+    fi
+}
+
+print_completion_message() {
+    local bundle_version
+    bundle_version="$(cat "$VERSION_FILE" 2>/dev/null || echo "unknown")"
+
+    echo ""
+    echo "==============================================================="
+    echo -e "${GREEN}  Containarium Air-Gapped Installation Complete${NC}"
+    echo -e "${GREEN}  No outbound network calls made during install${NC}"
+    echo "==============================================================="
+    echo ""
+    echo "Installed Components:"
+    echo "   - Containarium $(containarium version 2>/dev/null || echo "$bundle_version")"
+    echo "   - Incus $(incus --version 2>/dev/null || echo "(installed)")"
+    echo "   - ZFS kernel module"
+    echo "   - mcp-server, agent-box"
+    echo ""
+    echo "Configuration:"
+    echo "   - Config directory: $CONFIG_DIR"
+    echo "   - JWT secret: $CONFIG_DIR/jwt.secret"
+    if [ -f "$CONFIG_DIR/admin.token" ]; then
+        echo "   - Admin token: $CONFIG_DIR/admin.token"
+    fi
+    echo "   - Systemd service: /etc/systemd/system/containarium.service"
+    echo ""
+    echo "Next Steps:"
+    echo ""
+    echo "   1. Start the daemon:"
+    echo "      sudo systemctl start containarium"
+    echo ""
+    echo "   2. Check status:"
+    echo "      sudo systemctl status containarium"
+    echo ""
+    echo "   3. Create your first container. The bundle ships no base image:"
+    echo "      import one you transferred yourself, then use its alias:"
+    echo ""
+    echo "      sudo incus image import <file> --alias <local-image-alias>"
+    echo "      sudo containarium create test-1 \\"
+    echo "        --image <local-image-alias> \\"
+    echo "        --ssh-key ~/.ssh/id_ed25519.pub"
+    echo ""
+    echo "   4. (Optional) Provision a self-hosted GHA runner. For GitHub"
+    echo "      Enterprise Server set GH_BASE_URL to your server URL:"
+    echo ""
+    echo "      ssh test-1 'sudo GH_REPO=org/repo GH_PAT=xxx \\"
+    echo "        GH_BASE_URL=https://github.your-company.internal \\"
+    echo "        ./hacks/runner/install.sh'"
+    echo ""
+    echo "Documentation (offline, inside the bundle):"
+    echo "   - $BUNDLE_DIR/docs/INSTALL.md"
+    echo "   - $BUNDLE_DIR/docs/VERIFY.md"
+    echo "   - $BUNDLE_DIR/docs/GHES.md"
+    echo ""
+    echo "==============================================================="
+    echo ""
+}
+
+# Main installation flow
+main() {
+    echo ""
+    echo "==============================================================="
+    echo "  Containarium Air-Gapped Installation"
+    echo "==============================================================="
+    echo ""
+
+    check_root
+    check_os
+    check_bundle
+    verify_checksums
+    install_apt_dependencies
+    initialize_incus
+    configure_zfs
+    configure_kernel_modules
+    install_binaries
+    generate_tls_certificates
+    setup_jwt_secret
+    create_systemd_service
+    setup_firewall
+    generate_initial_token
+    import_sidecars
+    print_completion_message
+}
+
+# Run main when executed; sourcing only defines the functions (used by
+# scripts/ci/test-offline-bundle.sh).
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
