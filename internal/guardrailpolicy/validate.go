@@ -48,3 +48,54 @@ func Validate(policy *pb.GuardrailPolicy, signers []*pb.GuardrailTrustedSigner) 
 		}
 	}
 	return nil
+}
+
+// ValidateSetRequest is Validate plus the revoked keys (#2729): each has a
+// key_id of 64 lowercase hex characters and a reason, appears once, and is
+// not also a trusted signer. Whether the request keeps every stored
+// revocation is CheckTransition's job, under the store's lock.
+func ValidateSetRequest(req *pb.SetGuardrailPolicyRequest) error {
+	if err := Validate(req.GetPolicy(), req.GetTrustedSigners()); err != nil {
+		return err
+	}
+	revoked := make(map[string]bool, len(req.GetRevokedSigners()))
+	for i, r := range req.GetRevokedSigners() {
+		if !keyIDPattern.MatchString(r.GetKeyId()) {
+			return fmt.Errorf("revoked key %d: key_id %q is not 64 lowercase hex characters (a SHA-256)", i, r.GetKeyId())
+		}
+		if strings.TrimSpace(r.GetReason()) == "" {
+			return fmt.Errorf("revoked key %d (%s): a reason is required", i, r.GetKeyId())
+		}
+		if revoked[r.GetKeyId()] {
+			return fmt.Errorf("revoked key %d: %s is revoked twice", i, r.GetKeyId())
+		}
+		revoked[r.GetKeyId()] = true
+	}
+	for i, s := range req.GetTrustedSigners() {
+		if revoked[s.GetKeyId()] {
+			return fmt.Errorf("trusted signer %d (%q): key %s is revoked and cannot be trusted again", i, s.GetLabel(), s.GetKeyId())
+		}
+	}
+	return nil
+}
+
+var keyIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func definedKind(k pb.GuardrailKind) bool {
+	return k.Descriptor().Values().ByNumber(k.Number()) != nil
+}
+
+func definedAction(a pb.GuardrailAction) bool {
+	return a.Descriptor().Values().ByNumber(a.Number()) != nil
+}
+
+// ParseSetRequest decodes the `guardrail policy set --file` format: the
+// protojson encoding of SetGuardrailPolicyRequest. Unknown fields are an
+// error, so a misspelt field cannot silently drop part of a policy.
+func ParseSetRequest(data []byte) (*pb.SetGuardrailPolicyRequest, error) {
+	req := &pb.SetGuardrailPolicyRequest{}
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(data, req); err != nil {
+		return nil, fmt.Errorf("parse guardrail policy file: %w", err)
+	}
+	return req, nil
+}
