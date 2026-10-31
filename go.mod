@@ -52,7 +52,7 @@ require (
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.37.1
-	k8s.io/apimachinery v0.37.1
+	k8s.io/apimachinery v0.37.2
 	k8s.io/client-go v0.37.1
 	sigs.k8s.io/agent-sandbox v1.0.8
 	sigs.k8s.io/controller-runtime v0.25.2
